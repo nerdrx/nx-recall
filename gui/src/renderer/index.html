@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- No network anywhere in this app: connect-src is 'none' and there is no
+         remote origin in any directive. The only transport is the unix socket,
+         and only the main process touches it. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NX Recall</title>
+    <link rel="stylesheet" href="./tokens.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <!-- The light the glass refracts (DESIGN §3): drifting nebula, a vignette,
+         and the noise film that keeps the gradients from banding on OLED. -->
+    <div id="field" aria-hidden="true">
+      <span class="neb neb-1"></span>
+      <span class="neb neb-2"></span>
+      <span class="neb neb-3"></span>
+      <span class="vignette"></span>
+      <span class="grain"></span>
+    </div>
+
+    <div class="shell">
+      <nav class="rail" aria-label="Views">
+        <div class="rail-brand">
+          <img src="../../assets/icons/48x48.png" alt="" width="30" height="30" />
+          <span>
+            <b>Recall</b>
+            <small>local only</small>
+          </span>
+        </div>
+
+        <div class="rail-nav" role="tablist" aria-orientation="vertical">
+          <button class="rail-item" role="tab" data-view="transcript" aria-selected="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+              <path d="M4 5h16M4 10h11M4 15h16M4 20h8" stroke-linecap="square" />
+            </svg>
+            <span>Transcript</span>
+            <span class="badge" id="badge-transcript">0</span>
+          </button>
+          <button class="rail-item" role="tab" data-view="speakers" aria-selected="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+              <path d="M4 20v-2a4 4 0 0 1 4-4h3a4 4 0 0 1 4 4v2M6 7.5a3.5 3.5 0 1 0 7 0 3.5 3.5 0 0 0-7 0M17 13h1a3 3 0 0 1 3 3v2M17 5.2a2.8 2.8 0 1 1 0 5.6" stroke-linecap="square" />
+            </svg>
+            <span>Speakers</span>
+            <span class="badge" id="badge-speakers">0</span>
+          </button>
+          <button class="rail-item" role="tab" data-view="search" aria-selected="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+              <path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14M16 16l4.5 4.5" stroke-linecap="square" />
+            </svg>
+            <span>Search</span>
+          </button>
+          <button class="rail-item" role="tab" data-view="sources" aria-selected="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+              <path d="M4 8v8M8 5v14M12 9v6M16 3v18M20 8v8" stroke-linecap="square" />
+            </svg>
+            <span>Sources</span>
+            <span class="badge" id="badge-sources">0</span>
+          </button>
+        </div>
+
+        <!-- Pause surface #2 (the tray dropdown is #1) — DESIGN §8. -->
+        <div class="rail-pause">
+          <button class="pause-btn" id="pause-btn" data-paused="false" disabled>
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" id="pause-ico">
+              <rect x="6" y="5" width="4" height="14"></rect>
+              <rect x="14" y="5" width="4" height="14"></rect>
+            </svg>
+            <span id="pause-label">Pause capture</span>
+          </button>
+          <p class="rail-hint" id="pause-hint">Capture stops immediately. Nothing is written while paused.</p>
+        </div>
+      </nav>
+
+      <main class="main" id="main"></main>
+
+      <footer class="footer" id="footer"></footer>
+    </div>
+
+    <div id="sheet-root"></div>
+    <div class="toasts" id="toasts" aria-live="polite"></div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

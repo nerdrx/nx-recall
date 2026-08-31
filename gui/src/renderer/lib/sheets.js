@@ -1,0 +1,94 @@
+// Sheets, confirms and toasts — the only floating layers in the app, and the
+// only places real backdrop-filter is spent (DESIGN §4: glass on chrome only).
+
+import { h, clear } from './dom.js';
+
+const root = () => document.getElementById('sheet-root');
+
+let openCount = 0;
+
+/** openSheet(build) — build(close) returns the sheet's children. */
+export function openSheet(build, { onClose } = {}) {
+  const scrim = h('div', { class: 'scrim', role: 'presentation' });
+  const sheet = h('div', { class: 'sheet', role: 'dialog', 'aria-modal': 'true' });
+
+  const close = (result) => {
+    scrim.remove();
+    openCount = Math.max(0, openCount - 1);
+    document.removeEventListener('keydown', onKey, true);
+    if (onClose) onClose(result);
+  };
+  const onKey = (e) => {
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      close(null);
+    }
+  };
+
+  sheet.append(...[build(close)].flat().filter(Boolean));
+  scrim.append(sheet);
+  scrim.addEventListener('mousedown', (e) => {
+    if (e.target === scrim) close(null);
+  });
+  document.addEventListener('keydown', onKey, true);
+  root().append(scrim);
+  openCount += 1;
+
+  // Focus the first control so the sheet is keyboard-usable immediately.
+  const first = sheet.querySelector('input, textarea, button, select');
+  if (first) first.focus();
+  return close;
+}
+
+export function sheetsOpen() {
+  return openCount > 0;
+}
+
+/** A confirm that states the consequence plainly (DESIGN §9). */
+export function confirmSheet({ title, body, confirmLabel = 'Confirm', danger = false, detail = null }) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
+    const close = openSheet(
+      () => [
+        h('h2', { text: title }),
+        h('p', { class: 'sub', text: body }),
+        detail ? h('div', { class: 'quote', text: detail }) : null,
+        h(
+          'div',
+          { class: 'actions' },
+          h('button', { class: 'btn', onclick: () => { finish(false); close(false); } }, 'Cancel'),
+          h(
+            'button',
+            { class: `btn ${danger ? 'danger' : 'primary'}`, onclick: () => { finish(true); close(true); } },
+            confirmLabel
+          )
+        ),
+      ],
+      { onClose: () => finish(false) }
+    );
+  });
+}
+
+export function toast(text, kind = '') {
+  const box = document.getElementById('toasts');
+  const el = h('div', { class: `toast ${kind}`.trim(), text });
+  box.append(el);
+  // Errors stay until they are pushed out; everything else auto-dismisses.
+  const ttl = kind === 'error' ? 9000 : 4200;
+  setTimeout(() => {
+    el.style.transition = 'opacity var(--dur) var(--ease-soft)';
+    el.style.opacity = '0';
+    setTimeout(() => el.remove(), 260);
+  }, ttl);
+  while (box.children.length > 4) box.firstChild.remove();
+  return el;
+}
+
+export function clearToasts() {
+  clear(document.getElementById('toasts'));
+}

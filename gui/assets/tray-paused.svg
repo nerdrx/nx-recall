@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="NX Recall">
+  <title>NX Recall tray (paused)</title>
+<!--
+  Tray variant (DESIGN §8), tuned for 24-32px. Bevel, well and refraction are
+  dropped: at that size each lands on well under a pixel and only greys the
+  silhouette. The monogram is KNOCKED OUT rather than drawn light, so the
+  counters show whatever is behind them and the mark reads on a light tray, a
+  dark tray, and through a monochrome tint.
+-->
+  <defs>
+    <linearGradient id="g" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#6b6280"/>
+      <stop offset="0.5" stop-color="#4c4460"/>
+      <stop offset="1" stop-color="#2b2540"/>
+    </linearGradient>
+    <mask id="m">
+      <rect width="512" height="512" fill="#fff"/>
+      <g fill="none" stroke="#000" stroke-width="44" stroke-linecap="butt" stroke-linejoin="miter" stroke-miterlimit="4">
+        <path d="M199,356L199,156"/>
+        <path d="M199,156L283,156Q331,156 331,204Q331,252 283,252L199,252"/>
+        <path d="M264,252L334,356"/>
+      </g>
+    </mask>
+  </defs>
+  <path d="M240.13,18.49Q256,10 271.87,18.49L470.13,124.51Q486,133 486,151L486,361Q486,379 470.13,387.49L271.87,493.51Q256,502 240.13,493.51L41.87,387.49Q26,379 26,361L26,151Q26,133 41.87,124.51Z" fill="url(#g)" mask="url(#m)"/>
+</svg>
