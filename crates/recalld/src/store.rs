@@ -3,7 +3,9 @@
 //! Schema v1 (Step 1) was `sources` / `sessions` / `segments`. v2 adds the
 //! analysis columns, the voicebank (`speakers`, `speaker_prototypes`,
 //! `embeddings`, `golden_samples`) and a full-text index over transcripts.
-//! Existing v1 databases are migrated in place.
+//! v3 (Step 4) adds `session_roster` — who was in the instance, from VRChat's
+//! output log — and `operations`, the audit trail that makes a rename, a merge
+//! or a reassignment undoable. Existing databases are migrated in place.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::embed::Embedding;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct SourceRow {
@@ -22,6 +24,11 @@ pub struct SourceRow {
     pub display_name: String,
     pub allowed: bool,
     pub first_seen: i64,
+    /// Last time the source was seen on the graph. Equal to `first_seen` for a
+    /// source that has only ever been seen once.
+    pub last_seen: i64,
+    /// Capture sessions currently open for it — the "capturing now" light.
+    pub streams: i64,
 }
 
 /// What the analysis leg learned about one turn.
@@ -37,8 +44,39 @@ pub struct SegmentAnalysis {
 pub struct SpeakerSummary {
     pub id: i64,
     pub display_name: String,
+    /// The generated `Speaker_07` label, kept even after a rename so a client
+    /// can tell an unnamed voice from a named one — which is the whole
+    /// onboarding question (DESIGN §5).
+    pub auto_label: String,
+    /// When the user named this voice. `None` means nobody has.
+    pub named_at: Option<i64>,
+    pub created_at: i64,
     pub segments: i64,
     pub speech_ns: i64,
+}
+
+impl SpeakerSummary {
+    /// The user's name for this voice, or `None` while it is still anonymous.
+    pub fn name(&self) -> Option<&str> {
+        self.named_at.map(|_| self.display_name.as_str())
+    }
+}
+
+/// Everything a client needs about one segment, in one row.
+#[derive(Debug, Clone)]
+pub struct SegmentRow {
+    pub id: i64,
+    pub session_id: i64,
+    /// The source's match key (`VRChat.exe`).
+    pub source: String,
+    pub t_start_ns: i64,
+    pub t_end_ns: i64,
+    pub speaker_id: Option<i64>,
+    pub speaker_name: Option<String>,
+    pub text: Option<String>,
+    pub overlap_frac: Option<f32>,
+    pub match_score: Option<f32>,
+    pub audio_path: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,10 +93,60 @@ pub struct MergeReport {
 
 #[derive(Debug, Clone)]
 pub struct SearchHit {
-    pub segment_id: i64,
-    pub t_start_ns: i64,
-    pub speaker: Option<String>,
+    pub row: SegmentRow,
+    /// The matched words with their context, marked up by FTS5.
     pub snippet: String,
+}
+
+impl SearchHit {
+    pub fn segment_id(&self) -> i64 {
+        self.row.id
+    }
+    pub fn speaker(&self) -> Option<&str> {
+        self.row.speaker_name.as_deref()
+    }
+}
+
+/// One person's presence in a VRChat instance, as read from the output log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterRow {
+    pub id: i64,
+    pub world_id: Option<String>,
+    pub instance: Option<String>,
+    pub display_name: String,
+    pub joined_at_utc_ns: i64,
+    pub left_at_utc_ns: Option<i64>,
+}
+
+/// One entry in the audit trail. `prior_state` is JSON holding enough to undo
+/// the operation; writing the undo *method* is a later step, keeping the record
+/// is this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationRow {
+    pub id: i64,
+    pub op: String,
+    pub target_ids: String,
+    pub prior_state: String,
+    pub at_utc_ns: i64,
+}
+
+/// Which segments an operation is about. Every field is a narrowing `AND`; all
+/// of them `None` means "every live segment", which is why the delete path
+/// insists on a preview first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentFilter {
+    pub speaker: Option<i64>,
+    pub session: Option<i64>,
+    /// A source's match key (`VRChat.exe`), not its row id.
+    pub source: Option<String>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+}
+
+impl SegmentFilter {
+    pub fn is_everything(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +246,7 @@ impl Store {
 
         let migrating = current == Some(1);
         self.apply_v2()?;
+        self.apply_v3()?;
         if migrating {
             // Backfill the index for rows that predate it. New rows arrive
             // through the triggers.
@@ -278,18 +367,74 @@ impl Store {
         Ok(())
     }
 
-    fn add_column_if_missing(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+    /// Everything schema v3 adds, written so it is a no-op on a v3 database.
+    ///
+    /// Neither table references `sessions`: the roster is observed from
+    /// VRChat's log, which knows nothing about capture sessions, and the audit
+    /// trail has to outlive the rows it describes (that is the point of it).
+    fn apply_v3(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_roster (
+                 id               INTEGER PRIMARY KEY,
+                 world_id         TEXT,
+                 instance         TEXT,
+                 display_name     TEXT    NOT NULL,
+                 joined_at_utc_ns INTEGER NOT NULL,
+                 left_at_utc_ns   INTEGER
+             );
+
+             CREATE TABLE IF NOT EXISTS operations (
+                 id          INTEGER PRIMARY KEY,
+                 op          TEXT    NOT NULL,
+                 target_ids  TEXT    NOT NULL,
+                 prior_state TEXT    NOT NULL,
+                 at_utc_ns   INTEGER NOT NULL
+             );
+
+             CREATE INDEX IF NOT EXISTS idx_roster_open
+                 ON session_roster(display_name, left_at_utc_ns);
+             CREATE INDEX IF NOT EXISTS idx_roster_joined
+                 ON session_roster(joined_at_utc_ns);
+             CREATE INDEX IF NOT EXISTS idx_operations_at ON operations(at_utc_ns);",
+        )?;
+
+        // Columns the first real client asked for: an unnamed voice has to be
+        // distinguishable from a named one, and a source has to say when it was
+        // last seen, not only when it was first.
+        let fresh_auto = self.add_column_if_missing("speakers", "auto_label", "TEXT")?;
+        self.add_column_if_missing("speakers", "named_at", "INTEGER")?;
+        let fresh_last_seen = self.add_column_if_missing("sources", "last_seen", "INTEGER")?;
+        if fresh_auto {
+            // Backfill: the generated label for an existing row is the one it
+            // would have been minted with, and a display name that differs from
+            // it is a name the user chose.
+            self.conn.execute_batch(
+                "UPDATE speakers SET auto_label = 'Speaker_' || printf('%02d', id)
+                     WHERE auto_label IS NULL;
+                 UPDATE speakers SET named_at = created_at
+                     WHERE named_at IS NULL AND display_name <> auto_label;",
+            )?;
+        }
+        if fresh_last_seen {
+            self.conn
+                .execute_batch("UPDATE sources SET last_seen = first_seen WHERE last_seen IS NULL")?;
+        }
+        Ok(())
+    }
+
+    /// Returns whether the column had to be added, so a caller can backfill it.
+    fn add_column_if_missing(&self, table: &str, column: &str, decl: &str) -> Result<bool> {
         let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let existing: Vec<String> = stmt
             .query_map([], |r| r.get::<_, String>(1))?
             .collect::<rusqlite::Result<_>>()?;
         if existing.iter().any(|c| c == column) {
-            return Ok(());
+            return Ok(false);
         }
         self.conn
             .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
             .with_context(|| format!("adding {table}.{column}"))?;
-        Ok(())
+        Ok(true)
     }
 
     // ---- sources / sessions / segments (Step 1) --------------------------
@@ -306,9 +451,11 @@ impl Store {
         first_seen: i64,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO sources (match_key, display_name, allowed, first_seen)
-             VALUES (?1, ?2, 0, ?3)
-             ON CONFLICT(match_key) DO UPDATE SET display_name = excluded.display_name",
+            "INSERT INTO sources (match_key, display_name, allowed, first_seen, last_seen)
+             VALUES (?1, ?2, 0, ?3, ?3)
+             ON CONFLICT(match_key) DO UPDATE SET
+                 display_name = excluded.display_name,
+                 last_seen = MAX(COALESCE(sources.last_seen, 0), excluded.last_seen)",
             params![match_key, display_name, first_seen],
         )?;
         let id: i64 = self.conn.query_row(
@@ -322,8 +469,8 @@ impl Store {
     /// Mirror a config rule into the DB so `sources` can show it.
     pub fn set_allowed(&self, match_key: &str, allowed: bool, first_seen: i64) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sources (match_key, display_name, allowed, first_seen)
-             VALUES (?1, ?1, ?2, ?3)
+            "INSERT INTO sources (match_key, display_name, allowed, first_seen, last_seen)
+             VALUES (?1, ?1, ?2, ?3, ?3)
              ON CONFLICT(match_key) DO UPDATE SET allowed = excluded.allowed",
             params![match_key, allowed as i64, first_seen],
         )?;
@@ -332,8 +479,11 @@ impl Store {
 
     pub fn list_sources(&self) -> Result<Vec<SourceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, match_key, display_name, allowed, first_seen
-             FROM sources ORDER BY allowed DESC, match_key ASC",
+            "SELECT s.id, s.match_key, s.display_name, s.allowed,
+                    s.first_seen, COALESCE(s.last_seen, s.first_seen),
+                    (SELECT COUNT(*) FROM sessions ss
+                      WHERE ss.source_id = s.id AND ss.ended_at_utc_ns IS NULL)
+             FROM sources s ORDER BY s.allowed DESC, s.match_key ASC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -343,6 +493,8 @@ impl Store {
                     display_name: r.get(2)?,
                     allowed: r.get::<_, i64>(3)? != 0,
                     first_seen: r.get(4)?,
+                    last_seen: r.get(5)?,
+                    streams: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -502,9 +654,12 @@ impl Store {
             .collect()
     }
 
+    /// Create a voice that already has a name — the CLI's and the tests' path.
+    /// The generated label is the same string, so nothing claims the user named
+    /// it when they did not.
     pub fn create_speaker(&self, display_name: &str, created_at: i64) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO speakers (display_name, created_at) VALUES (?1, ?2)",
+            "INSERT INTO speakers (display_name, auto_label, created_at) VALUES (?1, ?1, ?2)",
             params![display_name, created_at],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -581,10 +736,12 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn rename_speaker(&self, speaker_id: i64, display_name: &str) -> Result<()> {
+    /// Name a voice. `named_at` is what tells a client this is a person the
+    /// user has identified rather than a number the daemon made up.
+    pub fn rename_speaker(&self, speaker_id: i64, display_name: &str, at_utc_ns: i64) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE speakers SET display_name = ?2 WHERE id = ?1",
-            params![speaker_id, display_name],
+            "UPDATE speakers SET display_name = ?2, named_at = ?3 WHERE id = ?1",
+            params![speaker_id, display_name, at_utc_ns],
         )?;
         if n == 0 {
             bail!("no speaker with id {speaker_id}");
@@ -660,7 +817,8 @@ impl Store {
 
     pub fn list_speakers(&self) -> Result<Vec<SpeakerSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.display_name,
+            "SELECT s.id, s.display_name, COALESCE(s.auto_label, s.display_name),
+                    s.named_at, s.created_at,
                     COUNT(g.id),
                     COALESCE(SUM(g.t_end_ns - g.t_start_ns), 0)
              FROM speakers s
@@ -668,19 +826,30 @@ impl Store {
                  ON g.speaker_id = s.id AND g.deleted_at IS NULL
              WHERE s.merged_into IS NULL
              GROUP BY s.id
-             ORDER BY 4 DESC, s.id ASC",
+             ORDER BY 7 DESC, s.id ASC",
         )?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(SpeakerSummary {
                     id: r.get(0)?,
                     display_name: r.get(1)?,
-                    segments: r.get(2)?,
-                    speech_ns: r.get(3)?,
+                    auto_label: r.get(2)?,
+                    named_at: r.get(3)?,
+                    created_at: r.get(4)?,
+                    segments: r.get(5)?,
+                    speech_ns: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// One voice, in the shape `speakers.list` returns.
+    pub fn speaker_summary(&self, speaker_id: i64) -> Result<Option<SpeakerSummary>> {
+        Ok(self
+            .list_speakers()?
+            .into_iter()
+            .find(|s| s.id == speaker_id))
     }
 
     pub fn find_speaker_by_name(&self, name: &str) -> Result<Option<i64>> {
@@ -697,27 +866,7 @@ impl Store {
     // ---- reading ---------------------------------------------------------
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT g.id, g.t_start_ns, sp.display_name,
-                    snippet(segments_fts, 0, '[', ']', '…', 12)
-             FROM segments_fts
-             JOIN segments g ON g.id = segments_fts.rowid
-             LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
-             WHERE segments_fts MATCH ?1 AND g.deleted_at IS NULL
-             ORDER BY g.t_start_ns ASC
-             LIMIT ?2",
-        )?;
-        let rows = stmt
-            .query_map(params![query, limit as i64], |r| {
-                Ok(SearchHit {
-                    segment_id: r.get(0)?,
-                    t_start_ns: r.get(1)?,
-                    speaker: r.get(2)?,
-                    snippet: r.get(3)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        self.search_filtered(query, &SegmentFilter::default(), limit)
     }
 
     pub fn transcript(
@@ -761,6 +910,468 @@ impl Store {
         )?;
         let rows = stmt
             .query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The columns every client-facing segment row is built from. Kept in one
+    /// place so a transcript page, a search hit and a live event cannot drift
+    /// into describing the same segment differently.
+    const SEGMENT_COLUMNS: &'static str =
+        "g.id, g.session_id, sc.match_key, g.t_start_ns, g.t_end_ns,
+         sp.canonical_id, sp.display_name, g.text, g.overlap_frac, g.match_score, g.audio_path";
+
+    fn segment_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentRow> {
+        Ok(SegmentRow {
+            id: r.get(0)?,
+            session_id: r.get(1)?,
+            source: r.get(2)?,
+            t_start_ns: r.get(3)?,
+            t_end_ns: r.get(4)?,
+            speaker_id: r.get(5)?,
+            speaker_name: r.get(6)?,
+            text: r.get(7)?,
+            overlap_frac: r.get::<_, Option<f64>>(8)?.map(|v| v as f32),
+            match_score: r.get::<_, Option<f64>>(9)?.map(|v| v as f32),
+            audio_path: r.get(10)?,
+        })
+    }
+
+    /// One segment, in the shape clients read.
+    pub fn segment_row(&self, segment_id: i64) -> Result<Option<SegmentRow>> {
+        let sql = format!(
+            "SELECT {}
+             FROM segments g
+             JOIN sessions ss ON ss.id = g.session_id
+             JOIN sources sc ON sc.id = ss.source_id
+             LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             WHERE g.id = ?1",
+            Self::SEGMENT_COLUMNS
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, params![segment_id], Self::segment_row_from)
+            .optional()?)
+    }
+
+    /// `search`, narrowed. The FTS query drives the match; the rest are `AND`ed
+    /// filters, and each hit carries the whole row so a client can render the
+    /// conversation around it without a second round trip.
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        filter: &SegmentFilter,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let sql = format!(
+            "SELECT {}, snippet(segments_fts, 0, '[', ']', '…', 12)
+             FROM segments_fts
+             JOIN segments g ON g.id = segments_fts.rowid
+             JOIN sessions ss ON ss.id = g.session_id
+             JOIN sources sc ON sc.id = ss.source_id
+             LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             WHERE segments_fts MATCH ?1 AND g.deleted_at IS NULL
+               AND (?2 IS NULL OR sp.canonical_id = ?2)
+               AND (?3 IS NULL OR g.session_id = ?3)
+               AND (?4 IS NULL OR sc.match_key = ?4)
+               AND (?5 IS NULL OR g.t_start_ns >= ?5)
+               AND (?6 IS NULL OR g.t_start_ns < ?6)
+             ORDER BY g.t_start_ns ASC
+             LIMIT ?7",
+            Self::SEGMENT_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    query,
+                    filter.speaker,
+                    filter.session,
+                    filter.source,
+                    filter.from,
+                    filter.to,
+                    limit as i64
+                ],
+                |r| {
+                    Ok(SearchHit {
+                        row: Self::segment_row_from(r)?,
+                        snippet: r.get(11)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// A transcript page: chronological, filtered, capped.
+    pub fn segment_rows(&self, filter: &SegmentFilter, limit: usize) -> Result<Vec<SegmentRow>> {
+        let sql = format!(
+            "SELECT {}
+             FROM segments g
+             JOIN sessions ss ON ss.id = g.session_id
+             JOIN sources sc ON sc.id = ss.source_id
+             LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             WHERE g.deleted_at IS NULL
+               AND (?1 IS NULL OR sp.canonical_id = ?1)
+               AND (?2 IS NULL OR g.session_id = ?2)
+               AND (?3 IS NULL OR sc.match_key = ?3)
+               AND (?4 IS NULL OR g.t_start_ns >= ?4)
+               AND (?5 IS NULL OR g.t_start_ns < ?5)
+             ORDER BY g.t_start_ns ASC, g.id ASC
+             LIMIT ?6",
+            Self::SEGMENT_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    filter.speaker,
+                    filter.session,
+                    filter.source,
+                    filter.from,
+                    filter.to,
+                    limit as i64
+                ],
+                Self::segment_row_from,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Live segments, for the status line.
+    pub fn segments_total(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM segments WHERE deleted_at IS NULL",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Live segments a filter selects, as `(id, audio_path)`. The delete path's
+    /// preview and its run read exactly the same set.
+    pub fn segments_matching(&self, filter: &SegmentFilter) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.audio_path
+             FROM segments g
+             JOIN sessions ss ON ss.id = g.session_id
+             JOIN sources sc ON sc.id = ss.source_id
+             LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             WHERE g.deleted_at IS NULL
+               AND (?1 IS NULL OR sp.canonical_id = ?1)
+               AND (?2 IS NULL OR g.session_id = ?2)
+               AND (?3 IS NULL OR sc.match_key = ?3)
+               AND (?4 IS NULL OR g.t_start_ns >= ?4)
+               AND (?5 IS NULL OR g.t_start_ns < ?5)
+             ORDER BY g.t_start_ns ASC, g.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    filter.speaker,
+                    filter.session,
+                    filter.source,
+                    filter.from,
+                    filter.to
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Soft delete: the row survives, hidden from every read path, until the
+    /// retention sweeper passes the undo window (DESIGN §8).
+    pub fn soft_delete_segments(&self, ids: &[i64], at_utc_ns: i64) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE segments SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            )?;
+            for id in ids {
+                n += stmt.execute(params![id, at_utc_ns])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Soft-deleted rows whose undo window has closed, as `(id, audio_path)`.
+    pub fn expired_soft_deletes(&self, before_utc_ns: i64) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, audio_path FROM segments
+             WHERE deleted_at IS NOT NULL AND deleted_at < ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![before_utc_ns], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Hard delete, cascading the rows that reference the segment. Deletion
+    /// means deletion; the caller unlinks the audio.
+    pub fn purge_segments(&self, ids: &[i64]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut drop_embeddings = tx.prepare("DELETE FROM embeddings WHERE segment_id = ?1")?;
+            let mut orphan_prototypes = tx.prepare(
+                "UPDATE speaker_prototypes SET source_segment_id = NULL WHERE source_segment_id = ?1",
+            )?;
+            let mut drop_segment = tx.prepare("DELETE FROM segments WHERE id = ?1")?;
+            for id in ids {
+                drop_embeddings.execute(params![id])?;
+                orphan_prototypes.execute(params![id])?;
+                n += drop_segment.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Live segments whose audio has aged past the audio tier, as
+    /// `(id, audio_path)`. The transcript stays; only the WAV goes.
+    pub fn audio_older_than(&self, before_utc_ns: i64) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, audio_path FROM segments
+             WHERE deleted_at IS NULL AND audio_path <> '' AND t_start_ns < ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![before_utc_ns], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Mark a segment's audio as gone while keeping the row. An empty
+    /// `audio_path` is the "text only" state.
+    pub fn forget_audio(&self, ids: &[i64]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare("UPDATE segments SET audio_path = '' WHERE id = ?1")?;
+            for id in ids {
+                n += stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Every audio path the database still expects to exist, soft-deleted rows
+    /// included — the sweeper must not treat an undoable row's file as an
+    /// orphan.
+    pub fn all_audio_paths(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, audio_path FROM segments WHERE audio_path <> ''")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
+    // ---- manual labelling ------------------------------------------------
+
+    /// The fields an undo would have to put back.
+    pub fn segment_state(&self, segment_id: i64) -> Result<(Option<i64>, Option<String>)> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT speaker_id, text FROM segments WHERE id = ?1",
+                params![segment_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.ok_or_else(|| anyhow::anyhow!("no segment with id {segment_id}"))
+    }
+
+    /// Hand-assign a speaker. The match score is cleared: it described the
+    /// automatic guess, and keeping it would misreport a human decision as a
+    /// confident model one.
+    pub fn reassign_segment(&self, segment_id: i64, speaker_id: Option<i64>) -> Result<()> {
+        let speaker_id = match speaker_id {
+            Some(id) => Some(self.resolve_speaker(id)?),
+            None => None,
+        };
+        let n = self.conn.execute(
+            "UPDATE segments SET speaker_id = ?2, match_score = NULL WHERE id = ?1",
+            params![segment_id, speaker_id],
+        )?;
+        if n == 0 {
+            bail!("no segment with id {segment_id}");
+        }
+        Ok(())
+    }
+
+    /// Hand-correct a transcript. The FTS index follows through the update
+    /// trigger, so a corrected segment is immediately searchable by its new
+    /// words and no longer by its old ones.
+    pub fn correct_segment_text(&self, segment_id: i64, text: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE segments SET text = ?2 WHERE id = ?1",
+            params![segment_id, text],
+        )?;
+        if n == 0 {
+            bail!("no segment with id {segment_id}");
+        }
+        Ok(())
+    }
+
+    pub fn speaker_name(&self, speaker_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT display_name FROM speakers WHERE id = ?1",
+                params![speaker_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    // ---- audit trail -----------------------------------------------------
+
+    /// Record an operation. `target_ids` and `prior_state` are JSON, produced
+    /// by the caller: the store stays free of a serialisation opinion, and the
+    /// undo path (a later step) reads back exactly what was written.
+    pub fn log_operation(
+        &self,
+        op: &str,
+        target_ids: &str,
+        prior_state: &str,
+        at_utc_ns: i64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO operations (op, target_ids, prior_state, at_utc_ns)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![op, target_ids, prior_state, at_utc_ns],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Most recent first — the order an undo stack wants.
+    pub fn operations(&self, limit: usize) -> Result<Vec<OperationRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, op, target_ids, prior_state, at_utc_ns
+             FROM operations ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(OperationRow {
+                    id: r.get(0)?,
+                    op: r.get(1)?,
+                    target_ids: r.get(2)?,
+                    prior_state: r.get(3)?,
+                    at_utc_ns: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // ---- roster ----------------------------------------------------------
+
+    /// Record a join, unless that person is already recorded as present in
+    /// this instance since that instant — a daemon restart re-reads the log
+    /// from the top and must not duplicate the people it already knows about.
+    pub fn roster_join(
+        &self,
+        world_id: Option<&str>,
+        instance: Option<&str>,
+        display_name: &str,
+        joined_at_utc_ns: i64,
+    ) -> Result<i64> {
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM session_roster
+                 WHERE display_name = ?1 AND left_at_utc_ns IS NULL
+                   AND joined_at_utc_ns = ?2
+                   AND world_id IS ?3 AND instance IS ?4",
+                params![display_name, joined_at_utc_ns, world_id, instance],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        self.conn.execute(
+            "INSERT INTO session_roster
+                 (world_id, instance, display_name, joined_at_utc_ns, left_at_utc_ns)
+             VALUES (?1, ?2, ?3, ?4, NULL)",
+            params![world_id, instance, display_name, joined_at_utc_ns],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Close the newest open row for that name. Returns whether one was found:
+    /// a leave for somebody we never saw join is noise, not an error.
+    pub fn roster_leave(&self, display_name: &str, left_at_utc_ns: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE session_roster SET left_at_utc_ns = ?2
+             WHERE id = (SELECT id FROM session_roster
+                         WHERE display_name = ?1 AND left_at_utc_ns IS NULL
+                         ORDER BY joined_at_utc_ns DESC, id DESC LIMIT 1)",
+            params![display_name, left_at_utc_ns],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// A world change ends everyone's presence in the old instance.
+    pub fn roster_close_all(&self, left_at_utc_ns: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE session_roster SET left_at_utc_ns = ?1 WHERE left_at_utc_ns IS NULL",
+            params![left_at_utc_ns],
+        )?)
+    }
+
+    /// Who is in the instance right now.
+    pub fn roster_present(&self) -> Result<Vec<RosterRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, world_id, instance, display_name, joined_at_utc_ns, left_at_utc_ns
+             FROM session_roster WHERE left_at_utc_ns IS NULL
+             ORDER BY joined_at_utc_ns ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(RosterRow {
+                    id: r.get(0)?,
+                    world_id: r.get(1)?,
+                    instance: r.get(2)?,
+                    display_name: r.get(3)?,
+                    joined_at_utc_ns: r.get(4)?,
+                    left_at_utc_ns: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Everyone recorded in a window, present or past.
+    pub fn roster_between(&self, from: i64, to: i64) -> Result<Vec<RosterRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, world_id, instance, display_name, joined_at_utc_ns, left_at_utc_ns
+             FROM session_roster
+             WHERE joined_at_utc_ns < ?2 AND (left_at_utc_ns IS NULL OR left_at_utc_ns > ?1)
+             ORDER BY joined_at_utc_ns ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![from, to], |r| {
+                Ok(RosterRow {
+                    id: r.get(0)?,
+                    world_id: r.get(1)?,
+                    instance: r.get(2)?,
+                    display_name: r.get(3)?,
+                    joined_at_utc_ns: r.get(4)?,
+                    left_at_utc_ns: r.get(5)?,
+                })
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1047,7 +1658,7 @@ mod tests {
         .unwrap();
         let hits = s.search("violin", 10).unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].segment_id, seg);
+        assert_eq!(hits[0].segment_id(), seg);
         assert!(hits[0].snippet.contains("violin"));
     }
 
@@ -1105,7 +1716,7 @@ mod tests {
         .unwrap();
         s.set_segment_speaker(seg, Some(spk), Some(0.7)).unwrap();
         let hits = s.search("fountain", 10).unwrap();
-        assert_eq!(hits[0].speaker.as_deref(), Some("Mira"));
+        assert_eq!(hits[0].speaker(), Some("Mira"));
 
         s.conn
             .execute(
@@ -1212,20 +1823,20 @@ mod tests {
         )
         .unwrap();
 
-        s.rename_speaker(spk, "Kestrel").unwrap();
+        s.rename_speaker(spk, "Kestrel", 99).unwrap();
         assert_eq!(
             s.transcript(None, None).unwrap()[0].speaker.as_deref(),
             Some("Kestrel")
         );
         assert_eq!(
-            s.search("anyone", 10).unwrap()[0].speaker.as_deref(),
+            s.search("anyone", 10).unwrap()[0].speaker(),
             Some("Kestrel")
         );
     }
 
     #[test]
     fn renaming_a_speaker_that_does_not_exist_is_an_error() {
-        assert!(store().rename_speaker(77, "Nobody").is_err());
+        assert!(store().rename_speaker(77, "Nobody", 0).is_err());
     }
 
     // ---- merge -----------------------------------------------------------
@@ -1383,6 +1994,219 @@ mod tests {
         s.store_embedding(seg, &v).unwrap();
         let back = s.segment_embedding(seg).unwrap().unwrap();
         assert_eq!(back, v);
+    }
+
+    // ---- v3: filters, soft delete, audit trail, roster --------------------
+
+    #[test]
+    fn filters_narrow_by_speaker_session_source_and_time() {
+        let s = store();
+        let vr = s.upsert_source("VRChat.exe", "VRChat.exe", 0).unwrap();
+        let dc = s.upsert_source("Discord", "Discord", 0).unwrap();
+        let s1 = s.begin_session(vr, 0).unwrap();
+        let s2 = s.begin_session(dc, 0).unwrap();
+        let spk = s.create_speaker("Wren", 0).unwrap();
+
+        let a = s.insert_segment(s1, 1_000, 2_000, "a.wav", 0).unwrap();
+        let b = s.insert_segment(s1, 5_000, 6_000, "b.wav", 0).unwrap();
+        let c = s.insert_segment(s2, 9_000, 9_500, "c.wav", 0).unwrap();
+        s.set_segment_speaker(a, Some(spk), Some(0.5)).unwrap();
+        for (id, text) in [(a, "portal world"), (b, "portal again"), (c, "portal chat")] {
+            s.set_segment_analysis(
+                id,
+                &SegmentAnalysis {
+                    text: Some(text.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let all = SegmentFilter::default();
+        assert!(all.is_everything());
+        assert_eq!(s.segments_matching(&all).unwrap().len(), 3);
+        assert_eq!(s.search_filtered("portal", &all, 10).unwrap().len(), 3);
+
+        let by_speaker = SegmentFilter {
+            speaker: Some(spk),
+            ..Default::default()
+        };
+        assert_eq!(s.segments_matching(&by_speaker).unwrap(), vec![(a, "a.wav".to_string())]);
+        assert_eq!(s.search_filtered("portal", &by_speaker, 10).unwrap().len(), 1);
+
+        let by_source = SegmentFilter {
+            source: Some("Discord".into()),
+            ..Default::default()
+        };
+        assert_eq!(s.segments_matching(&by_source).unwrap().len(), 1);
+
+        let by_window = SegmentFilter {
+            from: Some(4_000),
+            to: Some(9_000),
+            ..Default::default()
+        };
+        assert_eq!(s.segments_matching(&by_window).unwrap(), vec![(b, "b.wav".to_string())]);
+        assert_eq!(s.segment_rows(&by_window, 10).unwrap().len(), 1);
+        assert_eq!(s.segment_rows(&all, 2).unwrap().len(), 2, "limit applies");
+    }
+
+    #[test]
+    fn soft_delete_hides_the_row_and_the_purge_removes_it() {
+        let s = store();
+        let seg = a_segment(&s);
+        s.set_segment_analysis(
+            seg,
+            &SegmentAnalysis {
+                text: Some("a thing best forgotten".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.store_embedding(seg, &emb("m@1", &[1.0])).unwrap();
+
+        assert_eq!(s.soft_delete_segments(&[seg], 1_000).unwrap(), 1);
+        assert!(s.search("forgotten", 10).unwrap().is_empty());
+        assert!(s.transcript(None, None).unwrap().is_empty());
+        // Still there, still undoable, and its audio is not an orphan.
+        assert_eq!(s.all_audio_paths().unwrap().len(), 1);
+        // Re-deleting is a no-op, so the undo window is not silently extended.
+        assert_eq!(s.soft_delete_segments(&[seg], 9_999).unwrap(), 0);
+
+        assert!(s.expired_soft_deletes(999).unwrap().is_empty());
+        let expired = s.expired_soft_deletes(2_000).unwrap();
+        assert_eq!(expired, vec![(seg, "segments/a.wav".to_string())]);
+        assert_eq!(s.purge_segments(&[seg]).unwrap(), 1);
+        assert!(s.all_audio_paths().unwrap().is_empty());
+        assert!(s.segment_embedding(seg).unwrap().is_none());
+    }
+
+    #[test]
+    fn ageing_out_audio_keeps_the_transcript() {
+        let s = store();
+        let seg = a_segment(&s);
+        s.set_segment_analysis(
+            seg,
+            &SegmentAnalysis {
+                text: Some("words outlive their audio".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.audio_older_than(1_500).unwrap().len(), 1);
+        s.forget_audio(&[seg]).unwrap();
+        assert!(s.audio_older_than(1_500).unwrap().is_empty());
+        assert!(s.all_audio_paths().unwrap().is_empty());
+        assert_eq!(s.search("outlive", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_reassignment_replaces_the_model_score_with_nothing() {
+        let s = store();
+        let seg = a_segment(&s);
+        let a = s.create_speaker("A", 0).unwrap();
+        let b = s.create_speaker("B", 0).unwrap();
+        s.set_segment_speaker(seg, Some(a), Some(0.42)).unwrap();
+
+        s.reassign_segment(seg, Some(b)).unwrap();
+        let f = s.segment_fields(seg).unwrap();
+        assert_eq!(f["speaker_id"].as_deref(), Some(b.to_string().as_str()));
+        assert_eq!(f["match_score"], None, "a human decision has no cosine");
+
+        // Reassigning onto a tombstone lands on the canonical speaker.
+        let c = s.create_speaker("C", 0).unwrap();
+        s.merge_speakers(b, c).unwrap();
+        s.reassign_segment(seg, Some(b)).unwrap();
+        assert_eq!(s.segment_state(seg).unwrap().0, Some(c));
+        assert!(s.reassign_segment(4242, Some(a)).is_err());
+    }
+
+    #[test]
+    fn correcting_a_transcript_reindexes_it() {
+        let s = store();
+        let seg = a_segment(&s);
+        s.set_segment_analysis(
+            seg,
+            &SegmentAnalysis {
+                text: Some("the bell tolls".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.correct_segment_text(seg, "the belt holds").unwrap();
+        assert!(s.search("tolls", 10).unwrap().is_empty());
+        assert_eq!(s.search("belt", 10).unwrap().len(), 1);
+        assert_eq!(s.segment_state(seg).unwrap().1.as_deref(), Some("the belt holds"));
+    }
+
+    #[test]
+    fn operations_are_recorded_newest_first_and_outlive_their_rows() {
+        let s = store();
+        s.log_operation("speakers.name", "[3]", r#"{"name":"Speaker_03"}"#, 10)
+            .unwrap();
+        s.log_operation("speakers.merge", "[3,4]", r#"{"from":3,"into":4}"#, 20)
+            .unwrap();
+        let ops = s.operations(10).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].op, "speakers.merge");
+        assert_eq!(ops[0].target_ids, "[3,4]");
+        assert_eq!(ops[1].prior_state, r#"{"name":"Speaker_03"}"#);
+        assert_eq!(s.operations(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_roster_tracks_presence_and_a_world_change_ends_it() {
+        let s = store();
+        // Non-ASCII names are the common case, not an edge case.
+        s.roster_join(Some("wrld_a"), Some("12345"), "きつね", 1_000)
+            .unwrap();
+        s.roster_join(Some("wrld_a"), Some("12345"), "Ines", 2_000)
+            .unwrap();
+        // A restart re-reads the log: the same join must not duplicate.
+        s.roster_join(Some("wrld_a"), Some("12345"), "きつね", 1_000)
+            .unwrap();
+        assert_eq!(s.roster_present().unwrap().len(), 2);
+
+        assert!(s.roster_leave("Ines", 3_000).unwrap());
+        assert!(!s.roster_leave("Nobody", 3_000).unwrap(), "a stray leave is noise");
+        let present = s.roster_present().unwrap();
+        assert_eq!(present.len(), 1);
+        assert_eq!(present[0].display_name, "きつね");
+
+        assert_eq!(s.roster_close_all(4_000).unwrap(), 1);
+        assert!(s.roster_present().unwrap().is_empty());
+        // Both people overlap the window; the one who left is still on record.
+        assert_eq!(s.roster_between(0, 10_000).unwrap().len(), 2);
+        assert_eq!(s.roster_between(3_500, 10_000).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_v2_database_gains_the_v3_tables() {
+        let dir = std::env::temp_dir().join(format!("nx-recall-mig3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            // A v2 database: everything Step 3 wrote, stamped 2.
+            let s = Store::open(&dir).unwrap();
+            s.conn
+                .execute_batch(
+                    "DROP TABLE session_roster;
+                     DROP TABLE operations;
+                     UPDATE schema_version SET version = 2;",
+                )
+                .unwrap();
+            let seg = a_segment(&s);
+            assert_eq!(seg, 1);
+        }
+        let s = Store::open(&dir).unwrap();
+        let v: i64 = s
+            .conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3);
+        assert_eq!(s.segment_count(1).unwrap(), 1, "v2 rows survive");
+        s.roster_join(None, None, "Ines", 1).unwrap();
+        s.log_operation("x", "[]", "{}", 1).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

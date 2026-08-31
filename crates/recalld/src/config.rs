@@ -169,6 +169,92 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// The control socket. `$XDG_RUNTIME_DIR/nx-recall.sock` by default (DESIGN §8);
+/// `path`, or `NXR_SOCKET` in the environment, overrides it — which is what
+/// keeps the test suite off the live daemon's socket.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SocketConfig {
+    pub enabled: bool,
+    pub path: Option<PathBuf>,
+    /// How many past events the daemon can replay to a reconnecting client
+    /// before it has to answer `resync`.
+    pub replay_events: usize,
+    /// Per-client outbox depth. A client that cannot keep up is disconnected
+    /// at this bound rather than being allowed to stall the pipeline.
+    pub client_outbox: usize,
+}
+
+impl Default for SocketConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+            replay_events: 10_000,
+            client_outbox: 256,
+        }
+    }
+}
+
+/// The VRChat roster tailer (DESIGN §7). `log_dir` overrides the discovered
+/// Proton prefix; the tailer never errors the daemon when there is nothing to
+/// read, it just keeps looking.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RosterConfig {
+    pub enabled: bool,
+    pub log_dir: Option<PathBuf>,
+    /// How often to read new lines from the current log.
+    pub poll_ms: u64,
+    /// How often to look again when no log directory exists at all.
+    pub retry_s: u64,
+}
+
+impl Default for RosterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            log_dir: None,
+            poll_ms: 500,
+            retry_s: 30,
+        }
+    }
+}
+
+/// Tiered retention (DESIGN §8): audio is the heavy, short-lived artifact;
+/// text and identity are the light, long-lived ones. `0` disables a tier —
+/// "keep it" for the age limits, "purge immediately" is not expressible on
+/// purpose.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionConfig {
+    pub enabled: bool,
+    /// How often the sweeper runs.
+    pub sweep_interval_s: u64,
+    /// How long a soft-deleted row stays undoable before it is really gone.
+    pub undo_window_days: u32,
+    /// Age at which a segment's audio file is dropped; the transcript stays.
+    pub audio_days: u32,
+    /// Reconcile loose files against the database: orphaned files are removed,
+    /// dangling paths are logged. Both are crash residue (DESIGN §6).
+    pub reconcile: bool,
+    /// `VACUUM` after a sweep that actually purged rows.
+    pub vacuum_after_purge: bool,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sweep_interval_s: 6 * 3600,
+            undo_window_days: 7,
+            audio_days: 30,
+            reconcile: true,
+            vacuum_after_purge: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -177,6 +263,9 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     pub models: ModelsConfig,
     pub identity: IdentityConfig,
+    pub socket: SocketConfig,
+    pub roster: RosterConfig,
+    pub retention: RetentionConfig,
     /// Keyed on the match key (see `allowlist::SourceIdent::match_key`).
     pub rules: BTreeMap<String, Rule>,
 }
@@ -245,6 +334,22 @@ pub fn default_config_path() -> Result<PathBuf> {
 pub fn default_data_dir() -> Result<PathBuf> {
     let base = dirs::data_dir().context("no data directory (XDG_DATA_HOME / HOME unset)")?;
     Ok(base.join("nx-recall"))
+}
+
+/// Where the control socket lives, in precedence order: the config file, then
+/// `NXR_SOCKET`, then `$XDG_RUNTIME_DIR/nx-recall.sock`, then a path under the
+/// data dir for systems without a runtime dir.
+pub fn socket_path(cfg: &SocketConfig, data_dir: &Path) -> PathBuf {
+    if let Some(p) = &cfg.path {
+        return p.clone();
+    }
+    if let Some(p) = std::env::var_os("NXR_SOCKET").filter(|v| !v.is_empty()) {
+        return PathBuf::from(p);
+    }
+    if let Some(dir) = dirs::runtime_dir() {
+        return dir.join("nx-recall.sock");
+    }
+    data_dir.join("nx-recall.sock")
 }
 
 #[cfg(test)]
@@ -349,6 +454,39 @@ mod tests {
         assert_eq!(cfg.identity.label_threshold, 0.30);
         assert_eq!(cfg.identity.enroll_threshold, 0.55);
         assert_eq!(cfg.models.asr_threads, 4);
+    }
+
+    #[test]
+    fn the_step_4_sections_have_their_documented_defaults() {
+        let cfg = Config::default();
+        assert!(cfg.socket.enabled);
+        assert!(cfg.socket.path.is_none());
+        assert_eq!(cfg.socket.replay_events, 10_000);
+        assert_eq!(cfg.socket.client_outbox, 256);
+        assert!(cfg.roster.enabled);
+        assert_eq!(cfg.roster.poll_ms, 500);
+        // Tiered retention: audio is the short-lived tier, text outlives it.
+        assert_eq!(cfg.retention.audio_days, 30);
+        assert_eq!(cfg.retention.undo_window_days, 7);
+        assert_eq!(cfg.retention.sweep_interval_s, 6 * 3600);
+        assert!(cfg.retention.reconcile);
+    }
+
+    #[test]
+    fn an_explicit_socket_path_wins_over_the_runtime_dir() {
+        let sock = SocketConfig {
+            path: Some(PathBuf::from("/tmp/isolated.sock")),
+            ..Default::default()
+        };
+        assert_eq!(
+            socket_path(&sock, Path::new("/data")),
+            PathBuf::from("/tmp/isolated.sock")
+        );
+        // With no override and no runtime dir the data dir is the fallback, so
+        // the daemon always has somewhere to listen.
+        let bare = SocketConfig::default();
+        let resolved = socket_path(&bare, Path::new("/data"));
+        assert!(resolved.ends_with("nx-recall.sock"));
     }
 
     #[test]

@@ -86,6 +86,17 @@ pub enum Command {
         limit: usize,
     },
 
+    /// Stop writing anything, instantly. Capture keeps running; no segments,
+    /// no audio files, no transcripts, no roster. The scripting half of the
+    /// pause surfaces — the others are the tray dropdown and the GUI.
+    Pause,
+
+    /// Start writing again.
+    Resume,
+
+    /// Ask the running daemon how it is doing.
+    Status,
+
     /// Chronological transcript dump.
     Transcript {
         /// Restrict to one capture session.

@@ -153,6 +153,11 @@ impl Allowlist {
         self.rules.len()
     }
 
+    /// The rules as data, for the live copy the socket edits.
+    pub fn as_map(&self) -> BTreeMap<String, bool> {
+        self.rules.clone()
+    }
+
     /// No rules at all — the default-deny starting state, where every source
     /// is `Unknown`.
     pub fn is_empty(&self) -> bool {

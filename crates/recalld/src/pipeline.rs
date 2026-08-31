@@ -14,8 +14,10 @@ use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 
 use crate::analysis::{AnalysisStats, Analyzer, analyse_or_log};
+use crate::bus::{Bus, Topic};
 use crate::clock::{Anchor, samples_to_ns, utc_now_ns};
 use crate::config::{Config, SAMPLE_RATE};
+use crate::control::Control;
 use crate::models::ModelSet;
 use crate::queue::{AudioChunk, CaptureEvent, EventQueue};
 use crate::store::Store;
@@ -184,6 +186,13 @@ pub struct Pipeline {
     data_dir: PathBuf,
     sessions: HashMap<i64, SessionPipeline>,
     stats: Arc<Stats>,
+    /// Global pause. Read before every write, never messaged: the panic path
+    /// must not have to reach the front of a queue to take effect.
+    control: Arc<Control>,
+    bus: Arc<Bus>,
+    /// Whether the last chunk we saw was refused because of a pause, so the
+    /// transition is logged once rather than per buffer.
+    was_paused: bool,
 }
 
 impl Pipeline {
@@ -193,6 +202,8 @@ impl Pipeline {
         data_dir: PathBuf,
         stats: Arc<Stats>,
         analysis_stats: Arc<AnalysisStats>,
+        control: Arc<Control>,
+        bus: Arc<Bus>,
     ) -> Result<Self> {
         let vad = SileroVad::from_bytes(crate::VAD_MODEL)?;
         let seg_cfg = crate::ingest::segmenter_config(cfg);
@@ -221,6 +232,9 @@ impl Pipeline {
             data_dir,
             sessions: HashMap::new(),
             stats,
+            control,
+            bus,
+            was_paused: false,
         })
     }
 
@@ -249,6 +263,23 @@ impl Pipeline {
     }
 
     fn on_audio(&mut self, chunk: AudioChunk) -> Result<()> {
+        // Paused: the capture stream keeps running — dropping it would cost a
+        // re-negotiation and a lost session — but the audio stops here. Any
+        // half-built turn is discarded with the session state, so nothing said
+        // before the pause can be written by a segment that ends after it.
+        if self.control.is_paused() {
+            if !self.was_paused {
+                self.was_paused = true;
+                info!("paused: audio is being discarded, nothing is written");
+            }
+            self.sessions.remove(&chunk.session_id);
+            return Ok(());
+        }
+        if self.was_paused {
+            self.was_paused = false;
+            info!("resumed: writing segments again");
+        }
+
         let seg_cfg = self.seg_cfg;
         let new_state = self.vad.new_state();
         let merger = crate::ingest::turn_merger(&self.cfg);
@@ -318,6 +349,12 @@ impl Pipeline {
     }
 
     fn write_segment(&mut self, session_id: i64, span: crate::vad::SegmentSpan) -> Result<()> {
+        // Checked again here, not only in `on_audio`: this is the one place a
+        // file and a row are created, so this is where "no writes" has to be
+        // true no matter which path arrived.
+        if self.control.is_paused() {
+            return Ok(());
+        }
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return Ok(());
         };
@@ -361,7 +398,35 @@ impl Pipeline {
                 t_start_ns,
             );
         }
+        // Published after analysis so the event carries the transcript and the
+        // speaker, not an empty shell a client would have to re-query for.
+        {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
+            publish_segment(&self.bus, &store, segment_id);
+        }
         Ok(())
+    }
+}
+
+/// Announce a stored segment on the event stream.
+///
+/// Read back from the row rather than from the pipeline's own variables: the
+/// row is what every client will see when it queries, and the event must not
+/// disagree with it.
+pub fn publish_segment(bus: &Bus, store: &Store, segment_id: i64) {
+    match store.segment_row(segment_id) {
+        Ok(Some(row)) => {
+            bus.publish(
+                Topic::Segments,
+                "segment",
+                crate::service::segment_json(&row),
+            );
+        }
+        Ok(None) => warn!(segment_id, "a segment vanished between writing and announcing it"),
+        Err(e) => warn!(segment_id, "could not read back a stored segment: {e:#}"),
     }
 }
 

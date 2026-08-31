@@ -1,26 +1,34 @@
-//! NX Recall capture daemon — build order Steps 1-3.
+//! NX Recall capture daemon — build order Steps 1-4.
 //!
 //! Capture allowlisted application audio from PipeWire, segment it with Silero
-//! VAD, merge it into turns, transcribe it, and label the voice. No GUI and no
-//! IPC yet; those are later steps and deliberately absent.
+//! VAD, merge it into turns, transcribe it, label the voice, and serve all of
+//! it over a Unix socket to clients that never touch the database directly.
 
 mod cli;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::info;
+use serde_json::{Value, json};
+use tracing::{info, warn};
 
 use recalld::analysis::AnalysisStats;
+use recalld::bus::Bus;
 use recalld::capture;
+use recalld::client;
 use recalld::clock::utc_now_ns;
 use recalld::config::{self, Config, SAMPLE_RATE};
+use recalld::control::Control;
 use recalld::models::ModelSet;
 use recalld::pipeline::{self, Pipeline, Stats};
 use recalld::queue::EventQueue;
+use recalld::retention::{self, SweeperStop};
+use recalld::roster::{self, RosterStop};
+use recalld::server;
+use recalld::service::Service;
 use recalld::store::Store;
 
 use crate::cli::{Cli, Command, ModelsAction};
@@ -49,7 +57,7 @@ fn main() -> Result<()> {
     let cfg = Config::load(&config_path)?;
 
     match cli.command {
-        Command::Run => cmd_run(&cfg, &data_dir),
+        Command::Run => cmd_run(&cfg, &data_dir, &config_path),
         Command::Probe => cmd_probe(&cfg),
         Command::Sources => cmd_sources(&data_dir),
         Command::Allow { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, true),
@@ -67,6 +75,9 @@ fn main() -> Result<()> {
         Command::Transcript { session, speaker } => {
             cmd_transcript(&data_dir, session, speaker.as_deref())
         }
+        Command::Pause => cmd_pause(&cfg, &data_dir, true),
+        Command::Resume => cmd_pause(&cfg, &data_dir, false),
+        Command::Status => cmd_status(&cfg, &data_dir),
     }
 }
 
@@ -87,7 +98,7 @@ fn block_shutdown_signals() {
     }
 }
 
-fn cmd_run(cfg: &Config, data_dir: &Path) -> Result<()> {
+fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     block_shutdown_signals();
 
     let store = Store::open(data_dir)?;
@@ -95,8 +106,10 @@ fn cmd_run(cfg: &Config, data_dir: &Path) -> Result<()> {
     if closed > 0 {
         info!("closed {closed} session(s) left open by a previous run");
     }
-    // Config is the source of truth for rules; mirror it so `sources` and any
-    // later GUI see the same answer the capture path used.
+    // Config is the source of truth for rules at start-up; mirror it so
+    // `sources` and the GUI see the same answer the capture path used. From
+    // here on the live copy in `Control` is authoritative, and `sources.set`
+    // writes both.
     for (key, rule) in &cfg.rules {
         store.set_allowed(key, rule.allowed(), utc_now_ns())?;
     }
@@ -105,6 +118,20 @@ fn cmd_run(cfg: &Config, data_dir: &Path) -> Result<()> {
     let queue = EventQueue::for_seconds(cfg.capture.queue_seconds, SAMPLE_RATE);
     let stats = Arc::new(Stats::default());
     let analysis_stats = Arc::new(AnalysisStats::default());
+    let control = Control::new(
+        data_dir.to_path_buf(),
+        Some(config_path.to_path_buf()),
+        &cfg.allowlist(),
+    )
+    .with_pipeline(
+        Arc::clone(&queue),
+        Arc::clone(&stats),
+        Arc::clone(&analysis_stats),
+    );
+    if let Some(models) = ModelSet::resolve(&cfg.models).filter(|m| m.complete()) {
+        control.set_models(vec![models.asr_model_id(), models.embed_model_id()]);
+    }
+    let bus = Bus::new(cfg.socket.replay_events, cfg.socket.client_outbox);
     info!(
         data_dir = %data_dir.display(),
         queue_capacity_samples = queue.capacity_samples(),
@@ -117,6 +144,8 @@ fn cmd_run(cfg: &Config, data_dir: &Path) -> Result<()> {
         data_dir.to_path_buf(),
         Arc::clone(&stats),
         Arc::clone(&analysis_stats),
+        Arc::clone(&control),
+        Arc::clone(&bus),
     )?;
     let nice = cfg.runtime.inference_nice;
     let cpus = cfg.runtime.inference_cpus.clone();
@@ -129,7 +158,69 @@ fn cmd_run(cfg: &Config, data_dir: &Path) -> Result<()> {
         })
         .context("spawning the inference thread")?;
 
-    let result = capture::run(cfg, store, Arc::clone(&queue), Arc::clone(&stats));
+    // The socket, the roster and the sweeper are all optional: none of them is
+    // allowed to cost the daemon its capture, so a failure here is a warning.
+    let service = Service::new(Arc::clone(&store), Arc::clone(&control), Arc::clone(&bus));
+    let socket = if cfg.socket.enabled {
+        let path = config::socket_path(&cfg.socket, data_dir);
+        match server::serve(Arc::clone(&service), &path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!("no control socket: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let roster_stop = Arc::new(RosterStop::default());
+    let roster_thread = if cfg.roster.enabled {
+        let roster_cfg = cfg.roster.clone();
+        let store = Arc::clone(&store);
+        let bus = Arc::clone(&bus);
+        let control = Arc::clone(&control);
+        let stop = Arc::clone(&roster_stop);
+        std::thread::Builder::new()
+            .name("recalld-roster".into())
+            .spawn(move || roster::run(&roster_cfg, store, bus, control, stop))
+            .map_err(|e| warn!("no roster tailer: {e}"))
+            .ok()
+    } else {
+        None
+    };
+
+    let sweeper_stop = Arc::new(SweeperStop::default());
+    let sweeper_thread = if cfg.retention.enabled {
+        let retention_cfg = cfg.retention.clone();
+        let store = Arc::clone(&store);
+        let dir = data_dir.to_path_buf();
+        let stop = Arc::clone(&sweeper_stop);
+        std::thread::Builder::new()
+            .name("recalld-sweeper".into())
+            .spawn(move || retention::run(&retention_cfg, store, dir, stop))
+            .map_err(|e| warn!("no retention sweeper: {e}"))
+            .ok()
+    } else {
+        None
+    };
+
+    let result = capture::run(
+        cfg,
+        Arc::clone(&store),
+        Arc::clone(&queue),
+        Arc::clone(&stats),
+        Arc::clone(&control),
+    );
+
+    roster_stop.stop();
+    sweeper_stop.stop();
+    if let Some(s) = socket {
+        s.shutdown();
+    }
+    for handle in [roster_thread, sweeper_thread].into_iter().flatten() {
+        let _ = handle.join();
+    }
 
     // Let the pipeline finish whatever is still queued before we exit.
     info!(
@@ -290,7 +381,7 @@ fn cmd_speakers(data_dir: &Path) -> Result<()> {
 
 fn cmd_name(data_dir: &Path, speaker_id: i64, display_name: &str) -> Result<()> {
     let store = Store::open(data_dir)?;
-    store.rename_speaker(speaker_id, display_name)?;
+    store.rename_speaker(speaker_id, display_name, utc_now_ns())?;
     let n = store.transcript(None, Some(speaker_id))?.len();
     println!("Speaker {speaker_id} is now \"{display_name}\" ({n} segment(s), past and future).");
     Ok(())
@@ -325,8 +416,8 @@ fn cmd_search(data_dir: &Path, query: &str, limit: usize) -> Result<()> {
     for h in hits {
         println!(
             "{}  {:<20}  {}",
-            format_time(h.t_start_ns),
-            h.speaker.unwrap_or_else(|| "-".into()),
+            format_time(h.row.t_start_ns),
+            h.speaker().unwrap_or("-"),
             h.snippet
         );
     }
@@ -361,6 +452,87 @@ fn cmd_transcript(data_dir: &Path, session: Option<i64>, speaker: Option<&str>) 
         );
     }
     Ok(())
+}
+
+/// `recalld pause` / `resume` — the scripting surface from DESIGN §8. The
+/// other two are the tray dropdown and the GUI, both of which speak the same
+/// socket method.
+fn cmd_pause(cfg: &Config, data_dir: &Path, pause: bool) -> Result<()> {
+    let out = call(cfg, data_dir, if pause { "pause" } else { "resume" }, json!({}))?;
+    let paused = out["paused"].as_bool().unwrap_or(pause);
+    if out["changed"].as_bool() == Some(false) {
+        println!(
+            "Already {}.",
+            if paused { "paused" } else { "running" }
+        );
+    } else if paused {
+        println!("Paused. Capture keeps running; nothing is written until `recalld resume`.");
+    } else {
+        println!("Resumed.");
+    }
+    Ok(())
+}
+
+fn cmd_status(cfg: &Config, data_dir: &Path) -> Result<()> {
+    let s = call(cfg, data_dir, "status", json!({}))?;
+    println!("{:<18}{}", "daemon", s["daemon"].as_str().unwrap_or("?"));
+    println!("{:<18}{}", "uptime", format_duration(s["uptime_s"].as_i64().unwrap_or(0) * 1_000_000_000));
+    println!(
+        "{:<18}{}",
+        "state",
+        if s["paused"].as_bool() == Some(true) {
+            "PAUSED (no writes)"
+        } else {
+            "capturing"
+        }
+    );
+    println!(
+        "{:<18}{:.1} s queued of {:.0} s, {} buffer(s) dropped",
+        "queue",
+        s["queue"]["depth_seconds"].as_f64().unwrap_or(0.0),
+        s["queue"]["capacity_samples"].as_f64().unwrap_or(0.0) / SAMPLE_RATE as f64,
+        s["queue"]["dropped_buffers"].as_i64().unwrap_or(0),
+    );
+    let models = s["models"]["ids"]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    println!(
+        "{:<18}{}",
+        "models",
+        if models.is_empty() {
+            "none (capture and VAD only)".to_string()
+        } else {
+            models
+        }
+    );
+    println!(
+        "{:<18}{} segment(s), {} analysed, {} labelled, {} refused (overlap)",
+        "counters",
+        s["counters"]["segments_written"].as_i64().unwrap_or(0),
+        s["counters"]["analysed"].as_i64().unwrap_or(0),
+        s["counters"]["labelled"].as_i64().unwrap_or(0),
+        s["counters"]["refused_overlap"].as_i64().unwrap_or(0),
+    );
+    println!(
+        "{:<18}{} connected, seq {}",
+        "clients",
+        s["clients"].as_i64().unwrap_or(0),
+        s["seq"].as_i64().unwrap_or(0)
+    );
+    println!("{:<18}{}", "roster", s["roster_present"].as_i64().unwrap_or(0));
+    Ok(())
+}
+
+fn call(cfg: &Config, data_dir: &Path, method: &str, params: Value) -> Result<Value> {
+    let path: PathBuf = config::socket_path(&cfg.socket, data_dir);
+    let mut client = client::Client::connect(&path)?;
+    client.call(method, params)
 }
 
 /// UTC nanoseconds as `YYYY-MM-DD HH:MM:SS`, computed here rather than pulling

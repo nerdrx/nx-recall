@@ -6,12 +6,15 @@
 //! rather than of a parallel implementation.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 
 use crate::analysis::Analyzer;
+use crate::bus::Bus;
 use crate::config::{Config, SAMPLE_RATE};
-use crate::pipeline::{segment_path, write_wav};
+use crate::control::Control;
+use crate::pipeline::{publish_segment, segment_path, write_wav};
 use crate::store::Store;
 use crate::turns::TurnMerger;
 use crate::vad::{FRAME_SAMPLES, SegmentSpan, Segmenter, SegmenterConfig, SileroVad};
@@ -63,6 +66,28 @@ pub struct OfflinePipeline<'a> {
     pub cfg: &'a Config,
     /// `None` runs capture and segmentation only, as Step 1 did.
     pub analyzer: Option<&'a mut Analyzer>,
+    /// Global pause, when this ingest belongs to a running daemon. `None` is
+    /// "not a daemon" — an offline re-analysis has nothing to pause.
+    pub control: Option<Arc<Control>>,
+    /// Where stored segments are announced. `None` publishes nothing.
+    pub bus: Option<Arc<Bus>>,
+}
+
+impl<'a> OfflinePipeline<'a> {
+    /// The plain form: segment and analyse, announce nothing, pause nothing.
+    pub fn new(vad: &'a mut SileroVad, cfg: &'a Config, analyzer: Option<&'a mut Analyzer>) -> Self {
+        Self {
+            vad,
+            cfg,
+            analyzer,
+            control: None,
+            bus: None,
+        }
+    }
+
+    fn paused(&self) -> bool {
+        self.control.as_ref().is_some_and(|c| c.is_paused())
+    }
 }
 
 /// Segment `samples`, store each turn as a row plus a WAV, and analyse it.
@@ -78,6 +103,10 @@ pub fn ingest_pcm(
 ) -> Result<Vec<i64>> {
     let at = |sample: u64| t0_ns + (sample as i128 * 1_000_000_000 / SAMPLE_RATE as i128) as i64;
 
+    // Paused means no rows and no files, whichever path the audio came in on.
+    if pipe.paused() {
+        return Ok(Vec::new());
+    }
     let turns = segment_pcm(pipe.vad, pipe.cfg, samples)?;
     let mut ids = Vec::new();
     for (seq, span) in turns.into_iter().enumerate() {
@@ -101,6 +130,9 @@ pub fn ingest_pcm(
         )?;
         if let Some(a) = pipe.analyzer.as_deref_mut() {
             a.process(store, id, slice, t_start_ns)?;
+        }
+        if let Some(bus) = pipe.bus.as_ref() {
+            publish_segment(bus, store, id);
         }
         ids.push(id);
     }

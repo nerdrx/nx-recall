@@ -2,7 +2,9 @@
 //!
 //! Step 1 is capture: PipeWire per-application audio, an allowlist, Silero VAD,
 //! SQLite. Steps 2 and 3 add the analysis leg on top of the same inference
-//! thread: overlap segmentation, ASR, and speaker identity.
+//! thread: overlap segmentation, ASR, and speaker identity. Step 4 adds the
+//! control socket (`server` / `service` / `proto` / `bus`), global pause
+//! (`control`), the VRChat roster (`roster`) and retention (`retention`).
 //!
 //! The crate is a library so the acceptance suite in `tests/` can drive the
 //! real pipeline against the golden fixtures; `src/main.rs` is a thin bin.
@@ -10,17 +12,25 @@
 pub mod allowlist;
 pub mod analysis;
 pub mod asr;
+pub mod bus;
 pub mod capture;
+pub mod client;
 pub mod clock;
 pub mod config;
+pub mod control;
 pub mod embed;
 pub mod identity;
 pub mod ingest;
 pub mod models;
 pub mod overlap;
 pub mod pipeline;
+pub mod proto;
 pub mod queue;
 pub mod resample;
+pub mod retention;
+pub mod roster;
+pub mod server;
+pub mod service;
 pub mod store;
 pub mod turns;
 pub mod vad;

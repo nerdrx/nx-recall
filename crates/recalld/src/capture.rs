@@ -130,6 +130,10 @@ struct Shared {
     queue: Arc<EventQueue>,
     stats: Arc<Stats>,
     captures: HashMap<u32, Capture>,
+    /// Every playback node currently on the graph, captured or not. A live
+    /// `sources.set` has to be able to attach to a node we already decided to
+    /// skip, which means remembering the ones we skipped.
+    nodes: HashMap<u32, NodeInfo>,
     format_param: Vec<u8>,
     quantum: u32,
 }
@@ -140,6 +144,7 @@ impl Shared {
         let match_key = node.ident.match_key();
         let display_name = node.ident.display_name();
         let decision = self.allowlist.decide(&match_key);
+        self.nodes.insert(node.node_id, node.clone());
 
         // Record every source we see, allowed or not. Default-deny is only
         // usable if the user can find out what was refused.
@@ -374,7 +379,63 @@ impl Shared {
         Ok(())
     }
 
+    /// Apply a rule change from the socket: attach to anything newly allowed,
+    /// detach from anything newly denied. Runs on the PipeWire thread, from a
+    /// timer, because that loop cannot be called into from outside.
+    fn apply_rules(&mut self, core: &pw::core::CoreRc, allowlist: Allowlist) {
+        self.allowlist = allowlist;
+        let nodes: Vec<NodeInfo> = self.nodes.values().cloned().collect();
+
+        // Detach first, so a source that was re-keyed cannot briefly hold two
+        // sessions open.
+        for node in &nodes {
+            let key = node.ident.match_key();
+            if !self.allowlist.decide(&key).captures() && self.captures.contains_key(&node.node_id) {
+                info!(node = node.node_id, key = %key, "no longer allowed; stopping capture");
+                self.stop_capture(node.node_id);
+            }
+        }
+        for node in &nodes {
+            let key = node.ident.match_key();
+            if !self.allowlist.decide(&key).captures() || self.captures.contains_key(&node.node_id) {
+                continue;
+            }
+            let display_name = node.ident.display_name();
+            let source_id = {
+                let store = match self.store.lock() {
+                    Ok(s) => s,
+                    Err(p) => p.into_inner(),
+                };
+                match store.upsert_source(&key, &display_name, utc_now_ns()) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        error!("recording source {key}: {e:#}");
+                        continue;
+                    }
+                }
+            };
+            info!(node = node.node_id, key = %key, "newly allowed; starting capture");
+            if let Err(e) = self.attach(core, node, source_id, &key, &display_name) {
+                error!("attaching to {key} (node {}): {e:#}", node.node_id);
+            }
+        }
+    }
+
+    /// Drop a live capture and close its session. Dropping the `Capture`
+    /// disconnects the stream; the pipeline writes the final segment when it
+    /// sees the queued end event.
+    fn stop_capture(&mut self, node_id: u32) {
+        let Some(capture) = self.captures.remove(&node_id) else {
+            return;
+        };
+        self.queue.push(CaptureEvent::SessionEnd {
+            session_id: capture.session_id,
+            mono_ns: monotonic_ns(),
+        });
+    }
+
     fn on_node_removed(&mut self, node_id: u32) {
+        self.nodes.remove(&node_id);
         let Some(capture) = self.captures.remove(&node_id) else {
             return;
         };
@@ -513,6 +574,7 @@ pub fn run(
     store: Arc<std::sync::Mutex<Store>>,
     queue: Arc<EventQueue>,
     stats: Arc<Stats>,
+    control: Arc<crate::control::Control>,
 ) -> Result<()> {
     pw::init();
 
@@ -540,11 +602,12 @@ pub fn run(
     }
 
     let shared = Rc::new(RefCell::new(Shared {
-        allowlist: cfg.allowlist(),
+        allowlist: control.allowlist(),
         store,
         queue: Arc::clone(&queue),
         stats,
         captures: HashMap::new(),
+        nodes: HashMap::new(),
         format_param: target_format_param()?,
         quantum: cfg.capture.quantum,
     }));
@@ -556,6 +619,7 @@ pub fn run(
 
     let core_for_cb = core.clone();
     let shared_reg = Rc::clone(&shared);
+    let shared_timer = Rc::clone(&shared);
     let proxies_reg = Rc::clone(&proxies);
     let registry_weak = registry.downgrade();
     let _reg_listener = registry
@@ -624,8 +688,30 @@ pub fn run(
         })
         .register();
 
+    // `sources.set` arrives on a socket thread, which must not touch this
+    // loop's objects. It bumps a generation counter instead and this timer
+    // notices — a quarter of a second between the click and the microphone,
+    // with no cross-thread access to a PipeWire proxy anywhere.
+    let control_timer = Arc::clone(&control);
+    let core_timer = core.clone();
+    let applied_generation = std::cell::Cell::new(control.rules_generation());
+    let timer = main_loop.loop_().add_timer(move |_| {
+        let generation = control_timer.rules_generation();
+        if generation == applied_generation.get() {
+            return;
+        }
+        applied_generation.set(generation);
+        shared_timer
+            .borrow_mut()
+            .apply_rules(&core_timer, control_timer.allowlist());
+    });
+    let tick = std::time::Duration::from_millis(250);
+    if let Err(e) = timer.update_timer(Some(tick), Some(tick)).into_result() {
+        warn!("could not arm the rule-change timer ({e:?}); source toggles will need a restart");
+    }
+
     info!(
-        rules = cfg.allowlist().len(),
+        rules = control.allowlist().len(),
         queue_seconds = cfg.capture.queue_seconds,
         "watching for application audio streams"
     );

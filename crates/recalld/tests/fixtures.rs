@@ -127,11 +127,7 @@ impl Rig {
         let t0 = self.clock_ns;
         // Space fixtures a minute apart so nothing merges across files.
         self.clock_ns += 60_000_000_000;
-        let mut pipe = OfflinePipeline {
-            vad: &mut self.vad,
-            cfg: &self.cfg,
-            analyzer: Some(&mut self.analyzer),
-        };
+        let mut pipe = OfflinePipeline::new(&mut self.vad, &self.cfg, Some(&mut self.analyzer));
         ingest_pcm(
             &self.store,
             &self.dir,
@@ -419,11 +415,9 @@ fn transcripts_are_searchable_and_naming_reaches_back() {
     assert_eq!(hits.len(), 1, "the transcript was not indexed");
     assert!(hits[0].snippet.to_lowercase().contains("violin"));
 
-    rig.store.rename_speaker(speaker, "Ines").unwrap();
+    rig.store.rename_speaker(speaker, "Ines", 1).unwrap();
     assert_eq!(
-        rig.store.search("violin", 10).unwrap()[0]
-            .speaker
-            .as_deref(),
+        rig.store.search("violin", 10).unwrap()[0].speaker(),
         Some("Ines"),
         "naming must be retroactive"
     );

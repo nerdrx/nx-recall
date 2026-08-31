@@ -22,12 +22,11 @@ hound.workspace = true
 libc.workspace = true
 ort.workspace = true
 pipewire.workspace = true
+regex.workspace = true
 rusqlite.workspace = true
 sherpa-rs.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
