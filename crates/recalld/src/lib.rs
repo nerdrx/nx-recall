@@ -32,6 +32,7 @@ pub mod retention;
 pub mod roster;
 pub mod server;
 pub mod service;
+pub mod split;
 pub mod store;
 pub mod turns;
 pub mod vad;

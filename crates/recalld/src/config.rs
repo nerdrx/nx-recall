@@ -132,6 +132,19 @@ pub struct IdentityConfig {
     pub max_overlap: f32,
     pub min_duration_s: f32,
     pub max_prototypes: usize,
+    /// `speakers.split`: refuse the split when the two candidate centroids are
+    /// at least this similar. Two centroids that close are one voice being cut
+    /// in half, and a false split is as damaging as the false merge it was
+    /// meant to undo.
+    pub split_max_centroid_similarity: f32,
+    /// `speakers.split`: a segment whose similarities to the two centroids
+    /// differ by less than this is *undecidable*. It keeps the existing speaker
+    /// and is recorded at the weaker of the two scores, because guessing here
+    /// is exactly how a false merge was created in the first place.
+    pub split_ambiguous_margin: f32,
+    /// `speakers.split`: seeded restarts of the 2-means search. The seed is
+    /// fixed, so the same voicebank always splits the same way.
+    pub split_restarts: usize,
 }
 
 impl Default for IdentityConfig {
@@ -145,6 +158,9 @@ impl Default for IdentityConfig {
             max_overlap: 0.1,
             min_duration_s: 1.0,
             max_prototypes: 20,
+            split_max_centroid_similarity: 0.6,
+            split_ambiguous_margin: 0.05,
+            split_restarts: 8,
         }
     }
 }
@@ -427,6 +443,11 @@ mod tests {
         assert_eq!(cfg.identity.max_overlap, 0.1);
         assert_eq!(cfg.identity.min_duration_s, 1.0);
         assert_eq!(cfg.identity.max_prototypes, 20);
+        // Undoing a false merge must not be able to invent a second person:
+        // two centroids this close are one voice.
+        assert_eq!(cfg.identity.split_max_centroid_similarity, 0.6);
+        assert_eq!(cfg.identity.split_ambiguous_margin, 0.05);
+        assert_eq!(cfg.identity.split_restarts, 8);
         assert_eq!(cfg.vad.turn_merge_gap_ms, 1_500);
     }
 

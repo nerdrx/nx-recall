@@ -91,6 +91,41 @@ pub struct MergeReport {
     pub tombstones_repointed: usize,
 }
 
+/// The rows one accepted split hands to the new speaker, plus the ones that
+/// stay behind with a reduced score. Produced by `split::plan`, applied by
+/// `Store::split_speaker`, so the decision and the write stay separable.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SplitWrite {
+    /// Prototype ids that move to the minted speaker.
+    pub prototypes: Vec<i64>,
+    /// Segments that move, with the score to record for them.
+    pub segments: Vec<(i64, f32)>,
+    /// Segments that keep the existing speaker but are no longer trusted:
+    /// only their `match_score` changes.
+    pub ambiguous: Vec<(i64, f32)>,
+}
+
+/// What one segment was labelled with before an operation touched it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SegmentLabel {
+    pub segment_id: i64,
+    pub speaker_id: Option<i64>,
+    pub match_score: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SplitReport {
+    /// The speaker that kept its id, and therefore its name and its history.
+    pub kept: i64,
+    pub minted: i64,
+    /// The generated label of the minted voice — the onboarding flow's
+    /// "who is this?" handle (DESIGN §5).
+    pub auto_label: String,
+    pub prototypes: usize,
+    pub segments: usize,
+    pub ambiguous: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub row: SegmentRow,
@@ -812,6 +847,208 @@ impl Store {
             prototypes,
             golden_samples,
             tombstones_repointed,
+        })
+    }
+
+    // ---- split -----------------------------------------------------------
+
+    /// Which embedding space this speaker mostly lives in.
+    ///
+    /// A voice can carry vectors from more than one model across a migration,
+    /// and comparing them is forbidden (DESIGN §5), so a split works in one
+    /// space: the one holding the most evidence. Ties break on the model id, so
+    /// the answer never depends on row order.
+    pub fn speaker_embed_model(&self, speaker_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT embed_model_id, COUNT(*) AS n FROM (
+                     SELECT p.embed_model_id
+                     FROM speaker_prototypes p
+                     WHERE p.speaker_id = ?1
+                     UNION ALL
+                     SELECT e.embed_model_id
+                     FROM embeddings e
+                     JOIN segments g ON g.id = e.segment_id
+                     LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
+                     WHERE sp.canonical_id = ?1 AND g.deleted_at IS NULL
+                 )
+                 GROUP BY embed_model_id
+                 ORDER BY n DESC, embed_model_id ASC
+                 LIMIT 1",
+                params![speaker_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    /// Everything this speaker's identity rests on, in one embedding space:
+    /// its prototypes, and the embeddings of the segments assigned to it.
+    ///
+    /// A prototype that still remembers its `source_segment_id` is returned as
+    /// **one** vector carrying both ids — the pairing DESIGN §5 says makes a
+    /// split possible at all. Without it the same audio would vote twice and
+    /// then be moved half-way.
+    pub fn speaker_vectors(
+        &self,
+        speaker_id: i64,
+        embed_model_id: &str,
+    ) -> Result<Vec<crate::split::Vector>> {
+        let mut out: Vec<crate::split::Vector> = Vec::new();
+        let mut from_prototypes: HashMap<i64, usize> = HashMap::new();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, vector, is_golden, source_segment_id
+             FROM speaker_prototypes
+             WHERE speaker_id = ?1 AND embed_model_id = ?2
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![speaker_id, embed_model_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)? != 0,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, blob, is_golden, source_segment_id) in rows {
+            if let Some(seg) = source_segment_id {
+                from_prototypes.insert(seg, out.len());
+            }
+            out.push(crate::split::Vector {
+                prototype_id: Some(id),
+                is_golden,
+                segment_id: source_segment_id,
+                embedding: Embedding::from_blob(embed_model_id, &blob)?,
+            });
+        }
+
+        // The newest embedding per segment, matching what `segment_embedding`
+        // reads, so the clusterer and the matcher never disagree about which
+        // vector a segment *is*.
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, e.vector
+             FROM segments g
+             LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             JOIN embeddings e ON e.id = (
+                 SELECT MAX(x.id) FROM embeddings x
+                 WHERE x.segment_id = g.id AND x.embed_model_id = ?2
+             )
+             WHERE sp.canonical_id = ?1 AND g.deleted_at IS NULL
+             ORDER BY g.id",
+        )?;
+        let rows = stmt
+            .query_map(params![speaker_id, embed_model_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (segment_id, blob) in rows {
+            // Already present as the prototype it seeded: one piece of
+            // evidence, not two.
+            if from_prototypes.contains_key(&segment_id) {
+                continue;
+            }
+            out.push(crate::split::Vector {
+                prototype_id: None,
+                is_golden: false,
+                segment_id: Some(segment_id),
+                embedding: Embedding::from_blob(embed_model_id, &blob)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The speaker and score each of these segments carries right now — what an
+    /// undo of a split has to put back.
+    pub fn segment_labels(&self, ids: &[i64]) -> Result<Vec<SegmentLabel>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, speaker_id, match_score FROM segments WHERE id = ?1")?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(row) = stmt
+                .query_row(params![id], |r| {
+                    Ok(SegmentLabel {
+                        segment_id: r.get(0)?,
+                        speaker_id: r.get(1)?,
+                        match_score: r.get::<_, Option<f64>>(2)?.map(|v| v as f32),
+                    })
+                })
+                .optional()?
+            {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Apply an accepted split: mint a voice for the second cluster and move
+    /// its rows onto it, in one transaction.
+    ///
+    /// The existing id is the one that survives, so every name, link and
+    /// tombstone pointing at this speaker keeps meaning what it meant. Only the
+    /// rows named in `write` are touched: the confident majority keeps the
+    /// scores it already had rather than being restamped by a different
+    /// algorithm.
+    pub fn split_speaker(
+        &self,
+        from: i64,
+        write: &SplitWrite,
+        at_utc_ns: i64,
+    ) -> Result<SplitReport> {
+        if self.resolve_speaker(from)? != from {
+            bail!("speaker {from} is a tombstone; split the speaker it was merged into");
+        }
+        if write.prototypes.is_empty() && write.segments.is_empty() {
+            bail!("a split that moves nothing is not a split");
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let minted = self.mint_speaker(at_utc_ns)?;
+        let mut prototypes = 0usize;
+        let mut segments = 0usize;
+        let mut ambiguous = 0usize;
+        {
+            let mut move_prototype = tx.prepare(
+                "UPDATE speaker_prototypes SET speaker_id = ?2
+                 WHERE id = ?1 AND speaker_id = ?3",
+            )?;
+            for id in &write.prototypes {
+                prototypes += move_prototype.execute(params![id, minted, from])?;
+            }
+            let mut move_segment = tx.prepare(
+                "UPDATE segments SET speaker_id = ?2, match_score = ?3
+                 WHERE id = ?1 AND speaker_id = ?4",
+            )?;
+            for (id, score) in &write.segments {
+                segments += move_segment.execute(params![id, minted, *score as f64, from])?;
+            }
+            // The undecidable ones keep their speaker and lose their
+            // confidence: the correction UI reads `match_score` to know which
+            // labels to distrust (DESIGN §6).
+            let mut soften = tx.prepare(
+                "UPDATE segments SET match_score = ?2 WHERE id = ?1 AND speaker_id = ?3",
+            )?;
+            for (id, score) in &write.ambiguous {
+                ambiguous += soften.execute(params![id, *score as f64, from])?;
+            }
+        }
+        tx.commit()?;
+
+        let auto_label: String = self.conn.query_row(
+            "SELECT COALESCE(auto_label, display_name) FROM speakers WHERE id = ?1",
+            params![minted],
+            |r| r.get(0),
+        )?;
+        Ok(SplitReport {
+            kept: from,
+            minted,
+            auto_label,
+            prototypes,
+            segments,
+            ambiguous,
         })
     }
 
@@ -1939,6 +2176,150 @@ mod tests {
             Some("Wren")
         );
         assert_eq!(s.transcript(None, Some(b)).unwrap().len(), 1);
+    }
+
+    // ---- split -----------------------------------------------------------
+
+    /// One turn as the pipeline writes it: a segment, its embedding, and the
+    /// prototype that remembers which segment it came from.
+    fn a_voiced_segment(s: &Store, session: i64, speaker: i64, v: &[f32], golden: bool) -> i64 {
+        let t = 1_000 * (s.segments_total().unwrap() + 1);
+        let seg = s.insert_segment(session, t, t + 500, "segments/v.wav", 0).unwrap();
+        let e = emb("m@1", v);
+        s.store_embedding(seg, &e).unwrap();
+        s.set_segment_speaker(seg, Some(speaker), Some(0.8)).unwrap();
+        s.add_prototype(speaker, &e, Some(seg), golden, 20, 0).unwrap();
+        seg
+    }
+
+    #[test]
+    fn a_prototype_and_the_segment_it_came_from_are_one_vector() {
+        let s = store();
+        let src = s.upsert_source("x", "x", 0).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let spk = s.mint_speaker(0).unwrap();
+        let seg = a_voiced_segment(&s, sess, spk, &[1.0, 0.0], false);
+
+        let vectors = s.speaker_vectors(spk, "m@1").unwrap();
+        assert_eq!(vectors.len(), 1, "the same audio must not vote twice");
+        assert_eq!(vectors[0].segment_id, Some(seg));
+        assert!(vectors[0].prototype_id.is_some());
+        assert!(!vectors[0].is_golden);
+
+        // A labelled segment the bank never enrolled is still evidence.
+        let lone = s.insert_segment(sess, 9_000, 9_500, "segments/l.wav", 0).unwrap();
+        s.store_embedding(lone, &emb("m@1", &[0.0, 1.0])).unwrap();
+        s.set_segment_speaker(lone, Some(spk), Some(0.4)).unwrap();
+        let vectors = s.speaker_vectors(spk, "m@1").unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[1].prototype_id, None);
+        assert_eq!(vectors[1].segment_id, Some(lone));
+    }
+
+    #[test]
+    fn a_split_only_ever_looks_at_one_embedding_space() {
+        let s = store();
+        let src = s.upsert_source("x", "x", 0).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let spk = s.mint_speaker(0).unwrap();
+        a_voiced_segment(&s, sess, spk, &[1.0, 0.0], false);
+        a_voiced_segment(&s, sess, spk, &[0.0, 1.0], false);
+        // One stray vector from a different extractor: it must not be able to
+        // reach a cosine against the others.
+        s.add_prototype(spk, &emb("other@1", &[1.0, 0.0]), None, false, 20, 0)
+            .unwrap();
+
+        assert_eq!(s.speaker_embed_model(spk).unwrap().as_deref(), Some("m@1"));
+        let vectors = s.speaker_vectors(spk, "m@1").unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert!(vectors.iter().all(|v| v.embedding.model_id == "m@1"));
+        assert!(s.speaker_embed_model(4242).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_split_moves_exactly_what_it_is_told_and_leaves_the_rest_alone() {
+        let s = store();
+        let src = s.upsert_source("x", "x", 0).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let spk = s.create_speaker("Wren", 0).unwrap();
+        let mine = a_voiced_segment(&s, sess, spk, &[1.0, 0.0], false);
+        let theirs = a_voiced_segment(&s, sess, spk, &[0.0, 1.0], false);
+        let fence = a_voiced_segment(&s, sess, spk, &[1.0, 1.0], false);
+        let moving = s.speaker_vectors(spk, "m@1").unwrap()[1]
+            .prototype_id
+            .unwrap();
+
+        let report = s
+            .split_speaker(
+                spk,
+                &SplitWrite {
+                    prototypes: vec![moving],
+                    segments: vec![(theirs, 0.94)],
+                    ambiguous: vec![(fence, 0.51)],
+                },
+                77,
+            )
+            .unwrap();
+        assert_eq!(report.kept, spk);
+        assert_ne!(report.minted, spk);
+        assert_eq!(report.prototypes, 1);
+        assert_eq!(report.segments, 1);
+        assert_eq!(report.ambiguous, 1);
+        assert!(report.auto_label.starts_with("Speaker_"));
+
+        // The existing id keeps its name, its history and its rows.
+        assert_eq!(s.speaker_name(spk).unwrap().as_deref(), Some("Wren"));
+        assert_eq!(s.segment_state(mine).unwrap().0, Some(spk));
+        assert_eq!(s.segment_state(theirs).unwrap().0, Some(report.minted));
+        assert_eq!(s.prototype_count(spk).unwrap(), 2);
+        assert_eq!(s.prototype_count(report.minted).unwrap(), 1);
+
+        // The undecidable row stayed put but is no longer trusted; the
+        // confident majority was not restamped at all.
+        let score = |seg: i64| -> f32 {
+            s.segment_fields(seg).unwrap()["match_score"]
+                .as_ref()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        assert!((score(fence) - 0.51).abs() < 1e-5);
+        assert_eq!(s.segment_state(fence).unwrap().0, Some(spk));
+        assert!((score(mine) - 0.8).abs() < 1e-5, "an untouched row is untouched");
+        assert!((score(theirs) - 0.94).abs() < 1e-5);
+
+        // Both voices are live, and the audit trail can name what moved.
+        assert_eq!(s.list_speakers().unwrap().len(), 2);
+        let labels = s.segment_labels(&[mine, theirs, 4242]).unwrap();
+        assert_eq!(labels.len(), 2, "a segment that is gone is simply absent");
+        assert_eq!(labels[1].segment_id, theirs);
+        assert_eq!(labels[1].speaker_id, Some(report.minted));
+    }
+
+    #[test]
+    fn a_tombstone_cannot_be_split_and_neither_can_nothing() {
+        let s = store();
+        let a = s.create_speaker("A", 0).unwrap();
+        let b = s.create_speaker("B", 0).unwrap();
+        s.add_prototype(a, &emb("m@1", &[1.0, 0.0]), None, false, 20, 0)
+            .unwrap();
+        s.merge_speakers(a, b).unwrap();
+        // Splitting the tombstone would quietly cut up B instead.
+        assert!(
+            s.split_speaker(
+                a,
+                &SplitWrite {
+                    prototypes: vec![1],
+                    ..Default::default()
+                },
+                0
+            )
+            .is_err()
+        );
+        // Splitting the merge target is the whole point, but it still has to
+        // move something.
+        assert!(s.split_speaker(b, &SplitWrite::default(), 0).is_err());
+        assert_eq!(s.list_speakers().unwrap().len(), 1, "no voice was minted");
     }
 
     // ---- reading ---------------------------------------------------------

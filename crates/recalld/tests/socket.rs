@@ -98,7 +98,10 @@ impl Daemon {
         let session = store.begin_session(source, 0).unwrap();
         let store = Arc::new(Mutex::new(store));
 
-        let control = Control::new(dir.clone(), None, &Allowlist::from_rules([("fixtures", true)]));
+        let control = Control::new(dir.clone(), None, &Allowlist::from_rules([("fixtures", true)]))
+            // `speakers.split` re-clusters a voicebank, so the socket needs the
+            // same operating point the pipeline labelled with.
+            .with_identity(cfg.identity.clone());
         let bus = Bus::new(cfg.socket.replay_events, cfg.socket.client_outbox);
         let service = Service::new(Arc::clone(&store), Arc::clone(&control), Arc::clone(&bus));
         let socket = dir.join("nx-recall.sock");
@@ -403,6 +406,160 @@ fn a_rename_is_broadcast_to_every_connected_client_with_one_seq() {
         .expect("the renamed voice is listed");
     assert_eq!(row["name"], "Kira");
     assert!(row["auto"].as_str().unwrap().starts_with("Speaker_"));
+}
+
+/// The recovery path for the failure this whole design fears: two people on one
+/// id (DESIGN §8, FINDINGS §5). Merge two different voices on purpose, then
+/// split them and check they land apart again.
+///
+/// Needs the real models — a false merge cannot be forced without real
+/// embeddings — so without `NXR_MODELS` it reports itself skipped and passes.
+#[test]
+fn a_false_merge_is_undone_by_a_split_and_every_client_hears_about_it() {
+    let mut d = Daemon::start("split");
+    if d.analyzer.is_none() {
+        eprintln!("skipping the split round trip: set NXR_MODELS=<dir> to run it");
+        return;
+    }
+    let mut c = d.connect();
+    c.hello();
+    c.subscribe(&["relabel", "segments", "ops"]);
+
+    let ines = d.ingest("clean_single_0.wav");
+    let wren = d.ingest("clean_single_1.wav");
+    let speaker_of = |c: &mut Conn| -> std::collections::HashMap<i64, i64> {
+        c.call("transcript", json!({}))["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| !s["speaker"].is_null())
+            .map(|s| (s["id"].as_i64().unwrap(), s["speaker"].as_i64().unwrap()))
+            .collect()
+    };
+    /// The id most of a fixture's segments were given.
+    fn dominant(labels: &std::collections::HashMap<i64, i64>, ids: &[i64]) -> i64 {
+        let mut counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        for id in ids {
+            if let Some(spk) = labels.get(id) {
+                *counts.entry(*spk).or_default() += 1;
+            }
+        }
+        let mut best: Vec<(i64, usize)> = counts.into_iter().collect();
+        best.sort_by_key(|(id, n)| (std::cmp::Reverse(*n), *id));
+        best.first().map(|(id, _)| *id).expect("the fixture was labelled")
+    }
+
+    let before = speaker_of(&mut c);
+    let a = dominant(&before, &ines);
+    let b = dominant(&before, &wren);
+    assert_ne!(a, b, "two different voices must start on two ids");
+
+    // The poison: one id now holds two people.
+    c.call("speakers.merge", json!({"from": b, "into": a}));
+    let merged = speaker_of(&mut c);
+    assert_eq!(dominant(&merged, &ines), a);
+    assert_eq!(dominant(&merged, &wren), a, "the merge really did collapse them");
+    c.drain();
+
+    let out = c.call("speakers.split", json!({"id": a}));
+    assert_eq!(out["kept"], a);
+    let minted = out["minted"].as_i64().unwrap();
+    assert_ne!(minted, a);
+    assert!(out["moved_segments"].as_u64().unwrap() >= 1);
+    assert!(
+        out["centroid_similarity"].as_f64().unwrap() < 0.6,
+        "two real speakers must clear the refusal threshold: {out}"
+    );
+
+    // Apart again, and the id with the history is the one that survived.
+    let after = speaker_of(&mut c);
+    let split_a = dominant(&after, &ines);
+    let split_b = dominant(&after, &wren);
+    assert_ne!(split_a, split_b, "the split did not separate the two voices");
+    assert!(
+        [split_a, split_b].contains(&a) && [split_a, split_b].contains(&minted),
+        "the two halves are the kept id and the minted one, got {split_a} and {split_b}"
+    );
+    assert_eq!(
+        c.call("speakers.list", json!({}))["speakers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "two people, two voices"
+    );
+
+    // And no client has to poll to find out: both ids are announced, the new
+    // one saying which voice it came out of.
+    let evs = c.drain();
+    let relabels: Vec<&Value> = evs.iter().filter(|e| e["ev"] == "relabel").collect();
+    assert!(
+        relabels.iter().any(|e| e["data"]["speaker"] == a),
+        "the voice that was cut is announced: {evs:?}"
+    );
+    let fresh = relabels
+        .iter()
+        .find(|e| e["data"]["speaker"] == minted)
+        .expect("the minted voice is announced");
+    assert_eq!(fresh["data"]["split_from"], a);
+    assert_eq!(fresh["data"]["name"], Value::Null);
+    assert!(
+        evs.iter()
+            .any(|e| e["ev"] == "segment" && e["data"]["speaker"] == minted),
+        "every moved row arrives on the same event a new row would"
+    );
+    let done = evs
+        .iter()
+        .find(|e| e["ev"] == "op.done")
+        .expect("PROTOCOL calls a split an operation, so it gets a terminal event");
+    assert_eq!(done["data"]["kind"], "speakers.split");
+    assert_eq!(done["data"]["op"], out["op"]);
+
+    // The audit trail knows where every moved segment came from.
+    let ops = c.call("operations.list", json!({}))["operations"][0].clone();
+    assert_eq!(ops["op"], "speakers.split");
+    assert!(
+        ops["prior_state"]["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["speaker_id"] == a),
+        "every moved segment was on the merged id before the split"
+    );
+}
+
+#[test]
+fn splitting_a_voice_that_is_one_person_is_refused_over_the_wire() {
+    let mut d = Daemon::start("split-refuse");
+    if d.analyzer.is_none() {
+        eprintln!("skipping the split refusal: set NXR_MODELS=<dir> to run it");
+        return;
+    }
+    let mut c = d.connect();
+    c.hello();
+    c.subscribe(&["relabel", "segments"]);
+    // The same person twice: there is no second voice to find.
+    d.ingest("clean_single_0.wav");
+    d.ingest("clean_single_0.wav");
+    let speakers = c.call("speakers.list", json!({}))["speakers"].clone();
+    assert_eq!(speakers.as_array().unwrap().len(), 1);
+    let id = speakers[0]["id"].as_i64().unwrap();
+    c.drain();
+
+    let err = c.call_err("speakers.split", json!({"id": id}));
+    assert_eq!(err["code"], "refused");
+    // Nothing was invented and nothing was announced.
+    assert_eq!(
+        c.call("speakers.list", json!({}))["speakers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        !c.drain().iter().any(|e| e["ev"] == "relabel"),
+        "a refused split must not broadcast a thing"
+    );
 }
 
 // ---- 3. replay ----------------------------------------------------------

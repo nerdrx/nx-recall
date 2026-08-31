@@ -86,6 +86,7 @@ fn main() -> Result<()> {
             display_name,
         } => cmd_name(&data_dir, speaker_id, &display_name),
         Command::Merge { from, into } => cmd_merge(&data_dir, from, into),
+        Command::Split { speaker_id } => cmd_split(&cfg, &data_dir, speaker_id),
         Command::Search { query, limit } => cmd_search(&data_dir, &query.join(" "), limit),
         Command::Transcript { session, speaker } => {
             cmd_transcript(&data_dir, session, speaker.as_deref())
@@ -142,7 +143,10 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         Arc::clone(&queue),
         Arc::clone(&stats),
         Arc::clone(&analysis_stats),
-    );
+    )
+    // The socket's own identity work (`speakers.split`) must use the same
+    // operating point the pipeline labelled with, not the defaults.
+    .with_identity(cfg.identity.clone());
     if let Some(models) = ModelSet::resolve(&cfg.models).filter(|m| m.complete()) {
         control.set_models(vec![models.asr_model_id(), models.embed_model_id()]);
     }
@@ -488,6 +492,40 @@ fn cmd_merge(data_dir: &Path, from: i64, into: i64) -> Result<()> {
             r.tombstones_repointed, r.into
         );
     }
+    Ok(())
+}
+
+/// `recalld split <id>` goes over the socket rather than straight at the
+/// database: a split moves rows between identities, and every connected view
+/// has to be told, which only the running daemon can do.
+fn cmd_split(cfg: &Config, data_dir: &Path, speaker_id: i64) -> Result<()> {
+    let out = call(cfg, data_dir, "speakers.split", json!({"id": speaker_id}))?;
+    let kept = out["kept"].as_i64().unwrap_or(speaker_id);
+    let minted = out["minted"].as_i64().unwrap_or(0);
+    println!(
+        "Split speaker {kept}: minted {minted} ({}) for the second voice.",
+        out["auto"].as_str().unwrap_or("?")
+    );
+    println!(
+        "  {:>4} segment(s) moved to {minted}",
+        out["moved_segments"].as_i64().unwrap_or(0)
+    );
+    println!(
+        "  {:>4} prototype(s) moved",
+        out["moved_prototypes"].as_i64().unwrap_or(0)
+    );
+    let ambiguous = out["ambiguous"].as_i64().unwrap_or(0);
+    if ambiguous > 0 {
+        println!(
+            "  {ambiguous:>4} segment(s) sat between the two voices; they kept speaker \
+             {kept} at a reduced score"
+        );
+    }
+    println!(
+        "  the two voices score {:.3} against each other",
+        out["centroid_similarity"].as_f64().unwrap_or(0.0)
+    );
+    println!("`recalld name {minted} <who>` once you know who it is.");
     Ok(())
 }
 
