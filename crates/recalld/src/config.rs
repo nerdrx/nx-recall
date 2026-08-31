@@ -57,6 +57,10 @@ pub struct VadConfig {
     pub min_silence_ms: u32,
     pub pad_ms: u32,
     pub max_segment_ms: u32,
+    /// Adjacent VAD segments closer together than this are stored as one turn.
+    /// Step 0 measured +70% mean segment length and −42% spurious identities
+    /// from merging at 1.5 s, so a "segment" downstream is really a turn.
+    pub turn_merge_gap_ms: u32,
 }
 
 impl Default for VadConfig {
@@ -67,6 +71,80 @@ impl Default for VadConfig {
             min_silence_ms: 500,
             pad_ms: 200,
             max_segment_ms: 30_000,
+            turn_merge_gap_ms: 1_500,
+        }
+    }
+}
+
+/// Paths to the analysis models. Every other entry is resolved against `dir`;
+/// omitting `dir` turns the analysis leg off entirely and the daemon behaves
+/// exactly as it did in Step 1. Nothing here is ever downloaded.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelsConfig {
+    pub dir: Option<PathBuf>,
+    /// Transducer export directory (the 0.6b variant drops in here later).
+    pub asr: String,
+    pub asr_encoder: String,
+    pub asr_decoder: String,
+    pub asr_joiner: String,
+    pub asr_tokens: String,
+    pub embedding: String,
+    pub segmentation: String,
+    /// ASR is the only stage where throughput is worth threads; Step 0 measured
+    /// RTF 0.011 at four, which is still under 1% of a core.
+    pub asr_threads: i32,
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            asr: "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8".into(),
+            asr_encoder: "encoder.int8.onnx".into(),
+            asr_decoder: "decoder.int8.onnx".into(),
+            asr_joiner: "joiner.int8.onnx".into(),
+            asr_tokens: "tokens.txt".into(),
+            embedding: "eres2net_en.onnx".into(),
+            segmentation: "sherpa-onnx-pyannote-segmentation-3-0/model.onnx".into(),
+            asr_threads: 4,
+        }
+    }
+}
+
+/// Speaker-identity operating point.
+///
+/// The two thresholds are deliberately separate numbers with separate
+/// justifications: `label_threshold` is field-calibrated on real lobby audio
+/// (the corpus-calibrated 0.45 over-splits real speech roughly 3x), while
+/// enrolment is gated far higher *and* on an independent single-speaker signal,
+/// because a confident cosine score is provably no defence against equal-loudness
+/// overlap.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IdentityConfig {
+    pub label_threshold: f32,
+    pub enroll_threshold: f32,
+    pub enroll_margin: f32,
+    pub enroll_max_overlap: f32,
+    pub enroll_min_duration_s: f32,
+    /// Segments above this overlap fraction get no speaker at all.
+    pub max_overlap: f32,
+    pub min_duration_s: f32,
+    pub max_prototypes: usize,
+}
+
+impl Default for IdentityConfig {
+    fn default() -> Self {
+        Self {
+            label_threshold: 0.35,
+            enroll_threshold: 0.55,
+            enroll_margin: 0.06,
+            enroll_max_overlap: 0.05,
+            enroll_min_duration_s: 3.0,
+            max_overlap: 0.1,
+            min_duration_s: 1.0,
+            max_prototypes: 20,
         }
     }
 }
@@ -97,6 +175,8 @@ pub struct Config {
     pub capture: CaptureConfig,
     pub vad: VadConfig,
     pub runtime: RuntimeConfig,
+    pub models: ModelsConfig,
+    pub identity: IdentityConfig,
     /// Keyed on the match key (see `allowlist::SourceIdent::match_key`).
     pub rules: BTreeMap<String, Rule>,
 }
@@ -142,6 +222,10 @@ impl Config {
              #\n\
              # `recalld sources` lists everything seen so far; `recalld allow <key>`\n\
              # and `recalld deny <key>` edit this file. Restart the daemon to apply.\n\
+             #\n\
+             # Transcription and speaker identity stay off until `[models].dir`\n\
+             # points at a directory holding the ONNX models; `recalld models\n\
+             # status` reports what is present.\n\
              \n{body}"
         );
         let tmp = path.with_extension("toml.tmp");
@@ -222,6 +306,49 @@ mod tests {
         assert_eq!(back.vad.threshold, 0.42);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_identity_operating_point_has_the_measured_defaults() {
+        let cfg = Config::default();
+        // Field-calibrated, not corpus-calibrated: 0.45 over-splits real speech
+        // roughly threefold.
+        assert_eq!(cfg.identity.label_threshold, 0.35);
+        // Enrolling is a separate, stricter decision.
+        assert_eq!(cfg.identity.enroll_threshold, 0.55);
+        assert_eq!(cfg.identity.enroll_margin, 0.06);
+        assert_eq!(cfg.identity.enroll_max_overlap, 0.05);
+        assert_eq!(cfg.identity.enroll_min_duration_s, 3.0);
+        assert_eq!(cfg.identity.max_overlap, 0.1);
+        assert_eq!(cfg.identity.min_duration_s, 1.0);
+        assert_eq!(cfg.identity.max_prototypes, 20);
+        assert_eq!(cfg.vad.turn_merge_gap_ms, 1_500);
+    }
+
+    #[test]
+    fn models_default_to_off_and_to_the_measured_default_asr() {
+        let cfg = Config::default();
+        assert!(cfg.models.dir.is_none());
+        assert!(cfg.models.asr.contains("parakeet_tdt_transducer_110m"));
+        assert_eq!(cfg.models.embedding, "eres2net_en.onnx");
+    }
+
+    #[test]
+    fn the_new_sections_parse_and_keep_the_remaining_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [models]
+            dir = "/srv/models"
+
+            [identity]
+            label_threshold = 0.30
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.models.dir.unwrap().to_str().unwrap(), "/srv/models");
+        assert_eq!(cfg.identity.label_threshold, 0.30);
+        assert_eq!(cfg.identity.enroll_threshold, 0.55);
+        assert_eq!(cfg.models.asr_threads, 4);
     }
 
     #[test]

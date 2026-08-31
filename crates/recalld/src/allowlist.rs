@@ -152,6 +152,12 @@ impl Allowlist {
     pub fn len(&self) -> usize {
         self.rules.len()
     }
+
+    /// No rules at all — the default-deny starting state, where every source
+    /// is `Unknown`.
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
 }
 
 #[cfg(test)]

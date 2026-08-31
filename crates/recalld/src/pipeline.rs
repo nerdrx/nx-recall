@@ -13,10 +13,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 
+use crate::analysis::{AnalysisStats, Analyzer, analyse_or_log};
 use crate::clock::{Anchor, samples_to_ns, utc_now_ns};
 use crate::config::{Config, SAMPLE_RATE};
+use crate::models::ModelSet;
 use crate::queue::{AudioChunk, CaptureEvent, EventQueue};
 use crate::store::Store;
+use crate::turns::TurnMerger;
 use crate::vad::{FRAME_SAMPLES, SegmenterConfig, SileroVad, VadState};
 
 /// Apply the project's "never steal a VR frame" rule to the calling thread.
@@ -69,6 +72,9 @@ pub fn deprioritise_current_thread(nice: i32, cpus: &[usize]) {
 struct SessionPipeline {
     vad_state: VadState,
     segmenter: crate::vad::Segmenter,
+    /// Joins VAD segments separated by a short silence, so what reaches storage
+    /// and the analysis leg is a turn rather than a breath-sized fragment.
+    turns: TurnMerger,
     /// Rolling audio buffer; `ring[0]` is absolute sample `ring_base`.
     ring: Vec<f32>,
     ring_base: u64,
@@ -81,10 +87,16 @@ struct SessionPipeline {
 }
 
 impl SessionPipeline {
-    fn new(vad_state: VadState, seg_cfg: SegmenterConfig, first_chunk_mono_ns: u64) -> Self {
+    fn new(
+        vad_state: VadState,
+        seg_cfg: SegmenterConfig,
+        turns: TurnMerger,
+        first_chunk_mono_ns: u64,
+    ) -> Self {
         Self {
             vad_state,
             segmenter: crate::vad::Segmenter::new(seg_cfg),
+            turns,
             ring: Vec::new(),
             ring_base: 0,
             received: 0,
@@ -133,7 +145,12 @@ impl SessionPipeline {
     }
 
     fn trim(&mut self) {
-        let keep_from = self.segmenter.retain_from();
+        // An open turn pins the ring further back than the segmenter would:
+        // its audio is still waiting for a possible continuation.
+        let keep_from = self
+            .segmenter
+            .retain_from()
+            .min(self.turns.pending_start().unwrap_or(u64::MAX));
         if keep_from > self.ring_base {
             let drop = (keep_from - self.ring_base) as usize;
             if drop >= self.ring.len() {
@@ -158,6 +175,11 @@ pub struct Stats {
 pub struct Pipeline {
     vad: SileroVad,
     seg_cfg: SegmenterConfig,
+    cfg: Config,
+    /// `None` when no models are configured or present: the daemon then behaves
+    /// exactly as it did in Step 1 rather than refusing to capture.
+    analyzer: Option<Analyzer>,
+    analysis_stats: Arc<AnalysisStats>,
     store: Arc<std::sync::Mutex<Store>>,
     data_dir: PathBuf,
     sessions: HashMap<i64, SessionPipeline>,
@@ -170,19 +192,31 @@ impl Pipeline {
         store: Arc<std::sync::Mutex<Store>>,
         data_dir: PathBuf,
         stats: Arc<Stats>,
+        analysis_stats: Arc<AnalysisStats>,
     ) -> Result<Self> {
         let vad = SileroVad::from_bytes(crate::VAD_MODEL)?;
-        let seg_cfg = SegmenterConfig::from_ms(
-            cfg.vad.threshold,
-            cfg.vad.min_speech_ms,
-            cfg.vad.min_silence_ms,
-            cfg.vad.pad_ms,
-            cfg.vad.max_segment_ms,
-            SAMPLE_RATE,
-        );
+        let seg_cfg = crate::ingest::segmenter_config(cfg);
+        let analyzer = match ModelSet::resolve(&cfg.models) {
+            None => {
+                info!("no [models].dir configured: capture and VAD only");
+                None
+            }
+            Some(models) if !models.complete() => {
+                warn!(
+                    "analysis models incomplete under {} — see `recalld models status`; \
+                     capturing without ASR or speaker identity",
+                    models.root.display()
+                );
+                None
+            }
+            Some(models) => Some(Analyzer::load(&models, &cfg.identity)?),
+        };
         Ok(Self {
             vad,
             seg_cfg,
+            cfg: cfg.clone(),
+            analyzer,
+            analysis_stats,
             store,
             data_dir,
             sessions: HashMap::new(),
@@ -217,10 +251,10 @@ impl Pipeline {
     fn on_audio(&mut self, chunk: AudioChunk) -> Result<()> {
         let seg_cfg = self.seg_cfg;
         let new_state = self.vad.new_state();
-        let entry = self
-            .sessions
-            .entry(chunk.session_id)
-            .or_insert_with(|| SessionPipeline::new(new_state, seg_cfg, chunk.capture_mono_ns));
+        let merger = crate::ingest::turn_merger(&self.cfg);
+        let entry = self.sessions.entry(chunk.session_id).or_insert_with(|| {
+            SessionPipeline::new(new_state, seg_cfg, merger, chunk.capture_mono_ns)
+        });
 
         entry.maybe_reanchor(chunk.capture_mono_ns);
         entry.ring.extend_from_slice(&chunk.samples);
@@ -245,8 +279,11 @@ impl Pipeline {
                 .segmenter
                 .push_frame(prob, start, FRAME_SAMPLES as u64)
             {
-                emitted.push(span);
+                emitted.extend(entry.turns.push(span));
             }
+            // Release a turn once the merge window has passed, so a last turn
+            // followed by silence is not held until the session ends.
+            emitted.extend(entry.turns.poll(start + FRAME_SAMPLES as u64));
         }
 
         for span in emitted {
@@ -259,9 +296,14 @@ impl Pipeline {
     }
 
     fn on_session_end(&mut self, session_id: i64, mono_ns: u64) -> Result<()> {
-        if let Some(session) = self.sessions.get_mut(&session_id)
-            && let Some(span) = session.segmenter.flush()
-        {
+        let mut final_turns = Vec::new();
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            if let Some(span) = session.segmenter.flush() {
+                final_turns.extend(session.turns.push(span));
+            }
+            final_turns.extend(session.turns.flush());
+        }
+        for span in final_turns {
             self.write_segment(session_id, span)?;
         }
         self.sessions.remove(&session_id);
@@ -294,13 +336,13 @@ impl Pipeline {
         write_wav(&abs, &samples).with_context(|| format!("writing {}", abs.display()))?;
 
         let rel_str = rel.to_string_lossy().to_string();
-        {
+        let segment_id = {
             let store = self
                 .store
                 .lock()
                 .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
-            store.insert_segment(session_id, t_start_ns, t_end_ns, &rel_str, utc_now_ns())?;
-        }
+            store.insert_segment(session_id, t_start_ns, t_end_ns, &rel_str, utc_now_ns())?
+        };
         self.stats.segments_written.fetch_add(1, Ordering::Relaxed);
         info!(
             session_id,
@@ -308,13 +350,24 @@ impl Pipeline {
             path = %rel_str,
             "segment stored"
         );
+
+        if let Some(analyzer) = self.analyzer.as_mut() {
+            analyse_or_log(
+                analyzer,
+                &self.store,
+                &self.analysis_stats,
+                segment_id,
+                &samples,
+                t_start_ns,
+            );
+        }
         Ok(())
     }
 }
 
 /// `segments/<session>/seg-<seq>-<utc_ns>.wav`, relative to the data dir so the
 /// whole tree can be relocated without rewriting rows.
-fn segment_path(session_id: i64, seq: u64, t_start_ns: i64) -> PathBuf {
+pub fn segment_path(session_id: i64, seq: u64, t_start_ns: i64) -> PathBuf {
     PathBuf::from("segments")
         .join(format!("{session_id:06}"))
         .join(format!("seg-{seq:06}-{t_start_ns}.wav"))
@@ -322,7 +375,7 @@ fn segment_path(session_id: i64, seq: u64, t_start_ns: i64) -> PathBuf {
 
 /// 16 kHz mono, 16-bit PCM. Opus arrives in a later step; for Step 1 a WAV keeps
 /// the files trivially readable by every downstream tool.
-fn write_wav(path: &Path, samples: &[f32]) -> Result<()> {
+pub fn write_wav(path: &Path, samples: &[f32]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -386,6 +439,7 @@ mod tests {
         let mut s = SessionPipeline::new(
             VadState_stub(),
             SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE),
+            TurnMerger::new(24_000, 480_000),
             0,
         );
         s.anchor = Anchor {
@@ -410,6 +464,7 @@ mod tests {
         let mut s = SessionPipeline::new(
             VadState_stub(),
             SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE),
+            TurnMerger::new(24_000, 480_000),
             0,
         );
         s.anchor = Anchor {
@@ -432,6 +487,7 @@ mod tests {
         let mut s = SessionPipeline::new(
             VadState_stub(),
             SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE),
+            TurnMerger::new(24_000, 480_000),
             0,
         );
         s.anchor = Anchor {
@@ -449,6 +505,7 @@ mod tests {
         let mut s = SessionPipeline::new(
             VadState_stub(),
             SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE),
+            TurnMerger::new(24_000, 480_000),
             0,
         );
         s.ring = (0..100).map(|i| i as f32).collect();

@@ -1,10 +1,14 @@
 [package]
 name = "recalld"
-description = "NX Recall capture daemon: per-application audio capture, VAD segmentation, storage"
+description = "NX Recall capture daemon: per-application audio capture, VAD segmentation, transcription, speaker identity"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+[lib]
+name = "recalld"
+path = "src/lib.rs"
 
 [[bin]]
 name = "recalld"
@@ -19,7 +23,11 @@ libc.workspace = true
 ort.workspace = true
 pipewire.workspace = true
 rusqlite.workspace = true
+sherpa-rs.workspace = true
 serde.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

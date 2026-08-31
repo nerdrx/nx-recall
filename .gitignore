@@ -5,6 +5,10 @@
 # Step 0 spike artefacts (the spike itself is tracked, its heavy outputs are not)
 spike/venv/
 spike/models/
+
+# Analysis models: hundreds of megabytes, fetched or copied in by hand.
+# `NXR_MODELS=<dir>` points the acceptance suite at one.
+/models-local/
 spike/__pycache__/
 spike/vecs_*.npz
 spike/labels/
