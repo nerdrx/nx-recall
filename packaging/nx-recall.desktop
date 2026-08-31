@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=NX Recall
+GenericName=Conversation Recall
+Comment=Local-first conversation recall — live transcript, speakers, search
+Exec=nx-recall
+TryExec=nx-recall
+Icon=nx-recall
+Terminal=false
+Categories=Utility;
+Keywords=nx;transcript;speakers;recall;local;
+StartupNotify=false
+StartupWMClass=NX Recall
+X-NX-App=nx-recall

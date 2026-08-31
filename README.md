@@ -104,13 +104,33 @@ flowchart LR
 
 ```bash
 cargo build --release
+./target/release/recalld models fetch   # ~135 MB of ONNX models, once, into the data dir
 ./target/release/recalld probe          # see every app making sound, none captured
 ./target/release/recalld allow VRChat.exe
 ./target/release/recalld run            # first light
 ./target/release/recalld search "that portal world"
 ```
 
+`models fetch` is the only command in the program that opens a network socket. It
+verifies every file's exact byte size, skips anything already correct, and points
+`[models].dir` at what it installed so `models status` agrees with it. Everything
+after it runs offline.
+
 Pause lives in the tray dropdown and the GUI — instant, zero writes.
+
+## Packaging
+
+```bash
+packaging/build-release.sh              # dist/nx-recall-<version>-linux-x86_64.tar.gz
+```
+
+One `usr/`-shaped tarball for NX Hub's `tarball-prefix` engine: the daemon and its
+two ONNX libraries in `lib/nx-recall/`, the packaged Electron client beside them,
+launchers in `bin/`, and — the only two files outside its own subtrees — a systemd
+user unit and a desktop entry, both accounted for in
+[`nx-app.json`](nx-app.json) and removed exactly on uninstall. Your database and
+models live in the data dir, which is deliberately *not* in that manifest and
+survives uninstall. The script never publishes; it prints the `gh release` command.
 
 ## What never leaves this machine
 
@@ -135,7 +155,8 @@ missing feature, it's the [legal architecture](docs/DESIGN.md#12-legal-note).
 | 1 · Capture · VAD · allowlist | ✅ first light on a live 40-player lobby |
 | 2+3 · ASR · voicebank · overlap gate | ✅ 149 tests, golden fixtures enforced |
 | 4 · Socket protocol · tray · GUI | 🔨 in flight |
-| 5 · Roster integration · NX Hub packaging · Windows | 🗺 mapped |
+| 5 · Roster integration · Windows | 🗺 mapped |
+| NX Hub packaging | ✅ prefix tarball, manifest, model fetch |
 
 Golden fixtures gate every change: the equal-loudness mixes carry
 `expect: refuse` — a pipeline that labels them "correctly" by luck **fails CI**.

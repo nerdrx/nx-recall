@@ -1,0 +1,31 @@
+[Unit]
+Description=NX Recall capture daemon
+Documentation=https://github.com/nerdrx/nx-recall
+# Ordering only, never a dependency: recalld starts fine without PipeWire and
+# picks the graph up when it appears, and refusing to start would lose capture
+# on every session where audio comes up second.
+After=pipewire.service
+After=graphical-session.target
+
+[Service]
+Type=simple
+# The daemon, not the GUI. The GUI is a client that may or may not be running
+# (DESIGN §2), and pause survives it either way.
+ExecStart=%h/.local/bin/recalld run
+Restart=on-failure
+RestartSec=5
+
+# DESIGN §4: "analysis must never win a scheduling contest against a VR frame."
+# The whole pipeline is under 5% of one core, so this costs nothing and removes
+# the one failure mode measured live on the dev box.
+Nice=19
+
+# CPU placement is deliberately NOT set here. Which cores to avoid is a property
+# of the machine, not of the package: put `inference_cpus` in
+# ~/.config/nx-recall/config.toml instead (e.g. `[runtime]` inference_cpus =
+# [16,17,...] to keep an X3D die free for the game).
+
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -19,6 +19,7 @@ pub mod clock;
 pub mod config;
 pub mod control;
 pub mod embed;
+pub mod fetch;
 pub mod identity;
 pub mod ingest;
 pub mod models;

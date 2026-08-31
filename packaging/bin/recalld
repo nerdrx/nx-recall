@@ -1,0 +1,24 @@
+#!/bin/sh
+# NX Recall daemon launcher.
+#
+# The real binary lives in lib/nx-recall/ with libsherpa-onnx-c-api.so and
+# libonnxruntime.so beside it, which is what build.rs's `-rpath,$ORIGIN` is for:
+# no LD_LIBRARY_PATH is set here on purpose, so the loader takes our two ONNX
+# libraries from $ORIGIN and *everything else* — libpipewire, libc, the graphics
+# stack — from the host, where it belongs.
+#
+# Prefix-relative, never a baked-in path: the tarball is installed by copying
+# it into ~/.local (or anywhere else), so the only thing this script may assume
+# is where it is itself.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+prefix=$(CDPATH= cd -- "$here/.." && pwd)
+real="$prefix/lib/nx-recall/recalld"
+
+[ -x "$real" ] || {
+    echo "nx-recall: $real is missing — the install is incomplete." >&2
+    exit 1
+}
+
+exec "$real" "$@"

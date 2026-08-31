@@ -112,5 +112,31 @@ pub enum Command {
 pub enum ModelsAction {
     /// Report which analysis models are present and which are missing.
     /// Downloads nothing.
-    Status,
+    Status {
+        /// Report on this directory instead of `[models].dir`.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+    },
+
+    /// Download the analysis models (~140 MB compressed, ~700 MB on disk) into
+    /// the data directory. This is the only command in recalld that touches the
+    /// network, and it is a setup step: capture and transcription never do.
+    ///
+    /// Safe to re-run — files already present at the expected size are skipped.
+    Fetch {
+        /// Install into this directory instead of `[models].dir` (default:
+        /// `<data-dir>/models`).
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+
+        /// Download everything again, even files that are already correct.
+        #[arg(long)]
+        force: bool,
+
+        /// Do not write the resulting directory into config.toml. Without this
+        /// the fetch points `[models].dir` at what it just installed, so
+        /// `models status` and the daemon agree with it.
+        #[arg(long)]
+        no_config: bool,
+    },
 }

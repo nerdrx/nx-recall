@@ -1,0 +1,28 @@
+#!/bin/sh
+# NX Recall desktop app launcher — this is what the hub's Launch button and the
+# desktop entry both run.
+#
+# The GUI is only a client (DESIGN §2): it connects to recalld's socket and has
+# nothing to say if the daemon is not running, so this starts no daemon and
+# holds no state. `systemctl --user start nx-recall` is the daemon's story.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+prefix=$(CDPATH= cd -- "$here/.." && pwd)
+app="$prefix/lib/nx-recall/gui"
+bin="$app/nx-recall-gui"
+
+[ -x "$bin" ] || {
+    echo "nx-recall: $bin is missing — the install is incomplete." >&2
+    exit 1
+}
+
+# Chromium's setuid sandbox helper needs to be root-owned and mode 4755, which
+# no unprivileged install can arrange — the hub never elevates (PUBLISHING §8).
+# So: use the sandbox when someone has set it up by hand, and disable it rather
+# than fail to start when they have not. See README-NX.md.
+if [ -u "$app/chrome-sandbox" ]; then
+    exec "$bin" "$@"
+else
+    exec "$bin" --no-sandbox "$@"
+fi

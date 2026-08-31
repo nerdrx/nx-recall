@@ -22,7 +22,8 @@ use recalld::client;
 use recalld::clock::utc_now_ns;
 use recalld::config::{self, Config, SAMPLE_RATE};
 use recalld::control::Control;
-use recalld::models::ModelSet;
+use recalld::fetch;
+use recalld::models::{self, EntryState, ModelSet};
 use recalld::pipeline::{self, Pipeline, Stats};
 use recalld::queue::EventQueue;
 use recalld::retention::{self, SweeperStop};
@@ -63,7 +64,21 @@ fn main() -> Result<()> {
         Command::Allow { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, true),
         Command::Deny { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, false),
         Command::Models { action } => match action {
-            ModelsAction::Status => cmd_models_status(&cfg),
+            ModelsAction::Status { dir } => {
+                cmd_models_status(&cfg, &data_dir, dir.as_deref(), false)
+            }
+            ModelsAction::Fetch {
+                dir,
+                force,
+                no_config,
+            } => cmd_models_fetch(
+                &cfg,
+                &config_path,
+                &data_dir,
+                dir.as_deref(),
+                force,
+                no_config,
+            ),
         },
         Command::Speakers => cmd_speakers(&data_dir),
         Command::Name {
@@ -322,26 +337,50 @@ fn cmd_set_rule(config_path: &Path, data_dir: &Path, match_key: &str, allowed: b
     Ok(())
 }
 
-fn cmd_models_status(cfg: &Config) -> Result<()> {
-    let Some(models) = ModelSet::resolve(&cfg.models) else {
+/// `models status`. With `configured_only` false it falls back to the directory
+/// a fetch would use, so `status` never says "nothing configured" about a
+/// directory `fetch` just filled — the two commands read the same catalogue and
+/// resolve the same path.
+fn cmd_models_status(
+    cfg: &Config,
+    data_dir: &Path,
+    dir: Option<&Path>,
+    quiet_header: bool,
+) -> Result<()> {
+    let root = fetch::target_dir(dir, &cfg.models, data_dir);
+    let models = ModelSet::resolve_at(root, &cfg.models);
+
+    if !quiet_header && dir.is_none() && cfg.models.dir.is_none() {
         println!(
-            "No [models].dir configured — recalld will capture and segment but not\n\
-             transcribe or identify. Point it at a directory holding the models."
+            "[models].dir is not set in config.toml — reporting on the default,\n\
+             {}. Run `recalld models fetch` to populate it.\n",
+            models.root.display()
         );
-        return Ok(());
-    };
+    }
     println!("models dir: {}", models.root.display());
-    println!("{:<14}  {:<9}  {:>10}  PATH", "ROLE", "PRESENT", "SIZE");
+    println!(
+        "{:<14}  {:<9}  {:>10}  {:>10}  PATH",
+        "ROLE", "STATE", "SIZE", "EXPECTED"
+    );
+    println!(
+        "{:<14}  {:<9}  {:>10}  {:>10}  (compiled into the binary)",
+        "vad",
+        "ok",
+        fetch::human(recalld::VAD_MODEL.len() as u64),
+        fetch::human(models::VAD_MODEL_BYTES),
+    );
     for e in models.entries() {
-        let size = e
-            .bytes()
-            .map(|b| format!("{:.1} MB", b as f64 / 1_048_576.0))
-            .unwrap_or_else(|| "-".into());
+        let state = match e.state() {
+            EntryState::Ok => "ok",
+            EntryState::Missing => "MISSING",
+            EntryState::WrongSize { .. } => "BAD SIZE",
+        };
         println!(
-            "{:<14}  {:<9}  {:>10}  {}",
+            "{:<14}  {:<9}  {:>10}  {:>10}  {}",
             e.role,
-            if e.present() { "yes" } else { "MISSING" },
-            size,
+            state,
+            e.bytes().map(fetch::human).unwrap_or_else(|| "-".into()),
+            e.expected.map(fetch::human).unwrap_or_else(|| "?".into()),
             e.path.display()
         );
     }
@@ -352,11 +391,60 @@ fn cmd_models_status(cfg: &Config) -> Result<()> {
         println!("\nAll models present.");
     } else {
         println!(
-            "\n{} model file(s) missing; analysis stays off until they are there.",
+            "\n{} model file(s) missing or the wrong size; analysis stays off until\n\
+             they are there. `recalld models fetch` downloads them.",
             models.missing().len()
         );
     }
     Ok(())
+}
+
+/// `models fetch` — the setup-time download of DESIGN §4. Everything it needs
+/// to know about the network lives in `recalld::fetch`; this is the part that
+/// decides *where*, and then leaves the config saying so.
+fn cmd_models_fetch(
+    cfg: &Config,
+    config_path: &Path,
+    data_dir: &Path,
+    dir: Option<&Path>,
+    force: bool,
+    no_config: bool,
+) -> Result<()> {
+    let root = fetch::target_dir(dir, &cfg.models, data_dir);
+    println!("models dir: {}", root.display());
+    println!(
+        "up to {} to download from github.com/k2-fsa/sherpa-onnx\n",
+        fetch::human(models::total_download_bytes())
+    );
+
+    let report = fetch::fetch_models(&root, &cfg.models, &fetch::FetchOptions { force })?;
+
+    println!(
+        "\n{} downloaded, {} already present ({} transferred).",
+        report.downloaded,
+        report.skipped,
+        fetch::human(report.bytes)
+    );
+
+    // Point the config at what we just installed. Without this a fetch into the
+    // default directory would leave `models status` and the daemon still seeing
+    // "analysis off", which is exactly the disagreement this command exists to
+    // prevent.
+    if !no_config && cfg.models.dir.as_deref() != Some(root.as_path()) {
+        let mut updated = Config::load(config_path)?;
+        updated.models.dir = Some(root.clone());
+        updated.save(config_path)?;
+        println!(
+            "[models].dir set to {} in {}\n  restart `recalld run` to load them.",
+            root.display(),
+            config_path.display()
+        );
+    }
+
+    println!();
+    let mut effective = cfg.clone();
+    effective.models.dir = Some(root);
+    cmd_models_status(&effective, data_dir, None, true)
 }
 
 fn cmd_speakers(data_dir: &Path) -> Result<()> {

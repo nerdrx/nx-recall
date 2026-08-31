@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# Release artifacts: packaging/build-release.sh output, ~140 MB a shot.
+/dist/
+
 # Step 0 spike artefacts (the spike itself is tracked, its heavy outputs are not)
 spike/venv/
 spike/models/
