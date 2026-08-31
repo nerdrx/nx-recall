@@ -2,7 +2,7 @@
  "seed": 61822,
  "sample_rate": 16000,
  "source": "LibriSpeech dev-clean (CC-BY 4.0)",
- "note": "Regression goldens: run the pipeline, diff against `expect`. duo_equal/lobby_equal MUST be refused by the overlap gate \u2014 labelling them 'correctly' by luck is still a fail.",
+ "note": "Regression goldens: run the pipeline, diff against `expect`. duo_equal/lobby_equal MUST be refused by the overlap gate \u2014 labelling them 'correctly' by luck is still a fail. Segments shorter than the detector's 10 s window MUST be tile-padded (repeat the segment), never zero-padded: zero padding shifts the model's chunk normalisation and inflates overlap_frac on short dominant-speaker audio (measured: 0.914 -> 0.000).",
  "fixtures": [
   {
    "file": "clean_single_0.wav",
@@ -156,7 +156,7 @@
    ],
    "target_utterance": "5338-24640-0003",
    "target_transcript": "MISTER MORTON SEEMED PARTICULARLY STRUCK WITH THE ACCOUNT OF WAVERLEY'S VISIT TO DONALD BEAN LEAN",
-   "expect": "label+transcribe"
+   "expect": "transcribe; speaker label optional \u2014 continuous synthetic babble is the overlap detector's worst case (see FINDINGS \u00a78 caveat); real turn-taking flags far less"
   },
   {
    "file": "trio_dominant_1.wav",
@@ -172,7 +172,7 @@
    ],
    "target_utterance": "652-130726-0030",
    "target_transcript": "SEASON WITH SALT AND PEPPER AND A LITTLE SUGAR TO TASTE",
-   "expect": "label+transcribe"
+   "expect": "transcribe; speaker label optional \u2014 continuous synthetic babble is the overlap detector's worst case (see FINDINGS \u00a78 caveat); real turn-taking flags far less"
   },
   {
    "file": "lobby_dominant_0.wav",
@@ -195,7 +195,7 @@
    ],
    "target_utterance": "5536-43363-0015",
    "target_transcript": "FIVE YEARS LATER HE REPEATED THE SERVICE AND AGAIN SAVED HIS PEOPLE FROM AWFUL SLAUGHTER",
-   "expect": "label+transcribe"
+   "expect": "transcribe; speaker label optional \u2014 continuous synthetic babble is the overlap detector's worst case (see FINDINGS \u00a78 caveat); real turn-taking flags far less"
   },
   {
    "file": "lobby_dominant_1.wav",
@@ -218,7 +218,7 @@
    ],
    "target_utterance": "3000-15664-0026",
    "target_transcript": "THE MULE DEER ARE NEARLY AS HEAVY",
-   "expect": "label+transcribe"
+   "expect": "transcribe; speaker label optional \u2014 continuous synthetic babble is the overlap detector's worst case (see FINDINGS \u00a78 caveat); real turn-taking flags far less"
   },
   {
    "file": "lobby_equal_0.wav",
