@@ -79,6 +79,23 @@ never need to re-query for a rename. The daemon keeps a short replay buffer;
 `{"method": "events.since", "params": {"seq": N}}` replays it or returns
 `err: resync` if N has fallen out.
 
+## Field conventions (v1 clarifications, born from the first real client)
+
+- **Timestamps on events**: both `t_ms` (JSON number, ms since epoch — for display)
+  and `t_ns` (JSON **string**, UTC nanoseconds — full fidelity exceeds 2^53).
+- `status` is also a subscribable topic; the daemon pushes a `status` event on state
+  change (pause especially). Clients may poll the method as well.
+- `events.since` replies with the batch inline: `{"ok": {"events": [...]}}`.
+  Clients dedupe by seq, so stream re-push is tolerated but the batch is canonical.
+- `speakers.list` rows: `auto` (generated "Speaker_NN" label) alongside `name`
+  (null until the user names them).
+- `relabel` carries `merged_into` when caused by a merge. `delete.run` completion is
+  followed by a `purge` event naming removed rows.
+- `sources.list` rows: display name, binary, first_seen, last_seen, active streams.
+- After any resync, clients rebase `lastSeq` onto the welcome/resync seq; the daemon
+  guarantees `welcome.seq` reflects the live counter and subsequent events increase
+  strictly from it.
+
 ## Versioning rules
 
 - `proto` bumps only on breaking changes; additive fields/methods/events are free.
