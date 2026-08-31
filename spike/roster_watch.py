@@ -49,8 +49,10 @@ def parse_line(line: str) -> dict | None:
         return None
     t = utc_ns(m.group(1))
     if m.group(2):
+        # Names may carry trailing whitespace before the (usr_…) id, and are
+        # frequently non-ASCII; strip but never otherwise normalise.
         return {"t": t, "ev": "join" if m.group(2) == "Joined" else "leave",
-                "who": m.group(3)}
+                "who": m.group(3).strip()}
     if m.group(4):
         return {"t": t, "ev": "world", "world_id": m.group(4),
                 "instance": m.group(5).split("~")[0]}
