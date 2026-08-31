@@ -74,6 +74,7 @@ fn wer(reference: &str, hypothesis: &str) -> f32 {
 struct Rig {
     dir: PathBuf,
     cfg: Config,
+    models: ModelSet,
     store: Store,
     vad: SileroVad,
     analyzer: Analyzer,
@@ -110,6 +111,7 @@ impl Rig {
         Self {
             dir,
             cfg,
+            models: set,
             store,
             vad,
             analyzer,
@@ -257,6 +259,85 @@ fn equal_loudness_mixes_are_flagged_and_refused_a_speaker() {
     assert!(
         rig.store.list_speakers().unwrap().is_empty(),
         "no voice may be minted from equal-loudness audio"
+    );
+}
+
+#[test]
+fn a_dominant_talker_is_still_labelled_through_one_interferer() {
+    let mut rig = rig!("overlap-dominant");
+    for fixture in ["duo_dominant_0.wav", "duo_dominant_1.wav"] {
+        let ids = rig.ingest(fixture);
+        assert!(!ids.is_empty(), "{fixture} produced no segments at all");
+        for id in &ids {
+            let frac = rig.overlap_of(*id);
+            assert!(
+                frac < 0.1,
+                "{fixture} segment {id} read as {frac:.3} overlapped; a +12 dB \
+                 dominant talker must stay under the gate"
+            );
+        }
+        assert!(
+            ids.iter().any(|id| rig.speaker_of(*id).is_some()),
+            "{fixture} must be labelled, not refused"
+        );
+    }
+}
+
+#[test]
+fn dense_dominant_babble_is_transcribed_even_when_the_gate_refuses_it() {
+    // The manifest makes the label optional here: continuous synthetic babble
+    // from 3-10 talkers is the detector's worst case. The transcript is not
+    // optional — a refused label must never cost the words.
+    let mut rig = rig!("overlap-dense");
+    for fixture in [
+        "trio_dominant_0.wav",
+        "trio_dominant_1.wav",
+        "lobby_dominant_0.wav",
+        "lobby_dominant_1.wav",
+    ] {
+        let ids = rig.ingest(fixture);
+        assert!(!ids.is_empty(), "{fixture} produced no segments at all");
+        assert!(
+            !normalise_words(&rig.text_of(&ids)).is_empty(),
+            "{fixture} produced no transcript"
+        );
+    }
+}
+
+/// The short-segment padding rule, pinned.
+///
+/// Filling a sub-window segment out with silence shifts the model's per-chunk
+/// normalisation and lifts quiet interferers into "second active speaker";
+/// tiling it fixes that but fabricates periodic content and blinds the gate to
+/// dense equal-loudness babble. Neither may creep back in.
+#[test]
+fn short_segments_keep_the_gates_discrimination() {
+    let rig = rig!("overlap-short");
+    let mut detector = recalld::overlap::OverlapDetector::load(&rig.models.segmentation).unwrap();
+
+    let clean = read_wav(&fixtures_dir().join("clean_single_0.wav")).unwrap();
+    for seconds in [1.2f32, 2.0, 3.0] {
+        let n = (seconds * SAMPLE_RATE as f32) as usize;
+        let frac = detector.overlap_frac(&clean[..n.min(clean.len())]).unwrap();
+        assert!(
+            frac < 0.1,
+            "a {seconds} s slice of clean speech read as {frac:.3} overlapped"
+        );
+    }
+
+    let duo = read_wav(&fixtures_dir().join("duo_equal_0.wav")).unwrap();
+    let frac = detector.overlap_frac(&duo).unwrap();
+    assert!(
+        frac > 0.5,
+        "duo_equal_0 read as {frac:.3}; the gate would let it through"
+    );
+
+    // Ten talkers at equal loudness is where tiling silently fails.
+    let lobby = read_wav(&fixtures_dir().join("lobby_equal_0.wav")).unwrap();
+    let frac = detector.overlap_frac(&lobby).unwrap();
+    assert!(
+        frac > 0.5,
+        "lobby_equal_0 (2.9 s) read as {frac:.3}; short dense babble must still flag"
     );
 }
 
