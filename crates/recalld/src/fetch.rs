@@ -271,8 +271,6 @@ impl Progress {
             if final_ {
                 let _ = writeln!(err);
             }
-        } else if final_ {
-            let _ = writeln!(err, "{line}");
         } else {
             let _ = writeln!(err, "{line}");
         }

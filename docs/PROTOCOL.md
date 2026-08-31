@@ -42,7 +42,7 @@ Methods (initial set):
 | `speakers.list` | | id, name, counts, total time |
 | `speakers.name` | `{id, name}` | retroactive; broadcasts `relabel` |
 | `speakers.merge` | `{from, into}` | tombstone, no chains; broadcasts `relabel` |
-| `speakers.split` | `{id}` | **async op** (below) |
+| `speakers.split` | `{id}` | **async op** (below); work completes inline — the reply carries the op handle **plus** the outcome: `{op, kept, minted, auto, moved_segments, moved_prototypes, ambiguous, centroid_similarity, embed_model_id, resync, seq}`. Data-driven refusals (one voice, golden conflict) come back as `err:refused`. The minted speaker's `relabel` carries `split_from`. Past ~100 changed rows the per-segment events are skipped and `resync: true` tells clients to re-query. |
 | `segments.reassign` | `{segment_id, speaker_id}` | |
 | `segments.correct` | `{segment_id, text}` | feeds anchor per DESIGN §5 |
 | `search` | `{q, speaker?, source?, from?, to?, limit?}` | FTS now, +vec later |

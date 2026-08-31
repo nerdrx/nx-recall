@@ -12,7 +12,7 @@ speaker identity, instant search. Zero cloud. Zero telemetry. Zero exceptions.**
 ![local-first](https://img.shields.io/badge/inference-100%25_local-7700FF?style=for-the-badge)
 ![telemetry](https://img.shields.io/badge/telemetry-none._ever.-0a0714?style=for-the-badge)
 ![rust](https://img.shields.io/badge/daemon-rust-b7410e?style=for-the-badge)
-![tests](https://img.shields.io/badge/tests-149_passing-2ea44f?style=for-the-badge)
+![tests](https://img.shields.io/badge/tests-263_passing-2ea44f?style=for-the-badge)
 ![wer](https://img.shields.io/badge/WER_clean-1.3%25-7700FF?style=for-the-badge)
 ![footprint](https://img.shields.io/badge/pipeline_cost-%3C5%25_of_one_core-2ea44f?style=for-the-badge)
 
@@ -153,9 +153,9 @@ missing feature, it's the [legal architecture](docs/DESIGN.md#12-legal-note).
 |---|---|
 | 0 · Measurement spike (identity + ASR + field recording) | ✅ shipped, [findings public to the repo](spike/FINDINGS.md) |
 | 1 · Capture · VAD · allowlist | ✅ first light on a live 40-player lobby |
-| 2+3 · ASR · voicebank · overlap gate | ✅ 149 tests, golden fixtures enforced |
-| 4 · Socket protocol · tray · GUI | 🔨 in flight |
-| 5 · Roster integration · Windows | 🗺 mapped |
+| 2+3 · ASR · voicebank · overlap gate | ✅ golden fixtures enforced |
+| 4 · Socket protocol · tray · GUI · pause · roster · split | ✅ 263 tests, real-daemon interop 49/49 |
+| 5 · Windows backend | 🗺 mapped |
 | NX Hub packaging | ✅ prefix tarball, manifest, model fetch |
 
 Golden fixtures gate every change: the equal-loudness mixes carry
