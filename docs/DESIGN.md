@@ -194,9 +194,11 @@ preview; soft-delete undo window; panic-delete; source blocklist), plus:
   N" or full resync. Long operations (bulk delete, split re-cluster) run as **async
   operation handles with progress events** — a multi-second purge must not block
   every client.
-- Wayland global-pause hotkey: still the highest-risk UX unknown (GlobalShortcuts
-  portal under fullscreen VRChat). Must be spiked before the GUI milestone promises
-  it.
+- Global pause stays first-class — instant, zero writes — but ~~"global pause
+  hotkey — non-negotiable"~~ is relaxed per the user: the *pause primitive* is
+  required, a hotkey binding is not. Reachable via `recalld pause` (CLI), the GUI,
+  and the tray tile; a Wayland GlobalShortcuts binding is an optional nicety, off
+  the critical path, and the fullscreen-VRChat portal spike is no longer a blocker.
 - Socket: `$XDG_RUNTIME_DIR/nx-recall.sock`, mode 0600.
 - At-rest encryption: **honestly scoped.** A user-service that autostarts cannot
   prompt for a passphrase, so a local key would be theater against filesystem
