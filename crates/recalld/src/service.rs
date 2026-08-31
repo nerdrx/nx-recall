@@ -27,6 +27,12 @@ use crate::store::{SegmentFilter, SegmentRow, Store};
 /// How many segments one delete step touches before it reports progress.
 const DELETE_BATCH: usize = 200;
 
+/// How many per-row events one split may broadcast. Beyond this the two
+/// `relabel` events stand on their own and the reply asks for a re-query: a
+/// client's outbox is bounded and a slow client is disconnected rather than
+/// waited for (`bus`), so a big split must not be able to hang up every view.
+const SPLIT_EVENT_CAP: usize = 100;
+
 /// One segment on the wire.
 ///
 /// Both time forms, deliberately (PROTOCOL "Field conventions"): `t_ms` is what
@@ -105,11 +111,7 @@ impl Service {
             "speakers.list" => self.speakers_list(),
             "speakers.name" => self.speakers_name(req),
             "speakers.merge" => self.speakers_merge(req),
-            "speakers.split" => Err(Error::new(
-                "unimplemented",
-                "speakers.split lands with the re-cluster step; \
-                 speakers.merge and segments.reassign are the corrections available now",
-            )),
+            "speakers.split" => self.speakers_split(req),
             "segments.reassign" => self.segments_reassign(req),
             "segments.correct" => self.segments_correct(req),
             "search" => self.search(req),
@@ -474,6 +476,178 @@ impl Service {
         }))
     }
 
+    /// Cut a voice that turned out to be two people back apart.
+    ///
+    /// The decision lives in `split::plan` and is a refusal by default: one
+    /// voice cut in half is as damaging as the false merge this undoes
+    /// (FINDINGS §5), so a re-cluster that cannot show two distinct centroids
+    /// changes nothing. Every write is reported — as a `relabel` for each of
+    /// the two voices and a `segment` for every row that moved — because a
+    /// split is the one correction where rows change *identity*, and a view
+    /// that missed it would show the wrong person's words.
+    ///
+    /// PROTOCOL calls this an async op. The re-cluster is a brute-force pass
+    /// over one speaker's vectors — thousands at the very most, sub-millisecond
+    /// (DESIGN §6) — so it finishes inline; the op handle and its terminal
+    /// event are still issued, so a client written to the async contract sees
+    /// what it expects.
+    fn speakers_split(self: &Arc<Self>, req: &Request) -> Result<Value, Error> {
+        let id = req.i64("id")?;
+        let store = self.store();
+        if store
+            .speaker_name(id)
+            .map_err(Error::from)?
+            .is_none()
+        {
+            return Err(Error::not_found(format!("no speaker with id {id}")));
+        }
+        // A tombstone has no rows of its own: splitting it would silently cut
+        // up the speaker it was merged into. Splitting *that* speaker — the
+        // merge target — is exactly the intended use.
+        let canonical = store.resolve_speaker(id).map_err(Error::from)?;
+        if canonical != id {
+            return Err(Error::new(
+                "conflict",
+                format!(
+                    "speaker {id} was merged into {canonical}; split {canonical} instead — \
+                     that is the voice holding the rows"
+                ),
+            ));
+        }
+
+        let Some(model) = store.speaker_embed_model(id).map_err(Error::from)? else {
+            return Err(Error::new(
+                "refused",
+                format!("speaker {id} has no embeddings, so there is nothing to re-cluster"),
+            ));
+        };
+        let vectors = store.speaker_vectors(id, &model).map_err(Error::from)?;
+        let plan = match crate::split::plan(&self.control.identity, &vectors) {
+            Ok(plan) => plan,
+            Err(refusal) => {
+                info!(speaker = id, "split refused: {}", refusal.message());
+                return Err(Error::new(refusal.code(), refusal.message()));
+            }
+        };
+
+        // Read the prior labels before anything moves: `prior_state` has to be
+        // enough to put every segment back on the speaker it came from.
+        let touched: Vec<i64> = plan
+            .moved_segments
+            .iter()
+            .chain(&plan.ambiguous_segments)
+            .map(|(seg, _)| *seg)
+            .collect();
+        let prior = store.segment_labels(&touched).map_err(Error::from)?;
+        let write = crate::store::SplitWrite {
+            prototypes: plan.moved_prototypes.clone(),
+            segments: plan.moved_segments.clone(),
+            ambiguous: plan.ambiguous_segments.clone(),
+        };
+        let at = utc_now_ns();
+        let report = store
+            .split_speaker(id, &write, at)
+            .map_err(|e| Error::new("conflict", format!("{e:#}")))?;
+        store
+            .log_operation(
+                "speakers.split",
+                &json!([report.kept, report.minted]).to_string(),
+                &json!({
+                    "kept": report.kept,
+                    "minted": report.minted,
+                    "embed_model_id": model,
+                    "centroid_similarity": plan.centroid_similarity,
+                    "prototypes": plan.moved_prototypes,
+                    // Per segment, the speaker and score it had before this
+                    // ran: the whole point of the audit trail (DESIGN §6).
+                    "segments": prior
+                        .iter()
+                        .map(|row| json!({
+                            "segment_id": row.segment_id,
+                            "speaker_id": row.speaker_id,
+                            "match_score": row.match_score,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+                .to_string(),
+                at,
+            )
+            .map_err(Error::from)?;
+
+        let kept_name = store
+            .speaker_summary(report.kept)
+            .map_err(Error::from)?
+            .and_then(|s| s.name().map(str::to_string));
+        // Both the moved rows and the softened ones: an undecidable segment
+        // kept its speaker but not its confidence, and a view showing scores
+        // has to see that too.
+        let changed: Vec<SegmentRow> = touched
+            .iter()
+            .filter_map(|seg| store.segment_row(*seg).ok().flatten())
+            .collect();
+        drop(store);
+
+        // The existing voice first: the minted one's rows are about to arrive
+        // and a client should already know both ids exist.
+        let seq = self.bus.publish(
+            Topic::Relabel,
+            "relabel",
+            json!({"speaker": report.kept, "name": kept_name}),
+        );
+        self.bus.publish(
+            Topic::Relabel,
+            "relabel",
+            json!({
+                "speaker": report.minted,
+                "name": Value::Null,
+                "auto": report.auto_label,
+                // The mirror of a merge's `merged_into`: this id exists because
+                // that one was cut in two.
+                "split_from": report.kept,
+            }),
+        );
+        // A speaker with more rows than the replay buffer would cost every
+        // client its connection to announce one by one; past the cap the two
+        // relabels stand and the reply says a re-query is needed.
+        let resync = changed.len() > SPLIT_EVENT_CAP;
+        if !resync {
+            for row in &changed {
+                self.bus
+                    .publish(Topic::Segments, "segment", segment_json(row));
+            }
+        }
+
+        let op = format!("op_{}", self.next_op.fetch_add(1, Ordering::SeqCst));
+        self.finish_op(&op, OpState::Done);
+        let result = json!({
+            "op": op,
+            "kept": report.kept,
+            "minted": report.minted,
+            "auto": report.auto_label,
+            "moved_segments": report.segments,
+            "moved_prototypes": report.prototypes,
+            "ambiguous": report.ambiguous,
+            "centroid_similarity": plan.centroid_similarity,
+            "embed_model_id": model,
+            // True when the row-level events were suppressed: re-run your
+            // queries rather than trusting what you have.
+            "resync": resync,
+            "seq": seq,
+        });
+        info!(
+            kept = report.kept,
+            minted = report.minted,
+            segments = report.segments,
+            ambiguous = report.ambiguous,
+            similarity = plan.centroid_similarity,
+            "split a voice in two"
+        );
+        let mut done = result.clone();
+        done["kind"] = json!("speakers.split");
+        self.bus.publish(Topic::Ops, "op.done", done);
+        Ok(result)
+    }
+
     // ---- segments --------------------------------------------------------
 
     fn segments_reassign(&self, req: &Request) -> Result<Value, Error> {
@@ -799,13 +973,20 @@ mod tests {
     }
 
     fn rig(name: &str) -> Rig {
+        rig_with(name, crate::config::IdentityConfig::default())
+    }
+
+    /// A rig on a chosen operating point — `speakers.split` is the one method
+    /// whose behaviour the identity thresholds decide.
+    fn rig_with(name: &str, identity: crate::config::IdentityConfig) -> Rig {
         let dir = std::env::temp_dir().join(format!(
             "nx-recall-service-{}-{name}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::open(&dir).unwrap();
-        let control = Control::new(dir.clone(), None, &Allowlist::from_rules([("x", false)]));
+        let control = Control::new(dir.clone(), None, &Allowlist::from_rules([("x", false)]))
+            .with_identity(identity);
         let bus = Bus::new(64, 32);
         let service = Service::new(Arc::new(Mutex::new(store)), control, Arc::clone(&bus));
         let (client, rx) = bus.attach(None);
@@ -859,15 +1040,288 @@ mod tests {
         assert!(call(&r, r#"{"id":2,"method":"status"}"#).is_ok());
     }
 
+    // ---- speakers.split --------------------------------------------------
+
+    /// One turn of a voice: a segment, its embedding, and the prototype it
+    /// seeded — the arrangement the pipeline actually writes, and the one a
+    /// split depends on (a prototype remembers `source_segment_id`).
+    fn a_voiced_segment(
+        rig: &Rig,
+        session: i64,
+        speaker: i64,
+        vector: &[f32],
+        golden: bool,
+    ) -> i64 {
+        let store = rig.service.store();
+        let t = session * 1_000_000 + store.segments_total().unwrap() * 1_000;
+        let seg = store
+            .insert_segment(session, t, t + 1_000, "segments/x.wav", 0)
+            .unwrap();
+        let e = crate::embed::Embedding::new("m@1", vector.to_vec());
+        store.store_embedding(seg, &e).unwrap();
+        store.set_segment_speaker(seg, Some(speaker), Some(0.9)).unwrap();
+        store
+            .add_prototype(speaker, &e, Some(seg), golden, 20, 0)
+            .unwrap();
+        seg
+    }
+
+    fn a_session(rig: &Rig) -> i64 {
+        let store = rig.service.store();
+        let src = store.upsert_source("VRChat.exe", "VRChat.exe", 0).unwrap();
+        store.begin_session(src, 0).unwrap()
+    }
+
+    /// The scenario the feature exists for: two people collapsed onto one id.
+    /// Returns the surviving speaker, the tombstone, and each person's rows.
+    fn a_false_merge(rig: &Rig) -> FalseMerge {
+        let sess = a_session(rig);
+        let (a, b) = {
+            let store = rig.service.store();
+            (store.mint_speaker(0).unwrap(), store.mint_speaker(0).unwrap())
+        };
+        let ours: Vec<i64> = [[1.0, 0.05], [1.0, 0.0], [0.98, 0.1]]
+            .iter()
+            .map(|v| a_voiced_segment(rig, sess, a, v, false))
+            .collect();
+        let theirs: Vec<i64> = [[0.0, 1.0], [0.02, 1.0], [0.0, 0.97]]
+            .iter()
+            .map(|v| a_voiced_segment(rig, sess, b, v, false))
+            .collect();
+        rig.service.store().merge_speakers(b, a).unwrap();
+        FalseMerge {
+            kept: a,
+            tombstone: b,
+            session: sess,
+            ours,
+            theirs,
+        }
+    }
+
+    struct FalseMerge {
+        kept: i64,
+        tombstone: i64,
+        session: i64,
+        ours: Vec<i64>,
+        theirs: Vec<i64>,
+    }
+
+    fn split(rig: &Rig, id: i64) -> Result<Value, Error> {
+        call(
+            rig,
+            &format!(r#"{{"id":9,"method":"speakers.split","params":{{"id":{id}}}}}"#),
+        )
+    }
+
     #[test]
-    fn split_says_so_rather_than_pretending() {
+    fn a_false_merge_is_cut_back_into_two_voices() {
         let r = rig("split");
-        assert_eq!(
-            call(&r, r#"{"id":1,"method":"speakers.split","params":{"id":1}}"#)
-                .unwrap_err()
-                .code,
-            "unimplemented"
+        let FalseMerge {
+            kept, ours, theirs, ..
+        } = a_false_merge(&r);
+        events(&r);
+
+        let out = split(&r, kept).unwrap();
+        assert_eq!(out["kept"], kept);
+        let minted = out["minted"].as_i64().unwrap();
+        assert_ne!(minted, kept);
+        assert_eq!(out["moved_segments"], 3);
+        assert_eq!(out["moved_prototypes"], 3);
+        assert_eq!(out["ambiguous"], 0);
+        assert_eq!(out["resync"], false);
+        assert!(out["auto"].as_str().unwrap().starts_with("Speaker_"));
+        assert!(
+            out["centroid_similarity"].as_f64().unwrap() < 0.6,
+            "the two voices must be further apart than the refusal threshold"
         );
+
+        // The two groups are on different ids again, and the id that survived
+        // is the one that had a history.
+        let store = r.service.store();
+        let of = |seg: i64| store.segment_state(seg).unwrap().0;
+        assert!(ours.iter().all(|s| of(*s) == Some(kept)));
+        assert!(theirs.iter().all(|s| of(*s) == Some(minted)));
+        assert_eq!(store.prototype_count(kept).unwrap(), 3);
+        assert_eq!(store.prototype_count(minted).unwrap(), 3);
+        drop(store);
+
+        // Both voices are announced, the minted one saying where it came from,
+        // and every moved row arrives on the same `segment` event a new row
+        // would.
+        let evs = events(&r);
+        assert_eq!(evs[0]["ev"], "relabel");
+        assert_eq!(evs[0]["data"]["speaker"], kept);
+        assert_eq!(evs[0]["seq"], out["seq"]);
+        assert_eq!(evs[1]["data"]["speaker"], minted);
+        assert_eq!(evs[1]["data"]["name"], Value::Null);
+        assert_eq!(evs[1]["data"]["split_from"], kept);
+        let moved: Vec<i64> = evs
+            .iter()
+            .filter(|e| e["ev"] == "segment")
+            .map(|e| e["data"]["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(moved, theirs);
+        assert!(
+            evs.iter().any(|e| e["ev"] == "op.done"),
+            "PROTOCOL calls this an operation, so it gets a terminal event"
+        );
+    }
+
+    #[test]
+    fn a_split_records_the_speaker_every_segment_came_from() {
+        let r = rig("split-audit");
+        let FalseMerge { kept, theirs, .. } = a_false_merge(&r);
+        let out = split(&r, kept).unwrap();
+
+        let ops = call(&r, r#"{"id":1,"method":"operations.list"}"#).unwrap();
+        let op = &ops["operations"][0];
+        assert_eq!(op["op"], "speakers.split");
+        assert_eq!(op["target_ids"], json!([kept, out["minted"]]));
+        // Enough to undo: every moved segment, with the id and the score it
+        // held before the re-cluster ran.
+        let prior = op["prior_state"]["segments"].as_array().unwrap();
+        assert_eq!(prior.len(), theirs.len());
+        for (row, seg) in prior.iter().zip(&theirs) {
+            assert_eq!(row["segment_id"], *seg);
+            assert_eq!(row["speaker_id"], kept);
+            assert!((row["match_score"].as_f64().unwrap() - 0.9).abs() < 1e-6);
+        }
+        assert_eq!(op["prior_state"]["embed_model_id"], "m@1");
+        assert_eq!(op["prior_state"]["prototypes"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn one_voice_is_refused_rather_than_cut_in_half() {
+        let r = rig("split-one-voice");
+        let sess = a_session(&r);
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        for i in 0..4 {
+            a_voiced_segment(&r, sess, spk, &[1.0, 0.01 * i as f32], false);
+        }
+        events(&r);
+
+        let e = split(&r, spk).unwrap_err();
+        assert_eq!(e.code, "refused");
+        assert!(e.msg.contains("one person"), "{}", e.msg);
+        // A refusal changes nothing at all.
+        assert_eq!(r.service.store().list_speakers().unwrap().len(), 1);
+        assert!(events(&r).is_empty(), "a refused split broadcasts nothing");
+        assert!(
+            call(&r, r#"{"id":1,"method":"operations.list"}"#).unwrap()["operations"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "and writes no audit row"
+        );
+    }
+
+    #[test]
+    fn a_golden_pins_the_identity_and_two_goldens_refuse() {
+        let r = rig("split-golden");
+        let sess = a_session(&r);
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        // The hand-enrolled voice is the *minority* here: goldens are ground
+        // truth, so its cluster keeps the id anyway.
+        let golden = a_voiced_segment(&r, sess, spk, &[0.0, 1.0], true);
+        let others: Vec<i64> = [[1.0, 0.05], [1.0, 0.0], [0.98, 0.1]]
+            .iter()
+            .map(|v| a_voiced_segment(&r, sess, spk, v, false))
+            .collect();
+
+        let out = split(&r, spk).unwrap();
+        assert_eq!(out["kept"], spk);
+        let minted = out["minted"].as_i64().unwrap();
+        let store = r.service.store();
+        assert_eq!(
+            store.segment_state(golden).unwrap().0,
+            Some(spk),
+            "hand-enrolled audio never leaves the speaker it was enrolled on"
+        );
+        assert!(
+            others
+                .iter()
+                .all(|s| store.segment_state(*s).unwrap().0 == Some(minted))
+        );
+        drop(store);
+
+        // A second golden on the other side is conflicting evidence.
+        let r = rig("split-golden-conflict");
+        let sess = a_session(&r);
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        a_voiced_segment(&r, sess, spk, &[0.0, 1.0], true);
+        a_voiced_segment(&r, sess, spk, &[0.02, 1.0], false);
+        a_voiced_segment(&r, sess, spk, &[1.0, 0.05], true);
+        a_voiced_segment(&r, sess, spk, &[1.0, 0.0], false);
+        let e = split(&r, spk).unwrap_err();
+        assert_eq!(e.code, "refused");
+        assert!(e.msg.contains("both sides"), "{}", e.msg);
+    }
+
+    #[test]
+    fn an_undecidable_segment_keeps_its_speaker_and_loses_its_confidence() {
+        // A band wide enough to catch a segment sitting between the voices;
+        // the default one is deliberately narrow (see `split::plan`).
+        let r = rig_with(
+            "split-ambiguous",
+            crate::config::IdentityConfig {
+                split_ambiguous_margin: 0.2,
+                ..Default::default()
+            },
+        );
+        let FalseMerge { kept, session, .. } = a_false_merge(&r);
+        // Halfway between the two voices, and no prototype of its own — the
+        // segment the matcher should never have been confident about.
+        let fence = {
+            let store = r.service.store();
+            let seg = store
+                .insert_segment(session, 9_000, 10_000, "segments/f.wav", 0)
+                .unwrap();
+            store
+                .store_embedding(seg, &crate::embed::Embedding::new("m@1", vec![1.0, 1.0]))
+                .unwrap();
+            store.set_segment_speaker(seg, Some(kept), Some(0.92)).unwrap();
+            seg
+        };
+
+        let out = split(&r, kept).unwrap();
+        assert_eq!(out["ambiguous"], 1);
+        let store = r.service.store();
+        let (speaker, _) = store.segment_state(fence).unwrap();
+        assert_eq!(speaker, Some(kept), "an undecidable segment stays put");
+        let score: f32 = store.segment_fields(fence).unwrap()["match_score"]
+            .as_ref()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            score < 0.92,
+            "it must be less trusted than it was, not more: {score}"
+        );
+    }
+
+    #[test]
+    fn a_tombstone_cannot_be_split_but_the_voice_it_merged_into_can() {
+        let r = rig("split-tombstone");
+        let FalseMerge {
+            kept, tombstone, ..
+        } = a_false_merge(&r);
+        let e = split(&r, tombstone).unwrap_err();
+        assert_eq!(e.code, "conflict");
+        assert!(e.msg.contains(&kept.to_string()), "{}", e.msg);
+        // The merge target is exactly what a split is for.
+        assert!(split(&r, kept).is_ok());
+    }
+
+    #[test]
+    fn splitting_something_that_is_not_a_voice_says_so() {
+        let r = rig("split-missing");
+        assert_eq!(split(&r, 404).unwrap_err().code, "not_found");
+        // A voice with no embeddings has nothing to re-cluster.
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        let e = split(&r, spk).unwrap_err();
+        assert_eq!(e.code, "refused");
+        assert!(e.msg.contains("no embeddings"), "{}", e.msg);
+        assert!(events(&r).is_empty());
     }
 
     #[test]

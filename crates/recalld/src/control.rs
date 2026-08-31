@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use crate::allowlist::Allowlist;
 use crate::analysis::AnalysisStats;
 use crate::clock::utc_now_ns;
+use crate::config::IdentityConfig;
 use crate::pipeline::Stats;
 use crate::queue::EventQueue;
 
@@ -37,6 +38,10 @@ pub struct Control {
     pub queue: Option<Arc<EventQueue>>,
     pub stats: Arc<Stats>,
     pub analysis: Arc<AnalysisStats>,
+    /// The operating point the socket's own identity work reads —
+    /// `speakers.split` re-clusters a voicebank and needs the same thresholds
+    /// the pipeline was labelling with.
+    pub identity: IdentityConfig,
     models: Mutex<Vec<String>>,
 }
 
@@ -53,8 +58,18 @@ impl Control {
             queue: None,
             stats: Arc::new(Stats::default()),
             analysis: Arc::new(AnalysisStats::default()),
+            identity: IdentityConfig::default(),
             models: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The configured identity operating point, if it differs from the
+    /// defaults. Set before the daemon shares this handle, like the rest of the
+    /// wiring.
+    pub fn with_identity(mut self: Arc<Self>, identity: IdentityConfig) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
+        this.identity = identity;
+        self
     }
 
     /// The daemon's own wiring: the counters and the queue it reports on.

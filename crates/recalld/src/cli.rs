@@ -77,6 +77,15 @@ pub enum Command {
         into: i64,
     },
 
+    /// Split a voice that turned out to be two people: re-cluster what the
+    /// speaker's identity rests on, keep <ID> for the larger half and mint a
+    /// new voice for the other. Refused if the two halves are one person.
+    /// Needs the running daemon, because every client has to be told.
+    Split {
+        #[arg(value_name = "SPEAKER_ID")]
+        speaker_id: i64,
+    },
+
     /// Full-text search over transcripts.
     Search {
         #[arg(value_name = "QUERY")]
