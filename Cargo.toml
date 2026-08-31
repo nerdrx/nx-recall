@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/recalld"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+hound = "3.5"
+libc = "0.2"
+ort = "2.0.0-rc.13"
+pipewire = { version = "0.10", features = ["v1_2_0"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

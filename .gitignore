@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Step 0 spike artefacts (the spike itself is tracked, its heavy outputs are not)
+spike/venv/
+spike/models/
+spike/__pycache__/
+spike/vecs_*.npz
+spike/labels/
+spike/clips/
+
+# Recordings and captured audio
+*.flac
+*.opus
+
+# Local daemon state (never commit captured data)
+/data/
+/var/
+**/segments/
+**/recall.db
+**/recall.db-wal
+**/recall.db-shm
+**/nx-recall-data/
+
+# Editor / OS
+.DS_Store
+*.swp

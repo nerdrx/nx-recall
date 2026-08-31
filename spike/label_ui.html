@@ -1,0 +1,118 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>NX Recall — clip tagging</title>
+<style>
+  :root { --bg:#0a0714; --panel:#151027; --edge:#2a2144; --fg:#e8e4f4;
+          --dim:#9a92b8; --nx:#7700FF; --nx2:#a56bff; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--fg); font:16px/1.5 system-ui,sans-serif;
+         min-height:100vh; display:grid; place-items:center; }
+  main { width:min(680px,94vw); padding:24px; }
+  .bar { height:6px; background:var(--edge); border-radius:3px; overflow:hidden; margin-bottom:10px; }
+  .bar i { display:block; height:100%; background:linear-gradient(90deg,var(--nx),var(--nx2)); transition:width .2s; }
+  .meta { display:flex; justify-content:space-between; color:var(--dim); font-size:13px; margin-bottom:18px; }
+  .card { background:var(--panel); border:1px solid var(--edge); border-radius:16px; padding:22px; }
+  audio { width:100%; margin:6px 0 16px; }
+  .names { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+  button { background:#1e1735; color:var(--fg); border:1px solid var(--edge);
+           border-radius:10px; padding:9px 15px; font-size:15px; cursor:pointer; }
+  button:hover { border-color:var(--nx2); }
+  button.name { border-color:#3d2f66; }
+  button .k { color:var(--nx2); font-size:12px; margin-right:6px; }
+  .row { display:flex; gap:8px; }
+  input { flex:1; background:#0f0b1e; color:var(--fg); border:1px solid var(--edge);
+          border-radius:10px; padding:9px 12px; font-size:15px; }
+  input:focus { outline:none; border-color:var(--nx); }
+  .special { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
+  .special button { color:var(--dim); font-size:14px; }
+  .nav { display:flex; justify-content:space-between; margin-top:16px; color:var(--dim); font-size:13px; }
+  .nav button { font-size:13px; padding:5px 12px; }
+  .done { text-align:center; padding:40px 0; }
+  .done h1 { color:var(--nx2); margin-bottom:12px; }
+  kbd { background:#241b40; border-radius:4px; padding:1px 6px; font-size:12px; }
+</style>
+<main>
+  <div class="bar"><i id="prog"></i></div>
+  <div class="meta"><span id="count"></span><span id="pos"></span></div>
+  <div class="card" id="card"></div>
+  <div class="nav">
+    <button onclick="step(-1)">← back</button>
+    <span><kbd>space</kbd> replay · <kbd>1–9</kbd> pick name · <kbd>u</kbd> unsure · <kbd>m</kbd> multiple · <kbd>x</kbd> not speech</span>
+    <button onclick="step(1)">skip →</button>
+  </div>
+</main>
+<script>
+let R=null, labels={}, order=[], idx=0, names=[];
+const SPECIAL=["(unsure)","(multiple)","(not speech)"];
+
+async function boot(){
+  const st=await (await fetch("/state")).json();
+  R=st.regions; labels=st.labels; order=R.order;
+  names=[...new Set(Object.values(labels).filter(w=>!SPECIAL.includes(w)))];
+  idx=order.findIndex(id=>!(id in labels));
+  if(idx<0) idx=order.length;
+  render();
+}
+function pct(){ return Object.keys(labels).length; }
+function render(){
+  document.getElementById("prog").style.width=(pct()/order.length*100)+"%";
+  document.getElementById("count").textContent=`${pct()} / ${order.length} tagged`;
+  const card=document.getElementById("card");
+  if(idx>=order.length){
+    document.getElementById("pos").textContent="";
+    card.innerHTML=`<div class="done"><h1>All ${order.length} clips tagged</h1>
+      <p>labels saved to <code>clips/labels.json</code> — tell Claude you're done.</p></div>`;
+    return;
+  }
+  const id=order[idx], m=R.clips[id], cur=labels[id];
+  document.getElementById("pos").textContent=`clip ${id} · ${m.t0}s–${m.t1}s · ${(m.t1-m.t0).toFixed(1)}s`;
+  card.innerHTML=`
+    <audio id="au" controls autoplay src="/clip/clip_${String(id).padStart(3,"0")}.wav"></audio>
+    <div class="names" id="nm"></div>
+    <div class="row"><input id="newname" placeholder="new person… (Enter)" autocomplete="off">
+    <button onclick="addName()">add</button></div>
+    <div class="special">
+      <button onclick="tag('(unsure)')">❓ unsure <kbd>u</kbd></button>
+      <button onclick="tag('(multiple)')">👥 multiple <kbd>m</kbd></button>
+      <button onclick="tag('(not speech)')">🔇 not speech <kbd>x</kbd></button>
+    </div>`;
+  const nm=document.getElementById("nm");
+  names.forEach((w,i)=>{
+    const b=document.createElement("button");
+    b.className="name";
+    b.innerHTML=(i<9?`<span class="k">${i+1}</span>`:"")+w+(cur===w?" ✓":"");
+    b.onclick=()=>tag(w);
+    nm.appendChild(b);
+  });
+  const inp=document.getElementById("newname");
+  inp.addEventListener("keydown",e=>{ if(e.key==="Enter") addName(); e.stopPropagation(); });
+}
+function addName(){
+  const w=document.getElementById("newname").value.trim();
+  if(!w) return;
+  if(!names.includes(w)) names.push(w);
+  tag(w);
+}
+async function tag(who){
+  const id=order[idx]; labels[id]=who;
+  fetch("/label",{method:"POST",body:JSON.stringify({id,who})});
+  idx++;
+  while(idx<order.length && (order[idx] in labels)) idx++;
+  render();
+}
+function step(d){
+  idx=Math.max(0,Math.min(order.length,idx+d));
+  render();
+}
+document.addEventListener("keydown",e=>{
+  if(e.target.tagName==="INPUT") return;
+  if(e.key===" "){ e.preventDefault(); const a=document.getElementById("au"); if(a){a.currentTime=0;a.play();} }
+  else if(e.key>="1"&&e.key<="9"){ const w=names[+e.key-1]; if(w) tag(w); }
+  else if(e.key==="u") tag("(unsure)");
+  else if(e.key==="m") tag("(multiple)");
+  else if(e.key==="x") tag("(not speech)");
+  else if(e.key==="ArrowLeft") step(-1);
+  else if(e.key==="ArrowRight") step(1);
+});
+boot();
+</script>
