@@ -1,0 +1,280 @@
+{
+ "seed": 61822,
+ "sample_rate": 16000,
+ "source": "LibriSpeech dev-clean (CC-BY 4.0)",
+ "note": "Regression goldens: run the pipeline, diff against `expect`. duo_equal/lobby_equal MUST be refused by the overlap gate \u2014 labelling them 'correctly' by luck is still a fail.",
+ "fixtures": [
+  {
+   "file": "clean_single_0.wav",
+   "condition": "clean_single",
+   "n_talkers": 1,
+   "dominance_db": 0.0,
+   "opus_kbps": 0,
+   "duration_s": 5.17,
+   "target_speaker": "6295",
+   "interferer_speakers": [],
+   "target_utterance": "6295-64301-0013",
+   "target_transcript": "BUT IN HIS HANDS SOLITUDE AND A VIOLIN WERE SURE TO MARRY IN MUSIC",
+   "expect": "label+transcribe"
+  },
+  {
+   "file": "clean_single_1.wav",
+   "condition": "clean_single",
+   "n_talkers": 1,
+   "dominance_db": 0.0,
+   "opus_kbps": 0,
+   "duration_s": 1.75,
+   "target_speaker": "3170",
+   "interferer_speakers": [],
+   "target_utterance": "3170-137482-0033",
+   "target_transcript": "THE THREE FRIENDS WERE ASTOUNDED",
+   "expect": "label+transcribe"
+  },
+  {
+   "file": "opus24_single_0.wav",
+   "condition": "opus24_single",
+   "n_talkers": 1,
+   "dominance_db": 0.0,
+   "opus_kbps": 24,
+   "duration_s": 3.4,
+   "target_speaker": "3853",
+   "interferer_speakers": [],
+   "target_utterance": "3853-163249-0055",
+   "target_transcript": "THEN SHE SAW DAVID AND THE REGIMENT BECAME ONE MAN TO HER",
+   "expect": "label+transcribe"
+  },
+  {
+   "file": "opus24_single_1.wav",
+   "condition": "opus24_single",
+   "n_talkers": 1,
+   "dominance_db": 0.0,
+   "opus_kbps": 24,
+   "duration_s": 8.68,
+   "target_speaker": "1919",
+   "interferer_speakers": [],
+   "target_utterance": "1919-142785-0051",
+   "target_transcript": "PUT THE UDDER INTO A STEWPAN WITH SUFFICIENT WATER TO COVER IT LET IT STEW GENTLY TILL QUITE DONE WHEN TAKE IT OUT TO COOL",
+   "expect": "label+transcribe"
+  },
+  {
+   "file": "opus8_single_0.wav",
+   "condition": "opus8_single",
+   "n_talkers": 1,
+   "dominance_db": 0.0,
+   "opus_kbps": 8,
+   "duration_s": 3.1,
+   "target_speaker": "2086",
+   "interferer_speakers": [],
+   "target_utterance": "2086-149220-0044",
+   "target_transcript": "HOW WONDERFULLY RESPONSIVE TO EVERY EMOTION OF THE HUMAN SOUL",
+   "expect": "label+transcribe"
+  },
+  {
+   "file": "opus8_single_1.wav",
+   "condition": "opus8_single",
+   "n_talkers": 1,
+   "dominance_db": 0.0,
+   "opus_kbps": 8,
+   "duration_s": 3.58,
+   "target_speaker": "8297",
+   "interferer_speakers": [],
+   "target_utterance": "8297-275154-0007",
+   "target_transcript": "AFTER MONTHS OF SEPARATION HE RECEIVED A VISIT FROM HERBERT",
+   "expect": "label+transcribe"
+  },
+  {
+   "file": "duo_dominant_0.wav",
+   "condition": "duo_dominant",
+   "n_talkers": 2,
+   "dominance_db": 12.0,
+   "opus_kbps": 24,
+   "duration_s": 8.5,
+   "target_speaker": "251",
+   "interferer_speakers": [
+    "3536"
+   ],
+   "target_utterance": "251-136532-0019",
+   "target_transcript": "NOT THAT I'M INTERESTED IN ALL THIS FOR MYSELF HE DISCLAIMED AFTER LISTENING TO THE TELECAST FROM TERRA TWO DAYS AFTER HIS DISCOVERY",
+   "expect": "label+transcribe"
+  },
+  {
+   "file": "duo_dominant_1.wav",
+   "condition": "duo_dominant",
+   "n_talkers": 2,
+   "dominance_db": 12.0,
+   "opus_kbps": 24,
+   "duration_s": 7.62,
+   "target_speaker": "8842",
+   "interferer_speakers": [
+    "5895"
+   ],
+   "target_utterance": "8842-302203-0005",
+   "target_transcript": "AND THEREWITHAL SUCH A BEWILDERMENT POSSESS'D ME THAT I SHUT MINE EYES FOR PEACE AND IN MY BRAIN DID CEASE ORDER OF THOUGHT AND EVERY HEALTHFUL THING",
+   "expect": "label+transcribe"
+  },
+  {
+   "file": "duo_equal_0.wav",
+   "condition": "duo_equal",
+   "n_talkers": 2,
+   "dominance_db": 0.0,
+   "opus_kbps": 24,
+   "duration_s": 5.4,
+   "target_speaker": "1988",
+   "interferer_speakers": [
+    "3000"
+   ],
+   "target_utterance": "1988-24833-0024",
+   "target_transcript": "TOM DRINKS A LITTLE MORE COFFEE AND THEN HE GOES ON THE TROUBLE IS I CAN'T GET MARRIED ON THIS FLOWER SHOP JOB",
+   "expect": "refuse (overlap gate)"
+  },
+  {
+   "file": "duo_equal_1.wav",
+   "condition": "duo_equal",
+   "n_talkers": 2,
+   "dominance_db": 0.0,
+   "opus_kbps": 24,
+   "duration_s": 6.95,
+   "target_speaker": "5536",
+   "interferer_speakers": [
+    "2428"
+   ],
+   "target_utterance": "5536-43363-0018",
+   "target_transcript": "MANY OF THE INDIANS BELIEVED THAT ONE MAY BE BORN MORE THAN ONCE AND THERE WERE SOME WHO CLAIMED TO HAVE FULL KNOWLEDGE OF A FORMER INCARNATION",
+   "expect": "refuse (overlap gate)"
+  },
+  {
+   "file": "trio_dominant_0.wav",
+   "condition": "trio_dominant",
+   "n_talkers": 3,
+   "dominance_db": 12.0,
+   "opus_kbps": 24,
+   "duration_s": 5.35,
+   "target_speaker": "5338",
+   "interferer_speakers": [
+    "6345",
+    "6295"
+   ],
+   "target_utterance": "5338-24640-0003",
+   "target_transcript": "MISTER MORTON SEEMED PARTICULARLY STRUCK WITH THE ACCOUNT OF WAVERLEY'S VISIT TO DONALD BEAN LEAN",
+   "expect": "label+transcribe"
+  },
+  {
+   "file": "trio_dominant_1.wav",
+   "condition": "trio_dominant",
+   "n_talkers": 3,
+   "dominance_db": 12.0,
+   "opus_kbps": 24,
+   "duration_s": 2.75,
+   "target_speaker": "652",
+   "interferer_speakers": [
+    "1919",
+    "3576"
+   ],
+   "target_utterance": "652-130726-0030",
+   "target_transcript": "SEASON WITH SALT AND PEPPER AND A LITTLE SUGAR TO TASTE",
+   "expect": "label+transcribe"
+  },
+  {
+   "file": "lobby_dominant_0.wav",
+   "condition": "lobby_dominant",
+   "n_talkers": 10,
+   "dominance_db": 12.0,
+   "opus_kbps": 24,
+   "duration_s": 4.2,
+   "target_speaker": "5536",
+   "interferer_speakers": [
+    "8297",
+    "777",
+    "3536",
+    "1993",
+    "1462",
+    "2803",
+    "3081",
+    "1988",
+    "7850"
+   ],
+   "target_utterance": "5536-43363-0015",
+   "target_transcript": "FIVE YEARS LATER HE REPEATED THE SERVICE AND AGAIN SAVED HIS PEOPLE FROM AWFUL SLAUGHTER",
+   "expect": "label+transcribe"
+  },
+  {
+   "file": "lobby_dominant_1.wav",
+   "condition": "lobby_dominant",
+   "n_talkers": 10,
+   "dominance_db": 12.0,
+   "opus_kbps": 24,
+   "duration_s": 1.77,
+   "target_speaker": "3000",
+   "interferer_speakers": [
+    "3752",
+    "7976",
+    "3536",
+    "5536",
+    "6345",
+    "1673",
+    "5338",
+    "6313",
+    "2277"
+   ],
+   "target_utterance": "3000-15664-0026",
+   "target_transcript": "THE MULE DEER ARE NEARLY AS HEAVY",
+   "expect": "label+transcribe"
+  },
+  {
+   "file": "lobby_equal_0.wav",
+   "condition": "lobby_equal",
+   "n_talkers": 10,
+   "dominance_db": 0.0,
+   "opus_kbps": 24,
+   "duration_s": 2.88,
+   "target_speaker": "1988",
+   "interferer_speakers": [
+    "1673",
+    "777",
+    "6319",
+    "2277",
+    "84",
+    "3853",
+    "1462",
+    "6313",
+    "652"
+   ],
+   "target_utterance": "1988-147956-0013",
+   "target_transcript": "HE WAS BORN LIKE THAT THE OTHERS ARE SMART",
+   "expect": "refuse (overlap gate)"
+  },
+  {
+   "file": "lobby_equal_1.wav",
+   "condition": "lobby_equal",
+   "n_talkers": 10,
+   "dominance_db": 0.0,
+   "opus_kbps": 24,
+   "duration_s": 3.35,
+   "target_speaker": "6241",
+   "interferer_speakers": [
+    "652",
+    "2086",
+    "174",
+    "6345",
+    "2803",
+    "3536",
+    "6295",
+    "2277",
+    "1673"
+   ],
+   "target_utterance": "6241-61946-0018",
+   "target_transcript": "IN ANY CASE I SHALL TRUST RATHER TO MY OWN INTELLIGENCE THAN THEIRS",
+   "expect": "refuse (overlap gate)"
+  },
+  {
+   "file": "silence.wav",
+   "condition": "non_speech",
+   "expect": "no output (any ghost word is a regression)"
+  },
+  {
+   "file": "noise.wav",
+   "condition": "non_speech",
+   "expect": "no output (any ghost word is a regression)"
+  }
+ ]
+}
