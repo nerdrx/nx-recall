@@ -451,8 +451,9 @@ impl Store {
             )?;
         }
         if fresh_last_seen {
-            self.conn
-                .execute_batch("UPDATE sources SET last_seen = first_seen WHERE last_seen IS NULL")?;
+            self.conn.execute_batch(
+                "UPDATE sources SET last_seen = first_seen WHERE last_seen IS NULL",
+            )?;
         }
         Ok(())
     }
@@ -773,7 +774,12 @@ impl Store {
 
     /// Name a voice. `named_at` is what tells a client this is a person the
     /// user has identified rather than a number the daemon made up.
-    pub fn rename_speaker(&self, speaker_id: i64, display_name: &str, at_utc_ns: i64) -> Result<()> {
+    pub fn rename_speaker(
+        &self,
+        speaker_id: i64,
+        display_name: &str,
+        at_utc_ns: i64,
+    ) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE speakers SET display_name = ?2, named_at = ?3 WHERE id = ?1",
             params![speaker_id, display_name, at_utc_ns],
@@ -2184,11 +2190,15 @@ mod tests {
     /// prototype that remembers which segment it came from.
     fn a_voiced_segment(s: &Store, session: i64, speaker: i64, v: &[f32], golden: bool) -> i64 {
         let t = 1_000 * (s.segments_total().unwrap() + 1);
-        let seg = s.insert_segment(session, t, t + 500, "segments/v.wav", 0).unwrap();
+        let seg = s
+            .insert_segment(session, t, t + 500, "segments/v.wav", 0)
+            .unwrap();
         let e = emb("m@1", v);
         s.store_embedding(seg, &e).unwrap();
-        s.set_segment_speaker(seg, Some(speaker), Some(0.8)).unwrap();
-        s.add_prototype(speaker, &e, Some(seg), golden, 20, 0).unwrap();
+        s.set_segment_speaker(seg, Some(speaker), Some(0.8))
+            .unwrap();
+        s.add_prototype(speaker, &e, Some(seg), golden, 20, 0)
+            .unwrap();
         seg
     }
 
@@ -2207,7 +2217,9 @@ mod tests {
         assert!(!vectors[0].is_golden);
 
         // A labelled segment the bank never enrolled is still evidence.
-        let lone = s.insert_segment(sess, 9_000, 9_500, "segments/l.wav", 0).unwrap();
+        let lone = s
+            .insert_segment(sess, 9_000, 9_500, "segments/l.wav", 0)
+            .unwrap();
         s.store_embedding(lone, &emb("m@1", &[0.0, 1.0])).unwrap();
         s.set_segment_speaker(lone, Some(spk), Some(0.4)).unwrap();
         let vectors = s.speaker_vectors(spk, "m@1").unwrap();
@@ -2285,7 +2297,10 @@ mod tests {
         };
         assert!((score(fence) - 0.51).abs() < 1e-5);
         assert_eq!(s.segment_state(fence).unwrap().0, Some(spk));
-        assert!((score(mine) - 0.8).abs() < 1e-5, "an untouched row is untouched");
+        assert!(
+            (score(mine) - 0.8).abs() < 1e-5,
+            "an untouched row is untouched"
+        );
         assert!((score(theirs) - 0.94).abs() < 1e-5);
 
         // Both voices are live, and the audit trail can name what moved.
@@ -2412,8 +2427,14 @@ mod tests {
             speaker: Some(spk),
             ..Default::default()
         };
-        assert_eq!(s.segments_matching(&by_speaker).unwrap(), vec![(a, "a.wav".to_string())]);
-        assert_eq!(s.search_filtered("portal", &by_speaker, 10).unwrap().len(), 1);
+        assert_eq!(
+            s.segments_matching(&by_speaker).unwrap(),
+            vec![(a, "a.wav".to_string())]
+        );
+        assert_eq!(
+            s.search_filtered("portal", &by_speaker, 10).unwrap().len(),
+            1
+        );
 
         let by_source = SegmentFilter {
             source: Some("Discord".into()),
@@ -2426,7 +2447,10 @@ mod tests {
             to: Some(9_000),
             ..Default::default()
         };
-        assert_eq!(s.segments_matching(&by_window).unwrap(), vec![(b, "b.wav".to_string())]);
+        assert_eq!(
+            s.segments_matching(&by_window).unwrap(),
+            vec![(b, "b.wav".to_string())]
+        );
         assert_eq!(s.segment_rows(&by_window, 10).unwrap().len(), 1);
         assert_eq!(s.segment_rows(&all, 2).unwrap().len(), 2, "limit applies");
     }
@@ -2516,7 +2540,10 @@ mod tests {
         s.correct_segment_text(seg, "the belt holds").unwrap();
         assert!(s.search("tolls", 10).unwrap().is_empty());
         assert_eq!(s.search("belt", 10).unwrap().len(), 1);
-        assert_eq!(s.segment_state(seg).unwrap().1.as_deref(), Some("the belt holds"));
+        assert_eq!(
+            s.segment_state(seg).unwrap().1.as_deref(),
+            Some("the belt holds")
+        );
     }
 
     #[test]
@@ -2548,7 +2575,10 @@ mod tests {
         assert_eq!(s.roster_present().unwrap().len(), 2);
 
         assert!(s.roster_leave("Ines", 3_000).unwrap());
-        assert!(!s.roster_leave("Nobody", 3_000).unwrap(), "a stray leave is noise");
+        assert!(
+            !s.roster_leave("Nobody", 3_000).unwrap(),
+            "a stray leave is noise"
+        );
         let present = s.roster_present().unwrap();
         assert_eq!(present.len(), 1);
         assert_eq!(present[0].display_name, "きつね");

@@ -294,15 +294,7 @@ pub fn run(
         announced_missing = false;
         info!(log = %log.display(), "tailing the VRChat log");
 
-        if let Err(e) = tail_one(
-            &log,
-            &candidates,
-            poll,
-            &store,
-            &bus,
-            &control,
-            &stop,
-        ) {
+        if let Err(e) = tail_one(&log, &candidates, poll, &store, &bus, &control, &stop) {
             warn!("roster tailer restarting after: {e:#}");
             sleep_until(&stop, retry);
         }
@@ -491,13 +483,10 @@ mod tests {
     use super::*;
 
     /// Lines in the shapes the prototype's regex cases cover.
-    const JOIN: &str =
-        "2026.08.31 18:45:57 Debug      -  [Behaviour] OnPlayerJoined Ines (usr_0a1b2c3d-4e5f-6789-abcd-ef0123456789)";
+    const JOIN: &str = "2026.08.31 18:45:57 Debug      -  [Behaviour] OnPlayerJoined Ines (usr_0a1b2c3d-4e5f-6789-abcd-ef0123456789)";
     const JOIN_OLD: &str = "2026.08.31 18:46:02 Log        -  [Behaviour] OnPlayerJoined Kestrel";
-    const LEAVE: &str =
-        "2026.08.31 19:01:00 Debug      -  [Behaviour] OnPlayerLeft Ines (usr_0a1b2c3d-4e5f-6789-abcd-ef0123456789)";
-    const WORLD: &str =
-        "2026.08.31 18:45:50 Debug      -  [Behaviour] Joining wrld_4432ea9b-729c-46e3-8eaf-846aa0a37fdd:12345~region(eu)";
+    const LEAVE: &str = "2026.08.31 19:01:00 Debug      -  [Behaviour] OnPlayerLeft Ines (usr_0a1b2c3d-4e5f-6789-abcd-ef0123456789)";
+    const WORLD: &str = "2026.08.31 18:45:50 Debug      -  [Behaviour] Joining wrld_4432ea9b-729c-46e3-8eaf-846aa0a37fdd:12345~region(eu)";
     const ROOM: &str = "2026.08.31 18:45:51 Debug      -  [Behaviour] Entering Room: The Great Pug";
 
     fn ev(line: &str) -> Event {
@@ -599,7 +588,10 @@ mod tests {
             libc::localtime_r(&(secs as libc::time_t), &mut tm);
             tm
         };
-        assert_eq!((tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday), (2026, 8, 31));
+        assert_eq!(
+            (tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday),
+            (2026, 8, 31)
+        );
         assert_eq!((tm.tm_hour, tm.tm_min, tm.tm_sec), (18, 45, 57));
 
         assert_eq!(local_stamp_to_utc_ns("nonsense"), None);

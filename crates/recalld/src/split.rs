@@ -134,7 +134,10 @@ pub fn plan(cfg: &IdentityConfig, vectors: &[Vector]) -> Result<Plan, Refusal> {
         });
     }
 
-    let units: Vec<Vec<f32>> = vectors.iter().filter_map(|v| unit(&v.embedding.vector)).collect();
+    let units: Vec<Vec<f32>> = vectors
+        .iter()
+        .filter_map(|v| unit(&v.embedding.vector))
+        .collect();
     if units.len() != vectors.len() || units.len() < 2 {
         // A zero vector has no direction to cluster on; rather than let it drag
         // a centroid to the origin, the whole split is refused and the caller
@@ -422,14 +425,20 @@ mod tests {
         // vector, so 1-3 keep the id and 4-6 move.
         assert_eq!(plan.moved_prototypes, vec![4, 5, 6]);
         assert_eq!(
-            plan.moved_segments.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            plan.moved_segments
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
             vec![14, 15, 16]
         );
         assert!(plan.ambiguous_segments.is_empty());
         assert_eq!(plan.kept_vectors, 3);
         assert_eq!(plan.moved_vectors, 3);
         for (_, score) in &plan.moved_segments {
-            assert!(*score > 0.9, "a moved segment scores against its own centroid");
+            assert!(
+                *score > 0.9,
+                "a moved segment scores against its own centroid"
+            );
         }
     }
 
@@ -525,10 +534,7 @@ mod tests {
         // undecidable when the two readings are genuinely a coin toss — so this
         // one is decided by default and undecidable under a wider band.
         assert!(
-            plan(&cfg(), &items)
-                .unwrap()
-                .ambiguous_segments
-                .is_empty(),
+            plan(&cfg(), &items).unwrap().ambiguous_segments.is_empty(),
             "the default band must not swallow a merely off-centre segment"
         );
         let banded = IdentityConfig {
@@ -599,7 +605,11 @@ mod tests {
         items[3].embedding = Embedding::new("other@1", vec![0.0, 1.0, 0.05]);
         match plan(&cfg(), &items) {
             Err(r @ Refusal::Incomparable { .. }) => {
-                assert_eq!(r.code(), "internal", "a model leak is a fault, not a verdict");
+                assert_eq!(
+                    r.code(),
+                    "internal",
+                    "a model leak is a fault, not a verdict"
+                );
             }
             other => panic!("expected an incomparable refusal, got {other:?}"),
         }

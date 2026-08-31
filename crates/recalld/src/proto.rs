@@ -78,7 +78,10 @@ impl Request {
 /// What arrived on a line.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Incoming {
-    Hello { proto: u64, client: String },
+    Hello {
+        proto: u64,
+        client: String,
+    },
     Request(Request),
     /// Not JSON, or JSON that is neither a hello nor a request.
     Malformed(String),
@@ -265,6 +268,9 @@ mod tests {
         assert_eq!(v["err"]["code"], "not_found");
         assert_eq!(v["err"]["msg"], "no speaker with id 12");
         // The connection-fatal shape is a different key on purpose.
-        assert_eq!(as_json(fatal("proto", "unsupported"))["error"]["code"], "proto");
+        assert_eq!(
+            as_json(fatal("proto", "unsupported"))["error"]["code"],
+            "proto"
+        );
     }
 }

@@ -390,14 +390,16 @@ impl Shared {
         // sessions open.
         for node in &nodes {
             let key = node.ident.match_key();
-            if !self.allowlist.decide(&key).captures() && self.captures.contains_key(&node.node_id) {
+            if !self.allowlist.decide(&key).captures() && self.captures.contains_key(&node.node_id)
+            {
                 info!(node = node.node_id, key = %key, "no longer allowed; stopping capture");
                 self.stop_capture(node.node_id);
             }
         }
         for node in &nodes {
             let key = node.ident.match_key();
-            if !self.allowlist.decide(&key).captures() || self.captures.contains_key(&node.node_id) {
+            if !self.allowlist.decide(&key).captures() || self.captures.contains_key(&node.node_id)
+            {
                 continue;
             }
             let display_name = node.ident.display_name();

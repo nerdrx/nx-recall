@@ -379,7 +379,11 @@ mod tests {
             bus.publish(Topic::Segments, "segment", json!({"id": i}));
             // The fast client keeps up; the slow one never reads at all.
             while let Ok(b) = rx_fast.try_recv() {
-                seen.push(serde_json::from_slice::<Value>(&b).unwrap()["seq"].as_u64().unwrap());
+                seen.push(
+                    serde_json::from_slice::<Value>(&b).unwrap()["seq"]
+                        .as_u64()
+                        .unwrap(),
+                );
             }
         }
         assert!(slow.is_dead(), "the slow client must be disconnected");
@@ -401,7 +405,10 @@ mod tests {
         let (events, seq) = bus.events_since(&client, 2).unwrap();
         assert_eq!(seq, 4);
         assert_eq!(
-            events.iter().map(|e| e["seq"].as_u64().unwrap()).collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|e| e["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
             vec![3, 4]
         );
         assert!(

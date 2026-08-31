@@ -236,10 +236,8 @@ mod tests {
     }
 
     fn rig(name: &str) -> Rig {
-        let dir = std::env::temp_dir().join(format!(
-            "nx-recall-retention-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nx-recall-retention-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::open(&dir).unwrap();
         Rig { dir, store }
@@ -267,7 +265,10 @@ mod tests {
     }
 
     fn session(rig: &Rig) -> i64 {
-        let src = rig.store.upsert_source("VRChat.exe", "VRChat.exe", 0).unwrap();
+        let src = rig
+            .store
+            .upsert_source("VRChat.exe", "VRChat.exe", 0)
+            .unwrap();
         rig.store.begin_session(src, 0).unwrap()
     }
 
@@ -320,7 +321,10 @@ mod tests {
         // The words outlive the audio: still searchable, still in the transcript.
         assert_eq!(r.store.search("segment", 10).unwrap().len(), 2);
         assert_eq!(r.store.transcript(None, None).unwrap().len(), 2);
-        assert_eq!(r.store.all_audio_paths().unwrap(), vec![(fresh, "segments/000001/new.wav".into())]);
+        assert_eq!(
+            r.store.all_audio_paths().unwrap(),
+            vec![(fresh, "segments/000001/new.wav".into())]
+        );
         let _ = old;
 
         // Idempotent: a second pass finds nothing left to age.
@@ -351,7 +355,10 @@ mod tests {
         assert!(r.dir.join("segments/000001/kept.wav").exists());
         // The dangling row is kept: it is the only record of what was said.
         assert_eq!(r.store.transcript(None, None).unwrap().len(), 2);
-        assert!(!r.dir.join("segments/000009").exists(), "empty dirs are pruned");
+        assert!(
+            !r.dir.join("segments/000009").exists(),
+            "empty dirs are pruned"
+        );
         let _ = (kept, dangling);
     }
 
@@ -388,7 +395,10 @@ mod tests {
             reconcile: false,
             ..Default::default()
         };
-        assert_eq!(sweep(&cfg, &r.store, &r.dir, now).unwrap(), SweepReport::default());
+        assert_eq!(
+            sweep(&cfg, &r.store, &r.dir, now).unwrap(),
+            SweepReport::default()
+        );
         assert!(r.dir.join("segments/000001/ancient.wav").exists());
     }
 }

@@ -405,9 +405,11 @@ impl Service {
             .map_err(Error::from)?;
         drop(store);
 
-        let seq = self
-            .bus
-            .publish(Topic::Relabel, "relabel", json!({"speaker": id, "name": name}));
+        let seq = self.bus.publish(
+            Topic::Relabel,
+            "relabel",
+            json!({"speaker": id, "name": name}),
+        );
         Ok(json!({"id": id, "name": name, "seq": seq}))
     }
 
@@ -446,7 +448,9 @@ impl Service {
             .map_err(Error::from)?;
         let canonical = store.speaker_summary(report.into).map_err(Error::from)?;
         drop(store);
-        let canonical_name = canonical.as_ref().and_then(|s| s.name().map(str::to_string));
+        let canonical_name = canonical
+            .as_ref()
+            .and_then(|s| s.name().map(str::to_string));
 
         // Two events, because two things are true: the tombstoned id now lives
         // at `into` (every view moves its rows), and `into` itself is the row
@@ -494,11 +498,7 @@ impl Service {
     fn speakers_split(self: &Arc<Self>, req: &Request) -> Result<Value, Error> {
         let id = req.i64("id")?;
         let store = self.store();
-        if store
-            .speaker_name(id)
-            .map_err(Error::from)?
-            .is_none()
-        {
+        if store.speaker_name(id).map_err(Error::from)?.is_none() {
             return Err(Error::not_found(format!("no speaker with id {id}")));
         }
         // A tombstone has no rows of its own: splitting it would silently cut
@@ -763,7 +763,10 @@ impl Service {
     fn transcript(&self, req: &Request) -> Result<Value, Error> {
         let limit = req.usize_or("limit", 500)?.clamp(1, 10_000);
         let filter = self.filter_of(req)?;
-        let rows = self.store().segment_rows(&filter, limit).map_err(Error::from)?;
+        let rows = self
+            .store()
+            .segment_rows(&filter, limit)
+            .map_err(Error::from)?;
         Ok(json!({
             "segments": rows.iter().map(segment_json).collect::<Vec<_>>(),
         }))
@@ -807,7 +810,10 @@ impl Service {
 
     fn delete_preview(&self, req: &Request) -> Result<Value, Error> {
         let filter = self.filter_of(req)?;
-        let rows = self.store().segments_matching(&filter).map_err(Error::from)?;
+        let rows = self
+            .store()
+            .segments_matching(&filter)
+            .map_err(Error::from)?;
         let bytes: u64 = rows
             .iter()
             .filter(|(_, p)| !p.is_empty())
@@ -826,7 +832,10 @@ impl Service {
     /// once the undo window closes (DESIGN §8).
     fn delete_run(self: &Arc<Self>, req: &Request) -> Result<Value, Error> {
         let filter = self.filter_of(req)?;
-        let rows = self.store().segments_matching(&filter).map_err(Error::from)?;
+        let rows = self
+            .store()
+            .segments_matching(&filter)
+            .map_err(Error::from)?;
         let op = format!("op_{}", self.next_op.fetch_add(1, Ordering::SeqCst));
         self.ops
             .lock()
@@ -949,7 +958,6 @@ fn time_param(req: &Request, key: &str) -> Result<Option<i64>, Error> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -979,10 +987,8 @@ mod tests {
     /// A rig on a chosen operating point — `speakers.split` is the one method
     /// whose behaviour the identity thresholds decide.
     fn rig_with(name: &str, identity: crate::config::IdentityConfig) -> Rig {
-        let dir = std::env::temp_dir().join(format!(
-            "nx-recall-service-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nx-recall-service-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::open(&dir).unwrap();
         let control = Control::new(dir.clone(), None, &Allowlist::from_rules([("x", false)]))
@@ -1059,7 +1065,9 @@ mod tests {
             .unwrap();
         let e = crate::embed::Embedding::new("m@1", vector.to_vec());
         store.store_embedding(seg, &e).unwrap();
-        store.set_segment_speaker(seg, Some(speaker), Some(0.9)).unwrap();
+        store
+            .set_segment_speaker(seg, Some(speaker), Some(0.9))
+            .unwrap();
         store
             .add_prototype(speaker, &e, Some(seg), golden, 20, 0)
             .unwrap();
@@ -1078,7 +1086,10 @@ mod tests {
         let sess = a_session(rig);
         let (a, b) = {
             let store = rig.service.store();
-            (store.mint_speaker(0).unwrap(), store.mint_speaker(0).unwrap())
+            (
+                store.mint_speaker(0).unwrap(),
+                store.mint_speaker(0).unwrap(),
+            )
         };
         let ours: Vec<i64> = [[1.0, 0.05], [1.0, 0.0], [0.98, 0.1]]
             .iter()
@@ -1279,7 +1290,9 @@ mod tests {
             store
                 .store_embedding(seg, &crate::embed::Embedding::new("m@1", vec![1.0, 1.0]))
                 .unwrap();
-            store.set_segment_speaker(seg, Some(kept), Some(0.92)).unwrap();
+            store
+                .set_segment_speaker(seg, Some(kept), Some(0.92))
+                .unwrap();
             seg
         };
 
@@ -1331,7 +1344,10 @@ mod tests {
         assert_eq!(out["paused"], true);
         assert_eq!(out["changed"], true);
         assert!(r.service.control.is_paused());
-        assert_eq!(call(&r, r#"{"id":2,"method":"status"}"#).unwrap()["paused"], true);
+        assert_eq!(
+            call(&r, r#"{"id":2,"method":"status"}"#).unwrap()["paused"],
+            true
+        );
 
         // Pausing twice is not an error; the state is re-announced anyway, so
         // a client that asked for what it already had still sees the truth.
@@ -1355,13 +1371,17 @@ mod tests {
         let spk = {
             let store = r.service.store();
             let spk = store.mint_speaker(0).unwrap();
-            store.set_segment_speaker(seg, Some(spk), Some(0.7)).unwrap();
+            store
+                .set_segment_speaker(seg, Some(spk), Some(0.7))
+                .unwrap();
             spk
         };
 
         let out = call(
             &r,
-            &format!(r#"{{"id":1,"method":"speakers.name","params":{{"id":{spk},"name":"Kira"}}}}"#),
+            &format!(
+                r#"{{"id":1,"method":"speakers.name","params":{{"id":{spk},"name":"Kira"}}}}"#
+            ),
         )
         .unwrap();
         assert_eq!(out["name"], "Kira");
@@ -1373,15 +1393,27 @@ mod tests {
 
         // Past segments read through to the new name without re-querying. The
         // row carries the id (the identity) and the name (for display).
-        let hits = call(&r, r#"{"id":2,"method":"search","params":{"q":"fountain"}}"#).unwrap();
+        let hits = call(
+            &r,
+            r#"{"id":2,"method":"search","params":{"q":"fountain"}}"#,
+        )
+        .unwrap();
         assert_eq!(hits["hits"][0]["speaker"], spk);
         assert_eq!(hits["hits"][0]["speaker_name"], "Kira");
-        assert!(hits["hits"][0]["snippet"].as_str().unwrap().contains("fountain"));
+        assert!(
+            hits["hits"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("fountain")
+        );
 
         // And the audit trail knows what it was called before.
         let ops = call(&r, r#"{"id":3,"method":"operations.list"}"#).unwrap();
         assert_eq!(ops["operations"][0]["op"], "speakers.name");
-        assert_eq!(ops["operations"][0]["prior_state"]["display_name"], "Speaker_01");
+        assert_eq!(
+            ops["operations"][0]["prior_state"]["display_name"],
+            "Speaker_01"
+        );
     }
 
     #[test]
@@ -1433,7 +1465,9 @@ mod tests {
         assert_eq!(
             call(
                 &r,
-                &format!(r#"{{"id":2,"method":"speakers.merge","params":{{"from":{a},"into":{b}}}}}"#)
+                &format!(
+                    r#"{{"id":2,"method":"speakers.merge","params":{{"from":{a},"into":{b}}}}}"#
+                )
             )
             .unwrap_err()
             .code,
@@ -1473,9 +1507,15 @@ mod tests {
 
         let ops = call(&r, r#"{"id":3,"method":"operations.list"}"#).unwrap();
         assert_eq!(ops["operations"][0]["op"], "segments.correct");
-        assert_eq!(ops["operations"][0]["prior_state"]["text"], "the bell tolls");
+        assert_eq!(
+            ops["operations"][0]["prior_state"]["text"],
+            "the bell tolls"
+        );
         assert_eq!(ops["operations"][1]["op"], "segments.reassign");
-        assert_eq!(ops["operations"][1]["prior_state"]["speaker_id"], Value::Null);
+        assert_eq!(
+            ops["operations"][1]["prior_state"]["speaker_id"],
+            Value::Null
+        );
 
         let hits = call(&r, r#"{"id":4,"method":"search","params":{"q":"belt"}}"#).unwrap();
         assert_eq!(hits["hits"].as_array().unwrap().len(), 1);
@@ -1503,7 +1543,13 @@ mod tests {
             r.service.control.rules_generation() > gen0,
             "the capture loop must be told there is something to apply"
         );
-        assert!(r.service.control.allowlist().decide("VRChat.exe").captures());
+        assert!(
+            r.service
+                .control
+                .allowlist()
+                .decide("VRChat.exe")
+                .captures()
+        );
         assert_eq!(
             call(&r, r#"{"id":3,"method":"sources.list"}"#).unwrap()["sources"][0]["allowed"],
             true
@@ -1517,9 +1563,12 @@ mod tests {
     fn a_missing_parameter_is_a_params_error() {
         let r = rig("params");
         assert_eq!(
-            call(&r, r#"{"id":1,"method":"sources.set","params":{"match_key":"x"}}"#)
-                .unwrap_err()
-                .code,
+            call(
+                &r,
+                r#"{"id":1,"method":"sources.set","params":{"match_key":"x"}}"#
+            )
+            .unwrap_err()
+            .code,
             "params"
         );
         assert_eq!(
@@ -1590,7 +1639,10 @@ mod tests {
         assert_eq!(done["data"]["removed"], 1);
         assert!(seen.iter().any(|e| e["ev"] == "op.progress"));
         // The purge names the rows, so a client drops exactly those.
-        let purge = seen.iter().find(|e| e["ev"] == "purge").expect("a purge event");
+        let purge = seen
+            .iter()
+            .find(|e| e["ev"] == "purge")
+            .expect("a purge event");
         assert_eq!(purge["data"]["ids"], serde_json::json!([seg]));
         assert_eq!(r.service.op_state(&op), Some(OpState::Done));
 
@@ -1601,10 +1653,20 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(call(&r, r#"{"id":4,"method":"delete.preview"}"#).unwrap()["segments"], 0);
-        assert!(path.exists(), "soft delete keeps the audio until the sweeper");
         assert_eq!(
-            r.service.store().expired_soft_deletes(i64::MAX).unwrap().len(),
+            call(&r, r#"{"id":4,"method":"delete.preview"}"#).unwrap()["segments"],
+            0
+        );
+        assert!(
+            path.exists(),
+            "soft delete keeps the audio until the sweeper"
+        );
+        assert_eq!(
+            r.service
+                .store()
+                .expired_soft_deletes(i64::MAX)
+                .unwrap()
+                .len(),
             1
         );
         let _ = seg;
@@ -1647,9 +1709,12 @@ mod tests {
         assert!(events(&r).is_empty());
 
         assert_eq!(
-            call(&r, r#"{"id":2,"method":"events.since","params":{"seq":9999}}"#)
-                .unwrap_err()
-                .code,
+            call(
+                &r,
+                r#"{"id":2,"method":"events.since","params":{"seq":9999}}"#
+            )
+            .unwrap_err()
+            .code,
             "resync"
         );
     }

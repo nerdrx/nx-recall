@@ -42,11 +42,7 @@ impl Server {
         }
         // Wake the blocking `accept` with a connection that goes nowhere.
         let _ = UnixStream::connect(&self.path);
-        let handle = self
-            .accept
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
+        let handle = self.accept.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(h) = handle {
             let _ = h.join();
         }
@@ -74,12 +70,19 @@ pub fn serve(service: Arc<Service>, path: &Path) -> Result<Server> {
         // system without an XDG runtime dir the parent is ours to lock down.
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
+    // sockaddr_un caps unix socket paths at ~107 bytes; the raw bind error
+    // ("path must be shorter than SUN_LEN") explains nothing, so say it here.
+    if path.as_os_str().len() > 107 {
+        anyhow::bail!(
+            "socket path is {} bytes, over the unix limit of 107: {} — set a shorter \
+             path via NXR_SOCKET or [socket].path",
+            path.as_os_str().len(),
+            path.display()
+        );
+    }
     if path.exists() {
         if UnixStream::connect(path).is_ok() {
-            anyhow::bail!(
-                "another recalld is already listening on {}",
-                path.display()
-            );
+            anyhow::bail!("another recalld is already listening on {}", path.display());
         }
         debug!(path = %path.display(), "removing a socket left by a previous run");
         std::fs::remove_file(path)
@@ -178,7 +181,10 @@ fn read_loop(service: &Arc<Service>, client: &Arc<Client>, stream: UnixStream) -
         }
 
         match proto::parse(&line) {
-            Incoming::Hello { proto: p, client: name } => {
+            Incoming::Hello {
+                proto: p,
+                client: name,
+            } => {
                 if greeted {
                     // A second hello is a confused client, not a fatal fault.
                     client.send(Arc::new(proto::fatal("handshake", "already greeted")));
@@ -267,10 +273,8 @@ mod tests {
     }
 
     fn rig(name: &str) -> Rig {
-        let dir = std::env::temp_dir().join(format!(
-            "nx-recall-server-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nx-recall-server-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir).unwrap();
@@ -326,8 +330,15 @@ mod tests {
     #[test]
     fn the_socket_is_owner_only() {
         let r = rig("mode");
-        let mode = std::fs::metadata(r.server.path()).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "the socket must not be world-reachable");
+        let mode = std::fs::metadata(r.server.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the socket must not be world-reachable"
+        );
     }
 
     #[test]
@@ -339,7 +350,12 @@ mod tests {
         assert_eq!(w["welcome"]["proto"], 1);
         assert_eq!(w["welcome"]["schema"], crate::store::SCHEMA_VERSION);
         assert_eq!(w["welcome"]["seq"], 0);
-        assert!(w["welcome"]["daemon"].as_str().unwrap().starts_with("recalld/"));
+        assert!(
+            w["welcome"]["daemon"]
+                .as_str()
+                .unwrap()
+                .starts_with("recalld/")
+        );
     }
 
     #[test]

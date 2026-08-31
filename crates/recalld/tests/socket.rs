@@ -75,7 +75,8 @@ impl Drop for Daemon {
 
 impl Daemon {
     fn start(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("nx-recall-sock-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nx-recall-sock-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("creating the throwaway data dir");
 
@@ -98,10 +99,14 @@ impl Daemon {
         let session = store.begin_session(source, 0).unwrap();
         let store = Arc::new(Mutex::new(store));
 
-        let control = Control::new(dir.clone(), None, &Allowlist::from_rules([("fixtures", true)]))
-            // `speakers.split` re-clusters a voicebank, so the socket needs the
-            // same operating point the pipeline labelled with.
-            .with_identity(cfg.identity.clone());
+        let control = Control::new(
+            dir.clone(),
+            None,
+            &Allowlist::from_rules([("fixtures", true)]),
+        )
+        // `speakers.split` re-clusters a voicebank, so the socket needs the
+        // same operating point the pipeline labelled with.
+        .with_identity(cfg.identity.clone());
         let bus = Bus::new(cfg.socket.replay_events, cfg.socket.client_outbox);
         let service = Service::new(Arc::clone(&store), Arc::clone(&control), Arc::clone(&bus));
         let socket = dir.join("nx-recall.sock");
@@ -141,7 +146,12 @@ impl Daemon {
     }
 
     fn segment_rows(&self) -> usize {
-        self.store.lock().unwrap().transcript(None, None).unwrap().len()
+        self.store
+            .lock()
+            .unwrap()
+            .transcript(None, None)
+            .unwrap()
+            .len()
     }
 
     fn wav_count(&self) -> usize {
@@ -311,14 +321,20 @@ fn a_subscribed_client_receives_stored_segments_with_sequence_numbers() {
     let mut d = Daemon::start("segments");
     let mut c = d.connect();
     let welcome = c.hello();
-    assert_eq!(welcome["seq"], 0, "a fresh daemon starts the stream at zero");
+    assert_eq!(
+        welcome["seq"], 0,
+        "a fresh daemon starts the stream at zero"
+    );
     c.subscribe(&["segments"]);
 
     let ids = d.ingest("clean_single_0.wav");
     assert!(!ids.is_empty(), "the fixture must produce segments");
 
     let ev = c.wait_event("segment");
-    assert!(ev["seq"].as_u64().unwrap() >= 1, "every event carries a seq");
+    assert!(
+        ev["seq"].as_u64().unwrap() >= 1,
+        "every event carries a seq"
+    );
     assert_eq!(ev["data"]["id"], ids[0]);
     assert_eq!(ev["data"]["session"], d.session);
     if d.analyzer.is_some() {
@@ -376,7 +392,9 @@ fn a_rename_is_broadcast_to_every_connected_client_with_one_seq() {
             Some(id) => id,
             None => {
                 let id = store.mint_speaker(0).unwrap();
-                store.set_segment_speaker(ids[0], Some(id), Some(0.5)).unwrap();
+                store
+                    .set_segment_speaker(ids[0], Some(id), Some(0.5))
+                    .unwrap();
                 id
             }
         }
@@ -446,7 +464,9 @@ fn a_false_merge_is_undone_by_a_split_and_every_client_hears_about_it() {
         }
         let mut best: Vec<(i64, usize)> = counts.into_iter().collect();
         best.sort_by_key(|(id, n)| (std::cmp::Reverse(*n), *id));
-        best.first().map(|(id, _)| *id).expect("the fixture was labelled")
+        best.first()
+            .map(|(id, _)| *id)
+            .expect("the fixture was labelled")
     }
 
     let before = speaker_of(&mut c);
@@ -458,7 +478,11 @@ fn a_false_merge_is_undone_by_a_split_and_every_client_hears_about_it() {
     c.call("speakers.merge", json!({"from": b, "into": a}));
     let merged = speaker_of(&mut c);
     assert_eq!(dominant(&merged, &ines), a);
-    assert_eq!(dominant(&merged, &wren), a, "the merge really did collapse them");
+    assert_eq!(
+        dominant(&merged, &wren),
+        a,
+        "the merge really did collapse them"
+    );
     c.drain();
 
     let out = c.call("speakers.split", json!({"id": a}));
@@ -475,7 +499,10 @@ fn a_false_merge_is_undone_by_a_split_and_every_client_hears_about_it() {
     let after = speaker_of(&mut c);
     let split_a = dominant(&after, &ines);
     let split_b = dominant(&after, &wren);
-    assert_ne!(split_a, split_b, "the split did not separate the two voices");
+    assert_ne!(
+        split_a, split_b,
+        "the split did not separate the two voices"
+    );
     assert!(
         [split_a, split_b].contains(&a) && [split_a, split_b].contains(&minted),
         "the two halves are the kept id and the minted one, got {split_a} and {split_b}"
@@ -658,7 +685,11 @@ fn pause_stops_every_write_and_resume_starts_them_again() {
     let during = d.ingest("clean_single_1.wav");
     assert!(during.is_empty(), "a paused pipeline stores no segments");
     assert_eq!(d.segment_rows(), rows_before, "no new rows while paused");
-    assert_eq!(d.wav_count(), files_before, "no new audio files while paused");
+    assert_eq!(
+        d.wav_count(),
+        files_before,
+        "no new audio files while paused"
+    );
     let events = c.drain();
     assert!(
         !events.iter().any(|e| e["ev"] == "segment"),
@@ -757,7 +788,10 @@ fn a_bulk_delete_runs_as_an_operation_with_progress_and_a_terminal_event() {
     let done = c.wait_event("op.done");
     assert_eq!(done["data"]["op"], op.as_str());
     assert_eq!(done["data"]["kind"], "delete.run");
-    assert_eq!(done["data"]["removed"].as_u64().unwrap() as usize, ids.len());
+    assert_eq!(
+        done["data"]["removed"].as_u64().unwrap() as usize,
+        ids.len()
+    );
 
     // Soft delete: gone from the read paths, audio still on disk for the undo
     // window the sweeper enforces.
@@ -829,7 +863,10 @@ fn an_unnamed_voice_is_distinguishable_from_a_named_one() {
     c.hello();
     let (a, b) = {
         let store = d.store.lock().unwrap();
-        (store.mint_speaker(0).unwrap(), store.mint_speaker(0).unwrap())
+        (
+            store.mint_speaker(0).unwrap(),
+            store.mint_speaker(0).unwrap(),
+        )
     };
 
     c.call("speakers.name", json!({"id": b, "name": "Ines"}));
@@ -871,12 +908,18 @@ fn sources_report_what_they_are_when_they_were_seen_and_whether_they_are_live() 
 
     // Denying it stops counting it as capturing without touching the session
     // rows — the live rule is what the status line reports.
-    c.call("sources.set", json!({"match_key": "fixtures", "allowed": false}));
+    c.call(
+        "sources.set",
+        json!({"match_key": "fixtures", "allowed": false}),
+    );
     let status = c.call("status", json!({}));
     assert_eq!(status["sources_allowed"], 0);
     assert_eq!(status["sources_capturing"], 0);
 
-    c.call("sources.set", json!({"match_key": "fixtures", "allowed": true}));
+    c.call(
+        "sources.set",
+        json!({"match_key": "fixtures", "allowed": true}),
+    );
     let status = c.call("status", json!({}));
     assert_eq!(status["sources_allowed"], 1);
     assert_eq!(status["sources_capturing"], 1);
@@ -913,7 +956,10 @@ fn a_restarted_daemon_starts_its_sequence_over_and_says_so() {
 
     let mut after = d.connect();
     let welcome = after.hello();
-    assert_eq!(welcome["seq"], 0, "a restarted daemon counts from zero again");
+    assert_eq!(
+        welcome["seq"], 0,
+        "a restarted daemon counts from zero again"
+    );
     after.subscribe(&["segments"]);
     let ids = d.ingest("clean_single_1.wav");
     let ev = after.wait_event("segment");
@@ -977,7 +1023,14 @@ fn interop_daemon() {
 
     println!("interop daemon on {}", d.socket.display());
     println!("data dir {}", d.dir.display());
-    println!("models: {}", if d.analyzer.is_some() { "loaded" } else { "none" });
+    println!(
+        "models: {}",
+        if d.analyzer.is_some() {
+            "loaded"
+        } else {
+            "none"
+        }
+    );
 
     let fixtures = [
         "clean_single_0.wav",

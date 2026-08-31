@@ -584,13 +584,15 @@ fn cmd_transcript(data_dir: &Path, session: Option<i64>, speaker: Option<&str>) 
 /// other two are the tray dropdown and the GUI, both of which speak the same
 /// socket method.
 fn cmd_pause(cfg: &Config, data_dir: &Path, pause: bool) -> Result<()> {
-    let out = call(cfg, data_dir, if pause { "pause" } else { "resume" }, json!({}))?;
+    let out = call(
+        cfg,
+        data_dir,
+        if pause { "pause" } else { "resume" },
+        json!({}),
+    )?;
     let paused = out["paused"].as_bool().unwrap_or(pause);
     if out["changed"].as_bool() == Some(false) {
-        println!(
-            "Already {}.",
-            if paused { "paused" } else { "running" }
-        );
+        println!("Already {}.", if paused { "paused" } else { "running" });
     } else if paused {
         println!("Paused. Capture keeps running; nothing is written until `recalld resume`.");
     } else {
@@ -602,7 +604,11 @@ fn cmd_pause(cfg: &Config, data_dir: &Path, pause: bool) -> Result<()> {
 fn cmd_status(cfg: &Config, data_dir: &Path) -> Result<()> {
     let s = call(cfg, data_dir, "status", json!({}))?;
     println!("{:<18}{}", "daemon", s["daemon"].as_str().unwrap_or("?"));
-    println!("{:<18}{}", "uptime", format_duration(s["uptime_s"].as_i64().unwrap_or(0) * 1_000_000_000));
+    println!(
+        "{:<18}{}",
+        "uptime",
+        format_duration(s["uptime_s"].as_i64().unwrap_or(0) * 1_000_000_000)
+    );
     println!(
         "{:<18}{}",
         "state",
@@ -651,7 +657,11 @@ fn cmd_status(cfg: &Config, data_dir: &Path) -> Result<()> {
         s["clients"].as_i64().unwrap_or(0),
         s["seq"].as_i64().unwrap_or(0)
     );
-    println!("{:<18}{}", "roster", s["roster_present"].as_i64().unwrap_or(0));
+    println!(
+        "{:<18}{}",
+        "roster",
+        s["roster_present"].as_i64().unwrap_or(0)
+    );
     Ok(())
 }
 

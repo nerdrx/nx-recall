@@ -425,7 +425,10 @@ pub fn publish_segment(bus: &Bus, store: &Store, segment_id: i64) {
                 crate::service::segment_json(&row),
             );
         }
-        Ok(None) => warn!(segment_id, "a segment vanished between writing and announcing it"),
+        Ok(None) => warn!(
+            segment_id,
+            "a segment vanished between writing and announcing it"
+        ),
         Err(e) => warn!(segment_id, "could not read back a stored segment: {e:#}"),
     }
 }

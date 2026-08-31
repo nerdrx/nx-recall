@@ -75,7 +75,11 @@ pub struct OfflinePipeline<'a> {
 
 impl<'a> OfflinePipeline<'a> {
     /// The plain form: segment and analyse, announce nothing, pause nothing.
-    pub fn new(vad: &'a mut SileroVad, cfg: &'a Config, analyzer: Option<&'a mut Analyzer>) -> Self {
+    pub fn new(
+        vad: &'a mut SileroVad,
+        cfg: &'a Config,
+        analyzer: Option<&'a mut Analyzer>,
+    ) -> Self {
         Self {
             vad,
             cfg,
