@@ -24,6 +24,11 @@ const STATUS_POLL_MS = 3000;
 
 app.setName('NX Recall');
 
+// No native menu bar: Electron's default one is a grey strip of File/Edit/View
+// that belongs to no design system, and this app has no menu commands — the
+// rail navigates and the tray quits.
+Menu.setApplicationMenu(null);
+
 let win = null;
 let tray = null;
 let client = null;

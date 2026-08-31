@@ -164,6 +164,17 @@ test('a daemon whose sequence went backwards is treated as a restart', async () 
     mock.restart(1); // fresh counter, every client dropped
     const res = await waitFor(client, 'resync', 8000);
     assert.equal(res.reason, 'daemon-restart');
+
+    // And the stream actually resumes. Without rebasing lastSeq onto the
+    // daemon's new position, every low-numbered event after the restart looks
+    // like a replay duplicate and is dropped — the client stays connected and
+    // silently shows nothing, which is the worst possible failure here.
+    assert.ok(client.lastSeq <= 1, `lastSeq was not rebased (${client.lastSeq})`);
+    const after = [];
+    client.on('event', (e) => after.push(e.seq));
+    mock.emit('segments', 'segment', { id: 42, text: 'after the restart' });
+    await sleep(120);
+    assert.deepEqual(after, [2]);
   } finally {
     client.close();
     mock.close();

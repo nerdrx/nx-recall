@@ -287,7 +287,54 @@ export function runE2E(deps) {
       return { text: text.slice(0, 120) };
     });
 
-    // 14 — the app lives in the tray: closing the window hides it, does not
+    // 14 — the daemon dies and comes back with a reset counter. This is the
+    // case DESIGN §2 is written for: the client must notice, re-run its
+    // queries, and end up showing the truth again — without being restarted.
+    if (process.env.NX_RECALL_MOCK_PID) {
+      await step('survives-daemon-restart', async () => {
+        await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+        await waitFor('transcript rows', async () => js('document.querySelectorAll("#seg-list .seg").length > 0'));
+        const before = (await js('window.__recallDebug.counts()')).rows;
+        const seqBefore = deps.getUi().conn.seq;
+
+        process.kill(Number(process.env.NX_RECALL_MOCK_PID), 'SIGUSR1');
+        await waitFor('the connection to drop', async () => deps.getUi().conn.status !== 'connected', { timeout: 8000 });
+        await waitFor('the reconnect', async () => deps.getUi().conn.status === 'connected', { timeout: 20000 });
+
+        // The user is told, and the views are rebuilt from queries rather than
+        // patched from a gap that no longer exists.
+        const told = await waitFor(
+          'the restart notice',
+          async () => js('[...document.querySelectorAll(".toast")].some(t => /restarted/i.test(t.textContent))'),
+          { timeout: 6000 }
+        );
+        const after = await waitFor(
+          'the views to reload',
+          async () => {
+            const c = await js('window.__recallDebug.counts()');
+            return c.rows > 0 && c.speakers > 0 ? c : null;
+          },
+          { timeout: 15000 }
+        );
+        assert(told, 'the user was never told the daemon restarted');
+
+        // The live feed has to actually resume. This is the assertion that
+        // caught the client holding its pre-restart sequence number and
+        // discarding the restarted daemon's whole stream as duplicates.
+        const resumed = await waitFor(
+          'the feed after the restart',
+          async () => {
+            const n = (await js('window.__recallDebug.counts()')).rows;
+            return n > after.rows ? n : null;
+          },
+          { timeout: 15000 }
+        );
+        return { before, after: after.rows, resumed, seqBefore, seqAfter: deps.getUi().conn.seq };
+      });
+      await step('shot-after-restart', async () => ({ file: await shot('after-restart') }));
+    }
+
+    // 15 — the app lives in the tray: closing the window hides it, does not
     // quit, and does not take the pause switch away with it (DESIGN §8).
     await step('tray-works-with-window-closed', async () => {
       const w = win();

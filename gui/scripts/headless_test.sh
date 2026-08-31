@@ -70,7 +70,9 @@ if [[ $EXPOSE -eq 1 ]]; then
 fi
 APP_ARGS+=("${ARGS[@]+"${ARGS[@]}"}")
 
-ENVS=(NX_RECALL_SOCK="$MOCK_SOCK" NX_RECALL_E2E_OUT="$PWD/$OUT")
+# The driver signals the mock (SIGUSR1) to fake a daemon restart, so it needs
+# the pid. Nothing else in the app ever learns it.
+ENVS=(NX_RECALL_SOCK="$MOCK_SOCK" NX_RECALL_E2E_OUT="$PWD/$OUT" NX_RECALL_MOCK_PID="$MOCK_PID")
 if [[ $HOLD -eq 1 ]]; then
     ENVS+=(NX_RECALL_E2E=0)
 else

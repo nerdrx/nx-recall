@@ -125,12 +125,17 @@ export class RecallClient extends EventEmitter {
 
     if (prior == null) {
       // First connection of this session: nothing to catch up, everything to load.
+      this._rebaseSeq(welcome.seq);
       this._finishCatchup();
       this.emit('resync', { reason: 'first-connect' });
       return;
     }
     if (typeof welcome.seq === 'number' && welcome.seq < prior) {
       // Sequence went backwards → the daemon restarted and its counter reset.
+      // Rebasing is not cosmetic: _applyEvent drops anything at or below
+      // lastSeq as a replay duplicate, so keeping the pre-restart number would
+      // silently swallow the whole new stream until it climbed back past it.
+      this._rebaseSeq(welcome.seq);
       this._finishCatchup();
       this.emit('resync', { reason: 'daemon-restart' });
       return;
@@ -142,9 +147,25 @@ export class RecallClient extends EventEmitter {
       this._finishCatchup();
       this.emit('caughtup', { from: prior, to: this.lastSeq, replayed: evts.length });
     } catch (e) {
+      // The gap is unrecoverable, so the client re-queries from the daemon's
+      // current position rather than trying to resume from a lost one.
+      this._rebaseSeq(welcome.seq);
       this._finishCatchup();
       this.emit('resync', { reason: e?.code === 'resync' ? 'replay-buffer-overrun' : `events.since failed: ${e.message}` });
     }
+  }
+
+  // Adopt the daemon's sequence position. Queued live events that are already
+  // ahead of it survive; anything at or below it is history we are about to
+  // re-query anyway.
+  _rebaseSeq(seq) {
+    if (typeof seq !== 'number') return;
+    this.lastSeq = seq;
+    this.queued = this.queued.filter((e) => typeof e.seq !== 'number' || e.seq > seq);
+    // The last `state` was emitted before we knew the daemon's position, so
+    // anything showing seq (the status footer, the e2e report) would otherwise
+    // keep quoting the pre-restart number.
+    if (this.status === 'connected') this._setState('connected');
   }
 
   _finishCatchup() {
