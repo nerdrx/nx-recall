@@ -2,7 +2,7 @@
  "seed": 61822,
  "sample_rate": 16000,
  "source": "LibriSpeech dev-clean (CC-BY 4.0)",
- "note": "Regression goldens: run the pipeline, diff against `expect`. duo_equal/lobby_equal MUST be refused by the overlap gate \u2014 labelling them 'correctly' by luck is still a fail. Segments shorter than the detector's 10 s window MUST be tile-padded (repeat the segment), never zero-padded: zero padding shifts the model's chunk normalisation and inflates overlap_frac on short dominant-speaker audio (measured: 0.914 -> 0.000).",
+ "note": "Regression goldens: run the pipeline, diff against `expect`. duo_equal/lobby_equal MUST be refused by the overlap gate \u2014 labelling them 'correctly' by luck is still a fail. Segments shorter than the detector's 10 s window MUST be fed at their real length (the export's time axis is dynamic), never zero-padded (padding shifts chunk normalisation: a 1.8 s dominant turn reads 0.914 padded vs 0.000 native) and never tile-padded (fabricated periodicity un-flags dense equal babble: lobby_equal_0 reads 0.000 tiled vs 1.000 native).",
  "fixtures": [
   {
    "file": "clean_single_0.wav",
