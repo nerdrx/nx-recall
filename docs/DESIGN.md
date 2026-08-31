@@ -195,10 +195,11 @@ preview; soft-delete undo window; panic-delete; source blocklist), plus:
   operation handles with progress events** — a multi-second purge must not block
   every client.
 - Global pause stays first-class — instant, zero writes — but ~~"global pause
-  hotkey — non-negotiable"~~ is relaxed per the user: the *pause primitive* is
-  required, a hotkey binding is not. Reachable via `recalld pause` (CLI), the GUI,
-  and the tray tile; a Wayland GlobalShortcuts binding is an optional nicety, off
-  the critical path, and the fullscreen-VRChat portal spike is no longer a blocker.
+  hotkey — non-negotiable"~~ is removed per the user: **pause surfaces are the tray
+  dropdown and the GUI** (plus `recalld pause` for scripts), and that is the whole
+  requirement. No hotkey, no Wayland GlobalShortcuts spike, no in-world trigger.
+  For anything said before a pause: panic-delete-last-N-minutes and retention
+  limits cover it after the fact.
 - Socket: `$XDG_RUNTIME_DIR/nx-recall.sock`, mode 0600.
 - At-rest encryption: **honestly scoped.** A user-service that autostarts cannot
   prompt for a passphrase, so a local key would be theater against filesystem
