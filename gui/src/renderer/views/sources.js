@@ -7,8 +7,8 @@
 // can still be pre-denied here, which is the only way to deny something before
 // it ever makes a sound (DESIGN §3).
 
-import { h, clear, fmtDate, speakerHue } from '../lib/dom.js';
-import { store, ask } from '../lib/store.js';
+import { h, svg, clear, fmtDate, speakerHue } from '../lib/dom.js';
+import { store, ask, applyMic, micChip } from '../lib/store.js';
 import { toast } from '../lib/sheets.js';
 
 export const id = 'sources';
@@ -16,9 +16,14 @@ export const id = 'sources';
 export function mount(root, ctx) {
   const list = h('div', { id: 'source-list' });
   const sub = h('span', { class: 'sub', id: 'sources-sub' });
+  const micCard = h('div', { class: 'card mic-card', id: 'mic-card' });
   const body = h(
     'div',
     { class: 'view-body view-enter' },
+    // The microphone sits ABOVE the app list, because it is the one source
+    // whose consent question is different in kind: an app rule is about a
+    // program's output, this is about the room.
+    micCard,
     h(
       'div',
       { class: 'card' },
@@ -37,9 +42,113 @@ export function mount(root, ctx) {
     body
   );
 
+  // -- the microphone -------------------------------------------------------
+
+  let micPending = false;
+
+  function renderMic() {
+    const mic = store.mic;
+    const chip = micChip(mic.state);
+    clear(micCard);
+
+    const toggle = h('button', {
+      class: 'toggle',
+      role: 'switch',
+      id: 'mic-toggle',
+      'aria-pressed': String(!!mic.enabled),
+      'aria-label': mic.enabled ? 'Turn the microphone off' : 'Turn the microphone on',
+      disabled: micPending || store.conn.status !== 'connected',
+      onclick: () => setMic({ enabled: !mic.enabled }),
+    });
+
+    const mode = (value, label, hint) =>
+      h(
+        'button',
+        {
+          class: 'mode-opt',
+          dataset: { mode: value },
+          'aria-pressed': String(mic.mode === value),
+          disabled: micPending || !mic.enabled,
+          onclick: () => setMic({ mode: value }),
+        },
+        h('b', { text: label }),
+        h('small', { text: hint })
+      );
+
+    micCard.append(
+      h(
+        'div',
+        { class: 'mic-head' },
+        h(
+          'span',
+          { class: 'mic-ico', 'aria-hidden': 'true' },
+          svg('M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3M5 11a7 7 0 0 0 14 0M12 18v3', 18)
+        ),
+        h(
+          'span',
+          { class: 'mic-title' },
+          h('span', { class: 'name', text: 'Microphone' }),
+          h('span', { class: 'key', text: mic.device ?? 'system default input' })
+        ),
+        h('span', { class: 'spacer' }),
+        h('span', { class: chip.cls, id: 'mic-chip' }, h('span', { class: `dot${chip.live ? ' pulse' : ''}` }), chip.text),
+        toggle
+      ),
+      // The one sentence that has to be unmissable. It is not a caveat about
+      // the feature — it IS the feature's shape.
+      h('p', {
+        class: 'mic-warn',
+        id: 'mic-warning',
+        text: 'Your microphone hears the room, not the game. Anyone speaking near you is recorded and transcribed, whether or not they are in the instance.',
+      }),
+      h(
+        'div',
+        { class: 'mic-modes', id: 'mic-modes', role: 'group', 'aria-label': 'When the microphone records' },
+        mode('follow', 'Follow allowed apps', 'Only while something in the list below is being captured.'),
+        mode('always', 'Always', 'Whenever NX Recall is running.')
+      ),
+      h('p', {
+        class: 'rail-hint',
+        style: 'padding:8px 0 0;max-width:64ch',
+        text: 'Your own voice is labelled from where it came, not from a guess — it needs no naming and it enrols itself.',
+      })
+    );
+  }
+
+  async function setMic(change) {
+    const before = { ...store.mic };
+    // Optimistic, like the source toggles: the daemon confirms with a `mic`
+    // event and a `status` push, and a failure puts it back.
+    applyMic(change);
+    micPending = true;
+    renderMic();
+    try {
+      applyMic(await ask('mic.set', change));
+      toast(
+        store.mic.enabled
+          ? `Microphone on — ${store.mic.mode === 'always' ? 'recording whenever NX Recall runs' : 'recording only while an allowed app is captured'}.`
+          : 'Microphone off. Nothing from the room is recorded.',
+        'ok'
+      );
+    } catch (e) {
+      store.mic = before;
+      toast(`Could not change the microphone — ${e.message}`, 'error');
+    } finally {
+      micPending = false;
+      renderMic();
+    }
+  }
+
+  // -- the applications -----------------------------------------------------
+
   function render() {
+    renderMic();
     clear(list);
-    const rows = [...store.sources].sort((a, b) => Number(b.allowed) - Number(a.allowed) || String(a.display ?? a.match_key).localeCompare(String(b.display ?? b.match_key)));
+    // The microphone has its own card above; it must not also appear as a row
+    // in a list whose every other entry is opted in through the allowlist.
+    const rows = [...store.sources]
+      .filter((s) => s.kind !== 'mic')
+      .sort((a, b) => Number(b.allowed) - Number(a.allowed) || String(a.display ?? a.match_key).localeCompare(String(b.display ?? b.match_key)));
     const allowed = rows.filter((s) => s.allowed).length;
     sub.textContent = `${allowed} allowed · ${rows.length - allowed} denied`;
     const badge = document.getElementById('badge-sources');
@@ -124,6 +233,7 @@ export function mount(root, ctx) {
   void ctx;
   return {
     update(change) {
+      if (change?.mic || change?.conn) renderMic();
       if (change?.sources || change?.status) render();
     },
     render,

@@ -101,6 +101,35 @@ independent of output device. Implemented and verified in Step 1.
 - Clock: stamp at capture with CLOCK_MONOTONIC; store UTC nanoseconds; never stamp
   at transcription time.
 
+### 3a. The microphone (added 0.6.0)
+
+One source is not an application: the user's own default input. Same mechanism —
+an input-direction stream — aimed at an `Audio/Source` node instead of a
+`Stream/Output/Audio` one, resampled and stamped through the identical callbacks
+so a mic turn and a VRChat turn sit on one clock. Three differences, all
+deliberate, and **the ordering is the feature**:
+
+- **Off by default, and not an allowlist rule.** An app rule is consent about one
+  program's output; a microphone picks up the room, including people who never
+  joined the instance. It gets `[mic]`, its own switch, and its own UI copy saying
+  so out loud. `sources.set` refuses the `mic` key rather than letting the two
+  halves of the config disagree about a consent decision.
+- **`follow` is the default mode**: the tap is open exactly while at least one
+  allowed application is being captured, so the mic's lifetime is a conversation's
+  rather than the daemon's. VRChat opening opens it; the last allowed app closing
+  closes it, inside the 250 ms rule-poll tick. `always` is a deliberate second
+  choice.
+- **It follows the default source** (watched on the `default` metadata object's
+  `default.audio.source`) instead of pinning to one node. An app tap that
+  reconnected would silently record a different *program*; a mic tap that
+  reconnects records the same *person* on a different headset. A device change
+  reopens the session, so provenance never spans two microphones. `[mic].device`
+  pins one node for machines with several, and an absent pin is an error rather
+  than a silent fallback.
+
+Global pause covers it like everything else — enforced in the pipeline, where every
+other write is, rather than by tearing down a stream.
+
 ## 4. Inference
 
 All ONNX, no torch, models fetched on first run into the data dir (~700 MB default
@@ -142,6 +171,19 @@ prototypes capped ~20/speaker, diverse. Unchanged in shape; recalibrated in numb
 - **Auto-enrollment is never gated on match score alone.** The score cannot see the
   case where it is confidently wrong (§1). The overlap gate is the independent
   signal; mic loopback and push-to-talk boundaries add more when available.
+- **Mic loopback is a free perfect label, and it is provenance, not a match**
+  (implemented 0.6.0). A turn off the user's own microphone skips the voicebank
+  entirely and carries the pinned "You" speaker with `match_score` NULL — a score
+  would claim a comparison that never happened. The *overlap gate still runs*:
+  speakers-bleed is real, and a segment whose name is certain can still have audio
+  that is not, so `overlap_frac` is stored either way and the UI can distrust the
+  audio without distrusting the name. Enrolment keeps the same overlap and duration
+  gates the matching leg has, minus the two that are about identifying, and the
+  first few qualifying turns (longest, capped) are also written as golden samples.
+  That is the payoff: one voice the daemon can be certain about, enrolled for free.
+  The pin lives in `settings` so it survives a restart, and it **follows a merge** —
+  merging "You" into a named voice re-points it at the target rather than minting a
+  second user.
 - ~~"ECAPA wants ~3s+"~~ → **1 s suffices for labeling** (96% coverage, 2.5% EER);
   proximity-inheritance for sub-second utterances is a nicety, not a mechanism.
 - Turn merging (≤ 1.5 s gaps) before embedding: measured free win.
@@ -160,6 +202,10 @@ every row), with these additions:
 
 - `segments.overlap_frac` and `segments.match_score` — the correction UI needs to
   know which labels to distrust; both come free from the pipeline.
+- v4: `sources.kind` (`"app"` | `"mic"`, backfilled to `"app"`) and `settings`, the
+  key/value table that pins the "You" speaker. Golden samples for that speaker live
+  under `goldens/`, not `segments/` — the retention sweeper walks the latter, so
+  being retention-exempt costs the sweeper no special case at all.
 - `session_roster(session_id, display_name, joined_at, left_at)` — the roster is
   load-bearing for candidate pruning and the Orbit name-picker, so it must be stored,
   not just observed live.

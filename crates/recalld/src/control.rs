@@ -11,16 +11,22 @@
 //! - **The allowlist** is read by the PipeWire thread, which cannot be called
 //!   into from outside its loop. It polls a generation counter instead, so
 //!   `sources.set` attaches or detaches a capture without a restart.
+//! - **The microphone switch** is the same story with a second counter, plus
+//!   one flag going the other way: the capture thread is the only thing that
+//!   knows whether the mic stream is really open, and `status` has to be able
+//!   to say so.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use serde_json::{Value, json};
+
 use crate::allowlist::Allowlist;
 use crate::analysis::AnalysisStats;
 use crate::clock::utc_now_ns;
-use crate::config::IdentityConfig;
+use crate::config::{IdentityConfig, MicConfig, MicMode};
 use crate::pipeline::Stats;
 use crate::queue::EventQueue;
 
@@ -31,6 +37,14 @@ pub struct Control {
     /// Bumped on every rule change. The capture loop compares it against what
     /// it last applied; equal means there is nothing to do.
     rules_gen: AtomicU64,
+    /// The microphone switch, live. Separate from `rules` on purpose: the mic
+    /// is not an application and is deliberately not expressible as one.
+    mic: Mutex<MicConfig>,
+    mic_gen: AtomicU64,
+    /// Set by the capture thread when the mic stream is open. Read by `status`
+    /// — "enabled" and "recording right now" are different facts and follow
+    /// mode is the whole reason they differ.
+    mic_active: AtomicBool,
     started_at_ns: i64,
     /// Where `sources.set` persists a rule, so a toggle survives a restart.
     pub config_path: Option<PathBuf>,
@@ -52,6 +66,9 @@ impl Control {
             paused_since_ns: AtomicU64::new(0),
             rules: Mutex::new(rules.as_map()),
             rules_gen: AtomicU64::new(0),
+            mic: Mutex::new(MicConfig::default()),
+            mic_gen: AtomicU64::new(0),
+            mic_active: AtomicBool::new(false),
             started_at_ns: utc_now_ns(),
             config_path,
             data_dir,
@@ -69,6 +86,14 @@ impl Control {
     pub fn with_identity(mut self: Arc<Self>, identity: IdentityConfig) -> Arc<Self> {
         let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
         this.identity = identity;
+        self
+    }
+
+    /// The configured microphone switch. Set before the handle is shared, like
+    /// the rest of the wiring.
+    pub fn with_mic(mut self: Arc<Self>, mic: MicConfig) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
+        *this.mic.get_mut().unwrap_or_else(|p| p.into_inner()) = mic;
         self
     }
 
@@ -145,6 +170,74 @@ impl Control {
         self.rules.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    // ---- microphone ------------------------------------------------------
+
+    pub fn mic(&self) -> MicConfig {
+        self.mic.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Flip the switch, or the mode, or both. Returns the resulting config so
+    /// the caller answers with what is true rather than with what it asked for.
+    pub fn set_mic(&self, enabled: Option<bool>, mode: Option<MicMode>) -> MicConfig {
+        let mut guard = self.mic.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = enabled {
+            guard.enabled = e;
+        }
+        if let Some(m) = mode {
+            guard.mode = m;
+        }
+        let out = guard.clone();
+        drop(guard);
+        self.mic_gen.fetch_add(1, Ordering::SeqCst);
+        out
+    }
+
+    pub fn mic_generation(&self) -> u64 {
+        self.mic_gen.load(Ordering::SeqCst)
+    }
+
+    /// The capture thread reporting whether the mic stream is actually open.
+    pub fn set_mic_active(&self, active: bool) {
+        self.mic_active.store(active, Ordering::SeqCst);
+    }
+
+    pub fn mic_active(&self) -> bool {
+        self.mic_active.load(Ordering::SeqCst)
+    }
+
+    /// The one string `status` carries. Five states, and the pair that matters
+    /// is `following:idle` vs `following:active`: enabled but waiting for an
+    /// allowed application, versus recording the room right now.
+    ///
+    /// `always:idle` is the honest answer when the switch is on, the mode is
+    /// `always`, and the daemon still has not managed to open a device — a
+    /// missing microphone must not be able to read as "recording".
+    pub fn mic_state(&self) -> &'static str {
+        let cfg = self.mic();
+        if !cfg.enabled {
+            return "off";
+        }
+        match (cfg.mode, self.mic_active()) {
+            (MicMode::Follow, false) => "following:idle",
+            (MicMode::Follow, true) => "following:active",
+            (MicMode::Always, false) => "always:idle",
+            (MicMode::Always, true) => "always:active",
+        }
+    }
+
+    /// The mic block every client-facing payload embeds, in one place so the
+    /// `status` method, the `status` event and the `mic` event cannot drift.
+    pub fn mic_json(&self) -> Value {
+        let cfg = self.mic();
+        json!({
+            "enabled": cfg.enabled,
+            "mode": cfg.mode.as_str(),
+            "active": self.mic_active(),
+            "state": self.mic_state(),
+            "device": cfg.device_override(),
+        })
+    }
+
     // ---- status ----------------------------------------------------------
 
     pub fn uptime_s(&self) -> i64 {
@@ -197,6 +290,58 @@ mod tests {
         c.set_rule("VRChat.exe", false);
         assert!(c.rules_generation() > gen1);
         assert!(!c.allowlist().decide("VRChat.exe").captures());
+    }
+
+    #[test]
+    fn the_microphone_state_string_distinguishes_waiting_from_recording() {
+        let c = control();
+        // Off is off no matter what the capture thread last reported.
+        assert_eq!(c.mic_state(), "off");
+        c.set_mic_active(true);
+        assert_eq!(c.mic_state(), "off");
+        c.set_mic_active(false);
+
+        c.set_mic(Some(true), None);
+        assert_eq!(c.mic_state(), "following:idle");
+        c.set_mic_active(true);
+        assert_eq!(c.mic_state(), "following:active");
+
+        c.set_mic(None, Some(crate::config::MicMode::Always));
+        assert_eq!(c.mic_state(), "always:active");
+        // A microphone that will not open must not read as recording.
+        c.set_mic_active(false);
+        assert_eq!(c.mic_state(), "always:idle");
+
+        c.set_mic(Some(false), None);
+        assert_eq!(c.mic_state(), "off");
+    }
+
+    #[test]
+    fn a_mic_change_bumps_its_own_generation_not_the_rules_one() {
+        let c = control();
+        let rules0 = c.rules_generation();
+        let mic0 = c.mic_generation();
+
+        let after = c.set_mic(Some(true), Some(crate::config::MicMode::Always));
+        assert!(after.enabled);
+        assert_eq!(after.mode, crate::config::MicMode::Always);
+        assert!(c.mic_generation() > mic0);
+        // The microphone is not an allowlist rule and must never move one.
+        assert_eq!(c.rules_generation(), rules0);
+        assert!(!c.allowlist().as_map().contains_key("mic"));
+    }
+
+    #[test]
+    fn the_mic_payload_says_the_same_thing_the_state_string_does() {
+        let c = control();
+        c.set_mic(Some(true), None);
+        c.set_mic_active(true);
+        let v = c.mic_json();
+        assert_eq!(v["enabled"], serde_json::json!(true));
+        assert_eq!(v["mode"], serde_json::json!("follow"));
+        assert_eq!(v["active"], serde_json::json!(true));
+        assert_eq!(v["state"], serde_json::json!("following:active"));
+        assert_eq!(v["device"], serde_json::Value::Null);
     }
 
     #[test]

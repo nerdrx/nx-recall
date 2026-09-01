@@ -4,7 +4,7 @@
 // reassign/correct sheet (PROTOCOL segments.reassign / segments.correct).
 
 import { h, clear, fmtClock, fmtDay, fmtDayLabel, speakerColor } from '../lib/dom.js';
-import { store, speakerLabel, segmentSpeakerLabel, isUncertain, uncertainReason, ask } from '../lib/store.js';
+import { store, speakerLabel, segmentSpeakerLabel, isUncertain, uncertainReason, isYou, ask } from '../lib/store.js';
 import { openSheet, toast } from '../lib/sheets.js';
 import { play, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 
@@ -13,6 +13,7 @@ export const id = 'transcript';
 export function mount(root, ctx) {
   let follow = true;
   let filterSpeaker = null;
+  let lastYou = store.mic.you_speaker;
 
   const list = h('div', { class: 'seg-list', id: 'seg-list' });
   const card = h('div', { class: 'card' }, list);
@@ -113,9 +114,15 @@ export function mount(root, ctx) {
 
   function segRow(seg, isNew = false) {
     const uncertain = isUncertain(seg);
+    // The user's own voice, off their own microphone. The label did not come
+    // from a match, it came from where the audio arrived — so it is the one
+    // name in the transcript that is never a guess. Marked, not shouted: a
+    // filled dot and an underline on the name, no layout change, no colour of
+    // its own beyond the accent.
+    const mine = isYou(seg.speaker);
     const color = speakerColor(seg.speaker);
     const row = h('div', {
-      class: `seg${uncertain ? ' uncertain' : ''}${isNew ? ' new' : ''}${seg.corrected ? ' corrected' : ''}`,
+      class: `seg${uncertain ? ' uncertain' : ''}${mine ? ' you' : ''}${isNew ? ' new' : ''}${seg.corrected ? ' corrected' : ''}`,
       dataset: { seg: String(seg.id) },
       role: 'button',
       tabindex: '0',
@@ -128,7 +135,13 @@ export function mount(root, ctx) {
       class: `nm${seg.speaker == null ? ' reasoned' : ''}`,
       text: segmentSpeakerLabel(seg),
       style: seg.speaker == null ? '' : `color:${color}`,
-      ...(seg.speaker != null ? { title: `Show only ${speakerLabel(seg.speaker)}` } : {}),
+      ...(seg.speaker != null
+        ? {
+            title: mine
+              ? `Show only ${speakerLabel(seg.speaker)} — your own voice, from your microphone`
+              : `Show only ${speakerLabel(seg.speaker)}`,
+          }
+        : {}),
     });
     if (seg.speaker != null) {
       // The name filters; the rest of the row still opens the sheet. Reading a
@@ -245,6 +258,13 @@ export function mount(root, ctx) {
     }
     if (change.merged) renderAll(); // ids moved wholesale; a repaint is honest and rare
     if (change.relabel) refreshFilterOptions();
+    // The pin arriving (or moving, after a merge) changes which rows are
+    // marked as the user's. Guarded on the id itself, because `mic` and
+    // `status` events also fire for things that change nothing here.
+    if (change.mic && store.mic.you_speaker !== lastYou) {
+      lastYou = store.mic.you_speaker;
+      renderAll();
+    }
     if (change.status || change.conn) refreshLiveChip();
   }
 
@@ -396,7 +416,12 @@ export function openSegmentSheet(seg, ctx) {
         class: 'sub',
         text: isUncertain(seg)
           ? uncertainReason(seg)
-          : `Matched at ${(seg.match_score ?? 0).toFixed(2)} confidence, ${Math.round((seg.overlap_frac ?? 0) * 100)}% overlapped.`,
+          : isYou(seg.speaker)
+            ? // No score, and there should not be one: nothing was compared.
+              // Saying "matched at 0.00" here would be a lie about a fact the
+              // daemon is more sure of than anything else in the transcript.
+              `Recorded on your own microphone, so the speaker is not a guess. ${Math.round((seg.overlap_frac ?? 0) * 100)}% overlapped.`
+            : `Matched at ${(seg.match_score ?? 0).toFixed(2)} confidence, ${Math.round((seg.overlap_frac ?? 0) * 100)}% overlapped.`,
       }),
       h(
         'div',

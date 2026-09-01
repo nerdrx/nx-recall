@@ -6,7 +6,7 @@
 // who are they?" with the names right there to type.
 
 import { h, clear, fmtDur, fmtFirstSeen, speakerColor } from '../lib/dom.js';
-import { store, speakerLabel, isNamed, onboardingCandidates, ask, reloadSpeakers } from '../lib/store.js';
+import { store, speakerLabel, isNamed, isYou, onboardingCandidates, ask, reloadSpeakers } from '../lib/store.js';
 import { confirmSheet, openSheet, toast } from '../lib/sheets.js';
 import { playSpeaker, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 
@@ -289,15 +289,21 @@ export function mount(root, ctx) {
   function speakerRow(sp) {
     const color = speakerColor(sp.id);
     const named = isNamed(sp);
+    // The user's own voice, pinned by their microphone. Same quiet treatment as
+    // in the transcript: it is a fact about where the label came from, not a
+    // rank, so it gets a ring on the dot and nothing else.
+    const mine = isYou(sp.id);
     const name = h('span', {
       class: `sp-name${named ? '' : ' unnamed'}`,
       text: speakerLabel(sp.id),
-      title: 'Click to rename — renames are retroactive',
+      title: mine
+        ? 'Your own voice, labelled from your microphone rather than matched. Click to rename — renames are retroactive'
+        : 'Click to rename — renames are retroactive',
       tabindex: '0',
       role: 'button',
     });
     const row = h('div', {
-      class: 'sp-row',
+      class: `sp-row${mine ? ' you' : ''}`,
       dataset: { speaker: String(sp.id) },
       draggable: 'true',
     });

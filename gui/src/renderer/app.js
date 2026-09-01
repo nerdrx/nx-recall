@@ -255,7 +255,7 @@ window.recall.onState((st) => {
   renderPause();
   renderUpdateBar();
   renderFooter();
-  current?.update?.({ status: true, conn: true });
+  current?.update?.({ status: true, conn: true, mic: true });
   current?.refreshLiveChip?.();
 });
 
@@ -360,6 +360,30 @@ document.addEventListener('keydown', (e) => {
       speakers: store.speakers.size,
       sources: store.sources.length,
     }),
+    // The microphone: the model's view of the switch, and what the DOM is
+    // actually showing for it, so the driver can assert on both.
+    mic: () => {
+      const chip = document.getElementById('mic-chip');
+      const toggle = document.getElementById('mic-toggle');
+      return {
+        ...store.mic,
+        chip: chip ? chip.textContent : null,
+        pressed: toggle ? toggle.getAttribute('aria-pressed') : null,
+        mode: store.mic.mode,
+        modePressed: [...document.querySelectorAll('#mic-modes .mode-opt')].map((b) => [
+          b.dataset.mode,
+          b.getAttribute('aria-pressed'),
+        ]),
+        warning: (document.getElementById('mic-warning') || {}).textContent ?? '',
+        // "You" rows in the live transcript, and the rest, so the driver can
+        // prove the treatment is DISTINCT rather than merely present.
+        youRows: document.querySelectorAll('#seg-list .seg.you').length,
+        otherRows: document.querySelectorAll('#seg-list .seg:not(.you)').length,
+      };
+    },
+    // The one line behind the native-widget fix: without `color-scheme: dark`
+    // Chromium draws <select> option popups light-on-light over this palette.
+    colorScheme: () => getComputedStyle(document.documentElement).colorScheme,
     // The update banner, and whether its Restart really goes anywhere. The
     // driver may not press it — a relaunch would end the run — so the wiring is
     // read instead: the button's own handler, and the bridge it calls.

@@ -32,7 +32,7 @@ use recalld::server;
 use recalld::service::Service;
 use recalld::store::Store;
 
-use crate::cli::{Cli, Command, ModelsAction};
+use crate::cli::{Cli, Command, MicAction, ModelsAction};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -63,6 +63,7 @@ fn main() -> Result<()> {
         Command::Sources => cmd_sources(&data_dir),
         Command::Allow { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, true),
         Command::Deny { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, false),
+        Command::Mic { action } => cmd_mic(&cfg, &data_dir, action),
         Command::Models { action } => match action {
             ModelsAction::Status { dir } => {
                 cmd_models_status(&cfg, &data_dir, dir.as_deref(), false)
@@ -172,6 +173,14 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     for (key, rule) in &cfg.rules {
         store.set_allowed(key, rule.allowed(), utc_now_ns())?;
     }
+    // Same mirror for the microphone, which is a source row but never a rule.
+    store.upsert_source_kind(
+        capture::MIC_MATCH_KEY,
+        capture::MIC_DISPLAY_NAME,
+        recalld::store::KIND_MIC,
+        utc_now_ns(),
+    )?;
+    store.set_allowed(capture::MIC_MATCH_KEY, cfg.mic.enabled, utc_now_ns())?;
     let store = Arc::new(std::sync::Mutex::new(store));
 
     let queue = EventQueue::for_seconds(cfg.capture.queue_seconds, SAMPLE_RATE);
@@ -189,7 +198,8 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     )
     // The socket's own identity work (`speakers.split`) must use the same
     // operating point the pipeline labelled with, not the defaults.
-    .with_identity(cfg.identity.clone());
+    .with_identity(cfg.identity.clone())
+    .with_mic(cfg.mic.clone());
     // The ids clients see must be the ids that will be written on segments, so
     // resolve the ASR fallback here exactly as the pipeline does.
     if let Some(mut models) = ModelSet::resolve(&cfg.models) {
@@ -278,6 +288,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         Arc::clone(&queue),
         Arc::clone(&stats),
         Arc::clone(&control),
+        Arc::clone(&bus),
     );
 
     roster_stop.stop();
@@ -306,6 +317,9 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         analysed = analysis_stats.analysed.load(Ordering::Relaxed),
         labelled = analysis_stats.labelled.load(Ordering::Relaxed),
         refused_overlap = analysis_stats.refused_overlap.load(Ordering::Relaxed),
+        mic_segments = analysis_stats.mic_segments.load(Ordering::Relaxed),
+        mic_enrolled = analysis_stats.mic_enrolled.load(Ordering::Relaxed),
+        mic_goldens = analysis_stats.mic_goldens.load(Ordering::Relaxed),
         dropped_buffers = queue.dropped_chunks(),
         dropped_seconds = queue.dropped_samples() as f32 / SAMPLE_RATE as f32,
         "stopped"
@@ -315,36 +329,143 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
 
 fn cmd_probe(cfg: &Config) -> Result<()> {
     let allowlist = cfg.allowlist();
-    let nodes = capture::probe(&allowlist)?;
+    let probe = capture::probe(&allowlist)?;
 
-    if nodes.is_empty() {
+    if probe.apps.is_empty() {
         println!("No application playback streams (Stream/Output/Audio) on the graph.");
-        return Ok(());
+    } else {
+        println!(
+            "{:>5}  {:>8}  {:<24}  {:<28}  {:>8}  CAPTURE",
+            "NODE", "SERIAL", "MATCH KEY", "APPLICATION", "PID"
+        );
+        for (node, decision) in &probe.apps {
+            println!(
+                "{:>5}  {:>8}  {:<24}  {:<28}  {:>8}  {}",
+                node.node_id,
+                node.serial.as_deref().unwrap_or("-"),
+                node.ident.match_key(),
+                node.ident.display_name(),
+                node.ident
+                    .process_id
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                decision.as_str(),
+            );
+            if let Some(bin) = node.ident.process_binary.as_deref()
+                && bin != node.ident.match_key()
+            {
+                // Wine: the loader binary is shared, so say what we keyed on instead.
+                println!("       (application.process.binary = {bin}, keyed on the PE name)");
+            }
+        }
     }
 
-    println!(
-        "{:>5}  {:>8}  {:<24}  {:<28}  {:>8}  CAPTURE",
-        "NODE", "SERIAL", "MATCH KEY", "APPLICATION", "PID"
-    );
-    for (node, decision) in &nodes {
-        println!(
-            "{:>5}  {:>8}  {:<24}  {:<28}  {:>8}  {}",
+    // The microphone half. Nothing here opens a stream either — it is the
+    // "which device would the mic tap land on" answer, which is the only part
+    // of the mic path that can be checked without recording anything.
+    println!();
+    let pin = cfg.mic.device_override();
+    let resolved = probe.mic_target(pin);
+    let state = if cfg.mic.enabled {
+        cfg.mic.mode.as_str()
+    } else {
+        "off"
+    };
+    match (&probe.default_source, resolved) {
+        (_, Some(node)) => println!(
+            "default source:  {:<24}  {:<28}  node {}, serial {}  [{}]",
+            node.name.as_deref().unwrap_or("-"),
+            node.label(),
             node.node_id,
             node.serial.as_deref().unwrap_or("-"),
-            node.ident.match_key(),
-            node.ident.display_name(),
-            node.ident
-                .process_id
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".into()),
-            decision.as_str(),
-        );
-        if let Some(bin) = node.ident.process_binary.as_deref()
-            && bin != node.ident.match_key()
-        {
-            // Wine: the loader binary is shared, so say what we keyed on instead.
-            println!("       (application.process.binary = {bin}, keyed on the PE name)");
+            state,
+        ),
+        (Some(name), None) => println!(
+            "default source:  {name}\n  \
+             (the session manager names it, but no Audio/Source on the graph \
+             answers to that name)  [{state}]"
+        ),
+        (None, None) if pin.is_some() => println!(
+            "default source:  [mic].device = {}  — not on the graph  [{state}]",
+            pin.unwrap_or("?")
+        ),
+        (None, None) => println!(
+            "default source:  none published (the mic tap would let the session \
+             manager route it)  [{state}]"
+        ),
+    }
+    if probe.sources.is_empty() {
+        println!("capture devices: none (no Audio/Source nodes on the graph)");
+    } else {
+        println!("capture devices:");
+        for node in &probe.sources {
+            let here = resolved.is_some_and(|n| n.node_id == node.node_id);
+            println!(
+                "  {}{:>5}  {:<40}  {}",
+                if here { "*" } else { " " },
+                node.node_id,
+                node.name.as_deref().unwrap_or("-"),
+                node.label(),
+            );
         }
+    }
+    Ok(())
+}
+
+/// `recalld mic` — the scripting surface for the one source that is not an
+/// application. Goes over the socket rather than at the config file: the switch
+/// is live, and the GUI has to see it move.
+fn cmd_mic(cfg: &Config, data_dir: &Path, action: MicAction) -> Result<()> {
+    let out = match action {
+        MicAction::Status => call(cfg, data_dir, "mic.get", json!({}))?,
+        MicAction::On => call(cfg, data_dir, "mic.set", json!({"enabled": true}))?,
+        MicAction::Off => call(cfg, data_dir, "mic.set", json!({"enabled": false}))?,
+        MicAction::Follow => call(
+            cfg,
+            data_dir,
+            "mic.set",
+            json!({"enabled": true, "mode": "follow"}),
+        )?,
+        MicAction::Always => call(
+            cfg,
+            data_dir,
+            "mic.set",
+            json!({"enabled": true, "mode": "always"}),
+        )?,
+    };
+
+    let state = out["state"].as_str().unwrap_or("?");
+    println!("{:<18}{state}", "microphone");
+    println!(
+        "{:<18}{}",
+        "meaning",
+        match state {
+            "off" => "not recording, and not listening for a reason to",
+            "following:idle" =>
+                "on, waiting — it records only while an allowed application is captured",
+            "following:active" =>
+                "recording the room right now, because an allowed app is captured",
+            "always:active" => "recording the room right now, regardless of what is running",
+            "always:idle" => "on, but no input device opened yet — check `recalld probe`",
+            other => other,
+        }
+    );
+    if let Some(device) = out["device"].as_str() {
+        println!("{:<18}{device} (pinned in config.toml)", "device");
+    }
+    if let Some(you) = out["you_speaker"].as_i64() {
+        println!("{:<18}speaker {you}", "your voice");
+    }
+    if out["persisted"] == json!(false) {
+        println!(
+            "\nThe change is live but was NOT written to config.toml; it will not survive a restart."
+        );
+    }
+    if state != "off" {
+        println!(
+            "\nThe microphone hears the ROOM, not the game — anyone near you is recorded,\n\
+             whether or not they are in the instance."
+        );
     }
     Ok(())
 }
@@ -704,6 +825,11 @@ fn cmd_status(cfg: &Config, data_dir: &Path) -> Result<()> {
         s["queue"]["depth_seconds"].as_f64().unwrap_or(0.0),
         s["queue"]["capacity_samples"].as_f64().unwrap_or(0.0) / SAMPLE_RATE as f64,
         s["queue"]["dropped_buffers"].as_i64().unwrap_or(0),
+    );
+    println!(
+        "{:<18}{}",
+        "microphone",
+        s["mic_state"].as_str().unwrap_or("off")
     );
     let models = s["models"]["ids"]
         .as_array()

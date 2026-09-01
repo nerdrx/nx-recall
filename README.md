@@ -112,7 +112,7 @@ what survived.
 
 | Artifact | Lives | Leaves |
 |---|---|---|
-| Audio segments | your disk, retention-capped (default: days) | never |
+| Audio segments (apps, and your mic if you turn it on) | your disk, retention-capped (default: days) | never |
 | Transcripts | SQLite on your disk | never |
 | Voice fingerprints | your voicebank | never |
 | Golden enrollment samples | your disk, retention-exempt | never |
@@ -137,6 +137,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.5.4 | +27h | you can hear a voice before you are asked to name it |
 | 0.5.5 | +28h | usability: update banner, calm rows, honest "several voices" labels |
 | 0.5.6 | +29h | German. And 23 other languages. The default ASR goes multilingual |
+| 0.6.0 | +30h | your own voice joins the transcript, pre-labelled — mic as a source |
 
 Golden fixtures gate every release: the equal-loudness mixes carry
 `expect: refuse` — a pipeline that labels them correctly *by luck* fails the
@@ -149,7 +150,8 @@ suite. Silence and noise must produce zero words, always.
 | 2+3 · ASR · voicebank · overlap gate | `[ SHIPPED ]` |
 | 4 · Socket · tray · GUI · pause · roster · split | `[ SHIPPED ]` 284 tests, real-daemon interop |
 | NX Hub packaging · signed releases · delta-updated hub | `[ SHIPPED ]` |
-| Mic as a source · per-speaker languages · storage panel | `[ BUILDING ]` |
+| Mic as a source — off by default, follows the allowed apps, enrols itself | `[ SHIPPED ]` |
+| Per-speaker languages · storage panel | `[ BUILDING ]` |
 | Windows backend | `[ MAPPED ]` |
 
 ## Quickstart
@@ -161,6 +163,21 @@ cargo build --release
 ./target/release/recalld allow VRChat.exe
 ./target/release/recalld run              # first light
 ```
+
+Your own microphone is the one source that is not an application, so it has its
+own switch and it is **off** until you say otherwise:
+
+```bash
+./target/release/recalld mic              # what it is doing right now
+./target/release/recalld mic on           # follow mode: only while an allowed app is captured
+./target/release/recalld mic always       # whenever the daemon is running
+./target/release/recalld mic off
+```
+
+It hears the *room*, not the game — anyone near you is recorded, whether or not
+they are in the instance. In return it is the one voice the daemon never has to
+guess at: your turns are labelled from where the audio came, they enrol
+themselves, and you are never asked who you are.
 
 Or install it like a product: it ships through NX Hub as a signed prefix
 tarball — daemon, GUI, tray, systemd unit, and an exact-manifest uninstall that

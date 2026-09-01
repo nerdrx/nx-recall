@@ -5,7 +5,10 @@
 //! `embeddings`, `golden_samples`) and a full-text index over transcripts.
 //! v3 (Step 4) adds `session_roster` — who was in the instance, from VRChat's
 //! output log — and `operations`, the audit trail that makes a rename, a merge
-//! or a reassignment undoable. Existing databases are migrated in place.
+//! or a reassignment undoable. v4 adds `sources.kind`, because a source is no
+//! longer always an application (the microphone is one too), and `settings`,
+//! the small key/value table that pins the "You" speaker across restarts.
+//! Existing databases are migrated in place.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,13 +18,30 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::embed::Embedding;
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
+
+/// `sources.kind` for an application playback stream — the only kind before v4.
+pub const KIND_APP: &str = "app";
+/// `sources.kind` for the user's own microphone.
+pub const KIND_MIC: &str = "mic";
+
+/// `settings` key holding the id of the pinned "You" speaker.
+pub const YOU_SPEAKER_KEY: &str = "you_speaker_id";
+/// The generated label the pinned speaker is minted with. It survives a rename
+/// (the user may call themselves anything), so it is also how a database that
+/// somehow lost its settings row re-adopts the existing voice instead of
+/// minting a second one.
+pub const YOU_AUTO_LABEL: &str = "You";
 
 #[derive(Debug, Clone)]
 pub struct SourceRow {
     pub id: i64,
     pub match_key: String,
     pub display_name: String,
+    /// `"app"` or `"mic"` (v4). The microphone is a source like any other in
+    /// the schema and nothing like one in the consent model, so clients need to
+    /// be able to tell them apart without string-matching the key.
+    pub kind: String,
     pub allowed: bool,
     pub first_seen: i64,
     /// Last time the source was seen on the graph. Equal to `first_seen` for a
@@ -167,6 +187,18 @@ pub struct RosterRow {
     pub left_at_utc_ns: Option<i64>,
 }
 
+/// One kept clip of a voice, exempt from the audio retention window: a golden
+/// is what a future embedding model gets re-enrolled from (DESIGN §5/§6), so
+/// forgetting it would cost the identity, not just the recording.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoldenRow {
+    pub id: i64,
+    /// Relative to the data dir, under `goldens/`, which the retention sweeper
+    /// never walks.
+    pub audio_path: String,
+    pub duration_s: f32,
+}
+
 /// One entry in the audit trail. `prior_state` is JSON holding enough to undo
 /// the operation; writing the undo *method* is a later step, keeping the record
 /// is this one.
@@ -296,6 +328,7 @@ impl Store {
         let migrating = current == Some(1);
         self.apply_v2()?;
         self.apply_v3()?;
+        self.apply_v4()?;
         if migrating {
             // Backfill the index for rows that predate it. New rows arrive
             // through the triggers.
@@ -472,6 +505,38 @@ impl Store {
         Ok(())
     }
 
+    /// Everything schema v4 adds, written so it is a no-op on a v4 database.
+    ///
+    /// Two small things, both for the microphone: a `kind` on `sources`, so a
+    /// client can tell the room-listening device from an application without
+    /// string-matching a key, and a `settings` table, so the pinned "You"
+    /// speaker is a fact that survives a restart rather than a guess made from
+    /// whatever the voicebank happens to contain.
+    fn apply_v4(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS settings (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );",
+        )?;
+        // The default is what backfills every pre-v4 row: everything the
+        // daemon could capture before v4 was an application.
+        let fresh_kind = self.add_column_if_missing(
+            "sources",
+            "kind",
+            &format!("TEXT NOT NULL DEFAULT '{KIND_APP}'"),
+        )?;
+        if fresh_kind {
+            self.conn.execute(
+                "UPDATE sources SET kind = ?1 WHERE kind IS NULL OR kind = ''",
+                params![KIND_APP],
+            )?;
+        }
+        self.conn
+            .execute_batch("CREATE INDEX IF NOT EXISTS idx_sources_kind ON sources(kind);")?;
+        Ok(())
+    }
+
     /// Returns whether the column had to be added, so a caller can backfill it.
     fn add_column_if_missing(&self, table: &str, column: &str, decl: &str) -> Result<bool> {
         let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -500,13 +565,27 @@ impl Store {
         display_name: &str,
         first_seen: i64,
     ) -> Result<i64> {
+        self.upsert_source_kind(match_key, display_name, KIND_APP, first_seen)
+    }
+
+    /// `upsert_source` for a source that is not an application. The kind is
+    /// overwritten on conflict, so a row that predates v4 and happens to carry
+    /// the mic's key is corrected rather than left lying.
+    pub fn upsert_source_kind(
+        &self,
+        match_key: &str,
+        display_name: &str,
+        kind: &str,
+        first_seen: i64,
+    ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO sources (match_key, display_name, allowed, first_seen, last_seen)
-             VALUES (?1, ?2, 0, ?3, ?3)
+            "INSERT INTO sources (match_key, display_name, kind, allowed, first_seen, last_seen)
+             VALUES (?1, ?2, ?3, 0, ?4, ?4)
              ON CONFLICT(match_key) DO UPDATE SET
                  display_name = excluded.display_name,
+                 kind = excluded.kind,
                  last_seen = MAX(COALESCE(sources.last_seen, 0), excluded.last_seen)",
-            params![match_key, display_name, first_seen],
+            params![match_key, display_name, kind, first_seen],
         )?;
         let id: i64 = self.conn.query_row(
             "SELECT id FROM sources WHERE match_key = ?1",
@@ -514,6 +593,23 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(id)
+    }
+
+    /// Which kind of source a capture session belongs to — `"app"` or `"mic"`.
+    /// The pipeline asks once per session: a mic turn takes a different route
+    /// through identity, and it must be the *row* that says so, not a flag the
+    /// capture side hoped would survive the queue.
+    pub fn session_source_kind(&self, session_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT COALESCE(sc.kind, ?2) FROM sessions ss
+                 JOIN sources sc ON sc.id = ss.source_id
+                 WHERE ss.id = ?1",
+                params![session_id, KIND_APP],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
     }
 
     /// Mirror a config rule into the DB so `sources` can show it.
@@ -529,22 +625,23 @@ impl Store {
 
     pub fn list_sources(&self) -> Result<Vec<SourceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.match_key, s.display_name, s.allowed,
+            "SELECT s.id, s.match_key, s.display_name, COALESCE(s.kind, ?1), s.allowed,
                     s.first_seen, COALESCE(s.last_seen, s.first_seen),
                     (SELECT COUNT(*) FROM sessions ss
                       WHERE ss.source_id = s.id AND ss.ended_at_utc_ns IS NULL)
              FROM sources s ORDER BY s.allowed DESC, s.match_key ASC",
         )?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map(params![KIND_APP], |r| {
                 Ok(SourceRow {
                     id: r.get(0)?,
                     match_key: r.get(1)?,
                     display_name: r.get(2)?,
-                    allowed: r.get::<_, i64>(3)? != 0,
-                    first_seen: r.get(4)?,
-                    last_seen: r.get(5)?,
-                    streams: r.get(6)?,
+                    kind: r.get(3)?,
+                    allowed: r.get::<_, i64>(4)? != 0,
+                    first_seen: r.get(5)?,
+                    last_seen: r.get(6)?,
+                    streams: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -784,6 +881,123 @@ impl Store {
             params![speaker_id, audio_path, duration_s as f64],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// This voice's kept clips, longest first. Resolved through the tombstone
+    /// view, so a merged-away id still finds the surviving voice's goldens.
+    pub fn golden_samples_for(&self, speaker_id: i64) -> Result<Vec<GoldenRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.audio_path, g.duration_s
+             FROM golden_samples g
+             LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             WHERE sp.canonical_id = ?1
+             ORDER BY g.duration_s DESC, g.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![speaker_id], |r| {
+                Ok(GoldenRow {
+                    id: r.get(0)?,
+                    audio_path: r.get(1)?,
+                    duration_s: r.get::<_, f64>(2)? as f32,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Forget one golden, returning its path so the caller can unlink the file.
+    /// The row goes first: a file with no row is residue the reconciliation
+    /// sweep understands, a row with no file is a lie.
+    pub fn delete_golden_sample(&self, id: i64) -> Result<Option<String>> {
+        let path: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT audio_path FROM golden_samples WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if path.is_some() {
+            self.conn
+                .execute("DELETE FROM golden_samples WHERE id = ?1", params![id])?;
+        }
+        Ok(path)
+    }
+
+    // ---- settings (v4) ---------------------------------------------------
+
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// The pinned "You" speaker, if there is one. Never creates.
+    ///
+    /// Two self-healing steps, both about never growing a second You:
+    ///
+    /// * A merge moves the pin. If the user merges You into another voice, the
+    ///   pinned row is a tombstone and every segment, prototype and golden it
+    ///   owned now lives at the target — so the pin follows the merge and the
+    ///   next mic segment lands on the surviving id. A tombstone is not a
+    ///   reason to mint a replacement.
+    /// * If the settings row is missing but a voice already carries the `You`
+    ///   generated label, that voice is adopted rather than duplicated.
+    pub fn you_speaker_id(&self) -> Result<Option<i64>> {
+        if let Some(raw) = self.setting(YOU_SPEAKER_KEY)?
+            && let Ok(id) = raw.trim().parse::<i64>()
+        {
+            // `resolve_speaker` errors only when the row is gone entirely (a
+            // hard delete), which is the one case where re-adopting is right.
+            if let Ok(canonical) = self.resolve_speaker(id) {
+                if canonical != id {
+                    self.set_setting(YOU_SPEAKER_KEY, &canonical.to_string())?;
+                }
+                return Ok(Some(canonical));
+            }
+        }
+        let adopted: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM speakers
+                 WHERE auto_label = ?1 AND merged_into IS NULL
+                 ORDER BY id ASC LIMIT 1",
+                params![YOU_AUTO_LABEL],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = adopted {
+            self.set_setting(YOU_SPEAKER_KEY, &id.to_string())?;
+        }
+        Ok(adopted)
+    }
+
+    /// The pinned "You" speaker, minting it on first sight of the user's own
+    /// voice. Idempotent: called on every mic segment, creates at most once.
+    pub fn ensure_you_speaker(&self, created_at: i64) -> Result<i64> {
+        if let Some(id) = self.you_speaker_id()? {
+            return Ok(id);
+        }
+        // `create_speaker` sets auto_label = display_name and leaves `named_at`
+        // NULL, so this reads as an unnamed voice the daemon labelled — which
+        // is exactly what it is until the user calls themselves something else.
+        let id = self.create_speaker(YOU_AUTO_LABEL, created_at)?;
+        self.set_setting(YOU_SPEAKER_KEY, &id.to_string())?;
+        Ok(id)
     }
 
     /// Name a voice. `named_at` is what tells a client this is a person the
@@ -1921,7 +2135,12 @@ mod tests {
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
         assert_eq!(s.segment_count(1).unwrap(), 1);
-        assert_eq!(s.list_sources().unwrap().len(), 1);
+        let sources = s.list_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        // v4 backfill, over the whole v1 -> v4 chain: everything that existed
+        // before the microphone was an application.
+        assert_eq!(sources[0].kind, KIND_APP);
+        assert_eq!(s.session_source_kind(1).unwrap().as_deref(), Some(KIND_APP));
 
         // The v2 surface is usable on the migrated database.
         s.set_segment_analysis(
@@ -2691,11 +2910,199 @@ mod tests {
             .conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, SCHEMA_VERSION);
         assert_eq!(s.segment_count(1).unwrap(), 1, "v2 rows survive");
         s.roster_join(None, None, "Ines", 1).unwrap();
         s.log_operation("x", "[]", "{}", 1).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- v4: source kinds, settings, the pinned "You" speaker -------------
+
+    #[test]
+    fn a_v3_database_gains_the_source_kind_and_the_settings_table() {
+        let dir = std::env::temp_dir().join(format!("nx-recall-mig4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            // A v3 database: everything Step 4 wrote, stamped 3, with the v4
+            // additions taken back out.
+            let s = Store::open(&dir).unwrap();
+            let seg = a_segment(&s);
+            assert_eq!(seg, 1);
+            s.conn
+                .execute_batch(
+                    "DROP TABLE settings;
+                     DROP INDEX idx_sources_kind;
+                     ALTER TABLE sources DROP COLUMN kind;
+                     UPDATE schema_version SET version = 3;",
+                )
+                .unwrap();
+        }
+
+        let s = Store::open(&dir).unwrap();
+        let v: i64 = s
+            .conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(s.segment_count(1).unwrap(), 1, "v3 rows survive");
+
+        // Backfilled, not left NULL: a pre-v4 source is an application.
+        let rows = s.list_sources().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, KIND_APP);
+        assert_eq!(s.session_source_kind(1).unwrap().as_deref(), Some(KIND_APP));
+
+        // And the v4 surface works on the migrated database.
+        let mic = s
+            .upsert_source_kind("mic", "Microphone", KIND_MIC, 1)
+            .unwrap();
+        assert_eq!(
+            s.list_sources()
+                .unwrap()
+                .iter()
+                .find(|r| r.id == mic)
+                .map(|r| r.kind.as_str()),
+            Some(KIND_MIC)
+        );
+        s.set_setting("k", "v").unwrap();
+        assert_eq!(s.setting("k").unwrap().as_deref(), Some("v"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_source_kind_survives_reopening_and_defaults_to_app() {
+        let dir = std::env::temp_dir().join(format!("nx-recall-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let s = Store::open(&dir).unwrap();
+            s.upsert_source("VRChat.exe", "VRChat", 1).unwrap();
+            s.upsert_source_kind("mic", "Microphone", KIND_MIC, 1)
+                .unwrap();
+            // `set_allowed` on the mic key mirrors the switch and must not
+            // demote the row back to an application.
+            s.set_allowed("mic", true, 2).unwrap();
+        }
+        let s = Store::open(&dir).unwrap();
+        let by_key: HashMap<String, String> = s
+            .list_sources()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.match_key, r.kind))
+            .collect();
+        assert_eq!(by_key.get("VRChat.exe").map(String::as_str), Some(KIND_APP));
+        assert_eq!(by_key.get("mic").map(String::as_str), Some(KIND_MIC));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_you_speaker_is_created_once_and_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("nx-recall-you-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = {
+            let s = Store::open(&dir).unwrap();
+            assert_eq!(s.you_speaker_id().unwrap(), None, "nothing until asked");
+            let id = s.ensure_you_speaker(10).unwrap();
+            // Idempotent: every mic segment calls this.
+            assert_eq!(s.ensure_you_speaker(20).unwrap(), id);
+            assert_eq!(s.ensure_you_speaker(30).unwrap(), id);
+            assert_eq!(s.list_speakers().unwrap().len(), 1);
+            id
+        };
+        // A restart is a fresh Store over the same file.
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.you_speaker_id().unwrap(), Some(first));
+        assert_eq!(s.ensure_you_speaker(40).unwrap(), first);
+        assert_eq!(s.list_speakers().unwrap().len(), 1, "no second You");
+
+        // Naming yourself does not unpin you: the id is the identity, and the
+        // generated label is what a lost settings row would re-adopt from.
+        s.rename_speaker(first, "Alex", 50).unwrap();
+        assert_eq!(s.ensure_you_speaker(60).unwrap(), first);
+        let row = s.speaker_summary(first).unwrap().unwrap();
+        assert_eq!(row.name(), Some("Alex"));
+        assert_eq!(row.auto_label, YOU_AUTO_LABEL);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lost_pin_re_adopts_the_existing_you_instead_of_minting_a_second() {
+        let s = store();
+        let you = s.ensure_you_speaker(10).unwrap();
+        // Whatever loses the settings row — a hand-edited database, a restore
+        // from an older backup — must not produce two of the user.
+        s.conn
+            .execute(
+                "DELETE FROM settings WHERE key = ?1",
+                params![YOU_SPEAKER_KEY],
+            )
+            .unwrap();
+        assert_eq!(s.you_speaker_id().unwrap(), Some(you));
+        assert_eq!(s.ensure_you_speaker(20).unwrap(), you);
+        assert_eq!(s.list_speakers().unwrap().len(), 1);
+        // …and the pin healed itself on the way past.
+        assert_eq!(
+            s.setting(YOU_SPEAKER_KEY).unwrap().as_deref(),
+            Some(you.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn merging_you_away_moves_the_pin_and_does_not_resurrect_a_duplicate() {
+        let s = store();
+        let you = s.ensure_you_speaker(10).unwrap();
+        let kira = s.create_speaker("Kira", 20).unwrap();
+
+        // The user decides their mic voice and their named voice are the same
+        // person, which they are. The pin has to follow the rows.
+        s.merge_speakers(you, kira).unwrap();
+        assert_eq!(s.you_speaker_id().unwrap(), Some(kira));
+        assert_eq!(
+            s.ensure_you_speaker(30).unwrap(),
+            kira,
+            "the next mic segment lands on the surviving voice"
+        );
+        // The tombstone stays a tombstone: no third speaker, and nothing has
+        // re-adopted the dead row by its label.
+        assert_eq!(s.list_speakers().unwrap().len(), 1);
+        assert_eq!(s.resolve_speaker(you).unwrap(), kira);
+
+        // And the other direction: merging a stranger INTO You leaves the pin
+        // exactly where it was.
+        let stranger = s.create_speaker("Speaker_09", 40).unwrap();
+        s.merge_speakers(stranger, kira).unwrap();
+        assert_eq!(s.you_speaker_id().unwrap(), Some(kira));
+    }
+
+    #[test]
+    fn goldens_are_listed_longest_first_and_follow_a_merge() {
+        let s = store();
+        let you = s.ensure_you_speaker(10).unwrap();
+        s.add_golden_sample(you, "goldens/000001/a.wav", 2.0)
+            .unwrap();
+        let long = s
+            .add_golden_sample(you, "goldens/000001/b.wav", 7.5)
+            .unwrap();
+        let rows = s.golden_samples_for(you).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, long, "longest first — that is the one to keep");
+        assert_eq!(rows[0].duration_s, 7.5);
+
+        // Deleting hands back the path so the caller can unlink it.
+        assert_eq!(
+            s.delete_golden_sample(rows[1].id).unwrap().as_deref(),
+            Some("goldens/000001/a.wav")
+        );
+        assert_eq!(s.delete_golden_sample(rows[1].id).unwrap(), None);
+
+        // A merge moves the audio with everything else, and the surviving id
+        // finds it. The pin follows too, so the next mic segment asks about
+        // `kira` and gets the clips it kept as `you`.
+        let kira = s.create_speaker("Kira", 20).unwrap();
+        s.merge_speakers(you, kira).unwrap();
+        assert_eq!(s.golden_samples_for(kira).unwrap().len(), 1);
+        assert_eq!(s.you_speaker_id().unwrap(), Some(kira));
     }
 
     #[test]

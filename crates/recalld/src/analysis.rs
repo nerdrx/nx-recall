@@ -9,11 +9,17 @@
 //!    at or under 1.5% in the realistic regime.
 //! 3. **Identity only on turns the gate approved**, so a blended embedding is
 //!    never even computed, let alone stored.
+//!
+//! The microphone leg (`commit_mic`) short-circuits step 3's *question* without
+//! skipping its *guard*: the speaker is known from where the audio came, so the
+//! voicebank is never consulted, but the overlap detector still runs and still
+//! decides whether anything may be enrolled.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use anyhow::Result;
-use tracing::{debug, warn};
+use anyhow::{Context, Result};
+use tracing::{debug, info, warn};
 
 use crate::asr::{Asr, normalise_words};
 use crate::config::{IdentityConfig, SAMPLE_RATE};
@@ -51,6 +57,31 @@ pub struct Outcome {
     pub speaker_id: Option<i64>,
     pub match_score: Option<f32>,
     pub enrolled: bool,
+    /// A golden sample was written for this turn (mic enrolment only).
+    pub golden: bool,
+}
+
+/// Everything the microphone leg needs that the matching leg does not: who the
+/// audio belongs to by construction, and where the kept clips go.
+#[derive(Debug, Clone, Copy)]
+pub struct MicEnroll<'a> {
+    /// The pinned "You" speaker (`Store::ensure_you_speaker`).
+    pub speaker_id: i64,
+    pub data_dir: &'a Path,
+    pub max_goldens: usize,
+}
+
+/// `goldens/<speaker>/golden-<segment>.wav`, relative to the data dir.
+///
+/// Deliberately **not** under `segments/`: the retention sweeper walks that
+/// tree for orphans and unlinks what the `segments` table has aged out, and a
+/// golden must outlive both (DESIGN §5/§6 — a golden is what a future embedding
+/// model gets re-enrolled from). Living in its own directory is what makes it
+/// retention-exempt, with no special case in the sweeper at all.
+pub fn golden_path(speaker_id: i64, segment_id: i64) -> PathBuf {
+    PathBuf::from("goldens")
+        .join(format!("{speaker_id:06}"))
+        .join(format!("golden-{segment_id:06}.wav"))
 }
 
 pub struct Analyzer {
@@ -160,6 +191,7 @@ impl Analyzer {
                     speaker_id: None,
                     match_score: None,
                     enrolled: false,
+                    golden: false,
                 });
             }
         };
@@ -173,6 +205,9 @@ impl Analyzer {
             // `gate` already ran, so this arm is unreachable in practice; it
             // exists so a future gate change cannot silently label anyway.
             Decision::Refused(_) => (None, None, false),
+            // `decide` never returns this: pinning is what `commit_mic` does
+            // instead of asking. The arm exists so the match stays total.
+            Decision::Pinned { speaker_id } => (Some(*speaker_id), None, false),
             Decision::Matched {
                 speaker_id,
                 score,
@@ -201,6 +236,94 @@ impl Analyzer {
             speaker_id,
             match_score,
             enrolled,
+            golden: false,
+        })
+    }
+
+    /// The microphone leg: write what `prepare` learned, then label the turn
+    /// with the pinned "You" speaker **without consulting the voicebank**.
+    ///
+    /// The design note this implements (DESIGN §5) is that a mic tap is a free
+    /// perfect label, and the corollary is that it must not be laundered into
+    /// looking like a match: `match_score` stays NULL, because there was no
+    /// comparison to score. `overlap_frac` is still stored — when the user runs
+    /// loudspeakers the mic hears the room talking back, and the correction UI
+    /// has to be able to see that even though the name is certain.
+    ///
+    /// Enrolment keeps every gate the matching leg has, minus the two that are
+    /// about *identifying* (threshold and margin): overlap ≤ `enroll_max_overlap`
+    /// and duration ≥ `enroll_min_duration_s`. That is the payoff — prototypes
+    /// for the one voice the daemon can be certain about, plus up to
+    /// `max_goldens` kept clips for a future model migration.
+    pub fn commit_mic(
+        &self,
+        store: &Store,
+        segment_id: i64,
+        prepared: Prepared,
+        mic: &MicEnroll<'_>,
+        now_utc_ns: i64,
+    ) -> Result<Outcome> {
+        let Prepared {
+            overlap_frac,
+            duration_s,
+            text,
+            asr_model_id,
+            lang,
+            embedding,
+            refusal,
+        } = prepared;
+
+        store.set_segment_analysis(
+            segment_id,
+            &SegmentAnalysis {
+                lang: text.as_ref().and(lang).map(|l| l.to_string()),
+                text: text.clone(),
+                asr_model_id: Some(asr_model_id),
+                overlap_frac: Some(overlap_frac),
+            },
+        )?;
+        // Provenance, before anything else can fail: the label does not depend
+        // on the embedder having produced a vector.
+        store.set_segment_speaker(segment_id, Some(mic.speaker_id), None)?;
+
+        let mut enrolled = false;
+        let mut golden = false;
+        if let Some(embedding) = embedding {
+            store.store_embedding(segment_id, &embedding)?;
+            if overlap_frac <= self.cfg.enroll_max_overlap
+                && duration_s >= self.cfg.enroll_min_duration_s
+            {
+                store.add_prototype(
+                    mic.speaker_id,
+                    &embedding,
+                    Some(segment_id),
+                    false,
+                    self.cfg.max_prototypes,
+                    now_utc_ns,
+                )?;
+                enrolled = true;
+                golden = keep_golden(store, mic, segment_id, duration_s)?;
+            }
+        } else {
+            debug!(
+                segment_id,
+                overlap_frac,
+                duration_s,
+                "microphone: labelled but not enrolled ({})",
+                refusal.unwrap_or(Refusal::TooShort).as_str()
+            );
+        }
+
+        Ok(Outcome {
+            overlap_frac,
+            text,
+            decision: Decision::Pinned {
+                speaker_id: mic.speaker_id,
+            },
+            speaker_id: Some(mic.speaker_id),
+            match_score: None,
+            enrolled,
+            golden,
         })
     }
 
@@ -214,6 +337,19 @@ impl Analyzer {
     ) -> Result<Outcome> {
         let prepared = self.prepare(samples)?;
         self.commit(store, segment_id, prepared, now_utc_ns)
+    }
+
+    /// `prepare` then `commit_mic`, for callers that hold the store exclusively.
+    pub fn process_mic(
+        &mut self,
+        store: &Store,
+        segment_id: i64,
+        samples: &[f32],
+        mic: &MicEnroll<'_>,
+        now_utc_ns: i64,
+    ) -> Result<Outcome> {
+        let prepared = self.prepare(samples)?;
+        self.commit_mic(store, segment_id, prepared, mic, now_utc_ns)
     }
 
     fn enroll(
@@ -236,12 +372,88 @@ impl Analyzer {
     }
 }
 
+/// Keep this turn's audio as a golden sample, if it earns a slot.
+///
+/// "Up to N, longest": under the cap anything qualifying is kept; at the cap a
+/// longer clip replaces the shortest one, because a golden exists to re-enrol a
+/// future model and three seconds of speech does that better than one. Written
+/// at most once per segment — the path carries the segment id, so a re-analysis
+/// of the same turn finds its own file already there and does nothing.
+fn keep_golden(
+    store: &Store,
+    mic: &MicEnroll<'_>,
+    segment_id: i64,
+    duration_s: f32,
+) -> Result<bool> {
+    if mic.max_goldens == 0 {
+        return Ok(false);
+    }
+    let rel = golden_path(mic.speaker_id, segment_id);
+    let rel_str = rel.to_string_lossy().to_string();
+
+    let existing = store.golden_samples_for(mic.speaker_id)?;
+    if existing.iter().any(|g| g.audio_path == rel_str) {
+        return Ok(false);
+    }
+    let mut evict = None;
+    if existing.len() >= mic.max_goldens {
+        // `golden_samples_for` is longest-first, so the last row is the one to
+        // beat. Not beating it is the common case and costs nothing.
+        let Some(shortest) = existing.last() else {
+            return Ok(false);
+        };
+        if shortest.duration_s >= duration_s {
+            return Ok(false);
+        }
+        evict = Some(shortest.clone());
+    }
+
+    // Copy rather than move: the segment's own WAV still belongs to the
+    // transcript and to `segments.audio`, and retention still owns its life.
+    let Some((source_rel, _, _)) = store.segment_audio(segment_id)? else {
+        return Ok(false);
+    };
+    if source_rel.is_empty() {
+        return Ok(false);
+    }
+    let dst = mic.data_dir.join(&rel);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::copy(mic.data_dir.join(&source_rel), &dst)
+        .with_context(|| format!("copying {source_rel} to {}", dst.display()))?;
+    store.add_golden_sample(mic.speaker_id, &rel_str, duration_s)?;
+
+    if let Some(old) = evict {
+        // Row first, then the file: a file with no row is residue the
+        // reconciliation sweep understands; a row with no file is a lie.
+        if let Some(path) = store.delete_golden_sample(old.id)?
+            && !path.is_empty()
+        {
+            let _ = std::fs::remove_file(mic.data_dir.join(path));
+        }
+    }
+    info!(
+        segment_id,
+        speaker = mic.speaker_id,
+        duration_s,
+        path = %rel_str,
+        "microphone: kept a golden sample"
+    );
+    Ok(true)
+}
+
 /// Counters the daemon logs on shutdown.
 #[derive(Default)]
 pub struct AnalysisStats {
     pub analysed: std::sync::atomic::AtomicU64,
     pub labelled: std::sync::atomic::AtomicU64,
     pub refused_overlap: std::sync::atomic::AtomicU64,
+    /// Turns labelled from the microphone's provenance rather than a match.
+    pub mic_segments: std::sync::atomic::AtomicU64,
+    pub mic_enrolled: std::sync::atomic::AtomicU64,
+    pub mic_goldens: std::sync::atomic::AtomicU64,
 }
 
 impl AnalysisStats {
@@ -253,6 +465,16 @@ impl AnalysisStats {
             }
             Decision::Matched { .. } | Decision::Mint { .. } => {
                 self.labelled.fetch_add(1, Ordering::Relaxed);
+            }
+            Decision::Pinned { .. } => {
+                self.labelled.fetch_add(1, Ordering::Relaxed);
+                self.mic_segments.fetch_add(1, Ordering::Relaxed);
+                if outcome.enrolled {
+                    self.mic_enrolled.fetch_add(1, Ordering::Relaxed);
+                }
+                if outcome.golden {
+                    self.mic_goldens.fetch_add(1, Ordering::Relaxed);
+                }
             }
             _ => {}
         }
@@ -283,5 +505,36 @@ pub fn analyse_or_log(
     match analyzer.commit(&store, segment_id, prepared, now_utc_ns) {
         Ok(outcome) => stats.record(&outcome),
         Err(e) => warn!(segment_id, "storing analysis failed: {e:#}"),
+    }
+}
+
+/// `analyse_or_log` for a turn that came off the user's own microphone.
+///
+/// Same shape, same lock discipline; the only difference is which `commit` runs
+/// — and that difference is the whole point, because a mic turn must never fall
+/// through to the voicebank.
+pub fn analyse_mic_or_log(
+    analyzer: &mut Analyzer,
+    store: &std::sync::Mutex<Store>,
+    stats: &AnalysisStats,
+    segment_id: i64,
+    samples: &[f32],
+    mic: &MicEnroll<'_>,
+    now_utc_ns: i64,
+) {
+    let prepared = match analyzer.prepare(samples) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(segment_id, "analysis failed: {e:#}");
+            return;
+        }
+    };
+    let Ok(store) = store.lock() else {
+        warn!(segment_id, "store mutex poisoned; analysis discarded");
+        return;
+    };
+    match analyzer.commit_mic(&store, segment_id, prepared, mic, now_utc_ns) {
+        Ok(outcome) => stats.record(&outcome),
+        Err(e) => warn!(segment_id, "storing microphone analysis failed: {e:#}"),
     }
 }

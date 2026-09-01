@@ -11,6 +11,11 @@ import { ipcMain, BrowserWindow } from 'electron';
 const ALLOWED = new Set([
   'sources.list',
   'sources.set',
+  // The microphone's own switch. Deliberately a separate pair rather than an
+  // extra shape on `sources.set`: the daemon refuses the `mic` key there, and
+  // the UI must be able to reach the method that actually works.
+  'mic.get',
+  'mic.set',
   'speakers.list',
   'speakers.name',
   'speakers.merge',

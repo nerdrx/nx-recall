@@ -55,6 +55,11 @@ pub enum Decision {
     /// the new speaker's first prototype — it already passed the overlap and
     /// duration gates, and without a seed the bank could never grow.
     Mint { best_score: Option<f32> },
+    /// The turn came off the user's own microphone, so the speaker is known
+    /// before any model runs. This is **provenance, not a match**: the
+    /// voicebank is never consulted and `match_score` stays NULL, because a
+    /// score would claim a comparison that never happened.
+    Pinned { speaker_id: i64 },
 }
 
 /// Rank the bank: one score per speaker, the best of that speaker's prototypes,

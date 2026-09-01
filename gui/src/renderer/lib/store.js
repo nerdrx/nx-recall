@@ -14,10 +14,14 @@ export const store = {
   status: null,
   update: null, // {from, to} — the daemon came back as a different version
 
-  speakers: new Map(), // id → {id, name, auto, segments, total_ms, first_seen}
+  speakers: new Map(), // id → {id, name, auto, segments, total_ms, first_seen, you}
   segments: [], // ascending by t_ms
   segById: new Map(),
   sources: [],
+  // The microphone switch (PROTOCOL "The microphone"). Not a source rule: it
+  // hears the room rather than one program, so it has its own method, its own
+  // card, and its own default (off).
+  mic: { enabled: false, mode: 'follow', active: false, state: 'off', device: null, you_speaker: null },
   ops: new Map(), // op id → {kind, frac, done}
 
   loaded: false,
@@ -64,6 +68,11 @@ export function uncertainReason(seg) {
   const ov = seg.overlap_frac ?? 0;
   if (ov > OVERLAP_REFUSE && seg.speaker == null)
     return `Several voices overlap here (${Math.round(ov * 100)}% of the segment), so no speaker identity was claimed. Click to assign one.`;
+  // Your own microphone, with the room bleeding into it — loudspeakers, most
+  // likely. The NAME is not in doubt (it came from the device, not a match);
+  // the words are, because more than one person is in them.
+  if (ov > OVERLAP_REFUSE && isYou(seg.speaker))
+    return `Recorded on your microphone, so the speaker is certain — but ${Math.round(ov * 100)}% of it overlaps another voice, so the words may be a mix. Click to correct them.`;
   if (ov > OVERLAP_REFUSE)
     return `Overlapped speech (${Math.round(ov * 100)}%) — this label is not trustworthy. Click to correct it.`;
   if (seg.speaker == null) return 'No known voice matched this segment. Click to assign one.';
@@ -82,18 +91,62 @@ export { ask };
 
 /** Full resync: every view's data re-fetched from scratch. */
 export async function reloadAll() {
-  const [speakers, transcript, sources] = await Promise.all([
+  const [speakers, transcript, sources, mic] = await Promise.all([
     ask('speakers.list').catch(() => ({ speakers: [] })),
     ask('transcript', { limit: MAX_SEGMENTS }).catch(() => ({ segments: [] })),
     ask('sources.list').catch(() => ({ sources: [] })),
+    // A daemon older than 0.6.0 has no mic at all; its `unknown_method` is not
+    // an error worth showing, it is just an older half of the app.
+    ask('mic.get').catch(() => null),
   ]);
 
   store.speakers = new Map((speakers.speakers ?? []).map((s) => [s.id, s]));
   store.segments = [...(transcript.segments ?? [])].sort((a, b) => a.t_ms - b.t_ms);
   store.segById = new Map(store.segments.map((s) => [s.id, s]));
   store.sources = sources.sources ?? [];
+  if (mic) applyMic(mic);
   store.loaded = true;
   return store;
+}
+
+/**
+ * Fold a mic block (from `mic.get`, `mic.set`, or a `mic` event) into the
+ * model. `you_speaker` only travels on the first two, so an event must not be
+ * allowed to erase it.
+ */
+export function applyMic(d) {
+  store.mic = { ...store.mic, ...d };
+  if (d.you_speaker !== undefined) store.mic.you_speaker = d.you_speaker;
+  return store.mic;
+}
+
+/** Is this the user's own voice — the one the microphone pins? */
+export function isYou(speakerId) {
+  if (speakerId == null) return false;
+  if (store.mic.you_speaker != null) return speakerId === store.mic.you_speaker;
+  // `speakers.list` carries the same fact, and it is the one that survives a
+  // daemon too old to answer `mic.get`.
+  return store.speakers.get(speakerId)?.you === true;
+}
+
+/**
+ * What the microphone card's chip says. Three states a person can act on, out
+ * of the daemon's five: the two `always:*` collapse because "on and recording"
+ * is the same thing to look at whichever mode got you there, and `always:idle`
+ * is the honest "no device" case.
+ */
+export function micChip(state = store.mic.state) {
+  switch (state) {
+    case 'following:active':
+    case 'always:active':
+      return { text: 'capturing', cls: 'chip live', live: true };
+    case 'following:idle':
+      return { text: 'waiting for an allowed app', cls: 'chip' };
+    case 'always:idle':
+      return { text: 'no input device', cls: 'chip warn' };
+    default:
+      return { text: 'off', cls: 'chip' };
+  }
 }
 
 /**
@@ -223,7 +276,19 @@ export function applyEvent(evt, opts = {}) {
 
     case 'status': {
       store.status = d ?? null;
-      return { status: true };
+      // The daemon's status block carries the mic too, so a client that missed
+      // a `mic` event still converges on the truth.
+      if (d?.mic) applyMic(d.mic);
+      return { status: true, mic: true };
+    }
+
+    // PROTOCOL: the mic block, on the status topic. It arrives both when the
+    // switch moves and when the capture thread opens or closes the stream —
+    // the latter is the only way a follow-mode transition is visible.
+    case 'mic': {
+      if (!d) return null;
+      applyMic(d);
+      return { mic: true };
     }
 
     case 'op.progress': {
@@ -265,7 +330,12 @@ function bumpCount(speakerId, n, ms) {
  * when to ask: when unnamed speakers hold a real share of total speech time.
  */
 export function onboardingCandidates({ minShare = 0.25, top = 3 } = {}) {
-  const all = [...store.speakers.values()];
+  // "Who are they?" is not a question about yourself. The pinned voice is the
+  // one identity in the bank that was never guessed at, so it is out of the
+  // naming flow entirely — out of the candidates AND out of the denominator,
+  // because a user who talks a lot must not be able to suppress the question
+  // about everybody else.
+  const all = [...store.speakers.values()].filter((s) => !isYou(s.id));
   const total = all.reduce((n, s) => n + (s.total_ms ?? 0), 0);
   if (!total) return { show: false, share: 0, speakers: [] };
   const unnamed = all.filter((s) => !isNamed(s)).sort((a, b) => (b.total_ms ?? 0) - (a.total_ms ?? 0));

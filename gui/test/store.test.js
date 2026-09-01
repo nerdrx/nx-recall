@@ -9,8 +9,11 @@ import assert from 'node:assert/strict';
 import {
   store,
   applyEvent,
+  applyMic,
   isUncertain,
   uncertainReason,
+  isYou,
+  micChip,
   onboardingCandidates,
   mergeSegments,
   speakerLabel,
@@ -24,6 +27,7 @@ function reset() {
   store.sources = [];
   store.ops = new Map();
   store.status = null;
+  store.mic = { enabled: false, mode: 'follow', active: false, state: 'off', device: null, you_speaker: null };
 }
 
 const seg = (id, over = { }) => ({
@@ -137,6 +141,98 @@ test('onboarding asks only when unnamed voices really dominate', () => {
   assert.equal(ob.show, true);
   assert.ok(ob.share > 0.4);
   assert.deepEqual(ob.speakers.map((s) => s.id), [3, 2], 'the loudest unnamed voices come first');
+});
+
+test('a mic event moves the switch and never erases the pin behind it', () => {
+  reset();
+  applyMic({ enabled: true, mode: 'follow', active: false, state: 'following:idle', you_speaker: 8 });
+  assert.equal(store.mic.you_speaker, 8);
+
+  // The capture thread's event carries the switch but not the pin — folding it
+  // in must not blank the one field it does not talk about.
+  const change = applyEvent({
+    seq: 1,
+    ev: 'mic',
+    data: { enabled: true, mode: 'follow', active: true, state: 'following:active', device: null },
+  });
+  assert.deepEqual(change, { mic: true });
+  assert.equal(store.mic.state, 'following:active');
+  assert.equal(store.mic.you_speaker, 8, 'the pin survived an event that never mentioned it');
+
+  // A status push carries the same block and converges on the same answer.
+  applyEvent({ seq: 2, ev: 'status', data: { paused: false, mic: { state: 'off', enabled: false } } });
+  assert.equal(store.mic.state, 'off');
+  assert.equal(store.mic.you_speaker, 8);
+});
+
+test('the mic chip names the three states a person can act on', () => {
+  assert.equal(micChip('off').text, 'off');
+  // The one that matters: enabled but not recording, because nothing allowed
+  // is running. If this read as "capturing" the whole follow model would be a
+  // lie on screen.
+  assert.equal(micChip('following:idle').text, 'waiting for an allowed app');
+  assert.equal(micChip('following:active').text, 'capturing');
+  assert.equal(micChip('always:active').text, 'capturing');
+  assert.ok(micChip('following:active').live);
+  assert.ok(!micChip('following:idle').live);
+  // A microphone that will not open is a problem to look at, not "recording".
+  assert.equal(micChip('always:idle').text, 'no input device');
+  assert.match(micChip('always:idle').cls, /warn/);
+  // An unknown state from a newer daemon degrades to "off", never to "on".
+  assert.equal(micChip('something:new').text, 'off');
+});
+
+test('your own voice is recognised from the pin or from the speaker row', () => {
+  reset();
+  store.speakers.set(8, { id: 8, name: null, auto: 'You', you: true, total_ms: 1000 });
+  store.speakers.set(1, { id: 1, name: 'Kira', total_ms: 1000 });
+  // Before mic.get answers, `speakers.list` already carries the fact.
+  assert.equal(isYou(8), true);
+  assert.equal(isYou(1), false);
+  assert.equal(isYou(null), false);
+
+  // Once the pin is known it wins, which is what makes a merge take effect in
+  // the UI without a speakers re-query.
+  applyMic({ you_speaker: 1 });
+  assert.equal(isYou(1), true);
+  assert.equal(isYou(8), false);
+});
+
+test('a mic segment says its speaker is certain and its audio may not be', () => {
+  reset();
+  store.speakers.set(8, { id: 8, name: null, auto: 'You', you: true, total_ms: 0 });
+  applyMic({ you_speaker: 8 });
+
+  // No score, because nothing was compared. That must not read as uncertain.
+  const clean = seg(1, { speaker: 8, match_score: null, overlap_frac: 0.02 });
+  assert.equal(isUncertain(clean), false);
+
+  // Speakers-bleed: the room is in the recording. The NAME is still certain —
+  // it came from the device — and the copy has to say which half is in doubt.
+  const bleed = seg(2, { speaker: 8, match_score: null, overlap_frac: 0.55 });
+  assert.equal(isUncertain(bleed), true);
+  const why = uncertainReason(bleed);
+  assert.match(why, /your microphone/i);
+  assert.match(why, /certain/i);
+  assert.doesNotMatch(why, /not trustworthy/i, 'the label is not what is in doubt here');
+});
+
+test('onboarding never asks the user who they are', () => {
+  reset();
+  store.speakers.set(8, { id: 8, name: null, auto: 'You', you: true, total_ms: 200_000 });
+  store.speakers.set(2, { id: 2, name: null, auto: 'Speaker_07', total_ms: 60_000 });
+  applyMic({ you_speaker: 8 });
+
+  const ob = onboardingCandidates();
+  assert.ok(ob.show, 'there is still an unnamed voice worth naming');
+  assert.deepEqual(
+    ob.speakers.map((s) => s.id),
+    [2],
+    'the pinned voice is the one identity that was never guessed at'
+  );
+  // …and a user who talks more than everybody else must not be able to
+  // suppress the question about them just by being loud.
+  assert.equal(ob.share, 1, 'your own speech is not in the denominator either');
 });
 
 test('merging history into the live window never duplicates or reorders', () => {

@@ -480,6 +480,190 @@ export function runE2E(deps) {
       return { deniedBefore: denied, toggled: key, file };
     });
 
+    // 12b — the microphone. Off by default and NOT in the application list;
+    // enabling it in follow mode has to read as "waiting", not as "recording",
+    // because that difference is the whole privacy model (0.6.0).
+    await step('mic-card-is-off-and-separate', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await waitFor('the microphone card', async () => js('!!document.getElementById("mic-card")'));
+
+      // It sits above the application list, not in it.
+      const order = await js(`(() => {
+        const body = document.querySelector('.view-body');
+        const cards = [...body.querySelectorAll('.card')];
+        return cards.indexOf(document.getElementById('mic-card'));
+      })()`);
+      assert(order === 0, `the microphone card is not first in the view (index ${order})`);
+      const inList = await js(`[...document.querySelectorAll('#source-list .src-row')].some(r => r.dataset.source === 'mic')`);
+      assert(!inList, 'the microphone is listed as an application — it is not one');
+
+      const mic = await js('window.__recallDebug.mic()');
+      assert(mic.enabled === false, 'the microphone is not off by default');
+      assert(mic.mode === 'follow', `the default mode is not follow (${mic.mode})`);
+      assert(mic.chip === 'off', `the state chip reads "${mic.chip}"`);
+      assert(mic.pressed === 'false', 'the toggle claims to be on');
+
+      // The copy that has to be unmissable: it hears the ROOM.
+      assert(/room/i.test(mic.warning), `the warning does not say what it hears: ${mic.warning}`);
+      assert(/not the game/i.test(mic.warning), `the warning does not draw the contrast: ${mic.warning}`);
+      return { warning: mic.warning.slice(0, 70), chip: mic.chip };
+    });
+
+    await step('mic-follow-mode-waits-then-captures', async () => {
+      // Deny every application first, so "follow" has nothing to follow and
+      // the waiting state is reachable rather than theoretical.
+      const denied = await js(`(async () => {
+        const keys = [...document.querySelectorAll('#source-list .src-row:not(.denied)')].map(r => r.dataset.source);
+        for (const k of keys) await window.recall.request('sources.set', {match_key: k, allowed: false});
+        return keys;
+      })()`);
+
+      await js('document.getElementById("mic-toggle").click()');
+      const waiting = await waitFor(
+        'the microphone to report waiting',
+        async () => {
+          const m = await js('window.__recallDebug.mic()');
+          return m.enabled && m.state === 'following:idle' ? m : null;
+        },
+        { timeout: 10000, every: 150 }
+      );
+      assert(
+        /waiting/i.test(waiting.chip),
+        `enabled-but-idle must not read as recording (chip: "${waiting.chip}")`
+      );
+      assert(
+        waiting.modePressed.find(([m]) => m === 'follow')?.[1] === 'true',
+        `the mode picker does not show follow selected: ${JSON.stringify(waiting.modePressed)}`
+      );
+      const file = await shot('sources-mic-waiting');
+
+      // Allowing an application is what starts the microphone. Nothing else.
+      await js(`window.recall.request('sources.set', {match_key: ${JSON.stringify(denied[0])}, allowed: true})`);
+      const capturing = await waitFor(
+        'the microphone to start capturing',
+        async () => {
+          const m = await js('window.__recallDebug.mic()');
+          return m.state === 'following:active' ? m : null;
+        },
+        { timeout: 12000, every: 150 }
+      );
+      assert(/capturing/i.test(capturing.chip), `the chip did not follow the state: "${capturing.chip}"`);
+      return { denied, waiting: waiting.chip, capturing: capturing.chip, file };
+    });
+
+    // 12c — "You" renders distinctly, and it is a DIFFERENT treatment from
+    // everyone else rather than merely a present one.
+    await step('your-own-voice-renders-distinctly', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      const seen = await waitFor(
+        'You rows in the transcript',
+        async () => {
+          const m = await js('window.__recallDebug.mic()');
+          return m.youRows > 0 ? m : null;
+        },
+        { timeout: 20000, every: 250 }
+      );
+      assert(seen.otherRows > 0, 'every row is marked as the user — that is not a distinction');
+
+      // The mark itself: a ring on the dot and a standing underline on the
+      // name, neither of which an ordinary row carries.
+      const style = await js(`(() => {
+        const you = document.querySelector('#seg-list .seg.you .who .dot');
+        const other = document.querySelector('#seg-list .seg:not(.you) .who .dot');
+        const youName = document.querySelector('#seg-list .seg.you .who .nm');
+        const otherName = document.querySelector('#seg-list .seg:not(.you) .who .nm');
+        const cs = (e) => e ? getComputedStyle(e) : null;
+        return {
+          youDot: cs(you)?.boxShadow ?? '',
+          otherDot: cs(other)?.boxShadow ?? '',
+          youUnderline: cs(youName)?.borderBottomColor ?? '',
+          otherUnderline: cs(otherName)?.borderBottomColor ?? '',
+        };
+      })()`);
+      assert(style.youDot !== 'none' && style.youDot !== '', `the You dot carries no ring: ${JSON.stringify(style)}`);
+      assert(style.youDot !== style.otherDot, 'the You dot looks exactly like everyone else');
+      assert(style.youUnderline !== style.otherUnderline, 'the You name looks exactly like everyone else');
+
+      // …and the layout did not move: same grid, same columns, no extra badge.
+      const cols = await js(`(() => {
+        const you = getComputedStyle(document.querySelector('#seg-list .seg.you')).gridTemplateColumns;
+        const other = getComputedStyle(document.querySelector('#seg-list .seg:not(.you)')).gridTemplateColumns;
+        return [you, other];
+      })()`);
+      assert(cols[0] === cols[1], `the You row uses a different layout: ${cols}`);
+
+      const file = await shot('transcript-you');
+      return { youRows: seen.youRows, otherRows: seen.otherRows, file };
+    });
+
+    await step('mic-off-stops-it', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await waitFor('the microphone card', async () => js('!!document.getElementById("mic-card")'));
+      const before = (await js('window.__recallDebug.mic()')).state;
+      assert(before === 'following:active', `expected an active microphone, saw ${before}`);
+
+      await js('document.getElementById("mic-toggle").click()');
+      const off = await waitFor(
+        'the microphone to go off',
+        async () => {
+          const m = await js('window.__recallDebug.mic()');
+          return m.state === 'off' ? m : null;
+        },
+        { timeout: 10000, every: 150 }
+      );
+      assert(off.chip === 'off', `the chip did not follow the switch: "${off.chip}"`);
+      assert(off.pressed === 'false', 'the toggle still claims to be on');
+
+      // No new rows of the user's own voice arrive after the switch.
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      const stopped = (await js('window.__recallDebug.mic()')).youRows;
+      await sleep(6000); // three feed intervals
+      const after = (await js('window.__recallDebug.mic()')).youRows;
+      assert(after === stopped, `the microphone kept producing rows while off (${stopped} → ${after})`);
+      return { stopped, after };
+    });
+
+    // 12d — native widgets Chromium draws outside the page (a <select> option
+    // popup above all) take their colours from `color-scheme` and from nothing
+    // we can style. Without it the Search view's speaker dropdown is
+    // light-on-light and unreadable.
+    await step('native-widgets-render-dark', async () => {
+      const scheme = await js('window.__recallDebug.colorScheme()');
+      assert(/dark/.test(scheme), `the document declares color-scheme "${scheme}", so native popups render light`);
+
+      await js('document.querySelector(\'.rail-item[data-view="search"]\').click()');
+      await waitFor('the search facets', async () => js('!!document.getElementById("search-q")'));
+      const sel = await js(`(() => {
+        const s = document.getElementById('search-speaker');
+        if (!s) return null;
+        const cs = getComputedStyle(s);
+        // The popup itself is drawn by the browser and cannot be inspected, so
+        // check the rule that governs it instead of its pixels.
+        let rule = '';
+        for (const sheet of document.styleSheets) {
+          let rules;
+          try { rules = sheet.cssRules; } catch { continue; }
+          for (const r of rules) {
+            if (r.selectorText && /select\\.input option/.test(r.selectorText)) rule = r.cssText;
+          }
+        }
+        return {
+          scheme: cs.colorScheme,
+          options: s.options.length,
+          rule,
+        };
+      })()`);
+      assert(sel, 'the search view has no speaker <select> to check');
+      assert(/dark/.test(sel.scheme), `the select itself inherits "${sel.scheme}"`);
+      assert(sel.options > 1, `the speaker dropdown has nothing in it (${sel.options})`);
+      // Belt and braces behind the scheme, for platforms whose popup ignores it.
+      assert(sel.rule, 'no explicit option colours are declared');
+      assert(/background/.test(sel.rule) && /color/.test(sel.rule), `the option rule is incomplete: ${sel.rule}`);
+      const file = await shot('search-select');
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      return { ...sel, file };
+    });
+
     // 13 — the footer is the status surface the design asks for
     await step('status-footer', async () => {
       const text = await js('document.getElementById("footer").textContent');

@@ -123,6 +123,8 @@ impl Service {
             "resume" => self.set_paused(false),
             "sources.list" => self.sources_list(),
             "sources.set" => self.sources_set(req),
+            "mic.get" => self.mic_get(),
+            "mic.set" => self.mic_set(req),
             "speakers.list" => self.speakers_list(),
             "speakers.name" => self.speakers_name(req),
             "speakers.merge" => self.speakers_merge(req),
@@ -254,6 +256,10 @@ impl Service {
             "models_loaded": !models.is_empty(),
             "sources_allowed": allowed,
             "sources_capturing": capturing,
+            // The whole microphone answer in one place, plus the flat string
+            // for anything that only wants to print a word (PROTOCOL).
+            "mic": c.mic_json(),
+            "mic_state": c.mic_state(),
             "segments_total": store.segments_total()?,
             "counters": {
                 "sessions_opened": c.stats.sessions_opened.load(Ordering::Relaxed),
@@ -262,6 +268,9 @@ impl Service {
                 "analysed": c.analysis.analysed.load(Ordering::Relaxed),
                 "labelled": c.analysis.labelled.load(Ordering::Relaxed),
                 "refused_overlap": c.analysis.refused_overlap.load(Ordering::Relaxed),
+                "mic_segments": c.analysis.mic_segments.load(Ordering::Relaxed),
+                "mic_enrolled": c.analysis.mic_enrolled.load(Ordering::Relaxed),
+                "mic_goldens": c.analysis.mic_goldens.load(Ordering::Relaxed),
             },
             "clients": self.bus.client_count(),
             "seq": self.bus.current_seq(),
@@ -307,13 +316,20 @@ impl Service {
     fn sources_list(&self) -> Result<Value, Error> {
         let rows = self.store().list_sources().map_err(Error::from)?;
         let live = self.control.allowlist();
+        let mic = self.control.mic();
         Ok(json!({
             "sources": rows
                 .into_iter()
                 .map(|r| {
+                    let is_mic = r.kind == crate::store::KIND_MIC;
                     json!({
                         "id": r.id,
                         "match_key": r.match_key,
+                        // "app" or "mic" (schema v4). The microphone is a row
+                        // here like anything else and is governed by `[mic]`
+                        // rather than by the allowlist, so a client that does
+                        // not know the difference must not render it as an app.
+                        "kind": r.kind,
                         // `binary` is the process this was keyed on; `display`
                         // is what the application calls itself. For a Wine
                         // program these differ, which is exactly why the key is
@@ -322,8 +338,9 @@ impl Service {
                         "display": r.display_name,
                         "display_name": r.display_name,
                         // The live answer, which may be ahead of the database
-                        // for the instant between a toggle and its mirror.
-                        "allowed": live.decide(&r.match_key).captures(),
+                        // for the instant between a toggle and its mirror. The
+                        // microphone's switch is `[mic].enabled`, never a rule.
+                        "allowed": if is_mic { mic.enabled } else { live.decide(&r.match_key).captures() },
                         "first_seen": iso8601(r.first_seen),
                         "last_seen": iso8601(r.last_seen),
                         "streams": r.streams,
@@ -340,6 +357,19 @@ impl Service {
         let match_key = req.str("match_key")?.to_string();
         if match_key.trim().is_empty() {
             return Err(Error::params("match_key must not be empty"));
+        }
+        // The microphone is a row in `sources` and is deliberately not a rule
+        // in the allowlist: an app rule is consent about one program's output,
+        // and this device hears the room. Half-enabling it through the wrong
+        // method would leave `[rules]` and `[mic]` disagreeing about a consent
+        // decision, so the refusal names the method that actually works.
+        if match_key == crate::capture::MIC_MATCH_KEY {
+            return Err(Error::new(
+                "refused",
+                "the microphone is not an application rule — use mic.set \
+                 {enabled, mode}; it hears the room rather than one program, so \
+                 it has its own switch and its own default (off)",
+            ));
         }
         let allowed = req
             .opt_bool("allowed")?
@@ -376,15 +406,103 @@ impl Service {
         Ok(json!({"match_key": match_key, "allowed": allowed, "persisted": persisted}))
     }
 
+    // ---- microphone ------------------------------------------------------
+
+    /// The mic block plus the pinned speaker, so a client can render both the
+    /// switch and "which voice in the transcript is me" from one call.
+    fn mic_get(&self) -> Result<Value, Error> {
+        let you = self.store().you_speaker_id().map_err(Error::from)?;
+        let mut out = self.control.mic_json();
+        out["you_speaker"] = json!(you);
+        Ok(out)
+    }
+
+    /// The switch. Both fields are optional and applied independently, so
+    /// `recalld mic always` can change the mode without also having to know
+    /// whether the switch was already on.
+    ///
+    /// The device pin is config-file-only on purpose: it is a machine setup
+    /// decision, not something a click should be able to change under a user
+    /// who has deliberately chosen one microphone out of several.
+    fn mic_set(&self, req: &Request) -> Result<Value, Error> {
+        let enabled = req.opt_bool("enabled")?;
+        let mode = match req.opt_str("mode")? {
+            None => None,
+            Some(s) => Some(crate::config::MicMode::parse(s).ok_or_else(|| {
+                Error::params(format!("mode must be \"follow\" or \"always\", not {s:?}"))
+            })?),
+        };
+        if enabled.is_none() && mode.is_none() {
+            return Err(Error::params("mic.set needs at least one of enabled, mode"));
+        }
+
+        let cfg = self.control.set_mic(enabled, mode);
+
+        // Mirror the switch onto the source row, so `recalld sources` and any
+        // client reading `sources.list` agree with `mic.get`.
+        if let Err(e) = self.store().upsert_source_kind(
+            crate::capture::MIC_MATCH_KEY,
+            crate::capture::MIC_DISPLAY_NAME,
+            crate::store::KIND_MIC,
+            utc_now_ns(),
+        ) {
+            warn!("could not record the microphone source row: {e:#}");
+        }
+        if let Err(e) =
+            self.store()
+                .set_allowed(crate::capture::MIC_MATCH_KEY, cfg.enabled, utc_now_ns())
+        {
+            warn!("could not mirror the microphone switch onto its source row: {e:#}");
+        }
+
+        let mut persisted = false;
+        if let Some(path) = &self.control.config_path {
+            match Config::load(path) {
+                Ok(mut file) => {
+                    file.mic.enabled = cfg.enabled;
+                    file.mic.mode = cfg.mode;
+                    match file.save(path) {
+                        Ok(()) => persisted = true,
+                        Err(e) => warn!("could not persist the microphone switch: {e:#}"),
+                    }
+                }
+                Err(e) => warn!("could not re-read the config to persist the microphone: {e:#}"),
+            }
+        }
+        info!(
+            enabled = cfg.enabled,
+            mode = cfg.mode.as_str(),
+            persisted,
+            "microphone switch changed"
+        );
+
+        // Two events, because two things changed: the mic block (which the
+        // capture thread will confirm again the moment the stream really opens)
+        // and the daemon's overall state.
+        let mut payload = self.control.mic_json();
+        payload["persisted"] = json!(persisted);
+        self.bus.publish(Topic::Status, "mic", payload.clone());
+        self.announce_status();
+        Ok(payload)
+    }
+
     // ---- speakers --------------------------------------------------------
 
     fn speakers_list(&self) -> Result<Value, Error> {
-        let rows = self.store().list_speakers().map_err(Error::from)?;
+        let store = self.store();
+        let rows = store.list_speakers().map_err(Error::from)?;
+        let you = store.you_speaker_id().map_err(Error::from)?;
+        drop(store);
         Ok(json!({
             "speakers": rows
                 .into_iter()
                 .map(|r| json!({
                     "id": r.id,
+                    // The user's own voice, pinned by the microphone rather
+                    // than matched (PROTOCOL). A client renders it differently
+                    // because its label means something different: provenance,
+                    // not a score.
+                    "you": Some(r.id) == you,
                     // `null` until a person names this voice — the difference
                     // the onboarding flow is built on (DESIGN §5).
                     "name": r.name(),

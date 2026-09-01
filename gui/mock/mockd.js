@@ -25,8 +25,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const PROTO = 1;
-const DAEMON = 'recalld-mock/0.3';
-const SCHEMA = 2;
+const DAEMON = 'recalld-mock/0.4';
+const SCHEMA = 4;
 const REPLAY_MAX = 200; // deliberately small: overrunning it must be reachable
 
 export function defaultMockSocket() {
@@ -45,12 +45,32 @@ const SESSIONS = [
   { id: 3, world: 'Murder 4', started: '2026-08-31T18:05:00Z' },
 ];
 
+// `kind` is schema v4: "mic" is a source row like any other and is governed by
+// its own switch rather than by the allowlist, which is why the GUI renders it
+// somewhere else entirely.
 const SOURCES = [
-  { match_key: 'VRChat.exe', binary: 'wine64-preloader', display: 'VRChat', allowed: true, first_seen: '2026-07-02T18:22:00Z', last_seen: '2026-08-31T18:05:00Z', streams: 1 },
-  { match_key: 'Discord', binary: 'Discord', display: 'Discord', allowed: true, first_seen: '2026-07-02T19:01:00Z', last_seen: '2026-08-31T17:44:00Z', streams: 1 },
-  { match_key: 'firefox', binary: 'firefox', display: 'Firefox', allowed: false, first_seen: '2026-07-03T09:14:00Z', last_seen: '2026-08-31T12:30:00Z', streams: 0 },
-  { match_key: 'spotify', binary: 'spotify', display: 'Spotify', allowed: false, first_seen: '2026-07-05T22:10:00Z', last_seen: '2026-08-30T23:58:00Z', streams: 0 },
-  { match_key: 'mpv', binary: 'mpv', display: 'mpv', allowed: false, first_seen: '2026-08-14T20:44:00Z', last_seen: '2026-08-14T22:02:00Z', streams: 0 },
+  { match_key: 'VRChat.exe', kind: 'app', binary: 'wine64-preloader', display: 'VRChat', allowed: true, first_seen: '2026-07-02T18:22:00Z', last_seen: '2026-08-31T18:05:00Z', streams: 1 },
+  { match_key: 'Discord', kind: 'app', binary: 'Discord', display: 'Discord', allowed: true, first_seen: '2026-07-02T19:01:00Z', last_seen: '2026-08-31T17:44:00Z', streams: 1 },
+  { match_key: 'firefox', kind: 'app', binary: 'firefox', display: 'Firefox', allowed: false, first_seen: '2026-07-03T09:14:00Z', last_seen: '2026-08-31T12:30:00Z', streams: 0 },
+  { match_key: 'spotify', kind: 'app', binary: 'spotify', display: 'Spotify', allowed: false, first_seen: '2026-07-05T22:10:00Z', last_seen: '2026-08-30T23:58:00Z', streams: 0 },
+  { match_key: 'mpv', kind: 'app', binary: 'mpv', display: 'mpv', allowed: false, first_seen: '2026-08-14T20:44:00Z', last_seen: '2026-08-14T22:02:00Z', streams: 0 },
+  { match_key: 'mic', kind: 'mic', binary: 'mic', display: 'Microphone', allowed: false, first_seen: '2026-07-02T18:22:00Z', last_seen: '2026-08-31T18:05:00Z', streams: 0 },
+];
+
+/// The pinned "You" speaker. It exists in the mock's voicebank from the start
+/// (a previous session's microphone minted it) so the transcript's distinct
+/// treatment is reachable without waiting for a live enrolment.
+const YOU_SPEAKER = 8;
+
+// What the user says into their own microphone. Lines rather than tones: the
+// point of the mic feed is that these rows render differently, and a reviewer
+// looking at a screenshot has to be able to tell which ones they are.
+const MY_LINES = [
+  'hold on, I am going to move to the other side of the bar',
+  'yeah I can hear you fine now',
+  'I think the portal in the stairwell only opens at night',
+  'give me a second, my headset is doing the thing again',
+  'that is the world I was talking about earlier',
 ];
 
 // name: null means "not named yet" — the onboarding case (DESIGN §5).
@@ -61,6 +81,9 @@ const SPEAKERS = [
   { id: 4, name: 'Ash', auto: 'Speaker_18', first_seen: '2026-07-19T19:47:00Z' },
   { id: 5, name: null, auto: 'Speaker_31', first_seen: '2026-08-14T20:50:00Z' },
   { id: 6, name: null, auto: 'Speaker_44', first_seen: '2026-08-29T20:19:00Z' },
+  // Unnamed, like any other voice the daemon minted — the difference is where
+  // its label comes from, not whether the user has typed one.
+  { id: 8, name: null, auto: 'You', first_seen: '2026-08-29T20:12:00Z' },
 ];
 
 // One voice whose audio has aged out of retention while its text stayed. The
@@ -145,12 +168,22 @@ function buildHistory() {
   const out = [];
   const base = Date.parse('2026-08-31T18:05:00Z');
   for (let i = 0; i < 26; i++) {
-    const [sp, text, overlap, score] = CANNED_LINES[i % CANNED_LINES.length];
     const t = base + i * 47_000;
+    // Every seventh row is the user, from a session where the microphone was
+    // on. It comes from `source: "mic"`, carries the pinned speaker, and has NO
+    // match_score — the label is provenance, not a comparison — so the
+    // transcript's distinct treatment is visible on first paint rather than
+    // only after a live enrolment.
+    // The stride is chosen so it never displaces the canned lines the other
+    // tests depend on — the aged-out voice, and one of each kind of nameless.
+    const mine = i % 9 === 4;
+    const [sp, text, overlap, score] = mine
+      ? [YOU_SPEAKER, MY_LINES[Math.floor(i / 9) % MY_LINES.length], 0.02, null]
+      : CANNED_LINES[i % CANNED_LINES.length];
     out.push({
       id: 1000 + i,
       session: SESSIONS[i % 3 === 2 ? 2 : i % 2].id,
-      source: i % 5 === 3 ? 'Discord' : 'VRChat.exe',
+      source: mine ? 'mic' : i % 5 === 3 ? 'Discord' : 'VRChat.exe',
       speaker: overlap > 0.1 ? null : sp,
       text,
       t_ms: t,
@@ -176,6 +209,9 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
     speakers: SPEAKERS.map((s) => ({ ...s })),
     segments: buildHistory(),
     sources: SOURCES.map((s) => ({ ...s })),
+    // Off by default, exactly as the real daemon ships it.
+    mic: { enabled: false, mode: 'follow', active: false, device: null },
+    myLineIdx: 0,
     tombstones: new Map(), // merged-away speaker id → surviving id (never chained)
     replay: [],
     nextSegId: 2000,
@@ -236,14 +272,49 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
 
   function speakerList() {
     const c = counts();
+    const you = youSpeaker();
     return state.speakers.map((s) => ({
       id: s.id,
       name: s.name,
       auto: s.auto,
+      // Exactly one row can be true: the voice the microphone pins.
+      you: s.id === you,
       first_seen: s.first_seen,
       segments: c.get(s.id)?.segments ?? 0,
       total_ms: c.get(s.id)?.total_ms ?? 0,
     }));
+  }
+
+  /// The pinned speaker, followed through tombstones exactly as the daemon
+  /// does: merging "You" into a named voice moves the pin, it does not mint a
+  /// second user.
+  function youSpeaker() {
+    const resolved = state.tombstones.get(YOU_SPEAKER) ?? YOU_SPEAKER;
+    return state.speakers.some((s) => s.id === resolved) ? resolved : null;
+  }
+
+  /// The mic state machine, mirroring `capture::mic_plan`: `follow` is open
+  /// exactly while an allowed application is capturing, `always` ignores that.
+  function micActive() {
+    if (!state.mic.enabled) return false;
+    if (state.mic.mode === 'always') return true;
+    return state.sources.some((s) => s.kind !== 'mic' && s.allowed && s.streams > 0);
+  }
+
+  function micState() {
+    if (!state.mic.enabled) return 'off';
+    const active = micActive();
+    return state.mic.mode === 'always' ? (active ? 'always:active' : 'always:idle') : active ? 'following:active' : 'following:idle';
+  }
+
+  function micPayload() {
+    return {
+      enabled: state.mic.enabled,
+      mode: state.mic.mode,
+      active: micActive(),
+      state: micState(),
+      device: state.mic.device,
+    };
   }
 
   function statusPayload() {
@@ -254,6 +325,8 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       drops: state.drops,
       sources_capturing: state.sources.filter((s) => s.allowed && s.streams > 0).length,
       sources_allowed: state.sources.filter((s) => s.allowed).length,
+      mic: micPayload(),
+      mic_state: micState(),
       models: ['silero-vad', 'segmentation-3.0', 'eres2net-en', 'parakeet-tdt-110m'],
       segments_total: state.segments.length,
       daemon: daemonId(),
@@ -269,6 +342,14 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
   let feedTimer = null;
   function tick() {
     if (state.paused) return;
+    // Interleaved, not separate: the user's own voice arrives in the same
+    // stream as everybody else's, and the only thing that marks it is where it
+    // came from. Every third tick, while the mic is actually capturing.
+    if (micActive() && state.feedIdx % 3 === 2) {
+      state.feedIdx += 1;
+      emitMine();
+      return;
+    }
     const [sp, text, overlap, score] = CANNED_LINES[state.feedIdx % CANNED_LINES.length];
     state.feedIdx += 1;
     // A voice the client has never seen gets minted mid-session: there is no
@@ -297,6 +378,29 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
     state.queue = state.feedIdx % 4;
     emit('segments', 'segment', seg);
   }
+  /// One turn off the user's own microphone. Note what is NOT here: a
+  /// match_score. There was no comparison, so there is no score to report, and
+  /// a client that renders one would be inventing it.
+  function emitMine() {
+    const now = Date.now();
+    const text = MY_LINES[state.myLineIdx % MY_LINES.length];
+    state.myLineIdx += 1;
+    const seg = {
+      id: state.nextSegId++,
+      session: SESSIONS[2].id,
+      source: 'mic',
+      speaker: youSpeaker(),
+      text,
+      t_ms: now,
+      t_ns: String(now) + '000000',
+      dur_ms: 2200 + ((state.myLineIdx * 617) % 3400),
+      overlap_frac: 0.02,
+      match_score: null,
+    };
+    state.segments.push(seg);
+    emit('segments', 'segment', seg);
+  }
+
   function startFeed() {
     if (feedTimer) return;
     feedTimer = setInterval(tick, feedMs);
@@ -353,13 +457,49 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
     'sources.list': () => ({ sources: state.sources }),
 
     'sources.set'(params) {
+      // The microphone is a source row and deliberately not an allowlist rule:
+      // an app rule is consent about one program's output, and this device
+      // hears the room. The refusal names the method that works.
+      if (params?.match_key === 'mic') {
+        throw err(
+          'refused',
+          'the microphone is not an application rule — use mic.set {enabled, mode}; it hears the room rather than one program, so it has its own switch and its own default (off)'
+        );
+      }
       const s = state.sources.find((x) => x.match_key === params?.match_key);
       if (!s) throw err('not_found', `no source ${params?.match_key}`);
       s.allowed = !!params?.allowed;
       s.streams = s.allowed ? 1 : 0;
       emit('sources', 'source', { match_key: s.match_key, allowed: s.allowed });
+      // Allowing or denying the last app is a follow-mode transition, and the
+      // `mic` event is the only way a client can see one.
+      emit('status', 'mic', micPayload());
       emit('status', 'status', statusPayload());
       return { match_key: s.match_key, allowed: s.allowed };
+    },
+
+    'mic.get': () => ({ ...micPayload(), you_speaker: youSpeaker() }),
+
+    'mic.set'(params) {
+      const enabled = params?.enabled;
+      const mode = params?.mode;
+      if (enabled === undefined && mode === undefined) {
+        throw err('bad_params', 'mic.set needs at least one of enabled, mode');
+      }
+      if (mode !== undefined && mode !== 'follow' && mode !== 'always') {
+        throw err('bad_params', `mode must be "follow" or "always", not ${JSON.stringify(mode)}`);
+      }
+      if (enabled !== undefined) state.mic.enabled = !!enabled;
+      if (mode !== undefined) state.mic.mode = mode;
+      // Mirrored onto the row, so `sources.list` and `mic.get` agree.
+      const row = state.sources.find((s) => s.kind === 'mic');
+      if (row) {
+        row.allowed = state.mic.enabled;
+        row.streams = micActive() ? 1 : 0;
+      }
+      emit('status', 'mic', micPayload());
+      emit('status', 'status', statusPayload());
+      return { ...micPayload(), persisted: true };
     },
 
     'speakers.list': () => ({ speakers: speakerList() }),

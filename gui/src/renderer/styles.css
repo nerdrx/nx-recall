@@ -233,6 +233,20 @@ button, input, select, textarea { font: inherit; color: var(--text); }
 .input::placeholder { color: rgba(154, 143, 192, 0.6); }
 textarea.input { resize: vertical; min-height: 74px; line-height: 1.5; width: 100%; }
 
+/* Belt and braces behind `color-scheme: dark` (tokens.css): the option popup is
+   drawn by the browser, not by us, and on some platforms it still takes the
+   element's own colours rather than the scheme's. An unreadable dropdown is a
+   dead control, so both are set. */
+select.input option, select.input optgroup {
+  background: #0d0819;
+  color: var(--text);
+}
+/* `color-scheme: dark` already draws the date input's calendar glyph light —
+   inverting it here would put it straight back to invisible. Only its weight is
+   ours to set: quiet at rest, obvious under the pointer. */
+.input::-webkit-calendar-picker-indicator { opacity: 0.5; cursor: pointer; }
+.input::-webkit-calendar-picker-indicator:hover { opacity: 1; }
+
 .toggle {
   position: relative; width: 40px; height: 21px; flex: none; cursor: pointer;
   border-radius: var(--radius-xs); border: 1px solid var(--line);
@@ -278,6 +292,19 @@ textarea.input { resize: vertical; min-height: 74px; line-height: 1.5; width: 10
 /* A name in a transcript row is a filter: say so on hover, quietly. */
 .seg .who .nm:not(.reasoned) { cursor: pointer; border-bottom: 1px solid transparent; }
 .seg .who .nm:not(.reasoned):hover { border-bottom-color: currentColor; }
+/* Your own voice, off your own microphone. The one label in the transcript that
+   is provenance rather than a guess, and it is marked as quietly as that
+   deserves: the dot fills out to a ring, and the name carries a standing
+   underline in the accent. No extra column, no badge, no second colour — the
+   row still scans as a row. */
+.seg.you .who .dot {
+  box-shadow: 0 0 0 2px rgba(119, 0, 255, 0.55);
+}
+.seg.you .who .nm:not(.reasoned) {
+  border-bottom-color: var(--violet-soft);
+}
+.seg.you .who .nm:not(.reasoned):hover { border-bottom-color: currentColor; }
+
 .seg.new { animation: seg-in var(--dur) var(--ease-out) both; }
 @keyframes seg-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .seg.hit { background: rgba(119, 0, 255, 0.16); border-color: rgba(154, 60, 255, 0.4); }
@@ -318,6 +345,7 @@ textarea.input { resize: vertical; min-height: 74px; line-height: 1.5; width: 10
 }
 .sp-row + .sp-row { margin-top: 6px; }
 .sp-row:hover { background: rgba(255, 255, 255, 0.045); }
+.sp-row.you .dot { box-shadow: 0 0 0 2px rgba(119, 0, 255, 0.55); }
 .sp-row.drag-over { border-color: var(--violet); background: rgba(119, 0, 255, 0.14); transform: scale(1.008); }
 .sp-row.dragging { opacity: 0.4; }
 .sp-id { display: flex; align-items: center; gap: 10px; min-width: 0; }
@@ -425,6 +453,55 @@ textarea.input { resize: vertical; min-height: 74px; line-height: 1.5; width: 10
   background: radial-gradient(120% 120% at 30% 20%, var(--mono-a), var(--mono-b));
   color: #0b0616;
 }
+
+/* ---------------------------------------------------- the microphone card -- */
+/* Its own card above the application list, because the question it asks is a
+   different question: an app rule is consent about one program's output, this
+   is consent about the room. It is a content card, so it is an opaque
+   elevation step like every other one (§4) — the warning does its work with
+   amber text and a well, not with a second sheet of glass. */
+
+.mic-card { margin-bottom: var(--sp-2); }
+.mic-head { display: flex; align-items: center; gap: 12px; }
+.mic-head .spacer { flex: 1; }
+.mic-ico {
+  width: 34px; height: 34px; flex: none; border-radius: var(--radius-sm);
+  display: grid; place-items: center; color: var(--text);
+  background: linear-gradient(157deg, rgba(119, 0, 255, 0.34) 0%, rgba(119, 0, 255, 0.08) 100%);
+  box-shadow: inset 1px 1px 0 rgba(255, 255, 255, 0.12);
+}
+.mic-ico svg { width: 18px; height: 18px; }
+.mic-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.mic-title .name { font-size: 15px; font-weight: 700; }
+.mic-title .key { font: 400 11px/1.4 var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Amber, the attention colour — not red. Nothing is wrong; there is simply
+   something about this switch the user has to have read before flipping it. */
+.mic-warn {
+  margin: 12px 0 0; padding: 9px 11px; max-width: 68ch;
+  border-radius: var(--radius-sm); border: 1px solid rgba(255, 179, 0, 0.28);
+  background: rgba(255, 179, 0, 0.07);
+  color: var(--amber); font-size: 12.5px; line-height: 1.55;
+}
+
+.mic-modes { display: flex; gap: var(--sp-1); margin-top: 12px; flex-wrap: wrap; }
+.mode-opt {
+  flex: 1 1 240px; min-width: 0; text-align: left; cursor: pointer;
+  display: flex; flex-direction: column; gap: 3px;
+  padding: 9px 11px; border-radius: var(--radius-sm);
+  border: 1px solid var(--line); background: var(--well-deep);
+  transition: border-color var(--dur-fast) var(--ease-soft), background var(--dur-fast) var(--ease-soft);
+}
+.mode-opt:hover:not(:disabled) { border-color: rgba(255, 255, 255, 0.18); }
+.mode-opt:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.mode-opt b { font-size: 13px; font-weight: 600; }
+.mode-opt small { font-size: 11.5px; line-height: 1.45; color: var(--muted); }
+.mode-opt[aria-pressed="true"] {
+  border-color: var(--violet); background: rgba(119, 0, 255, 0.16);
+}
+/* Off, the modes are a preference with nothing to apply to. Dimmed rather than
+   hidden: the choice that is waiting is worth seeing before you flip it. */
+.mode-opt:disabled { opacity: 0.42; cursor: default; }
 
 /* --------------------------------------------------------------- footer -- */
 

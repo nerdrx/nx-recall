@@ -49,6 +49,83 @@ impl Default for CaptureConfig {
     }
 }
 
+/// When the microphone stream is open.
+///
+/// `Follow` is the default and the reason this feature is acceptable at all:
+/// the microphone hears the *room*, so it is only open while an allowed
+/// application is itself being captured — VRChat running means a conversation
+/// is happening; VRChat closed means the room is nobody's business. `Always` is
+/// a deliberate second choice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MicMode {
+    #[default]
+    Follow,
+    Always,
+}
+
+impl MicMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MicMode::Follow => "follow",
+            MicMode::Always => "always",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "follow" => Some(MicMode::Follow),
+            "always" => Some(MicMode::Always),
+            _ => None,
+        }
+    }
+}
+
+/// The user's own microphone as a capture source (DESIGN §5: "mic loopback and
+/// push-to-talk boundaries add more [independent signal] when available").
+///
+/// Deliberately **not** a `[rules]` entry. An allowlist rule is consent about
+/// one program's output; this device picks up whoever is in the room, including
+/// people who never joined the instance, so it gets its own switch, its own
+/// default (off), and its own copy in the UI. `sources.set` refuses the `mic`
+/// key for exactly that reason — see `mic.set` in PROTOCOL.md.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MicConfig {
+    pub enabled: bool,
+    pub mode: MicMode,
+    /// PipeWire `node.name` to capture instead of the default source. Unset
+    /// (the normal case) follows whatever the session manager calls default, so
+    /// swapping a headset moves the tap instead of breaking it.
+    pub device: Option<String>,
+    /// How many golden samples the mic's free enrolment is allowed to keep.
+    /// Goldens live outside the retention window (DESIGN §6), so the cap is the
+    /// only thing bounding them.
+    pub max_goldens: usize,
+}
+
+impl Default for MicConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: MicMode::Follow,
+            device: None,
+            max_goldens: 3,
+        }
+    }
+}
+
+impl MicConfig {
+    /// The `node.name` this should be capturing, or `None` for "whatever the
+    /// session manager routes a plain capture stream to".
+    pub fn device_override(&self) -> Option<&str> {
+        self.device
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VadConfig {
@@ -282,6 +359,7 @@ impl Default for RetentionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub capture: CaptureConfig,
+    pub mic: MicConfig,
     pub vad: VadConfig,
     pub runtime: RuntimeConfig,
     pub models: ModelsConfig,
@@ -338,6 +416,12 @@ impl Config {
              # Transcription and speaker identity stay off until `[models].dir`\n\
              # points at a directory holding the ONNX models; `recalld models\n\
              # status` reports what is present.\n\
+             #\n\
+             # `[mic]` is the one source that is NOT an application rule: it is\n\
+             # the default microphone, it hears the ROOM rather than a program,\n\
+             # and it is off until you turn it on with `recalld mic on`. In the\n\
+             # default \"follow\" mode it only records while an allowed program is\n\
+             # itself being captured.\n\
              \n{body}"
         );
         let tmp = path.with_extension("toml.tmp");
@@ -519,6 +603,66 @@ mod tests {
         let bare = SocketConfig::default();
         let resolved = socket_path(&bare, Path::new("/data"));
         assert!(resolved.ends_with("nx-recall.sock"));
+    }
+
+    #[test]
+    fn the_microphone_is_off_and_following_until_it_is_asked_otherwise() {
+        let cfg = Config::default();
+        // The ordering IS the feature: off by default, and when on, only while
+        // an allowed application is being captured.
+        assert!(!cfg.mic.enabled);
+        assert_eq!(cfg.mic.mode, MicMode::Follow);
+        assert_eq!(cfg.mic.device_override(), None);
+        assert_eq!(cfg.mic.max_goldens, 3);
+    }
+
+    #[test]
+    fn the_mic_section_parses_both_modes_and_a_device_pin() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [mic]
+            enabled = true
+            mode = "always"
+            device = "alsa_input.usb-Blue_Yeti"
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.mic.enabled);
+        assert_eq!(cfg.mic.mode, MicMode::Always);
+        assert_eq!(cfg.mic.device_override(), Some("alsa_input.usb-Blue_Yeti"));
+        // Everything else keeps its default.
+        assert_eq!(cfg.mic.max_goldens, 3);
+
+        let back: Config = toml::from_str("[mic]\nmode = \"follow\"\n").unwrap();
+        assert_eq!(back.mic.mode, MicMode::Follow);
+        // A blank device string is "no override", not a node named "".
+        let blank: Config = toml::from_str("[mic]\ndevice = \"  \"\n").unwrap();
+        assert_eq!(blank.mic.device_override(), None);
+    }
+
+    #[test]
+    fn a_nonsense_mic_mode_is_refused_rather_than_defaulted() {
+        assert!(toml::from_str::<Config>("[mic]\nmode = \"sometimes\"\n").is_err());
+        assert_eq!(MicMode::parse("Always"), Some(MicMode::Always));
+        assert_eq!(MicMode::parse("follow"), Some(MicMode::Follow));
+        assert_eq!(MicMode::parse("whenever"), None);
+    }
+
+    #[test]
+    fn the_mic_switch_round_trips_through_the_file() {
+        let dir = std::env::temp_dir().join(format!("nx-recall-mic-cfg-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut cfg = Config::default();
+        cfg.mic.enabled = true;
+        cfg.mic.mode = MicMode::Always;
+        cfg.save(&path).unwrap();
+
+        let back = Config::load(&path).unwrap();
+        assert!(back.mic.enabled);
+        assert_eq!(back.mic.mode, MicMode::Always);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

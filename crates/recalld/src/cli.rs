@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -48,6 +48,30 @@ pub enum Command {
     Deny {
         #[arg(value_name = "MATCH_KEY")]
         match_key: String,
+    },
+
+    /// Turn the microphone on or off, or ask what it is doing.
+    // clap reflows a doc comment into paragraphs, which turns the example block
+    // below into one long line. `long_about` is taken verbatim.
+    #[command(long_about = "\
+Turn the microphone on or off, or ask what it is doing.
+
+The microphone is the one source that is NOT an application rule: it hears the
+ROOM, not a program, so it is off by default and has its own switch. In the
+default `follow` mode it only records while an allowed application is itself
+being captured.
+
+  recalld mic          what it is doing right now
+  recalld mic on       enable it, keeping the current mode
+  recalld mic follow   enable it, only while an allowed app is captured
+  recalld mic always   enable it, whenever the daemon is running
+  recalld mic off      disable it
+
+Needs the running daemon: the switch is live, and every connected client has to
+be told.")]
+    Mic {
+        #[arg(value_enum, default_value_t = MicAction::Status)]
+        action: MicAction,
     },
 
     /// Inspect the analysis models.
@@ -115,6 +139,20 @@ pub enum Command {
         #[arg(long, value_name = "SPEAKER")]
         speaker: Option<String>,
     },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicAction {
+    /// Enable the microphone, keeping whichever mode is configured.
+    On,
+    /// Disable the microphone.
+    Off,
+    /// Enable it in follow mode: only while an allowed application is captured.
+    Follow,
+    /// Enable it in always mode: whenever the daemon is running.
+    Always,
+    /// Report the current state, changing nothing.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]

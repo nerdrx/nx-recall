@@ -13,14 +13,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 
-use crate::analysis::{AnalysisStats, Analyzer, analyse_or_log};
+use crate::analysis::{AnalysisStats, Analyzer, MicEnroll, analyse_mic_or_log, analyse_or_log};
 use crate::bus::{Bus, Topic};
 use crate::clock::{Anchor, samples_to_ns, utc_now_ns};
 use crate::config::{Config, SAMPLE_RATE};
 use crate::control::Control;
 use crate::models::ModelSet;
 use crate::queue::{AudioChunk, CaptureEvent, EventQueue};
-use crate::store::Store;
+use crate::store::{KIND_MIC, Store};
 use crate::turns::TurnMerger;
 use crate::vad::{FRAME_SAMPLES, SegmenterConfig, SileroVad, VadState};
 
@@ -86,6 +86,12 @@ struct SessionPipeline {
     anchor: Anchor,
     anchor_sample: u64,
     segment_seq: u64,
+    /// Whether this session belongs to the user's own microphone
+    /// (`sources.kind = "mic"`). Read once from the row when the session
+    /// starts: the identity route differs, and it has to be the database that
+    /// says so rather than a flag the capture side hoped would survive a queue
+    /// that is allowed to drop things.
+    is_mic: bool,
 }
 
 impl SessionPipeline {
@@ -94,6 +100,7 @@ impl SessionPipeline {
         seg_cfg: SegmenterConfig,
         turns: TurnMerger,
         first_chunk_mono_ns: u64,
+        is_mic: bool,
     ) -> Self {
         Self {
             vad_state,
@@ -105,6 +112,7 @@ impl SessionPipeline {
             anchor: Anchor::at(first_chunk_mono_ns),
             anchor_sample: 0,
             segment_seq: 0,
+            is_mic,
         }
     }
 
@@ -293,8 +301,17 @@ impl Pipeline {
         let seg_cfg = self.seg_cfg;
         let new_state = self.vad.new_state();
         let merger = crate::ingest::turn_merger(&self.cfg);
+        // One row read per session, not per buffer. A lookup that fails reads
+        // as "an application", which is the safe answer: the worst case is a
+        // mic turn going through the voicebank like any other voice, never an
+        // app turn being labelled as the user.
+        let is_mic = if self.sessions.contains_key(&chunk.session_id) {
+            false // unused; the entry already exists
+        } else {
+            self.session_is_mic(chunk.session_id)
+        };
         let entry = self.sessions.entry(chunk.session_id).or_insert_with(|| {
-            SessionPipeline::new(new_state, seg_cfg, merger, chunk.capture_mono_ns)
+            SessionPipeline::new(new_state, seg_cfg, merger, chunk.capture_mono_ns, is_mic)
         });
 
         entry.maybe_reanchor(chunk.capture_mono_ns);
@@ -334,6 +351,26 @@ impl Pipeline {
             s.trim();
         }
         Ok(())
+    }
+
+    fn session_is_mic(&self, session_id: i64) -> bool {
+        let Ok(store) = self.store.lock() else {
+            warn!(
+                session_id,
+                "store mutex poisoned; treating the session as an application"
+            );
+            return false;
+        };
+        match store.session_source_kind(session_id) {
+            Ok(kind) => kind.as_deref() == Some(KIND_MIC),
+            Err(e) => {
+                warn!(
+                    session_id,
+                    "could not read the session's source kind: {e:#}"
+                );
+                false
+            }
+        }
     }
 
     fn on_session_end(&mut self, session_id: i64, mono_ns: u64) -> Result<()> {
@@ -377,6 +414,7 @@ impl Pipeline {
         let t_start_ns = session.utc_of_sample(span.start);
         let t_end_ns = session.utc_of_sample(span.end);
         session.segment_seq += 1;
+        let is_mic = session.is_mic;
         let rel = segment_path(session_id, session.segment_seq, t_start_ns);
         let abs = self.data_dir.join(&rel);
 
@@ -398,15 +436,62 @@ impl Pipeline {
             "segment stored"
         );
 
+        // The one voice this daemon can be certain about. Resolved per segment
+        // rather than cached: `ensure_you_speaker` follows a merge, so a user
+        // who merges "You" into their named voice keeps the pin pointing at the
+        // row that actually holds the rows.
+        let you = if is_mic {
+            match self.store.lock() {
+                Ok(store) => match store.ensure_you_speaker(utc_now_ns()) {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        // Refuse rather than fall through: a mic turn that took
+                        // the matching path would let the user's own voice mint
+                        // or absorb a stranger's identity.
+                        error!(segment_id, "could not pin the microphone speaker: {e:#}");
+                        None
+                    }
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         if let Some(analyzer) = self.analyzer.as_mut() {
-            analyse_or_log(
-                analyzer,
-                &self.store,
-                &self.analysis_stats,
-                segment_id,
-                &samples,
-                t_start_ns,
-            );
+            match you {
+                Some(speaker_id) => analyse_mic_or_log(
+                    analyzer,
+                    &self.store,
+                    &self.analysis_stats,
+                    segment_id,
+                    &samples,
+                    &MicEnroll {
+                        speaker_id,
+                        data_dir: &self.data_dir,
+                        max_goldens: self.cfg.mic.max_goldens,
+                    },
+                    t_start_ns,
+                ),
+                None if is_mic => {}
+                None => analyse_or_log(
+                    analyzer,
+                    &self.store,
+                    &self.analysis_stats,
+                    segment_id,
+                    &samples,
+                    t_start_ns,
+                ),
+            }
+        } else if let Some(speaker_id) = you {
+            // No models loaded. The label is provenance, not inference, so it
+            // is still true — and stamping it here is what makes a mic capture
+            // useful on a machine that has not fetched the model set yet.
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
+            store.set_segment_speaker(segment_id, Some(speaker_id), None)?;
         }
         // Published after analysis so the event carries the transcript and the
         // speaker, not an empty shell a client would have to re-query for.
@@ -519,6 +604,7 @@ mod tests {
             SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE),
             TurnMerger::new(24_000, 480_000),
             0,
+            false,
         );
         s.anchor = Anchor {
             mono_ns: 0,
@@ -544,6 +630,7 @@ mod tests {
             SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE),
             TurnMerger::new(24_000, 480_000),
             0,
+            false,
         );
         s.anchor = Anchor {
             mono_ns: 0,
@@ -567,6 +654,7 @@ mod tests {
             SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE),
             TurnMerger::new(24_000, 480_000),
             0,
+            false,
         );
         s.anchor = Anchor {
             mono_ns: 0,
@@ -585,6 +673,7 @@ mod tests {
             SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE),
             TurnMerger::new(24_000, 480_000),
             0,
+            false,
         );
         s.ring = (0..100).map(|i| i as f32).collect();
         s.ring_base = 1000;

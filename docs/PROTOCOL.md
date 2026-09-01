@@ -38,7 +38,8 @@ Methods (initial set):
 
 | method | params | notes |
 |---|---|---|
-| `sources.list` / `sources.set` | `{match_key, allowed}` | live toggle, no restart |
+| `sources.list` / `sources.set` | `{match_key, allowed}` | live toggle, no restart. `sources.set` **refuses** `match_key: "mic"` — see `mic.set` |
+| `mic.get` / `mic.set` | `{enabled?, mode?}` | the microphone switch; live, no restart |
 | `speakers.list` | | id, name, counts, total time |
 | `speakers.name` | `{id, name}` | retroactive; broadcasts `relabel` |
 | `speakers.merge` | `{from, into}` | tombstone, no chains; broadcasts `relabel` |
@@ -111,6 +112,54 @@ never need to re-query for a rename. The daemon keeps a short replay buffer;
 - **Frame budget**: one NDJSON line may reach 16 MB (`service::MAX_FRAME_BYTES`), the
   size the 10 MB audio cap can produce once base64'd. Clients MUST accept frames that
   large; a smaller guard drops the connection mid-reply instead of failing one request.
+
+### The microphone (schema 4)
+
+The user's own default input is a capture source like any other in the schema and
+nothing like one in the consent model, so it is additive everywhere and never
+folded into the allowlist.
+
+- **`sources.list` rows carry `kind`**: `"app"` or `"mic"`. A client that does not
+  know the difference must not render the microphone as an application — it hears
+  the *room*, not one program, and its copy has to say so.
+- **`sources.set` refuses `match_key: "mic"`** with `err:refused`, naming `mic.set`.
+  The two would otherwise write to different halves of the config (`[rules]` vs
+  `[mic]`) and disagree about a consent decision.
+- **`mic.get`** → `{enabled, mode, active, state, device, you_speaker}`. `device` is
+  the `[mic].device` pin (config-file only — a machine setup decision, not a click)
+  or `null` for "follow the default source". `you_speaker` is the pinned speaker id,
+  or `null` until the microphone has produced a segment.
+- **`mic.set {enabled?, mode?}`** → the same block plus `persisted`. Both fields are
+  optional and applied independently, so a client can change the mode without
+  knowing whether the switch was already on. `mode` is `"follow"` or `"always"`;
+  anything else is `err:params`, never a default. A call with neither field is
+  `err:params`. The change is live *and* written to `config.toml`, so it survives a
+  daemon restart; `persisted: false` means only the former.
+- **`state`** is the one string worth printing, and there are five:
+  `off`, `following:idle` (enabled, waiting for an allowed application),
+  `following:active` (an allowed application is captured, so the room is being
+  recorded), `always:active`, and `always:idle` — which means the switch is on in
+  `always` mode and the daemon has not managed to open an input device. A missing
+  microphone must never read as "recording".
+- **`status`** carries `mic` (the same block, without `you_speaker`) and the flat
+  `mic_state` string, plus `counters.mic_segments` / `mic_enrolled` / `mic_goldens`.
+- **`mic` event**, on the existing **`status`** topic: `{"ev": "mic", "data": {...}}`,
+  the same block. Published when the switch moves and when the capture thread opens
+  or closes the stream — which is the only way a client can see a `follow`-mode
+  transition, since nothing else in the protocol reports it. No new topic, so no
+  client has to change its subscription and an older one ignores it under the
+  versioning rule. There is deliberately **no** roster-style start/stop event beyond
+  this: the segment stream already shows what is being recorded.
+- **`speakers.list` rows carry `you`**: `true` for the pinned speaker the microphone
+  labels, `false` for everyone else. Exactly one row can be `true`. It is not a
+  match: segments from the microphone carry `speaker` with `match_score: null`,
+  because there was no comparison to score. `overlap_frac` is still populated, so a
+  client can still distrust the *audio* of a segment whose *name* is certain — which
+  is what speakers-bleed looks like when the user runs loudspeakers.
+- A **merge moves the pin.** `speakers.merge {from: <You>, into: <someone>}` leaves
+  the tombstone a tombstone and re-points `you_speaker` at the target; the next
+  microphone segment lands there. Merging in the other direction changes nothing.
+  A second "You" is never minted.
 
 ## Versioning rules
 

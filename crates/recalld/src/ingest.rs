@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::analysis::Analyzer;
+use crate::analysis::{Analyzer, MicEnroll};
 use crate::bus::Bus;
 use crate::config::{Config, SAMPLE_RATE};
 use crate::control::Control;
 use crate::pipeline::{publish_segment, segment_path, write_wav};
-use crate::store::Store;
+use crate::store::{KIND_MIC, Store};
 use crate::turns::TurnMerger;
 use crate::vad::{FRAME_SAMPLES, SegmentSpan, Segmenter, SegmenterConfig, SileroVad};
 
@@ -107,10 +107,18 @@ pub fn ingest_pcm(
 ) -> Result<Vec<i64>> {
     let at = |sample: u64| t0_ns + (sample as i128 * 1_000_000_000 / SAMPLE_RATE as i128) as i64;
 
-    // Paused means no rows and no files, whichever path the audio came in on.
+    // Paused means no rows and no files, whichever path the audio came in on —
+    // and the microphone is not an exception to that (DESIGN §8).
     if pipe.paused() {
         return Ok(Vec::new());
     }
+    // The same question the live pipeline asks, from the same column: is this
+    // session the user's own microphone? If so the voicebank is not consulted
+    // and the speaker is the pinned "You".
+    let mic_speaker = match store.session_source_kind(session_id)? {
+        Some(kind) if kind == KIND_MIC => Some(store.ensure_you_speaker(t0_ns)?),
+        _ => None,
+    };
     let turns = segment_pcm(pipe.vad, pipe.cfg, samples)?;
     let mut ids = Vec::new();
     for (seq, span) in turns.into_iter().enumerate() {
@@ -132,8 +140,27 @@ pub fn ingest_pcm(
             &rel.to_string_lossy(),
             t_start_ns,
         )?;
-        if let Some(a) = pipe.analyzer.as_deref_mut() {
-            a.process(store, id, slice, t_start_ns)?;
+        match (pipe.analyzer.as_deref_mut(), mic_speaker) {
+            (Some(a), Some(speaker_id)) => {
+                a.process_mic(
+                    store,
+                    id,
+                    slice,
+                    &MicEnroll {
+                        speaker_id,
+                        data_dir,
+                        max_goldens: pipe.cfg.mic.max_goldens,
+                    },
+                    t_start_ns,
+                )?;
+            }
+            (Some(a), None) => {
+                a.process(store, id, slice, t_start_ns)?;
+            }
+            // Models off: the mic label is provenance, not inference, so it is
+            // still true and still worth writing.
+            (None, Some(speaker_id)) => store.set_segment_speaker(id, Some(speaker_id), None)?,
+            (None, None) => {}
         }
         if let Some(bus) = pipe.bus.as_ref() {
             publish_segment(bus, store, id);

@@ -6,6 +6,13 @@
    the "audio is being captured right now" signal — never as an action colour,
    never as generic status. Violet still leads every screen. */
 :root {
+  /* Native widgets Chromium draws OUTSIDE the page — <select> option popups,
+     the date picker's calendar, default scrollbars — take their colours from
+     this and from nothing we can style. Without it they render light-on-light
+     against this palette and a dropdown is unreadable. It is one line and it
+     is load-bearing. */
+  color-scheme: dark;
+
   /* brand (frozen) — the ground is TRUE BLACK (§13) */
   --bg-top: #000000;
   --bg-bottom: #000000;
