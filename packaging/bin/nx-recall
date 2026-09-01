@@ -2,10 +2,17 @@
 # NX Recall desktop app launcher — this is what the hub's Launch button and the
 # desktop entry both run.
 #
-# The GUI is only a client (DESIGN §2): it connects to recalld's socket and has
-# nothing to say if the daemon is not running, so this starts no daemon and
-# holds no state. `systemctl --user start nx-recall` is the daemon's story.
+# The GUI is only a client (DESIGN §2), but "Launch" in the hub means "the app
+# works", so if the daemon's socket is absent we start the unit (start, not
+# enable: whether it autostarts at login stays the user's systemctl decision).
+# Capture remains default-deny regardless — starting recalld records nothing
+# the user hasn't explicitly allowed.
 set -eu
+
+sock="${NXR_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nx-recall.sock}"
+if [ ! -S "$sock" ]; then
+    systemctl --user start nx-recall.service 2>/dev/null || true
+fi
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 prefix=$(CDPATH= cd -- "$here/.." && pwd)
