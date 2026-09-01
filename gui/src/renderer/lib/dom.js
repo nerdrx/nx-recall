@@ -107,3 +107,12 @@ export function fmtDate(iso) {
   const t = Date.parse(iso);
   return Number.isFinite(t) ? `${fmtDay(t)} ${fmtClock(t).slice(0, 5)}` : '—';
 }
+
+// A voice minted a minute ago has no stored first_seen yet, and a zeroed
+// timestamp is not a date either. "first heard —" reads like a bug in the app;
+// "first heard today" is both true and the answer to the question being asked.
+export function fmtFirstSeen(iso) {
+  const t = iso ? Date.parse(iso) : NaN;
+  if (!Number.isFinite(t) || t <= 0) return 'today';
+  return fmtDate(iso);
+}

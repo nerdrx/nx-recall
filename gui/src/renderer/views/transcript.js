@@ -4,7 +4,7 @@
 // reassign/correct sheet (PROTOCOL segments.reassign / segments.correct).
 
 import { h, clear, fmtClock, fmtDay, fmtDayLabel, speakerColor } from '../lib/dom.js';
-import { store, speakerLabel, isUncertain, uncertainReason, ask } from '../lib/store.js';
+import { store, speakerLabel, segmentSpeakerLabel, isUncertain, uncertainReason, ask } from '../lib/store.js';
 import { openSheet, toast } from '../lib/sheets.js';
 import { play, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 
@@ -18,6 +18,8 @@ export function mount(root, ctx) {
   const card = h('div', { class: 'card' }, list);
   const body = h('div', { class: 'view-body view-enter', id: 'transcript-body' }, card);
 
+  // Capture state belongs where the words are, not only in the rail: this is
+  // the surface you are reading when you wonder why nothing new has appeared.
   const liveChip = h('span', { class: 'chip live', id: 'live-chip' });
   const countSub = h('span', { class: 'sub', id: 'seg-count' });
 
@@ -50,6 +52,13 @@ export function mount(root, ctx) {
     },
     h('option', { value: '' }, 'Everyone')
   );
+
+  /** Drive the existing Everyone/speaker filter from anywhere else in the UI. */
+  function setFilter(spId) {
+    filterSpeaker = spId ?? null;
+    speakerFilter.value = spId == null ? '' : String(spId);
+    renderAll();
+  }
 
   const head = h(
     'div',
@@ -112,11 +121,29 @@ export function mount(root, ctx) {
       tabindex: '0',
       title: 'Click to reassign or correct this segment',
     });
+    // A nameless segment says WHY it is nameless (store.segmentSpeakerLabel):
+    // "several voices" and "unknown voice" are different problems with
+    // different fixes, and neither of them is a name — hence the italic.
+    const nm = h('span', {
+      class: `nm${seg.speaker == null ? ' reasoned' : ''}`,
+      text: segmentSpeakerLabel(seg),
+      style: seg.speaker == null ? '' : `color:${color}`,
+      ...(seg.speaker != null ? { title: `Show only ${speakerLabel(seg.speaker)}` } : {}),
+    });
+    if (seg.speaker != null) {
+      // The name filters; the rest of the row still opens the sheet. Reading a
+      // transcript and wanting only one person's lines is one click, not a trip
+      // to the dropdown.
+      nm.addEventListener('click', (e) => {
+        e.stopPropagation();
+        setFilter(seg.speaker);
+      });
+    }
     const who = h(
       'span',
       { class: 'who', ...(seg.speaker != null ? { dataset: { sp: String(seg.speaker) } } : {}) },
       h('span', { class: 'dot', style: `color:${color}` }),
-      h('span', { class: 'nm', text: speakerLabel(seg.speaker), style: seg.speaker == null ? '' : `color:${color}` })
+      nm
     );
     row.append(
       h('span', { class: 't', text: fmtClock(seg.t_ms) }),
@@ -153,8 +180,9 @@ export function mount(root, ctx) {
       liveChip.className = 'chip bad';
       liveChip.append(h('span', { class: 'dot' }), 'offline');
     } else if (store.paused) {
+      // Amber, not red: this is attention, and red is spent on delete alone.
       liveChip.className = 'chip warn';
-      liveChip.append(h('span', { class: 'dot' }), 'paused');
+      liveChip.append(h('span', { class: 'dot' }), 'capture paused');
     } else {
       liveChip.className = 'chip live';
       liveChip.append(h('span', { class: 'dot pulse' }), 'live');
@@ -240,6 +268,26 @@ export function mount(root, ctx) {
       row.classList.add('hit');
       row.scrollIntoView({ block: 'center', behavior: 'smooth' });
       return true;
+    },
+    /**
+     * "Show in transcript", from the speakers view or a segment sheet: the
+     * existing filter is set to that voice and the view lands on the last thing
+     * they said, because the question behind the click is almost always "what
+     * have they been saying?".
+     */
+    focusSpeaker(spId) {
+      follow = false;
+      followBtn.setAttribute('aria-pressed', 'false');
+      followBtn.textContent = 'Follow';
+      setFilter(spId);
+      const rows = list.querySelectorAll('.seg');
+      const last = rows[rows.length - 1];
+      if (last) {
+        for (const el of list.querySelectorAll('.seg.hit')) el.classList.remove('hit');
+        last.classList.add('hit');
+        last.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      }
+      return { speaker: spId, rows: rows.length };
     },
     refreshLiveChip,
   };
@@ -356,7 +404,27 @@ export function openSegmentSheet(seg, ctx) {
         listen,
         h('span', {}, `${fmtClock(seg.t_ms)} · ${seg.source ?? 'unknown source'}`, hint)
       ),
-      h('div', { class: 'card-title', text: 'Who said this' }),
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('span', { class: 'card-title', text: 'Who said this' }),
+        // Only once the segment HAS a voice: "show me the rest of what they
+        // said" is the natural next question after answering "who is this?".
+        seg.speaker != null
+          ? h(
+              'button',
+              {
+                class: 'btn small',
+                id: 'sheet-show-in-transcript',
+                onclick: () => {
+                  close();
+                  ctx?.showSpeakerInTranscript?.(seg.speaker);
+                },
+              },
+              'Show in transcript'
+            )
+          : null
+      ),
       pick,
       h('div', { class: 'card-title', text: 'What they said' }),
       text,
@@ -371,5 +439,4 @@ export function openSegmentSheet(seg, ctx) {
 
   // Closing the sheet takes the sound with it — the stop button just left.
   openSheet(build, { onClose: () => stopPreview() });
-  void ctx;
 }

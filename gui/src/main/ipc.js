@@ -34,7 +34,7 @@ export function broadcast(channel, payload) {
   }
 }
 
-export function registerIpc({ request, setPaused, getState, showWindow }) {
+export function registerIpc({ request, setPaused, getState, showWindow, relaunch }) {
   ipcMain.handle('recall:request', async (_e, method, params) => {
     if (!ALLOWED.has(method)) return { ok: false, err: { code: 'refused', msg: `method ${method} is not exposed to the UI` } };
     try {
@@ -52,6 +52,13 @@ export function registerIpc({ request, setPaused, getState, showWindow }) {
 
   ipcMain.handle('recall:show', () => {
     showWindow();
+    return true;
+  });
+
+  // Also not a protocol request: restarting the app is an act on this process,
+  // and the update banner is the one surface allowed to ask for it.
+  ipcMain.handle('recall:relaunch', () => {
+    relaunch();
     return true;
   });
 }

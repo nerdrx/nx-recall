@@ -31,6 +31,11 @@
     </div>
 
     <div class="shell">
+      <!-- The daemon can replace itself under a running window (0.5.3). When it
+           comes back as a different version this says so above every view, not
+           only the one that happens to be mounted. -->
+      <div class="update-bar" id="update-bar" role="status" hidden></div>
+
       <nav class="rail" aria-label="Views">
         <div class="rail-brand">
           <img src="../../assets/icons/48x48.png" alt="" width="30" height="30" />

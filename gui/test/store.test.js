@@ -6,7 +6,16 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { store, applyEvent, isUncertain, uncertainReason, onboardingCandidates, mergeSegments, speakerLabel } from '../src/renderer/lib/store.js';
+import {
+  store,
+  applyEvent,
+  isUncertain,
+  uncertainReason,
+  onboardingCandidates,
+  mergeSegments,
+  speakerLabel,
+  segmentSpeakerLabel,
+} from '../src/renderer/lib/store.js';
 
 function reset() {
   store.speakers = new Map();
@@ -103,6 +112,18 @@ test('uncertainty tracks the pipeline, not a guess', () => {
   // The "?" has to name the reason, not just shrug.
   assert.match(uncertainReason(seg(1, { overlap_frac: 0.61, speaker: null })), /overlap/i);
   assert.match(uncertainReason(seg(1, { match_score: 0.2 })), /weak/i);
+});
+
+test('a nameless segment says which kind of nameless it is', () => {
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', total_ms: 0 });
+  assert.equal(segmentSpeakerLabel(seg(1)), 'Kira');
+  // Refused by the overlap gate: nobody can be named here, ever.
+  assert.equal(segmentSpeakerLabel(seg(1, { speaker: null, overlap_frac: 0.61 })), 'several voices');
+  // One person spoke and matched nothing: naming this one is worth doing.
+  assert.equal(segmentSpeakerLabel(seg(1, { speaker: null, overlap_frac: 0.02, match_score: null })), 'unknown voice');
+  // The label and the prose behind the "?" have to be telling one story.
+  assert.match(uncertainReason(seg(1, { speaker: null, overlap_frac: 0.61 })), /several voices/i);
 });
 
 test('onboarding asks only when unnamed voices really dominate', () => {

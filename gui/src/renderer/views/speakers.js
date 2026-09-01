@@ -5,7 +5,7 @@
 // banner over this list saying "these voices are most of your conversations —
 // who are they?" with the names right there to type.
 
-import { h, clear, fmtDur, fmtDate, speakerColor } from '../lib/dom.js';
+import { h, clear, fmtDur, fmtFirstSeen, speakerColor } from '../lib/dom.js';
 import { store, speakerLabel, isNamed, onboardingCandidates, ask, reloadSpeakers } from '../lib/store.js';
 import { confirmSheet, openSheet, toast } from '../lib/sheets.js';
 import { playSpeaker, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
@@ -132,9 +132,138 @@ export function mount(root, ctx) {
     return res;
   }
 
+  // -- row overflow menu ----------------------------------------------------
+  //
+  // The row answers "who is this and how much do they talk": ▶, the name, the
+  // counts. Merge/Split/Delete are not that question — they are three verbs of
+  // wildly different weight sitting a stray click apart, with Delete on the
+  // end. They move behind one ⋯ per row, where Delete can still look
+  // destructive without being adjacent to anything routine. Dragging one voice
+  // onto another still merges, untouched.
+
+  let openMenu = null; // {menu, btn, onDoc, onKey}
+  let pendingRender = false;
+
+  function closeMenu({ restoreFocus = false } = {}) {
+    if (!openMenu) return;
+    const { menu, btn, onDoc, onKey } = openMenu;
+    openMenu = null;
+    document.removeEventListener('mousedown', onDoc, true);
+    document.removeEventListener('keydown', onKey, true);
+    menu.remove();
+    btn.setAttribute('aria-expanded', 'false');
+    if (restoreFocus && btn.isConnected) btn.focus();
+    if (pendingRender) {
+      pendingRender = false;
+      renderList();
+    }
+  }
+
+  function openRowMenu(spId, btn, wrap) {
+    const item = (label, run, cls = '') =>
+      h(
+        'button',
+        {
+          class: `menu-item${cls ? ` ${cls}` : ''}`,
+          role: 'menuitem',
+          type: 'button',
+          onclick: () => {
+            closeMenu();
+            run();
+          },
+        },
+        label
+      );
+
+    const menu = h(
+      'div',
+      { class: 'row-menu', role: 'menu', 'aria-label': `Actions for ${speakerLabel(spId)}` },
+      item('Show in transcript', () => showInTranscript(spId)),
+      item('Merge…', () => pickMerge(spId), 'menu-merge'),
+      item('Split', () => doSplit(spId)),
+      // Still visibly destructive — just no longer one slip away from Merge.
+      item('Delete', () => doDelete(spId), 'danger')
+    );
+    menu.dataset.menu = String(spId);
+
+    // Both handlers sit on the document, so both check that this view is still
+    // mounted: switching views takes the menu's DOM away and these have to go
+    // with it rather than hold a dead row alive.
+    const onDoc = (e) => {
+      if (!list.isConnected) {
+        closeMenu();
+        return;
+      }
+      if (menu.contains(e.target) || btn.contains(e.target)) return;
+      closeMenu();
+    };
+    const onKey = (e) => {
+      if (!list.isConnected) {
+        closeMenu();
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        closeMenu({ restoreFocus: true });
+        return;
+      }
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+      const items = [...menu.querySelectorAll('.menu-item')];
+      const at = items.indexOf(document.activeElement);
+      e.preventDefault();
+      const next = e.key === 'ArrowDown' ? at + 1 : at - 1;
+      items[(next + items.length) % items.length].focus();
+    };
+
+    wrap.append(menu);
+    btn.setAttribute('aria-expanded', 'true');
+    openMenu = { menu, btn, onDoc, onKey };
+    // A menu on the last row would open into the bottom edge of the card.
+    const box = menu.getBoundingClientRect();
+    if (box.bottom > window.innerHeight - 8) menu.classList.add('up');
+    document.addEventListener('mousedown', onDoc, true);
+    document.addEventListener('keydown', onKey, true);
+    menu.querySelector('.menu-item')?.focus();
+  }
+
+  function moreButton(spId) {
+    const wrap = h('span', { class: 'sp-menu' });
+    const btn = h(
+      'button',
+      {
+        class: 'btn small more',
+        dataset: { more: String(spId) },
+        'aria-haspopup': 'menu',
+        'aria-expanded': 'false',
+        'aria-label': `More actions for ${speakerLabel(spId)}`,
+        title: 'Merge, split or delete this voice',
+        onclick: (e) => {
+          e.stopPropagation();
+          const mine = openMenu?.btn === btn;
+          closeMenu();
+          if (!mine) openRowMenu(spId, btn, wrap);
+        },
+      },
+      '⋯'
+    );
+    wrap.append(btn);
+    return wrap;
+  }
+
+  function showInTranscript(spId) {
+    ctx.showSpeakerInTranscript?.(spId);
+  }
+
   // -- list -----------------------------------------------------------------
 
   function renderList() {
+    // The live feed repaints this list every couple of seconds (the counts
+    // move). A repaint while a row menu is open would tear the menu out from
+    // under the pointer, so the repaint waits for the menu to close instead.
+    if (openMenu) {
+      pendingRender = true;
+      return;
+    }
     clear(list);
     const rows = [...store.speakers.values()].sort((a, b) => (b.total_ms ?? 0) - (a.total_ms ?? 0));
     sub.textContent = `${rows.length} voice${rows.length === 1 ? '' : 's'} · ${rows.filter(isNamed).length} named`;
@@ -209,19 +338,13 @@ export function mount(root, ctx) {
           'span',
           {},
           name,
-          h('span', { class: 'sp-sub', text: ` first heard ${fmtDate(sp.first_seen)}` }),
+          h('span', { class: 'sp-sub', text: ` first heard ${fmtFirstSeen(sp.first_seen)}` }),
           h('span', { class: 'sp-hint', dataset: { hint: String(sp.id) } })
         )
       ),
       h('span', { class: 'sp-num' }, String(sp.segments ?? 0), h('small', { text: 'segments' })),
       h('span', { class: 'sp-num' }, fmtDur(sp.total_ms), h('small', { text: 'total speech' })),
-      h(
-        'span',
-        { class: 'sp-actions' },
-        h('button', { class: 'btn small', dataset: { merge: String(sp.id) }, onclick: () => pickMerge(sp.id) }, 'Merge…'),
-        h('button', { class: 'btn small', onclick: () => doSplit(sp.id) }, 'Split'),
-        h('button', { class: 'btn small danger', onclick: () => doDelete(sp.id) }, 'Delete')
-      )
+      h('span', { class: 'sp-actions' }, moreButton(sp.id))
     );
     return row;
   }
@@ -411,6 +534,5 @@ export function mount(root, ctx) {
   renderBanner();
   renderList();
   paintPlayState();
-  void ctx;
-  return { update, renderList, renderBanner, startRename };
+  return { update, renderList, renderBanner, startRename, closeMenu };
 }

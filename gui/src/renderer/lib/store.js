@@ -12,6 +12,7 @@ export const store = {
   paused: false,
   pausePending: false,
   status: null,
+  update: null, // {from, to} — the daemon came back as a different version
 
   speakers: new Map(), // id → {id, name, auto, segments, total_ms, first_seen}
   segments: [], // ascending by t_ms
@@ -28,6 +29,20 @@ export function speakerLabel(id) {
   const sp = store.speakers.get(id);
   if (!sp) return `Speaker ${id}`;
   return sp.name || sp.auto || `Speaker_${String(id).padStart(2, '0')}`;
+}
+
+/**
+ * What to call the voice on a segment that has none. "Unassigned" says only
+ * that a field is empty; the pipeline knows more than that and the two cases
+ * are not the same problem. Above the refuse line the identity was never
+ * attempted because people were talking over each other — that is "several
+ * voices", and no amount of listening will turn it into one name. Below it, one
+ * person spoke and matched nothing in the voicebank — that is an "unknown
+ * voice", and naming it is worth doing.
+ */
+export function segmentSpeakerLabel(seg) {
+  if (seg?.speaker != null) return speakerLabel(seg.speaker);
+  return (seg?.overlap_frac ?? 0) > OVERLAP_REFUSE ? 'several voices' : 'unknown voice';
 }
 
 export function isNamed(sp) {
@@ -48,10 +63,10 @@ export function isUncertain(seg) {
 export function uncertainReason(seg) {
   const ov = seg.overlap_frac ?? 0;
   if (ov > OVERLAP_REFUSE && seg.speaker == null)
-    return `Two or more voices overlap here (${Math.round(ov * 100)}% of the segment), so no speaker identity was claimed. Click to assign one.`;
+    return `Several voices overlap here (${Math.round(ov * 100)}% of the segment), so no speaker identity was claimed. Click to assign one.`;
   if (ov > OVERLAP_REFUSE)
     return `Overlapped speech (${Math.round(ov * 100)}%) — this label is not trustworthy. Click to correct it.`;
-  if (seg.speaker == null) return 'No speaker was matched to this segment. Click to assign one.';
+  if (seg.speaker == null) return 'No known voice matched this segment. Click to assign one.';
   return `Weak voice match (${(seg.match_score ?? 0).toFixed(2)}). Click to correct it.`;
 }
 

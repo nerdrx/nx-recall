@@ -43,7 +43,28 @@ const ui = {
   paused: false,
   pausePending: false,
   status: null, // last `status` reply/event payload
+  update: null, // {from, to} once the daemon has come back as a different version
 };
+
+// The daemon replaces itself when the hub drops a new binary under it (0.5.3)
+// and reconnects on its own — but this window is still the code that shipped
+// with the OLD one. The version string in the first welcome of this app run is
+// the baseline; any later welcome that disagrees means an update landed and the
+// app is now the stale half. Compared against the FIRST welcome, never against
+// this app's own version: the two are allowed to differ (a mock, a side-loaded
+// daemon), and only a CHANGE means something happened.
+let firstDaemon = null;
+
+function noteDaemonVersion(daemon) {
+  if (!daemon) return;
+  if (firstDaemon == null) {
+    firstDaemon = daemon;
+    return;
+  }
+  if (daemon === firstDaemon || ui.update?.to === daemon) return;
+  ui.update = { from: firstDaemon, to: daemon };
+  console.log(`[recall] daemon updated: ${firstDaemon} → ${daemon}`);
+}
 
 const startMinimized =
   process.argv.includes('--minimized') || process.env.NX_RECALL_START_MINIMIZED === '1';
@@ -202,6 +223,20 @@ export async function setPaused(next) {
   return ui.paused;
 }
 
+/**
+ * Restart this app onto the version that is already on disk. Like pause, it is
+ * its own channel rather than a protocol request: it is an act on the process,
+ * not on the daemon, and the renderer has no business reaching either directly.
+ */
+export function relaunchApp() {
+  quitting = true;
+  app.relaunch();
+  // exit(), not quit(): quit() runs the close handler that hides the window and
+  // keeps the tray alive, and the relaunched copy would then lose the single
+  // instance lock race against the copy that refused to die.
+  app.exit(0);
+}
+
 async function refreshStatus() {
   if (!client || client.status !== 'connected') return;
   try {
@@ -223,6 +258,7 @@ function pushStateToRenderer() {
     paused: ui.paused,
     pausePending: ui.pausePending,
     status: ui.status,
+    update: ui.update,
   });
 }
 
@@ -235,6 +271,7 @@ function startClient() {
 
   client.on('state', (st) => {
     ui.conn = st;
+    if (st.status === 'connected') noteDaemonVersion(st.daemon);
     if (st.status !== 'connected') {
       ui.status = null;
       if (statusTimer) clearInterval(statusTimer);
@@ -281,8 +318,15 @@ async function bootstrap() {
   registerIpc({
     request: (method, params) => client.request(method, params),
     setPaused,
-    getState: () => ({ conn: ui.conn, paused: ui.paused, pausePending: ui.pausePending, status: ui.status }),
+    getState: () => ({
+      conn: ui.conn,
+      paused: ui.paused,
+      pausePending: ui.pausePending,
+      status: ui.status,
+      update: ui.update,
+    }),
     showWindow,
+    relaunch: relaunchApp,
   });
 
   startClient();

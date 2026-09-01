@@ -4,7 +4,7 @@
 // answered by the conversation, not by the matching line on its own.
 
 import { h, clear, fmtClock, fmtDay, fmtDate, speakerColor } from '../lib/dom.js';
-import { store, speakerLabel, isUncertain, ask } from '../lib/store.js';
+import { store, speakerLabel, segmentSpeakerLabel, isUncertain, ask } from '../lib/store.js';
 import { toast } from '../lib/sheets.js';
 
 export const id = 'search';
@@ -138,7 +138,13 @@ export function mount(root, ctx) {
         'span',
         { class: 'who', ...(seg.speaker != null ? { dataset: { sp: String(seg.speaker) } } : {}) },
         h('span', { class: 'dot', style: `color:${color}` }),
-        h('span', { class: 'nm', text: speakerLabel(seg.speaker), style: seg.speaker == null ? '' : `color:${color}` })
+        // Same vocabulary as the transcript: a hit with no voice says which
+        // kind of nameless it is, not just that a field is empty.
+        h('span', {
+          class: `nm${seg.speaker == null ? ' reasoned' : ''}`,
+          text: segmentSpeakerLabel(seg),
+          style: seg.speaker == null ? '' : `color:${color}`,
+        })
       ),
       h('span', { class: 'txt' }, ...highlight(seg.text ?? '', facetState.q)),
       h('span', { class: 'meta' }, h('span', { class: 'chip', text: seg.source ?? 'unknown' }))

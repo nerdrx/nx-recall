@@ -15,6 +15,10 @@
 //
 // Signals: SIGUSR1 simulates a daemon restart (drops every client and resets
 // the sequence counter), which is exactly the case the GUI must resync from.
+// It also bumps the advertised version string, because the restart the real
+// daemon performs is the one it performs onto a REPLACED binary (0.5.3): the
+// window that was already open is now the old client of a new daemon, and that
+// string is the only place it can find that out.
 
 import net from 'node:net';
 import fs from 'node:fs';
@@ -124,6 +128,10 @@ const CANNED_LINES = [
   [2, 'I built a smaller version of that for the meetup thing', 0.05, 0.58],
   [3, 'send me the link, I want to look at how you did the shaders', 0.02, 0.64],
   [null, 'both of them talking at once here', 0.61, 0.24],
+  // Nobody was talking over anybody — the voice simply matched nothing in the
+  // voicebank. It is a different failure from an overlap refusal and the GUI
+  // has to say so, so the mock always produces one of each.
+  [null, 'someone in the corner I do not recognise at all', 0.03, null],
   [5, 'my mic keeps cutting out, is it better now?', 0.08, 0.55],
   [1, 'much better. you were clipping badly before', 0.03, 0.72],
   [6, 'has anyone actually finished that map or are we all pretending', 0.02, 0.51],
@@ -172,6 +180,7 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
     replay: [],
     nextSegId: 2000,
     nextOp: 400,
+    restarts: 0,
     feedIdx: 0,
     startedAt: Date.now(),
     drops: 0,
@@ -196,6 +205,15 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       }
     }
     return frame;
+  }
+
+  // What this daemon calls itself. It moves with every simulated restart: a
+  // hub update replaces the binary and the daemon comes back as a different
+  // version, which is what a still-running GUI has to notice. $NX_RECALL_MOCK_V2
+  // pins the post-restart string when a test wants to name it.
+  function daemonId() {
+    if (!state.restarts) return DAEMON;
+    return process.env.NX_RECALL_MOCK_V2 || `${DAEMON}+${state.restarts}`;
   }
 
   function speakerById(id) {
@@ -238,7 +256,7 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       sources_allowed: state.sources.filter((s) => s.allowed).length,
       models: ['silero-vad', 'segmentation-3.0', 'eres2net-en', 'parakeet-tdt-110m'],
       segments_total: state.segments.length,
-      daemon: DAEMON,
+      daemon: daemonId(),
       schema: SCHEMA,
       seq: state.seq,
     };
@@ -581,7 +599,7 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
           client.hello = true;
           client.name = msg.hello.client;
           log('hello from', client.name);
-          write({ welcome: { proto: PROTO, daemon: DAEMON, seq: state.seq, schema: SCHEMA } });
+          write({ welcome: { proto: PROTO, daemon: daemonId(), seq: state.seq, schema: SCHEMA } });
           continue;
         }
 
@@ -628,7 +646,10 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
     // Simulate the daemon dying and coming back with a fresh counter — the case
     // the GUI has to notice and full-resync from.
     restart(newSeq = 1) {
-      log('simulated restart');
+      // Coming back as a new version is the point, not a detail: see the
+      // header note on SIGUSR1.
+      state.restarts += 1;
+      log(`simulated restart — now ${daemonId()}`);
       for (const c of clients) c.sock.destroy();
       clients.clear();
       state.seq = newSeq;

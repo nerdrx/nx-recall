@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld("recall", {
   setPaused: (next) => ipcRenderer.invoke("recall:setPaused", next),
   getState: () => ipcRenderer.invoke("recall:getState"),
   show: () => ipcRenderer.invoke("recall:show"),
+  relaunch: () => ipcRenderer.invoke("recall:relaunch"),
 
   onState: (fn) => on("recall:state", fn),
   onEvent: (fn) => on("recall:event", fn),

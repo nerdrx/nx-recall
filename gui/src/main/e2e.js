@@ -120,7 +120,18 @@ export function runE2E(deps) {
       assert(n > 0, 'no uncertain segments rendered — the overlap fixtures should produce some');
       assert(q > 0, 'uncertain segments carry no "?" affordance');
       assert(why.length > 20, 'the "?" does not explain itself');
-      return { uncertain: n, qmarks: q, why: why.slice(0, 60) };
+
+      // 0.5.5: a nameless segment says WHICH kind of nameless it is. Refused by
+      // the overlap gate and matched against nothing are different problems
+      // with different fixes, and "Unassigned" said neither.
+      const labels = await js(
+        '[...new Set([...document.querySelectorAll("#seg-list .seg .who .nm.reasoned")].map(e => e.textContent))]'
+      );
+      assert(labels.includes('several voices'), `no overlap-refused label rendered: ${JSON.stringify(labels)}`);
+      assert(labels.includes('unknown voice'), `no unmatched-voice label rendered: ${JSON.stringify(labels)}`);
+      const generic = await js('document.getElementById("seg-list").textContent.includes("Unassigned")');
+      assert(!generic, 'a transcript row still says "Unassigned"');
+      return { uncertain: n, qmarks: q, labels, why: why.slice(0, 60) };
     });
 
     await step('shot-transcript', async () => ({ file: await shot('transcript') }));
@@ -274,6 +285,67 @@ export function runE2E(deps) {
       return { speaker: target };
     });
 
+    // 6e — the row is for reading; the verbs live behind one ⋯. Delete is still
+    // red, it just no longer sits a slip away from Merge (0.5.5).
+    await step('voice-row-overflow-menu', async () => {
+      const target = await js('Number(document.querySelector("#speaker-list .sp-row").dataset.speaker)');
+      const actions = await js(`document.querySelectorAll('.sp-row[data-speaker="${target}"] .sp-actions .btn').length`);
+      assert(actions === 1, `the row still carries ${actions} action buttons — they belong behind ⋯`);
+
+      const more = `document.querySelector('.sp-row[data-speaker="${target}"] [data-more]')`;
+      const haspopup = await js(`${more}.getAttribute('aria-haspopup')`);
+      assert(haspopup === 'menu', `⋯ does not announce a menu (aria-haspopup=${haspopup})`);
+
+      await js(`${more}.click()`);
+      await waitFor('the row menu', async () => js('!!document.querySelector(".row-menu")'));
+      const items = await js('[...document.querySelectorAll(".row-menu .menu-item")].map(b => b.textContent)');
+      for (const want of ['Show in transcript', 'Merge…', 'Split', 'Delete']) {
+        assert(items.includes(want), `"${want}" is not in the row menu: ${JSON.stringify(items)}`);
+      }
+      const danger = await js('(document.querySelector(".row-menu .menu-item.danger")||{}).textContent || ""');
+      assert(danger === 'Delete', `Delete lost its destructive styling inside the menu (danger item: "${danger}")`);
+      assert((await js(`${more}.getAttribute('aria-expanded')`)) === 'true', 'the ⋯ button never reports itself as expanded');
+      const file = await shot('speakers-row-menu');
+
+      // Escape closes it…
+      await js('document.dispatchEvent(new KeyboardEvent("keydown", {key: "Escape", bubbles: true}))');
+      await waitFor('the menu to close on Escape', async () => js('!document.querySelector(".row-menu")'));
+      // …and so does a press anywhere else.
+      await js(`${more}.click()`);
+      await waitFor('the menu again', async () => js('!!document.querySelector(".row-menu")'));
+      await js('document.getElementById("main").dispatchEvent(new MouseEvent("mousedown", {bubbles: true}))');
+      await waitFor('the menu to close on click-away', async () => js('!document.querySelector(".row-menu")'));
+      assert((await js(`${more}.getAttribute('aria-expanded')`)) === 'false', 'the ⋯ button still claims to be expanded');
+      return { speaker: target, items, file };
+    });
+
+    // 6f — "show in transcript": a voice is really a question about what they
+    // said, and the answer is the existing filter, already set (0.5.5).
+    await step('show-voice-in-transcript', async () => {
+      const target = await js('Number(document.querySelector("#speaker-list .sp-row").dataset.speaker)');
+      await js(`document.querySelector('.sp-row[data-speaker="${target}"] [data-more]').click()`);
+      await waitFor('the row menu', async () => js('!!document.querySelector(".row-menu")'));
+      await js(
+        '[...document.querySelectorAll(".row-menu .menu-item")].find(b => b.textContent === "Show in transcript").click()'
+      );
+      await waitFor('the transcript to mount', async () => js('window.__recallDebug.view() === "transcript"'));
+      const filter = await waitFor('the speaker filter to be set', async () =>
+        js('document.getElementById("transcript-filter").value')
+      );
+      assert(Number(filter) === target, `the filter reads "${filter}", not the voice that was asked for (${target})`);
+      const rows = await js('document.querySelectorAll("#seg-list .seg").length');
+      assert(rows > 0, 'the filtered transcript rendered no rows');
+      const strays = await js(
+        `[...document.querySelectorAll('#seg-list .seg .who')].filter(w => w.dataset.sp !== '${target}').length`
+      );
+      assert(strays === 0, `${strays} rows in the filtered transcript belong to another voice`);
+      const file = await shot('show-in-transcript');
+      // Leave the UI where the later steps expect to find it.
+      await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
+      await waitFor('the speaker list again', async () => js('document.querySelectorAll("#speaker-list .sp-row").length > 0'));
+      return { speaker: target, rows, file };
+    });
+
     await step('shot-speakers', async () => ({ file: await shot('speakers') }));
 
     // 7 — inline rename through the real UI, then the retroactive broadcast
@@ -332,7 +404,12 @@ export function runE2E(deps) {
       const after = (await js('window.__recallDebug.counts()')).rows;
       assert(after === before, `feed kept running while paused (${before} → ${after})`);
       assert(label === 'Resume capture', `pause button did not flip its label (got "${label}")`);
-      assert(/paused/i.test(chip), `transcript still claims to be live (chip: "${chip}")`);
+      // The chip sits in the transcript header, where you are actually reading
+      // when you wonder why nothing new is arriving — and it says which thing
+      // is paused, in amber (0.5.5).
+      assert(/capture paused/i.test(chip), `transcript still claims to be live (chip: "${chip}")`);
+      const amber = await js('document.getElementById("live-chip").className');
+      assert(/\bwarn\b/.test(amber), `the paused chip is not the amber one (class: "${amber}")`);
       return { before, after, label, chip, trayLine: deps.statusLine() };
     });
 
@@ -457,6 +534,39 @@ export function runE2E(deps) {
         return { before, after: after.rows, resumed, seqBefore, seqAfter: deps.getUi().conn.seq };
       });
       await step('shot-after-restart', async () => ({ file: await shot('after-restart') }));
+
+      // 14b — the daemon that came back is a NEWER one (the hub replaced its
+      // binary under it, 0.5.3). This window is now the old half of the app and
+      // has to say so — once, above every view, with the one action that ends
+      // the mismatch (0.5.5).
+      await step('update-banner-and-dismiss', async () => {
+        const bar = await waitFor(
+          'the update banner',
+          async () => {
+            const u = await js('window.__recallDebug.update()');
+            return u.shown ? u : null;
+          },
+          { timeout: 15000 }
+        );
+        const daemon = deps.getUi().conn.daemon;
+        assert(bar.version === daemon, `the banner names ${bar.version}, the daemon says ${daemon}`);
+        assert(bar.text.includes(String(daemon).split('/').pop()), `the banner does not name the new version: ${bar.text}`);
+        assert(/restart/i.test(bar.text), `the banner does not say what to do about it: ${bar.text}`);
+
+        // The button is NOT pressed: app.relaunch() would take the window out
+        // from under this driver mid-run. Its wiring is read instead — the
+        // handler on the button, and the channel that handler calls.
+        assert(bar.restart.present, 'the banner offers no Restart button');
+        assert(bar.restart.wired, 'the Restart button carries no handler');
+        assert(bar.restart.ipc, 'there is no relaunch channel for it to call');
+        const file = await shot('update-banner');
+
+        // It is a notice, not a modal: it can be waved away.
+        await js('document.getElementById("update-dismiss").click()');
+        const gone = await waitFor('the banner to go away', async () => js('!window.__recallDebug.update().shown'));
+        assert(gone, 'the update banner could not be dismissed');
+        return { from: bar.text.slice(0, 60), version: bar.version, file };
+      });
     }
 
     // 15 — the app lives in the tray: closing the window hides it, does not

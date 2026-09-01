@@ -36,6 +36,7 @@ let current = null;
 const ctx = {
   go,
   jumpToSegment,
+  showSpeakerInTranscript,
   toast,
 };
 
@@ -47,6 +48,8 @@ function go(name) {
   if (!VIEWS[name]) return;
   // Leaving a view takes its stop button off screen, so it takes the sound too.
   stopPreview();
+  // …and any menu it left hanging over a row that is about to stop existing.
+  current?.closeMenu?.();
   currentName = name;
   for (const btn of document.querySelectorAll('.rail-item')) {
     btn.setAttribute('aria-selected', String(btn.dataset.view === name));
@@ -80,6 +83,12 @@ async function jumpToSegment(seg) {
   current?.focusSegment?.(seg.id);
 }
 
+/** A voice → what they have been saying. Same filter the header already has. */
+function showSpeakerInTranscript(spId) {
+  go('transcript');
+  return current?.focusSpeaker?.(spId) ?? null;
+}
+
 // ---------------------------------------------------------------------------
 // pause — surface #2 (DESIGN §8). The tray dropdown is #1 and both call the
 // same main-process state machine, so they can never disagree.
@@ -111,6 +120,70 @@ pauseBtn.addEventListener('click', async () => {
   current?.refreshLiveChip?.();
   await window.recall.setPaused(next);
 });
+
+// ---------------------------------------------------------------------------
+// the update banner
+//
+// DESIGN §2 makes clients dumb views that survive a daemon restart — which is
+// precisely how this window can end up being the OLD half of the app, talking
+// happily to a daemon the hub replaced under it, and never mention it. The main
+// process watches the version string across welcomes; this says so, once, above
+// every view, and offers the one action that fixes it.
+// ---------------------------------------------------------------------------
+
+const updateBar = document.getElementById('update-bar');
+let dismissedUpdate = null; // the version the user already waved away
+
+// "recalld/0.5.5" → "0.5.5". Anything without a slash is shown as it came.
+function versionOf(daemon) {
+  const s = String(daemon ?? '');
+  const at = s.lastIndexOf('/');
+  return at >= 0 ? s.slice(at + 1) : s;
+}
+
+function requestRestart() {
+  return window.recall.relaunch();
+}
+
+function renderUpdateBar() {
+  const up = store.update;
+  clear(updateBar);
+  const show = !!up?.to && up.to !== dismissedUpdate;
+  updateBar.hidden = !show;
+  if (!show) return;
+
+  const restart = h('button', { class: 'btn small primary', id: 'update-restart' }, 'Restart');
+  // Assigned as a property rather than added as a listener, on purpose: the
+  // headless driver has to prove this button is wired WITHOUT pressing it —
+  // relaunching mid-run would take the window out from under the driver.
+  restart.onclick = requestRestart;
+
+  updateBar.append(
+    h('span', { class: 'dot' }),
+    h('span', {
+      class: 'update-text',
+      id: 'update-text',
+      text: `NX Recall was updated to ${versionOf(up.to)} — restart the app to finish`,
+      title: `${up.from} → ${up.to}`,
+    }),
+    h('span', { class: 'spacer' }),
+    restart,
+    h(
+      'button',
+      {
+        class: 'btn small',
+        id: 'update-dismiss',
+        'aria-label': 'Dismiss the update notice',
+        title: 'Dismiss — the app keeps working, it is just the older half',
+        onclick: () => {
+          dismissedUpdate = up.to;
+          renderUpdateBar();
+        },
+      },
+      '✕'
+    )
+  );
+}
 
 // ---------------------------------------------------------------------------
 // footer
@@ -178,7 +251,9 @@ window.recall.onState((st) => {
   store.paused = !!st.paused;
   store.pausePending = !!st.pausePending;
   if (st.status) store.status = st.status;
+  store.update = st.update ?? null;
   renderPause();
+  renderUpdateBar();
   renderFooter();
   current?.update?.({ status: true, conn: true });
   current?.refreshLiveChip?.();
@@ -263,7 +338,9 @@ document.addEventListener('keydown', (e) => {
   store.conn = st.conn ?? store.conn;
   store.paused = !!st.paused;
   store.status = st.status ?? null;
+  store.update = st.update ?? null;
   renderPause();
+  renderUpdateBar();
   renderFooter();
   await reloadAll().catch(() => {});
   go('transcript');
@@ -283,6 +360,22 @@ document.addEventListener('keydown', (e) => {
       speakers: store.speakers.size,
       sources: store.sources.length,
     }),
+    // The update banner, and whether its Restart really goes anywhere. The
+    // driver may not press it — a relaunch would end the run — so the wiring is
+    // read instead: the button's own handler, and the bridge it calls.
+    update: () => {
+      const btn = document.getElementById('update-restart');
+      return {
+        shown: !updateBar.hidden,
+        version: store.update?.to ?? null,
+        text: (document.getElementById('update-text') || {}).textContent ?? '',
+        restart: {
+          present: !!btn,
+          wired: !!btn && btn.onclick === requestRestart,
+          ipc: typeof window.recall.relaunch === 'function',
+        },
+      };
+    },
     // Voice preview: the driver asserts against the real <audio> element, not
     // against the UI's opinion of it.
     audio: () => {
