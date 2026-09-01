@@ -173,6 +173,13 @@ pub struct ModelsConfig {
     pub asr_tokens: String,
     pub embedding: String,
     pub segmentation: String,
+    /// The optional text-embedding model for semantic search, as a directory
+    /// under the models root plus the two files in it. Separate keys rather
+    /// than one path because the directory name is what the stored
+    /// `model_id` is derived from, exactly as it is for the ASR export.
+    pub semantic: String,
+    pub semantic_model: String,
+    pub semantic_tokenizer: String,
     /// ASR is the only stage where throughput is worth threads. Step 0 measured
     /// RTF 0.011 at four on the 110m; the multilingual default is ~3x the
     /// compute and still RTF 0.08 on a *single* thread, so four remains far
@@ -191,6 +198,9 @@ impl Default for ModelsConfig {
             asr_tokens: crate::models::DEFAULT_ASR.tokens.into(),
             embedding: "eres2net_en.onnx".into(),
             segmentation: "sherpa-onnx-pyannote-segmentation-3-0/model.onnx".into(),
+            semantic: crate::models::SEMANTIC_DIR.into(),
+            semantic_model: "model.onnx".into(),
+            semantic_tokenizer: "tokenizer.json".into(),
             asr_threads: 4,
         }
     }

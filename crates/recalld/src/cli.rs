@@ -151,6 +151,17 @@ Needs the running daemon: every connected client has to be told.")]
         /// Maximum hits to print.
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Search by meaning as well as by word, and fuse the two. Needs the
+        /// semantic model — `recalld models fetch --semantic`.
+        #[arg(long)]
+        smart: bool,
+    },
+
+    /// Semantic search: the index behind "what did she say about that world"
+    /// when you cannot remember the words.
+    Semantic {
+        #[command(subcommand)]
+        action: SemanticAction,
     },
 
     /// Stop writing anything, instantly. Capture keeps running; no segments,
@@ -319,10 +330,53 @@ pub enum ModelsAction {
         #[arg(long)]
         graph: bool,
 
+        /// Also install the text-embedding model that semantic search needs
+        /// (~135 MB). Not part of the default set: keyword search works
+        /// without it, and it is a feature you opt into rather than something
+        /// the daemon needs to be correct.
+        #[arg(long)]
+        semantic: bool,
+
         /// Do not write the resulting directory into config.toml. Without this
         /// the fetch points `[models].dir` at what it just installed, so
         /// `models status` and the daemon agree with it.
         #[arg(long)]
         no_config: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SemanticAction {
+    /// Report what semantic search has indexed, and what it still owes.
+    Status,
+
+    /// Embed every transcript that has no current vector.
+    // Verbatim: the two paragraphs below are the whole operating model and
+    // clap would reflow them into one.
+    #[command(long_about = "\
+Embed every transcript that has no current vector.
+
+Segments captured from now on are embedded as they are transcribed. This is for
+everything said BEFORE the model was installed — and for anything whose words
+have changed since, because a corrected transcript and a re-decoded one both
+make the old vector a wrong answer waiting to be given.
+
+Resumable by construction: the work list is a query, not a cursor, so a run that
+is interrupted loses at most one batch and the next run picks up the rest. It
+runs at idle priority and holds the database only one batch at a time, so it is
+safe to run while the daemon is capturing.")]
+    Backfill {
+        /// Segments per transaction.
+        #[arg(long, value_name = "N", default_value_t = 128)]
+        batch: usize,
+
+        /// Stop after this many segments. Without it the backfill runs to
+        /// completion.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+
+        /// Use this models directory instead of `[models].dir`.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
     },
 }

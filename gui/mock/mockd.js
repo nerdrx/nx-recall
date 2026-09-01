@@ -9,6 +9,7 @@
 //
 // Usage:
 //   node mock/mockd.js [--sock PATH] [--feed-ms 2000] [--seq N] [--quiet]
+//                      [--no-semantic]
 //
 // Defaults to $NX_RECALL_MOCK_SOCK, else $XDG_RUNTIME_DIR/nx-recall-mock.sock.
 // It NEVER listens on TCP — same rule as the real daemon.
@@ -356,11 +357,81 @@ const THREAD_TOPICS = {
   [500 + Math.floor(28 / THREAD_BLOCK)]: 'shader work',
 };
 
+// --- a stand-in for meaning -------------------------------------------------
+// The real leg is 118 MB of ONNX. This is a lookup table with the same SHAPE:
+// a query expands to a handful of related surface forms, in both languages, so
+// the view's cross-language case is demonstrable without weights in the repo.
+
+const GLOSS = [
+  ['whale', 'wal', 'cetacea'],
+  ['world', 'welt', 'instance', 'instanz'],
+  ['portal', 'portal'],
+  ['fountain', 'brunnen'],
+  ['cat', 'katze'],
+  ['coffee', 'kaffee'],
+  ['train', 'zug'],
+  ['late', 'verspätung', 'delayed'],
+  ['dentist', 'zahnarzt', 'tooth', 'zahn'],
+  ['mic', 'mikro', 'mikrofon', 'microphone'],
+  ['fridge', 'kühlschrank', 'hum', 'brummt'],
+  ['lost', 'verlaufen', 'maze', 'labyrinth'],
+  ['avatar', 'avatar', 'physbones'],
+];
+
+/** Query -> the surface forms a real embedding would put nearby. */
+export function expand(q) {
+  const words = q
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((w) => w.length > 2);
+  const out = new Set(words.map((w) => ` ${w}`));
+  for (const w of words) {
+    for (const row of GLOSS) {
+      // Prefix matching, but not so loose that "den" reaches "dentist":
+      // a shorter query word only matches a longer gloss term from four
+      // characters up, and a longer one only within three of a stem.
+      const near = (t) =>
+        t === w || (w.length >= 4 && t.startsWith(w)) || (w.startsWith(t) && w.length - t.length <= 3);
+      if (row.some(near)) {
+        for (const t of row) out.add(` ${t}`);
+      }
+    }
+  }
+  return [...out];
+}
+
+/** Reciprocal-rank fusion, k=60, matching docs/PROTOCOL.md. */
+export function rrf(keyword, semantic, k = 60) {
+  const at = new Map();
+  const push = (id, rank, leg) => {
+    if (!at.has(id)) at.set(id, { id, score: 0, via: leg, keyword_rank: null, semantic_rank: null });
+    const e = at.get(id);
+    if (e[`${leg}_rank`] != null) return;
+    e[`${leg}_rank`] = rank;
+    e.score += 1 / (k + rank);
+    if (e.keyword_rank != null && e.semantic_rank != null) e.via = 'both';
+    else e.via = leg;
+  };
+  keyword.forEach((id, i) => push(id, i + 1, 'keyword'));
+  semantic.forEach((id, i) => push(id, i + 1, 'semantic'));
+  const best = (e) => Math.min(e.keyword_rank ?? Infinity, e.semantic_rank ?? Infinity);
+  return [...at.values()].sort((a, b) => b.score - a.score || best(a) - best(b) || a.id - b.id);
+}
+
 // ---------------------------------------------------------------------------
 // server
 // ---------------------------------------------------------------------------
 
-export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqStart = 41823, quiet = false } = {}) {
+export function startMock({
+  sockPath = defaultMockSocket(),
+  feedMs = 2000,
+  seqStart = 41823,
+  quiet = false,
+  // 0.6.5: whether this mock daemon has the optional semantic model. Both
+  // answers are real states of a real install and the UI has to be right in
+  // both, so the driver runs the app against each.
+  semantic = true,
+} = {}) {
   const log = quiet ? () => {} : (...a) => console.log('[mockd]', ...a);
 
   const state = {
@@ -417,6 +488,7 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
     startedAt: Date.now(),
     drops: 0,
     queue: 0,
+    semantic,
   };
 
   const clients = new Set(); // {sock, topics:Set, name}
@@ -727,6 +799,24 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       // missed the `graph` event still converges on the truth.
       graph: { ...state.enrichment },
       models: ['silero-vad', 'segmentation-3.0', 'eres2net-en', 'parakeet-tdt-110m'],
+      // 0.6.5: semantic search. Optional in the daemon, so the mock has a
+      // switch for it — `--no-semantic` is the state most machines are in and
+      // the UI has to be photographed in both.
+      semantic: state.semantic
+        ? {
+            available: true,
+            model: 'multilingual-e5-small-int8@1',
+            dim: 384,
+            resident: state.segments.length,
+            resident_bytes: state.segments.length * 384 * 4,
+            indexed: state.segments.length,
+            eligible: state.segments.length,
+            pending: 0,
+          }
+        : {
+            available: false,
+            how: 'semantic search is not installed. `recalld models fetch --semantic` installs multilingual-e5-small-int8 (128.9 MB), then `recalld semantic backfill` indexes what has already been said.',
+          },
       segments_total: state.segments.length,
       daemon: daemonId(),
       schema: SCHEMA,
@@ -1308,6 +1398,68 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       return { hits, total: rows.length, q: params?.q ?? '' };
     },
 
+    // 0.6.5. Not a real embedding, obviously: a deterministic stand-in whose
+    // *shape* is right, so the view's mode toggle, `via` markers and empty
+    // states are all exercised without 118 MB of weights in the repository.
+    // Meaning is faked as "shares an uncommon word with the query, in either
+    // language", plus a tiny hand-written German/English gloss so the
+    // cross-language case — the whole point of the feature — is visible.
+    'search.semantic'(params) {
+      if (!state.semantic) {
+        throw err(
+          'unavailable',
+          'semantic search is not installed. `recalld models fetch --semantic` installs multilingual-e5-small-int8 (128.9 MB), then `recalld semantic backfill` indexes what has already been said.'
+        );
+      }
+      const q = String(params?.q ?? '').trim();
+      if (!q) throw err('params', 'q must not be empty');
+      const mode = params?.mode ?? 'semantic';
+      if (mode !== 'semantic' && mode !== 'hybrid') {
+        throw err('params', `mode must be "semantic" or "hybrid", not ${JSON.stringify(mode)}`);
+      }
+      const limit = Number(params?.limit ?? 50);
+
+      let rows = state.segments;
+      if (params?.speaker != null) rows = rows.filter((s) => s.speaker === Number(params.speaker));
+      if (params?.source) rows = rows.filter((s) => s.source === params.source);
+      if (params?.from) rows = rows.filter((s) => s.t_ms >= Date.parse(params.from));
+      if (params?.to) rows = rows.filter((s) => s.t_ms <= Date.parse(params.to));
+
+      const terms = expand(q);
+      const scored = rows
+        .map((s) => {
+          const hay = ` ${String(s.text ?? '').toLowerCase()} `;
+          let n = 0;
+          for (const t of terms) if (hay.includes(t)) n += 1;
+          return { s, score: n ? Math.min(0.95, 0.62 + n * 0.09) : 0 };
+        })
+        .filter((x) => x.score > 0)
+        .sort((a, b) => b.score - a.score || a.s.id - b.s.id)
+        .slice(0, limit);
+
+      const keyword =
+        mode === 'hybrid'
+          ? rows.filter((s) => String(s.text ?? '').toLowerCase().includes(q.toLowerCase())).slice(0, limit)
+          : [];
+      const fused = rrf(keyword.map((s) => s.id), scored.map((x) => x.s.id));
+      const byId = new Map(state.segments.map((s) => [s.id, s]));
+      const byScore = new Map(scored.map((x) => [x.s.id, x.score]));
+      const hits = fused.slice(0, limit).map((f) => {
+        const seg = byId.get(f.id);
+        const out = { ...seg, via: f.via, rrf: f.score };
+        if (byScore.has(f.id)) out.score = byScore.get(f.id);
+        return out;
+      });
+      return {
+        total: hits.length,
+        q,
+        mode,
+        model: 'multilingual-e5-small-int8@1',
+        took_ms: 12 + (q.length % 7),
+        hits,
+      };
+    },
+
     transcript(params) {
       let rows = state.segments;
       if (params?.session != null) rows = rows.filter((s) => s.session === Number(params.session));
@@ -1497,6 +1649,7 @@ if (isMain) {
     feedMs: Number(get('--feed-ms', 2000)),
     seqStart: Number(get('--seq', 41823)),
     quiet: args.includes('--quiet'),
+    semantic: !args.includes('--no-semantic'),
   });
   process.on('SIGUSR1', () => mock.restart(1));
   const bye = () => {

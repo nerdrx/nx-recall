@@ -1,4 +1,6 @@
-// Search — FTS over the transcript with speaker / source / date facets.
+// Search — over the transcript, with speaker / source / date facets, in three
+// modes: the words (FTS), the meaning (vectors), or both fused. The mode
+// control and the per-hit `via` marker live in ./semantic.js.
 // A hit is not a destination: clicking one loads the transcript around that
 // moment and highlights it, because "what did she say about that world?" is
 // answered by the conversation, not by the matching line on its own.
@@ -6,6 +8,7 @@
 import { h, clear, fmtClock, fmtDay, fmtDate, speakerColor } from '../lib/dom.js';
 import { store, speakerLabel, segmentSpeakerLabel, isUncertain, ask } from '../lib/store.js';
 import { toast } from '../lib/sheets.js';
+import { defaultMode, modeControl, requestFor, resultSummary, semanticState, viaBadge } from './semantic.js';
 
 export const id = 'search';
 
@@ -24,13 +27,32 @@ const facetState = {
   source: '',
   from: isoDay(new Date(Date.now() - 7 * 86400e3)),
   to: isoDay(new Date()),
+  // `null` until the first mount, then whichever mode the daemon can serve.
+  // Sticky like the rest of the facets: a person who chose Keyword meant it.
+  mode: null,
 };
 let lastHits = [];
 
 export function mount(root, ctx) {
   const results = h('div', { id: 'search-results' });
   const resultCard = h('div', { class: 'card' }, results);
-  const sub = h('span', { class: 'sub', id: 'search-sub', text: 'Full-text over everything captured.' });
+  const sub = h('span', { class: 'sub', id: 'search-sub', text: 'Everything captured, by word or by meaning.' });
+
+  const sem = semanticState(store.status);
+  if (facetState.mode == null) facetState.mode = defaultMode(sem);
+  // A daemon that lost its model between visits must not leave the view stuck
+  // in a mode it can no longer answer.
+  if (!sem.available) facetState.mode = 'keyword';
+  const modes = modeControl({
+    selected: facetState.mode,
+    available: sem.available,
+    how: sem.how,
+    onSelect: (id) => {
+      facetState.mode = id;
+      modes.paint(id);
+      if (facetState.q) run();
+    },
+  });
 
   const qInput = h('input', {
     class: 'input',
@@ -73,7 +95,7 @@ export function mount(root, ctx) {
     h('div', { class: 'facet' }, h('label', { text: ' ' }), h('button', { class: 'btn primary', id: 'search-go', onclick: () => run() }, 'Search'))
   );
 
-  const body = h('div', { class: 'view-body view-enter' }, h('div', { class: 'card' }, facets), resultCard);
+  const body = h('div', { class: 'view-body view-enter' }, h('div', { class: 'card' }, facets, modes.el), resultCard);
   root.append(
     h('div', { class: 'view-head' }, h('div', {}, h('h1', { text: 'Search' }), sub), h('div', { class: 'spacer' })),
     body
@@ -95,10 +117,20 @@ export function mount(root, ctx) {
     if (facetState.to) params.to = `${facetState.to}T23:59:59Z`;
 
     try {
-      const res = await ask('search', params);
+      const [method, p] = requestFor(facetState.mode, params);
+      const res = await ask(method, p);
       lastHits = res.hits ?? [];
       renderHits(res);
     } catch (e) {
+      // The one error worth demoting a mode over: the daemon lost (or never
+      // had) the model. Fall back rather than showing the user a red box for
+      // a search that keyword can still answer.
+      if (e.code === 'unavailable' && facetState.mode !== 'keyword') {
+        facetState.mode = 'keyword';
+        modes.paint('keyword');
+        toast('Smart search needs a model this daemon does not have. Searching by words.', '');
+        return run();
+      }
       clear(results);
       results.append(
         h('div', { class: 'empty' }, h('b', { text: 'Search failed' }), h('p', { text: `${e.message}. The daemon may be restarting — try again in a moment.` }))
@@ -108,14 +140,19 @@ export function mount(root, ctx) {
 
   function renderHits(res) {
     clear(results);
-    sub.textContent = `${res.total ?? lastHits.length} match${(res.total ?? 0) === 1 ? '' : 'es'}${facetState.q ? ` for “${facetState.q}”` : ''}`;
+    sub.textContent = resultSummary(facetState.mode, res, facetState.q);
     if (!lastHits.length) {
       results.append(
         h(
           'div',
           { class: 'empty' },
           h('b', { text: 'Nothing matched' }),
-          h('p', { text: 'Try fewer words, or widen the speaker and date facets — search only covers what has been captured on allowed sources.' })
+          h('p', {
+            text:
+              facetState.mode === 'keyword'
+                ? 'Try fewer words, or Smart search if you cannot remember them — search only covers what has been captured on allowed sources.'
+                : 'Try describing it differently, or widen the speaker and date facets — search only covers what has been captured on allowed sources.',
+          })
         )
       );
       return;
@@ -147,7 +184,14 @@ export function mount(root, ctx) {
         })
       ),
       h('span', { class: 'txt' }, ...highlight(seg.text ?? '', facetState.q)),
-      h('span', { class: 'meta' }, h('span', { class: 'chip', text: seg.source ?? 'unknown' }))
+      h(
+        'span',
+        { class: 'meta' },
+        // Only in Both: in the single-leg modes every row arrived the same way
+        // and a badge on all of them says nothing.
+        facetState.mode === 'both' ? viaBadge(seg.via) : null,
+        h('span', { class: 'chip', text: seg.source ?? 'unknown' })
+      )
     );
     const jump = () => ctx.jumpToSegment(seg);
     row.addEventListener('click', jump);
@@ -177,6 +221,13 @@ export function mount(root, ctx) {
     return out;
   }
 
+  // Re-run mount() in place: the mode control's availability is baked into
+  // its buttons, and rebuilding is cheaper to reason about than mutating them.
+  function remount() {
+    clear(root);
+    return mount(root, ctx);
+  }
+
   fillFacets();
   if (facetState.q || facetState.speaker || facetState.source) run();
   else
@@ -193,6 +244,12 @@ export function mount(root, ctx) {
     update(change) {
       if (change?.relabel || change?.merged) fillFacets();
       if (change?.sources) fillFacets();
+      // The model can arrive while the app is open — a fetch and a daemon
+      // restart — so the toggle follows `status` rather than the first paint.
+      if (change?.status) {
+        const now = semanticState(store.status);
+        if (now.available !== sem.available) return remount();
+      }
     },
     focusQuery() {
       qInput.focus();

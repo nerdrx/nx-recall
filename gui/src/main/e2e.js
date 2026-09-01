@@ -1137,6 +1137,53 @@ export function runE2E(deps) {
 
     await step('shot-search-jump', async () => ({ file: await shot('search-jump') }));
 
+    // 11b — the search mode toggle (0.6.5). The mock daemon has the semantic
+    // model, so all three modes are live; the absent case is the GUI unit
+    // suite's (`test/semantic.test.js`), which does not need a screen.
+    await step('search-modes', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="search"]\').click()');
+      await waitFor('the mode toggle', async () => js('!!document.getElementById("search-mode-both")'));
+      const defaulted = await js('document.getElementById("search-mode-both").getAttribute("aria-pressed")');
+      assert(defaulted === 'true', `Both should be the default with a model present, got ${defaulted}`);
+
+      // A cross-language query: German in, and the mock's gloss reaches the
+      // English turns the same way the real model does.
+      await js(`(() => {
+        document.getElementById('search-q').value = 'die Welt mit den Walen';
+        document.getElementById('search-go').click();
+        return true;
+      })()`);
+      // Both counts in ONE evaluation. Read separately they can straddle a
+      // repaint from the live feed, and a hit count from before it against a
+      // badge count from after it is a failure that is not a bug.
+      const counts = await waitFor('smart hits', async () => {
+        const c = await js(`(() => {
+          const seg = document.querySelectorAll('#search-results .seg').length;
+          const via = document.querySelectorAll('#search-results .chip.via').length;
+          const sub = document.getElementById('search-sub').textContent;
+          return seg > 0 && sub.includes('Walen') ? { seg, via, sub } : null;
+        })()`);
+        return c;
+      });
+      const hits = counts.seg;
+      const vias = counts.via;
+      assert(vias === hits, `every hit in Both must say how it was found: ${vias} of ${hits}`);
+      assert(/by words and meaning/.test(counts.sub), `the mode should be stated: ${counts.sub}`);
+      const both = await shot('search-both');
+
+      // Keyword cannot answer that query at all, which is the point of the
+      // toggle: the same words, a different mode, a different answer.
+      await js('document.getElementById("search-mode-keyword").click()');
+      const pressed = await waitFor('keyword to take over', async () =>
+        js('document.getElementById("search-mode-keyword").getAttribute("aria-pressed") === "true"')
+      );
+      await waitFor('the keyword answer', async () =>
+        js('document.querySelectorAll("#search-results .chip.via").length === 0')
+      );
+      const keyword = await shot('search-keyword');
+      return { hits, vias, pressed, both, keyword };
+    });
+
     // 12 — sources: default-deny visuals and a live toggle
     await step('sources-toggle', async () => {
       await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');

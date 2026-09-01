@@ -45,7 +45,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::config::ModelsConfig;
-use crate::models::{EntryState, Group, Install, ModelSet, REMOTE_ASSETS, RemoteAsset};
+use crate::models::{
+    EntryState, Group, Install, ModelSet, REMOTE_ASSETS, RemoteAsset, SEMANTIC_ROLE,
+    SEMANTIC_TOKENIZER_ROLE, SemanticModel,
+};
 
 /// Read timeout for a single chunk. The whole download has no deadline — a
 /// 1.9 GB model on a slow line is not an error — but a stalled connection is.
@@ -78,6 +81,10 @@ pub struct FetchOptions {
     /// Also install the memory graph's Tier 3 assets (GRAPH.md): the 1.9 GB
     /// GGUF and the llama.cpp binaries. Off by default, like the feature.
     pub graph: bool,
+    /// Also install the optional text-embedding model for semantic search
+    /// (135 MB). Off by default: keyword search works without it, and this is
+    /// the one asset that buys a *feature* rather than correctness.
+    pub semantic: bool,
     /// Force the single-stream path. Only the test suite sets this; it is how
     /// the fallback is exercised without finding a server that lacks ranges.
     pub single_stream: bool,
@@ -92,6 +99,9 @@ impl FetchOptions {
         }
         if self.graph {
             out.push(Group::Graph);
+        }
+        if self.semantic {
+            out.push(Group::Semantic);
         }
         out
     }
@@ -147,7 +157,14 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
     // machine that never asked for the graph model is not incomplete.
     let mut set = ModelSet::resolve_at(root.to_path_buf(), cfg);
     set.select_asr();
-    let missing = set.missing();
+    let mut missing = set.missing();
+    // The semantic model is verified only when it was asked for: it is not part
+    // of `ModelSet` precisely because its absence must never read as a broken
+    // install (see `models::SemanticModel`).
+    if opts.semantic {
+        let sem = SemanticModel::resolve_at(root.to_path_buf(), cfg);
+        missing.extend(sem.entries().into_iter().filter(|e| !e.ok()));
+    }
     if !missing.is_empty() {
         eprintln!();
         for e in &missing {
@@ -835,15 +852,18 @@ mod tests {
     // ---- the catalogue -----------------------------------------------------
 
     #[test]
-    fn every_catalogued_url_is_an_https_release_asset_from_a_host_we_named() {
-        // Two hosts, and only two: the speech models come from the sherpa-onnx
-        // releases and the graph's Tier 3 comes from the llama.cpp releases and
-        // the GGUF's own publisher. A URL that drifts off this list is a
-        // supply-chain change and has to be a visible diff.
-        const HOSTS: [&str; 3] = [
+    fn every_catalogued_url_comes_from_a_publisher_we_named() {
+        // Four publishers, and only four: sherpa-onnx releases for the speech
+        // leg, llama.cpp releases + bartowski's quants for the graph's Tier 3,
+        // and the e5 mirror for semantic search — the latter pinned to a
+        // commit rather than a branch so "the catalogued size" cannot change
+        // under us. A URL that drifts off this list is a supply-chain change
+        // and has to be a visible diff.
+        const HOSTS: [&str; 4] = [
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/",
             "https://github.com/ggml-org/llama.cpp/releases/download/",
             "https://huggingface.co/bartowski/",
+            "https://huggingface.co/Xenova/multilingual-e5-small/resolve/",
         ];
         for a in REMOTE_ASSETS {
             assert!(
@@ -852,9 +872,70 @@ mod tests {
                 a.role,
                 a.url
             );
+            let semantic = a.role == SEMANTIC_ROLE || a.role == SEMANTIC_TOKENIZER_ROLE;
+            if semantic {
+                assert!(
+                    !a.url.contains("/resolve/main/"),
+                    "{} must be pinned to a commit, not to a branch: {}",
+                    a.role,
+                    a.url
+                );
+                assert!(!a.default(), "semantic search is opt-in");
+            }
             assert!(a.download_bytes > 0);
             assert!(!a.files.is_empty());
         }
+    }
+
+    /// The two optional legs are independent switches: a bare fetch installs
+    /// neither, and asking for one must not drag in the other.
+    #[test]
+    fn the_optional_assets_are_each_behind_their_own_flag() {
+        let bare = FetchOptions::default();
+        let sem = FetchOptions {
+            semantic: true,
+            ..bare
+        };
+        let en = FetchOptions {
+            fallback_asr: true,
+            ..bare
+        };
+        for a in REMOTE_ASSETS.iter().filter(|a| !a.default()) {
+            assert!(!bare.wants(a), "{} is not part of a bare fetch", a.role);
+        }
+        let semantic_assets: Vec<&RemoteAsset> = REMOTE_ASSETS
+            .iter()
+            .filter(|a| a.role == SEMANTIC_ROLE || a.role == SEMANTIC_TOKENIZER_ROLE)
+            .collect();
+        assert_eq!(semantic_assets.len(), 2, "model and tokenizer, both needed");
+        for a in &semantic_assets {
+            assert!(sem.wants(a));
+            assert!(!en.wants(a));
+        }
+        let fb = REMOTE_ASSETS
+            .iter()
+            .find(|a| a.role == "asr-fallback")
+            .unwrap();
+        assert!(en.wants(fb));
+        assert!(!sem.wants(fb));
+    }
+
+    #[test]
+    fn the_semantic_model_is_catalogued_at_its_exact_size() {
+        assert_eq!(
+            expected_bytes("multilingual-e5-small-int8/model.onnx"),
+            Some(118_308_185)
+        );
+        assert_eq!(
+            expected_bytes("multilingual-e5-small-int8/tokenizer.json"),
+            Some(17_082_730)
+        );
+        assert_eq!(
+            crate::models::semantic_download_bytes(),
+            118_308_185 + 17_082_730
+        );
+        // ...and it is NOT in the default set's budget, either way round.
+        assert!(total_download_bytes(&[]) < 700_000_000);
     }
 
     /// The v3 entry, transcribed from the release asset and the unpacked files.
@@ -955,6 +1036,15 @@ mod tests {
         let graph = crate::config::GraphConfig::default();
         assert_eq!(graph.llm_model, "qwen2.5-3b-instruct-q4_k_m.gguf");
         assert_eq!(graph.llama_dir, "llama");
+        // Optional, but not the only optional thing any more: semantic search
+        // adds two, and this assertion is about the ASR leg.
+        assert_eq!(
+            REMOTE_ASSETS
+                .iter()
+                .filter(|a| !a.default() && a.role.starts_with("asr"))
+                .count(),
+            1
+        );
     }
 
     #[test]

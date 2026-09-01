@@ -33,7 +33,9 @@ use recalld::server;
 use recalld::service::Service;
 use recalld::store::Store;
 
-use crate::cli::{Cli, Command, GraphAction, MicAction, ModelsAction, SpeakersAction};
+use crate::cli::{
+    Cli, Command, GraphAction, MicAction, ModelsAction, SemanticAction, SpeakersAction,
+};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -74,6 +76,7 @@ fn main() -> Result<()> {
                 force,
                 fallback_asr,
                 graph,
+                semantic,
                 no_config,
             } => cmd_models_fetch(
                 &cfg,
@@ -84,6 +87,7 @@ fn main() -> Result<()> {
                     force,
                     fallback_asr,
                     graph,
+                    semantic,
                     single_stream: false,
                 },
                 no_config,
@@ -106,7 +110,20 @@ fn main() -> Result<()> {
         } => cmd_name(&data_dir, speaker_id, &display_name),
         Command::Merge { from, into } => cmd_merge(&data_dir, from, into),
         Command::Split { speaker_id } => cmd_split(&cfg, &data_dir, speaker_id),
-        Command::Search { query, limit } => cmd_search(&data_dir, &query.join(" "), limit),
+        Command::Search {
+            query,
+            limit,
+            smart,
+        } => cmd_search(&cfg, &data_dir, &query.join(" "), limit, smart),
+        // Semantic search (0.6.5). Both actions run in THIS process rather than
+        // over the socket: the backfill is a long batch job that must be
+        // niceable and Ctrl-C-able, and neither wants to be an async op.
+        Command::Semantic { action } => match action {
+            SemanticAction::Status => recalld::semantic::status_command(&data_dir, &cfg),
+            SemanticAction::Backfill { batch, limit, dir } => {
+                recalld::semantic::backfill_command(&data_dir, &cfg, dir.as_deref(), batch, limit)
+            }
+        },
         Command::Transcript { session, speaker } => {
             cmd_transcript(&data_dir, session, speaker.as_deref())
         }
@@ -242,6 +259,31 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         Arc::clone(&control),
         Arc::clone(&bus),
     )?;
+    // Semantic search (0.6.5). Optional in the strongest sense: not installed
+    // means keyword search, exactly as before, with no warning — the user did
+    // not ask for the feature. One leg, shared by the inference thread (which
+    // embeds each turn) and the socket (which embeds each query), because the
+    // weights are 118 MB and two copies would be 236.
+    let semantic = match recalld::models::SemanticModel::resolve(&cfg.models) {
+        Some(sem) if sem.present() => {
+            match recalld::semantic::TextEmbedder::load(&sem) {
+                Ok(e) => {
+                    let leg = Arc::new(recalld::semantic::SemanticLeg::new(e));
+                    info!(model = %sem.model_id(), "semantic search is on");
+                    pipeline.attach_semantic(Arc::clone(&leg));
+                    Some(leg)
+                }
+                // Loud, because this one IS a broken install: the files are
+                // there at the catalogued size and still would not load.
+                Err(e) => {
+                    warn!("semantic search is off: {e:#}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     let nice = cfg.runtime.inference_nice;
     let cpus = cfg.runtime.inference_cpus.clone();
     let queue_for_thread = Arc::clone(&queue);
@@ -256,6 +298,9 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     // The socket, the roster and the sweeper are all optional: none of them is
     // allowed to cost the daemon its capture, so a failure here is a warning.
     let service = Service::new(Arc::clone(&store), Arc::clone(&control), Arc::clone(&bus));
+    if let Some(leg) = semantic {
+        service.attach_semantic(leg);
+    }
     let socket = if cfg.socket.enabled {
         let path = config::socket_path(&cfg.socket, data_dir);
         match server::serve(Arc::clone(&service), &path) {
@@ -632,6 +677,26 @@ fn cmd_models_status(
     println!("asr model id:       {}", models.asr_model_id());
     println!("embedding model id: {}", models.embed_model_id());
 
+    // Semantic search, listed separately because it is OPTIONAL: it is absent
+    // on a healthy install, and putting it in the table above would make the
+    // normal state look like a broken one.
+    let sem = models::SemanticModel::resolve_at(models.root.clone(), &cfg.models);
+    println!();
+    if sem.present() {
+        println!("semantic search:    on   ({})", sem.model_id());
+        for e in sem.entries() {
+            println!(
+                "  {:<14}  {:>10}  {}",
+                e.role,
+                e.bytes().map(fetch::human).unwrap_or_else(|| "-".into()),
+                e.path.display()
+            );
+        }
+    } else {
+        println!("semantic search:    off  (optional)");
+        println!("  {}", models::SemanticModel::how_to_get_it());
+    }
+
     if selection == AsrSelection::Fallback {
         // The set is complete and analysis will run — but on the English-only
         // model, which is a 103% WER answer to a German lobby. Say so before
@@ -973,11 +1038,14 @@ fn cmd_split(cfg: &Config, data_dir: &Path, speaker_id: i64) -> Result<()> {
     Ok(())
 }
 
-fn cmd_search(data_dir: &Path, query: &str, limit: usize) -> Result<()> {
+fn cmd_search(cfg: &Config, data_dir: &Path, query: &str, limit: usize, smart: bool) -> Result<()> {
     if query.trim().is_empty() {
         anyhow::bail!("nothing to search for");
     }
     let store = Store::open(data_dir)?;
+    if smart {
+        return cmd_search_smart(cfg, data_dir, &store, query, limit);
+    }
     let hits = store.search(query, limit)?;
     if hits.is_empty() {
         println!("No matches for {query:?}.");
@@ -991,6 +1059,72 @@ fn cmd_search(data_dir: &Path, query: &str, limit: usize) -> Result<()> {
             h.snippet
         );
     }
+    Ok(())
+}
+
+/// `recalld search --smart`: the same fusion the socket serves, in one process.
+///
+/// Deliberately not a socket call. This is the surface you reach for while
+/// debugging the index — including on a machine where the daemon is not
+/// running — so it opens the database itself.
+fn cmd_search_smart(
+    cfg: &Config,
+    data_dir: &Path,
+    store: &Store,
+    query: &str,
+    limit: usize,
+) -> Result<()> {
+    use recalld::semantic;
+
+    let root = fetch::target_dir(None, &cfg.models, data_dir);
+    let sem = models::SemanticModel::resolve_at(root, &cfg.models);
+    if !sem.present() {
+        anyhow::bail!("{}", models::SemanticModel::how_to_get_it());
+    }
+    let leg = semantic::SemanticLeg::new(semantic::TextEmbedder::load(&sem)?);
+
+    let filter = recalld::store::SegmentFilter::default();
+    let within = semantic::candidates(store, &filter)?;
+    let started = std::time::Instant::now();
+    let vector = leg.search(store, query, limit, &within)?;
+    let elapsed = started.elapsed();
+
+    let keyword: Vec<i64> = store
+        .search(query, limit)
+        .unwrap_or_default()
+        .iter()
+        .map(|h| h.segment_id())
+        .collect();
+    let semantic_ids: Vec<i64> = vector.iter().map(|s| s.segment_id).collect();
+    let fused = semantic::fuse(&keyword, &semantic_ids, semantic::RRF_K);
+
+    if fused.is_empty() {
+        println!("No matches for {query:?}.");
+        return Ok(());
+    }
+    let by_score: std::collections::HashMap<i64, f32> =
+        vector.iter().map(|s| (s.segment_id, s.score)).collect();
+    for f in fused.iter().take(limit) {
+        let Some(row) = store.segment_row(f.segment_id)? else {
+            continue;
+        };
+        println!(
+            "{}  {:<9}{:>6}  {:<20}  {}",
+            format_time(row.t_start_ns),
+            f.via.as_str(),
+            by_score
+                .get(&f.segment_id)
+                .map(|s| format!("{s:.3}"))
+                .unwrap_or_else(|| "-".into()),
+            row.speaker_name.as_deref().unwrap_or("-"),
+            row.text.as_deref().unwrap_or("")
+        );
+    }
+    eprintln!(
+        "\n{} hit(s); the vector leg searched in {:.1} ms",
+        fused.len().min(limit),
+        elapsed.as_secs_f64() * 1000.0
+    );
     Ok(())
 }
 

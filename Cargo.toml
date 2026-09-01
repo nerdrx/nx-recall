@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/recalld"]
 
 [workspace.package]
-version = "0.7.2"
+version = "0.7.3"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -27,6 +27,13 @@ serde_json = "1"
 sherpa-rs = "0.6"
 serde = { version = "1", features = ["derive"] }
 tar = "0.4"
+# Semantic search only (crate::semantic): the HuggingFace tokenizer that the
+# sentence-embedding model was trained with. Default features off on purpose —
+# they pull in a C++ suffix-array build (`esaxx_fast`) and a progress bar that
+# only the *training* paths use, and an inference-only dependency must not need
+# a C++ toolchain to build. `fancy-regex` rather than the default `onig` for the
+# same reason: it is the pure-Rust one of the two required regex backends.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
