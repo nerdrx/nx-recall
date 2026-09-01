@@ -51,11 +51,81 @@ Methods (initial set):
 | `segments.correct` | `{segment_id, text}` | feeds anchor per DESIGN §5 |
 | `person.get` | `{id}` | the person page in one reply: totals, co-presence edges, recent conversations |
 | `thread.get` | `{id}` | one conversation's segments, in order |
-| `search` | `{q, speaker?, source?, from?, to?, limit?}` | FTS now, +vec later |
+| `search` | `{q, speaker?, source?, from?, to?, limit?}` | FTS5 over transcripts |
+| `search.semantic` | `{q, mode?, speaker?, source?, from?, to?, limit?}` | search by meaning; `mode: "hybrid"` fuses it with FTS. `err:unavailable` when the optional model is not installed — see below |
 | `transcript` | `{session?, speaker?, from?, to?}` | chronological page |
 | `delete.preview` / `delete.run` | `{speaker?, session?, from?, to?}` | preview returns counts+bytes; run is an **async op** |
 | `pause` / `resume` | | global capture pause (the panic path; must be instant) |
 | `status` | | uptime, queue depth, drop counters, models loaded |
+
+## Semantic search
+
+`search.semantic` ranks turns by what they **mean** rather than by which words
+they contain, over 384-dimension sentence embeddings of the transcript
+(`multilingual-e5-small`, 384-d, int8). It exists for the query nobody can
+phrase: *what did she say about that world* — and, because the two languages in
+use here are German and English, for the German query that has to find the
+English turn.
+
+```json
+{"id": 12, "method": "search.semantic", "params": {"q": "die Welt mit den Walen", "mode": "hybrid", "limit": 50}}
+```
+
+| param | meaning |
+|---|---|
+| `q` | the query. No syntax: unlike `search`, there is nothing to get wrong |
+| `mode` | `"semantic"` (default) or `"hybrid"` |
+| `speaker` / `source` / `from` / `to` / `limit` | exactly as `search` |
+
+`mode: "hybrid"` runs FTS **and** the vector scan and fuses the two ranked
+lists with reciprocal-rank fusion (k=60). Fusing *ranks* rather than scores is
+deliberate: there is no exchange rate between FTS5's bm25 and a cosine, and any
+constant that claimed there was would be a number nobody could justify.
+
+The reply is `search`'s, plus:
+
+```json
+{"id": 12, "ok": {
+  "total": 2, "q": "...", "mode": "hybrid", "model": "multilingual-e5-small-int8@1",
+  "took_ms": 31.4,
+  "hits": [{"id": 918, "...": "...", "via": "both", "rrf": 0.0323, "score": 0.871}]
+}}
+```
+
+* **`via`** — `"keyword"`, `"semantic"` or `"both"`: which leg found this row.
+  A client must show it. "These words are in there" and "this seemed to mean
+  the same thing" are different claims, and a person deciding whether to trust
+  a hit needs to know which one they are looking at.
+* **`rrf`** — the fusion score the list is ordered by.
+* **`score`** — cosine, **only present when the vector leg scored the row**. A
+  keyword-only hit has no cosine and none is invented for it.
+
+Ordering is fully determined (fusion score, then the better of the two ranks,
+then segment id), so the same query twice is the same list twice.
+
+### When the model is not installed
+
+The embedding model is **optional** — `recalld models fetch --semantic`, ~135 MB
+— and everything else works without it. `search.semantic` then answers:
+
+```json
+{"id": 12, "err": {"code": "unavailable", "msg": "semantic search is not installed. `recalld models fetch --semantic` installs ..."}}
+```
+
+An error, never an empty `hits` list: a client that rendered emptiness would be
+telling the user she never said it. `status` carries the same answer up front,
+so a client can decide what to offer before anyone types anything:
+
+```json
+"semantic": {"available": false, "how": "semantic search is not installed. ..."}
+"semantic": {"available": true, "model": "multilingual-e5-small-int8@1", "dim": 384,
+             "resident": 41822, "resident_bytes": 64238592,
+             "indexed": 41822, "eligible": 41830, "pending": 8}
+```
+
+`pending` is transcripts captured before the model was installed (or corrected
+since); `recalld semantic backfill` clears it. New turns are embedded as they
+are transcribed.
 
 ## Async operations
 

@@ -33,6 +33,7 @@ pub mod queue;
 pub mod resample;
 pub mod retention;
 pub mod roster;
+pub mod semantic;
 pub mod server;
 pub mod service;
 pub mod split;

@@ -487,6 +487,18 @@ select.input option, select.input optgroup {
   border-color: transparent; background: var(--accent-fill); color: var(--on-accent);
 }
 
+/* ---------------------------------------------------------- search via --- */
+/* Which leg of a hybrid search found a hit. A chip, because it is a status and
+   not a name — and violet only for "meaning", which is the claim that is worth
+   a second look. "Words" is a fact and stays neutral. */
+
+.seg-note { margin: 0 0 var(--sp-1); min-height: 1.2em; }
+.chip.via { letter-spacing: 0.09em; }
+.chip.via-semantic,
+.chip.via-both { color: var(--violet); border-color: var(--clear-line-accent); background: var(--violet-soft); }
+.seg-ctl .seg-opt:disabled { opacity: 0.4; cursor: not-allowed; }
+.seg-ctl .seg-opt:disabled:hover { background: var(--clear-tile); border-color: var(--clear-line); }
+
 /* ------------------------------------------------------------- storage --- */
 /* Four rows, not one number: they behave differently and only two of them are
    anybody's decision. */

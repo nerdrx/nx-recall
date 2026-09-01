@@ -18,6 +18,11 @@
 //! only derived table in the schema, it is re-derivable from the transcript,
 //! and the migration backfills it by replaying the same rule the live path
 //! uses.
+//! v9 adds `segment_vectors` — one sentence-embedding per transcribed turn, so
+//! search can answer "what did she say about that world" without the words
+//! (DESIGN §6/§7). The whole migration lives in `crate::semantic::migrate_v9`;
+//! it is standalone (one table, three indexes, no backfill) and reads nothing
+//! any other migration writes, so it applies to a v6, v7 or v8 database alike.
 //! Existing databases are migrated in place.
 
 use std::collections::{BTreeSet, HashMap};
@@ -29,7 +34,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::embed::Embedding;
 use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -429,6 +434,15 @@ impl Store {
         Ok(store)
     }
 
+    /// The open connection, for the modules that own their own tables.
+    ///
+    /// `crate::semantic` is one: `segment_vectors` is queried by nothing else
+    /// in the schema, and putting its dozen statements here would make this
+    /// file the place every feature goes to grow.
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     fn init(&self) -> Result<()> {
         // WAL keeps the writer from blocking readers, so the future GUI can
         // browse while the daemon is still appending.
@@ -511,6 +525,9 @@ impl Store {
         self.apply_v4()?;
         self.apply_v5()?;
         self.apply_v6()?;
+        // v9: semantic search. Unconditional and idempotent like every
+        // migration above it, and deliberately dependent on none of them.
+        crate::semantic::migrate_v9(&self.conn)?;
 
         match current {
             None => {
@@ -2076,12 +2093,17 @@ impl Store {
         let mut n = 0;
         {
             let mut drop_embeddings = tx.prepare("DELETE FROM embeddings WHERE segment_id = ?1")?;
+            // v9: the text vector goes with the words. A purged turn must stop
+            // being findable by meaning as well as by word.
+            let mut drop_vectors =
+                tx.prepare("DELETE FROM segment_vectors WHERE segment_id = ?1")?;
             let mut orphan_prototypes = tx.prepare(
                 "UPDATE speaker_prototypes SET source_segment_id = NULL WHERE source_segment_id = ?1",
             )?;
             let mut drop_segment = tx.prepare("DELETE FROM segments WHERE id = ?1")?;
             for id in ids {
                 drop_embeddings.execute(params![id])?;
+                drop_vectors.execute(params![id])?;
                 orphan_prototypes.execute(params![id])?;
                 n += drop_segment.execute(params![id])?;
             }

@@ -201,6 +201,9 @@ pub struct Pipeline {
     /// Whether the last chunk we saw was refused because of a pause, so the
     /// transition is logged once rather than per buffer.
     was_paused: bool,
+    /// Semantic search's text embedder (0.6.5), when the optional model is
+    /// installed. Shared with the socket service — one 118 MB session, not two.
+    semantic: Option<Arc<crate::semantic::SemanticLeg>>,
 }
 
 impl Pipeline {
@@ -253,7 +256,14 @@ impl Pipeline {
             control,
             bus,
             was_paused: false,
+            semantic: None,
         })
+    }
+
+    /// Give the inference thread the semantic leg, so a turn is embedded as
+    /// soon as its transcript exists. Set once, before the thread starts.
+    pub fn attach_semantic(&mut self, leg: Arc<crate::semantic::SemanticLeg>) {
+        self.semantic = Some(leg);
     }
 
     /// Drain `queue` until it closes. Intended to be the body of the inference
@@ -502,6 +512,25 @@ impl Pipeline {
                 Some(crate::store::label_via::MIC),
             )?;
         }
+        // The text vector, after the transcript exists and before the event
+        // goes out. On THIS thread on purpose: it is the deprioritised worker
+        // the ASR and identity legs already run on, one forward pass is ~2 ms
+        // against ASR's tens, and doing it anywhere else would either put model
+        // work on the capture thread or need a second copy of the weights. A
+        // failure costs a search result, never a recording.
+        if let Some(leg) = self.semantic.clone() {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
+            if let Err(e) = leg.embed_segment(&store, segment_id) {
+                warn!(
+                    segment_id,
+                    "could not embed a segment for semantic search: {e:#}"
+                );
+            }
+        }
+
         // Published after analysis so the event carries the transcript and the
         // speaker, not an empty shell a client would have to re-query for.
         {

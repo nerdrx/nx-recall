@@ -22,6 +22,11 @@ use crate::config::ModelsConfig;
 /// model ids" rule keys on.
 pub const EMBED_CONTRACT_VERSION: u32 = 1;
 pub const ASR_CONTRACT_VERSION: u32 = 1;
+/// The same rule for the *text* embedding space (`crate::semantic`). Baked into
+/// the `model_id` stored on every row of `segment_vectors`, so changing the
+/// export, the pooling or the `query:`/`passage:` prefixes retires the old
+/// vectors instead of silently comparing against them.
+pub const SEMANTIC_CONTRACT_VERSION: u32 = 1;
 
 /// The Silero VAD graph is compiled into the binary (`crate::VAD_MODEL`), so it
 /// is never fetched and never missing. Recorded here only so `models status`
@@ -63,6 +68,15 @@ impl RemoteAsset {
         self.url.rsplit('/').next().unwrap_or(self.url)
     }
 }
+
+/// `RemoteAsset::role` for the two optional semantic-search files. Named
+/// constants because `models fetch --semantic` and `models status` both have to
+/// pick them out of the catalogue and a typo in either would be silent.
+pub const SEMANTIC_ROLE: &str = "semantic";
+pub const SEMANTIC_TOKENIZER_ROLE: &str = "semantic.tokens";
+
+/// The directory the semantic model installs into, under the models root.
+pub const SEMANTIC_DIR: &str = "multilingual-e5-small-int8";
 
 /// The default model set of DESIGN §4, as published by the sherpa-onnx project.
 ///
@@ -128,6 +142,32 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
                 93_939,
             ),
         ],
+    },
+    // Semantic search (crate::semantic). OPTIONAL, and the only asset in this
+    // catalogue that is not published by k2-fsa: `intfloat/multilingual-e5-small`
+    // as an int8 ONNX export, from the transformers.js mirror that publishes it,
+    // pinned to a commit so "the catalogued size" cannot be changed under us by
+    // a re-upload to `main`. The tokenizer is a second asset rather than part of
+    // the first because upstream ships them as two files; the daemon refuses to
+    // load the model without it, so half an install is not a usable one.
+    //
+    // Why this model and not the paraphrase MiniLM, and why int8 and not the
+    // 470 MB fp32: see the module docs in `crate::semantic`, with numbers.
+    RemoteAsset {
+        role: SEMANTIC_ROLE,
+        url: "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/onnx/model_quantized.onnx",
+        download_bytes: 118_308_185,
+        install: Install::File("multilingual-e5-small-int8/model.onnx"),
+        default: false,
+        files: &[("multilingual-e5-small-int8/model.onnx", 118_308_185)],
+    },
+    RemoteAsset {
+        role: SEMANTIC_TOKENIZER_ROLE,
+        url: "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/tokenizer.json",
+        download_bytes: 17_082_730,
+        install: Install::File("multilingual-e5-small-int8/tokenizer.json"),
+        default: false,
+        files: &[("multilingual-e5-small-int8/tokenizer.json", 17_082_730)],
     },
     // The English-only export that was the default up to 0.5.5. Not fetched by
     // default any more, but kept in the catalogue with its exact sizes: it is
@@ -247,7 +287,7 @@ impl AsrSelection {
 pub fn total_download_bytes(include_optional: bool) -> u64 {
     REMOTE_ASSETS
         .iter()
-        .filter(|a| a.default || include_optional)
+        .filter(|a| a.default || (include_optional && a.role == "asr-fallback"))
         .map(|a| a.download_bytes)
         .sum()
 }
@@ -284,6 +324,90 @@ pub fn default_asr_entries(root: &Path) -> Vec<ModelEntry> {
         }
     })
     .collect()
+}
+
+/// Where the optional text-embedding model lives, and whether it is there.
+///
+/// Kept apart from [`ModelSet`] on purpose. `ModelSet::complete()` is the gate
+/// on the whole analysis leg — a missing file there costs the user their
+/// transcripts — and semantic search is a *feature*: absent, everything else
+/// works and keyword search is exactly what it was. Folding these two files
+/// into `missing()` would turn "you have not opted into semantic search" into
+/// "analysis is off", which is the wrong answer to the wrong question.
+#[derive(Debug, Clone)]
+pub struct SemanticModel {
+    pub root: PathBuf,
+    pub dir: PathBuf,
+    pub model: PathBuf,
+    pub tokenizer: PathBuf,
+}
+
+impl SemanticModel {
+    pub fn resolve(cfg: &ModelsConfig) -> Option<Self> {
+        Some(Self::resolve_at(cfg.dir.clone()?, cfg))
+    }
+
+    pub fn resolve_at(root: PathBuf, cfg: &ModelsConfig) -> Self {
+        let dir = root.join(&cfg.semantic);
+        Self {
+            model: dir.join(&cfg.semantic_model),
+            tokenizer: dir.join(&cfg.semantic_tokenizer),
+            dir,
+            root,
+        }
+    }
+
+    pub fn entries(&self) -> Vec<ModelEntry> {
+        [
+            (SEMANTIC_ROLE, &self.model),
+            (SEMANTIC_TOKENIZER_ROLE, &self.tokenizer),
+        ]
+        .into_iter()
+        .map(|(role, path)| ModelEntry {
+            role,
+            path: path.clone(),
+            expected: path
+                .strip_prefix(&self.root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .as_deref()
+                .and_then(expected_bytes),
+        })
+        .collect()
+    }
+
+    /// Both files present at exactly the catalogued size. A half-installed or
+    /// truncated model is *absent*, not broken: the daemon says "semantic
+    /// search is not installed" and keyword search carries on.
+    pub fn present(&self) -> bool {
+        self.entries().iter().all(|e| e.ok())
+    }
+
+    /// Stable identity of the text embedding space, stored on every vector.
+    pub fn model_id(&self) -> String {
+        format!("{}@{SEMANTIC_CONTRACT_VERSION}", dir_name(&self.dir))
+    }
+
+    /// What `models status` prints when the files are not there — the whole
+    /// point being that the toggle in the GUI, the status table and this line
+    /// all name the same command.
+    pub fn how_to_get_it() -> String {
+        format!(
+            "semantic search is not installed. `recalld models fetch --semantic` \
+             installs {SEMANTIC_DIR} ({}), then `recalld semantic backfill` indexes \
+             what has already been said.",
+            crate::fetch::human(semantic_download_bytes())
+        )
+    }
+}
+
+/// Bytes `models fetch --semantic` has to pull down.
+pub fn semantic_download_bytes() -> u64 {
+    REMOTE_ASSETS
+        .iter()
+        .filter(|a| a.role == SEMANTIC_ROLE || a.role == SEMANTIC_TOKENIZER_ROLE)
+        .map(|a| a.download_bytes)
+        .sum()
 }
 
 #[derive(Debug, Clone)]

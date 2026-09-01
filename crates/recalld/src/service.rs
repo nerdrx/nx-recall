@@ -109,6 +109,14 @@ pub struct Service {
     pub bus: Arc<Bus>,
     next_op: AtomicU64,
     ops: Mutex<HashMap<String, OpState>>,
+    /// Semantic search (0.6.5), when the optional model is installed.
+    ///
+    /// A `OnceLock` set after construction rather than a constructor argument:
+    /// the leg is 118 MB of weights that only `recalld run` has any business
+    /// loading, and every other caller of `Service::new` — the socket tests,
+    /// the mic tests, the server's own tests — would otherwise have to pass a
+    /// `None` it does not care about.
+    semantic: std::sync::OnceLock<Arc<crate::semantic::SemanticLeg>>,
 }
 
 impl Service {
@@ -119,11 +127,22 @@ impl Service {
             bus,
             next_op: AtomicU64::new(1),
             ops: Mutex::new(HashMap::new()),
+            semantic: std::sync::OnceLock::new(),
         })
     }
 
     fn store(&self) -> MutexGuard<'_, Store> {
         self.store.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Hand the service the loaded semantic leg. Called once, at start-up,
+    /// only when the optional model is actually on disk.
+    pub fn attach_semantic(&self, leg: Arc<crate::semantic::SemanticLeg>) {
+        let _ = self.semantic.set(leg);
+    }
+
+    pub fn semantic(&self) -> Option<&Arc<crate::semantic::SemanticLeg>> {
+        self.semantic.get()
     }
 
     pub fn op_state(&self, op: &str) -> Option<OpState> {
@@ -161,6 +180,7 @@ impl Service {
             "segments.correct" => self.segments_correct(req),
             "segments.audio" => self.segments_audio(req),
             "search" => self.search(req),
+            "search.semantic" => self.search_semantic(req),
             "transcript" => self.transcript(req),
             "roster.now" => self.roster_now(),
             "operations.list" => self.operations_list(req),
@@ -237,6 +257,29 @@ impl Service {
     /// One shape, served two ways: the `status` method a client polls and the
     /// `status` event pushed on every state change (pause above all — a pause
     /// nobody can see is not a panic button).
+    /// What `status` says about the semantic leg. `available: false` with the
+    /// line that fixes it, rather than silence — the GUI's mode toggle renders
+    /// this verbatim, so the app and the CLI say the same sentence.
+    fn semantic_json(&self, store: &Store) -> anyhow::Result<Value> {
+        let Some(leg) = self.semantic() else {
+            return Ok(json!({
+                "available": false,
+                "how": crate::models::SemanticModel::how_to_get_it(),
+            }));
+        };
+        let (resident, bytes, coverage) = leg.stats(store)?;
+        Ok(json!({
+            "available": true,
+            "model": leg.model_id(),
+            "dim": crate::semantic::DIM,
+            "resident": resident,
+            "resident_bytes": bytes,
+            "indexed": coverage.embedded,
+            "eligible": coverage.eligible,
+            "pending": coverage.pending(),
+        }))
+    }
+
     fn status_payload(&self) -> anyhow::Result<Value> {
         let c = &self.control;
         let (depth, capacity, dropped_chunks, dropped_samples) = match &c.queue {
@@ -281,6 +324,10 @@ impl Service {
             },
             "models": models,
             "models_loaded": !models.is_empty(),
+            // Semantic search (0.6.5). Always present, always a boolean:
+            // a client has to be able to tell "the model is not installed"
+            // from "an older daemon", and a missing key cannot.
+            "semantic": self.semantic_json(&store)?,
             "sources_allowed": allowed,
             "sources_capturing": capturing,
             // The whole microphone answer in one place, plus the flat string
@@ -1553,6 +1600,103 @@ impl Service {
         }))
     }
 
+    /// `search.semantic` — search by meaning, optionally fused with FTS.
+    ///
+    /// Two modes, and the parameter is explicit rather than inferred:
+    ///
+    /// * `"semantic"` (the default) ranks by cosine over the transcript
+    ///   vectors alone. This is the mode that finds a German sentence from an
+    ///   English query, and the one that finds nothing at all when the words
+    ///   are right there but the meaning is thin ("Japan").
+    /// * `"hybrid"` runs FTS *and* the vector scan and fuses them with
+    ///   reciprocal-rank fusion. Each hit says which leg found it, in `via`.
+    ///
+    /// A missing model is `err:unavailable` with the command that fixes it —
+    /// never an empty result set, which a client would render as "she never
+    /// said that".
+    fn search_semantic(&self, req: &Request) -> Result<Value, Error> {
+        use crate::semantic::{self, Via};
+
+        let Some(leg) = self.semantic() else {
+            return Err(Error::new(
+                "unavailable",
+                crate::models::SemanticModel::how_to_get_it(),
+            ));
+        };
+        let q = req.str("q")?.trim().to_string();
+        if q.is_empty() {
+            return Err(Error::params("q must not be empty"));
+        }
+        let hybrid = match req.opt_str("mode")? {
+            None | Some("semantic") => false,
+            Some("hybrid") => true,
+            Some(other) => {
+                return Err(Error::params(format!(
+                    "mode must be \"semantic\" or \"hybrid\", not {other:?}"
+                )));
+            }
+        };
+        let limit = req.usize_or("limit", 50)?.clamp(1, 1000);
+        let filter = self.filter_of(req)?;
+
+        let store = self.store();
+        let within = semantic::candidates(&store, &filter).map_err(Error::from)?;
+        let started = std::time::Instant::now();
+        let scored = leg
+            .search(&store, &q, limit, &within)
+            .map_err(|e| Error::new("failed", format!("{e:#}")))?;
+        let took_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let semantic_ids: Vec<i64> = scored.iter().map(|s| s.segment_id).collect();
+        let scores: HashMap<i64, f32> = scored.iter().map(|s| (s.segment_id, s.score)).collect();
+
+        // The keyword leg is best-effort in hybrid mode: `MATCH` is a query
+        // language and a user typing a bare apostrophe into a search box is
+        // not an error worth failing the whole search over — the vector leg
+        // has no syntax at all and will still answer.
+        let keyword_ids: Vec<i64> = if hybrid {
+            match store.search_filtered(&q, &filter, limit) {
+                Ok(hits) => hits.iter().map(|h| h.segment_id()).collect(),
+                Err(e) => {
+                    warn!("the keyword leg of a hybrid search failed: {e:#}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let fused = semantic::fuse(&keyword_ids, &semantic_ids, semantic::RRF_K);
+        let mut hits = Vec::with_capacity(fused.len().min(limit));
+        for f in fused.iter().take(limit) {
+            let Some(row) = store.segment_row(f.segment_id).map_err(Error::from)? else {
+                continue;
+            };
+            let mut item = segment_json(&row);
+            item["via"] = json!(f.via.as_str());
+            item["rrf"] = json!(f.score);
+            // Only present when the vector leg actually scored it: a
+            // keyword-only hit has no cosine, and inventing one would be a
+            // number a client could sort by and be wrong.
+            if let Some(s) = scores.get(&f.segment_id) {
+                item["score"] = json!(*s);
+            }
+            if f.via != Via::Semantic {
+                item["snippet"] = json!(row.text.clone().unwrap_or_default());
+            }
+            hits.push(item);
+        }
+        drop(store);
+
+        Ok(json!({
+            "total": hits.len(),
+            "q": q,
+            "mode": if hybrid { "hybrid" } else { "semantic" },
+            "model": leg.model_id(),
+            "took_ms": took_ms,
+            "hits": hits,
+        }))
+    }
+
     fn transcript(&self, req: &Request) -> Result<Value, Error> {
         let limit = req.usize_or("limit", 500)?.clamp(1, 10_000);
         let filter = self.filter_of(req)?;
@@ -2407,6 +2551,57 @@ mod tests {
         )
         .unwrap();
         assert!(by_source["hits"].as_array().unwrap().is_empty());
+    }
+
+    /// Semantic search with no model installed — which is every machine that
+    /// has not opted in, so it is the *normal* path, not the sad one.
+    #[test]
+    fn semantic_search_without_the_model_says_how_to_get_it() {
+        let r = rig("semantic-absent");
+        let (_, _) = a_segment(&r, "portal world");
+
+        let err = call(
+            &r,
+            r#"{"id":1,"method":"search.semantic","params":{"q":"portal"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "unavailable");
+        let msg = err.msg.as_str();
+        assert!(msg.contains("models fetch --semantic"), "{msg}");
+        assert!(
+            msg.contains("semantic backfill"),
+            "the second half of the answer is missing: {msg}"
+        );
+
+        // Keyword search is untouched. That is the whole contract of an
+        // optional model: nothing else notices it is gone.
+        let hits = call(&r, r#"{"id":2,"method":"search","params":{"q":"portal"}}"#).unwrap();
+        assert_eq!(hits["hits"].as_array().unwrap().len(), 1);
+
+        // ...and `status` says so before anyone types anything, as a boolean
+        // rather than as a missing key.
+        let st = call(&r, r#"{"id":3,"method":"status"}"#).unwrap();
+        assert_eq!(st["semantic"]["available"], false);
+        assert!(
+            st["semantic"]["how"]
+                .as_str()
+                .unwrap()
+                .contains("--semantic")
+        );
+    }
+
+    #[test]
+    fn semantic_search_validates_its_parameters_before_it_needs_a_model() {
+        let r = rig("semantic-params");
+        // The unavailable check comes first on purpose: a client on a machine
+        // with no model must get the actionable answer, not a quibble about
+        // the mode string.
+        for line in [
+            r#"{"id":1,"method":"search.semantic","params":{"q":"x","mode":"nonsense"}}"#,
+            r#"{"id":2,"method":"search.semantic","params":{"q":"   "}}"#,
+        ] {
+            assert_eq!(call(&r, line).unwrap_err().code, "unavailable", "{line}");
+        }
     }
 
     #[test]

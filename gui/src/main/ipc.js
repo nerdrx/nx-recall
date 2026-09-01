@@ -43,6 +43,10 @@ const ALLOWED = new Set([
   'segments.reassign',
   'segments.correct',
   'search',
+  // Semantic search (0.6.5). Read-only, same facets, and the Search
+  // view's mode toggle calls it directly — a method the UI offers and
+  // this set forgets is a dead button.
+  'search.semantic',
   'transcript',
   'delete.preview',
   'delete.run',

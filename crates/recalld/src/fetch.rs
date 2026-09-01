@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::config::ModelsConfig;
-use crate::models::{EntryState, Install, ModelSet, REMOTE_ASSETS, RemoteAsset};
+use crate::models::{
+    EntryState, Install, ModelSet, REMOTE_ASSETS, RemoteAsset, SEMANTIC_ROLE,
+    SEMANTIC_TOKENIZER_ROLE, SemanticModel,
+};
 
 /// Read timeout for a single chunk. The whole download has no deadline — a
 /// 130 MB model on a slow line is not an error — but a stalled connection is.
@@ -35,6 +38,21 @@ pub struct FetchOptions {
     /// multilingual set beats it at English too, and it only exists here so a
     /// machine that wants the small model can still get it.
     pub fallback_asr: bool,
+    /// Also install the optional text-embedding model for semantic search
+    /// (135 MB). Off by default: keyword search works without it, and this is
+    /// the one asset that buys a *feature* rather than correctness.
+    pub semantic: bool,
+}
+
+impl FetchOptions {
+    /// Is this non-default asset one the caller asked for?
+    fn wants(&self, asset: &RemoteAsset) -> bool {
+        match asset.role {
+            "asr-fallback" => self.fallback_asr,
+            SEMANTIC_ROLE | SEMANTIC_TOKENIZER_ROLE => self.semantic,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -63,7 +81,7 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
             report.skipped += 1;
             continue;
         }
-        if !asset.default && !opts.fallback_asr {
+        if !asset.default && !opts.wants(asset) {
             continue;
         }
         let n = fetch_one(root, asset)?;
@@ -77,7 +95,14 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
     // just wrote.
     let mut set = ModelSet::resolve_at(root.to_path_buf(), cfg);
     set.select_asr();
-    let missing = set.missing();
+    let mut missing = set.missing();
+    // The semantic model is verified only when it was asked for: it is not part
+    // of `ModelSet` precisely because its absence must never read as a broken
+    // install (see `models::SemanticModel`).
+    if opts.semantic {
+        let sem = SemanticModel::resolve_at(root.to_path_buf(), cfg);
+        missing.extend(sem.entries().into_iter().filter(|e| !e.ok()));
+    }
     if !missing.is_empty() {
         eprintln!();
         for e in &missing {
@@ -332,19 +357,94 @@ mod tests {
     use super::*;
     use crate::models::{expected_bytes, total_download_bytes};
 
+    /// Two publishers, and only two. Everything the analysis leg needs comes
+    /// from k2-fsa's release assets; the optional semantic model is the one
+    /// exception, and it is pinned to a commit rather than to `main` so that
+    /// "the catalogued size" cannot change under us.
     #[test]
-    fn every_catalogued_url_is_an_https_github_release_asset() {
+    fn every_catalogued_url_comes_from_a_publisher_we_named() {
         for a in REMOTE_ASSETS {
-            assert!(
-                a.url
-                    .starts_with("https://github.com/k2-fsa/sherpa-onnx/releases/download/"),
-                "{} points somewhere unexpected: {}",
-                a.role,
-                a.url
-            );
+            let sherpa = a
+                .url
+                .starts_with("https://github.com/k2-fsa/sherpa-onnx/releases/download/");
+            let semantic = a.role == SEMANTIC_ROLE || a.role == SEMANTIC_TOKENIZER_ROLE;
+            if semantic {
+                assert!(
+                    a.url.starts_with(
+                        "https://huggingface.co/Xenova/multilingual-e5-small/resolve/"
+                    ),
+                    "{} points somewhere unexpected: {}",
+                    a.role,
+                    a.url
+                );
+                assert!(
+                    !a.url.contains("/resolve/main/"),
+                    "{} must be pinned to a commit, not to a branch: {}",
+                    a.role,
+                    a.url
+                );
+                assert!(!a.default, "semantic search is opt-in");
+            } else {
+                assert!(sherpa, "{} points somewhere unexpected: {}", a.role, a.url);
+            }
             assert!(a.download_bytes > 0);
             assert!(!a.files.is_empty());
         }
+    }
+
+    /// The two optional legs are independent switches: a bare fetch installs
+    /// neither, and asking for one must not drag in the other.
+    #[test]
+    fn the_optional_assets_are_each_behind_their_own_flag() {
+        let bare = FetchOptions {
+            force: false,
+            fallback_asr: false,
+            semantic: false,
+        };
+        let sem = FetchOptions {
+            semantic: true,
+            ..bare
+        };
+        let en = FetchOptions {
+            fallback_asr: true,
+            ..bare
+        };
+        for a in REMOTE_ASSETS.iter().filter(|a| !a.default) {
+            assert!(!bare.wants(a), "{} is not part of a bare fetch", a.role);
+        }
+        let semantic_assets: Vec<&RemoteAsset> = REMOTE_ASSETS
+            .iter()
+            .filter(|a| a.role == SEMANTIC_ROLE || a.role == SEMANTIC_TOKENIZER_ROLE)
+            .collect();
+        assert_eq!(semantic_assets.len(), 2, "model and tokenizer, both needed");
+        for a in &semantic_assets {
+            assert!(sem.wants(a));
+            assert!(!en.wants(a));
+        }
+        let fb = REMOTE_ASSETS
+            .iter()
+            .find(|a| a.role == "asr-fallback")
+            .unwrap();
+        assert!(en.wants(fb));
+        assert!(!sem.wants(fb));
+    }
+
+    #[test]
+    fn the_semantic_model_is_catalogued_at_its_exact_size() {
+        assert_eq!(
+            expected_bytes("multilingual-e5-small-int8/model.onnx"),
+            Some(118_308_185)
+        );
+        assert_eq!(
+            expected_bytes("multilingual-e5-small-int8/tokenizer.json"),
+            Some(17_082_730)
+        );
+        assert_eq!(
+            crate::models::semantic_download_bytes(),
+            118_308_185 + 17_082_730
+        );
+        // ...and it is NOT in the default set's budget, either way round.
+        assert!(total_download_bytes(true) < 700_000_000);
     }
 
     /// The v3 entry, transcribed from the release asset and the unpacked files.
@@ -402,7 +502,15 @@ mod tests {
             ),
             Some(131_113_202)
         );
-        assert_eq!(REMOTE_ASSETS.iter().filter(|a| !a.default).count(), 1);
+        // Optional, but not the only optional thing any more: semantic search
+        // adds two, and this assertion is about the ASR leg.
+        assert_eq!(
+            REMOTE_ASSETS
+                .iter()
+                .filter(|a| !a.default && a.role.starts_with("asr"))
+                .count(),
+            1
+        );
     }
 
     #[test]

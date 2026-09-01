@@ -37,10 +37,22 @@ $ recalld allow VRChat.exe
 $ recalld search "portal"
 2026-09-01 20:16  Kira   wait, which [portal] was it — the one behind the bar
                          or the one in the stairwell?
+
+$ recalld search --smart "die Welt mit den Walen"
+2026-09-01 20:14  both      Jonas  Die Welt mit den riesigen schwebenden Walen
+                                   hieß glaube ich Cetacea.
+2026-09-01 20:14  semantic  Kira   That world with the giant floating whales was
+                                   called Cetacea, I think.
 ```
 
 Nothing is recorded until you say so. Then everything you allow becomes
 searchable — who said it, when, in which app — seconds after it is said.
+
+`--smart` searches by **meaning** rather than by word, so the German query finds
+the English turn it shares no word with, and "what did she say about that world"
+works when you cannot remember what she actually said. It needs one optional
+model (`recalld models fetch --semantic`, ~135 MB) and `recalld semantic
+backfill` to index what was captured before it.
 
 ## The problem nobody shipped a fix for
 
