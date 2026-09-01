@@ -51,7 +51,7 @@ architecture is what survived.
 
 | Claim | Measured |
 |---|---|
-| Transcription accuracy (clean) | **1.3% WER** — Parakeet-TDT, fully offline |
+| Transcription accuracy (clean) | **1.4% WER English, 8.4% German** — Parakeet-TDT 0.6b v3, 25 languages, fully offline |
 | VRChat's voice codec "quality ceiling" | **Debunked**: Opus down to 8 kbps costs 0.2 pp WER, ~0.02 cosine for identity |
 | Speaker ID from 1 second of speech | **96% coverage, 2.5% EER** |
 | Real lobby, 20 min field recording | **9.8% overlapped speech** — the failure regime is rare in the wild |
@@ -104,7 +104,7 @@ flowchart LR
 
 ```bash
 cargo build --release
-./target/release/recalld models fetch   # ~135 MB of ONNX models, once, into the data dir
+./target/release/recalld models fetch   # ~500 MB of ONNX models, once, into the data dir
 ./target/release/recalld probe          # see every app making sound, none captured
 ./target/release/recalld allow VRChat.exe
 ./target/release/recalld run            # first light
@@ -115,6 +115,11 @@ cargo build --release
 verifies every file's exact byte size, skips anything already correct, and points
 `[models].dir` at what it installed so `models status` agrees with it. Everything
 after it runs offline.
+
+The ASR model is multilingual (25 languages, German and English included). An
+install that still only has the older English-only export keeps transcribing on
+it — the daemon says so at start-up and `models status` shows it as a fallback —
+so an update can cost accuracy but never the transcripts.
 
 Pause lives in the tray dropdown and the GUI — instant, zero writes.
 

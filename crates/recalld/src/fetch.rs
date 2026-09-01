@@ -31,6 +31,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct FetchOptions {
     /// Re-download everything, even files that are already the right size.
     pub force: bool,
+    /// Also install the optional English-only ASR export. Off by default: the
+    /// multilingual set beats it at English too, and it only exists here so a
+    /// machine that wants the small model can still get it.
+    pub fallback_asr: bool,
 }
 
 #[derive(Debug, Default)]
@@ -46,6 +50,10 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
 
     let mut report = FetchReport::default();
     for asset in REMOTE_ASSETS {
+        // An asset already on disk at the catalogued size is reported whether
+        // it is part of the default set or not — the old English-only export
+        // does not vanish from an existing install just because it stopped
+        // being the default.
         if !opts.force && asset_satisfied(root, asset) {
             println!(
                 "  {:<13} present  ({})",
@@ -55,15 +63,20 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
             report.skipped += 1;
             continue;
         }
+        if !asset.default && !opts.fallback_asr {
+            continue;
+        }
         let n = fetch_one(root, asset)?;
         report.downloaded += 1;
         report.bytes += n;
     }
 
     // The set is only useful if the daemon can resolve it through the same
-    // config it will run with, so verify through `ModelSet`, not through the
-    // catalogue we just wrote.
-    let set = ModelSet::resolve_at(root.to_path_buf(), cfg);
+    // config it will run with, so verify through `ModelSet` — including the
+    // ASR selection the daemon itself will make — not through the catalogue we
+    // just wrote.
+    let mut set = ModelSet::resolve_at(root.to_path_buf(), cfg);
+    set.select_asr();
     let missing = set.missing();
     if !missing.is_empty() {
         eprintln!();
@@ -334,6 +347,64 @@ mod tests {
         }
     }
 
+    /// The v3 entry, transcribed from the release asset and the unpacked files.
+    /// Every number here is checked by the fetch itself, so a re-upload upstream
+    /// fails the download rather than installing a different model under the
+    /// same name — and this test is what stops the numbers drifting silently.
+    #[test]
+    fn the_default_asr_is_the_multilingual_export() {
+        let a = REMOTE_ASSETS.iter().find(|a| a.role == "asr").unwrap();
+        assert!(a.default);
+        assert_eq!(
+            a.url,
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/\
+             sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2"
+        );
+        assert_eq!(a.download_bytes, 487_170_055);
+        assert_eq!(a.install, Install::TarBz2);
+        assert_eq!(
+            a.files,
+            &[
+                (
+                    "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/encoder.int8.onnx",
+                    652_184_281
+                ),
+                (
+                    "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/decoder.int8.onnx",
+                    11_845_275
+                ),
+                (
+                    "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/joiner.int8.onnx",
+                    6_355_277
+                ),
+                (
+                    "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/tokens.txt",
+                    93_939
+                ),
+            ]
+        );
+    }
+
+    /// The English-only export is not fetched by default any more, but it is
+    /// still catalogued: `models status` needs its sizes to report a fallback
+    /// install, and `--fallback-asr` needs its URL.
+    #[test]
+    fn the_english_only_export_stays_catalogued_but_is_not_default() {
+        let a = REMOTE_ASSETS
+            .iter()
+            .find(|a| a.role == "asr-fallback")
+            .unwrap();
+        assert!(!a.default);
+        assert_eq!(a.download_bytes, 108_035_095);
+        assert_eq!(
+            expected_bytes(
+                "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8/encoder.int8.onnx"
+            ),
+            Some(131_113_202)
+        );
+        assert_eq!(REMOTE_ASSETS.iter().filter(|a| !a.default).count(), 1);
+    }
+
     #[test]
     fn the_catalogue_covers_every_file_the_daemon_resolves() {
         let cfg = ModelsConfig::default();
@@ -350,9 +421,17 @@ mod tests {
 
     #[test]
     fn the_default_set_is_the_documented_size() {
-        // DESIGN §4 says "~700 MB default set" of models on disk; the download
-        // itself is ~140 MB because the heavy ASR export ships compressed.
-        assert_eq!(total_download_bytes(), 6_958_444 + 26_485_263 + 108_035_095);
+        // DESIGN §4's "~700 MB default set" on disk, now literally true: the
+        // multilingual encoder alone unpacks to 622 MB. ~496 MB compressed.
+        assert_eq!(
+            total_download_bytes(false),
+            6_958_444 + 26_485_263 + 487_170_055
+        );
+        // The optional English-only export is only counted when it is asked for.
+        assert_eq!(
+            total_download_bytes(true),
+            total_download_bytes(false) + 108_035_095
+        );
         assert_eq!(expected_bytes("eres2net_en.onnx"), Some(26_485_263));
         assert_eq!(expected_bytes("no/such/model.onnx"), None);
     }
@@ -375,7 +454,7 @@ mod tests {
         let a = REMOTE_ASSETS.iter().find(|a| a.role == "asr").unwrap();
         assert_eq!(
             a.file_name(),
-            "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8.tar.bz2"
+            "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2"
         );
     }
 

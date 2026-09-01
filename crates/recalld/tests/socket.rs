@@ -83,7 +83,9 @@ impl Daemon {
         let mut cfg = Config::default();
         let analyzer = models_dir().map(|models| {
             cfg.models.dir = Some(models.clone());
-            let set = ModelSet::resolve(&cfg.models).expect("NXR_MODELS resolves to a model set");
+            let mut set =
+                ModelSet::resolve(&cfg.models).expect("NXR_MODELS resolves to a model set");
+            set.select_asr();
             let missing = set.missing();
             assert!(
                 missing.is_empty(),
@@ -1162,9 +1164,12 @@ fn interop_daemon() {
     if let Some(models) = models_dir() {
         let mut cfg = Config::default();
         cfg.models.dir = Some(models);
-        if let Some(set) = ModelSet::resolve(&cfg.models).filter(ModelSet::complete) {
-            d.control
-                .set_models(vec![set.asr_model_id(), set.embed_model_id()]);
+        if let Some(mut set) = ModelSet::resolve(&cfg.models) {
+            set.select_asr();
+            if set.complete() {
+                d.control
+                    .set_models(vec![set.asr_model_id(), set.embed_model_id()]);
+            }
         }
     }
     {

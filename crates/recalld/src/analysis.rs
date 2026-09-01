@@ -34,6 +34,9 @@ pub struct Prepared {
     pub duration_s: f32,
     pub text: Option<String>,
     pub asr_model_id: String,
+    /// The transcript's language, when the model is one that only speaks one.
+    /// `None` from the multilingual export — see `Asr::lang`.
+    pub lang: Option<&'static str>,
     /// `None` exactly when `refusal` is `Some`: audio the gate rejects is never
     /// embedded, so no blended vector can reach the voicebank.
     pub embedding: Option<Embedding>,
@@ -101,6 +104,7 @@ impl Analyzer {
             duration_s,
             text,
             asr_model_id: self.asr.model_id().to_string(),
+            lang: self.asr.lang(),
             embedding,
             refusal,
         })
@@ -120,6 +124,7 @@ impl Analyzer {
             duration_s,
             text,
             asr_model_id,
+            lang,
             embedding,
             refusal,
         } = prepared;
@@ -127,7 +132,9 @@ impl Analyzer {
         store.set_segment_analysis(
             segment_id,
             &SegmentAnalysis {
-                lang: text.as_ref().map(|_| "en".to_string()),
+                // Only when the model itself constrains the answer; the
+                // multilingual export leaves it NULL rather than guessing.
+                lang: text.as_ref().and(lang).map(|l| l.to_string()),
                 text: text.clone(),
                 asr_model_id: Some(asr_model_id),
                 overlap_frac: Some(overlap_frac),

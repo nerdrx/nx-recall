@@ -93,7 +93,11 @@ impl Rig {
 
         let mut cfg = Config::default();
         cfg.models.dir = Some(models.to_path_buf());
-        let set = ModelSet::resolve(&cfg.models).expect("NXR_MODELS resolves to a model set");
+        let mut set = ModelSet::resolve(&cfg.models).expect("NXR_MODELS resolves to a model set");
+        // Exactly what the daemon does at start-up. A models dir holding only
+        // the English-only export runs the whole suite in fallback mode, which
+        // is the point: the acceptance budgets must hold either way.
+        let selection = set.select_asr();
         let missing = set.missing();
         assert!(
             missing.is_empty(),
@@ -101,6 +105,7 @@ impl Rig {
             models.display(),
             missing.iter().map(|e| e.role).collect::<Vec<_>>()
         );
+        eprintln!("  asr: {} ({selection:?})", set.asr_model_id());
 
         let store = Store::open(&dir).expect("opening the throwaway database");
         let source = store.upsert_source("fixtures", "fixtures", 0).unwrap();
@@ -144,6 +149,13 @@ impl Rig {
             .filter_map(|id| self.store.segment_fields(*id).unwrap()["text"].clone())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// The model stamped on the row. Present even when the transcript is empty:
+    /// that is how "the analysis leg ran and had nothing to say" is told apart
+    /// from "the analysis leg never looked at this audio".
+    fn asr_model_of(&self, id: i64) -> Option<String> {
+        self.store.segment_fields(id).unwrap()["asr_model_id"].clone()
     }
 
     fn overlap_of(&self, id: i64) -> f32 {
@@ -191,9 +203,20 @@ macro_rules! rig {
 #[test]
 fn clean_fixtures_transcribe_within_the_wer_budget() {
     let mut rig = rig!("asr");
+    // Whichever export was selected — the multilingual default or the
+    // English-only fallback — the budget is the same and the rows have to say
+    // which one wrote them.
+    let model = rig.models.asr_model_id();
     for fixture in ["clean_single_0.wav", "clean_single_1.wav"] {
         let ids = rig.ingest(fixture);
         assert!(!ids.is_empty(), "{fixture} produced no segments at all");
+        for id in &ids {
+            assert_eq!(
+                rig.asr_model_of(*id).as_deref(),
+                Some(model.as_str()),
+                "{fixture} segment {id} carries the wrong ASR provenance"
+            );
+        }
         let got = rig.text_of(&ids);
         let want = target_transcript(fixture);
         let rate = wer(&want, &got);
@@ -281,22 +304,43 @@ fn a_dominant_talker_is_still_labelled_through_one_interferer() {
 
 #[test]
 fn dense_dominant_babble_is_transcribed_even_when_the_gate_refuses_it() {
-    // The manifest makes the label optional here: continuous synthetic babble
-    // from 3-10 talkers is the detector's worst case. The transcript is not
-    // optional — a refused label must never cost the words.
+    // The manifest makes the *label* optional here: continuous synthetic babble
+    // from 3-10 talkers is the overlap detector's worst case. A refused label
+    // must still never cost the words, so every one of these segments has to go
+    // through ASR — which is what the stamped model id proves, transcript or no
+    // transcript.
+    //
+    // Whether words come back is a per-fixture question, because the words only
+    // exist while the dominant voice is intelligible. `lobby_dominant_0` (ten
+    // continuous talkers, +12 dB, 4.2 s) is where that stops: the English-only
+    // export answered it with "I know this takes people from us." — 87% WER
+    // against the reference, a sentence it made up — and the multilingual
+    // default returns nothing at all. Silence is the better of those two
+    // answers, and this project already refuses to trade ghost words for
+    // coverage (see the non-speech test), so a blank is allowed here.
     let mut rig = rig!("overlap-dense");
-    for fixture in [
-        "trio_dominant_0.wav",
-        "trio_dominant_1.wav",
-        "lobby_dominant_0.wav",
-        "lobby_dominant_1.wav",
+    let model = rig.models.asr_model_id();
+    for (fixture, words_required) in [
+        ("trio_dominant_0.wav", true),
+        ("trio_dominant_1.wav", true),
+        ("lobby_dominant_0.wav", false),
+        ("lobby_dominant_1.wav", true),
     ] {
         let ids = rig.ingest(fixture);
         assert!(!ids.is_empty(), "{fixture} produced no segments at all");
-        assert!(
-            !normalise_words(&rig.text_of(&ids)).is_empty(),
-            "{fixture} produced no transcript"
-        );
+        for id in &ids {
+            assert_eq!(
+                rig.asr_model_of(*id).as_deref(),
+                Some(model.as_str()),
+                "{fixture} segment {id} never reached ASR"
+            );
+        }
+        if words_required {
+            assert!(
+                !normalise_words(&rig.text_of(&ids)).is_empty(),
+                "{fixture} produced no transcript"
+            );
+        }
     }
 }
 

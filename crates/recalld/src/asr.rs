@@ -13,6 +13,7 @@ use crate::models::ModelSet;
 pub struct Asr {
     recognizer: TransducerRecognizer,
     model_id: String,
+    lang: Option<&'static str>,
 }
 
 impl Asr {
@@ -40,11 +41,19 @@ impl Asr {
         Ok(Self {
             recognizer,
             model_id: models.asr_model_id(),
+            lang: models.asr_lang(),
         })
     }
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// What to stamp on this model's transcripts, `None` for a multilingual
+    /// export: the transducer returns words, not a language, and guessing "en"
+    /// over a German lobby writes a wrong answer into the database forever.
+    pub fn lang(&self) -> Option<&'static str> {
+        self.lang
     }
 
     /// Transcribe one segment. Returns an empty string for non-speech.

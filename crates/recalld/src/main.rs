@@ -23,7 +23,7 @@ use recalld::clock::utc_now_ns;
 use recalld::config::{self, Config, SAMPLE_RATE};
 use recalld::control::Control;
 use recalld::fetch;
-use recalld::models::{self, EntryState, ModelSet};
+use recalld::models::{self, AsrSelection, EntryState, ModelSet};
 use recalld::pipeline::{self, Pipeline, Stats};
 use recalld::queue::EventQueue;
 use recalld::retention::{self, SweeperStop};
@@ -70,13 +70,17 @@ fn main() -> Result<()> {
             ModelsAction::Fetch {
                 dir,
                 force,
+                fallback_asr,
                 no_config,
             } => cmd_models_fetch(
                 &cfg,
                 &config_path,
                 &data_dir,
                 dir.as_deref(),
-                force,
+                &fetch::FetchOptions {
+                    force,
+                    fallback_asr,
+                },
                 no_config,
             ),
         },
@@ -131,20 +135,22 @@ fn spawn_upgrade_watcher() {
     }
     std::thread::Builder::new()
         .name("recalld-upgrade".into())
-        .spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            match std::fs::read_link("/proc/self/exe") {
-                Ok(p) if exe_replaced(p.as_os_str()) => {
-                    info!("binary replaced on disk — restarting onto the new version");
-                    // The signalfd shutdown path: identical to systemctl stop,
-                    // so the queue drains and the session closes cleanly. Must
-                    // be PROCESS-directed (kill, not raise): every thread
-                    // blocks SIGTERM for the signalfd, and a thread-directed
-                    // signal would sit pending on this thread unseen.
-                    unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
-                    return;
+        .spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                match std::fs::read_link("/proc/self/exe") {
+                    Ok(p) if exe_replaced(p.as_os_str()) => {
+                        info!("binary replaced on disk — restarting onto the new version");
+                        // The signalfd shutdown path: identical to systemctl stop,
+                        // so the queue drains and the session closes cleanly. Must
+                        // be PROCESS-directed (kill, not raise): every thread
+                        // blocks SIGTERM for the signalfd, and a thread-directed
+                        // signal would sit pending on this thread unseen.
+                        unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+                        return;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         })
         .ok();
@@ -184,8 +190,13 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     // The socket's own identity work (`speakers.split`) must use the same
     // operating point the pipeline labelled with, not the defaults.
     .with_identity(cfg.identity.clone());
-    if let Some(models) = ModelSet::resolve(&cfg.models).filter(|m| m.complete()) {
-        control.set_models(vec![models.asr_model_id(), models.embed_model_id()]);
+    // The ids clients see must be the ids that will be written on segments, so
+    // resolve the ASR fallback here exactly as the pipeline does.
+    if let Some(mut models) = ModelSet::resolve(&cfg.models) {
+        models.select_asr();
+        if models.complete() {
+            control.set_models(vec![models.asr_model_id(), models.embed_model_id()]);
+        }
     }
     let bus = Bus::new(cfg.socket.replay_events, cfg.socket.client_outbox);
     info!(
@@ -389,7 +400,11 @@ fn cmd_models_status(
     quiet_header: bool,
 ) -> Result<()> {
     let root = fetch::target_dir(dir, &cfg.models, data_dir);
-    let models = ModelSet::resolve_at(root, &cfg.models);
+    let mut models = ModelSet::resolve_at(root, &cfg.models);
+    // Report on the set the daemon would actually load, not on the one the
+    // config names: those differ exactly when the fallback is carrying the
+    // install, which is the case this output exists to make obvious.
+    let selection = models.select_asr();
 
     if !quiet_header && dir.is_none() && cfg.models.dir.is_none() {
         println!(
@@ -426,9 +441,37 @@ fn cmd_models_status(
         );
     }
     println!();
+    println!(
+        "asr set:            {}{}",
+        models.asr_dir_name(),
+        models
+            .asr_export()
+            .map(|e| format!("  ({})", e.note))
+            .unwrap_or_else(|| "  (not in the catalogue — used as configured)".into())
+    );
     println!("asr model id:       {}", models.asr_model_id());
     println!("embedding model id: {}", models.embed_model_id());
-    if models.complete() {
+
+    if selection == AsrSelection::Fallback {
+        // The set is complete and analysis will run — but on the English-only
+        // model, which is a 103% WER answer to a German lobby. Say so before
+        // the reassuring "All models present".
+        println!("\nFALLBACK ACTIVE — the default multilingual ASR set is not installed:");
+        for e in models::default_asr_entries(&models.root) {
+            println!("  {:<14}  {}", e.role, fetch::describe(e.state(), &e.path));
+        }
+        println!(
+            "Transcription runs on {} instead.\n\
+             `recalld models fetch` installs {}\n  ({}).",
+            models::FALLBACK_ASR.dir,
+            models::DEFAULT_ASR.dir,
+            models::DEFAULT_ASR.note,
+        );
+    }
+
+    if models.complete() && selection == AsrSelection::Fallback {
+        println!("\nAnalysis runs — on the fallback ASR. The default set is not here.");
+    } else if models.complete() {
         println!("\nAll models present.");
     } else {
         println!(
@@ -448,17 +491,17 @@ fn cmd_models_fetch(
     config_path: &Path,
     data_dir: &Path,
     dir: Option<&Path>,
-    force: bool,
+    opts: &fetch::FetchOptions,
     no_config: bool,
 ) -> Result<()> {
     let root = fetch::target_dir(dir, &cfg.models, data_dir);
     println!("models dir: {}", root.display());
     println!(
         "up to {} to download from github.com/k2-fsa/sherpa-onnx\n",
-        fetch::human(models::total_download_bytes())
+        fetch::human(models::total_download_bytes(opts.fallback_asr))
     );
 
-    let report = fetch::fetch_models(&root, &cfg.models, &fetch::FetchOptions { force })?;
+    let report = fetch::fetch_models(&root, &cfg.models, opts)?;
 
     println!(
         "\n{} downloaded, {} already present ({} transferred).",
@@ -756,7 +799,9 @@ mod tests {
         assert!(super::exe_replaced(OsStr::new(
             "/home/u/.local/lib/nx-recall/recalld (deleted)"
         )));
-        assert!(!super::exe_replaced(OsStr::new("/home/u/.local/lib/nx-recall/recalld")));
+        assert!(!super::exe_replaced(OsStr::new(
+            "/home/u/.local/lib/nx-recall/recalld"
+        )));
         // a path that merely CONTAINS the marker mid-string is not a match
         assert!(!super::exe_replaced(OsStr::new("/tmp/x (deleted)/recalld")));
     }

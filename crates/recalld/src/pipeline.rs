@@ -212,15 +212,25 @@ impl Pipeline {
                 info!("no [models].dir configured: capture and VAD only");
                 None
             }
-            Some(models) if !models.complete() => {
-                warn!(
-                    "analysis models incomplete under {} — see `recalld models status`; \
-                     capturing without ASR or speaker identity",
-                    models.root.display()
-                );
-                None
+            Some(mut models) => {
+                // Resolve the ASR leg against the disk before judging the set:
+                // a machine that still only has the old English-only export
+                // keeps transcribing (loudly) instead of losing analysis.
+                let selection = models.select_asr();
+                if let Some(line) = selection.warning(&models.root) {
+                    warn!("{line}");
+                }
+                if models.complete() {
+                    Some(Analyzer::load(&models, &cfg.identity)?)
+                } else {
+                    warn!(
+                        "analysis models incomplete under {} — see `recalld models status`; \
+                         capturing without ASR or speaker identity",
+                        models.root.display()
+                    );
+                    None
+                }
             }
-            Some(models) => Some(Analyzer::load(&models, &cfg.identity)?),
         };
         Ok(Self {
             vad,

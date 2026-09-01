@@ -47,6 +47,12 @@ pub struct RemoteAsset {
     pub url: &'static str,
     pub download_bytes: u64,
     pub install: Install,
+    /// Part of the default set a bare `models fetch` installs. The one asset
+    /// that is not (the English-only ASR export) is still catalogued, so
+    /// `models status` can size it and `models fetch --fallback-asr` can pull
+    /// it, but a fresh install does not spend 103 MB on a model the default
+    /// already beats at English.
+    pub default: bool,
     /// `(path relative to the models root, exact byte size)`.
     pub files: &'static [(&'static str, u64)],
 }
@@ -70,6 +76,7 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
         download_bytes: 6_958_444,
         install: Install::TarBz2,
+        default: true,
         files: &[
             (
                 "sherpa-onnx-pyannote-segmentation-3-0/model.onnx",
@@ -89,13 +96,49 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
         // `embed_model_id`) says `eres2net_en`, and that name must not drift
         // with whatever upstream calls the file this year.
         install: Install::File("eres2net_en.onnx"),
+        default: true,
         files: &[("eres2net_en.onnx", 26_485_263)],
     },
+    // The default since 0.5.6. Measured (spike/asr_multilang.py, 60 utterances
+    // each, clean and through the Opus-24k voice path): 8.4% WER on German
+    // FLEURS and 1.4% on LibriSpeech dev-clean — better than the English-only
+    // export is at English, against its 103% on German. It costs ~3x the
+    // compute of the 110m and is still RTF 0.08 on one thread.
     RemoteAsset {
         role: "asr",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
+        download_bytes: 487_170_055,
+        install: Install::TarBz2,
+        default: true,
+        files: &[
+            (
+                "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/encoder.int8.onnx",
+                652_184_281,
+            ),
+            (
+                "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/decoder.int8.onnx",
+                11_845_275,
+            ),
+            (
+                "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/joiner.int8.onnx",
+                6_355_277,
+            ),
+            (
+                "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/tokens.txt",
+                93_939,
+            ),
+        ],
+    },
+    // The English-only export that was the default up to 0.5.5. Not fetched by
+    // default any more, but kept in the catalogue with its exact sizes: it is
+    // what an existing install already has on disk, and the daemon falls back
+    // to it rather than going silent when the multilingual set is missing.
+    RemoteAsset {
+        role: "asr-fallback",
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8.tar.bz2",
         download_bytes: 108_035_095,
         install: Install::TarBz2,
+        default: false,
         files: &[
             (
                 "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8/encoder.int8.onnx",
@@ -117,9 +160,96 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
     },
 ];
 
-/// Total bytes the fetch has to pull down for a cold start.
-pub fn total_download_bytes() -> u64 {
-    REMOTE_ASSETS.iter().map(|a| a.download_bytes).sum()
+/// One published transducer export: the directory it unpacks to, the files
+/// inside it, and what it can actually transcribe.
+///
+/// Both exports happen to use the same four file names, so switching between
+/// them is a change of directory — which is exactly what makes the fallback in
+/// [`ModelSet::select_asr`] a two-line operation rather than a second config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsrExport {
+    pub dir: &'static str,
+    pub encoder: &'static str,
+    pub decoder: &'static str,
+    pub joiner: &'static str,
+    pub tokens: &'static str,
+    /// The BCP-47 tag to store on the segments it produces. `None` for a
+    /// multilingual export: the transducer returns text, not a language, and
+    /// stamping every German turn `en` would be a lie the database keeps.
+    pub lang: Option<&'static str>,
+    /// One line for `models status`.
+    pub note: &'static str,
+}
+
+/// Multilingual, and the default since 0.5.6.
+pub const DEFAULT_ASR: AsrExport = AsrExport {
+    dir: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+    encoder: "encoder.int8.onnx",
+    decoder: "decoder.int8.onnx",
+    joiner: "joiner.int8.onnx",
+    tokens: "tokens.txt",
+    lang: None,
+    note: "multilingual, 25 languages — 8.4% WER German, 1.4% English",
+};
+
+/// English only, and the default up to 0.5.5.
+pub const FALLBACK_ASR: AsrExport = AsrExport {
+    dir: "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8",
+    encoder: "encoder.int8.onnx",
+    decoder: "decoder.int8.onnx",
+    joiner: "joiner.int8.onnx",
+    tokens: "tokens.txt",
+    lang: Some("en"),
+    note: "English only — 2.0% WER English, 103% German",
+};
+
+/// In preference order: the first export whose files are all on disk wins.
+pub const ASR_EXPORTS: &[AsrExport] = &[DEFAULT_ASR, FALLBACK_ASR];
+
+/// Which ASR export the daemon will actually run, once the disk has been
+/// consulted. Returned by [`ModelSet::select_asr`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsrSelection {
+    /// The multilingual default is installed.
+    Default,
+    /// It is not, but the English-only export is. Transcription runs on that
+    /// rather than switching itself off — an update must never cost the user
+    /// their transcripts, only some of their accuracy.
+    Fallback,
+    /// `[models].asr` names an export this catalogue does not publish, so it is
+    /// a deliberate choice and is used exactly as written, present or not.
+    Pinned,
+    /// Neither catalogued export is installed. Analysis stays off.
+    Missing,
+}
+
+impl AsrSelection {
+    /// The line the daemon logs at start-up, `None` when there is nothing worth
+    /// saying. Every non-`None` case names the command that fixes it.
+    pub fn warning(&self, root: &Path) -> Option<String> {
+        match self {
+            AsrSelection::Fallback => Some(format!(
+                "the multilingual ASR model is not installed under {} — transcribing with the \
+                 English-only {}, which scores ~103% WER on German. Run `recalld models fetch` \
+                 to install {} ({}).",
+                root.display(),
+                FALLBACK_ASR.dir,
+                DEFAULT_ASR.dir,
+                DEFAULT_ASR.note,
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Total bytes the fetch has to pull down for a cold start. The optional
+/// English-only export is only counted when it is actually being asked for.
+pub fn total_download_bytes(include_optional: bool) -> u64 {
+    REMOTE_ASSETS
+        .iter()
+        .filter(|a| a.default || include_optional)
+        .map(|a| a.download_bytes)
+        .sum()
 }
 
 /// Expected size of a file the catalogue knows about, by its path relative to
@@ -131,6 +261,29 @@ pub fn expected_bytes(relative: &str) -> Option<u64> {
         .flat_map(|a| a.files)
         .find(|(p, _)| *p == relative)
         .map(|(_, n)| *n)
+}
+
+/// The default ASR export's files under `root`, as entries that can report
+/// their own state. `models status` uses this to show *why* it fell back,
+/// which is otherwise invisible: the table shows the export in use, not the
+/// one that is missing.
+pub fn default_asr_entries(root: &Path) -> Vec<ModelEntry> {
+    [
+        ("asr.encoder", DEFAULT_ASR.encoder),
+        ("asr.decoder", DEFAULT_ASR.decoder),
+        ("asr.joiner", DEFAULT_ASR.joiner),
+        ("asr.tokens", DEFAULT_ASR.tokens),
+    ]
+    .into_iter()
+    .map(|(role, name)| {
+        let rel = format!("{}/{name}", DEFAULT_ASR.dir);
+        ModelEntry {
+            role,
+            path: root.join(&rel),
+            expected: expected_bytes(&rel),
+        }
+    })
+    .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +371,84 @@ impl ModelSet {
         }
     }
 
+    /// Point the ASR leg at `export` under this root.
+    fn point_asr_at(&mut self, export: &AsrExport) {
+        let dir = self.root.join(export.dir);
+        self.encoder = dir.join(export.encoder);
+        self.decoder = dir.join(export.decoder);
+        self.joiner = dir.join(export.joiner);
+        self.tokens = dir.join(export.tokens);
+        self.asr_dir = dir;
+    }
+
+    /// Is every file of `export` on disk at exactly its catalogued size?
+    fn asr_export_ok(&self, export: &AsrExport) -> bool {
+        [export.encoder, export.decoder, export.joiner, export.tokens]
+            .iter()
+            .all(|name| {
+                let rel = format!("{}/{name}", export.dir);
+                let found = std::fs::metadata(self.root.join(&rel))
+                    .map(|m| m.len())
+                    .ok();
+                match (found, expected_bytes(&rel)) {
+                    (Some(found), Some(want)) => found == want,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                }
+            })
+    }
+
+    /// Resolve the ASR leg against what is actually installed, and say what was
+    /// chosen. This is the step that keeps an update from turning transcription
+    /// off: a machine that only has the old English-only export keeps
+    /// transcribing on it (loudly) instead of losing the analysis leg.
+    ///
+    /// A configured directory the catalogue does not publish is left alone —
+    /// that is somebody's own model and none of our business. A configured
+    /// directory that *is* one of ours is treated as a preference, not a pin,
+    /// so an install carrying the 0.5.5 default in its `config.toml` picks up
+    /// the multilingual set the moment it is fetched.
+    pub fn select_asr(&mut self) -> AsrSelection {
+        let configured = self.asr_dir.file_name().map(|s| s.to_string_lossy());
+        if !ASR_EXPORTS
+            .iter()
+            .any(|e| configured.as_deref() == Some(e.dir))
+        {
+            return AsrSelection::Pinned;
+        }
+        for (rank, export) in ASR_EXPORTS.iter().enumerate() {
+            if self.asr_export_ok(export) {
+                self.point_asr_at(export);
+                return if rank == 0 {
+                    AsrSelection::Default
+                } else {
+                    AsrSelection::Fallback
+                };
+            }
+        }
+        // Nothing usable: report against the default, because that is what
+        // `models fetch` is about to install.
+        self.point_asr_at(&DEFAULT_ASR);
+        AsrSelection::Missing
+    }
+
+    /// Just the export directory's name, for reporting.
+    pub fn asr_dir_name(&self) -> String {
+        dir_name(&self.asr_dir)
+    }
+
+    /// The catalogued export this set's ASR paths point at, if any.
+    pub fn asr_export(&self) -> Option<&'static AsrExport> {
+        let dir = self.asr_dir.file_name()?.to_string_lossy().to_string();
+        ASR_EXPORTS.iter().find(|e| e.dir == dir)
+    }
+
+    /// The language tag to store on this model's transcripts. `None` means "the
+    /// model did not say", which is the truth for a multilingual export.
+    pub fn asr_lang(&self) -> Option<&'static str> {
+        self.asr_export().and_then(|e| e.lang)
+    }
+
     pub fn entries(&self) -> Vec<ModelEntry> {
         [
             ("asr.encoder", &self.encoder),
@@ -255,8 +486,12 @@ impl ModelSet {
     }
 
     /// Stable identity of the transcript producer, stored on every segment.
+    ///
+    /// The whole directory name, not its stem: `…-tdt-0.6b-v3-int8` has a dot
+    /// in it, and a stem would file every v3 transcript under
+    /// `sherpa-onnx-nemo-parakeet-tdt-0`.
     pub fn asr_model_id(&self) -> String {
-        format!("{}@{ASR_CONTRACT_VERSION}", stem(&self.asr_dir))
+        format!("{}@{ASR_CONTRACT_VERSION}", dir_name(&self.asr_dir))
     }
 
     /// Stable identity of the embedding space. Vectors carrying different ids
@@ -276,6 +511,12 @@ pub fn default_dir(data_dir: &Path) -> PathBuf {
 
 fn stem(path: &Path) -> String {
     path.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn dir_name(path: &Path) -> String {
+    path.file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".into())
 }
@@ -308,6 +549,164 @@ mod tests {
         assert!(m.encoder.ends_with("encoder.int8.onnx"));
     }
 
+    /// A models root populated with sparse files at exactly the catalogued
+    /// sizes: "present" means the right size everywhere in this module, so a
+    /// fallback test has to satisfy the same rule the daemon does.
+    struct Root(PathBuf);
+
+    impl Root {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("nxr-models-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let me = Self(dir);
+            // Every install has these; only the ASR leg varies below.
+            me.place("eres2net_en.onnx");
+            me.place("sherpa-onnx-pyannote-segmentation-3-0/model.onnx");
+            me
+        }
+
+        /// Create `rel` at its catalogued size, without writing 600 MB.
+        fn place(&self, rel: &str) {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_len(expected_bytes(rel).unwrap_or_else(|| panic!("{rel} is not catalogued")))
+                .unwrap();
+        }
+
+        fn place_export(&self, export: &AsrExport) {
+            for name in [export.encoder, export.decoder, export.joiner, export.tokens] {
+                self.place(&format!("{}/{name}", export.dir));
+            }
+        }
+
+        fn set(&self) -> ModelSet {
+            ModelSet::resolve(&cfg(self.0.to_str().unwrap())).unwrap()
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_multilingual_export_is_chosen_when_it_is_installed() {
+        let root = Root::new("default");
+        root.place_export(&DEFAULT_ASR);
+        let mut m = root.set();
+        assert_eq!(m.select_asr(), AsrSelection::Default);
+        assert!(m.complete());
+        assert_eq!(m.asr_dir_name(), DEFAULT_ASR.dir);
+        // Multilingual: the model does not say which language it heard, so
+        // nothing is stamped on the transcript.
+        assert_eq!(m.asr_lang(), None);
+        assert!(AsrSelection::Default.warning(&m.root).is_none());
+    }
+
+    /// An update must never turn transcription off. With only the old
+    /// English-only export on disk the daemon runs on it and says so.
+    #[test]
+    fn a_missing_default_falls_back_to_the_english_export_with_a_warning() {
+        let root = Root::new("fallback");
+        root.place_export(&FALLBACK_ASR);
+        let mut m = root.set();
+        let selection = m.select_asr();
+
+        assert_eq!(selection, AsrSelection::Fallback);
+        assert!(
+            m.complete(),
+            "the fallback set must be usable, not merely named"
+        );
+        assert_eq!(m.asr_dir_name(), FALLBACK_ASR.dir);
+        assert_eq!(
+            m.encoder,
+            m.root.join(FALLBACK_ASR.dir).join("encoder.int8.onnx")
+        );
+        assert_eq!(m.asr_model_id(), format!("{}@1", FALLBACK_ASR.dir));
+        assert_eq!(m.asr_lang(), Some("en"));
+
+        let warning = selection
+            .warning(&m.root)
+            .expect("a silent downgrade is the failure mode this exists to prevent");
+        assert!(warning.contains("recalld models fetch"), "{warning}");
+        assert!(warning.contains(DEFAULT_ASR.dir), "{warning}");
+
+        // ...and the fallback is a stopgap, not a new default: `models status`
+        // can still show what is missing.
+        let default_missing = default_asr_entries(&m.root);
+        assert_eq!(default_missing.len(), 4);
+        assert!(
+            default_missing
+                .iter()
+                .all(|e| e.state() == EntryState::Missing)
+        );
+    }
+
+    /// A config carrying the 0.5.5 default is a preference, not a pin: the
+    /// multilingual set wins the moment it is on disk, without anyone having to
+    /// hand-edit config.toml after an update.
+    #[test]
+    fn an_old_configured_default_upgrades_itself_once_the_new_set_is_there() {
+        let root = Root::new("upgrade");
+        root.place_export(&DEFAULT_ASR);
+        root.place_export(&FALLBACK_ASR);
+        let mut m = ModelSet::resolve(&ModelsConfig {
+            dir: Some(root.0.clone()),
+            asr: FALLBACK_ASR.dir.into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(m.select_asr(), AsrSelection::Default);
+        assert_eq!(m.asr_dir_name(), DEFAULT_ASR.dir);
+    }
+
+    #[test]
+    fn neither_export_present_means_analysis_stays_off() {
+        let root = Root::new("none");
+        let mut m = root.set();
+        assert_eq!(m.select_asr(), AsrSelection::Missing);
+        assert!(!m.complete());
+        // It reports against the default, because that is what a fetch installs.
+        assert_eq!(m.asr_dir_name(), DEFAULT_ASR.dir);
+        assert_eq!(m.missing().len(), 4);
+        assert!(AsrSelection::Missing.warning(&m.root).is_none());
+    }
+
+    /// A half-unpacked or truncated export is not a usable one: the fallback
+    /// has to be as strict about size as everything else, or the daemon would
+    /// pick a set it then fails to load.
+    #[test]
+    fn a_truncated_export_is_not_selected() {
+        let root = Root::new("truncated");
+        root.place_export(&FALLBACK_ASR);
+        std::fs::write(
+            root.0.join(FALLBACK_ASR.dir).join("joiner.int8.onnx"),
+            b"not a model",
+        )
+        .unwrap();
+        let mut m = root.set();
+        assert_eq!(m.select_asr(), AsrSelection::Missing);
+    }
+
+    #[test]
+    fn a_model_outside_the_catalogue_is_used_exactly_as_configured() {
+        let root = Root::new("pinned");
+        root.place_export(&DEFAULT_ASR);
+        let mut m = ModelSet::resolve(&ModelsConfig {
+            dir: Some(root.0.clone()),
+            asr: "my-own-export".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(m.select_asr(), AsrSelection::Pinned);
+        assert_eq!(m.asr_dir_name(), "my-own-export");
+        assert_eq!(m.asr_lang(), None);
+    }
+
     #[test]
     fn a_missing_directory_is_reported_not_panicked_on() {
         let m = ModelSet::resolve(&cfg("/definitely/not/here")).unwrap();
@@ -319,9 +718,11 @@ mod tests {
     fn model_ids_carry_the_contract_version() {
         let m = ModelSet::resolve(&cfg("/models")).unwrap();
         assert_eq!(m.embed_model_id(), "eres2net_en@1");
+        // The whole directory name: `0.6b` has a dot in it, and a file_stem
+        // would file every v3 transcript under `…-parakeet-tdt-0`.
         assert_eq!(
             m.asr_model_id(),
-            "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8@1"
+            "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8@1"
         );
     }
 }

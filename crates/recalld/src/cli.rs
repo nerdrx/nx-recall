@@ -127,7 +127,7 @@ pub enum ModelsAction {
         dir: Option<PathBuf>,
     },
 
-    /// Download the analysis models (~140 MB compressed, ~700 MB on disk) into
+    /// Download the analysis models (~500 MB compressed, ~700 MB on disk) into
     /// the data directory. This is the only command in recalld that touches the
     /// network, and it is a setup step: capture and transcription never do.
     ///
@@ -141,6 +141,13 @@ pub enum ModelsAction {
         /// Download everything again, even files that are already correct.
         #[arg(long)]
         force: bool,
+
+        /// Also install the older English-only ASR export (~103 MB). Not part
+        /// of the default set: the multilingual default transcribes English
+        /// better as well. It exists as the fallback for machines that already
+        /// have it.
+        #[arg(long)]
+        fallback_asr: bool,
 
         /// Do not write the resulting directory into config.toml. Without this
         /// the fetch points `[models].dir` at what it just installed, so

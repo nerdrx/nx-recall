@@ -14,7 +14,7 @@
       "stripPrefix": "usr/",
       "prefix": "~/.local",
       "launchCmd": "~/.local/bin/nx-recall",
-      "postInstallNote": "Two one-time steps in a terminal: `~/.local/bin/recalld models fetch` (~135 MB of speech models, the only network use in the program), then `systemctl --user daemon-reload && systemctl --user enable --now nx-recall`. Capture is default-deny — nothing is recorded until `recalld allow <program>`. Outside its own bin/ and lib/ this install writes exactly two files, share/systemd/user/nx-recall.service and share/applications/nx-recall.desktop, both removed on uninstall. Your transcripts and models in ~/.local/share/nx-recall are not: that directory outlives uninstall on purpose."
+      "postInstallNote": "Two one-time steps in a terminal: `~/.local/bin/recalld models fetch` (~500 MB of speech models — multilingual ASR — the only network use in the program), then `systemctl --user daemon-reload && systemctl --user enable --now nx-recall`. Capture is default-deny — nothing is recorded until `recalld allow <program>`. Outside its own bin/ and lib/ this install writes exactly two files, share/systemd/user/nx-recall.service and share/applications/nx-recall.desktop, both removed on uninstall. Your transcripts and models in ~/.local/share/nx-recall are not: that directory outlives uninstall on purpose."
     }
   ]
 }

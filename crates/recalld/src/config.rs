@@ -83,7 +83,12 @@ impl Default for VadConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ModelsConfig {
     pub dir: Option<PathBuf>,
-    /// Transducer export directory (the 0.6b variant drops in here later).
+    /// Transducer export directory. A name the catalogue publishes is a
+    /// *preference*: `ModelSet::select_asr` resolves it against what is on
+    /// disk, so a config still carrying the 0.5.5 English-only default picks
+    /// the multilingual set up as soon as it is fetched, and a machine that
+    /// only has the old one keeps transcribing on it. Any other name is a
+    /// deliberate pin and is used as written.
     pub asr: String,
     pub asr_encoder: String,
     pub asr_decoder: String,
@@ -91,8 +96,10 @@ pub struct ModelsConfig {
     pub asr_tokens: String,
     pub embedding: String,
     pub segmentation: String,
-    /// ASR is the only stage where throughput is worth threads; Step 0 measured
-    /// RTF 0.011 at four, which is still under 1% of a core.
+    /// ASR is the only stage where throughput is worth threads. Step 0 measured
+    /// RTF 0.011 at four on the 110m; the multilingual default is ~3x the
+    /// compute and still RTF 0.08 on a *single* thread, so four remains far
+    /// more headroom than the workload needs.
     pub asr_threads: i32,
 }
 
@@ -100,11 +107,11 @@ impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
             dir: None,
-            asr: "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8".into(),
-            asr_encoder: "encoder.int8.onnx".into(),
-            asr_decoder: "decoder.int8.onnx".into(),
-            asr_joiner: "joiner.int8.onnx".into(),
-            asr_tokens: "tokens.txt".into(),
+            asr: crate::models::DEFAULT_ASR.dir.into(),
+            asr_encoder: crate::models::DEFAULT_ASR.encoder.into(),
+            asr_decoder: crate::models::DEFAULT_ASR.decoder.into(),
+            asr_joiner: crate::models::DEFAULT_ASR.joiner.into(),
+            asr_tokens: crate::models::DEFAULT_ASR.tokens.into(),
             embedding: "eres2net_en.onnx".into(),
             segmentation: "sherpa-onnx-pyannote-segmentation-3-0/model.onnx".into(),
             asr_threads: 4,
@@ -455,7 +462,11 @@ mod tests {
     fn models_default_to_off_and_to_the_measured_default_asr() {
         let cfg = Config::default();
         assert!(cfg.models.dir.is_none());
-        assert!(cfg.models.asr.contains("parakeet_tdt_transducer_110m"));
+        // Multilingual by default since 0.5.6: the English-only export scores
+        // 103% WER on German, and German is half of what this daemon hears.
+        assert_eq!(cfg.models.asr, "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8");
+        assert_eq!(cfg.models.asr_encoder, "encoder.int8.onnx");
+        assert_eq!(cfg.models.asr_tokens, "tokens.txt");
         assert_eq!(cfg.models.embedding, "eres2net_en.onnx");
     }
 

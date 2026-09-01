@@ -227,7 +227,7 @@ copies \`usr/\` into \`~/.local\`, records every file, and uninstalls exactly.
     systemctl --user enable --now nx-recall
 
 \`models fetch\` is the only part of this program that opens a network socket. It
-pulls ~135 MB of ONNX models from the sherpa-onnx GitHub releases into
+pulls ~500 MB of ONNX models from the sherpa-onnx GitHub releases into
 \`~/.local/share/nx-recall/models\` and verifies every file's exact byte size.
 Transcription itself never touches the network.
 
