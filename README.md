@@ -138,6 +138,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.5.5 | +28h | usability: update banner, calm rows, honest "several voices" labels |
 | 0.5.6 | +29h | German. And 23 other languages. The default ASR goes multilingual |
 | 0.6.0 | +30h | your own voice joins the transcript, pre-labelled — mic as a source |
+| 0.6.1 | +31h | voices get languages, grunts stop becoming people, disk stops being a mystery |
 
 Golden fixtures gate every release: the equal-loudness mixes carry
 `expect: refuse` — a pipeline that labels them correctly *by luck* fails the

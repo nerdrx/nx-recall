@@ -381,6 +381,23 @@ impl ModelSet {
         self.asr_dir = dir;
     }
 
+    /// The same set with its ASR leg pointed at another catalogued export.
+    ///
+    /// This is what makes the 0.6.1 wrong-language re-decode a small thing: the
+    /// English-only export is loaded from the same root, through the same
+    /// `Asr::load`, and carries its own `asr_model_id` and `lang` — so a
+    /// re-decoded row records the model that actually produced its words.
+    pub fn with_asr(&self, export: &AsrExport) -> Self {
+        let mut me = self.clone();
+        me.point_asr_at(export);
+        me
+    }
+
+    /// Is every file of `export` on disk at exactly its catalogued size?
+    pub fn has_asr_export(&self, export: &AsrExport) -> bool {
+        self.asr_export_ok(export)
+    }
+
     /// Is every file of `export` on disk at exactly its catalogued size?
     fn asr_export_ok(&self, export: &AsrExport) -> bool {
         [export.encoder, export.decoder, export.joiner, export.tokens]

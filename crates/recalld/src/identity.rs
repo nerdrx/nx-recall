@@ -55,6 +55,20 @@ pub enum Decision {
     /// the new speaker's first prototype — it already passed the overlap and
     /// duration gates, and without a seed the bank could never grow.
     Mint { best_score: Option<f32> },
+    /// Nothing matched, and this turn is **too slight to be worth an
+    /// identity** (0.6.1): under `mint_min_duration_s`, or fewer than
+    /// `mint_min_words` words. The segment keeps its transcript and its
+    /// embedding and stays speaker-NULL.
+    ///
+    /// The bar sits *above* the label bar deliberately. Recognising a grunt as
+    /// somebody already known costs nothing and is often right; minting a new
+    /// voice from one is how a voicebank fills with rows nobody can name — and
+    /// a wrong new identity is permanent in a way a wrong label is not.
+    TooSlight {
+        best_score: Option<f32>,
+        duration_s: f32,
+        words: usize,
+    },
     /// The turn came off the user's own microphone, so the speaker is known
     /// before any model runs. This is **provenance, not a match**: the
     /// voicebank is never consulted and `match_score` stays NULL, because a
@@ -101,25 +115,46 @@ pub fn gate(cfg: &IdentityConfig, overlap_frac: f32, duration_s: f32) -> Option<
     None
 }
 
+/// Is this turn substantial enough to be worth a *new* identity?
+///
+/// Separate from `gate` because it is a different question with a different
+/// answer: `gate` decides whether the audio can be embedded at all, this
+/// decides whether an unrecognised voice earns a row in the voicebank.
+pub fn mints(cfg: &IdentityConfig, duration_s: f32, words: usize) -> bool {
+    duration_s >= cfg.mint_min_duration_s && words >= cfg.mint_min_words
+}
+
 /// Apply the operating point. `ranked` must be sorted descending (as `rank`
-/// returns it).
+/// returns it). `words` is the transcript's word count, which only the mint
+/// bar looks at — matching an existing voice never depends on what was said.
 pub fn decide(
     cfg: &IdentityConfig,
     overlap_frac: f32,
     duration_s: f32,
+    words: usize,
     ranked: &[Candidate],
 ) -> Decision {
     if let Some(refusal) = gate(cfg, overlap_frac, duration_s) {
         return Decision::Refused(refusal);
     }
 
+    let mint = |best_score: Option<f32>| {
+        if mints(cfg, duration_s, words) {
+            Decision::Mint { best_score }
+        } else {
+            Decision::TooSlight {
+                best_score,
+                duration_s,
+                words,
+            }
+        }
+    };
+
     let Some(top) = ranked.first() else {
-        return Decision::Mint { best_score: None };
+        return mint(None);
     };
     if top.score < cfg.label_threshold {
-        return Decision::Mint {
-            best_score: Some(top.score),
-        };
+        return mint(Some(top.score));
     }
 
     let runner_up = ranked.get(1).map(|c| c.score).unwrap_or(f32::NEG_INFINITY);
@@ -183,18 +218,18 @@ mod tests {
 
     #[test]
     fn an_overlapped_turn_is_refused_however_confident_the_match() {
-        let d = decide(&cfg(), 0.6, 5.0, &[c(1, 0.99)]);
+        let d = decide(&cfg(), 0.6, 5.0, 5, &[c(1, 0.99)]);
         assert_eq!(d, Decision::Refused(Refusal::Overlapped));
     }
 
     #[test]
     fn the_overlap_gate_is_at_one_tenth_and_is_inclusive() {
         assert!(matches!(
-            decide(&cfg(), 0.10, 5.0, &[c(1, 0.9)]),
+            decide(&cfg(), 0.10, 5.0, 5, &[c(1, 0.9)]),
             Decision::Matched { .. }
         ));
         assert_eq!(
-            decide(&cfg(), 0.101, 5.0, &[c(1, 0.9)]),
+            decide(&cfg(), 0.101, 5.0, 5, &[c(1, 0.9)]),
             Decision::Refused(Refusal::Overlapped)
         );
     }
@@ -202,11 +237,11 @@ mod tests {
     #[test]
     fn a_short_turn_is_refused_before_any_scoring() {
         assert_eq!(
-            decide(&cfg(), 0.0, 0.99, &[c(1, 0.99)]),
+            decide(&cfg(), 0.0, 0.99, 5, &[c(1, 0.99)]),
             Decision::Refused(Refusal::TooShort)
         );
         assert!(matches!(
-            decide(&cfg(), 0.0, 1.0, &[c(1, 0.99)]),
+            decide(&cfg(), 0.0, 1.0, 5, &[c(1, 0.99)]),
             Decision::Matched { .. }
         ));
     }
@@ -214,7 +249,7 @@ mod tests {
     #[test]
     fn overlap_is_checked_before_duration() {
         assert_eq!(
-            decide(&cfg(), 0.9, 0.1, &[]),
+            decide(&cfg(), 0.9, 0.1, 5, &[]),
             Decision::Refused(Refusal::Overlapped)
         );
     }
@@ -224,7 +259,7 @@ mod tests {
     #[test]
     fn an_empty_bank_mints() {
         assert_eq!(
-            decide(&cfg(), 0.0, 5.0, &[]),
+            decide(&cfg(), 0.0, 5.0, 5, &[]),
             Decision::Mint { best_score: None }
         );
     }
@@ -232,7 +267,7 @@ mod tests {
     #[test]
     fn below_the_label_threshold_mints_and_reports_what_it_saw() {
         assert_eq!(
-            decide(&cfg(), 0.0, 5.0, &[c(1, 0.34)]),
+            decide(&cfg(), 0.0, 5.0, 5, &[c(1, 0.34)]),
             Decision::Mint {
                 best_score: Some(0.34)
             }
@@ -242,9 +277,74 @@ mod tests {
     #[test]
     fn the_label_threshold_is_inclusive() {
         assert!(matches!(
-            decide(&cfg(), 0.0, 5.0, &[c(7, 0.35)]),
+            decide(&cfg(), 0.0, 5.0, 5, &[c(7, 0.35)]),
             Decision::Matched { speaker_id: 7, .. }
         ));
+    }
+
+    // ---- the mint bar: every condition is separately load-bearing --------
+
+    #[test]
+    fn a_grunt_matches_an_existing_voice_but_never_mints_a_new_one() {
+        // The bar is above the label bar, not instead of it: half a second of
+        // "hm" that scores over `label_threshold` still gets its name.
+        assert!(matches!(
+            decide(&cfg(), 0.0, 1.2, 1, &[c(4, 0.80)]),
+            Decision::Matched { speaker_id: 4, .. }
+        ));
+        // The same grunt against an empty bank mints nothing.
+        assert_eq!(
+            decide(&cfg(), 0.0, 1.2, 1, &[]),
+            Decision::TooSlight {
+                best_score: None,
+                duration_s: 1.2,
+                words: 1
+            }
+        );
+    }
+
+    #[test]
+    fn each_half_of_the_mint_bar_can_fail_on_its_own() {
+        // Long enough, but one word.
+        assert!(matches!(
+            decide(&cfg(), 0.0, 5.0, 1, &[]),
+            Decision::TooSlight { words: 1, .. }
+        ));
+        // Wordy enough, but too short.
+        assert!(matches!(
+            decide(&cfg(), 0.0, 1.9, 6, &[]),
+            Decision::TooSlight { duration_s, .. } if (duration_s - 1.9).abs() < 1e-6
+        ));
+        // Both satisfied, at exactly the bar: inclusive on each.
+        assert_eq!(
+            decide(&cfg(), 0.0, 2.0, 2, &[]),
+            Decision::Mint { best_score: None }
+        );
+    }
+
+    #[test]
+    fn a_near_miss_below_the_bar_reports_what_it_saw() {
+        // Under the label threshold, so nothing matched — and under the mint
+        // bar, so nothing is minted either. The best score is still reported:
+        // it is what a later reassign would be argued from.
+        assert_eq!(
+            decide(&cfg(), 0.0, 1.0, 4, &[c(1, 0.30)]),
+            Decision::TooSlight {
+                best_score: Some(0.30),
+                duration_s: 1.0,
+                words: 4
+            }
+        );
+    }
+
+    #[test]
+    fn the_overlap_gate_still_outranks_the_mint_bar() {
+        // Overlapped audio is refused outright: no embedding, no label, and the
+        // question of whether it *would* have minted never arises.
+        assert_eq!(
+            decide(&cfg(), 0.9, 1.0, 1, &[]),
+            Decision::Refused(Refusal::Overlapped)
+        );
     }
 
     // ---- enrolment: every condition is separately load-bearing -----------
@@ -252,7 +352,7 @@ mod tests {
     #[test]
     fn enrolment_needs_all_four_conditions() {
         // Baseline: comfortably over every bar.
-        let d = decide(&cfg(), 0.0, 5.0, &[c(1, 0.80), c(2, 0.40)]);
+        let d = decide(&cfg(), 0.0, 5.0, 5, &[c(1, 0.80), c(2, 0.40)]);
         assert_eq!(
             d,
             Decision::Matched {
@@ -271,6 +371,7 @@ mod tests {
             &cfg(),
             0.0,
             5.0,
+            5,
             &[c(1, 0.54), c(2, 0.10)]
         )));
         // Margin too thin.
@@ -278,6 +379,7 @@ mod tests {
             &cfg(),
             0.0,
             5.0,
+            5,
             &[c(1, 0.80), c(2, 0.75)]
         )));
         // Overlap over the (stricter) enrol ceiling but under the label gate.
@@ -285,6 +387,7 @@ mod tests {
             &cfg(),
             0.08,
             5.0,
+            5,
             &[c(1, 0.80), c(2, 0.10)]
         )));
         // Too short to enrol, long enough to label.
@@ -292,13 +395,14 @@ mod tests {
             &cfg(),
             0.0,
             2.9,
+            5,
             &[c(1, 0.80), c(2, 0.10)]
         )));
     }
 
     #[test]
     fn the_enrolment_boundaries_are_inclusive() {
-        let d = decide(&cfg(), 0.05, 3.0, &[c(1, 0.55), c(2, 0.49)]);
+        let d = decide(&cfg(), 0.05, 3.0, 5, &[c(1, 0.55), c(2, 0.49)]);
         assert_eq!(
             d,
             Decision::Matched {
@@ -311,7 +415,7 @@ mod tests {
 
     #[test]
     fn a_sole_candidate_has_no_runner_up_to_lose_the_margin_to() {
-        let d = decide(&cfg(), 0.0, 5.0, &[c(1, 0.90)]);
+        let d = decide(&cfg(), 0.0, 5.0, 5, &[c(1, 0.90)]);
         assert_eq!(
             d,
             Decision::Matched {

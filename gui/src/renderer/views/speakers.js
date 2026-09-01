@@ -6,7 +6,18 @@
 // who are they?" with the names right there to type.
 
 import { h, clear, fmtDur, fmtFirstSeen, speakerColor } from '../lib/dom.js';
-import { store, speakerLabel, isNamed, isYou, onboardingCandidates, ask, reloadSpeakers } from '../lib/store.js';
+import {
+  store,
+  speakerLabel,
+  isNamed,
+  isYou,
+  onboardingCandidates,
+  ask,
+  reloadSpeakers,
+  LANGUAGE_CHOICES,
+  languageValue,
+  languageLabel,
+} from '../lib/store.js';
 import { confirmSheet, openSheet, toast } from '../lib/sheets.js';
 import { playSpeaker, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 
@@ -21,9 +32,18 @@ export function mount(root, ctx) {
   const card = h('div', { class: 'card' }, h('div', { class: 'card-title', text: 'Voices' }), list);
   const body = h('div', { class: 'view-body view-enter' }, bannerSlot, card);
   const sub = h('span', { class: 'sub', id: 'speakers-sub' });
+  // Only ever occupied when there is something to sweep, so the header stays
+  // quiet on a voicebank that has nothing wrong with it.
+  const sweepSlot = h('div', { id: 'sweep-slot' });
 
   root.append(
-    h('div', { class: 'view-head' }, h('div', {}, h('h1', { text: 'Speakers' }), sub), h('div', { class: 'spacer' })),
+    h(
+      'div',
+      { class: 'view-head' },
+      h('div', {}, h('h1', { text: 'Speakers' }), sub),
+      h('div', { class: 'spacer' }),
+      sweepSlot
+    ),
     body
   );
 
@@ -179,6 +199,10 @@ export function mount(root, ctx) {
       'div',
       { class: 'row-menu', role: 'menu', 'aria-label': `Actions for ${speakerLabel(spId)}` },
       item('Show in transcript', () => showInTranscript(spId)),
+      // Which languages this voice speaks. It sits here and in the rename flow
+      // because it is the same question — "who is this?" — asked about the
+      // words rather than the name.
+      item('Languages…', () => pickLanguages(spId), 'menu-languages'),
       item('Merge…', () => pickMerge(spId), 'menu-merge'),
       item('Split', () => doSplit(spId)),
       // Still visibly destructive — just no longer one slip away from Merge.
@@ -350,7 +374,28 @@ export function mount(root, ctx) {
       ),
       h('span', { class: 'sp-num' }, String(sp.segments ?? 0), h('small', { text: 'segments' })),
       h('span', { class: 'sp-num' }, fmtDur(sp.total_ms), h('small', { text: 'total speech' })),
-      h('span', { class: 'sp-actions' }, moreButton(sp.id))
+      h(
+        'span',
+        { class: 'sp-actions' },
+        // The second entry point to the language sheet. A declared language is
+        // a standing fact about a person that changes what the transcript says,
+        // so it belongs on the row rather than only behind a menu.
+        h(
+          'button',
+          {
+            class: `chip lang${languageValue(sp) ? ' set' : ''}`,
+            dataset: { lang: String(sp.id) },
+            title: `Speaks: ${languageLabel(sp)} — click to change`,
+            'aria-label': `${speakerLabel(sp.id)} speaks ${languageLabel(sp)}`,
+            onclick: (e) => {
+              e.stopPropagation();
+              pickLanguages(sp.id);
+            },
+          },
+          languageLabel(sp)
+        ),
+        moreButton(sp.id)
+      )
     );
     return row;
   }
@@ -412,6 +457,134 @@ export function mount(root, ctx) {
     target.replaceWith(input);
     input.focus();
     input.select();
+  }
+
+  // -- languages ------------------------------------------------------------
+  //
+  // Four choices, not a free-text field: the daemon classifies two languages
+  // and holds one constrained decoder, so anything else would be a promise it
+  // cannot keep. The copy says what each choice *does*, because "German" on
+  // its own does not explain why a transcript changed afterwards.
+
+  function languageControl(spId, onPick) {
+    const current = languageValue(store.speakers.get(spId));
+    const group = h('div', {
+      class: 'seg-ctl',
+      id: 'language-control',
+      role: 'group',
+      'aria-label': `Languages ${speakerLabel(spId)} speaks`,
+    });
+    for (const choice of LANGUAGE_CHOICES) {
+      group.append(
+        h(
+          'button',
+          {
+            class: 'seg-opt',
+            type: 'button',
+            dataset: { lang: choice.value || 'any' },
+            title: choice.title,
+            'aria-pressed': String(choice.value === current),
+            onclick: () => onPick(choice),
+          },
+          choice.label
+        )
+      );
+    }
+    return group;
+  }
+
+  function pickLanguages(spId) {
+    const close = openSheet((close) => [
+      h('h2', { text: `What does ${speakerLabel(spId)} speak?` }),
+      h('p', {
+        class: 'sub',
+        text: 'On short turns the transcriber does not merely fail to identify a language — it picks the wrong one and commits. Saying a voice speaks English only lets a German-looking transcript from them be decoded again with a model that cannot produce German at all. Two languages, or Any, correct nothing.',
+      }),
+      languageControl(spId, (choice) => {
+        close();
+        void setLanguages(spId, choice);
+      }),
+      h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => close() }, 'Cancel')),
+    ]);
+    // The sheet focuses its first control; the useful one to land on is the
+    // setting that is already true, so Escape-and-look costs nothing and the
+    // keyboard path starts from the current answer.
+    document.querySelector('#language-control .seg-opt[aria-pressed="true"]')?.focus();
+    return close;
+  }
+
+  async function setLanguages(spId, choice) {
+    const codes = choice.value ? choice.value.split(',') : [];
+    try {
+      await ask('speakers.set_languages', { id: spId, languages: codes });
+      // Nothing is patched here: the daemon broadcasts `relabel` carrying the
+      // languages, and the whole UI updates from that one path.
+      toast(
+        choice.value
+          ? `${speakerLabel(spId)} speaks ${choice.label}.`
+          : `${speakerLabel(spId)} speaks any language — nothing will be corrected.`,
+        'ok'
+      );
+    } catch (e) {
+      toast(`Could not set the language — ${e.message}`, 'error');
+    }
+  }
+
+  // -- sweeping one-off voices ----------------------------------------------
+  //
+  // A voice with one grunt and a second of speech is not a person. The mint bar
+  // stops new ones appearing; this clears out the ones that predate it.
+
+  let sweepable = [];
+
+  async function refreshSweep() {
+    try {
+      const res = await ask('speakers.prune', { apply: false });
+      sweepable = res.voices ?? [];
+    } catch {
+      // An older daemon has no such method. Not an error worth showing — the
+      // affordance simply does not appear.
+      sweepable = [];
+    }
+    renderSweep();
+  }
+
+  function renderSweep() {
+    clear(sweepSlot);
+    if (!sweepable.length) return;
+    sweepSlot.append(
+      h(
+        'button',
+        {
+          class: 'btn small',
+          id: 'sweep-voices',
+          title: 'Delete voices with a single short segment — the ones that are not people',
+          onclick: () => void doSweep(),
+        },
+        `Sweep one-off voices (${sweepable.length})`
+      )
+    );
+  }
+
+  async function doSweep() {
+    const list = sweepable
+      .map((v) => `${v.name ?? v.auto} · ${v.segments} segment · ${fmtDur(v.total_ms)}`)
+      .join('\n');
+    const ok = await confirmSheet({
+      title: `Sweep ${sweepable.length} one-off voice${sweepable.length === 1 ? '' : 's'}?`,
+      body: 'These voices have a single short segment each — a cough, a laugh, one syllable through a door. Deleting them removes the identity and its recordings; the words go with them. Your own voice and every voice you have named are never swept.',
+      detail: list,
+      confirmLabel: `Sweep ${sweepable.length}`,
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const res = await ask('speakers.prune', { apply: true });
+      toast(`Swept ${res.count} voice${res.count === 1 ? '' : 's'}.`, 'ok');
+      await refreshSweep();
+    } catch (e) {
+      toast(`Could not sweep — ${e.message}`, 'error');
+    }
   }
 
   function pickMerge(fromId) {
@@ -524,6 +697,9 @@ export function mount(root, ctx) {
         renderBanner();
       });
     }
+    // What is sweepable moves with the counts, so it is re-asked whenever they
+    // change — but only on the events that can change them, not on every tick.
+    if (change.speakers || change.merged || change.purged || change.opFinished) void refreshSweep();
   }
 
   // Playback state lives outside the view (one <audio> for the whole app), so
@@ -540,5 +716,6 @@ export function mount(root, ctx) {
   renderBanner();
   renderList();
   paintPlayState();
-  return { update, renderList, renderBanner, startRename, closeMenu };
+  void refreshSweep();
+  return { update, renderList, renderBanner, startRename, closeMenu, pickLanguages };
 }

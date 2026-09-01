@@ -40,8 +40,10 @@ Methods (initial set):
 |---|---|---|
 | `sources.list` / `sources.set` | `{match_key, allowed}` | live toggle, no restart. `sources.set` **refuses** `match_key: "mic"` — see `mic.set` |
 | `mic.get` / `mic.set` | `{enabled?, mode?}` | the microphone switch; live, no restart |
-| `speakers.list` | | id, name, counts, total time |
+| `speakers.list` | | id, name, counts, total time, `languages` |
 | `speakers.name` | `{id, name}` | retroactive; broadcasts `relabel` |
+| `speakers.set_languages` | `{id, languages}` | which languages this voice speaks; broadcasts `relabel` |
+| `speakers.prune` | `{apply?}` | list (default) or sweep the one-off voices |
 | `speakers.merge` | `{from, into}` | tombstone, no chains; broadcasts `relabel` |
 | `speakers.split` | `{id}` | **async op** (below); work completes inline — the reply carries the op handle **plus** the outcome: `{op, kept, minted, auto, moved_segments, moved_prototypes, ambiguous, centroid_similarity, embed_model_id, resync, seq}`. Data-driven refusals (one voice, golden conflict) come back as `err:refused`. The minted speaker's `relabel` carries `split_from`. Past ~100 changed rows the per-segment events are skipped and `resync: true` tells clients to re-query. |
 | `segments.reassign` | `{segment_id, speaker_id}` | |
@@ -160,6 +162,75 @@ folded into the allowlist.
   the tombstone a tombstone and re-points `you_speaker` at the target; the next
   microphone segment lands there. Merging in the other direction changes nothing.
   A second "You" is never minted.
+
+### Per-speaker languages, provenance and storage (schema 5)
+
+Three additive changes, all of them about the daemon saying *why* rather than
+only *what*.
+
+- **`speakers.list` rows carry `languages`**: a sorted array of BCP-47 tags
+  (`["de"]`, `["de","en"]`) or `null`, which means *any* and is the default.
+- **`speakers.set_languages {id, languages}`** → `{id, languages, seq}`.
+  `languages` may be an array, a single string, or `null` / `[]` / `["any"]`,
+  all three of which clear the declaration. Tags are lower-cased, de-duplicated
+  and sorted, so one setting has one representation. Only `de` and `en` are
+  accepted — the daemon classifies exactly those two, and a tag it cannot check
+  is a correction it can never make; anything else is `err:params`. Broadcast on
+  the existing **`relabel`** event, carrying `languages` *and* the current
+  `name`, so a client folding it in never has to choose between the two facts.
+  A `relabel` without a `languages` key says nothing about languages and must
+  not clear them.
+
+  What the declaration *does* is not symmetric, because the model catalogue is
+  not. A voice pinned to exactly one language, and only such a voice, gets its
+  transcripts checked against the text classifier. `en` + a German-looking
+  transcript → the segment is decoded again with the English-only export, whose
+  language is a property of the model rather than a hint; the new text replaces
+  the old **only** if it is non-empty and reads as English, and `asr_model_id`
+  moves with it. `de` + an English-looking transcript → there is no
+  German-constrained decoder to re-run it with, so the words are kept and the
+  row is marked. Either way the *speaker* is untouched: a voice does not become
+  less recognisable by having been decoded in the wrong language.
+
+  The declaration is load-bearing and a wrong one costs transcript quality: if
+  a voice really does speak German and is declared English-only, the re-decode
+  will replace good German with English-sounding nonsense. That is the honest
+  consequence of a hard constraint, it is reversible (widen the languages), and
+  it is why the default is `any` and the GUI copy says what each choice does.
+
+- **Segment rows carry `lang` and `label_via`.** `lang` is the transcript's
+  language when one is known — from the model when the model only speaks one,
+  otherwise from the text classifier — and `null` when nobody could tell, which
+  is a real answer. `label_via` is how the *speaker* got there:
+  `"match"` (the voicebank), `"mic"` (provenance, never a comparison),
+  `"manual"` (a person said so), or `"proximity"`. **A client must render
+  `proximity` as uncertain**: that label was inherited from the confident turns
+  either side of a fragment too short to identify, so it is a guess with a good
+  reason rather than a measurement, and it carries `match_score: null`.
+
+- **`speakers.prune {apply?}`** → `{apply, count, voices, ...}`. Without
+  `apply` it lists and changes nothing: `voices` is `[{id, auto, name,
+  segments, total_ms, speech_ns}]` for every voice with at most one segment and
+  under three seconds of speech, plus `max_segments` and `max_speech_ms` so a
+  client can explain the bar. With `apply: true` it deletes them — the segments
+  are soft-deleted exactly as `delete.run` does them, so the undo window still
+  applies, and the identity goes with its prototypes and goldens — and answers
+  `{count, removed, segments}`. It **refuses the pinned "You" speaker and every
+  named voice**, whatever the counts say. Each removed voice is announced as a
+  `relabel` carrying `pruned: true`, which is *not* a merge: nothing moved
+  anywhere, the id simply stops existing and its rows go back to nameless.
+
+- **`status` carries `storage`**, or `null` before anything has measured it:
+  `{db_bytes, audio_bytes, audio_files, goldens_bytes, models_bytes,
+  total_bytes, measured_at_utc_ns}` — the last as a **string**, like every other
+  nanosecond value on the wire. It is measured by the retention sweeper once per
+  pass (and once at start-up), never by the `status` call itself: the status
+  poll runs every three seconds in every open client and the answer costs a walk
+  of the whole data directory. `null` means "not measured yet" and a client must
+  render it as such; zeroes would be a claim about an empty disk.
+
+- **`status.counters`** gains `too_slight` (turns that matched nobody and were
+  under the mint bar), `proximity_labelled`, `redecoded` and `lang_mismatch`.
 
 ## Versioning rules
 

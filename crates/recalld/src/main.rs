@@ -32,7 +32,7 @@ use recalld::server;
 use recalld::service::Service;
 use recalld::store::Store;
 
-use crate::cli::{Cli, Command, MicAction, ModelsAction};
+use crate::cli::{Cli, Command, MicAction, ModelsAction, SpeakersAction};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -85,7 +85,13 @@ fn main() -> Result<()> {
                 no_config,
             ),
         },
-        Command::Speakers => cmd_speakers(&data_dir),
+        Command::Speakers { action } => match action {
+            None => cmd_speakers(&data_dir),
+            Some(SpeakersAction::Prune { apply }) => cmd_prune(&cfg, &data_dir, apply),
+        },
+        Command::Languages { speaker_id, codes } => {
+            cmd_languages(&cfg, &data_dir, speaker_id, &codes)
+        }
         Command::Name {
             speaker_id,
             display_name,
@@ -267,15 +273,27 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         None
     };
 
+    // What is on disk, before anything has swept: a daemon that has just come
+    // up must be able to answer "how much space is this using" without waiting
+    // out a sweep interval. The sweeper re-measures after every pass.
+    let models_dir = ModelSet::resolve(&cfg.models).map(|m| m.root);
+    control.set_storage(retention::measure(
+        data_dir,
+        models_dir.as_deref(),
+        utc_now_ns(),
+    ));
+
     let sweeper_stop = Arc::new(SweeperStop::default());
     let sweeper_thread = if cfg.retention.enabled {
         let retention_cfg = cfg.retention.clone();
         let store = Arc::clone(&store);
         let dir = data_dir.to_path_buf();
+        let models = models_dir.clone();
+        let control = Arc::clone(&control);
         let stop = Arc::clone(&sweeper_stop);
         std::thread::Builder::new()
             .name("recalld-sweeper".into())
-            .spawn(move || retention::run(&retention_cfg, store, dir, stop))
+            .spawn(move || retention::run(&retention_cfg, store, dir, models, control, stop))
             .map_err(|e| warn!("no retention sweeper: {e}"))
             .ok()
     } else {
@@ -320,6 +338,10 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         mic_segments = analysis_stats.mic_segments.load(Ordering::Relaxed),
         mic_enrolled = analysis_stats.mic_enrolled.load(Ordering::Relaxed),
         mic_goldens = analysis_stats.mic_goldens.load(Ordering::Relaxed),
+        too_slight = analysis_stats.too_slight.load(Ordering::Relaxed),
+        proximity = analysis_stats.proximity_labelled.load(Ordering::Relaxed),
+        redecoded = analysis_stats.redecoded.load(Ordering::Relaxed),
+        lang_mismatch = analysis_stats.lang_mismatch.load(Ordering::Relaxed),
         dropped_buffers = queue.dropped_chunks(),
         dropped_seconds = queue.dropped_samples() as f32 / SAMPLE_RATE as f32,
         "stopped"
@@ -659,14 +681,112 @@ fn cmd_speakers(data_dir: &Path) -> Result<()> {
         println!("No voices yet.");
         return Ok(());
     }
-    println!("{:>4}  {:<24}  {:>8}  SPEECH", "ID", "NAME", "SEGMENTS");
+    println!(
+        "{:>4}  {:<24}  {:>8}  {:<9}  SPEECH",
+        "ID", "NAME", "SEGMENTS", "SPEAKS"
+    );
     for r in rows {
         println!(
-            "{:>4}  {:<24}  {:>8}  {}",
+            "{:>4}  {:<24}  {:>8}  {:<9}  {}",
             r.id,
             r.display_name,
             r.segments,
+            r.languages
+                .as_ref()
+                .map(|l| l.join("+"))
+                .unwrap_or_else(|| "any".into()),
             format_duration(r.speech_ns)
+        );
+    }
+    Ok(())
+}
+
+/// `recalld languages <id> <codes|any>` — over the socket, because a language
+/// declaration changes what the pipeline does with the *next* segment and every
+/// open client shows the setting.
+fn cmd_languages(cfg: &Config, data_dir: &Path, speaker_id: i64, codes: &str) -> Result<()> {
+    let list: Vec<String> = codes
+        .split(',')
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    let out = call(
+        cfg,
+        data_dir,
+        "speakers.set_languages",
+        json!({"id": speaker_id, "languages": list}),
+    )?;
+    match out["languages"].as_array() {
+        Some(langs) if !langs.is_empty() => {
+            let names: Vec<&str> = langs.iter().filter_map(|v| v.as_str()).collect();
+            let spoken: Vec<&str> = names
+                .iter()
+                .map(|c| match *c {
+                    "de" => "German",
+                    "en" => "English",
+                    other => other,
+                })
+                .collect();
+            println!("Speaker {speaker_id} speaks {}.", spoken.join(" and "));
+            if names.len() == 1 && names[0] == "en" {
+                println!(
+                    "A transcript from this voice that reads as German will be decoded again\n\
+                     with the English-only model, which cannot produce German at all."
+                );
+            } else if names.len() == 1 {
+                println!(
+                    "A transcript from this voice that reads as English will be flagged.\n\
+                     There is no German-constrained decoder in the catalogue to re-run it with,\n\
+                     so the words are kept as they are and the row is marked."
+                );
+            } else {
+                println!("Two languages: nothing is corrected — either one is expected.");
+            }
+        }
+        _ => println!("Speaker {speaker_id} speaks any language; nothing will be corrected."),
+    }
+    Ok(())
+}
+
+/// `recalld speakers prune [--apply]` — the one-off voice sweep.
+fn cmd_prune(cfg: &Config, data_dir: &Path, apply: bool) -> Result<()> {
+    let out = call(cfg, data_dir, "speakers.prune", json!({"apply": apply}))?;
+    let voices = out["voices"].as_array().cloned().unwrap_or_default();
+    if voices.is_empty() {
+        println!("No one-off voices: every voice has more than a moment of speech.");
+        return Ok(());
+    }
+    println!("{:>4}  {:<24}  {:>8}  SPEECH", "ID", "NAME", "SEGMENTS");
+    for v in &voices {
+        println!(
+            "{:>4}  {:<24}  {:>8}  {}",
+            v["id"].as_i64().unwrap_or(0),
+            v["name"]
+                .as_str()
+                .unwrap_or_else(|| v["auto"].as_str().unwrap_or("?")),
+            v["segments"].as_i64().unwrap_or(0),
+            format_duration(
+                v["speech_ns"]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0)
+            )
+        );
+    }
+    if apply {
+        println!(
+            "\nSwept {} voice(s); {} segment(s) deleted (undoable until the retention\n\
+             window closes). Your own voice and every named voice were left alone.",
+            out["count"].as_i64().unwrap_or(0),
+            out["segments"].as_i64().unwrap_or(0),
+        );
+    } else {
+        println!(
+            "\n{} voice(s) with at most {} segment and under {} ms of speech.\n\
+             Nothing was changed — `recalld speakers prune --apply` deletes them.",
+            out["count"].as_i64().unwrap_or(0),
+            out["max_segments"].as_i64().unwrap_or(1),
+            out["max_speech_ms"].as_i64().unwrap_or(3000),
         );
     }
     Ok(())
@@ -831,7 +951,7 @@ fn cmd_status(cfg: &Config, data_dir: &Path) -> Result<()> {
         "microphone",
         s["mic_state"].as_str().unwrap_or("off")
     );
-    let models = s["models"]["ids"]
+    let models = s["models"]
         .as_array()
         .map(|ids| {
             ids.iter()
@@ -868,7 +988,45 @@ fn cmd_status(cfg: &Config, data_dir: &Path) -> Result<()> {
         "roster",
         s["roster_present"].as_i64().unwrap_or(0)
     );
+    print_storage(&s["storage"]);
     Ok(())
+}
+
+/// The disk breakdown, in the four parts that behave differently: audio is
+/// capped by `[retention].audio_days` and self-limiting, the database grows
+/// forever and is the memory, goldens are retention-exempt on purpose, and the
+/// models are a fixed one-off. A single total would hide all four.
+fn print_storage(storage: &Value) {
+    let Some(block) = storage.as_object() else {
+        println!(
+            "{:<18}not measured yet (the retention sweeper measures it once per pass)",
+            "storage"
+        );
+        return;
+    };
+    let n = |key: &str| block.get(key).and_then(Value::as_u64).unwrap_or(0);
+    println!("{:<18}{} total", "storage", fetch::human(n("total_bytes")));
+    println!(
+        "{:<18}{:>10}  transcripts, voices and the search index",
+        "  database",
+        fetch::human(n("db_bytes"))
+    );
+    println!(
+        "{:<18}{:>10}  {} file(s), capped by the audio retention window",
+        "  audio",
+        fetch::human(n("audio_bytes")),
+        n("audio_files"),
+    );
+    println!(
+        "{:<18}{:>10}  kept clips, deliberately exempt from retention",
+        "  goldens",
+        fetch::human(n("goldens_bytes"))
+    );
+    println!(
+        "{:<18}{:>10}  fixed; `recalld models status` lists them",
+        "  models",
+        fetch::human(n("models_bytes"))
+    );
 }
 
 fn call(cfg: &Config, data_dir: &Path, method: &str, params: Value) -> Result<Value> {

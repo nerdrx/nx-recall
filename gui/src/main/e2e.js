@@ -134,6 +134,22 @@ export function runE2E(deps) {
       return { uncertain: n, qmarks: q, labels, why: why.slice(0, 60) };
     });
 
+    // 4b — 0.6.1: a label inherited from the turns around it. It has a name and
+    // no score, and it must read as a guess with a reason rather than as a
+    // measurement — the "?" is what carries that.
+    await step('inherited-labels-read-as-uncertain', async () => {
+      const p = await waitFor('a proximity-labelled row', async () => {
+        const p = await js('window.__recallDebug.proximity()');
+        return p.rows > 0 ? p : null;
+      });
+      assert(
+        p.uncertain === p.rows,
+        `${p.rows - p.uncertain} inherited row(s) render as certain`
+      );
+      assert(/surrounding turn/i.test(p.why), `the "?" does not explain the inheritance: ${p.why}`);
+      return p;
+    });
+
     await step('shot-transcript', async () => ({ file: await shot('transcript') }));
 
     // 5 — the segment sheet opens, and reassigning writes through the daemon
@@ -346,6 +362,82 @@ export function runE2E(deps) {
       return { speaker: target, rows, file };
     });
 
+    // 6g — 0.6.1: a voice can be told which languages it speaks, and the
+    // setting persists through the daemon rather than being a local opinion.
+    await step('speaker-languages-persist', async () => {
+      const target = await js('Number(document.querySelector("#speaker-list .sp-row").dataset.speaker)');
+      const before = await js(`window.__recallDebug.speaker(${target})`);
+      assert(before.chip, 'the row carries no language chip');
+
+      // Both entry points exist: the chip on the row, and the ⋯ menu.
+      await js(`document.querySelector('.sp-row[data-speaker="${target}"] .chip.lang').click()`);
+      await waitFor('the language sheet', async () => js('!!document.getElementById("language-control")'));
+      const options = await js(
+        '[...document.querySelectorAll("#language-control .seg-opt")].map(b => b.textContent)'
+      );
+      for (const want of ['Any', 'German', 'English', 'German + English']) {
+        assert(options.includes(want), `"${want}" is not offered: ${JSON.stringify(options)}`);
+      }
+      const file = await shot('speaker-languages');
+      await js('document.querySelector(\'#language-control [data-lang="de"]\').click()');
+      await waitFor('the sheet to close', async () => js('!document.querySelector(".sheet")'));
+
+      // The daemon is what makes it true: the model updates from the relabel
+      // broadcast, and a fresh speakers.list agrees.
+      await waitFor('the model to carry the language', async () => {
+        const s = await js(`window.__recallDebug.speaker(${target})`);
+        return s.languages && s.languages.join(',') === 'de' ? s : null;
+      });
+      const listed = await js(`(async () => {
+        const r = await window.recall.request('speakers.list');
+        const row = r.data.speakers.find(s => s.id === ${target});
+        return row ? row.languages : null;
+      })()`);
+      assert(
+        Array.isArray(listed) && listed.join(',') === 'de',
+        `speakers.list does not report the language: ${JSON.stringify(listed)}`
+      );
+      const after = await js(`window.__recallDebug.speaker(${target})`);
+      assert(/german/i.test(after.chip), `the row chip did not follow: ${after.chip}`);
+
+      // The ⋯ menu reaches the same sheet.
+      await js(`document.querySelector('.sp-row[data-speaker="${target}"] [data-more]').click()`);
+      await waitFor('the row menu', async () => js('!!document.querySelector(".row-menu")'));
+      const items = await js('[...document.querySelectorAll(".row-menu .menu-item")].map(b => b.textContent)');
+      assert(items.includes('Languages…'), `the ⋯ menu lost its language item: ${JSON.stringify(items)}`);
+      await js('document.dispatchEvent(new KeyboardEvent("keydown", {key: "Escape", bubbles: true}))');
+      await waitFor('the menu to close', async () => js('!document.querySelector(".row-menu")'));
+      return { speaker: target, options, listed, chip: after.chip, file };
+    });
+
+    // 6h — 0.6.1: voices that are not people. The affordance only exists when
+    // there is something to sweep, and it says how many.
+    await step('sweep-one-off-voices', async () => {
+      const before = await js('window.__recallDebug.sweep()');
+      assert(before.present, 'the mock has one-off voices but the sweep affordance is absent');
+      assert(/\(\d+\)/.test(before.label), `the affordance does not say how many: ${before.label}`);
+      const rows = await js('document.querySelectorAll("#speaker-list .sp-row").length');
+
+      await js('document.getElementById("sweep-voices").click()');
+      await waitFor('the confirm sheet', async () => js('!!document.querySelector(".sheet .quote")'));
+      const detail = await js('document.querySelector(".sheet .quote").textContent');
+      assert(/segment/.test(detail), `the confirm does not list what would go: ${detail}`);
+      const body = await js('document.querySelector(".sheet .sub").textContent');
+      assert(/named/i.test(body), `the confirm does not say what is protected: ${body}`);
+      const file = await shot('sweep-confirm');
+
+      await js('[...document.querySelectorAll(".sheet .actions .btn")].find(b => /Sweep/.test(b.textContent)).click()');
+      await waitFor('the voices to go', async () => {
+        const n = await js('document.querySelectorAll("#speaker-list .sp-row").length');
+        return n < rows ? n : null;
+      });
+      const after = await waitFor('the affordance to retire', async () => {
+        const s = await js('window.__recallDebug.sweep()');
+        return s.present === false ? s : null;
+      });
+      return { before: before.label, rowsBefore: rows, after, file };
+    });
+
     await step('shot-speakers', async () => ({ file: await shot('speakers') }));
 
     // 7 — inline rename through the real UI, then the retroactive broadcast
@@ -478,6 +570,34 @@ export function runE2E(deps) {
       const file = await shot('sources');
       await js(`document.querySelector('[data-toggle="${key}"]').click()`); // put it back
       return { deniedBefore: denied, toggled: key, file };
+    });
+
+    // 12a — 0.6.1: what all of this costs on disk, broken into the four parts
+    // that behave differently. A single total would hide the fact that exactly
+    // one of them shrinks on its own.
+    await step('storage-card-and-footer', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      const s = await waitFor('the storage card', async () => {
+        const s = await js('window.__recallDebug.storage()');
+        return s.rows.length ? s : null;
+      });
+      const keys = s.rows.map(([k]) => k);
+      for (const want of ['db', 'audio', 'goldens', 'models', 'total']) {
+        assert(keys.includes(want), `the breakdown is missing "${want}": ${JSON.stringify(keys)}`);
+      }
+      // Real sizes, not placeholders.
+      assert(
+        s.rows.every(([, v]) => /\d/.test(v)),
+        `a storage row rendered no number: ${JSON.stringify(s.rows)}`
+      );
+      assert(/retention/i.test(s.note), `the card does not say what is capped: ${s.note}`);
+      assert(/model/i.test(s.note), `the card does not say the models are fixed: ${s.note}`);
+      assert(/db/.test(s.footer) && /audio/.test(s.footer), `the footer lost its storage line: "${s.footer}"`);
+      // The card sits under the application list, so a screenshot of the top
+      // of the page would not document it.
+      await js('document.getElementById("storage-card").scrollIntoView({block: "end"})');
+      const file = await shot('sources-storage');
+      return { rows: s.rows, footer: s.footer, file };
     });
 
     // 12b — the microphone. Off by default and NOT in the application list;

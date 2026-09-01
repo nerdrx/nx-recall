@@ -25,8 +25,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const PROTO = 1;
-const DAEMON = 'recalld-mock/0.4';
-const SCHEMA = 4;
+const DAEMON = 'recalld-mock/0.5';
+const SCHEMA = 5;
 const REPLAY_MAX = 200; // deliberately small: overrunning it must be reachable
 
 export function defaultMockSocket() {
@@ -74,8 +74,11 @@ const MY_LINES = [
 ];
 
 // name: null means "not named yet" — the onboarding case (DESIGN §5).
+// `languages` is schema v5: which languages this voice actually speaks, so a
+// wrong-language transcript can be corrected rather than merely noticed. `null`
+// is "any", the default, and is what almost every voice starts as.
 const SPEAKERS = [
-  { id: 1, name: 'Kira', auto: 'Speaker_03', first_seen: '2026-07-02T18:24:00Z' },
+  { id: 1, name: 'Kira', auto: 'Speaker_03', languages: ['de'], first_seen: '2026-07-02T18:24:00Z' },
   { id: 2, name: null, auto: 'Speaker_07', first_seen: '2026-07-02T18:31:00Z' },
   { id: 3, name: null, auto: 'Speaker_12', first_seen: '2026-07-11T21:02:00Z' },
   { id: 4, name: 'Ash', auto: 'Speaker_18', first_seen: '2026-07-19T19:47:00Z' },
@@ -84,7 +87,15 @@ const SPEAKERS = [
   // Unnamed, like any other voice the daemon minted — the difference is where
   // its label comes from, not whether the user has typed one.
   { id: 8, name: null, auto: 'You', first_seen: '2026-08-29T20:12:00Z' },
+  // A one-off: one grunt, a second of speech, no name. The kind of row the
+  // mint bar now prevents and `speakers.prune` sweeps up when it slipped
+  // through anyway (0.6.1).
+  { id: 9, name: null, auto: 'Speaker_52', first_seen: '2026-08-31T18:07:00Z' },
 ];
+
+/// What counts as a one-off voice, matching the daemon's own bar.
+const PRUNE_MAX_SEGMENTS = 1;
+const PRUNE_MAX_SPEECH_MS = 3000;
 
 // One voice whose audio has aged out of retention while its text stayed. The
 // GUI has to say so in place ("no audio kept for this voice") rather than
@@ -180,19 +191,59 @@ function buildHistory() {
     const [sp, text, overlap, score] = mine
       ? [YOU_SPEAKER, MY_LINES[Math.floor(i / 9) % MY_LINES.length], 0.02, null]
       : CANNED_LINES[i % CANNED_LINES.length];
+    const speaker = overlap > 0.1 ? null : sp;
     out.push({
       id: 1000 + i,
       session: SESSIONS[i % 3 === 2 ? 2 : i % 2].id,
       source: mine ? 'mic' : i % 5 === 3 ? 'Discord' : 'VRChat.exe',
-      speaker: overlap > 0.1 ? null : sp,
+      speaker,
       text,
       t_ms: t,
       t_ns: String(t) + '000000',
       dur_ms: 1800 + ((i * 733) % 4200),
       overlap_frac: overlap,
       match_score: overlap > 0.1 ? null : score,
+      // schema v5. `label_via` is how the speaker got here; the value that
+      // changes what a client renders is "proximity" (below).
+      label_via: speaker == null ? null : mine ? 'mic' : 'match',
+      lang: speaker === 1 ? 'de' : 'en',
     });
   }
+
+  // Two rows that only exist since 0.6.1, both of which the GUI has to render
+  // differently from everything above.
+  const base2 = base + 26 * 47_000;
+  out.push({
+    // Inherited from the confident turns around it: a name with no score
+    // behind it. It reads as uncertain, and the "?" says why.
+    id: 1100,
+    session: SESSIONS[2].id,
+    source: 'VRChat.exe',
+    speaker: 1,
+    text: 'mm',
+    t_ms: base2,
+    t_ns: String(base2) + '000000',
+    dur_ms: 600,
+    overlap_frac: 0.02,
+    match_score: null,
+    label_via: 'proximity',
+    lang: null,
+  });
+  out.push({
+    // The one-off voice: one grunt, and the whole reason a sweep exists.
+    id: 1101,
+    session: SESSIONS[2].id,
+    source: 'VRChat.exe',
+    speaker: 9,
+    text: 'huh',
+    t_ms: base2 + 47_000,
+    t_ns: String(base2 + 47_000) + '000000',
+    dur_ms: 900,
+    overlap_frac: 0.03,
+    match_score: 0.38,
+    label_via: 'match',
+    lang: null,
+  });
   return out;
 }
 
@@ -279,10 +330,30 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       auto: s.auto,
       // Exactly one row can be true: the voice the microphone pins.
       you: s.id === you,
+      // schema v5: null is "any", which is what a voice speaks until somebody
+      // says otherwise.
+      languages: s.languages ?? null,
       first_seen: s.first_seen,
       segments: c.get(s.id)?.segments ?? 0,
       total_ms: c.get(s.id)?.total_ms ?? 0,
     }));
+  }
+
+  /// The voices a sweep would take: one segment at most, under three seconds
+  /// of speech, unnamed, and never the pinned "You".
+  function pruneCandidates() {
+    const c = counts();
+    const you = youSpeaker();
+    return state.speakers
+      .filter((s) => !s.name && s.id !== you)
+      .map((s) => ({
+        id: s.id,
+        auto: s.auto,
+        name: s.name,
+        segments: c.get(s.id)?.segments ?? 0,
+        total_ms: c.get(s.id)?.total_ms ?? 0,
+      }))
+      .filter((s) => s.segments <= PRUNE_MAX_SEGMENTS && s.total_ms < PRUNE_MAX_SPEECH_MS);
   }
 
   /// The pinned speaker, followed through tombstones exactly as the daemon
@@ -317,6 +388,26 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
     };
   }
 
+  /// Disk usage, in the four parts that behave differently. Derived from the
+  /// canned world rather than invented: audio is ~32 KB per second of segment,
+  /// which is what 16 kHz 16-bit mono actually weighs.
+  function storagePayload() {
+    const audioMs = state.segments.reduce((n, s) => n + s.dur_ms, 0);
+    const audio_bytes = Math.round((audioMs / 1000) * 32000);
+    const db_bytes = 180 * 1024 + state.segments.length * 900;
+    const goldens_bytes = 3 * 32000 * 4;
+    const models_bytes = 707 * 1024 * 1024;
+    return {
+      db_bytes,
+      audio_bytes,
+      audio_files: state.segments.length,
+      goldens_bytes,
+      models_bytes,
+      total_bytes: db_bytes + audio_bytes + goldens_bytes + models_bytes,
+      measured_at_utc_ns: String(Date.now()) + '000000',
+    };
+  }
+
   function statusPayload() {
     return {
       uptime_s: Math.round((Date.now() - state.startedAt) / 1000),
@@ -327,6 +418,10 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       sources_allowed: state.sources.filter((s) => s.allowed).length,
       mic: micPayload(),
       mic_state: micState(),
+      // 0.6.1: measured by the retention sweeper, not by this call. The audio
+      // figure moves as the feed runs, so the footer and the Sources card have
+      // something that actually changes to render.
+      storage: storagePayload(),
       models: ['silero-vad', 'segmentation-3.0', 'eres2net-en', 'parakeet-tdt-110m'],
       segments_total: state.segments.length,
       daemon: daemonId(),
@@ -513,6 +608,54 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       // every client to relabel in place (PROTOCOL "Events").
       emit('relabel', 'relabel', { speaker: sp.id, name: sp.name });
       return { id: sp.id, name: sp.name };
+    },
+
+    // schema v5 / PROTOCOL "Per-speaker languages". Only the two tags the
+    // daemon's classifier knows are accepted: a tag it cannot check is a
+    // correction it can never make.
+    'speakers.set_languages'(params) {
+      const sp = speakerById(Number(params?.id));
+      if (!sp) throw err('not_found', `no speaker ${params?.id}`);
+      const raw = params?.languages;
+      const list = raw == null ? [] : Array.isArray(raw) ? raw : [raw];
+      const out = [];
+      for (const item of list) {
+        if (typeof item !== 'string') throw err('bad_params', 'languages must be an array of strings');
+        const code = item.trim().toLowerCase();
+        if (!code || code === 'any') continue;
+        if (code !== 'de' && code !== 'en') {
+          throw err('bad_params', `unknown language ${JSON.stringify(code)}; this daemon classifies de and en only`);
+        }
+        if (!out.includes(code)) out.push(code);
+      }
+      out.sort();
+      sp.languages = out.length ? out : null;
+      // On the existing relabel event, carrying the name too, so a client
+      // folding it in never has to choose between the two facts.
+      emit('relabel', 'relabel', { speaker: sp.id, name: sp.name, languages: sp.languages });
+      return { id: sp.id, languages: sp.languages };
+    },
+
+    // 0.6.1: the one-off voices sweep. Lists by default; `apply` deletes.
+    'speakers.prune'(params) {
+      const voices = pruneCandidates();
+      if (!params?.apply) {
+        return {
+          apply: false,
+          count: voices.length,
+          voices,
+          max_segments: PRUNE_MAX_SEGMENTS,
+          max_speech_ms: PRUNE_MAX_SPEECH_MS,
+        };
+      }
+      const ids = new Set(voices.map((v) => v.id));
+      const removedSegments = state.segments.filter((s) => ids.has(s.speaker)).map((s) => s.id);
+      state.segments = state.segments.filter((s) => !ids.has(s.speaker));
+      state.speakers = state.speakers.filter((s) => !ids.has(s.id));
+      if (removedSegments.length) emit('segments', 'purge', { ids: removedSegments });
+      for (const id of ids) emit('relabel', 'relabel', { speaker: id, name: null, pruned: true });
+      emit('status', 'status', statusPayload());
+      return { apply: true, count: ids.size, removed: [...ids], segments: removedSegments.length, voices };
     },
 
     'speakers.merge'(params) {

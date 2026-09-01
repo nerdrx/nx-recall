@@ -186,6 +186,33 @@ prototypes capped ~20/speaker, diverse. Unchanged in shape; recalibrated in numb
   second user.
 - ~~"ECAPA wants ~3s+"~~ → **1 s suffices for labeling** (96% coverage, 2.5% EER);
   proximity-inheritance for sub-second utterances is a nicety, not a mechanism.
+- **The mint bar sits above the label bar** (added 0.6.1). Matching a grunt to a
+  voice already in the bank costs nothing and is often right; *minting* a new
+  identity from one is how a voicebank fills with rows nobody can ever name, and
+  a wrong new identity is permanent in a way a wrong label is not. So a new
+  voice additionally needs `mint_min_duration_s` (2.0 s) **and**
+  `mint_min_words` (2) — seconds *and* words, because either alone passes things
+  that are not speech. Below the bar the segment keeps its transcript and its
+  embedding (a later reassignment still has the evidence) and stays speaker-NULL.
+  Its corollary is the nicety above, now implemented: an unlabelled fragment
+  whose neighbours within 2.5 s carry the *same* confident speaker inherits it,
+  with `match_score` NULL and `label_via = "proximity"` so every client shows it
+  as uncertain. One side is enough — a session has edges — but two confident
+  neighbours that disagree are a handover, and it inherits nothing. **It never
+  inherits from an inherited row**: one guess may not become the evidence for
+  the next. And `speakers.prune` sweeps up the one-off voices that predate the
+  bar, refusing "You" and every named voice.
+- **A voice's languages are a standing fact worth storing** (added 0.6.1). One
+  turn is 1-3 s of audio and the multilingual export flips language on 12% of
+  those (§10 / `spike/lang_flip.py`); a person's languages do not flip at all.
+  `speakers.languages` turns an unfixable annoyance into a decidable question:
+  a voice pinned to exactly one language gets its transcripts checked against a
+  text classifier, and an English-only voice's German-looking transcript is
+  decoded again with the English-only export — whose language is a property of
+  the model, not a hint. The other direction is only flagged, because the
+  catalogue holds no German-constrained decoder. The asymmetry is the honest
+  shape of the model set, not an oversight, and the declaration is load-bearing:
+  a wrong one costs transcript quality until it is widened.
 - Turn merging (≤ 1.5 s gaps) before embedding: measured free win.
 - Golden samples, model-migration via re-enrollment from goldens,
   `embed_model_id` versioning with cross-model comparison forbidden in code: as v1.
@@ -206,6 +233,14 @@ every row), with these additions:
   key/value table that pins the "You" speaker. Golden samples for that speaker live
   under `goldens/`, not `segments/` — the retention sweeper walks the latter, so
   being retention-exempt costs the sweeper no special case at all.
+- v5: `speakers.languages` (JSON array; NULL is *any*) and two provenance
+  columns on `segments`. Before v5 the only marker was `match_score IS NULL`,
+  which conflated a microphone pin, a hand reassignment and a split's softened
+  score; `label_via` says which (`match` | `mic` | `manual` | `proximity`) and
+  `lang_via` says where the language came from (`model` | `classified` |
+  `re-decode` | `mismatch`). The backfill reads the old convention as faithfully
+  as it can: every labelled row is `match`, except the pinned voice's scoreless
+  ones, which were the microphone.
 - `session_roster(session_id, display_name, joined_at, left_at)` — the roster is
   load-bearing for candidate pruning and the Orbit name-picker, so it must be stored,
   not just observed live.
@@ -221,6 +256,17 @@ every row), with these additions:
 - Loose audio files get a **reconciliation sweeper** (orphaned files / dangling
   paths after a crash between DB delete and unlink), alongside the nightly
   soft-delete purge + `VACUUM`.
+- **A row with neither words nor a voice ages out on the audio clock** (0.6.1).
+  The tiers exist because a transcript is cheap and *is* the memory while audio
+  is heavy and is only evidence. A segment with no transcript and no speaker is
+  neither: not searchable, not attributable — a door closing, a cough. Keeping
+  it in the light tier forever would grow the database with rows that answer no
+  question anybody can ask, so it expires with the audio it was evidence of.
+- **Disk usage is measured by the sweeper, not by `status`** (0.6.1), in the
+  four parts that behave differently: database, audio, goldens, models. Only one
+  of them shrinks on its own, and a single total would hide that. The status
+  poll runs every three seconds in every open client and must never pay for a
+  directory walk, so it reads a cache the sweeper refills once a pass.
 
 ## 7. Roster (correction)
 

@@ -458,8 +458,12 @@ impl Pipeline {
             None
         };
 
+        // Segments other than this one that the analysis leg changed: proximity
+        // inheritance names the turn *before* this one, and a view that never
+        // heard about it would keep showing "unknown voice" until it re-queried.
+        let mut also_changed: Vec<i64> = Vec::new();
         if let Some(analyzer) = self.analyzer.as_mut() {
-            match you {
+            also_changed = match you {
                 Some(speaker_id) => analyse_mic_or_log(
                     analyzer,
                     &self.store,
@@ -473,7 +477,7 @@ impl Pipeline {
                     },
                     t_start_ns,
                 ),
-                None if is_mic => {}
+                None if is_mic => Vec::new(),
                 None => analyse_or_log(
                     analyzer,
                     &self.store,
@@ -482,7 +486,7 @@ impl Pipeline {
                     &samples,
                     t_start_ns,
                 ),
-            }
+            };
         } else if let Some(speaker_id) = you {
             // No models loaded. The label is provenance, not inference, so it
             // is still true — and stamping it here is what makes a mic capture
@@ -491,7 +495,12 @@ impl Pipeline {
                 .store
                 .lock()
                 .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
-            store.set_segment_speaker(segment_id, Some(speaker_id), None)?;
+            store.set_segment_speaker_via(
+                segment_id,
+                Some(speaker_id),
+                None,
+                Some(crate::store::label_via::MIC),
+            )?;
         }
         // Published after analysis so the event carries the transcript and the
         // speaker, not an empty shell a client would have to re-query for.
@@ -501,6 +510,9 @@ impl Pipeline {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
             publish_segment(&self.bus, &store, segment_id);
+            for id in also_changed {
+                publish_segment(&self.bus, &store, id);
+            }
         }
         Ok(())
     }

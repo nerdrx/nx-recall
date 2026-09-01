@@ -18,6 +18,9 @@ import {
   mergeSegments,
   speakerLabel,
   segmentSpeakerLabel,
+  LANGUAGE_CHOICES,
+  languageValue,
+  languageLabel,
 } from '../src/renderer/lib/store.js';
 
 function reset() {
@@ -241,4 +244,74 @@ test('merging history into the live window never duplicates or reorders', () => 
   const added = mergeSegments([seg(5), seg(10), seg(7)]);
   assert.equal(added, 2);
   assert.deepEqual(store.segments.map((s) => s.id), [5, 7, 10]);
+});
+
+// ---- 0.6.1 ---------------------------------------------------------------
+
+test('an inherited label reads as uncertain and says where it came from', () => {
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', total_ms: 1000 });
+
+  // Proximity inheritance: a name, no score, and a reason. It must not read as
+  // a measurement — nothing was measured — but it is not nameless either.
+  const inherited = seg(1, { speaker: 1, match_score: null, label_via: 'proximity', overlap_frac: 0.02 });
+  assert.equal(isUncertain(inherited), true);
+  const why = uncertainReason(inherited);
+  assert.match(why, /surrounding turn/i);
+  assert.match(why, /Kira/);
+
+  // A matched row with the same shape minus the marker is not uncertain: this
+  // is about provenance, not about the missing score.
+  const matched = seg(2, { speaker: 1, match_score: 0.82, label_via: 'match', overlap_frac: 0.02 });
+  assert.equal(isUncertain(matched), false);
+});
+
+test('a speaker language is a closed set with one label per state', () => {
+  assert.equal(languageValue({ languages: null }), '');
+  assert.equal(languageValue({}), '');
+  assert.equal(languageValue({ languages: [] }), '');
+  assert.equal(languageValue({ languages: ['en'] }), 'en');
+  // Order is normalised, so one setting has one representation in the UI too.
+  assert.equal(languageValue({ languages: ['en', 'de'] }), 'de,en');
+
+  assert.equal(languageLabel({ languages: null }), 'Any');
+  assert.equal(languageLabel({ languages: ['de'] }), 'German');
+  assert.equal(languageLabel({ languages: ['en'] }), 'English');
+  assert.equal(languageLabel({ languages: ['en', 'de'] }), 'German + English');
+  // Every choice the control offers has a value the daemon accepts and a line
+  // saying what it does — "German" alone does not explain a changed transcript.
+  assert.equal(LANGUAGE_CHOICES.length, 4);
+  for (const c of LANGUAGE_CHOICES) {
+    assert.ok(c.title.length > 20, `${c.label} does not explain itself`);
+    for (const code of c.value ? c.value.split(',') : []) {
+      assert.ok(['de', 'en'].includes(code), `${code} is not a language the daemon classifies`);
+    }
+  }
+});
+
+test('a relabel carries languages without clobbering the name, and vice versa', () => {
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', auto: 'Speaker_03', languages: null, segments: 0, total_ms: 0 });
+
+  applyEvent({ seq: 1, ev: 'relabel', data: { speaker: 1, name: 'Kira', languages: ['de'] } });
+  assert.deepEqual(store.speakers.get(1).languages, ['de']);
+  assert.equal(store.speakers.get(1).name, 'Kira');
+
+  // A plain rename says nothing about languages and must not erase them.
+  applyEvent({ seq: 2, ev: 'relabel', data: { speaker: 1, name: 'Kira Vex' } });
+  assert.equal(store.speakers.get(1).name, 'Kira Vex');
+  assert.deepEqual(store.speakers.get(1).languages, ['de']);
+});
+
+test('a swept voice disappears and its rows go back to nameless', () => {
+  reset();
+  store.speakers.set(9, { id: 9, name: null, auto: 'Speaker_52', segments: 1, total_ms: 900 });
+  applyEvent({ seq: 1, ev: 'segment', data: seg(1, { speaker: 9 }) });
+
+  // Not a merge: nothing was moved anywhere, the identity simply stops
+  // existing, so its rows must not keep pointing at an id no view knows.
+  const change = applyEvent({ seq: 2, ev: 'relabel', data: { speaker: 9, name: null, pruned: true } });
+  assert.equal(store.speakers.has(9), false);
+  assert.equal(store.segments[0].speaker, null);
+  assert.ok(change.speakers, 'the speakers view has to repaint');
 });

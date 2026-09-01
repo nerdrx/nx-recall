@@ -48,6 +48,13 @@ const MAX_AUDIO_BYTES: u64 = 10 * 1024 * 1024;
 /// How many clips `speakers.sample` returns when the caller does not say.
 const SAMPLE_LIMIT: usize = 3;
 
+/// What counts as a one-off voice for `speakers.prune`: at most this many
+/// segments and under this much speech in total. Both are deliberately far
+/// below anything a person produces in a conversation — a real voice reaches
+/// three seconds in one sentence.
+const PRUNE_MAX_SEGMENTS: i64 = 1;
+const PRUNE_MAX_SPEECH_NS: i64 = 3_000_000_000;
+
 /// One segment on the wire.
 ///
 /// Both time forms, deliberately (PROTOCOL "Field conventions"): `t_ms` is what
@@ -71,6 +78,12 @@ pub fn segment_json(row: &SegmentRow) -> Value {
         "overlap_frac": row.overlap_frac,
         "match_score": row.match_score,
         "has_audio": !row.audio_path.is_empty(),
+        // Schema v5. `lang` is the transcript's language when one is known at
+        // all; `label_via` is how the speaker got here, and the value a client
+        // must act on is `"proximity"` — that label was inherited from the
+        // turns around it rather than heard, so it is shown as uncertain.
+        "lang": row.lang,
+        "label_via": row.label_via,
     })
 }
 
@@ -127,6 +140,8 @@ impl Service {
             "mic.set" => self.mic_set(req),
             "speakers.list" => self.speakers_list(),
             "speakers.name" => self.speakers_name(req),
+            "speakers.set_languages" => self.speakers_set_languages(req),
+            "speakers.prune" => self.speakers_prune(req),
             "speakers.merge" => self.speakers_merge(req),
             "speakers.split" => self.speakers_split(req),
             "speakers.sample" => self.speakers_sample(req),
@@ -260,6 +275,10 @@ impl Service {
             // for anything that only wants to print a word (PROTOCOL).
             "mic": c.mic_json(),
             "mic_state": c.mic_state(),
+            // Measured by the retention sweeper, never here: this method is
+            // polled every three seconds by every open client and the answer
+            // costs a walk of the data directory (0.6.1).
+            "storage": c.storage_json(),
             "segments_total": store.segments_total()?,
             "counters": {
                 "sessions_opened": c.stats.sessions_opened.load(Ordering::Relaxed),
@@ -271,6 +290,13 @@ impl Service {
                 "mic_segments": c.analysis.mic_segments.load(Ordering::Relaxed),
                 "mic_enrolled": c.analysis.mic_enrolled.load(Ordering::Relaxed),
                 "mic_goldens": c.analysis.mic_goldens.load(Ordering::Relaxed),
+                // 0.6.1: turns that matched nobody and were too slight to mint
+                // a voice, turns that took a name from their neighbours, and
+                // the two outcomes of the wrong-language check.
+                "too_slight": c.analysis.too_slight.load(Ordering::Relaxed),
+                "proximity_labelled": c.analysis.proximity_labelled.load(Ordering::Relaxed),
+                "redecoded": c.analysis.redecoded.load(Ordering::Relaxed),
+                "lang_mismatch": c.analysis.lang_mismatch.load(Ordering::Relaxed),
             },
             "clients": self.bus.client_count(),
             "seq": self.bus.current_seq(),
@@ -507,12 +533,194 @@ impl Service {
                     // the onboarding flow is built on (DESIGN §5).
                     "name": r.name(),
                     "auto": r.auto_label,
+                    // Which languages this voice speaks (schema v5). `null` is
+                    // "any", the default and the only state until somebody
+                    // says otherwise — it is what turns a wrong-language decode
+                    // from an unfixable annoyance into a decidable question.
+                    "languages": r.languages,
                     "first_seen": iso8601(r.created_at),
                     "segments": r.segments,
                     "total_ms": ns_to_ms(r.speech_ns),
                     "speech_ns": r.speech_ns.to_string(),
                 }))
                 .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Declare which languages a voice speaks — or clear the declaration.
+    ///
+    /// `languages` is an array of tags, or `null` / `[]` / `["any"]` for *any*,
+    /// which is the default. Only the tags the daemon's classifier knows are
+    /// accepted (`de`, `en`): storing anything else would promise a correction
+    /// that cannot be made, and a promise the daemon cannot keep is worse than
+    /// no setting at all.
+    fn speakers_set_languages(&self, req: &Request) -> Result<Value, Error> {
+        let id = req.i64("id")?;
+        let codes: Vec<String> = match req.param("languages") {
+            // Absent or null: "any". Explicit, because it is how a client
+            // clears a declaration.
+            None => Vec::new(),
+            Some(Value::String(one)) => vec![one.clone()],
+            Some(Value::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    let Some(code) = item.as_str() else {
+                        return Err(Error::params("languages must be an array of strings"));
+                    };
+                    out.push(code.to_string());
+                }
+                out
+            }
+            Some(_) => {
+                return Err(Error::params(
+                    "languages must be an array of strings, a string, or null",
+                ));
+            }
+        };
+        let languages = crate::lang::normalise_languages(&codes).map_err(Error::params)?;
+
+        let store = self.store();
+        let prior = store.speaker_languages(id).map_err(Error::from)?;
+        let name = store
+            .speaker_name(id)
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::not_found(format!("no speaker with id {id}")))?;
+        store
+            .set_speaker_languages(id, languages.as_deref())
+            .map_err(Error::from)?;
+        store
+            .log_operation(
+                "speakers.set_languages",
+                &json!([id]).to_string(),
+                &json!({"id": id, "languages": prior}).to_string(),
+                utc_now_ns(),
+            )
+            .map_err(Error::from)?;
+        let summary = store.speaker_summary(id).map_err(Error::from)?;
+        drop(store);
+
+        // On the existing `relabel` event, carrying the *name* as well: a
+        // client folds one shape into its speaker row and must not be made to
+        // choose between applying the languages and keeping the name.
+        let seq = self.bus.publish(
+            Topic::Relabel,
+            "relabel",
+            json!({
+                "speaker": id,
+                "name": summary.as_ref().and_then(|s| s.name()),
+                "languages": languages,
+            }),
+        );
+        info!(speaker = id, ?languages, "speaker languages set");
+        let _ = name;
+        Ok(json!({"id": id, "languages": languages, "seq": seq}))
+    }
+
+    /// The one-off voices sweep (0.6.1): list, or delete.
+    ///
+    /// A grunt that slipped past the mint bar — or one minted before the bar
+    /// existed — leaves a voice with a single segment and a second of speech
+    /// that nobody will ever name. This finds them and, with `apply`, removes
+    /// them the way `delete.run` removes anything: the segments are
+    /// soft-deleted so the undo window still applies, and the identity itself
+    /// goes with its prototypes and goldens.
+    ///
+    /// It refuses to touch the pinned "You" speaker or any voice the user has
+    /// named, whatever the counts say. A name is a person saying "this one
+    /// matters", and a sweep must never argue with that.
+    fn speakers_prune(&self, req: &Request) -> Result<Value, Error> {
+        let apply = req.opt_bool("apply")?.unwrap_or(false);
+        let store = self.store();
+        let you = store.you_speaker_id().map_err(Error::from)?;
+        let candidates: Vec<crate::store::SpeakerSummary> = store
+            .prune_candidates(PRUNE_MAX_SEGMENTS, PRUNE_MAX_SPEECH_NS)
+            .map_err(Error::from)?
+            .into_iter()
+            .filter(|s| Some(s.id) != you)
+            .collect();
+        let preview: Vec<Value> = candidates
+            .iter()
+            .map(|s| {
+                json!({
+                    "id": s.id,
+                    "auto": s.auto_label,
+                    "name": s.name(),
+                    "segments": s.segments,
+                    "total_ms": ns_to_ms(s.speech_ns),
+                    "speech_ns": s.speech_ns.to_string(),
+                })
+            })
+            .collect();
+
+        if !apply {
+            drop(store);
+            return Ok(json!({
+                "apply": false,
+                "count": preview.len(),
+                "voices": preview,
+                "max_segments": PRUNE_MAX_SEGMENTS,
+                "max_speech_ms": PRUNE_MAX_SPEECH_NS / 1_000_000,
+            }));
+        }
+
+        let at = utc_now_ns();
+        let mut removed: Vec<i64> = Vec::new();
+        let mut segments = 0usize;
+        let mut files: Vec<String> = Vec::new();
+        for voice in &candidates {
+            match store.prune_speaker(voice.id, at) {
+                Ok(report) => {
+                    segments += report.soft_deleted;
+                    files.extend(report.goldens.clone());
+                    store
+                        .log_operation(
+                            "speakers.prune",
+                            &json!([voice.id]).to_string(),
+                            &json!({
+                                "id": voice.id,
+                                "auto_label": voice.auto_label,
+                                "segments": report.segments,
+                                "prototypes": report.prototypes,
+                                "goldens": report.goldens,
+                            })
+                            .to_string(),
+                            at,
+                        )
+                        .map_err(Error::from)?;
+                    removed.push(voice.id);
+                }
+                Err(e) => warn!(speaker = voice.id, "could not prune a voice: {e:#}"),
+            }
+        }
+        drop(store);
+
+        // The rows are gone, so the files may go too — in that order, because a
+        // file with no row is residue the reconciliation sweep understands.
+        for rel in files {
+            if !rel.is_empty() {
+                let _ = std::fs::remove_file(self.control.data_dir.join(rel));
+            }
+        }
+        for id in &removed {
+            // A tombstone-less disappearance: the voice never existed as far as
+            // any view should now be concerned, and its segments are unlabelled.
+            self.bus.publish(
+                Topic::Relabel,
+                "relabel",
+                json!({"speaker": id, "name": Value::Null, "pruned": true}),
+            );
+        }
+        info!(
+            voices = removed.len(),
+            segments, "swept one-off voices out of the voicebank"
+        );
+        self.announce_status();
+        Ok(json!({
+            "apply": true,
+            "count": removed.len(),
+            "removed": removed,
+            "segments": segments,
+            "voices": preview,
         }))
     }
 
@@ -2160,5 +2368,223 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["samples"].as_array().unwrap().len(), 0);
+    }
+
+    // ---- 0.6.1: per-speaker languages ------------------------------------
+
+    #[test]
+    fn a_voices_languages_are_set_listed_and_broadcast() {
+        let r = rig("languages");
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"speakers.name","params":{{"id":{spk},"name":"Kira"}}}}"#
+            ),
+        )
+        .unwrap();
+        let _ = events(&r);
+
+        // Any, until somebody says otherwise.
+        let listed = call(&r, r#"{"id":2,"method":"speakers.list"}"#).unwrap();
+        assert_eq!(listed["speakers"][0]["languages"], Value::Null);
+
+        let out = call(
+            &r,
+            &format!(
+                r#"{{"id":3,"method":"speakers.set_languages","params":{{"id":{spk},"languages":["EN"]}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(out["languages"], json!(["en"]), "case-folded on the way in");
+
+        // It is on the list, and it was broadcast — with the name intact, so a
+        // client folding the event in cannot lose one to learn the other.
+        let listed = call(&r, r#"{"id":4,"method":"speakers.list"}"#).unwrap();
+        assert_eq!(listed["speakers"][0]["languages"], json!(["en"]));
+        let relabel = events(&r)
+            .into_iter()
+            .find(|e| e["ev"] == "relabel")
+            .expect("setting a language is broadcast like any other relabel");
+        assert_eq!(relabel["data"]["speaker"], json!(spk));
+        assert_eq!(relabel["data"]["languages"], json!(["en"]));
+        assert_eq!(relabel["data"]["name"], json!("Kira"));
+
+        // Two languages sort, so one setting has one representation.
+        let both = call(
+            &r,
+            &format!(
+                r#"{{"id":5,"method":"speakers.set_languages","params":{{"id":{spk},"languages":["en","de"]}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(both["languages"], json!(["de", "en"]));
+
+        // …and clearing it is spelled several ways, all meaning "any".
+        for params in [
+            format!(r#"{{"id":{spk},"languages":[]}}"#),
+            format!(r#"{{"id":{spk},"languages":["any"]}}"#),
+            format!(r#"{{"id":{spk}}}"#),
+        ] {
+            let out = call(
+                &r,
+                &format!(r#"{{"id":6,"method":"speakers.set_languages","params":{params}}}"#),
+            )
+            .unwrap();
+            assert_eq!(out["languages"], Value::Null, "{params}");
+        }
+    }
+
+    #[test]
+    fn a_language_the_daemon_cannot_classify_is_refused_rather_than_stored() {
+        let r = rig("languages-refuse");
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        // Storing `fr` would promise a correction this daemon cannot make: the
+        // classifier knows two languages and the catalogue holds one
+        // constrained decoder.
+        let e = call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"speakers.set_languages","params":{{"id":{spk},"languages":["fr"]}}}}"#
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "params");
+        assert!(e.msg.contains("fr"), "{}", e.msg);
+        assert_eq!(
+            r.service.store().speaker_languages(spk).unwrap(),
+            None,
+            "a refused call must not have written anything"
+        );
+
+        assert_eq!(
+            call(
+                &r,
+                &format!(
+                    r#"{{"id":2,"method":"speakers.set_languages","params":{{"id":{spk},"languages":5}}}}"#
+                )
+            )
+            .unwrap_err()
+            .code,
+            "params"
+        );
+        assert_eq!(
+            call(
+                &r,
+                r#"{"id":3,"method":"speakers.set_languages","params":{"id":4242,"languages":["en"]}}"#
+            )
+            .unwrap_err()
+            .code,
+            "not_found"
+        );
+    }
+
+    // ---- 0.6.1: sweeping one-off voices ----------------------------------
+
+    #[test]
+    fn prune_lists_before_it_deletes_and_never_touches_you_or_a_named_voice() {
+        let r = rig("prune");
+        let sess = a_session(&r);
+        let (grunt, named, you, real) = {
+            let store = r.service.store();
+            let grunt = store.mint_speaker(0).unwrap();
+            let named = store.mint_speaker(0).unwrap();
+            store.rename_speaker(named, "Kira", 1).unwrap();
+            let you = store.ensure_you_speaker(0).unwrap();
+            let real = store.mint_speaker(0).unwrap();
+            (grunt, named, you, real)
+        };
+        // One half-second segment each for the three thin voices…
+        a_clip(&r, sess, "grunt", 0.5, Some((grunt, 0.4)));
+        a_clip(&r, sess, "named", 0.5, Some((named, 0.4)));
+        a_clip(&r, sess, "you", 0.5, Some((you, 0.4)));
+        // …and a voice that actually said something.
+        a_clip(&r, sess, "real", 8.0, Some((real, 0.9)));
+
+        let preview = call(&r, r#"{"id":1,"method":"speakers.prune"}"#).unwrap();
+        assert_eq!(preview["apply"], json!(false));
+        let ids: Vec<i64> = preview["voices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![grunt],
+            "only the nameless one-off, got {preview:#}"
+        );
+        assert_eq!(preview["count"], json!(1));
+        assert_eq!(preview["voices"][0]["segments"], json!(1));
+        // A preview changes nothing.
+        assert_eq!(r.service.store().list_speakers().unwrap().len(), 4);
+
+        let applied = call(
+            &r,
+            r#"{"id":2,"method":"speakers.prune","params":{"apply":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(applied["count"], json!(1));
+        assert_eq!(applied["removed"], json!([grunt]));
+        assert_eq!(applied["segments"], json!(1));
+
+        let left: Vec<i64> = r
+            .service
+            .store()
+            .list_speakers()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(!left.contains(&grunt));
+        for kept in [named, you, real] {
+            assert!(left.contains(&kept), "speaker {kept} must survive a sweep");
+        }
+        // The pinned voice is still pinned, and the sweep is in the audit log.
+        assert_eq!(r.service.store().you_speaker_id().unwrap(), Some(you));
+        let ops = call(&r, r#"{"id":3,"method":"operations.list"}"#).unwrap();
+        assert!(
+            ops["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["op"] == "speakers.prune"),
+            "a sweep is an operation like any other: {ops:#}"
+        );
+        // Nothing left to sweep the second time.
+        assert_eq!(
+            call(&r, r#"{"id":4,"method":"speakers.prune"}"#).unwrap()["count"],
+            json!(0)
+        );
+    }
+
+    // ---- 0.6.1: storage --------------------------------------------------
+
+    #[test]
+    fn status_carries_the_storage_breakdown_the_sweeper_measured() {
+        let r = rig("storage-status");
+        // Nothing has swept yet: null, not zeroes. A client renders "not
+        // measured yet"; zeroes would be a claim about an empty disk.
+        let before = call(&r, r#"{"id":1,"method":"status"}"#).unwrap();
+        assert_eq!(before["storage"], Value::Null);
+
+        r.service
+            .control
+            .set_storage(crate::retention::StorageUsage {
+                db_bytes: 100,
+                audio_bytes: 200,
+                audio_files: 2,
+                goldens_bytes: 50,
+                models_bytes: 700,
+                total_bytes: 1050,
+                measured_at_utc_ns: 42,
+            });
+        let after = call(&r, r#"{"id":2,"method":"status"}"#).unwrap();
+        assert_eq!(after["storage"]["db_bytes"], json!(100));
+        assert_eq!(after["storage"]["audio_files"], json!(2));
+        assert_eq!(after["storage"]["total_bytes"], json!(1050));
+        // The timestamp is a string, like every other nanosecond value on the
+        // wire: 1.8e18 does not survive a JSON number in a browser.
+        assert_eq!(after["storage"]["measured_at_utc_ns"], json!("42"));
     }
 }

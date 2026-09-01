@@ -6,7 +6,7 @@
 // model is discarded and rebuilt from queries, which is the entire strategy for
 // surviving a daemon restart (DESIGN §2).
 
-import { h, clear } from './lib/dom.js';
+import { h, clear, fmtBytes } from './lib/dom.js';
 import { store, applyEvent, reloadAll, mergeSegments, ask } from './lib/store.js';
 import { patchSpeakerLabels } from './lib/labels.js';
 import { toast } from './lib/sheets.js';
@@ -209,6 +209,19 @@ function renderFooter() {
     h('span', { class: 'stat' }, 'queue ', h('b', { text: String(store.status?.queue_depth ?? '—') })),
     h('span', { class: 'stat' }, 'drops ', h('b', { text: String(store.status?.drops ?? '—') })),
     h('span', { class: 'stat' }, 'sources ', h('b', { text: String(store.status?.sources_capturing ?? 0) })),
+    // The two halves of disk usage that actually move, in the one place a
+    // person already looks for "what is this program doing". The full
+    // breakdown, and what each part means, is the Sources view's card.
+    store.status?.storage
+      ? h(
+          'span',
+          { class: 'stat', id: 'storage-stat', title: 'Database and recordings on disk — the breakdown is in Sources' },
+          'db ',
+          h('b', { text: fmtBytes(store.status.storage.db_bytes ?? 0) }),
+          ' · audio ',
+          h('b', { text: fmtBytes(store.status.storage.audio_bytes ?? 0) })
+        )
+      : null,
     store.paused ? h('span', { class: 'chip warn' }, h('span', { class: 'dot' }), 'capture paused') : null,
     h('span', { class: 'spacer' }),
   ];
@@ -379,6 +392,43 @@ document.addEventListener('keydown', (e) => {
         // prove the treatment is DISTINCT rather than merely present.
         youRows: document.querySelectorAll('#seg-list .seg.you').length,
         otherRows: document.querySelectorAll('#seg-list .seg:not(.you)').length,
+      };
+    },
+    // 0.6.1. Three facts the driver has to be able to read back: what a voice
+    // is declared to speak, how many voices a sweep would take, and what the
+    // storage card is actually rendering.
+    speaker: (id) => {
+      const sp = store.speakers.get(Number(id)) ?? null;
+      const chip = document.querySelector(`.sp-row[data-speaker="${id}"] .chip.lang`);
+      return {
+        languages: sp?.languages ?? null,
+        chip: chip ? chip.textContent : null,
+      };
+    },
+    sweep: () => {
+      const btn = document.getElementById('sweep-voices');
+      return { present: !!btn, label: btn ? btn.textContent : null };
+    },
+    storage: () => ({
+      status: store.status?.storage ?? null,
+      rows: [...document.querySelectorAll('#storage-rows .storage-row')].map((r) => [
+        r.dataset.storage,
+        r.querySelector('.storage-bytes').textContent,
+      ]),
+      note: (document.getElementById('storage-note') || {}).textContent ?? '',
+      footer: (document.getElementById('storage-stat') || {}).textContent ?? '',
+    }),
+    // Segments whose speaker was inherited from the turns around them rather
+    // than heard: they must read as uncertain, with a "?" that says why.
+    proximity: () => {
+      const rows = [...document.querySelectorAll('#seg-list .seg')].filter((r) => {
+        const seg = store.segById.get(Number(r.dataset.seg));
+        return seg?.label_via === 'proximity';
+      });
+      return {
+        rows: rows.length,
+        uncertain: rows.filter((r) => r.classList.contains('uncertain')).length,
+        why: rows[0]?.querySelector('.qmark')?.title ?? '',
       };
     },
     // The one line behind the native-widget fix: without `color-scheme: dark`

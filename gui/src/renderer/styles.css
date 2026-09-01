@@ -391,6 +391,46 @@ select.input option, select.input optgroup {
 /* One hairline between "go and look at this voice" and "change this voice". */
 .row-menu .menu-item.menu-merge { border-top: 1px solid var(--line); margin-top: 4px; padding-top: 10px; }
 
+/* --------------------------------------------------- speaker languages --- */
+/* A declared language changes what the transcript SAYS, so it lives on the row
+   rather than only behind the ⋯ menu — quietly while it is the default ("Any"),
+   and in violet once it is a decision somebody made. */
+
+.chip.lang { cursor: pointer; letter-spacing: 0.08em; transition: color var(--dur-fast) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft); }
+.chip.lang:hover { color: var(--text); border-color: rgba(255, 255, 255, 0.18); }
+.chip.lang:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.chip.lang.set { color: var(--violet-soft); border-color: rgba(119, 0, 255, 0.38); background: rgba(119, 0, 255, 0.12); }
+
+/* Four choices, one row: the daemon classifies two languages, so this is a
+   closed set and a segmented control is the honest shape for it. */
+.seg-ctl { display: flex; gap: 6px; margin: var(--sp-2) 0; flex-wrap: wrap; }
+.seg-opt {
+  flex: 1 1 auto; cursor: pointer; padding: 9px 12px;
+  border-radius: var(--radius-sm); border: 1px solid var(--line);
+  background: var(--well-deep); color: var(--text); font-size: 13px;
+  transition: border-color var(--dur-fast) var(--ease-soft), background var(--dur-fast) var(--ease-soft);
+}
+.seg-opt:hover { border-color: rgba(255, 255, 255, 0.18); }
+.seg-opt:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.seg-opt[aria-pressed="true"] { border-color: var(--violet); background: rgba(119, 0, 255, 0.16); }
+
+/* ------------------------------------------------------------- storage --- */
+/* Four rows, not one number: they behave differently and only two of them are
+   anybody's decision. */
+
+.storage-rows { display: flex; flex-direction: column; }
+.storage-row {
+  display: flex; align-items: baseline; gap: var(--sp-2);
+  padding: 9px 0; border-bottom: 1px solid var(--hairline);
+}
+.storage-row:last-child { border-bottom: 0; }
+.storage-name { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.storage-name b { font-size: 13px; font-weight: 600; }
+.storage-name small { font-size: 11.5px; line-height: 1.45; color: var(--muted); }
+.storage-bytes { font: 500 13px/1 var(--mono); color: var(--text); white-space: nowrap; }
+.storage-row.total { border-top: 1px solid var(--line); margin-top: 4px; }
+.storage-row.total .storage-bytes { color: var(--recall-live); }
+
 /* ------------------------------------------------------- voice preview --- */
 /* Listening is how you answer "who is this?", so the control sits ahead of the
    name rather than behind a menu. It is a play control, not a brand moment:

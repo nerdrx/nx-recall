@@ -18,6 +18,12 @@ const ALLOWED = new Set([
   'mic.set',
   'speakers.list',
   'speakers.name',
+  // Which languages a voice speaks, and the sweep for voices that are not
+  // people at all. Both are 0.6.1 and both are reachable from the speakers
+  // view, so both belong here — a method the UI calls and this set forgets is
+  // a dead button.
+  'speakers.set_languages',
+  'speakers.prune',
   'speakers.merge',
   'speakers.split',
   // Reads only, both of them: which clips identify a voice, and one clip's

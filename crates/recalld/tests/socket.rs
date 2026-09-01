@@ -133,6 +133,23 @@ impl Daemon {
     fn ingest(&mut self, fixture: &str) -> Vec<i64> {
         let samples =
             read_wav(&fixtures_dir().join(fixture)).unwrap_or_else(|e| panic!("{fixture}: {e:#}"));
+        self.ingest_samples(&samples)
+    }
+
+    /// The same fixture, long enough to be worth an identity.
+    ///
+    /// The mint bar (0.6.1) refuses to spend a permanent voice on a turn under
+    /// `mint_min_duration_s`, and `clean_single_1.wav` is 1.75 s — a real turn,
+    /// but a shorter one than a new identity is worth. Doubling it is the
+    /// cheapest way to get a second *person* out of the fixture set.
+    fn ingest_twice_over(&mut self, fixture: &str) -> Vec<i64> {
+        let samples =
+            read_wav(&fixtures_dir().join(fixture)).unwrap_or_else(|e| panic!("{fixture}: {e:#}"));
+        let doubled: Vec<f32> = samples.iter().chain(samples.iter()).copied().collect();
+        self.ingest_samples(&doubled)
+    }
+
+    fn ingest_samples(&mut self, samples: &[f32]) -> Vec<i64> {
         let t0 = self.clock_ns;
         self.clock_ns += 60_000_000_000;
         let mut pipe = OfflinePipeline {
@@ -143,8 +160,8 @@ impl Daemon {
             bus: Some(Arc::clone(&self.bus)),
         };
         let store = self.store.lock().unwrap();
-        ingest_pcm(&store, &self.dir, self.session, &samples, t0, &mut pipe)
-            .unwrap_or_else(|e| panic!("ingesting {fixture}: {e:#}"))
+        ingest_pcm(&store, &self.dir, self.session, samples, t0, &mut pipe)
+            .unwrap_or_else(|e| panic!("ingesting {} samples: {e:#}", samples.len()))
     }
 
     fn segment_rows(&self) -> usize {
@@ -446,7 +463,7 @@ fn a_false_merge_is_undone_by_a_split_and_every_client_hears_about_it() {
     c.subscribe(&["relabel", "segments", "ops"]);
 
     let ines = d.ingest("clean_single_0.wav");
-    let wren = d.ingest("clean_single_1.wav");
+    let wren = d.ingest_twice_over("clean_single_1.wav");
     let speaker_of = |c: &mut Conn| -> std::collections::HashMap<i64, i64> {
         c.call("transcript", json!({}))["segments"]
             .as_array()

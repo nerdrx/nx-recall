@@ -25,9 +25,10 @@ use crate::asr::{Asr, normalise_words};
 use crate::config::{IdentityConfig, SAMPLE_RATE};
 use crate::embed::{Embedder, Embedding};
 use crate::identity::{self, Decision, Refusal};
-use crate::models::ModelSet;
+use crate::lang::{self, Lang};
+use crate::models::{FALLBACK_ASR, ModelSet};
 use crate::overlap::OverlapDetector;
-use crate::store::{SegmentAnalysis, Store};
+use crate::store::{SegmentAnalysis, Store, lang_via};
 
 /// What inference learned about a turn, before anything is written down.
 ///
@@ -41,8 +42,10 @@ pub struct Prepared {
     pub text: Option<String>,
     pub asr_model_id: String,
     /// The transcript's language, when the model is one that only speaks one.
-    /// `None` from the multilingual export — see `Asr::lang`.
-    pub lang: Option<&'static str>,
+    /// `None` from the multilingual export — see `Asr::lang`. This is the
+    /// model's constraint, not a reading of the words; the text classifier
+    /// fills the gap when it is absent (`language_of`).
+    pub model_lang: Option<&'static str>,
     /// `None` exactly when `refusal` is `Some`: audio the gate rejects is never
     /// embedded, so no blended vector can reach the voicebank.
     pub embedding: Option<Embedding>,
@@ -59,6 +62,13 @@ pub struct Outcome {
     pub enrolled: bool,
     /// A golden sample was written for this turn (mic enrolment only).
     pub golden: bool,
+    /// What the wrong-language correction did, if anything (0.6.1).
+    pub language_fix: Option<LanguageFix>,
+    /// **Other** segments this turn's arrival changed — proximity inheritance
+    /// labels the turn *before* this one, once this one proves what came after
+    /// it. The caller publishes them, so a GUI sees the row change without
+    /// re-querying.
+    pub also_changed: Vec<i64>,
 }
 
 /// Everything the microphone leg needs that the matching leg does not: who the
@@ -84,11 +94,32 @@ pub fn golden_path(speaker_id: i64, segment_id: i64) -> PathBuf {
         .join(format!("golden-{segment_id:06}.wav"))
 }
 
+/// What the language correction did to one row, when it did anything.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LanguageFix {
+    /// The audio was decoded again under a hard language constraint and the
+    /// new transcript won. `text` is what the row says now.
+    Redecoded { text: String, asr_model_id: String },
+    /// The transcript and the speaker's declared language disagree and nothing
+    /// in the catalogue can settle it. The words are kept and the row is
+    /// marked; `lang` goes to NULL rather than to a guess.
+    Marked { read_as: &'static str },
+}
+
 pub struct Analyzer {
     overlap: OverlapDetector,
     asr: Asr,
     embedder: Embedder,
     cfg: IdentityConfig,
+    /// Where the models live, kept so a constrained decoder can be loaded from
+    /// the same root later without re-resolving the config.
+    models: ModelSet,
+    /// The English-only export, loaded the first time a wrong-language decode
+    /// needs it and resident from then on. `None` means "not tried yet";
+    /// `en_unavailable` means "tried, not installed" — the difference is what
+    /// keeps the warning to one line rather than one per segment.
+    en_asr: Option<Asr>,
+    en_unavailable: bool,
 }
 
 impl Analyzer {
@@ -107,6 +138,9 @@ impl Analyzer {
             asr: Asr::load(models)?,
             embedder: Embedder::load(models)?,
             cfg: cfg.clone(),
+            models: models.clone(),
+            en_asr: None,
+            en_unavailable: false,
         })
     }
 
@@ -135,7 +169,7 @@ impl Analyzer {
             duration_s,
             text,
             asr_model_id: self.asr.model_id().to_string(),
-            lang: self.asr.lang(),
+            model_lang: self.asr.lang(),
             embedding,
             refusal,
         })
@@ -155,17 +189,17 @@ impl Analyzer {
             duration_s,
             text,
             asr_model_id,
-            lang,
+            model_lang,
             embedding,
             refusal,
         } = prepared;
 
+        let (lang, lang_via) = language_of(text.as_deref(), model_lang);
         store.set_segment_analysis(
             segment_id,
             &SegmentAnalysis {
-                // Only when the model itself constrains the answer; the
-                // multilingual export leaves it NULL rather than guessing.
-                lang: text.as_ref().and(lang).map(|l| l.to_string()),
+                lang,
+                lang_via,
                 text: text.clone(),
                 asr_model_id: Some(asr_model_id),
                 overlap_frac: Some(overlap_frac),
@@ -192,6 +226,8 @@ impl Analyzer {
                     match_score: None,
                     enrolled: false,
                     golden: false,
+                    language_fix: None,
+                    also_changed: Vec::new(),
                 });
             }
         };
@@ -199,7 +235,10 @@ impl Analyzer {
         store.store_embedding(segment_id, &embedding)?;
         let bank = store.prototypes(&embedding.model_id)?;
         let ranked = identity::rank(&embedding, &bank)?;
-        let decision = identity::decide(&self.cfg, overlap_frac, duration_s, &ranked);
+        // The word count is the mint bar's second half (0.6.1): a new identity
+        // needs seconds *and* words. Matching an existing one never asks.
+        let words = text.as_deref().map(lang::word_count).unwrap_or(0);
+        let decision = identity::decide(&self.cfg, overlap_frac, duration_s, words, &ranked);
 
         let (speaker_id, match_score, enrolled) = match &decision {
             // `gate` already ran, so this arm is unreachable in practice; it
@@ -226,6 +265,19 @@ impl Analyzer {
                 self.enroll(store, id, &embedding, segment_id, now_utc_ns)?;
                 (Some(id), *best_score, true)
             }
+            // Below the mint bar: nothing matched and this turn is too slight
+            // to be an identity. The embedding is already stored, so a later
+            // reassignment or split still has the evidence — only the voicebank
+            // is spared a row nobody could ever name (0.6.1).
+            Decision::TooSlight {
+                duration_s, words, ..
+            } => {
+                debug!(
+                    segment_id,
+                    duration_s, words, "below the mint bar: no new voice"
+                );
+                (None, None, false)
+            }
         };
         store.set_segment_speaker(segment_id, speaker_id, match_score)?;
 
@@ -237,6 +289,8 @@ impl Analyzer {
             match_score,
             enrolled,
             golden: false,
+            language_fix: None,
+            also_changed: Vec::new(),
         })
     }
 
@@ -268,23 +322,32 @@ impl Analyzer {
             duration_s,
             text,
             asr_model_id,
-            lang,
+            model_lang,
             embedding,
             refusal,
         } = prepared;
 
+        let (lang, lang_via) = language_of(text.as_deref(), model_lang);
         store.set_segment_analysis(
             segment_id,
             &SegmentAnalysis {
-                lang: text.as_ref().and(lang).map(|l| l.to_string()),
+                lang,
+                lang_via,
                 text: text.clone(),
                 asr_model_id: Some(asr_model_id),
                 overlap_frac: Some(overlap_frac),
             },
         )?;
         // Provenance, before anything else can fail: the label does not depend
-        // on the embedder having produced a vector.
-        store.set_segment_speaker(segment_id, Some(mic.speaker_id), None)?;
+        // on the embedder having produced a vector. It is recorded as such —
+        // `label_via = "mic"` — so nothing downstream has to infer it from a
+        // NULL score, which is a thing three other paths also produce.
+        store.set_segment_speaker_via(
+            segment_id,
+            Some(mic.speaker_id),
+            None,
+            Some(crate::store::label_via::MIC),
+        )?;
 
         let mut enrolled = false;
         let mut golden = false;
@@ -324,7 +387,46 @@ impl Analyzer {
             match_score: None,
             enrolled,
             golden,
+            language_fix: None,
+            also_changed: Vec::new(),
         })
+    }
+
+    /// The two corrections that can only run once the row exists and its
+    /// speaker is known: the wrong-language re-decode, and giving the *previous*
+    /// turn a name now that this one has proved what came after it.
+    ///
+    /// Both are best-effort. Neither may cost the segment that was just
+    /// analysed: a failure is logged and the row stands as committed.
+    fn after_commit(
+        &mut self,
+        store: &Store,
+        segment_id: i64,
+        outcome: &mut Outcome,
+        samples: &[f32],
+    ) {
+        if let Some(speaker_id) = outcome.speaker_id {
+            match self.correct_language(
+                store,
+                segment_id,
+                speaker_id,
+                outcome.text.as_deref(),
+                samples,
+            ) {
+                Ok(fix) => {
+                    if let Some(LanguageFix::Redecoded { text, .. }) = &fix {
+                        outcome.text = Some(text.clone());
+                    }
+                    outcome.language_fix = fix;
+                }
+                Err(e) => warn!(segment_id, "language correction failed: {e:#}"),
+            }
+        }
+        match crate::proximity::apply(store, &self.cfg, segment_id) {
+            Ok(Some(id)) => outcome.also_changed.push(id),
+            Ok(None) => {}
+            Err(e) => warn!(segment_id, "proximity inheritance failed: {e:#}"),
+        }
     }
 
     /// `prepare` then `commit`, for callers that hold the store exclusively.
@@ -336,7 +438,9 @@ impl Analyzer {
         now_utc_ns: i64,
     ) -> Result<Outcome> {
         let prepared = self.prepare(samples)?;
-        self.commit(store, segment_id, prepared, now_utc_ns)
+        let mut outcome = self.commit(store, segment_id, prepared, now_utc_ns)?;
+        self.after_commit(store, segment_id, &mut outcome, samples);
+        Ok(outcome)
     }
 
     /// `prepare` then `commit_mic`, for callers that hold the store exclusively.
@@ -349,7 +453,140 @@ impl Analyzer {
         now_utc_ns: i64,
     ) -> Result<Outcome> {
         let prepared = self.prepare(samples)?;
-        self.commit_mic(store, segment_id, prepared, mic, now_utc_ns)
+        let mut outcome = self.commit_mic(store, segment_id, prepared, mic, now_utc_ns)?;
+        self.after_commit(store, segment_id, &mut outcome, samples);
+        Ok(outcome)
+    }
+
+    /// The English-only decoder, loaded on demand and kept.
+    ///
+    /// It is not part of the default model set any more (DESIGN §4 — the
+    /// multilingual export beats it at English too), so the honest answer here
+    /// is often "not installed", and that is said once rather than per segment.
+    fn english(&mut self) -> Option<&mut Asr> {
+        if self.en_asr.is_none() && !self.en_unavailable {
+            if !self.models.has_asr_export(&FALLBACK_ASR) {
+                self.en_unavailable = true;
+                warn!(
+                    "a transcript disagrees with its speaker's declared language, but the \
+                     English-only export is not installed under {} — nothing to re-decode with. \
+                     `recalld models fetch --fallback-asr` installs it ({}).",
+                    self.models.root.display(),
+                    FALLBACK_ASR.note
+                );
+            } else {
+                match Asr::load(&self.models.with_asr(&FALLBACK_ASR)) {
+                    Ok(asr) => {
+                        info!(
+                            model = asr.model_id(),
+                            "loaded the English-only decoder for wrong-language correction"
+                        );
+                        self.en_asr = Some(asr);
+                    }
+                    Err(e) => {
+                        self.en_unavailable = true;
+                        warn!("could not load the English-only decoder: {e:#}");
+                    }
+                }
+            }
+        }
+        self.en_asr.as_mut()
+    }
+
+    /// Act on a transcript that disagrees with its speaker's declared language.
+    ///
+    /// This is the correction the 0.6.1 measurement asks for. `spike/lang_flip.py`
+    /// found the multilingual export decoding German fragments *as English* on
+    /// 12% of 1 s windows and 5% of 2 s ones, against a median real turn of
+    /// 2.4 s — so on a lobby of short turns a German speaker's transcript is
+    /// wrong several times an hour, silently, in a way full-utterance benchmarks
+    /// never show. Knowing which languages a voice actually speaks turns that
+    /// from an unfixable annoyance into a decidable question.
+    ///
+    /// Only a speaker pinned to **exactly one** language can be corrected: a
+    /// bilingual voice speaking German is not a mistake, and neither is a voice
+    /// nobody has said anything about (the default).
+    ///
+    /// The two directions are not symmetric, and pretending otherwise would be
+    /// the bug here:
+    ///
+    /// * **English speaker, German-looking transcript** → decode the audio
+    ///   again with the English-only export, whose language is a hard property
+    ///   of the model rather than a hint. The result replaces the text *only*
+    ///   if it is non-empty and reads as English; `asr_model_id` moves with it,
+    ///   because the row must say which model produced the words it holds.
+    /// * **German speaker, English-looking transcript** → there is no German
+    ///   constrained decoder in the catalogue, so there is nothing to re-decode
+    ///   *with*. The words are kept (they are the only record of what was said)
+    ///   and the row is marked; `lang` goes to NULL, because the classifier and
+    ///   the declaration cannot both be right and this daemon cannot tell which
+    ///   is wrong. Identity is untouched: the label came from the voice, and a
+    ///   voice does not become less recognisable by switching language.
+    pub fn correct_language(
+        &mut self,
+        store: &Store,
+        segment_id: i64,
+        speaker_id: i64,
+        text: Option<&str>,
+        samples: &[f32],
+    ) -> Result<Option<LanguageFix>> {
+        let Some(text) = text.filter(|t| !t.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let declared = store.speaker_languages(speaker_id)?;
+        let Some(want) = lang::sole_language(declared.as_ref()) else {
+            return Ok(None);
+        };
+        let read = lang::classify(text);
+        // "Unclear" and "empty" disagree with nothing: a name, a number and a
+        // grunt are not evidence that the wrong language was decoded.
+        let Some(got) = read.tag() else {
+            return Ok(None);
+        };
+        if got == want {
+            return Ok(None);
+        }
+
+        if want == "en" {
+            // Already decoding under the English constraint: the text is what
+            // this model says, and running it twice would say it again.
+            let already_english = self.asr.lang() == Some("en");
+            if !already_english && let Some(asr) = self.english() {
+                let model_id = asr.model_id().to_string();
+                let raw = asr.transcribe(samples);
+                let redecoded = lang::classify(&raw);
+                if redecoded == Lang::En && !normalise_words(&raw).is_empty() {
+                    store.set_segment_text_from_redecode(segment_id, &raw, "en", &model_id)?;
+                    info!(
+                        segment_id,
+                        speaker = speaker_id,
+                        model = %model_id,
+                        "re-decoded a transcript that read as German for an English-only voice"
+                    );
+                    return Ok(Some(LanguageFix::Redecoded {
+                        text: raw,
+                        asr_model_id: model_id,
+                    }));
+                }
+                debug!(
+                    segment_id,
+                    speaker = speaker_id,
+                    reads_as = redecoded.as_str(),
+                    "the English re-decode did not come back as English; keeping the original"
+                );
+            }
+        }
+
+        // Unresolvable in either direction: mark it and keep the words.
+        store.mark_segment_language_mismatch(segment_id)?;
+        debug!(
+            segment_id,
+            speaker = speaker_id,
+            declared = want,
+            reads_as = got,
+            "transcript disagrees with the speaker's declared language; marked, not changed"
+        );
+        Ok(Some(LanguageFix::Marked { read_as: got }))
     }
 
     fn enroll(
@@ -454,6 +691,15 @@ pub struct AnalysisStats {
     pub mic_segments: std::sync::atomic::AtomicU64,
     pub mic_enrolled: std::sync::atomic::AtomicU64,
     pub mic_goldens: std::sync::atomic::AtomicU64,
+    /// Turns that matched nobody and were too slight to mint a voice (0.6.1).
+    pub too_slight: std::sync::atomic::AtomicU64,
+    /// Turns that took their name from the turns around them.
+    pub proximity_labelled: std::sync::atomic::AtomicU64,
+    /// Transcripts re-decoded under a language constraint.
+    pub redecoded: std::sync::atomic::AtomicU64,
+    /// Transcripts that disagree with their speaker's declared language and
+    /// could not be corrected.
+    pub lang_mismatch: std::sync::atomic::AtomicU64,
 }
 
 impl AnalysisStats {
@@ -465,6 +711,9 @@ impl AnalysisStats {
             }
             Decision::Matched { .. } | Decision::Mint { .. } => {
                 self.labelled.fetch_add(1, Ordering::Relaxed);
+            }
+            Decision::TooSlight { .. } => {
+                self.too_slight.fetch_add(1, Ordering::Relaxed);
             }
             Decision::Pinned { .. } => {
                 self.labelled.fetch_add(1, Ordering::Relaxed);
@@ -478,11 +727,57 @@ impl AnalysisStats {
             }
             _ => {}
         }
+        match &outcome.language_fix {
+            Some(LanguageFix::Redecoded { .. }) => {
+                self.redecoded.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(LanguageFix::Marked { .. }) => {
+                self.lang_mismatch.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
+        }
+        self.proximity_labelled
+            .fetch_add(outcome.also_changed.len() as u64, Ordering::Relaxed);
+    }
+}
+
+/// The language to store for a transcript, and where it came from.
+///
+/// Three answers, in order of how much they can be trusted:
+///
+/// 1. **The model said so.** An English-only export cannot produce German, so
+///    its tag is a property of the decoder rather than a reading of the words.
+/// 2. **The classifier read it.** The multilingual export returns text and no
+///    language at all, so somebody has to look at the words — and that is worth
+///    doing precisely because the model is *wrong* about language often enough
+///    to matter on short turns (FINDINGS §10 / `spike/lang_flip.py`).
+/// 3. **Nobody knows.** A tie, a name, a number, or no words: NULL, and no
+///    provenance either. "I could not tell" is a real answer and is not a
+///    language.
+fn language_of(
+    text: Option<&str>,
+    model_lang: Option<&'static str>,
+) -> (Option<String>, Option<String>) {
+    let Some(text) = text else {
+        return (None, None);
+    };
+    if let Some(l) = model_lang {
+        return (Some(l.to_string()), Some(lang_via::MODEL.to_string()));
+    }
+    match lang::classify(text).tag() {
+        Some(tag) => (
+            Some(tag.to_string()),
+            Some(lang_via::CLASSIFIED.to_string()),
+        ),
+        None => (None, None),
     }
 }
 
 /// Inference outside the lock, then the write inside it, logging rather than
 /// propagating a model failure: one bad segment must not stop capture.
+///
+/// Returns the ids of **other** segments this call changed (proximity
+/// inheritance labels the previous turn), so the caller can announce them.
 pub fn analyse_or_log(
     analyzer: &mut Analyzer,
     store: &std::sync::Mutex<Store>,
@@ -490,21 +785,28 @@ pub fn analyse_or_log(
     segment_id: i64,
     samples: &[f32],
     now_utc_ns: i64,
-) {
+) -> Vec<i64> {
     let prepared = match analyzer.prepare(samples) {
         Ok(p) => p,
         Err(e) => {
             warn!(segment_id, "analysis failed: {e:#}");
-            return;
+            return Vec::new();
         }
     };
     let Ok(store) = store.lock() else {
         warn!(segment_id, "store mutex poisoned; analysis discarded");
-        return;
+        return Vec::new();
     };
     match analyzer.commit(&store, segment_id, prepared, now_utc_ns) {
-        Ok(outcome) => stats.record(&outcome),
-        Err(e) => warn!(segment_id, "storing analysis failed: {e:#}"),
+        Ok(mut outcome) => {
+            analyzer.after_commit(&store, segment_id, &mut outcome, samples);
+            stats.record(&outcome);
+            outcome.also_changed
+        }
+        Err(e) => {
+            warn!(segment_id, "storing analysis failed: {e:#}");
+            Vec::new()
+        }
     }
 }
 
@@ -521,20 +823,27 @@ pub fn analyse_mic_or_log(
     samples: &[f32],
     mic: &MicEnroll<'_>,
     now_utc_ns: i64,
-) {
+) -> Vec<i64> {
     let prepared = match analyzer.prepare(samples) {
         Ok(p) => p,
         Err(e) => {
             warn!(segment_id, "analysis failed: {e:#}");
-            return;
+            return Vec::new();
         }
     };
     let Ok(store) = store.lock() else {
         warn!(segment_id, "store mutex poisoned; analysis discarded");
-        return;
+        return Vec::new();
     };
     match analyzer.commit_mic(&store, segment_id, prepared, mic, now_utc_ns) {
-        Ok(outcome) => stats.record(&outcome),
-        Err(e) => warn!(segment_id, "storing microphone analysis failed: {e:#}"),
+        Ok(mut outcome) => {
+            analyzer.after_commit(&store, segment_id, &mut outcome, samples);
+            stats.record(&outcome);
+            outcome.also_changed
+        }
+        Err(e) => {
+            warn!(segment_id, "storing microphone analysis failed: {e:#}");
+            Vec::new()
+        }
     }
 }

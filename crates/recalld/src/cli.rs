@@ -80,8 +80,42 @@ be told.")]
         action: ModelsAction,
     },
 
-    /// List known voices with how much they have said.
-    Speakers,
+    /// List known voices with how much they have said, or sweep the one-off
+    /// ones out of the voicebank.
+    Speakers {
+        #[command(subcommand)]
+        action: Option<SpeakersAction>,
+    },
+
+    /// Say which languages a voice speaks, so a wrong-language transcript can
+    /// be corrected instead of merely noticed.
+    // The doc comment is taken verbatim: clap would otherwise reflow the
+    // example block into one paragraph.
+    #[command(long_about = "\
+Say which languages a voice speaks.
+
+The multilingual ASR does not merely fail to identify a language on short
+fragments — it picks the wrong one and commits. Measured on German read speech
+cut to lobby-sized windows: 12% of 1 s fragments and 5% of 2 s ones come back
+reading as English, against a median real turn of 2.4 s.
+
+Knowing a voice speaks only English makes that fixable: a German-looking
+transcript from that voice is re-decoded with the English-only model, which
+cannot produce German at all. The other direction is only flagged — there is no
+German-constrained decoder in the model catalogue yet.
+
+  recalld languages 7 en        this voice speaks English only
+  recalld languages 7 de,en     bilingual: nothing is ever corrected
+  recalld languages 7 any       clear it (the default)
+
+Needs the running daemon: every connected client has to be told.")]
+    Languages {
+        #[arg(value_name = "SPEAKER_ID")]
+        speaker_id: i64,
+        /// Comma-separated tags (`de`, `en`, `de,en`), or `any` to clear.
+        #[arg(value_name = "CODES")]
+        codes: String,
+    },
 
     /// Give a voice a name. Retroactive by nature: the numeric id is the
     /// identity, so every past and future segment follows.
@@ -138,6 +172,19 @@ be told.")]
         /// Restrict to one speaker, by id or display name.
         #[arg(long, value_name = "SPEAKER")]
         speaker: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SpeakersAction {
+    /// Sweep voices that are almost certainly not people: at most one segment
+    /// and under three seconds of speech in total. Lists them by default and
+    /// changes nothing; `--apply` deletes them, cascading exactly as a
+    /// delete-by-speaker does. Never touches a named voice or your own.
+    Prune {
+        /// Actually delete them. Without this the command only lists.
+        #[arg(long)]
+        apply: bool,
     },
 }
 

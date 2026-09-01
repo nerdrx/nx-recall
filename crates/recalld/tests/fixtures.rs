@@ -129,19 +129,18 @@ impl Rig {
     fn ingest(&mut self, fixture: &str) -> Vec<i64> {
         let samples = read_wav(&fixtures_dir().join(fixture))
             .unwrap_or_else(|e| panic!("reading {fixture}: {e:#}"));
+        self.ingest_samples(&samples)
+    }
+
+    /// The same, from a buffer — for cases the fixture set does not contain,
+    /// such as "the same person, but long enough to be worth an identity".
+    fn ingest_samples(&mut self, samples: &[f32]) -> Vec<i64> {
         let t0 = self.clock_ns;
         // Space fixtures a minute apart so nothing merges across files.
         self.clock_ns += 60_000_000_000;
         let mut pipe = OfflinePipeline::new(&mut self.vad, &self.cfg, Some(&mut self.analyzer));
-        ingest_pcm(
-            &self.store,
-            &self.dir,
-            self.session,
-            &samples,
-            t0,
-            &mut pipe,
-        )
-        .unwrap_or_else(|e| panic!("ingesting {fixture}: {e:#}"))
+        ingest_pcm(&self.store, &self.dir, self.session, samples, t0, &mut pipe)
+            .unwrap_or_else(|e| panic!("ingesting {} samples: {e:#}", samples.len()))
     }
 
     fn text_of(&self, ids: &[i64]) -> String {
@@ -403,10 +402,29 @@ fn one_voice_keeps_its_id_and_two_voices_do_not_collide() {
         "recognition scored {score:.3}, under the {label_threshold} label threshold"
     );
 
+    // A different person, in 1.75 s and four words — under the mint bar
+    // (0.6.1), so this much of a stranger is *unknown* rather than either
+    // misattributed or turned into a permanent identity.
     let other = rig.ingest("clean_single_1.wav");
+    assert!(
+        other.iter().all(|id| rig.speaker_of(*id) != Some(a)),
+        "a second person's speech was labelled as the first"
+    );
+    assert_eq!(
+        rig.store.list_speakers().unwrap().len(),
+        1,
+        "a 1.75 s turn is under the mint bar and must not become a voice"
+    );
+
+    // Given enough of that same person, they do become one — and it is not the
+    // first voice.
+    let short = read_wav(&fixtures_dir().join("clean_single_1.wav")).unwrap();
+    let doubled: Vec<f32> = short.iter().chain(short.iter()).copied().collect();
     let c = rig
-        .speaker_of(other[0])
-        .expect("a second voice must be minted");
+        .ingest_samples(&doubled)
+        .iter()
+        .find_map(|id| rig.speaker_of(*id))
+        .expect("3.5 s of one person must mint a voice");
     assert_ne!(a, c, "two different speakers collapsed onto one identity");
 
     // Both voices are visible, and the first has been heard twice.
@@ -416,6 +434,58 @@ fn one_voice_keeps_its_id_and_two_voices_do_not_collide() {
     assert_eq!(
         first_voice.segments,
         first.len() as i64 + second.len() as i64
+    );
+}
+
+/// The mint bar, on real audio: a grunt does not become a person.
+///
+/// The failure it prevents is cumulative rather than dramatic. Every
+/// half-second "hm" that mints leaves a permanent row in the voicebank that
+/// nobody can name, and after a few lobbies the speakers view is mostly those.
+/// A slice that short still gets *matched* if it sounds like somebody known —
+/// the bar sits above the label bar, not instead of it.
+#[test]
+fn a_fragment_too_short_to_be_a_person_does_not_mint_one() {
+    let mut rig = rig!("mint-bar");
+    let clean = read_wav(&fixtures_dir().join("clean_single_0.wav")).unwrap();
+    let session = rig.session;
+
+    // 1.2 s: over the identity gate's 1.0 s minimum, under the 2.0 s mint bar.
+    let short = &clean[..(1.2 * SAMPLE_RATE as f32) as usize];
+    let seg = rig
+        .store
+        .insert_segment(session, 0, 1_200_000_000, "", 0)
+        .unwrap();
+    rig.analyzer.process(&rig.store, seg, short, 0).unwrap();
+    assert_eq!(
+        rig.speaker_of(seg),
+        None,
+        "a 1.2 s fragment minted a voice; the mint bar is not holding"
+    );
+    assert!(
+        rig.store.list_speakers().unwrap().is_empty(),
+        "nothing may reach the voicebank from below the bar"
+    );
+    // The evidence is kept even so: a later reassignment or split still has the
+    // vector to work from.
+    assert!(rig.store.segment_embedding(seg).unwrap().is_some());
+
+    // The same voice at length mints, and then the fragment matches it — the
+    // bar is about minting, and only about minting.
+    let long = rig.ingest("clean_single_0.wav");
+    let voice = long
+        .iter()
+        .find_map(|id| rig.speaker_of(*id))
+        .expect("a whole file of clean speech mints a voice");
+    let again = rig
+        .store
+        .insert_segment(session, 60_000_000_000, 61_200_000_000, "", 0)
+        .unwrap();
+    rig.analyzer.process(&rig.store, again, short, 0).unwrap();
+    assert_eq!(
+        rig.speaker_of(again),
+        Some(voice),
+        "the same fragment must still be recognised once the voice is known"
     );
 }
 
@@ -469,6 +539,177 @@ fn transcripts_are_searchable_and_naming_reaches_back() {
         rig.store.transcript(None, Some(speaker)).unwrap().len(),
         ids.len()
     );
+}
+
+// ---- 5. per-speaker languages (0.6.1) ----------------------------------
+
+/// The measured case, end to end on real audio.
+///
+/// `spike/lang_flip.py` found the multilingual export decoding German
+/// fragments as English on 12% of 1 s windows and 5% of 2 s ones, against a
+/// median real turn of 2.4 s. Telling the daemon that a voice speaks English
+/// only is what makes the opposite direction fixable: a German-looking
+/// transcript from that voice is decoded again with the English-only export,
+/// whose language is a property of the model rather than a hint.
+///
+/// This drives the real function the pipeline calls, on real German audio the
+/// real ASR transcribed — the one thing a text injection could not test, since
+/// the correction re-runs the *audio*.
+///
+/// Needs **both** exports installed: the multilingual one to produce a German
+/// transcript in the first place, and the English-only one to re-decode with.
+#[test]
+fn an_english_only_voice_gets_its_german_transcript_re_examined() {
+    let mut rig = rig!("lang-redecode");
+    if !rig.models.has_asr_export(&recalld::models::FALLBACK_ASR) || rig.models.asr_lang().is_some()
+    {
+        eprintln!(
+            "skipping: this needs the multilingual export in use AND the English-only \
+             export installed (`recalld models fetch --fallback-asr`)"
+        );
+        return;
+    }
+
+    // A German clip through the real pipeline, then the segment whose text
+    // actually reads as German. If the export decoded none of them that way
+    // there is nothing to correct and nothing to test.
+    let mut german: Option<(i64, String)> = None;
+    for fixture in [
+        "de/de_short_0.wav",
+        "de/de_short_1.wav",
+        "de/de_short_2.wav",
+    ] {
+        for id in rig.ingest(fixture) {
+            let Some(text) = rig.store.segment_fields(id).unwrap()["text"].clone() else {
+                continue;
+            };
+            if recalld::lang::classify(&text) == recalld::lang::Lang::De {
+                german = Some((id, text));
+                break;
+            }
+        }
+        if german.is_some() {
+            break;
+        }
+    }
+    let Some((seg, before)) = german else {
+        panic!("the multilingual export read none of the German fixtures as German");
+    };
+    // Stamped by the classifier on the way in — that is the other half of this
+    // feature and it has to be true before the correction is asked for.
+    assert_eq!(
+        rig.store.segment_fields(seg).unwrap()["lang"].as_deref(),
+        Some("de")
+    );
+
+    // Now say this voice speaks English only, and ask the daemon to act on it.
+    let speaker = rig.store.create_speaker("Ines", 0).unwrap();
+    rig.store
+        .set_speaker_languages(speaker, Some(&["en".to_string()]))
+        .unwrap();
+    rig.store
+        .set_segment_speaker(seg, Some(speaker), Some(0.8))
+        .unwrap();
+
+    let rel = rig.store.segment_audio(seg).unwrap().unwrap().0;
+    let samples = read_wav(&rig.dir.join(&rel)).unwrap();
+    let fix = rig
+        .analyzer
+        .correct_language(&rig.store, seg, speaker, Some(&before), &samples)
+        .unwrap()
+        .expect("a German transcript from an English-only voice is a disagreement");
+
+    let after = rig.store.segment_fields(seg).unwrap();
+    match fix {
+        // The English-only model produced English words: they win, and the row
+        // says which model wrote them.
+        recalld::analysis::LanguageFix::Redecoded { text, asr_model_id } => {
+            eprintln!("  re-decoded: {before:?}\n          -> {text:?}");
+            assert_eq!(after["text"].as_deref(), Some(text.as_str()));
+            assert_eq!(
+                recalld::lang::classify(&text),
+                recalld::lang::Lang::En,
+                "only an English-reading re-decode may replace the text: {text:?}"
+            );
+            assert!(!normalise_words(&text).is_empty());
+            assert_eq!(after["lang"].as_deref(), Some("en"));
+            assert_eq!(after["lang_via"].as_deref(), Some("re-decode"));
+            assert_eq!(
+                after["asr_model_id"].as_deref(),
+                Some(asr_model_id.as_str())
+            );
+            assert!(
+                asr_model_id.contains(recalld::models::FALLBACK_ASR.dir),
+                "the row must name the model that produced the words it holds: {asr_model_id}"
+            );
+        }
+        // It did not, so nothing replaces the original. The words stay — they
+        // are the only record of what was said — and the row is marked as a
+        // disagreement nobody could settle.
+        recalld::analysis::LanguageFix::Marked { read_as } => {
+            eprintln!("  marked, not re-decoded: {before:?} still reads as {read_as}");
+            assert_eq!(read_as, "de");
+            assert_eq!(after["text"].as_deref(), Some(before.as_str()));
+            assert_eq!(after["lang"], None, "a marked row claims no language");
+            assert_eq!(after["lang_via"].as_deref(), Some("mismatch"));
+        }
+    }
+    // Either way the identity is untouched: a voice does not become less
+    // recognisable by having been decoded in the wrong language.
+    assert_eq!(rig.speaker_of(seg), Some(speaker));
+    assert_eq!(rig.score_of(seg), Some(0.8));
+}
+
+/// The other direction, which is deliberately *not* symmetric: there is no
+/// German-constrained decoder in the catalogue, so a German voice's
+/// English-looking transcript can only be flagged.
+#[test]
+fn a_german_only_voice_with_an_english_transcript_is_marked_not_rewritten() {
+    let mut rig = rig!("lang-mark");
+    let ids = rig.ingest("clean_single_0.wav");
+    let seg = ids[0];
+    let before = rig.store.segment_fields(seg).unwrap()["text"]
+        .clone()
+        .expect("clean English speech transcribes");
+    assert_eq!(recalld::lang::classify(&before), recalld::lang::Lang::En);
+
+    let speaker = rig.store.create_speaker("Jonas", 0).unwrap();
+    rig.store
+        .set_speaker_languages(speaker, Some(&["de".to_string()]))
+        .unwrap();
+    rig.store
+        .set_segment_speaker(seg, Some(speaker), Some(0.7))
+        .unwrap();
+
+    let rel = rig.store.segment_audio(seg).unwrap().unwrap().0;
+    let samples = read_wav(&rig.dir.join(&rel)).unwrap();
+    let fix = rig
+        .analyzer
+        .correct_language(&rig.store, seg, speaker, Some(&before), &samples)
+        .unwrap();
+    assert_eq!(
+        fix,
+        Some(recalld::analysis::LanguageFix::Marked { read_as: "en" })
+    );
+    let after = rig.store.segment_fields(seg).unwrap();
+    assert_eq!(after["text"].as_deref(), Some(before.as_str()));
+    assert_eq!(after["lang"], None);
+    assert_eq!(after["lang_via"].as_deref(), Some("mismatch"));
+    assert_eq!(rig.speaker_of(seg), Some(speaker));
+
+    // A voice that speaks both, or none in particular, is never corrected:
+    // switching language is not a mistake.
+    for languages in [Some(vec!["de".to_string(), "en".to_string()]), None] {
+        rig.store
+            .set_speaker_languages(speaker, languages.as_deref())
+            .unwrap();
+        assert_eq!(
+            rig.analyzer
+                .correct_language(&rig.store, seg, speaker, Some(&before), &samples)
+                .unwrap(),
+            None
+        );
+    }
 }
 
 // ---- pure helpers ------------------------------------------------------

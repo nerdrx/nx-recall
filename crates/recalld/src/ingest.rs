@@ -140,30 +140,43 @@ pub fn ingest_pcm(
             &rel.to_string_lossy(),
             t_start_ns,
         )?;
+        // Rows other than this one that the analysis leg touched — proximity
+        // inheritance labels the turn before it (0.6.1).
+        let mut also_changed: Vec<i64> = Vec::new();
         match (pipe.analyzer.as_deref_mut(), mic_speaker) {
             (Some(a), Some(speaker_id)) => {
-                a.process_mic(
-                    store,
-                    id,
-                    slice,
-                    &MicEnroll {
-                        speaker_id,
-                        data_dir,
-                        max_goldens: pipe.cfg.mic.max_goldens,
-                    },
-                    t_start_ns,
-                )?;
+                also_changed = a
+                    .process_mic(
+                        store,
+                        id,
+                        slice,
+                        &MicEnroll {
+                            speaker_id,
+                            data_dir,
+                            max_goldens: pipe.cfg.mic.max_goldens,
+                        },
+                        t_start_ns,
+                    )?
+                    .also_changed;
             }
             (Some(a), None) => {
-                a.process(store, id, slice, t_start_ns)?;
+                also_changed = a.process(store, id, slice, t_start_ns)?.also_changed;
             }
             // Models off: the mic label is provenance, not inference, so it is
             // still true and still worth writing.
-            (None, Some(speaker_id)) => store.set_segment_speaker(id, Some(speaker_id), None)?,
+            (None, Some(speaker_id)) => store.set_segment_speaker_via(
+                id,
+                Some(speaker_id),
+                None,
+                Some(crate::store::label_via::MIC),
+            )?,
             (None, None) => {}
         }
         if let Some(bus) = pipe.bus.as_ref() {
             publish_segment(bus, store, id);
+            for changed in &also_changed {
+                publish_segment(bus, store, *changed);
+            }
         }
         ids.push(id);
     }

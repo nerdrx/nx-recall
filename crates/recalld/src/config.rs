@@ -229,6 +229,21 @@ pub struct IdentityConfig {
     /// `speakers.split`: seeded restarts of the 2-means search. The seed is
     /// fixed, so the same voicebank always splits the same way.
     pub split_restarts: usize,
+    /// **The mint bar, which sits above the label bar (0.6.1).** A turn may
+    /// match an existing voice at `label_threshold`, but *minting a new one*
+    /// additionally needs this much audio. A grunt — "hm", a laugh, one
+    /// syllable through a door — is not an identity, and every one of them that
+    /// mints becomes a permanent row in the voicebank the user then has to
+    /// sweep up.
+    pub mint_min_duration_s: f32,
+    /// The other half of the mint bar: a new voice needs words, not just
+    /// seconds. Two is the cheapest honest test — one word is "yeah".
+    pub mint_min_words: usize,
+    /// Proximity inheritance (0.6.1): how far either side of an unlabelled
+    /// short turn the daemon will look for a confident neighbour to inherit
+    /// from. Beyond this the silence is long enough that somebody else may have
+    /// started talking.
+    pub proximity_gap_s: f32,
 }
 
 impl Default for IdentityConfig {
@@ -245,6 +260,9 @@ impl Default for IdentityConfig {
             split_max_centroid_similarity: 0.6,
             split_ambiguous_margin: 0.05,
             split_restarts: 8,
+            mint_min_duration_s: 2.0,
+            mint_min_words: 2,
+            proximity_gap_s: 2.5,
         }
     }
 }

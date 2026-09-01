@@ -57,6 +57,11 @@ pub struct Control {
     /// the pipeline was labelling with.
     pub identity: IdentityConfig,
     models: Mutex<Vec<String>>,
+    /// How much disk the program is using, as last measured by the retention
+    /// sweeper (and once at start-up). Cached rather than computed on demand
+    /// because `status` is polled every three seconds by every open client and
+    /// the answer costs a walk of the whole data directory.
+    storage: Mutex<Option<crate::retention::StorageUsage>>,
 }
 
 impl Control {
@@ -77,6 +82,7 @@ impl Control {
             analysis: Arc::new(AnalysisStats::default()),
             identity: IdentityConfig::default(),
             models: Mutex::new(Vec::new()),
+            storage: Mutex::new(None),
         })
     }
 
@@ -236,6 +242,27 @@ impl Control {
             "state": self.mic_state(),
             "device": cfg.device_override(),
         })
+    }
+
+    // ---- storage ---------------------------------------------------------
+
+    /// The sweeper reporting what it just measured.
+    pub fn set_storage(&self, usage: crate::retention::StorageUsage) {
+        *self.storage.lock().unwrap_or_else(|p| p.into_inner()) = Some(usage);
+    }
+
+    pub fn storage(&self) -> Option<crate::retention::StorageUsage> {
+        *self.storage.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The `storage` block `status` carries, or `null` before the first sweep
+    /// has measured anything. Null is an honest answer and a client renders it
+    /// as "not measured yet"; zeroes would be a lie about an empty disk.
+    pub fn storage_json(&self) -> Value {
+        match self.storage() {
+            Some(usage) => usage.to_json(),
+            None => Value::Null,
+        }
     }
 
     // ---- status ----------------------------------------------------------

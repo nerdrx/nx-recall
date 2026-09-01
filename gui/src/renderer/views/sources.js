@@ -7,7 +7,7 @@
 // can still be pre-denied here, which is the only way to deny something before
 // it ever makes a sound (DESIGN §3).
 
-import { h, svg, clear, fmtDate, speakerHue } from '../lib/dom.js';
+import { h, svg, clear, fmtDate, fmtBytes, speakerHue } from '../lib/dom.js';
 import { store, ask, applyMic, micChip } from '../lib/store.js';
 import { toast } from '../lib/sheets.js';
 
@@ -17,6 +17,7 @@ export function mount(root, ctx) {
   const list = h('div', { id: 'source-list' });
   const sub = h('span', { class: 'sub', id: 'sources-sub' });
   const micCard = h('div', { class: 'card mic-card', id: 'mic-card' });
+  const storageCard = h('div', { class: 'card', id: 'storage-card' });
   const body = h(
     'div',
     { class: 'view-body view-enter' },
@@ -34,7 +35,10 @@ export function mount(root, ctx) {
         text: 'Nothing is captured until you allow it here, and allowing takes effect immediately — no restart, no queue. Apps that have been seen but never allowed can be denied ahead of time.',
       }),
       list
-    )
+    ),
+    // What all of that costs on disk. It belongs on this page because this is
+    // where the decisions that grow it are made.
+    storageCard
   );
 
   root.append(
@@ -139,10 +143,69 @@ export function mount(root, ctx) {
     }
   }
 
+  // -- storage --------------------------------------------------------------
+  //
+  // Four rows rather than one number, because the four behave differently and
+  // only two of them are anybody's decision: audio is capped by the retention
+  // window and self-limiting, the transcript grows forever and is the point,
+  // the models are a fixed one-off, and kept clips are deliberately exempt.
+
+  function renderStorage() {
+    clear(storageCard);
+    const s = store.status?.storage;
+    storageCard.append(h('div', { class: 'card-title', text: 'Storage' }));
+    if (!s) {
+      storageCard.append(
+        h('p', {
+          class: 'rail-hint',
+          id: 'storage-pending',
+          style: 'padding:0;max-width:64ch',
+          text: 'Not measured yet — the retention sweeper measures it once per pass, so the status poll never has to walk the disk.',
+        })
+      );
+      return;
+    }
+    const rows = [
+      ['db', 'Transcripts and voices', s.db_bytes, 'The memory: text, identities and the search index. It grows, and it is meant to.'],
+      ['audio', 'Recordings', s.audio_bytes, `${s.audio_files ?? 0} segment file${s.audio_files === 1 ? '' : 's'}, capped by the audio retention window.`],
+      ['goldens', 'Kept voice samples', s.goldens_bytes, 'Exempt from retention on purpose — a future model is re-enrolled from these.'],
+      ['models', 'Speech models', s.models_bytes, 'Fixed, downloaded once. No setting shrinks these.'],
+    ];
+    const table = h('div', { class: 'storage-rows', id: 'storage-rows' });
+    for (const [key, label, bytes, hint] of rows) {
+      table.append(
+        h(
+          'div',
+          { class: 'storage-row', dataset: { storage: key } },
+          h('span', { class: 'storage-name' }, h('b', { text: label }), h('small', { text: hint })),
+          h('span', { class: 'storage-bytes', text: fmtBytes(bytes ?? 0) })
+        )
+      );
+    }
+    table.append(
+      h(
+        'div',
+        { class: 'storage-row total', dataset: { storage: 'total' } },
+        h('span', { class: 'storage-name' }, h('b', { text: 'Total' })),
+        h('span', { class: 'storage-bytes', text: fmtBytes(s.total_bytes ?? 0) })
+      )
+    );
+    storageCard.append(
+      table,
+      h('p', {
+        class: 'rail-hint',
+        id: 'storage-note',
+        style: 'padding:10px 0 0;max-width:64ch',
+        text: 'Recordings age out on the retention window and are the only part that shrinks on its own; the speech models are a fixed download. Nothing here leaves the machine.',
+      })
+    );
+  }
+
   // -- the applications -----------------------------------------------------
 
   function render() {
     renderMic();
+    renderStorage();
     clear(list);
     // The microphone has its own card above; it must not also appear as a row
     // in a list whose every other entry is opted in through the allowlist.
@@ -234,6 +297,7 @@ export function mount(root, ctx) {
   return {
     update(change) {
       if (change?.mic || change?.conn) renderMic();
+      if (change?.status) renderStorage();
       if (change?.sources || change?.status) render();
     },
     render,

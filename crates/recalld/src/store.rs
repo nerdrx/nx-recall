@@ -8,6 +8,10 @@
 //! or a reassignment undoable. v4 adds `sources.kind`, because a source is no
 //! longer always an application (the microphone is one too), and `settings`,
 //! the small key/value table that pins the "You" speaker across restarts.
+//! v5 adds `speakers.languages` (which languages this voice actually speaks,
+//! so a wrong-language decode can be corrected rather than merely noticed) and
+//! two provenance columns on `segments`: `label_via`, how the speaker got
+//! there, and `lang_via`, how the language did.
 //! Existing databases are migrated in place.
 
 use std::collections::HashMap;
@@ -18,12 +22,47 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::embed::Embedding;
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
 /// `sources.kind` for the user's own microphone.
 pub const KIND_MIC: &str = "mic";
+
+/// `segments.label_via` — how this row's *speaker* came to be what it is (v5).
+/// Before v5 the same distinction was carried implicitly by `match_score`
+/// being NULL, which could not tell a microphone pin from a hand reassignment;
+/// this says it out loud.
+pub mod label_via {
+    /// The voicebank matched it. The default, and what every pre-v5 labelled
+    /// row is backfilled to.
+    pub const MATCH: &str = "match";
+    /// The user's own microphone: provenance, never a comparison (DESIGN §5).
+    pub const MIC: &str = "mic";
+    /// Inherited from the confident turns either side of it (0.6.1). Carries
+    /// `match_score` NULL, because nothing was compared — and a client must
+    /// render it as uncertain, because nothing was heard either.
+    pub const PROXIMITY: &str = "proximity";
+    /// A person said so.
+    pub const MANUAL: &str = "manual";
+}
+
+/// `segments.lang_via` — how this row's *language* came to be what it is (v5).
+pub mod lang_via {
+    /// The ASR export only speaks one language, so the tag is a fact about the
+    /// model rather than a guess about the audio.
+    pub const MODEL: &str = "model";
+    /// The text classifier (`crate::lang`) read the transcript.
+    pub const CLASSIFIED: &str = "classified";
+    /// The transcript was re-decoded under a hard language constraint because
+    /// it disagreed with the speaker's declared language, and the new text won.
+    pub const REDECODE: &str = "re-decode";
+    /// The transcript disagrees with the speaker's declared language and no
+    /// constrained decoder for that language exists, so the row is *marked* and
+    /// its text left alone. `lang` stays NULL: the honest answer is that we do
+    /// not know which of the two is wrong.
+    pub const MISMATCH: &str = "mismatch";
+}
 
 /// `settings` key holding the id of the pinned "You" speaker.
 pub const YOU_SPEAKER_KEY: &str = "you_speaker_id";
@@ -56,6 +95,10 @@ pub struct SourceRow {
 pub struct SegmentAnalysis {
     pub text: Option<String>,
     pub lang: Option<String>,
+    /// Where `lang` came from (`store::lang_via`). NULL when there is no
+    /// language: a transcript nobody could classify says so by leaving both
+    /// columns empty rather than by claiming a language it did not read.
+    pub lang_via: Option<String>,
     pub asr_model_id: Option<String>,
     pub overlap_frac: Option<f32>,
 }
@@ -73,6 +116,9 @@ pub struct SpeakerSummary {
     pub created_at: i64,
     pub segments: i64,
     pub speech_ns: i64,
+    /// Which languages this voice actually speaks (v5). `None` is *any*, the
+    /// default: nothing is corrected until somebody says what to expect.
+    pub languages: Option<Vec<String>>,
 }
 
 impl SpeakerSummary {
@@ -97,6 +143,11 @@ pub struct SegmentRow {
     pub overlap_frac: Option<f32>,
     pub match_score: Option<f32>,
     pub audio_path: String,
+    /// The transcript's language, when one is known (v5).
+    pub lang: Option<String>,
+    /// How the speaker got here (`store::label_via`), so a client can distrust
+    /// an inherited label without distrusting a matched one.
+    pub label_via: Option<String>,
 }
 
 /// One candidate clip for naming a voice: enough to rank it, label it in a
@@ -111,6 +162,38 @@ pub struct SampleRow {
     pub match_score: Option<f32>,
     /// Relative to the data dir, and never empty: the query filters those out.
     pub audio_path: String,
+}
+
+/// One segment as proximity inheritance sees it: when it happened, who it was
+/// labelled as, and how confidently. Deliberately not a `SegmentRow` — this is
+/// asked once per stored turn and must not cost three joins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NeighbourSegment {
+    pub id: i64,
+    pub t_start_ns: i64,
+    pub t_end_ns: i64,
+    pub speaker_id: Option<i64>,
+    pub match_score: Option<f32>,
+    pub label_via: Option<String>,
+}
+
+impl NeighbourSegment {
+    pub fn duration_s(&self) -> f32 {
+        (self.t_end_ns - self.t_start_ns).max(0) as f32 / 1e9
+    }
+}
+
+/// What sweeping one one-off voice removed. `goldens` are paths the caller
+/// unlinks — the rows are already gone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    pub speaker_id: i64,
+    /// Every segment that pointed at the voice, live or already soft-deleted.
+    pub segments: Vec<i64>,
+    /// How many of those this call was the one to soft-delete.
+    pub soft_deleted: usize,
+    pub prototypes: usize,
+    pub goldens: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -329,6 +412,7 @@ impl Store {
         self.apply_v2()?;
         self.apply_v3()?;
         self.apply_v4()?;
+        self.apply_v5()?;
         if migrating {
             // Backfill the index for rows that predate it. New rows arrive
             // through the triggers.
@@ -537,6 +621,52 @@ impl Store {
         Ok(())
     }
 
+    /// Everything schema v5 adds, written so it is a no-op on a v5 database.
+    ///
+    /// `speakers.languages` is a JSON array (`["de"]`, `["de","en"]`) and NULL
+    /// means *any*, which is what every existing voice is. Storing it on the
+    /// speaker rather than deriving it per segment is the whole point: one turn
+    /// is 1-3 s of audio and the ASR flips language on 12% of those (FINDINGS
+    /// §10 / `spike/lang_flip.py`), while a person's languages are stable, so
+    /// the standing fact is the one worth writing down.
+    ///
+    /// The two `segments` columns are provenance. Before v5 the only marker was
+    /// `match_score IS NULL`, which conflated three unrelated things — a
+    /// microphone pin, a hand reassignment and a split's softened score — and
+    /// 0.6.1 adds a fourth (proximity inheritance) that a client has to be able
+    /// to distrust specifically. The backfill reads the old convention as
+    /// faithfully as it can: a labelled row is `match`, except the pinned "You"
+    /// speaker's scoreless rows, which are `mic`.
+    fn apply_v5(&self) -> Result<()> {
+        let fresh_languages = self.add_column_if_missing("speakers", "languages", "TEXT")?;
+        let fresh_label_via = self.add_column_if_missing("segments", "label_via", "TEXT")?;
+        self.add_column_if_missing("segments", "lang_via", "TEXT")?;
+        let _ = fresh_languages; // NULL is the correct value for every old row.
+
+        if fresh_label_via {
+            self.conn.execute(
+                "UPDATE segments SET label_via = ?1 WHERE speaker_id IS NOT NULL",
+                params![label_via::MATCH],
+            )?;
+            // The one pre-v5 case that was not a match: the microphone's pin,
+            // which is provenance and has always carried a NULL score.
+            if let Some(you) = self
+                .setting(YOU_SPEAKER_KEY)?
+                .and_then(|v| v.parse::<i64>().ok())
+            {
+                self.conn.execute(
+                    "UPDATE segments SET label_via = ?2
+                     WHERE speaker_id = ?1 AND match_score IS NULL",
+                    params![you, label_via::MIC],
+                )?;
+            }
+        }
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_segments_label_via ON segments(label_via);",
+        )?;
+        Ok(())
+    }
+
     /// Returns whether the column had to be added, so a caller can backfill it.
     fn add_column_if_missing(&self, table: &str, column: &str, decl: &str) -> Result<bool> {
         let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -704,12 +834,13 @@ impl Store {
     pub fn set_segment_analysis(&self, segment_id: i64, a: &SegmentAnalysis) -> Result<()> {
         self.conn.execute(
             "UPDATE segments
-             SET text = ?2, lang = ?3, asr_model_id = ?4, overlap_frac = ?5
+             SET text = ?2, lang = ?3, lang_via = ?4, asr_model_id = ?5, overlap_frac = ?6
              WHERE id = ?1",
             params![
                 segment_id,
                 a.text,
                 a.lang,
+                a.lang_via,
                 a.asr_model_id,
                 a.overlap_frac.map(|v| v as f64)
             ],
@@ -717,15 +848,67 @@ impl Store {
         Ok(())
     }
 
+    /// Replace a transcript after a constrained re-decode, keeping the row's
+    /// provenance honest: the ASR that actually produced these words is the one
+    /// recorded, not the one that produced the words being replaced.
+    pub fn set_segment_text_from_redecode(
+        &self,
+        segment_id: i64,
+        text: &str,
+        lang: &str,
+        asr_model_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET text = ?2, lang = ?3, lang_via = ?4, asr_model_id = ?5
+             WHERE id = ?1",
+            params![segment_id, text, lang, lang_via::REDECODE, asr_model_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a segment whose transcript disagrees with its speaker's declared
+    /// language when nothing can be done about it. The text stays — it is the
+    /// only record of what was said — and `lang` goes back to NULL, because the
+    /// classifier's answer and the speaker's declaration cannot both be right
+    /// and this daemon cannot tell which is wrong.
+    pub fn mark_segment_language_mismatch(&self, segment_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET lang = NULL, lang_via = ?2 WHERE id = ?1",
+            params![segment_id, lang_via::MISMATCH],
+        )?;
+        Ok(())
+    }
+
+    /// Label a segment from a voicebank match (or clear its label). The
+    /// provenance follows: a row with a speaker was matched, a row without one
+    /// has no provenance to record.
     pub fn set_segment_speaker(
         &self,
         segment_id: i64,
         speaker_id: Option<i64>,
         match_score: Option<f32>,
     ) -> Result<()> {
+        let via = speaker_id.map(|_| label_via::MATCH);
+        self.set_segment_speaker_via(segment_id, speaker_id, match_score, via)
+    }
+
+    /// `set_segment_speaker` for a label that did not come from the voicebank:
+    /// the microphone's pin, an inheritance, a person's decision.
+    pub fn set_segment_speaker_via(
+        &self,
+        segment_id: i64,
+        speaker_id: Option<i64>,
+        match_score: Option<f32>,
+        label_via: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "UPDATE segments SET speaker_id = ?2, match_score = ?3 WHERE id = ?1",
-            params![segment_id, speaker_id, match_score.map(|v| v as f64)],
+            "UPDATE segments SET speaker_id = ?2, match_score = ?3, label_via = ?4 WHERE id = ?1",
+            params![
+                segment_id,
+                speaker_id,
+                match_score.map(|v| v as f64),
+                label_via
+            ],
         )?;
         Ok(())
     }
@@ -1252,8 +1435,11 @@ impl Store {
             for id in &write.prototypes {
                 prototypes += move_prototype.execute(params![id, minted, from])?;
             }
+            // A moved row carries a score again, so its provenance is a match
+            // whatever it was before — including an inherited label, which the
+            // re-cluster has just replaced with a measured one.
             let mut move_segment = tx.prepare(
-                "UPDATE segments SET speaker_id = ?2, match_score = ?3
+                "UPDATE segments SET speaker_id = ?2, match_score = ?3, label_via = 'match'
                  WHERE id = ?1 AND speaker_id = ?4",
             )?;
             for (id, score) in &write.segments {
@@ -1291,7 +1477,8 @@ impl Store {
             "SELECT s.id, s.display_name, COALESCE(s.auto_label, s.display_name),
                     s.named_at, s.created_at,
                     COUNT(g.id),
-                    COALESCE(SUM(g.t_end_ns - g.t_start_ns), 0)
+                    COALESCE(SUM(g.t_end_ns - g.t_start_ns), 0),
+                    s.languages
              FROM speakers s
              LEFT JOIN segments g
                  ON g.speaker_id = s.id AND g.deleted_at IS NULL
@@ -1309,10 +1496,53 @@ impl Store {
                     created_at: r.get(4)?,
                     segments: r.get(5)?,
                     speech_ns: r.get(6)?,
+                    languages: crate::lang::parse_languages(
+                        r.get::<_, Option<String>>(7)?.as_deref(),
+                    ),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    // ---- per-speaker languages (v5) --------------------------------------
+
+    /// Which languages a voice speaks. `None` is *any* — the default, and the
+    /// only answer until somebody says otherwise. Resolved through the
+    /// tombstone view so a merged-away id answers for the surviving voice.
+    pub fn speaker_languages(&self, speaker_id: i64) -> Result<Option<Vec<String>>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT s.languages FROM speakers s
+                 JOIN speaker_resolved sp ON sp.canonical_id = s.id
+                 WHERE sp.id = ?1",
+                params![speaker_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(crate::lang::parse_languages(raw.flatten().as_deref()))
+    }
+
+    /// Declare (or clear) a voice's languages. `None` means any.
+    pub fn set_speaker_languages(
+        &self,
+        speaker_id: i64,
+        languages: Option<&[String]>,
+    ) -> Result<()> {
+        let encoded = match languages {
+            None => None,
+            Some([]) => None,
+            Some(list) => Some(serde_json::to_string(list)?),
+        };
+        let n = self.conn.execute(
+            "UPDATE speakers SET languages = ?2 WHERE id = ?1",
+            params![speaker_id, encoded],
+        )?;
+        if n == 0 {
+            bail!("no speaker with id {speaker_id}");
+        }
+        Ok(())
     }
 
     /// One voice, in the shape `speakers.list` returns.
@@ -1390,7 +1620,8 @@ impl Store {
     /// into describing the same segment differently.
     const SEGMENT_COLUMNS: &'static str =
         "g.id, g.session_id, sc.match_key, g.t_start_ns, g.t_end_ns,
-         sp.canonical_id, sp.display_name, g.text, g.overlap_frac, g.match_score, g.audio_path";
+         sp.canonical_id, sp.display_name, g.text, g.overlap_frac, g.match_score, g.audio_path,
+         g.lang, g.label_via";
 
     fn segment_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentRow> {
         Ok(SegmentRow {
@@ -1405,6 +1636,8 @@ impl Store {
             overlap_frac: r.get::<_, Option<f64>>(8)?.map(|v| v as f32),
             match_score: r.get::<_, Option<f64>>(9)?.map(|v| v as f32),
             audio_path: r.get(10)?,
+            lang: r.get(11)?,
+            label_via: r.get(12)?,
         })
     }
 
@@ -1530,7 +1763,7 @@ impl Store {
                 |r| {
                     Ok(SearchHit {
                         row: Self::segment_row_from(r)?,
-                        snippet: r.get(11)?,
+                        snippet: r.get(13)?,
                     })
                 },
             )?
@@ -1736,8 +1969,13 @@ impl Store {
             None => None,
         };
         let n = self.conn.execute(
-            "UPDATE segments SET speaker_id = ?2, match_score = NULL WHERE id = ?1",
-            params![segment_id, speaker_id],
+            "UPDATE segments SET speaker_id = ?2, match_score = NULL, label_via = ?3
+             WHERE id = ?1",
+            params![
+                segment_id,
+                speaker_id,
+                speaker_id.map(|_| label_via::MANUAL)
+            ],
         )?;
         if n == 0 {
             bail!("no segment with id {segment_id}");
@@ -1911,11 +2149,187 @@ impl Store {
         Ok(rows)
     }
 
+    // ---- proximity inheritance (0.6.1) -----------------------------------
+
+    /// The columns proximity inheritance reasons about, for one segment.
+    fn neighbour_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<NeighbourSegment> {
+        Ok(NeighbourSegment {
+            id: r.get(0)?,
+            t_start_ns: r.get(1)?,
+            t_end_ns: r.get(2)?,
+            speaker_id: r.get(3)?,
+            match_score: r.get::<_, Option<f64>>(4)?.map(|v| v as f32),
+            label_via: r.get(5)?,
+        })
+    }
+
+    pub fn neighbour_segment(&self, segment_id: i64) -> Result<Option<NeighbourSegment>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, t_start_ns, t_end_ns, speaker_id, match_score, label_via
+                 FROM segments WHERE id = ?1 AND deleted_at IS NULL",
+                params![segment_id],
+                Self::neighbour_from,
+            )
+            .optional()?)
+    }
+
+    /// The live segments immediately before `segment_id` **in the same
+    /// session**, nearest first.
+    ///
+    /// Same session is not a detail: two sources are two microphones on two
+    /// different conversations, and "the turn before this one" only means
+    /// something inside one of them.
+    pub fn segments_before(&self, segment_id: i64, n: usize) -> Result<Vec<NeighbourSegment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.t_start_ns, g.t_end_ns, g.speaker_id, g.match_score, g.label_via
+             FROM segments g
+             JOIN segments anchor ON anchor.id = ?1
+             WHERE g.session_id = anchor.session_id
+               AND g.deleted_at IS NULL
+               AND (g.t_start_ns, g.id) < (anchor.t_start_ns, anchor.id)
+             ORDER BY g.t_start_ns DESC, g.id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![segment_id, n as i64], Self::neighbour_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // ---- pruning one-off voices (0.6.1) ----------------------------------
+
+    /// Voices that are almost certainly not people: at most one segment and
+    /// under `max_speech_ns` of speech in total.
+    ///
+    /// Named voices are excluded outright — a name is a person saying "this one
+    /// matters", and a sweep must never argue with that — and so is any voice
+    /// that is the target of a merge, because a merge target carries somebody
+    /// else's history even when its own counts look thin.
+    pub fn prune_candidates(
+        &self,
+        max_segments: i64,
+        max_speech_ns: i64,
+    ) -> Result<Vec<SpeakerSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.display_name, COALESCE(s.auto_label, s.display_name),
+                    s.named_at, s.created_at,
+                    COUNT(g.id) AS segments,
+                    COALESCE(SUM(g.t_end_ns - g.t_start_ns), 0) AS speech,
+                    s.languages
+             FROM speakers s
+             LEFT JOIN segments g
+                 ON g.speaker_id = s.id AND g.deleted_at IS NULL
+             WHERE s.merged_into IS NULL
+               AND s.named_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM speakers t WHERE t.merged_into = s.id)
+             GROUP BY s.id
+             HAVING segments <= ?1 AND speech < ?2
+             ORDER BY speech ASC, s.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![max_segments, max_speech_ns], |r| {
+                Ok(SpeakerSummary {
+                    id: r.get(0)?,
+                    display_name: r.get(1)?,
+                    auto_label: r.get(2)?,
+                    named_at: r.get(3)?,
+                    created_at: r.get(4)?,
+                    segments: r.get(5)?,
+                    speech_ns: r.get(6)?,
+                    languages: crate::lang::parse_languages(
+                        r.get::<_, Option<String>>(7)?.as_deref(),
+                    ),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Remove one voice and everything that rests on it, in one transaction.
+    ///
+    /// The cascade is the one `delete.run` performs, plus the identity itself:
+    /// the voice's segments are soft-deleted (so the undo window still applies
+    /// and the sweeper still finalises them), their labels are cleared so the
+    /// foreign key can go, and the prototypes and goldens that made this a
+    /// recognisable voice are removed for real. The golden files are returned
+    /// rather than unlinked — the row goes first, because a file with no row is
+    /// residue the reconciliation sweep understands and a row with no file is a
+    /// lie.
+    pub fn prune_speaker(&self, speaker_id: i64, at_utc_ns: i64) -> Result<PruneReport> {
+        if self.resolve_speaker(speaker_id)? != speaker_id {
+            bail!("speaker {speaker_id} is a tombstone, not a voice");
+        }
+        let segments: Vec<i64> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM segments WHERE speaker_id = ?1 ORDER BY id")?;
+            stmt.query_map(params![speaker_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let goldens: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT audio_path FROM golden_samples WHERE speaker_id = ?1")?;
+            stmt.query_map(params![speaker_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let tx = self.conn.unchecked_transaction()?;
+        let soft_deleted = tx.execute(
+            "UPDATE segments SET deleted_at = ?2
+             WHERE speaker_id = ?1 AND deleted_at IS NULL",
+            params![speaker_id, at_utc_ns],
+        )?;
+        tx.execute(
+            "UPDATE segments SET speaker_id = NULL, match_score = NULL, label_via = NULL
+             WHERE speaker_id = ?1",
+            params![speaker_id],
+        )?;
+        let prototypes = tx.execute(
+            "DELETE FROM speaker_prototypes WHERE speaker_id = ?1",
+            params![speaker_id],
+        )?;
+        tx.execute(
+            "DELETE FROM golden_samples WHERE speaker_id = ?1",
+            params![speaker_id],
+        )?;
+        tx.execute("DELETE FROM speakers WHERE id = ?1", params![speaker_id])?;
+        tx.commit()?;
+
+        Ok(PruneReport {
+            speaker_id,
+            segments,
+            soft_deleted,
+            prototypes,
+            goldens,
+        })
+    }
+
+    /// Live segments that are past the audio window and carry **no memory
+    /// value at all**: no transcript and no speaker. See the sweeper.
+    pub fn empty_unlabelled_older_than(&self, before_utc_ns: i64) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, audio_path FROM segments
+             WHERE deleted_at IS NULL
+               AND speaker_id IS NULL
+               AND (text IS NULL OR TRIM(text) = '')
+               AND t_start_ns < ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![before_utc_ns], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Raw column read, used by tests and by the CLI's single-row lookups.
     pub fn segment_fields(&self, segment_id: i64) -> Result<HashMap<String, Option<String>>> {
         let mut out = HashMap::new();
         self.conn.query_row(
-            "SELECT text, asr_model_id, overlap_frac, speaker_id, match_score
+            "SELECT text, asr_model_id, overlap_frac, speaker_id, match_score, lang, lang_via,
+                    label_via
              FROM segments WHERE id = ?1",
             params![segment_id],
             |r| {
@@ -1933,6 +2347,9 @@ impl Store {
                     "match_score".into(),
                     r.get::<_, Option<f64>>(4)?.map(|v| v.to_string()),
                 );
+                out.insert("lang".into(), r.get::<_, Option<String>>(5)?);
+                out.insert("lang_via".into(), r.get::<_, Option<String>>(6)?);
+                out.insert("label_via".into(), r.get::<_, Option<String>>(7)?);
                 Ok(())
             },
         )?;
@@ -2137,10 +2554,13 @@ mod tests {
         assert_eq!(s.segment_count(1).unwrap(), 1);
         let sources = s.list_sources().unwrap();
         assert_eq!(sources.len(), 1);
-        // v4 backfill, over the whole v1 -> v4 chain: everything that existed
+        // v4 backfill, over the whole v1 -> v5 chain: everything that existed
         // before the microphone was an application.
         assert_eq!(sources[0].kind, KIND_APP);
         assert_eq!(s.session_source_kind(1).unwrap().as_deref(), Some(KIND_APP));
+        // v5: the row had no speaker, so it has no label provenance either,
+        // and no voice has declared a language.
+        assert_eq!(s.segment_fields(1).unwrap()["label_via"], None);
 
         // The v2 surface is usable on the migrated database.
         s.set_segment_analysis(
@@ -2159,6 +2579,63 @@ mod tests {
         drop(s);
         let s = Store::open(&dir).unwrap();
         assert_eq!(s.segment_count(1).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The v5 backfill has one real judgement in it: before v5, "labelled by
+    /// the microphone" was spelled "has a speaker and a NULL score", and that
+    /// spelling has to be read back correctly or every old mic row would claim
+    /// to have been matched against a voicebank it never touched.
+    #[test]
+    fn a_v4_database_learns_where_its_old_labels_came_from() {
+        let dir = std::env::temp_dir().join(format!("nx-recall-mig5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let matched;
+        let mine;
+        let you;
+        {
+            // Build a v4-shaped database using the current code, then take the
+            // v5 columns back off: the only way to test the migration without
+            // pasting a whole historical schema in here.
+            let s = Store::open(&dir).unwrap();
+            let src = s.upsert_source("VRChat.exe", "VRChat.exe", 1).unwrap();
+            let sess = s.begin_session(src, 0).unwrap();
+            you = s.ensure_you_speaker(1).unwrap();
+            let other = s.create_speaker("Kira", 1).unwrap();
+            matched = s.insert_segment(sess, 0, 1_000, "a.wav", 0).unwrap();
+            mine = s.insert_segment(sess, 2_000, 3_000, "b.wav", 0).unwrap();
+            s.set_segment_speaker(matched, Some(other), Some(0.8))
+                .unwrap();
+            s.set_segment_speaker(mine, Some(you), None).unwrap();
+            s.conn
+                .execute_batch(
+                    "DROP INDEX IF EXISTS idx_segments_label_via;
+                     ALTER TABLE segments DROP COLUMN label_via;
+                     ALTER TABLE segments DROP COLUMN lang_via;
+                     ALTER TABLE speakers DROP COLUMN languages;
+                     UPDATE schema_version SET version = 4;",
+                )
+                .unwrap();
+        }
+
+        let s = Store::open(&dir).unwrap();
+        let v: i64 = s
+            .conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(
+            s.segment_fields(matched).unwrap()["label_via"].as_deref(),
+            Some(label_via::MATCH)
+        );
+        assert_eq!(
+            s.segment_fields(mine).unwrap()["label_via"].as_deref(),
+            Some(label_via::MIC),
+            "a scoreless row on the pinned voice was the microphone, not a match"
+        );
+        assert_eq!(s.you_speaker_id().unwrap(), Some(you));
+        assert_eq!(s.speaker_languages(you).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2667,6 +3144,7 @@ mod tests {
             &SegmentAnalysis {
                 text: Some("some words".into()),
                 lang: Some("en".into()),
+                lang_via: Some(lang_via::CLASSIFIED.into()),
                 asr_model_id: Some("parakeet@1".into()),
                 overlap_frac: Some(0.25),
             },
@@ -2677,6 +3155,8 @@ mod tests {
         assert_eq!(f["asr_model_id"].as_deref(), Some("parakeet@1"));
         assert!(f["overlap_frac"].as_ref().unwrap().starts_with("0.25"));
         assert_eq!(f["speaker_id"], None);
+        assert_eq!(f["lang"].as_deref(), Some("en"));
+        assert_eq!(f["lang_via"].as_deref(), Some(lang_via::CLASSIFIED));
     }
 
     #[test]
@@ -3121,5 +3601,321 @@ mod tests {
         let todo = s.unanalysed_segments(10).unwrap();
         assert_eq!(todo.len(), 1);
         assert_eq!(todo[0].0, pending);
+    }
+
+    // ---- v5: per-speaker languages ---------------------------------------
+
+    #[test]
+    fn a_voice_speaks_any_language_until_somebody_says_otherwise() {
+        let s = store();
+        let id = s.create_speaker("Kira", 1).unwrap();
+        assert_eq!(s.speaker_languages(id).unwrap(), None);
+        assert_eq!(s.list_speakers().unwrap()[0].languages, None);
+
+        s.set_speaker_languages(id, Some(&["de".into(), "en".into()]))
+            .unwrap();
+        assert_eq!(
+            s.speaker_languages(id).unwrap(),
+            Some(vec!["de".to_string(), "en".to_string()])
+        );
+        assert_eq!(
+            s.list_speakers().unwrap()[0].languages,
+            Some(vec!["de".to_string(), "en".to_string()])
+        );
+
+        // An empty list is the same fact as "any" and is stored the same way,
+        // so the setting has exactly one representation in the database.
+        s.set_speaker_languages(id, Some(&[])).unwrap();
+        assert_eq!(s.speaker_languages(id).unwrap(), None);
+        s.set_speaker_languages(id, Some(&["en".into()])).unwrap();
+        s.set_speaker_languages(id, None).unwrap();
+        assert_eq!(s.speaker_languages(id).unwrap(), None);
+
+        assert!(s.set_speaker_languages(4242, None).is_err());
+    }
+
+    #[test]
+    fn a_merged_away_id_answers_with_the_surviving_voices_languages() {
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let b = s.create_speaker("B", 1).unwrap();
+        s.set_speaker_languages(b, Some(&["de".into()])).unwrap();
+        s.merge_speakers(a, b).unwrap();
+        assert_eq!(
+            s.speaker_languages(a).unwrap(),
+            Some(vec!["de".to_string()])
+        );
+    }
+
+    // ---- v5: label provenance --------------------------------------------
+
+    #[test]
+    fn every_way_a_label_can_arrive_says_so_on_the_row() {
+        let s = store();
+        let seg = a_segment(&s);
+        let spk = s.create_speaker("Kira", 1).unwrap();
+
+        s.set_segment_speaker(seg, Some(spk), Some(0.7)).unwrap();
+        assert_eq!(
+            s.segment_fields(seg).unwrap()["label_via"].as_deref(),
+            Some(label_via::MATCH)
+        );
+
+        s.set_segment_speaker_via(seg, Some(spk), None, Some(label_via::PROXIMITY))
+            .unwrap();
+        assert_eq!(
+            s.segment_fields(seg).unwrap()["label_via"].as_deref(),
+            Some(label_via::PROXIMITY)
+        );
+
+        // A person's decision outranks and overwrites an inherited one.
+        s.reassign_segment(seg, Some(spk)).unwrap();
+        assert_eq!(
+            s.segment_fields(seg).unwrap()["label_via"].as_deref(),
+            Some(label_via::MANUAL)
+        );
+
+        // Clearing the label clears the provenance: there is nothing to
+        // describe the origin of any more.
+        s.set_segment_speaker(seg, None, None).unwrap();
+        assert_eq!(s.segment_fields(seg).unwrap()["label_via"], None);
+    }
+
+    #[test]
+    fn a_re_decode_replaces_the_words_and_the_model_that_wrote_them() {
+        let s = store();
+        let seg = a_segment(&s);
+        s.set_segment_analysis(
+            seg,
+            &SegmentAnalysis {
+                text: Some("das ist nicht so".into()),
+                lang: Some("de".into()),
+                lang_via: Some(lang_via::CLASSIFIED.into()),
+                asr_model_id: Some("multilingual@1".into()),
+                overlap_frac: Some(0.0),
+            },
+        )
+        .unwrap();
+
+        s.set_segment_text_from_redecode(seg, "that is not so", "en", "english-only@1")
+            .unwrap();
+        let f = s.segment_fields(seg).unwrap();
+        assert_eq!(f["text"].as_deref(), Some("that is not so"));
+        assert_eq!(f["lang"].as_deref(), Some("en"));
+        assert_eq!(f["lang_via"].as_deref(), Some(lang_via::REDECODE));
+        assert_eq!(
+            f["asr_model_id"].as_deref(),
+            Some("english-only@1"),
+            "the row must name the model that produced the words it holds"
+        );
+        // The index follows the new words, not the old ones.
+        assert_eq!(s.search("nicht", 10).unwrap().len(), 0);
+        assert_eq!(s.search("not", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_unresolvable_language_disagreement_keeps_the_words_and_drops_the_tag() {
+        let s = store();
+        let seg = a_segment(&s);
+        s.set_segment_analysis(
+            seg,
+            &SegmentAnalysis {
+                text: Some("that is not so".into()),
+                lang: Some("en".into()),
+                lang_via: Some(lang_via::CLASSIFIED.into()),
+                asr_model_id: Some("multilingual@1".into()),
+                overlap_frac: Some(0.0),
+            },
+        )
+        .unwrap();
+        s.mark_segment_language_mismatch(seg).unwrap();
+        let f = s.segment_fields(seg).unwrap();
+        assert_eq!(
+            f["text"].as_deref(),
+            Some("that is not so"),
+            "the transcript is the only record of what was said"
+        );
+        assert_eq!(f["lang"], None);
+        assert_eq!(f["lang_via"].as_deref(), Some(lang_via::MISMATCH));
+    }
+
+    // ---- v5: neighbours and pruning --------------------------------------
+
+    /// Three consecutive turns in one session, and one in another.
+    fn a_conversation(s: &Store) -> (i64, Vec<i64>) {
+        let src = s.upsert_source("VRChat.exe", "VRChat.exe", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let ids = (0..3)
+            .map(|i| {
+                let t = i * 10_000_000_000;
+                let id = s
+                    .insert_segment(sess, t, t + 4_000_000_000, &format!("s/{i}.wav"), 0)
+                    .unwrap();
+                s.set_segment_analysis(
+                    id,
+                    &SegmentAnalysis {
+                        text: Some(format!("turn {i}")),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                id
+            })
+            .collect();
+        (sess, ids)
+    }
+
+    #[test]
+    fn neighbours_stop_at_the_session_boundary() {
+        let s = store();
+        let (_, ids) = a_conversation(&s);
+        let other_src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let other = s.begin_session(other_src, 0).unwrap();
+        let elsewhere = s
+            .insert_segment(other, 5_000_000_000, 6_000_000_000, "o.wav", 0)
+            .unwrap();
+
+        let before = s.segments_before(ids[2], 5).unwrap();
+        assert_eq!(
+            before.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![ids[1], ids[0]],
+            "nearest first, and never across a session"
+        );
+        assert!(s.segments_before(ids[0], 5).unwrap().is_empty());
+        assert!(s.segments_before(elsewhere, 5).unwrap().is_empty());
+
+        // A soft-deleted row is not a neighbour: it is not in any read path.
+        s.soft_delete_segments(&[ids[1]], 1).unwrap();
+        assert_eq!(
+            s.segments_before(ids[2], 5).unwrap()[0].id,
+            ids[0],
+            "a deleted turn does not stand between two others"
+        );
+    }
+
+    #[test]
+    fn pruning_refuses_your_own_voice_and_every_named_one() {
+        let s = store();
+        let (sess, _) = a_conversation(&s);
+
+        // A one-off: minted, never named, one short segment.
+        let grunt = s.mint_speaker(1).unwrap();
+        let g = s.insert_segment(sess, 0, 900_000_000, "g.wav", 0).unwrap();
+        s.set_segment_speaker(g, Some(grunt), Some(0.4)).unwrap();
+
+        // The user's own voice, with exactly as little to show for it.
+        let you = s.ensure_you_speaker(1).unwrap();
+        let y = s.insert_segment(sess, 0, 900_000_000, "y.wav", 0).unwrap();
+        s.set_segment_speaker_via(y, Some(you), None, Some(label_via::MIC))
+            .unwrap();
+
+        // A named voice, ditto. A name is the user saying "this one matters".
+        let named = s.mint_speaker(1).unwrap();
+        s.rename_speaker(named, "Kira", 2).unwrap();
+        let n = s.insert_segment(sess, 0, 900_000_000, "n.wav", 0).unwrap();
+        s.set_segment_speaker(n, Some(named), Some(0.4)).unwrap();
+
+        let candidates = s.prune_candidates(1, 3_000_000_000).unwrap();
+        let ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
+        assert!(ids.contains(&grunt), "the one-off voice is a candidate");
+        assert!(
+            !ids.contains(&named),
+            "a named voice is never swept, whatever its counts say"
+        );
+        // "You" is unnamed and thin, so the *query* offers it — the guard that
+        // keeps it is the pin, which only the caller can resolve.
+        assert!(ids.contains(&you));
+        assert_eq!(s.you_speaker_id().unwrap(), Some(you));
+
+        // A voice somebody merged into is never a candidate either: its own
+        // counts look thin but it carries another voice's history.
+        let target = s.mint_speaker(1).unwrap();
+        let ghost = s.mint_speaker(1).unwrap();
+        s.merge_speakers(ghost, target).unwrap();
+        let after: Vec<i64> = s
+            .prune_candidates(1, 3_000_000_000)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(!after.contains(&target), "a merge target is not a one-off");
+    }
+
+    #[test]
+    fn pruning_a_voice_removes_the_identity_and_soft_deletes_its_words() {
+        let s = store();
+        let (sess, _) = a_conversation(&s);
+        let grunt = s.mint_speaker(1).unwrap();
+        let seg = s.insert_segment(sess, 0, 900_000_000, "g.wav", 0).unwrap();
+        s.set_segment_speaker(seg, Some(grunt), Some(0.4)).unwrap();
+        s.add_prototype(grunt, &emb("m@1", &[1.0, 0.0]), Some(seg), false, 20, 0)
+            .unwrap();
+        s.add_golden_sample(grunt, "goldens/000009/a.wav", 1.0)
+            .unwrap();
+
+        let report = s.prune_speaker(grunt, 500).unwrap();
+        assert_eq!(report.segments, vec![seg]);
+        assert_eq!(report.soft_deleted, 1);
+        assert_eq!(report.prototypes, 1);
+        assert_eq!(report.goldens, vec!["goldens/000009/a.wav".to_string()]);
+
+        // The identity is gone, not tombstoned: nothing was merged anywhere.
+        assert!(!s.list_speakers().unwrap().iter().any(|v| v.id == grunt));
+        assert!(s.speaker_name(grunt).unwrap().is_none());
+        // The segment is out of every read path, and carries no dangling id.
+        assert!(
+            !s.transcript(None, None)
+                .unwrap()
+                .iter()
+                .any(|r| r.segment_id == seg)
+        );
+        let f = s.segment_fields(seg).unwrap();
+        assert_eq!(f["speaker_id"], None);
+        assert_eq!(f["label_via"], None);
+        // …and the undo window still applies, exactly as a delete-by-speaker.
+        assert_eq!(s.expired_soft_deletes(1_000).unwrap().len(), 1);
+
+        // A tombstone is not a voice and cannot be pruned.
+        let a = s.mint_speaker(1).unwrap();
+        let b = s.mint_speaker(1).unwrap();
+        s.merge_speakers(a, b).unwrap();
+        assert!(s.prune_speaker(a, 500).is_err());
+    }
+
+    #[test]
+    fn a_row_with_no_words_and_no_voice_is_findable_as_such() {
+        let s = store();
+        let (sess, _) = a_conversation(&s);
+        let empty = s.insert_segment(sess, 100, 900, "e.wav", 0).unwrap();
+        let worded = s.insert_segment(sess, 200, 900, "w.wav", 0).unwrap();
+        let labelled = s.insert_segment(sess, 300, 900, "l.wav", 0).unwrap();
+        s.set_segment_analysis(
+            worded,
+            &SegmentAnalysis {
+                text: Some("something".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let spk = s.mint_speaker(1).unwrap();
+        s.set_segment_speaker(labelled, Some(spk), Some(0.8))
+            .unwrap();
+
+        let found: Vec<i64> = s
+            .empty_unlabelled_older_than(1_000)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            found,
+            vec![empty],
+            "only the row that is neither searchable nor attributable"
+        );
+        // Whitespace is not a transcript either.
+        s.correct_segment_text(empty, "   ").unwrap();
+        assert_eq!(s.empty_unlabelled_older_than(1_000).unwrap().len(), 1);
+        // Nothing before the cutoff.
+        assert!(s.empty_unlabelled_older_than(50).unwrap().is_empty());
     }
 }

@@ -57,6 +57,10 @@ export function isUncertain(seg) {
   if (!seg) return false;
   if (seg.speaker == null) return true;
   if ((seg.overlap_frac ?? 0) > OVERLAP_REFUSE) return true;
+  // Inherited from the turns either side of it rather than heard (0.6.1). It
+  // has a name and no score, and the honest reading of that is "probably, for
+  // a good reason" — which is exactly what the uncertain treatment says.
+  if (seg.label_via === 'proximity') return true;
   if (seg.match_score != null && seg.match_score < WEAK_MATCH) return true;
   return false;
 }
@@ -76,7 +80,33 @@ export function uncertainReason(seg) {
   if (ov > OVERLAP_REFUSE)
     return `Overlapped speech (${Math.round(ov * 100)}%) — this label is not trustworthy. Click to correct it.`;
   if (seg.speaker == null) return 'No known voice matched this segment. Click to assign one.';
+  // A fragment too short for the voicebank to place, sitting inside somebody
+  // else's turn. The clock named it, not the model, and saying so is the whole
+  // point of the mark.
+  if (seg.label_via === 'proximity')
+    return `Too short to identify on its own — inherited from the surrounding turn, which was ${speakerLabel(seg.speaker)}. Click to correct it.`;
   return `Weak voice match (${(seg.match_score ?? 0).toFixed(2)}). Click to correct it.`;
+}
+
+/**
+ * How a voice's languages read in one short phrase. `null`/absent is "Any",
+ * the default — and the difference matters, because only a voice pinned to
+ * exactly one language ever gets a transcript corrected.
+ */
+export const LANGUAGE_CHOICES = [
+  { value: '', label: 'Any', title: 'No correction: any language is expected from this voice.' },
+  { value: 'de', label: 'German', title: 'A transcript that reads as English is flagged — there is no German-constrained decoder to re-run it with.' },
+  { value: 'en', label: 'English', title: 'A transcript that reads as German is decoded again with the English-only model.' },
+  { value: 'de,en', label: 'German + English', title: 'Two languages: nothing is corrected, because either one is expected.' },
+];
+
+export function languageValue(sp) {
+  const list = sp?.languages;
+  return Array.isArray(list) && list.length ? [...list].sort().join(',') : '';
+}
+
+export function languageLabel(sp) {
+  return LANGUAGE_CHOICES.find((c) => c.value === languageValue(sp))?.label ?? 'Any';
 }
 
 // -- queries ----------------------------------------------------------------
@@ -260,9 +290,29 @@ export function applyEvent(evt, opts = {}) {
         for (const seg of store.segments) if (seg.speaker === from) seg.speaker = into;
         return { relabel: [from, into], merged: { from, into } };
       }
+      // A swept one-off voice (0.6.1): the identity is gone, not merged, and
+      // its rows arrive separately as a `purge`.
+      if (d.pruned) {
+        store.speakers.delete(d.speaker);
+        for (const seg of store.segments) if (seg.speaker === d.speaker) seg.speaker = null;
+        return { relabel: [d.speaker], speakers: true };
+      }
       const sp = store.speakers.get(d.speaker);
-      if (sp) sp.name = d.name ?? null;
-      else store.speakers.set(d.speaker, { id: d.speaker, name: d.name ?? null, auto: null, segments: 0, total_ms: 0 });
+      if (sp) {
+        sp.name = d.name ?? null;
+        // Only when the event carries it: a plain rename must not silently
+        // clear a language declaration it never mentioned.
+        if (d.languages !== undefined) sp.languages = d.languages;
+      } else {
+        store.speakers.set(d.speaker, {
+          id: d.speaker,
+          name: d.name ?? null,
+          auto: null,
+          languages: d.languages ?? null,
+          segments: 0,
+          total_ms: 0,
+        });
+      }
       return { relabel: [d.speaker] };
     }
 
