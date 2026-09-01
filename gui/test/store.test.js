@@ -16,6 +16,14 @@ import {
   micChip,
   onboardingCandidates,
   mergeSegments,
+  prependSegments,
+  replaceSegments,
+  setFollowing,
+  collapseToTail,
+  trimWindow,
+  capWindow,
+  MAX_SEGMENTS,
+  HARD_MAX,
   speakerLabel,
   segmentSpeakerLabel,
   LANGUAGE_CHOICES,
@@ -30,6 +38,8 @@ function reset() {
   store.sources = [];
   store.ops = new Map();
   store.status = null;
+  store.appended = 0;
+  store.window = { following: true, anchor: null, capped: false, beginning: false, firstMs: null };
   store.mic = { enabled: false, mode: 'follow', active: false, state: 'off', device: null, you_speaker: null };
   store.graph = { counts: null, enrichment: { phase: 'off' }, config: null };
 }
@@ -382,4 +392,234 @@ test('an unknown event is still ignored rather than being an error', () => {
   reset();
   assert.equal(applyEvent({ seq: 1, ev: 'something-from-0.8', data: { x: 1 } }), null);
   assert.equal(applyEvent({ seq: 2, ev: 'graph' }), null);
+});
+
+// ---- 0.7.4: the window model ---------------------------------------------
+//
+// One rule, asserted from every side below: TRIMMING NEVER HAPPENS IN THE
+// DIRECTION THE READER IS LOOKING. Following the tail, that direction is the
+// newest rows and the oldest are dropped above MAX_SEGMENTS exactly as they
+// always were. Browsing, it is the older rows and nothing is dropped at all.
+
+/** Fill the window with `n` rows in time order, ids 1..n. */
+function fill(n, from = 1) {
+  const rows = [];
+  for (let i = from; i < from + n; i += 1) rows.push(seg(i));
+  store.segments = rows;
+  store.segById = new Map(rows.map((s) => [s.id, s]));
+  return rows;
+}
+
+test('following the tail, the window still trims the oldest above 600', () => {
+  reset();
+  fill(MAX_SEGMENTS);
+  applyEvent({ seq: 1, ev: 'segment', data: seg(MAX_SEGMENTS + 1) });
+  assert.equal(store.segments.length, MAX_SEGMENTS, 'the live window is still bounded');
+  assert.equal(store.segments[0].id, 2, 'the OLDEST row went, which is the unchanged behaviour');
+  assert.equal(store.segById.has(1), false, 'the index followed the array');
+  assert.equal(store.segments.at(-1).id, MAX_SEGMENTS + 1);
+  assert.equal(store.appended, 1, 'a bounded window still counts what arrived');
+});
+
+test('browsing history, a live segment trims nothing at all', () => {
+  reset();
+  fill(MAX_SEGMENTS);
+  setFollowing(false);
+  for (let i = 0; i < 50; i += 1) applyEvent({ seq: i, ev: 'segment', data: seg(MAX_SEGMENTS + 1 + i) });
+  assert.equal(store.segments.length, MAX_SEGMENTS + 50, 'trimming is suspended while reading history');
+  assert.equal(store.segments[0].id, 1, 'the row at the top of the reader’s screen is still there');
+  assert.equal(store.appended, 50);
+});
+
+test('a page of older rows prepends without duplicating or reordering', () => {
+  reset();
+  fill(10, 101); // ids 101..110
+  setFollowing(false);
+  // The page overlaps what is already held — the daemon's `to` is exclusive so
+  // it should not, but a client that trusted that would corrupt itself the one
+  // time it was wrong.
+  const added = prependSegments([seg(97), seg(99), seg(101), seg(98)]);
+  assert.equal(added, 3, 'the row already held was not added twice');
+  assert.deepEqual(store.segments.slice(0, 4).map((s) => s.id), [97, 98, 99, 101]);
+  assert.equal(store.segments.length, 13);
+  assert.equal(new Set(store.segments.map((s) => s.id)).size, 13, 'no duplicate ids');
+  assert.deepEqual(
+    store.segments.map((s) => s.t_ms),
+    [...store.segments.map((s) => s.t_ms)].sort((a, b) => a - b),
+    'the window stayed in time order'
+  );
+});
+
+test('a prepend leaves the tail, so no live row can undo it', () => {
+  reset();
+  fill(MAX_SEGMENTS, 1000);
+  assert.equal(store.window.following, true);
+  prependSegments([seg(1), seg(2)]);
+  assert.equal(store.window.following, false, 'asking for older rows IS browsing');
+  // …and the proof: the very next live segment used to be enough to throw the
+  // fetched page away, because the window was already full.
+  applyEvent({ seq: 1, ev: 'segment', data: seg(9999) });
+  assert.equal(store.segById.has(1), true, 'the page that was just fetched survived a live row');
+  assert.equal(store.segments[0].id, 1);
+});
+
+test('audit finding #12: history merged in for a jump survives a full window', () => {
+  reset();
+  // The exact shape of the bug. The window is FULL (which is when it bit) and
+  // a search hit two hours older is merged in for context. The old code sorted
+  // the page in and then shift()ed the oldest rows off to get back to 600 —
+  // dropping precisely the rows it had just been asked to show.
+  fill(MAX_SEGMENTS, 1000);
+  const context = [seg(1), seg(2), seg(3), seg(4), seg(5)];
+  const added = mergeSegments(context);
+
+  assert.equal(added, 5);
+  for (const c of context) {
+    assert.ok(store.segById.has(c.id), `merged row ${c.id} was discarded — this is finding #12`);
+  }
+  assert.deepEqual(store.segments.slice(0, 5).map((s) => s.id), [1, 2, 3, 4, 5]);
+  assert.equal(store.segments.length, MAX_SEGMENTS + 5, 'nothing was trimmed to make room');
+  assert.equal(store.window.following, false, 'a jump into the past is not the live tail');
+});
+
+test('merging rows that are NOT older leaves the follow state alone', () => {
+  reset();
+  fill(10, 100);
+  // Backfilling a gap inside the window, or re-merging what is already there,
+  // is not a jump — the tail must not be dropped for it.
+  mergeSegments([seg(105), seg(106)]);
+  assert.equal(store.window.following, true);
+  assert.equal(store.segments.length, 10);
+});
+
+test('returning to Follow collapses the window to the newest 600 in one step', () => {
+  reset();
+  fill(2400);
+  setFollowing(false);
+  assert.equal(store.segments.length, 2400, 'browsing keeps everything that was paged in');
+
+  const dropped = setFollowing(true);
+  assert.equal(dropped, true);
+  assert.equal(store.segments.length, MAX_SEGMENTS, 'one step, not a slow bleed');
+  assert.equal(store.segments[0].id, 2400 - MAX_SEGMENTS + 1, 'the NEWEST 600 are what is left');
+  assert.equal(store.segments.at(-1).id, 2400);
+  assert.equal(store.segById.size, MAX_SEGMENTS, 'the index collapsed with the array');
+  assert.equal(store.window.capped, false);
+  // …and the beginning marker cannot still be true: the beginning just went.
+  assert.equal(store.window.beginning, false);
+});
+
+test('collapsing a window that never grew keeps the beginning marker', () => {
+  reset();
+  fill(40);
+  store.window.beginning = true;
+  setFollowing(false);
+  setFollowing(true);
+  assert.equal(store.segments.length, 40);
+  assert.equal(store.window.beginning, true, 'nothing was dropped, so nothing stopped being true');
+});
+
+test('the 20k ceiling trims from whichever end is furthest from the reader', () => {
+  reset();
+  fill(HARD_MAX);
+  setFollowing(false);
+
+  // Reading the OLDEST rows: the anchor is at the top, so the newest go.
+  store.window.anchor = store.segments[0].id;
+  prependSegments([seg(0, { t_ms: 1 }), seg(-1, { t_ms: 0 })]);
+  assert.equal(store.segments.length, HARD_MAX);
+  assert.equal(store.segments[0].id, -1, 'the rows being read stayed');
+  assert.equal(store.segById.has(HARD_MAX), false, 'the far end was trimmed instead');
+  assert.equal(store.window.capped, true, 'hitting the ceiling is said out loud');
+
+  // Reading the NEWEST rows: the anchor is at the bottom, so the oldest go —
+  // the same rule, pointing the other way.
+  reset();
+  fill(HARD_MAX);
+  store.window.anchor = store.segments.at(-1).id;
+  store.window.following = false;
+  const first = store.segments[0].id;
+  mergeSegments([seg(HARD_MAX + 1), seg(HARD_MAX + 2)]);
+  assert.equal(store.segments.length, HARD_MAX);
+  assert.equal(store.segById.has(first), false, 'the far end — the old one — was trimmed');
+  assert.equal(store.segments.at(-1).id, HARD_MAX + 2);
+});
+
+test('with no anchor at all the ceiling degrades to the tail behaviour', () => {
+  reset();
+  fill(HARD_MAX + 5);
+  store.window.anchor = null;
+  store.window.following = false;
+  capWindow();
+  assert.equal(store.segments.length, HARD_MAX);
+  assert.equal(store.segments.at(-1).id, HARD_MAX + 5, 'the newest rows are the safe default to keep');
+  assert.equal(store.segments[0].id, 6);
+});
+
+test('trimWindow is the only trim, and it does nothing while browsing', () => {
+  reset();
+  fill(5000);
+  setFollowing(false);
+  assert.equal(trimWindow(), 0, 'nothing to trim: under the ceiling, and not following');
+  assert.equal(store.segments.length, 5000);
+
+  store.window.following = true;
+  assert.equal(trimWindow(), 5000 - MAX_SEGMENTS);
+  assert.equal(store.segments.length, MAX_SEGMENTS);
+});
+
+test('the date picker replaces the window rather than merging into it', () => {
+  reset();
+  fill(600, 5000);
+  const day = [seg(11), seg(12), seg(13)];
+  assert.equal(replaceSegments(day), 3);
+  assert.deepEqual(store.segments.map((s) => s.id), [11, 12, 13]);
+  assert.equal(store.segById.size, 3, 'the index was rebuilt, not appended to');
+  assert.equal(store.window.following, false, 'you asked to be somewhere else');
+  assert.equal(store.window.beginning, false, 'a day in the middle is not the beginning');
+  assert.equal(store.window.anchor, 11, 'the reader lands at the START of the day');
+  // …and from there the scrollback still works: paging back is anchored on the
+  // first row of whatever is resident, whichever way you got there.
+  assert.equal(store.segments[0].id, 11);
+});
+
+test('a live row arriving in a detached window is counted, not filed', () => {
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', segments: 0, total_ms: 0 });
+  // The date picker took the window to another day. Tonight's rows must not
+  // pile up underneath July's — the tail is one query away when Follow is
+  // pressed, and until then this window is somewhere else.
+  replaceSegments([seg(11), seg(12)]);
+  assert.equal(store.window.detached, true);
+
+  const change = applyEvent({ seq: 1, ev: 'segment', data: seg(9000) });
+  assert.deepEqual(change, { detached: true }, 'no `added` — nothing was rendered');
+  assert.equal(store.segments.length, 2, 'the day you are reading is untouched');
+  assert.equal(store.segById.has(9000), false);
+  // …but it happened, and the speakers view is entitled to know.
+  assert.equal(store.appended, 1);
+  assert.equal(store.speakers.get(1).segments, 1);
+
+  // A correction to a row that IS resident still lands, detached or not.
+  const upd = applyEvent({ seq: 2, ev: 'segment', data: seg(11, { text: 'fixed' }) });
+  assert.ok(upd.updated);
+  assert.equal(store.segById.get(11).text, 'fixed');
+});
+
+test('a purge still works while browsing, and takes only what it names', () => {
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', segments: 0, total_ms: 0 });
+  fill(800);
+  setFollowing(false);
+  applyEvent({ seq: 1, ev: 'purge', data: { ids: [1, 2, 800] } });
+  assert.equal(store.segments.length, 797, 'the purge trimmed, the WINDOW did not');
+  assert.equal(store.segments[0].id, 3);
+});
+
+test('collapseToTail is idempotent and safe on an empty window', () => {
+  reset();
+  assert.equal(collapseToTail(), 0);
+  fill(MAX_SEGMENTS);
+  assert.equal(collapseToTail(), 0, 'exactly at the window is not over it');
+  assert.equal(store.segments.length, MAX_SEGMENTS);
 });

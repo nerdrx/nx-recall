@@ -2264,6 +2264,14 @@ impl Store {
     }
 
     /// A transcript page: chronological, filtered, capped.
+    ///
+    /// Which END the LIMIT bites off is the whole contract, and it is decided
+    /// by `anchored` below. A `to` alone does not anchor, which makes
+    /// `{to, limit}` mean "the newest `limit` rows strictly before T" — the
+    /// backwards-paging primitive the GUI's infinite scrollback is built on,
+    /// with no extra method. See
+    /// `tests::a_to_only_transcript_page_is_the_newest_rows_before_it` for the
+    /// expectation table the mock daemon is held to as well.
     pub fn segment_rows(&self, filter: &SegmentFilter, limit: usize) -> Result<Vec<SegmentRow>> {
         // A limited window with no explicit range means "the most recent
         // `limit` rows" — the live transcript. Selecting ASC LIMIT n here
@@ -4774,6 +4782,129 @@ mod tests {
         );
         assert_eq!(s.segment_rows(&by_window, 10).unwrap().len(), 1);
         assert_eq!(s.segment_rows(&all, 2).unwrap().len(), 2, "limit applies");
+    }
+
+    /// The backwards-paging primitive (0.7.4). The GUI's infinite scrollback is
+    /// built on it and adds no daemon method: `{to, limit}` is "the newest
+    /// `limit` rows strictly before T", which is exactly one page older than
+    /// whatever is already loaded.
+    ///
+    /// This is the 0.7.1 ordering rule seen from the other side. `anchored` is
+    /// `from.is_some() || session.is_some()` — a `to` alone does NOT anchor, so
+    /// the query stays on the DESC + reverse path and the LIMIT bites at the
+    /// NEW end of the range rather than the old one. Selecting ASC here would
+    /// hand back the oldest rows before T and the scrollback would page the
+    /// wrong way for ever.
+    ///
+    /// THE SHARED EXPECTATION TABLE. `gui/test/paging.test.js` asserts the mock
+    /// daemon against this same fixture and these same rows — the mock is a
+    /// conformance twin, not an approximation, because a divergence in this one
+    /// method has shipped three bugs. Ten segments, one per 1000 ns, ids 1..=10
+    /// in time order. `from` is inclusive (`>=`), `to` is exclusive (`<`).
+    ///
+    /// | query                          | rows      | why                         |
+    /// |--------------------------------|-----------|-----------------------------|
+    /// | `{limit: 3}`                   | 8, 9, 10  | unanchored: the newest 3    |
+    /// | `{to: 8000, limit: 3}`         | 5, 6, 7   | the newest 3 before T       |
+    /// | `{to: 5000, limit: 3}`         | 2, 3, 4   | the page before that one    |
+    /// | `{to: 2000, limit: 3}`         | 1         | short page = the beginning  |
+    /// | `{to: 1000, limit: 3}`         | (none)    | T is exclusive              |
+    /// | `{from: 3000, limit: 3}`       | 3, 4, 5   | anchored: the oldest 3      |
+    /// | `{from: 3000, to: 6000, l: 10}`| 3, 4, 5   | a bounded day, in order     |
+    ///
+    /// Every answer is ascending by time, always: the caller renders
+    /// chronologically whichever end the LIMIT bit off.
+    #[test]
+    fn a_to_only_transcript_page_is_the_newest_rows_before_it() {
+        let s = store();
+        let src = s.upsert_source("VRChat.exe", "VRChat.exe", 0).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let ids: Vec<i64> = (1..=10)
+            .map(|n| {
+                s.insert_segment(sess, n * 1_000, n * 1_000 + 500, &format!("{n}.wav"), 0)
+                    .unwrap()
+            })
+            .collect();
+        // Ids are handed out in insertion order, so "row 5" below is ids[4].
+        let row = |n: usize| ids[n - 1];
+        let page = |from: Option<i64>, to: Option<i64>, limit: usize| {
+            s.segment_rows(
+                &SegmentFilter {
+                    from,
+                    to,
+                    ..Default::default()
+                },
+                limit,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>()
+        };
+
+        // The table, line by line.
+        assert_eq!(
+            page(None, None, 3),
+            vec![row(8), row(9), row(10)],
+            "unanchored and limited is the NEWEST n, ascending (the 0.7.1 rule)"
+        );
+        assert_eq!(
+            page(None, Some(8_000), 3),
+            vec![row(5), row(6), row(7)],
+            "a `to` alone must not anchor: this is the newest 3 BEFORE T"
+        );
+        assert_eq!(
+            page(None, Some(5_000), 3),
+            vec![row(2), row(3), row(4)],
+            "paging again from the first row of the previous page walks backwards"
+        );
+        assert_eq!(
+            page(None, Some(2_000), 3),
+            vec![row(1)],
+            "a short page is how a client learns it has reached the beginning"
+        );
+        assert!(
+            page(None, Some(1_000), 3).is_empty(),
+            "`to` is exclusive, so paging from the very first row returns nothing"
+        );
+        assert_eq!(
+            page(Some(3_000), None, 3),
+            vec![row(3), row(4), row(5)],
+            "a `from` DOES anchor: the oldest 3 at or after T"
+        );
+        assert_eq!(
+            page(Some(3_000), Some(6_000), 10),
+            vec![row(3), row(4), row(5)],
+            "a bounded range is the date picker's query, in order"
+        );
+
+        // Walking the whole history backwards in pages of 4 visits every row
+        // exactly once and terminates — the loop the GUI's scrollback runs.
+        let mut seen: Vec<i64> = Vec::new();
+        let mut cursor = None;
+        loop {
+            let rows = s
+                .segment_rows(
+                    &SegmentFilter {
+                        to: cursor,
+                        ..Default::default()
+                    },
+                    4,
+                )
+                .unwrap();
+            if rows.is_empty() {
+                break;
+            }
+            cursor = Some(rows[0].t_start_ns);
+            for r in rows.into_iter().rev() {
+                seen.push(r.id);
+            }
+        }
+        seen.reverse();
+        assert_eq!(
+            seen, ids,
+            "backwards paging visited every row, once, in order"
+        );
     }
 
     #[test]

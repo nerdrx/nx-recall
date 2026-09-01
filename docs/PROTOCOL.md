@@ -53,7 +53,7 @@ Methods (initial set):
 | `thread.get` | `{id}` | one conversation's segments, in order |
 | `search` | `{q, speaker?, source?, from?, to?, limit?}` | FTS5 over transcripts |
 | `search.semantic` | `{q, mode?, speaker?, source?, from?, to?, limit?}` | search by meaning; `mode: "hybrid"` fuses it with FTS. `err:unavailable` when the optional model is not installed — see below |
-| `transcript` | `{session?, speaker?, from?, to?}` | chronological page |
+| `transcript` | `{session?, speaker?, from?, to?, limit?}` | chronological page — see "Paging the transcript" |
 | `delete.preview` / `delete.run` | `{speaker?, session?, from?, to?}` | preview returns counts+bytes; run is an **async op** |
 | `pause` / `resume` | | global capture pause (the panic path; must be instant) |
 | `status` | | uptime, queue depth, drop counters, models loaded |
@@ -594,6 +594,37 @@ delete brings both back.
   mean "wipe the transcript".
 - `search` returns `total` = all matches (pre-LIMIT); hits are the newest first.
 - A limited unanchored `transcript` returns the NEWEST `limit` rows, ascending.
+
+## Paging the transcript
+
+`transcript` pages in both directions with no second method, because **which
+end the `limit` bites off is decided by whether the query is anchored**, and
+only `from` and `session` anchor it:
+
+> **A `transcript` call carrying `to` but no `from` and no `session` returns the
+> newest `limit` rows strictly before `to`, ascending — so passing the timestamp
+> of the oldest row you hold walks one page further back, and a page shorter
+> than `limit` means you have reached the beginning of the archive.**
+
+`from` is inclusive (`>=`), `to` is exclusive (`<`) — which is what makes
+"page again from the first row I already have" return the rows *before* it
+rather than repeating it. Both accept ISO-8601 or a number (milliseconds under
+`1e15`, nanoseconds at or above it). Every reply is ascending by time whichever
+end was trimmed, so a client renders chronologically without re-sorting.
+
+The three shapes, together:
+
+| call | meaning |
+|---|---|
+| `{limit: 600}` | the live tail — the newest 600 rows |
+| `{to: <oldest held>, limit: 400}` | one page further back |
+| `{from: <day start>, to: <day end>}` | a bounded range, oldest first (anchored) |
+
+This is what the desktop client's infinite scrollback and its date picker are
+built on. `mock/mockd.js` implements it identically and `gui/test/paging.test.js`
+holds it to the same expectation table as the daemon's own unit test — a
+divergence in this one method is not a mock detail, it is a bug the GUI cannot
+see until a user hits it.
 
 ## Versioning rules
 

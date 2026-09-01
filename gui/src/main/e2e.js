@@ -137,17 +137,25 @@ export function runE2E(deps) {
     });
 
     // 3 — the live feed appends without a re-query
+    //
+    // Counted with `appended`, not with rows. 0.7.4's window is bounded while
+    // following the tail and the mock now carries fourteen evenings behind the
+    // canned rows, so the list opens FULL: it can be moving and still be 600
+    // rows long. `appended` is the monotone count of live segments this client
+    // has folded in, which is the thing this step is actually about.
     await step('live-feed-appends', async () => {
-      const before = (await js('window.__recallDebug.counts()')).rows;
+      const before = (await js('window.__recallDebug.counts()')).appended;
       const after = await waitFor(
         'a new segment',
         async () => {
-          const n = (await js('window.__recallDebug.counts()')).rows;
-          return n > before ? n : null;
+          const c = await js('window.__recallDebug.counts()');
+          return c.appended > before ? c.appended : null;
         },
         { timeout: 12000 }
       );
-      return { before, after };
+      const w = await js('window.__recallDebug.scrollback()');
+      assert(w.rows > 0, 'the feed appended but nothing is on screen');
+      return { before, after, rows: w.rows, following: w.following };
     });
 
     // 4 — uncertain segments are visibly muted and carry the "?" affordance
@@ -189,6 +197,227 @@ export function runE2E(deps) {
     });
 
     await step('shot-transcript', async () => ({ file: await shot('transcript') }));
+
+    // -----------------------------------------------------------------------
+    // 4c — 0.7.4: the transcript is the whole archive, not the last 600 rows.
+    //
+    // The mock carries fourteen evenings behind its canned rows, so the window
+    // opens FULL and every one of these steps is really paging: scroll up, get
+    // the page before, keep going until the beginning, and never lose your
+    // place doing it.
+    // -----------------------------------------------------------------------
+
+    await step('scrolling-up-loads-the-page-before', async () => {
+      const before = await js('window.__recallDebug.scrollback()');
+      assert(before.following, 'the transcript did not open on the live tail');
+      assert(before.rows > 0, 'nothing rendered to scroll up from');
+      assert(!before.beginning, 'the mock fixture is smaller than one window — nothing to page');
+      assert(before.datePicker, 'the transcript header has no date picker');
+
+      // Where the row at the top of the viewport sits right now. Anchoring is
+      // the claim being tested, and the only honest way to check it is to look
+      // at a real element's position on a real screen before and after.
+      const topOf = (id) =>
+        js(`(() => {
+          const r = document.querySelector('#seg-list .seg[data-seg="${id}"]');
+          return r ? Math.round(r.getBoundingClientRect().top) : null;
+        })()`);
+
+      // A real scroll, not a call into the view: the whole feature is that
+      // this happens because you scrolled.
+      await js('document.getElementById("transcript-body").scrollTop = 0');
+      const after = await waitFor(
+        'an older page',
+        async () => {
+          const w = await js('window.__recallDebug.scrollback()');
+          return w.rows > before.rows ? w : null;
+        },
+        { timeout: 20000 }
+      );
+
+      assert(!after.following, 'scrolling up into history left the Follow button on');
+      assert(after.pressed === 'false', `the button says "${after.pressed}" while reading history`);
+      assert(after.rows === after.unique, `the prepended page duplicated rows (${after.rows} rows, ${after.unique} ids)`);
+      assert(after.ordered, 'the window came back out of time order');
+      assert(after.firstId !== before.firstId, 'the first row did not change — nothing was prepended');
+      assert(after.firstMs < before.firstMs, 'the page that arrived was not OLDER');
+      assert(after.segments === after.rows, `${after.segments} segments in the model, ${after.rows} rows on screen`);
+      return {
+        rows: `${before.rows} → ${after.rows}`,
+        segments: after.segments,
+        page: after.rows - before.rows,
+        anchored: (await topOf(before.firstId)) != null,
+      };
+    });
+
+    await step('a-prepend-does-not-move-what-you-are-reading', async () => {
+      // Park a known row in the middle of the viewport, note where it is, load
+      // another page above it, and assert it did not move. This is the whole
+      // scroll-anchoring contract in one measurement.
+      const mark = await js(`(() => {
+        const rows = [...document.querySelectorAll('#seg-list .seg')];
+        const mid = rows[Math.min(40, rows.length - 1)];
+        mid.scrollIntoView({ block: 'center' });
+        return { id: Number(mid.dataset.seg) };
+      })()`);
+      await sleep(600);
+      const at = (id) =>
+        js(`Math.round(document.querySelector('#seg-list .seg[data-seg="${id}"]').getBoundingClientRect().top)`);
+      const before = await at(mark.id);
+      const rowsBefore = (await js('window.__recallDebug.scrollback()')).rows;
+
+      await js('window.__recallDebug.loadOlder()');
+      const grew = await waitFor(
+        'the page to land',
+        async () => {
+          const w = await js('window.__recallDebug.scrollback()');
+          return w.rows > rowsBefore ? w : null;
+        },
+        { timeout: 20000 }
+      );
+      const after = await at(mark.id);
+      assert(
+        Math.abs(after - before) <= 4,
+        `the row being read jumped ${after - before}px when a page was prepended above it`
+      );
+      return { id: mark.id, top: `${before} → ${after}`, rows: `${rowsBefore} → ${grew.rows}` };
+    });
+
+    await step('the-seams-between-pages-are-clean', async () => {
+      const w = await js('window.__recallDebug.scrollback()');
+      // Several evenings are loaded by now, so there is more than one seam and
+      // more than one day boundary to have got wrong.
+      assert(w.daySeps >= 2, `only ${w.daySeps} day separator(s) across ${w.rows} rows of several evenings`);
+      assert(w.adjacentSeps === 0, 'two day separators ended up back to back — a seam was not recomputed');
+      assert(
+        new Set(w.dayLabels).size === w.dayLabels.length,
+        `the same day is announced twice: ${JSON.stringify(w.dayLabels)}`
+      );
+      assert(w.threadSeps > 0, 'conversation boundaries stopped rendering once pages were prepended');
+      // The one structural rule: nothing but a separator may sit above the
+      // first row, and the first row must have a day header.
+      const leading = await js(`(() => {
+        const first = document.querySelector('#seg-list .seg');
+        const out = [];
+        for (let n = first.previousElementSibling; n; n = n.previousElementSibling) out.unshift(n.className);
+        return out;
+      })()`);
+      assert(leading.length === 1 && /day-sep/.test(leading[0]), `above the first row: ${JSON.stringify(leading)}`);
+      return { days: w.daySeps, threads: w.threadSeps, labels: w.dayLabels.slice(0, 4) };
+    });
+
+    await step('paging-back-reaches-the-beginning-and-says-so', async () => {
+      let w = await js('window.__recallDebug.scrollback()');
+      for (let i = 0; i < 12 && !w.beginning; i += 1) {
+        await js('window.__recallDebug.loadOlder()');
+        await sleep(400);
+        w = await js('window.__recallDebug.scrollback()');
+      }
+      assert(w.beginning, `never reached the beginning (${w.segments} segments loaded)`);
+      assert(w.beginMark.shown, 'the beginning was reached but nothing says so');
+      assert(/beginning/i.test(w.beginMark.text), `the marker does not say what it is: "${w.beginMark.text}"`);
+      assert(
+        /\d{4}-\d{2}-\d{2}|today|yesterday/i.test(w.beginMark.text),
+        `the marker does not say WHEN the first thing was captured: "${w.beginMark.text}"`
+      );
+      assert(w.rows === w.unique, 'the full archive contains duplicate rows');
+      assert(w.ordered, 'the full archive came out of order');
+      assert(!w.note.shown, 'the 20k ceiling notice is up on a fixture nowhere near it');
+
+      // Paging again at the beginning is a no-op. Measured at the OLD end:
+      // the live feed is still appending at the new one, which is correct and
+      // has nothing to do with whether another page came back.
+      const first = w.firstId;
+      const firstMs = w.firstMs;
+      await js('window.__recallDebug.loadOlder()');
+      await sleep(500);
+      const again = await js('window.__recallDebug.scrollback()');
+      assert(again.firstId === first, `paging past the beginning changed the first row (${first} → ${again.firstId})`);
+      assert(again.firstMs === firstMs, 'paging past the beginning reached further back than the beginning');
+      assert(again.beginning, 'the beginning stopped being the beginning');
+
+      await js('document.getElementById("transcript-body").scrollTop = 0');
+      await sleep(300);
+      return { segments: w.segments, marker: w.beginMark.text, days: w.daySeps };
+    });
+
+    await step('shot-scrollback-beginning', async () => ({ file: await shot('scrollback-beginning') }));
+
+    await step('the-date-picker-jumps-to-a-day', async () => {
+      // The day of the oldest thing in the archive — which is loaded right
+      // now, so the expected answer is knowable rather than guessed.
+      const day = await js(`(() => {
+        const t = window.__recallDebug.store.segments[0].t_ms;
+        const d = new Date(t);
+        const p = (n) => String(n).padStart(2, '0');
+        return \`\${d.getFullYear()}-\${p(d.getMonth() + 1)}-\${p(d.getDate())}\`;
+      })()`);
+
+      // Through the real control, with the real event a date input fires.
+      await js(`(() => {
+        const i = document.getElementById('transcript-date');
+        i.value = ${JSON.stringify(day)};
+        i.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      })()`);
+      const w = await waitFor(
+        'the day to load',
+        async () => {
+          const w = await js('window.__recallDebug.scrollback()');
+          return w.detached ? w : null;
+        },
+        { timeout: 15000 }
+      );
+
+      assert(!w.following, 'jumping to a date left the view following the live tail');
+      assert(w.pressed === 'false', 'the Follow button did not follow the jump');
+      assert(w.rows > 0, `nothing rendered for ${day}`);
+      assert(w.daySeps === 1, `${w.daySeps} day separators for a single day`);
+      const allOnTheDay = await js(`(() => {
+        const p = (n) => String(n).padStart(2, '0');
+        const fmt = (t) => { const d = new Date(t); return \`\${d.getFullYear()}-\${p(d.getMonth() + 1)}-\${p(d.getDate())}\`; };
+        return window.__recallDebug.store.segments.every((s) => fmt(s.t_ms) === ${JSON.stringify(day)});
+      })()`);
+      assert(allOnTheDay, `the window holds rows from outside ${day}`);
+      return { day, rows: w.rows, file: await shot('date-jump') };
+    });
+
+    await step('follow-collapses-the-window-and-the-feed-keeps-appending', async () => {
+      const before = await js('window.__recallDebug.scrollback()');
+      const appended = (await js('window.__recallDebug.counts()')).appended;
+
+      await js('document.getElementById("follow-btn").click()');
+      const w = await waitFor(
+        'the collapse back to the tail',
+        async () => {
+          const w = await js('window.__recallDebug.scrollback()');
+          return w.following && !w.detached ? w : null;
+        },
+        { timeout: 15000 }
+      );
+
+      assert(w.pressed === 'true', 'the button did not go back to Following');
+      assert(w.segments <= 600, `the window did not collapse: ${w.segments} segments resident`);
+      assert(w.rows === w.segments, `${w.rows} rows on screen for ${w.segments} segments`);
+      assert(w.lastId !== before.lastId, 'Follow did not come back to the live tail from another day');
+      // At the bottom, and staying there as rows arrive.
+      assert(
+        w.scrollHeight - w.scrollTop - w.clientHeight < 120,
+        `Follow did not land at the bottom (${w.scrollHeight - w.scrollTop - w.clientHeight}px away)`
+      );
+      const after = await waitFor(
+        'the live feed, still running',
+        async () => {
+          const c = await js('window.__recallDebug.counts()');
+          return c.appended > appended ? c.appended : null;
+        },
+        { timeout: 15000 }
+      );
+      const end = await js('window.__recallDebug.scrollback()');
+      assert(end.segments <= 600, `the window grew past its bound again: ${end.segments}`);
+      assert(end.rows === end.unique, 'appending after a collapse duplicated rows');
+      return { collapsedTo: w.segments, appended: `${appended} → ${after}` };
+    });
 
     // 5 — the segment sheet opens, and reassigning writes through the daemon
     await step('segment-sheet-reassign', async () => {
@@ -1066,7 +1295,7 @@ export function runE2E(deps) {
 
     // 8 — pause from the TRAY path stops the feed (DESIGN §8, the marquee case)
     await step('tray-pause-stops-feed', async () => {
-      const before = (await js('window.__recallDebug.counts()')).rows;
+      const before = (await js('window.__recallDebug.counts()')).appended;
       await deps.setPaused(true); // exactly what the tray menu item calls
       await waitFor('the UI to show paused', async () =>
         js('document.getElementById("pause-btn").dataset.paused === "true"')
@@ -1074,7 +1303,7 @@ export function runE2E(deps) {
       const label = await js('document.getElementById("pause-label").textContent');
       const chip = await js('(document.getElementById("live-chip")||{}).textContent || ""');
       await sleep(6000); // three feed intervals
-      const after = (await js('window.__recallDebug.counts()')).rows;
+      const after = (await js('window.__recallDebug.counts()')).appended;
       assert(after === before, `feed kept running while paused (${before} → ${after})`);
       assert(label === 'Resume capture', `pause button did not flip its label (got "${label}")`);
       // The chip sits in the transcript header, where you are actually reading
@@ -1090,12 +1319,12 @@ export function runE2E(deps) {
 
     // 9 — resume, and the feed comes back
     await step('resume-restarts-feed', async () => {
-      const before = (await js('window.__recallDebug.counts()')).rows;
+      const before = (await js('window.__recallDebug.counts()')).appended;
       await deps.setPaused(false);
       const after = await waitFor(
         'the feed to restart',
         async () => {
-          const n = (await js('window.__recallDebug.counts()')).rows;
+          const n = (await js('window.__recallDebug.counts()')).appended;
           return n > before ? n : null;
         },
         { timeout: 12000 }
@@ -1136,6 +1365,106 @@ export function runE2E(deps) {
     });
 
     await step('shot-search-jump', async () => ({ file: await shot('search-jump') }));
+
+    // 11a — audit finding #12, as a regression test with teeth.
+    //
+    // Jump to a hit that is FAR older than the live window — the single oldest
+    // row in the archive, fourteen evenings back — and then wait through three
+    // feed intervals. The old window model sorted the merged context in and
+    // then trimmed the oldest rows to get back to 600, which threw away the
+    // rows it had just been asked to show; the failure looked like "the
+    // transcript went blank a second after I clicked the search result", and
+    // it only happened once the window was full, which is always in practice.
+    // Surviving the wait is the whole assertion.
+    await step('a-jump-to-the-oldest-segment-renders-AND-SURVIVES', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="search"]\').click()');
+      await waitFor('the search box', async () => js('!!document.getElementById("search-q")'));
+      // The date facets default to the last seven days, and the row this step
+      // is after is a fortnight back — so widen them, which is exactly what a
+      // person looking for something old does. Their previous values are put
+      // back afterwards: the facets are sticky by design and the steps that
+      // run later expect the default window.
+      const facets = await js(`(() => {
+        const f = document.getElementById('search-from');
+        const t = document.getElementById('search-to');
+        const was = { from: f.value, to: t.value };
+        f.value = '';
+        t.value = '';
+        document.getElementById('search-q').value = 'obsidian';
+        document.getElementById('search-go').click();
+        return was;
+      })()`);
+      // Wait for THIS query's results, not for whatever the previous step
+      // left on screen — a row count going above zero is true before the new
+      // answer has arrived, and clicking then jumps to the wrong segment.
+      const hit = await waitFor('the obsidian hit', async () => {
+        const rows = await js(`[...document.querySelectorAll('#search-results .seg')]
+          .filter((r) => /obsidian/i.test(r.textContent))
+          .map((r) => Number(r.dataset.hit))`);
+        return rows.length ? rows : null;
+      });
+      const hitId = hit[0];
+      // It really is the far end of the archive — older than everything the
+      // live window holds. Without that this step proves nothing, because the
+      // bug only ever bit on rows the window did not already have.
+      const outside = await js(`(() => {
+        const s = window.__recallDebug.store;
+        return { held: s.segById.has(${hitId}), oldest: s.segments[0]?.t_ms ?? null };
+      })()`);
+      assert(!outside.held, 'the "oldest" segment was already in the live window — the fixture stopped being a test');
+
+      await js(`document.querySelector('#search-results .seg[data-hit="${hitId}"]').click()`);
+      await waitFor('the transcript', async () => js('window.__recallDebug.view() === "transcript"'));
+      const marked = await waitFor(
+        'the hit to be marked in the transcript',
+        async () => js(`!!document.querySelector('#seg-list .seg.hit[data-seg="${hitId}"]')`),
+        { timeout: 15000 }
+      );
+      assert(marked, 'the search hit never rendered in the transcript');
+
+      const w = await js('window.__recallDebug.scrollback()');
+      assert(!w.following, 'a jump into the past left the view following the live tail');
+      const context = await js(`document.querySelectorAll('#seg-list .seg').length`);
+      assert(context > 1, 'the hit rendered with no conversation around it');
+
+      // Three feed intervals. This is the part that used to fail.
+      await sleep(7000);
+      const still = await js(`!!document.querySelector('#seg-list .seg[data-seg="${hitId}"]')`);
+      assert(still, 'the merged context was trimmed away by the live feed — audit finding #12 is back');
+      const inModel = await js(`window.__recallDebug.store.segById.has(${hitId})`);
+      assert(inModel, 'the row left the model even though it is what the user was sent to');
+      const end = await js('window.__recallDebug.scrollback()');
+      assert(end.rows === end.unique, 'the live feed duplicated rows into a browsing window');
+      assert(end.ordered, 'the live feed put the browsing window out of order');
+
+      // And the toast that used to paper over the miss is gone: nothing should
+      // be telling the user their segment is "outside the loaded window".
+      const excuses = await js(
+        '[...document.querySelectorAll(".toast")].filter(t => /outside the loaded window|scrolled out of the live window/i.test(t.textContent)).length'
+      );
+      assert(excuses === 0, 'the old "outside the loaded window" toast is still being shown');
+
+      const file = await shot('jump-to-oldest');
+
+      // Back to the tail, and the facets back to where they were. The facets
+      // are sticky in module state, so putting the inputs back is not enough —
+      // a search has to actually run for the view to write them down again.
+      await js('document.getElementById("follow-btn").click()');
+      await sleep(400);
+      await js('document.querySelector(\'.rail-item[data-view="search"]\').click()');
+      await waitFor('the search box', async () => js('!!document.getElementById("search-q")'));
+      await js(`(() => {
+        document.getElementById('search-from').value = ${JSON.stringify(facets.from)};
+        document.getElementById('search-to').value = ${JSON.stringify(facets.to)};
+        document.getElementById('search-q').value = 'portal';
+        document.getElementById('search-go').click();
+        return true;
+      })()`);
+      await sleep(600);
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      await sleep(400);
+      return { hits: hit.length, segment: hitId, wasOutside: !outside.held, context, file };
+    });
 
     // 11b — the search mode toggle (0.6.5). The mock daemon has the semantic
     // model, so all three modes are live; the absent case is the GUI unit
@@ -1333,12 +1662,24 @@ export function runE2E(deps) {
       assert(style.youUnderline !== style.otherUnderline, 'the You name looks exactly like everyone else');
 
       // …and the layout did not move: same grid, same columns, no extra badge.
+      //
+      // Compared against a row with the SAME meta content. The last track is
+      // content-sized, so a plain row and one carrying a source chip resolve
+      // to different widths for reasons that have nothing to do with the You
+      // treatment — which is what this assertion is about.
       const cols = await js(`(() => {
-        const you = getComputedStyle(document.querySelector('#seg-list .seg.you')).gridTemplateColumns;
-        const other = getComputedStyle(document.querySelector('#seg-list .seg:not(.you)')).gridTemplateColumns;
-        return [you, other];
+        const you = document.querySelector('#seg-list .seg.you');
+        const badges = (r) => r.querySelector('.meta').children.length;
+        const other = [...document.querySelectorAll('#seg-list .seg:not(.you)')].find((r) => badges(r) === badges(you));
+        if (!other) return { skipped: true };
+        return {
+          you: getComputedStyle(you).gridTemplateColumns,
+          other: getComputedStyle(other).gridTemplateColumns,
+          badges: badges(you),
+        };
       })()`);
-      assert(cols[0] === cols[1], `the You row uses a different layout: ${cols}`);
+      assert(!cols.skipped, 'no comparable row to check the You layout against');
+      assert(cols.you === cols.other, `the You row uses a different layout: ${cols.you} vs ${cols.other}`);
 
       const file = await shot('transcript-you');
       return { youRows: seen.youRows, otherRows: seen.otherRows, file };
@@ -1514,8 +1855,8 @@ export function runE2E(deps) {
         const resumed = await waitFor(
           'the feed after the restart',
           async () => {
-            const n = (await js('window.__recallDebug.counts()')).rows;
-            return n > after.rows ? n : null;
+            const n = (await js('window.__recallDebug.counts()')).appended;
+            return n > after.appended ? n : null;
           },
           { timeout: 15000 }
         );

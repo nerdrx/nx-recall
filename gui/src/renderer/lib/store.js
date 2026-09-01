@@ -5,7 +5,24 @@
 
 const OVERLAP_REFUSE = 0.1; // DESIGN §4: embeddings only run at overlap_frac ≤ 0.1
 const WEAK_MATCH = 0.4; // below this the label is a guess worth flagging
-const MAX_SEGMENTS = 600; // the live view is a window, not an archive
+
+/**
+ * The live window while you are FOLLOWING the tail. Not a limit on what the
+ * app can show — 0.7.4 pages backwards without bound — a limit on how much of
+ * the tail is kept resident when nobody is reading history.
+ */
+export const MAX_SEGMENTS = 600;
+
+/** One page of scrollback. */
+export const PAGE_SEGMENTS = 400;
+
+/**
+ * The ceiling on resident rows, in either direction. Twenty thousand segments
+ * is somewhere north of forty hours of conversation and about 20 MB of DOM;
+ * past that the honest thing is to say so and point at search and the date
+ * picker rather than to keep growing until the window stops scrolling.
+ */
+export const HARD_MAX = 20_000;
 
 export const store = {
   conn: { status: 'offline', daemon: null, seq: null, error: null, socketPath: null },
@@ -17,6 +34,36 @@ export const store = {
   speakers: new Map(), // id → {id, name, auto, segments, total_ms, first_seen, you}
   segments: [], // ascending by t_ms
   segById: new Map(),
+  /**
+   * How the resident window behaves (0.7.4). The rule the whole feature turns
+   * on: **trimming must never discard rows in the direction the reader is
+   * looking.**
+   *
+   * - `following` — the live tail. The only state in which the oldest rows may
+   *   be dropped, and they are, above MAX_SEGMENTS, exactly as they always were.
+   * - browsing (`following: false`) — the reader has scrolled up into history,
+   *   or jumped to a search hit or a date. Tail trimming is SUSPENDED: history
+   *   is precisely what it used to throw away (audit finding #12).
+   *
+   * `anchor` is the id of a row near the viewport, set by the view. It decides
+   * which END the 20k ceiling trims from: whichever is further from it.
+   * `beginning` is true once a short page has proved there is nothing older;
+   * `firstMs` is when that first captured row was, for the marker.
+   *
+   * `detached` is the third state and the one that is easy to miss. Scrolling
+   * up is browsing but the tail is still down there at the bottom of the
+   * window; the DATE PICKER throws the window away and rebuilds it somewhere
+   * else, so the tail is not resident at all and cannot be collapsed back to.
+   * Rows arriving live while detached are counted but not filed — tonight does
+   * not belong underneath July — and Follow re-asks for the tail in one query.
+   */
+  window: { following: true, anchor: null, capped: false, beginning: false, firstMs: null, detached: false },
+  /**
+   * How many live segments this client has seen arrive. A monotone counter,
+   * because the row count no longer is: with a bounded window "did the feed
+   * append?" and "did the list get longer?" are different questions.
+   */
+  appended: 0,
   sources: [],
   // The microphone switch (PROTOCOL "The microphone"). Not a source rule: it
   // hears the room rather than one program, so it has its own method, its own
@@ -140,6 +187,17 @@ export async function reloadAll() {
   store.speakers = new Map((speakers.speakers ?? []).map((s) => [s.id, s]));
   store.segments = [...(transcript.segments ?? [])].sort((a, b) => a.t_ms - b.t_ms);
   store.segById = new Map(store.segments.map((s) => [s.id, s]));
+  // A resync lands you back on the live tail, which is where a resync means
+  // you were. A first page SHORTER than the window is the whole archive, so
+  // the beginning is already loaded and the scrollback has nowhere to go.
+  store.window = {
+    following: true,
+    anchor: null,
+    capped: false,
+    beginning: store.segments.length < MAX_SEGMENTS,
+    firstMs: store.segments[0]?.t_ms ?? null,
+    detached: false,
+  };
   store.sources = sources.sources ?? [];
   if (mic) applyMic(mic);
   store.graph = graph ?? { counts: null, enrichment: { phase: 'off' }, config: null };
@@ -187,13 +245,152 @@ export function micChip(state = store.mic.state) {
   }
 }
 
+// -- the resident window ----------------------------------------------------
+
+const byTime = (a, b) => a.t_ms - b.t_ms || a.id - b.id;
+
+function dropOldest() {
+  const seg = store.segments.shift();
+  if (seg) store.segById.delete(seg.id);
+  return seg;
+}
+
+function dropNewest() {
+  const seg = store.segments.pop();
+  if (seg) store.segById.delete(seg.id);
+  return seg;
+}
+
+/** Where the reader is, as an index. The tail, unless the view said otherwise. */
+function anchorIndex(fallbackId = null) {
+  const id = store.window.anchor ?? fallbackId;
+  if (id != null) {
+    const i = store.segments.findIndex((s) => s.id === id);
+    if (i >= 0) return i;
+  }
+  return store.segments.length - 1;
+}
+
 /**
- * Fold a page of history into the live window without disturbing what is
- * already there. Used when a search hit is older than the window: the answer
- * to "what did she say about that world?" is the conversation around the hit,
- * so the surrounding minutes are pulled in rather than replacing the view.
+ * The 20k ceiling, trimmed from whichever END is further from the viewport.
+ *
+ * This is the same rule as the tail trim, generalised: the rows nearest the
+ * anchor are the ones being read, so they are the last thing that may go.
+ * Reaching it at all is worth saying out loud, which is what `capped` is for.
  */
-export function mergeSegments(list) {
+export function capWindow(fallbackAnchor = null) {
+  let over = store.segments.length - HARD_MAX;
+  if (over <= 0) return 0;
+  const dropped = over;
+  let i = anchorIndex(fallbackAnchor);
+  let tookFromTheOldEnd = false;
+  while (over > 0 && store.segments.length) {
+    // Ties go to the old end: with no anchor at all this degrades to exactly
+    // the tail behaviour, which is the safe default.
+    if (i >= store.segments.length - 1 - i) {
+      dropOldest();
+      i -= 1;
+      tookFromTheOldEnd = true;
+    } else {
+      dropNewest();
+    }
+    over -= 1;
+  }
+  store.window.capped = true;
+  if (tookFromTheOldEnd) {
+    store.window.beginning = false;
+    store.window.firstMs = null;
+  }
+  return dropped;
+}
+
+/**
+ * Trim the resident window after something was added to it.
+ *
+ * Following the tail: drop the oldest above MAX_SEGMENTS, as ever. Browsing:
+ * drop nothing at all except at the hard ceiling, and take that from the far
+ * end. There is no third case, and no path here trims towards the reader.
+ */
+export function trimWindow(fallbackAnchor = null) {
+  let dropped = 0;
+  if (store.window.following) {
+    while (store.segments.length > MAX_SEGMENTS) {
+      dropOldest();
+      dropped += 1;
+    }
+    if (dropped) {
+      store.window.beginning = false;
+      store.window.firstMs = null;
+    }
+  }
+  return dropped + capWindow(fallbackAnchor);
+}
+
+/**
+ * Follow the live tail, or stop.
+ *
+ * Turning it back ON collapses the window to the newest MAX_SEGMENTS in one
+ * step — an hour of scrollback is not something to keep paying for once the
+ * reader has gone back to watching the conversation happen.
+ */
+export function setFollowing(on) {
+  const next = !!on;
+  store.window.following = next;
+  if (next) {
+    store.window.anchor = null;
+    collapseToTail();
+  }
+  return next;
+}
+
+/**
+ * Come back to the live tail from a window that is not near it — what Follow
+ * does after the date picker took you to another day. One query, and the model
+ * is the newest MAX_SEGMENTS again; collapsing a July window locally would
+ * just leave you following July.
+ */
+export async function followTail(limit = MAX_SEGMENTS) {
+  const res = await ask('transcript', { limit });
+  const rows = [...(res.segments ?? [])].sort(byTime);
+  store.segments = rows;
+  store.segById = new Map(rows.map((s) => [s.id, s]));
+  store.window = {
+    following: true,
+    anchor: null,
+    capped: false,
+    beginning: rows.length < limit,
+    firstMs: rows[0]?.t_ms ?? null,
+    detached: false,
+  };
+  return rows.length;
+}
+
+/** Back to the newest MAX_SEGMENTS, in one step. Returns how many rows went. */
+export function collapseToTail() {
+  let dropped = 0;
+  while (store.segments.length > MAX_SEGMENTS) {
+    dropOldest();
+    dropped += 1;
+  }
+  if (dropped) {
+    // The beginning is no longer loaded, and the ceiling is no longer near.
+    store.window.beginning = false;
+    store.window.firstMs = null;
+  }
+  store.window.capped = false;
+  return dropped;
+}
+
+/**
+ * Prepend a page of older history — the scrollback path.
+ *
+ * Deliberately NOT `trimWindow`: a prepend only ever happens while browsing,
+ * and the tail trim would throw away the page that was just fetched. Only the
+ * ceiling applies, anchored on the row that used to be first, so the far end
+ * is the new one.
+ */
+export function prependSegments(list) {
+  const wasFirst = store.segments[0]?.id ?? null;
   let added = 0;
   for (const seg of list ?? []) {
     if (store.segById.has(seg.id)) continue;
@@ -201,12 +398,84 @@ export function mergeSegments(list) {
     store.segments.push(seg);
     added += 1;
   }
-  if (added) store.segments.sort((a, b) => a.t_ms - b.t_ms);
-  while (store.segments.length > MAX_SEGMENTS) {
-    const drop = store.segments.shift();
-    store.segById.delete(drop.id);
-  }
+  if (added) store.segments.sort(byTime);
+  // Asking for older rows is browsing, whatever the button said a moment ago.
+  // Structural, not a caller's responsibility: the tail trim must not be one
+  // stray live segment away from undoing the page that was just fetched.
+  if (added) store.window.following = false;
+  capWindow(wasFirst);
   return added;
+}
+
+/**
+ * Fold a page of history into the live window without disturbing what is
+ * already there. Used when a search hit is older than the window: the answer
+ * to "what did she say about that world?" is the conversation around the hit,
+ * so the surrounding minutes are pulled in rather than replacing the view.
+ *
+ * Audit finding #12 lived in the last three lines of the old version: it
+ * sorted the merged page in and then `shift()`ed the oldest rows off — which
+ * is the merged page itself, discarded at the exact moment the window was full,
+ * i.e. every time it mattered. Two things fix it and both are needed. Merging
+ * rows older than the window IS a jump into the past, so it leaves the follow
+ * state; and the trim is anchored on the oldest row merged, so the ceiling
+ * takes from the other end. The caller cannot get this wrong by forgetting.
+ */
+export function mergeSegments(list) {
+  const head = store.segments[0] ?? null;
+  let added = 0;
+  let oldest = null;
+  for (const seg of list ?? []) {
+    if (store.segById.has(seg.id)) continue;
+    store.segById.set(seg.id, seg);
+    store.segments.push(seg);
+    if (oldest == null || byTime(seg, oldest) < 0) oldest = seg;
+    added += 1;
+  }
+  if (added) store.segments.sort(byTime);
+  if (oldest && head && oldest.t_ms < head.t_ms) store.window.following = false;
+  trimWindow(oldest?.id ?? null);
+  return added;
+}
+
+/**
+ * Throw the window away and rebuild it from one page — the date picker's path.
+ * You asked to be somewhere else, so you are somewhere else, and not following.
+ */
+export function replaceSegments(list) {
+  store.segments = [...(list ?? [])].sort(byTime);
+  store.segById = new Map(store.segments.map((s) => [s.id, s]));
+  store.window = {
+    following: false,
+    anchor: store.segments[0]?.id ?? null,
+    capped: false,
+    beginning: false,
+    firstMs: null,
+    detached: true,
+  };
+  return store.segments.length;
+}
+
+/**
+ * One page further back. Returns how many NEW rows arrived and whether that
+ * was the beginning of the archive — a page shorter than asked for is the only
+ * signal the protocol gives, and it is enough (PROTOCOL "Paging the transcript").
+ */
+export async function loadOlderPage(limit = PAGE_SEGMENTS) {
+  const oldest = store.segments[0];
+  if (!oldest || store.window.beginning) {
+    return { added: 0, beginning: true, rows: 0 };
+  }
+  // `to` is exclusive, so the row we page from is not repeated.
+  const res = await ask('transcript', { to: oldest.t_ms, limit });
+  const rows = res.segments ?? [];
+  const added = prependSegments(rows);
+  const beginning = rows.length < limit;
+  if (beginning) {
+    store.window.beginning = true;
+    store.window.firstMs = store.segments[0]?.t_ms ?? null;
+  }
+  return { added, beginning, rows: rows.length };
 }
 
 export async function reloadSpeakers() {
@@ -257,6 +526,12 @@ export function applyEvent(evt, opts = {}) {
         Object.assign(known, d);
         return { updated: [known] };
       }
+      store.appended += 1;
+      bumpCount(d.speaker, +1, d.dur_ms);
+      // The window is somewhere else entirely — the date picker rebuilt it on
+      // another day. Tonight's rows must not pile up under July's, and the
+      // tail is one query away the moment Follow comes back on.
+      if (store.window.detached) return { detached: true };
       store.segById.set(d.id, d);
       // The feed is chronological in practice, but a corrected or late segment
       // must not jump the list out of order.
@@ -266,11 +541,10 @@ export function applyEvent(evt, opts = {}) {
         const i = store.segments.findIndex((s) => s.t_ms > d.t_ms);
         store.segments.splice(i < 0 ? store.segments.length : i, 0, d);
       }
-      while (store.segments.length > MAX_SEGMENTS) {
-        const drop = store.segments.shift();
-        store.segById.delete(drop.id);
-      }
-      bumpCount(d.speaker, +1, d.dur_ms);
+      // Bounded while following the tail, unbounded (to the ceiling) while the
+      // reader is up in history: a live row arriving must never be the thing
+      // that scrolls the page they are reading out from under them.
+      trimWindow();
       return { added: [d] };
     }
 

@@ -438,7 +438,57 @@ document.addEventListener('keydown', (e) => {
       rows: document.querySelectorAll('#seg-list .seg').length,
       speakers: store.speakers.size,
       sources: store.sources.length,
+      // 0.7.4: the row count stopped being a proxy for "did the feed append?".
+      // The window is bounded while following, so it can be full and still be
+      // moving. This counter only ever goes up, and it goes up per live segment.
+      appended: store.appended,
     }),
+    // 0.7.4, the scrollback. Everything the driver has to read back about the
+    // window: which state it is in, how far back it reaches, whether the
+    // beginning marker is really on screen, and how the seams came out.
+    scrollback: () => {
+      const bodyEl = document.getElementById('transcript-body');
+      const rows = [...document.querySelectorAll('#seg-list .seg')];
+      const ids = rows.map((r) => Number(r.dataset.seg));
+      return {
+        following: store.window.following,
+        detached: store.window.detached,
+        pressed: (document.getElementById('follow-btn') || {}).getAttribute?.('aria-pressed') ?? null,
+        beginning: store.window.beginning,
+        capped: store.window.capped,
+        segments: store.segments.length,
+        rows: rows.length,
+        // A prepend must not duplicate, and the list must stay in time order.
+        unique: new Set(ids).size,
+        ordered: store.segments.every((s, i, a) => i === 0 || a[i - 1].t_ms <= s.t_ms),
+        firstId: ids[0] ?? null,
+        lastId: ids[ids.length - 1] ?? null,
+        firstMs: store.segments[0]?.t_ms ?? null,
+        daySeps: document.querySelectorAll('#seg-list .day-sep').length,
+        threadSeps: document.querySelectorAll('#seg-list .thread-sep').length,
+        // No two day separators may name the same day, and none may sit
+        // directly against another — both are what a bad seam looks like.
+        dayLabels: [...document.querySelectorAll('#seg-list .day-sep')].map((d) => d.textContent),
+        adjacentSeps: [...document.querySelectorAll('#seg-list .day-sep')].filter(
+          (d) => d.previousElementSibling?.classList.contains('day-sep')
+        ).length,
+        beginMark: {
+          shown: !document.getElementById('transcript-beginning')?.hidden,
+          text: document.getElementById('transcript-beginning')?.textContent ?? '',
+        },
+        note: {
+          shown: !document.getElementById('window-note')?.hidden,
+          text: document.getElementById('window-note')?.textContent ?? '',
+        },
+        datePicker: !!document.getElementById('transcript-date'),
+        scrollTop: bodyEl?.scrollTop ?? null,
+        scrollHeight: bodyEl?.scrollHeight ?? null,
+        clientHeight: bodyEl?.clientHeight ?? null,
+      };
+    },
+    /** Drive the scrollback from the driver without faking wheel events. */
+    loadOlder: () => current?.loadOlder?.() ?? null,
+    jumpToDay: (day) => current?.jumpToDay?.(day) ?? null,
     // The microphone: the model's view of the switch, and what the DOM is
     // actually showing for it, so the driver can assert on both.
     mic: () => {

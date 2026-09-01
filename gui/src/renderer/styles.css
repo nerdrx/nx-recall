@@ -352,6 +352,59 @@ select.input option, select.input optgroup {
 }
 .day-sep::after { content: ""; flex: 1; height: 1px; background: var(--clear-line); }
 
+/* --------------------------------------------------- the scrollback (0.7.4) */
+
+/* Everything above the first row. Deliberately styleless: all three of its
+   children are `hidden` unless they have something true to say, so it collapses
+   to nothing at all — which is most of the time, and the transcript must not
+   open with a band of chrome over it. */
+
+/* The loader. Quiet on purpose: a page arriving while you scroll is not an
+   event, it is the view keeping up, and a spinner that announced itself would
+   be the loudest thing on a screen of grey text. */
+.scroll-loader {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 10px 12px; font-size: 11px; letter-spacing: 0.06em;
+  color: var(--clear-muted);
+}
+.scroll-loader[hidden] { display: none; }
+.scroll-loader .spinner {
+  width: 11px; height: 11px; flex: none; border-radius: 50%;
+  border: 1.5px solid var(--clear-line);
+  border-top-color: var(--clear-muted);
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* The end of the archive. Louder than a day separator, because it is the one
+   boundary in the transcript that is not going to move: a rule across the full
+   width with the date the first thing was ever captured in it. */
+.begin-sep {
+  display: flex; align-items: center; justify-content: center;
+  margin: var(--sp-2) 0 var(--sp-3); padding: 8px 12px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--clear-muted);
+  border-top: 1px solid var(--clear-line);
+  border-bottom: 1px solid var(--clear-line);
+  text-align: center;
+}
+.begin-sep[hidden] { display: none; }
+
+/* …and the case where it is NOT the end of the archive, merely the end of what
+   is resident. Saying so is the whole point of the note: a scrollback that
+   silently stopped growing reads as one that had run out of history. */
+.window-note {
+  margin: var(--sp-2) var(--sp-2) 0; padding: 8px 12px;
+  border: 1px solid var(--clear-line); border-radius: var(--clear-r-mini);
+  background: var(--clear-warn-soft); color: var(--clear-warn);
+  font-size: 11.5px; line-height: 1.5; text-align: center;
+}
+.window-note[hidden] { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .scroll-loader .spinner { animation: none; }
+}
+
 /* -------------------------------------------------------------- speakers - */
 
 /* The onboarding banner (DESIGN §5). Neutral surface with the hairline warmed

@@ -197,10 +197,94 @@ const CANNED_LINES = [
 const THREAD_BLOCK = 5;
 const threadFor = (i) => 500 + Math.floor(i / THREAD_BLOCK);
 
+// ---------------------------------------------------------------------------
+// the back catalogue (0.7.4)
+// ---------------------------------------------------------------------------
+//
+// Two dozen canned rows was enough while the transcript was a 600-row window
+// and nothing could ask for anything older. Infinite scrollback can, and a
+// fixture smaller than one page cannot exercise a single seam — so the mock now
+// carries fourteen earlier evenings behind the canned ones.
+//
+// Everything about it is deliberately BEHIND the canned rows and beneath their
+// ids: the newest 600 (what the client opens on) is still filler-then-canned
+// with every canned fixture present and in the same relative order, the person
+// page's `recent_threads` still surfaces the canned threads because their ids
+// are higher, and no e2e step that counts or clicks a canned row moves.
+const FILLER_DAYS = 14;
+const FILLER_PER_DAY = 105; // 14 × 105 = 1470 rows, ~3.7 pages of scrollback
+const FILLER_SPEAKERS = [1, 2, 3, 4, 6]; // never 5, 8, 9 or 10 — all four are fixtures
+const FILLER_LINES = [
+  'I keep meaning to redo the lighting in that room',
+  'did anyone else get dropped when the instance filled up',
+  'it runs fine until about twelve people and then it does not',
+  'that is the third time tonight',
+  'I have a build of it somewhere, I will dig it out',
+  'no, the other one, the small one with the stairs',
+  'we should write some of this down at some point',
+  'my headset battery is about to go, hold on',
+  'that sounds like a driver thing more than a game thing',
+  'honestly it looked better before you fixed it',
+  'give me a minute, I am reading the changelog',
+  'okay that is genuinely clever',
+  'I never understood why they did it that way',
+  'someone said they were going to look at it and then nobody did',
+  'it is late, I should probably log off soon',
+];
+
+/// The single oldest row in the archive, and the only place this phrase
+/// appears. It is what the e2e searches for to prove a jump to the far end of
+/// the history renders AND SURVIVES the live feed — audit finding #12, which
+/// discarded exactly this row at exactly the moment it was merged in.
+const OLDEST_LINE = 'the obsidian lighthouse world, before they took it down';
+
+function buildFiller(base) {
+  const out = [];
+  for (let d = 0; d < FILLER_DAYS; d += 1) {
+    const evening = base - (FILLER_DAYS - d) * 86_400_000;
+    for (let r = 0; r < FILLER_PER_DAY; r += 1) {
+      const i = d * FILLER_PER_DAY + r;
+      const t = evening + r * 40_000;
+      // Three of the five voices per conversation, rotating, rather than all
+      // five in every one. Otherwise every thread separator in fourteen
+      // evenings names the same people in the same order, which tells a
+      // reviewer looking at a screenshot nothing at all — and gives the person
+      // page's "people they talk with" no edges worth weighing.
+      const block = Math.floor(i / THREAD_BLOCK);
+      const cast = [block, block + 1, block + 3].map((n) => FILLER_SPEAKERS[n % FILLER_SPEAKERS.length]);
+      const speaker = cast[i % cast.length];
+      out.push({
+        // 10000..11469. Clear of the canned block (1000..1104) by a wide
+        // margin, and deliberately ABOVE it rather than below: ids in this
+        // fixture are handed out by insertion, not by time, and the one thing
+        // that must never collide is the id — an overlapping id made
+        // `segments.audio` hand back the wrong row's tone and nothing else
+        // noticed for the length of a test run.
+        id: 10_000 + i,
+        session: SESSIONS[i % 2].id,
+        source: i % 7 === 3 ? 'Discord' : 'VRChat.exe',
+        speaker,
+        text: i === 0 ? OLDEST_LINE : FILLER_LINES[i % FILLER_LINES.length],
+        t_ms: t,
+        t_ns: String(t) + '000000',
+        dur_ms: 1600 + ((i * 617) % 3800),
+        overlap_frac: 0.02,
+        match_score: 0.6 + ((i % 30) / 100),
+        label_via: 'match',
+        lang: speaker === 1 ? 'de' : 'en',
+        // Blocks of five, as above, but numbered BELOW the canned threads so
+        // "recent conversations" still means the canned ones.
+        thread: 100 + block,
+      });
+    }
+  }
+  return out;
+}
+
 // A fixed history so every run of the GUI and every screenshot looks the same.
 function buildHistory() {
-  const out = [];
   const base = Date.parse('2026-08-31T18:05:00Z');
+  const out = buildFiller(base);
   for (let i = 0; i < 26; i++) {
     const t = base + i * 47_000;
     // Every seventh row is the user, from a session where the microphone was
@@ -416,6 +500,63 @@ export function rrf(keyword, semantic, k = 60) {
   semantic.forEach((id, i) => push(id, i + 1, 'semantic'));
   const best = (e) => Math.min(e.keyword_rank ?? Infinity, e.semantic_rank ?? Infinity);
   return [...at.values()].sort((a, b) => b.score - a.score || best(a) - best(b) || a.id - b.id);
+}
+
+// ---------------------------------------------------------------------------
+// the transcript's paging, as a conformance twin of the daemon's
+// ---------------------------------------------------------------------------
+
+/**
+ * `service::time_param`, in JavaScript. ISO-8601 or a number; a number under
+ * 1e15 is milliseconds and anything at or above it is nanoseconds. Returns
+ * milliseconds, because that is what the mock's rows are stored in.
+ *
+ * The mock used to call `Date.parse` on this, which silently returned NaN for
+ * every numeric timestamp — so a client that paged with `to: seg.t_ms` (the
+ * shape the daemon documents and accepts) got the WHOLE history back from a
+ * mock that thought it had no filter at all.
+ */
+export function mockTimeParam(value) {
+  if (value == null) return null;
+  if (typeof value === 'number') {
+    return Math.abs(value) >= 1e15 ? Math.round(value / 1e6) : value;
+  }
+  const n = Date.parse(String(value));
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * `Store::segment_rows`, in JavaScript, held to the same expectation table as
+ * the daemon's own unit test (crates/recalld/src/store.rs
+ * `a_to_only_transcript_page_is_the_newest_rows_before_it`, and
+ * gui/test/paging.test.js which asserts both halves against it).
+ *
+ * The rule that matters, and the reason this function exists rather than four
+ * lines of `filter`: a query is ANCHORED by `from` or `session` and by nothing
+ * else. Anchored, the limit takes the OLDEST rows in range; unanchored, it
+ * takes the NEWEST — which is what makes `{to, limit}` mean "the newest limit
+ * rows strictly before T", the primitive the GUI pages backwards on.
+ */
+export function transcriptPage(all, params = {}) {
+  const from = mockTimeParam(params?.from);
+  const to = mockTimeParam(params?.to);
+  const session = params?.session == null ? null : Number(params.session);
+  const speaker = params?.speaker == null ? null : Number(params.speaker);
+  const source = params?.source == null ? null : String(params.source);
+  const limit = Math.min(10_000, Math.max(1, Number(params?.limit ?? 500)));
+
+  const rows = all
+    .filter((s) => (session == null || s.session === session)
+      && (speaker == null || s.speaker === speaker)
+      && (source == null || s.source === source)
+      // `from` is inclusive and `to` is exclusive — the asymmetry is what lets
+      // a client page with the timestamp of a row it already holds.
+      && (from == null || s.t_ms >= from)
+      && (to == null || s.t_ms < to))
+    .sort((a, b) => a.t_ms - b.t_ms || a.id - b.id);
+
+  const anchored = from != null || session != null;
+  return anchored ? rows.slice(0, limit) : rows.slice(-limit);
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,8 +1532,12 @@ export function startMock({
       if (q) rows = rows.filter((s) => s.text.toLowerCase().includes(q));
       if (params?.speaker != null) rows = rows.filter((s) => s.speaker === Number(params.speaker));
       if (params?.source) rows = rows.filter((s) => s.source === params.source);
-      if (params?.from) rows = rows.filter((s) => s.t_ms >= Date.parse(params.from));
-      if (params?.to) rows = rows.filter((s) => s.t_ms <= Date.parse(params.to));
+      // Inclusive `from`, exclusive `to`, ISO or number — the same time
+      // semantics every filtered method on this socket uses.
+      const from = mockTimeParam(params?.from);
+      const to = mockTimeParam(params?.to);
+      if (from != null) rows = rows.filter((s) => s.t_ms >= from);
+      if (to != null) rows = rows.filter((s) => s.t_ms < to);
       const limit = Number(params?.limit ?? 50);
       const hits = rows.slice(-limit).reverse();
       return { hits, total: rows.length, q: params?.q ?? '' };
@@ -1461,13 +1606,7 @@ export function startMock({
     },
 
     transcript(params) {
-      let rows = state.segments;
-      if (params?.session != null) rows = rows.filter((s) => s.session === Number(params.session));
-      if (params?.speaker != null) rows = rows.filter((s) => s.speaker === Number(params.speaker));
-      if (params?.from) rows = rows.filter((s) => s.t_ms >= Date.parse(params.from));
-      if (params?.to) rows = rows.filter((s) => s.t_ms <= Date.parse(params.to));
-      const limit = Number(params?.limit ?? 200);
-      return { segments: rows.slice(-limit), sessions: SESSIONS };
+      return { segments: transcriptPage(state.segments, params), sessions: SESSIONS };
     },
 
     'delete.preview'(params) {
@@ -1511,8 +1650,12 @@ export function startMock({
     let rows = state.segments;
     if (params?.speaker != null) rows = rows.filter((s) => s.speaker === Number(params.speaker));
     if (params?.session != null) rows = rows.filter((s) => s.session === Number(params.session));
-    if (params?.from) rows = rows.filter((s) => s.t_ms >= Date.parse(params.from));
-    if (params?.to) rows = rows.filter((s) => s.t_ms <= Date.parse(params.to));
+    // Same time semantics as every other filter on the wire: inclusive `from`,
+    // exclusive `to`, ISO or number (`Store::segments_matching`).
+    const from = mockTimeParam(params?.from);
+    const to = mockTimeParam(params?.to);
+    if (from != null) rows = rows.filter((s) => s.t_ms >= from);
+    if (to != null) rows = rows.filter((s) => s.t_ms < to);
     return rows;
   }
 
