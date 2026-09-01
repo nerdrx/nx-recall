@@ -1431,11 +1431,24 @@ impl Store {
 
     /// `Speaker_01`, `Speaker_02`, ... The number is a display convenience; the
     /// row id is the stable identity, which is what makes `name` retroactive.
+    ///
+    /// The number IS the row id. It used to be `COUNT(*) + 1`, which collides
+    /// as soon as any voice is hard-deleted (prune, nuke): after removing two
+    /// of five voices the next two mints would both read from a shrunken count
+    /// and one of them re-issues a label that already exists (audit finding
+    /// #6). The v3 migration always numbered by id; now the mint agrees.
     pub fn mint_speaker(&self, created_at: i64) -> Result<i64> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM speakers", [], |r| r.get(0))?;
-        self.create_speaker(&format!("Speaker_{:02}", n + 1), created_at)
+        self.conn.execute(
+            "INSERT INTO speakers (display_name, auto_label, created_at) VALUES ('', '', ?1)",
+            params![created_at],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        let label = format!("Speaker_{id:02}");
+        self.conn.execute(
+            "UPDATE speakers SET display_name = ?1, auto_label = ?1 WHERE id = ?2",
+            params![label, id],
+        )?;
+        Ok(id)
     }
 
     /// Add a prototype, evicting the most redundant one if the speaker is full.
@@ -2160,6 +2173,33 @@ impl Store {
     /// `search`, narrowed. The FTS query drives the match; the rest are `AND`ed
     /// filters, and each hit carries the whole row so a client can render the
     /// conversation around it without a second round trip.
+    /// How many live segments match, before any LIMIT — what "total" means.
+    pub fn search_count(&self, query: &str, filter: &SegmentFilter) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM segments_fts
+             JOIN segments g ON g.id = segments_fts.rowid
+             JOIN sessions ss ON ss.id = g.session_id
+             JOIN sources sc ON sc.id = ss.source_id
+             LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             WHERE segments_fts MATCH ?1 AND g.deleted_at IS NULL
+               AND (?2 IS NULL OR sp.canonical_id = ?2)
+               AND (?3 IS NULL OR g.session_id = ?3)
+               AND (?4 IS NULL OR sc.match_key = ?4)
+               AND (?5 IS NULL OR g.t_start_ns >= ?5)
+               AND (?6 IS NULL OR g.t_start_ns < ?6)",
+            params![
+                query,
+                filter.speaker,
+                filter.session,
+                filter.source,
+                filter.from,
+                filter.to
+            ],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn search_filtered(
         &self,
         query: &str,
@@ -2179,7 +2219,7 @@ impl Store {
                AND (?4 IS NULL OR sc.match_key = ?4)
                AND (?5 IS NULL OR g.t_start_ns >= ?5)
                AND (?6 IS NULL OR g.t_start_ns < ?6)
-             ORDER BY g.t_start_ns ASC
+             ORDER BY g.t_start_ns DESC
              LIMIT ?7",
             Self::SEGMENT_COLUMNS
         );
@@ -2208,6 +2248,14 @@ impl Store {
 
     /// A transcript page: chronological, filtered, capped.
     pub fn segment_rows(&self, filter: &SegmentFilter, limit: usize) -> Result<Vec<SegmentRow>> {
+        // A limited window with no explicit range means "the most recent
+        // `limit` rows" — the live transcript. Selecting ASC LIMIT n here
+        // returned the OLDEST n forever once the table outgrew the window
+        // (audit finding #1: the user's live view opened on their first
+        // evening, months of speech ago). Take the newest n, hand them back
+        // ascending so callers still render chronologically.
+        let anchored = filter.from.is_some() || filter.session.is_some();
+        let order = if anchored { "ASC" } else { "DESC" };
         let sql = format!(
             "SELECT {}
              FROM segments g
@@ -2220,12 +2268,12 @@ impl Store {
                AND (?3 IS NULL OR sc.match_key = ?3)
                AND (?4 IS NULL OR g.t_start_ns >= ?4)
                AND (?5 IS NULL OR g.t_start_ns < ?5)
-             ORDER BY g.t_start_ns ASC, g.id ASC
+             ORDER BY g.t_start_ns {order}, g.id {order}
              LIMIT ?6",
             Self::SEGMENT_COLUMNS
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map(
                 params![
                     filter.speaker,
@@ -2238,6 +2286,9 @@ impl Store {
                 Self::segment_row_from,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !anchored {
+            rows.reverse();
+        }
         Ok(rows)
     }
 

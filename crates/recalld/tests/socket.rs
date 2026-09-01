@@ -800,7 +800,10 @@ fn a_bulk_delete_runs_as_an_operation_with_progress_and_a_terminal_event() {
     assert_eq!(preview["segments"].as_u64().unwrap() as usize, ids.len());
     assert!(preview["bytes"].as_u64().unwrap() > 0);
 
-    let run = c.call("delete.run", json!({}));
+    // Deleting everything now takes an explicit confession over the wire.
+    let refused = c.call_raw("delete.run", json!({}));
+    assert_eq!(refused["err"]["code"], "refused");
+    let run = c.call("delete.run", json!({"confirm_everything": true}));
     let op = run["op"].as_str().unwrap().to_string();
     let purge = c.wait_event("purge");
     assert_eq!(purge["data"]["ids"].as_array().unwrap().len(), ids.len());

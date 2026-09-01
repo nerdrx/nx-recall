@@ -507,6 +507,12 @@ A *soft* delete needs no cascade: every graph read joins to a live segment, so
 hiding the transcript line hides what was inferred from it and undoing the
 delete brings both back.
 
+- `delete.run` with a filter matching every live segment is refused unless the
+  request carries `confirm_everything: true` — one absent parameter must never
+  mean "wipe the transcript".
+- `search` returns `total` = all matches (pre-LIMIT); hits are the newest first.
+- A limited unanchored `transcript` returns the NEWEST `limit` rows, ascending.
+
 ## Versioning rules
 
 - `proto` bumps only on breaking changes; additive fields/methods/events are free.

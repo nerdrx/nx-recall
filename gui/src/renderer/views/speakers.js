@@ -760,9 +760,18 @@ export function mount(root, ctx) {
       renderList();
     }
     if (change.added || change.purged) {
-      // Counts moved; the rows show counts, so repaint them (cheap: tens of rows).
-      renderList();
-      renderBanner();
+      // Counts moved. `purge` only decrements counts for rows inside the live
+      // window, so after a big delete the local numbers are wrong — re-pull
+      // the list instead of repainting stale state (audit finding #16).
+      if (change.purged) {
+        reloadSpeakers().then(() => {
+          renderList();
+          renderBanner();
+        });
+      } else {
+        renderList();
+        renderBanner();
+      }
     }
     if (change.opFinished) {
       reloadSpeakers().then(() => {

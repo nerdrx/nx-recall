@@ -462,7 +462,14 @@ impl Pipeline {
         // inheritance names the turn *before* this one, and a view that never
         // heard about it would keep showing "unknown voice" until it re-queried.
         let mut also_changed: Vec<i64> = Vec::new();
-        if let Some(analyzer) = self.analyzer.as_mut() {
+        // Pause re-checked between the transcript write and the analysis leg
+        // (audit finding #5): this body can run for seconds, and a pause that
+        // lands inside it must stop the enrollment artifacts — prototypes and
+        // retention-EXEMPT goldens — even though the turn itself completed
+        // before the pause and its transcript may stand. The window between
+        // checks shrinks from "the whole body" to "one model call".
+        let paused_mid_write = self.control.is_paused();
+        if let Some(analyzer) = self.analyzer.as_mut().filter(|_| !paused_mid_write) {
             also_changed = match you {
                 Some(speaker_id) => analyse_mic_or_log(
                     analyzer,
@@ -515,7 +522,9 @@ impl Pipeline {
             // every client would have to re-query to draw one separator. A
             // threading failure is logged and the turn keeps its transcript —
             // a derived index is never allowed to cost a recording.
-            if let Err(e) = crate::threads::assign(&store, &self.cfg.graph, segment_id) {
+            if !paused_mid_write
+                && let Err(e) = crate::threads::assign(&store, &self.cfg.graph, segment_id)
+            {
                 warn!(segment_id, "could not thread a segment: {e:#}");
             }
             // Tier 2 (GRAPH.md): the deterministic extractors, always on and
@@ -527,7 +536,9 @@ impl Pipeline {
             // After threading, because a promise needs a counterparty and the
             // thread is where the counterparty is. Failures are logged and
             // dropped: a derived annotation never costs a recording.
-            if let Err(e) = crate::commitment::extract(&store, segment_id, utc_now_ns()) {
+            if !paused_mid_write
+                && let Err(e) = crate::commitment::extract(&store, segment_id, utc_now_ns())
+            {
                 warn!(segment_id, "tier-2 extraction failed: {e:#}");
             }
             publish_segment(&self.bus, &store, segment_id);

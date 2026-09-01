@@ -700,10 +700,12 @@ impl Service {
         let mut removed: Vec<i64> = Vec::new();
         let mut segments = 0usize;
         let mut files: Vec<String> = Vec::new();
+        let mut purged_ids: Vec<i64> = Vec::new();
         for voice in &candidates {
             match store.prune_speaker(voice.id, at) {
                 Ok(report) => {
                     segments += report.soft_deleted.len();
+                    purged_ids.extend(report.soft_deleted.iter().copied());
                     files.extend(report.goldens.clone());
                     store
                         .log_operation(
@@ -734,9 +736,17 @@ impl Service {
                 let _ = std::fs::remove_file(self.control.data_dir.join(rel));
             }
         }
+        // The swept voices' segments are soft-DELETED, not merely unlabelled —
+        // without these purge events every open transcript kept showing the
+        // deleted rows as "unknown voice" (audit finding #4; the GUI comment
+        // always promised they'd arrive, and the mock even sent them).
+        for batch in purged_ids.chunks(DELETE_BATCH) {
+            self.bus
+                .publish(Topic::Segments, "purge", json!({"ids": batch}));
+        }
         for id in &removed {
             // A tombstone-less disappearance: the voice never existed as far as
-            // any view should now be concerned, and its segments are unlabelled.
+            // any view should now be concerned.
             self.bus.publish(
                 Topic::Relabel,
                 "relabel",
@@ -1833,13 +1843,21 @@ impl Service {
         }
         let limit = req.usize_or("limit", 50)?.clamp(1, 1000);
         let filter = self.filter_of(req)?;
-        let hits = self
-            .store()
-            .search_filtered(&q, &filter, limit)
-            // A malformed FTS query is the caller's problem, not a daemon fault.
-            .map_err(|e| Error::new("params", format!("{e:#}")))?;
+        let (hits, total) = {
+            let store = self.store();
+            let hits = store
+                .search_filtered(&q, &filter, limit)
+                // A malformed FTS query is the caller's problem, not a daemon fault.
+                .map_err(|e| Error::new("params", format!("{e:#}")))?;
+            // The real match count, not the page size (audit finding #23:
+            // 4,000 matches reported as "100 matches").
+            let total = store
+                .search_count(&q, &filter)
+                .map_err(|e| Error::new("params", format!("{e:#}")))?;
+            (hits, total)
+        };
         Ok(json!({
-            "total": hits.len(),
+            "total": total,
             "q": q,
             // A hit is a whole segment, not a fragment: the answer to "what did
             // she say about that world?" is the conversation around it, so the
@@ -1927,6 +1945,17 @@ impl Service {
     /// once the undo window closes (DESIGN §8).
     fn delete_run(self: &Arc<Self>, req: &Request) -> Result<Value, Error> {
         let filter = self.filter_of(req)?;
+        // An empty filter selects EVERY live segment. That must never be one
+        // absent parameter away (audit finding #14: a client bug passing
+        // `speaker: null` would have wiped the whole transcript and cheerfully
+        // reported the count). Wiping everything requires saying so.
+        if filter.is_everything() && !req.opt_bool("confirm_everything")?.unwrap_or(false) {
+            return Err(Error::new(
+                "refused",
+                "this filter matches every live segment — pass confirm_everything: true \
+                 if wiping the whole transcript is really the intent",
+            ));
+        }
         let rows = self
             .store()
             .segments_matching(&filter)
@@ -2725,7 +2754,16 @@ mod tests {
         assert_eq!(preview["bytes"], 1234);
         assert_eq!(preview["everything"], true, "an unfiltered delete says so");
 
-        let run = call(&r, r#"{"id":2,"method":"delete.run"}"#).unwrap();
+        // An unfiltered run is refused unless the caller says the quiet part
+        // out loud — one absent parameter must never mean "wipe everything".
+        let refused = call(&r, r#"{"id":2,"method":"delete.run"}"#).unwrap_err();
+        assert_eq!(refused.code, "refused");
+
+        let run = call(
+            &r,
+            r#"{"id":3,"method":"delete.run","params":{"confirm_everything":true}}"#,
+        )
+        .unwrap();
         let op = run["op"].as_str().unwrap().to_string();
         assert!(op.starts_with("op_"));
 
