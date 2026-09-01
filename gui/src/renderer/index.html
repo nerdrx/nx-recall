@@ -4,10 +4,15 @@
     <meta charset="utf-8" />
     <!-- No network anywhere in this app: connect-src is 'none' and there is no
          remote origin in any directive. The only transport is the unix socket,
-         and only the main process touches it. -->
+         and only the main process touches it.
+
+         media-src blob: is the one addition (0.5.4, voice preview): a segment's
+         WAV arrives base64 inside a protocol reply and is wrapped in a blob URL
+         to hand to <audio>. blob: is same-origin by construction and fetches
+         nothing — connect-src stays 'none'. -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; media-src blob:; connect-src 'none'"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NX Recall</title>

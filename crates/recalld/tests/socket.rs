@@ -970,7 +970,162 @@ fn a_restarted_daemon_starts_its_sequence_over_and_says_so() {
     assert!(t["segments"].as_array().unwrap().len() > ids.len());
 }
 
-// ---- 8. a live daemon for external clients ------------------------------
+// ---- 8. playing a voice back --------------------------------------------
+
+/// The question the feature answers is "who is this?", and it cannot be
+/// answered by reading. This is the whole path: pipeline writes a WAV, a
+/// client asks for it by segment id, and the bytes that come back over the
+/// socket are the bytes on disk.
+#[test]
+fn a_segments_audio_crosses_the_socket_byte_for_byte() {
+    let mut d = Daemon::start("audio");
+    let ids = d.ingest("clean_single_0.wav");
+    let seg = *ids.first().expect("the fixture produces a segment");
+
+    let mut c = d.connect();
+    c.hello();
+    let out = c.call("segments.audio", json!({"id": seg}));
+
+    let rel = {
+        let store = d.store.lock().unwrap();
+        store.segment_audio(seg).unwrap().unwrap().0
+    };
+    let on_disk = std::fs::read(d.dir.join(&rel)).expect("the pipeline wrote a WAV");
+    assert_eq!(
+        out["wav_b64"].as_str().unwrap(),
+        recalld::b64::encode(&on_disk),
+        "the wire payload is not the file"
+    );
+    assert_eq!(out["id"], seg);
+    assert_eq!(out["sample_rate"], 16_000, "segments are stored at 16 kHz");
+    assert_eq!(out["bytes"], on_disk.len());
+    assert!(
+        out["duration_ms"].as_i64().unwrap() > 0,
+        "a clip with no length cannot be listened to"
+    );
+
+    // And an id that never existed is an error the client can branch on.
+    assert_eq!(
+        c.call_err("segments.audio", json!({"id": 987654}))["code"],
+        "not_found"
+    );
+}
+
+/// A frame far bigger than anything a real segment produces still arrives
+/// whole. This is the limit half of the decision: the daemon caps the file it
+/// will encode, and both ends carry a frame budget above what that cap can
+/// produce — a reply that gets truncated or hangs a client up is worse than a
+/// refusal.
+#[test]
+fn a_multi_megabyte_reply_arrives_in_one_piece() {
+    let mut d = Daemon::start("audio-big");
+    let ids = d.ingest("clean_single_0.wav");
+    let seg = *ids.first().unwrap();
+    let rel = {
+        let store = d.store.lock().unwrap();
+        store.segment_audio(seg).unwrap().unwrap().0
+    };
+    // 2 MB of audio — about a minute of 16 kHz mono, twice the segment cap,
+    // and ~2.7 MB once base64'd.
+    let big: Vec<f32> = (0..1_000_000)
+        .map(|i| ((i % 97) as f32 / 97.0) - 0.5)
+        .collect();
+    recalld::pipeline::write_wav(&d.dir.join(&rel), &big).unwrap();
+
+    let mut c = d.connect();
+    c.hello();
+    let out = c.call("segments.audio", json!({"id": seg}));
+    assert_eq!(out["bytes"], 2_000_044);
+    assert_eq!(
+        out["wav_b64"].as_str().unwrap().len(),
+        recalld::b64::encoded_len(2_000_044),
+        "the payload was truncated on the way through"
+    );
+    // The connection is still usable afterwards, which is the thing a broken
+    // frame guard would take away.
+    assert!(c.call("status", json!({}))["daemon"].as_str().is_some());
+}
+
+/// Retention outlives the recording on purpose: the text stays, the WAV goes.
+/// A client asking for audio that has aged out must be told *that*, not
+/// "no such segment" — the difference is the difference between a bug and a
+/// setting the user chose.
+#[test]
+fn audio_that_aged_out_answers_gone_over_the_wire() {
+    let mut d = Daemon::start("audio-retention");
+    let ids = d.ingest("clean_single_0.wav");
+    let seg = *ids.first().unwrap();
+    let rel = {
+        let store = d.store.lock().unwrap();
+        store.segment_audio(seg).unwrap().unwrap().0
+    };
+    std::fs::remove_file(d.dir.join(&rel)).unwrap();
+
+    let mut c = d.connect();
+    c.hello();
+    let e = c.call_err("segments.audio", json!({"id": seg}));
+    assert_eq!(e["code"], "gone");
+    assert!(
+        e["msg"].as_str().unwrap().contains("retention"),
+        "the message must name the reason: {}",
+        e["msg"]
+    );
+    // The transcript still has the row — that is the point of the distinction.
+    let t = c.call("transcript", json!({}));
+    assert!(
+        t["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == seg)
+    );
+}
+
+/// The naming query: given a voice, hand back the clips worth listening to,
+/// each one playable through `segments.audio`.
+#[test]
+fn speakers_sample_offers_playable_clips_for_naming() {
+    let mut d = Daemon::start("sample");
+    let mut ids = d.ingest("clean_single_0.wav");
+    ids.extend(d.ingest("clean_single_1.wav"));
+    assert!(
+        ids.len() >= 2,
+        "two fixtures should give at least two clips"
+    );
+    let spk = {
+        let store = d.store.lock().unwrap();
+        let spk = store.mint_speaker(0).unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            store
+                .set_segment_speaker(*id, Some(spk), Some(0.5 + i as f32 / 100.0))
+                .unwrap();
+        }
+        spk
+    };
+
+    let mut c = d.connect();
+    c.hello();
+    let out = c.call("speakers.sample", json!({"id": spk, "limit": 2}));
+    let samples = out["samples"].as_array().unwrap().clone();
+    assert_eq!(samples.len(), 2);
+    // Long first: that is what makes a clip worth playing to identify someone.
+    let durs: Vec<i64> = samples
+        .iter()
+        .map(|s| s["duration_ms"].as_i64().unwrap())
+        .collect();
+    assert!(
+        durs[0] >= durs[1],
+        "samples are not longest-first: {durs:?}"
+    );
+
+    // Every clip offered actually plays — the promise the file check makes.
+    for s in &samples {
+        let audio = c.call("segments.audio", json!({"id": s["segment_id"]}));
+        assert!(audio["wav_b64"].as_str().unwrap().starts_with("UklG"));
+    }
+}
+
+// ---- 9. a live daemon for external clients ------------------------------
 
 /// Not part of the suite — an interop harness for real clients.
 ///

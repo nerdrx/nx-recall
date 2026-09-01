@@ -137,6 +137,28 @@ export function runE2E(deps) {
       return { file };
     });
 
+    // 5b — a segment's own ▶: the same shared player, one clip.
+    await step('segment-sheet-plays-its-clip', async () => {
+      await js('document.querySelector("#seg-list .seg").click()');
+      await waitFor('the sheet', async () => js('!!document.querySelector(".sheet #segment-play")'));
+      await js('document.querySelector(".sheet #segment-play").click()');
+      const heard = await waitFor(
+        'the audio element to play the segment',
+        async () => {
+          const a = await js('window.__recallDebug.audio()');
+          return a.exists && (a.ended || a.currentTime > 0) ? a : null;
+        },
+        { timeout: 15000, every: 100 }
+      );
+      assert(heard.error == null, `the media element reported error ${heard.error}`);
+      await js('document.querySelector(".scrim").dispatchEvent(new MouseEvent("mousedown", {bubbles: true}))');
+      await waitFor('the sheet to close', async () => js('!document.querySelector(".sheet")'));
+      // Closing the sheet takes the stop button away, so it takes the sound.
+      const after = await js('window.__recallDebug.audio()');
+      assert(after.phase === 'idle', `preview kept running after the sheet closed (${after.phase})`);
+      return { currentTime: heard.currentTime, readyState: heard.readyState };
+    });
+
     // 6 — speakers view + the onboarding banner (DESIGN §5)
     await step('speakers-and-onboarding', async () => {
       await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
@@ -162,6 +184,94 @@ export function runE2E(deps) {
       );
       assert(found, 'Speaker_77 was minted mid-feed but never appeared in the speakers view');
       return { found };
+    });
+
+    // 6b — the feature this release exists for: you can HEAR a voice before
+    // you are asked to name it. The assertion is on the real <audio> element,
+    // not on the UI's opinion of it.
+    await step('voice-preview-plays-and-stops', async () => {
+      const target = await js(`(() => {
+        const b = document.querySelector('[data-onboard]');
+        return b ? Number(b.dataset.onboard) : null;
+      })()`);
+      assert(target != null, 'no unnamed voice to preview');
+
+      await js(`document.querySelector('.sp-row[data-speaker="${target}"] [data-preview]').click()`);
+      const marked = await waitFor(
+        'the row to show it is playing',
+        async () => js(`!!document.querySelector('.sp-row[data-speaker="${target}"].playing')`),
+        { timeout: 10000, every: 100 }
+      );
+      const heard = await waitFor(
+        'the audio element to play',
+        async () => {
+          const a = await js('window.__recallDebug.audio()');
+          return a.exists && (a.ended || a.currentTime > 0) ? a : null;
+        },
+        { timeout: 20000, every: 100 }
+      );
+      assert(marked, 'the row never showed a playing indicator');
+      assert(heard.error == null, `the media element reported error ${heard.error}`);
+      const label = await js(`document.querySelector('.sp-row[data-speaker="${target}"] [data-preview]').textContent`);
+      assert(label === '■', `the play button did not become a stop button (got ${JSON.stringify(label)})`);
+
+      const file = await shot('speakers-playing');
+      // Pressing it again stops, and nothing else was ever sounding at once.
+      await js(`document.querySelector('.sp-row[data-speaker="${target}"] [data-preview]').click()`);
+      await waitFor('the preview to stop', async () => js('window.__recallDebug.audio().phase === "idle"'), {
+        timeout: 8000,
+        every: 100,
+      });
+      const stopped = await js(`document.querySelectorAll('.sp-row.playing').length`);
+      assert(stopped === 0, 'a row still claims to be playing after stop');
+      return { speaker: target, currentTime: heard.currentTime, samples: heard.total, file };
+    });
+
+    // 6c — a voice whose audio retention already took. This must read as a
+    // setting, in place, not as a failed click.
+    await step('preview-with-no-audio-explains-retention', async () => {
+      const rows = await js(`[...document.querySelectorAll('#speaker-list .sp-row')].map(r => Number(r.dataset.speaker))`);
+      assert(rows.includes(5), `the aged-out mock voice is not listed: ${rows}`);
+      await js(`document.querySelector('.sp-row[data-speaker="5"] [data-preview]').click()`);
+      const hint = await waitFor(
+        'the retention hint',
+        async () => js(`(document.querySelector('.sp-row[data-speaker="5"] .sp-hint.shown')||{}).textContent || ''`),
+        { timeout: 10000, every: 100 }
+      );
+      assert(/retention/i.test(hint), `the hint does not explain itself: ${JSON.stringify(hint)}`);
+      const toastOnly = await js('[...document.querySelectorAll(".toast")].some(t => /retention/i.test(t.textContent))');
+      assert(!toastOnly, 'the retention hint was a toast — it has to sit on the row');
+      return { hint, file: await shot('speakers-no-audio') };
+    });
+
+    // 6d — DESIGN §5's onboarding, made answerable: pressing "Name this voice"
+    // plays it, so listening and typing are one motion.
+    await step('naming-a-voice-plays-it', async () => {
+      const target = await js(`(() => {
+        const b = document.querySelector('[data-onboard]');
+        return b ? Number(b.dataset.onboard) : null;
+      })()`);
+      assert(target != null, 'no unnamed voice in the banner');
+      await js('document.querySelector("[data-onboard]").click()');
+      await waitFor('the rename input', async () => js('!!document.getElementById("rename-input")'));
+      const playing = await waitFor(
+        'the voice to start playing with the field',
+        async () => js(`window.__recallDebug.audio().key === "speaker:${target}"`),
+        { timeout: 10000, every: 100 }
+      );
+      assert(playing, 'naming a voice did not play it');
+      // Leave the UI as the later steps expect to find it.
+      await js(`(() => {
+        const i = document.getElementById('rename-input');
+        i.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
+        return true;
+      })()`);
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
+      await waitFor('the speaker list again', async () => js('document.querySelectorAll("#speaker-list .sp-row").length > 0'));
+      const quiet = await js('window.__recallDebug.audio().phase');
+      assert(quiet === 'idle', `leaving the view left audio running (${quiet})`);
+      return { speaker: target };
     });
 
     await step('shot-speakers', async () => ({ file: await shot('speakers') }));

@@ -15,6 +15,10 @@ const ALLOWED = new Set([
   'speakers.name',
   'speakers.merge',
   'speakers.split',
+  // Reads only, both of them: which clips identify a voice, and one clip's
+  // bytes so it can be played (docs/PROTOCOL.md, "Voice preview").
+  'speakers.sample',
+  'segments.audio',
   'segments.reassign',
   'segments.correct',
   'search',

@@ -95,6 +95,22 @@ never need to re-query for a rename. The daemon keeps a short replay buffer;
 - After any resync, clients rebase `lastSeq` onto the welcome/resync seq; the daemon
   guarantees `welcome.seq` reflects the live counter and subsequent events increase
   strictly from it.
+- **Voice preview.** `segments.audio {id}` → `{id, wav_b64, duration_ms, sample_rate,
+  bytes}`: that segment's stored WAV (16 kHz mono), standard padded base64 in the
+  JSON frame. `err:not_found` = no such live segment (unknown id, or soft-deleted);
+  `err:gone` = the row is still in the transcript but its audio is not (retention
+  expired, or the file went missing) — the message says so, and a client must show it
+  as a fact rather than a failure; `err:refused` = the file is over 10 MB, which no
+  real segment is. `duration_ms`/`sample_rate` come from the WAV header, not the row.
+- `speakers.sample {id, limit?}` → `{id, samples: [{segment_id, t_ms, t_ns,
+  duration_ms, text, match_score}]}`: that voice's live segments **that still have a
+  file on disk**, ranked longest-first (bucketed to whole seconds) then best-matched,
+  `limit` default 3, max 20. It is the "play me this voice" query, so the naming flow
+  does not page through transcripts. An empty `samples` is a valid answer (all of that
+  voice's audio has aged out); an unknown speaker is `err:not_found`.
+- **Frame budget**: one NDJSON line may reach 16 MB (`service::MAX_FRAME_BYTES`), the
+  size the 10 MB audio cap can produce once base64'd. Clients MUST accept frames that
+  large; a smaller guard drops the connection mid-reply instead of failing one request.
 
 ## Versioning rules
 

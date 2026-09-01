@@ -303,3 +303,63 @@ test('the client reconnects on its own after the daemon goes away', async () => 
     mock.close();
   }
 });
+
+test('a voice preview arrives as a playable WAV, and an aged-out one says so', async () => {
+  const { mock, path } = withMock({ feedMs: 100000 });
+  const client = new RecallClient({ socketPath: path });
+  try {
+    await connected(client);
+
+    // The naming query: the clips worth hearing, longest first.
+    const sample = await client.request('speakers.sample', { id: 1, limit: 2 });
+    assert.equal(sample.samples.length, 2);
+    assert.ok(
+      Math.floor(sample.samples[0].duration_ms / 1000) >= Math.floor(sample.samples[1].duration_ms / 1000),
+      'samples are not longest-first'
+    );
+
+    // And one of them, decoded: a real RIFF/WAVE at the rate segments are stored at.
+    const clip = await client.request('segments.audio', { id: sample.samples[0].segment_id });
+    const wav = Buffer.from(clip.wav_b64, 'base64');
+    assert.equal(wav.subarray(0, 4).toString(), 'RIFF');
+    assert.equal(wav.subarray(8, 12).toString(), 'WAVE');
+    assert.equal(wav.readUInt32LE(24), 16000, 'segments are 16 kHz');
+    assert.equal(clip.bytes, wav.length);
+    assert.equal(clip.sample_rate, 16000);
+
+    // Retention outlives the recording: the voice is listed, the audio is not.
+    const aged = await client.request('speakers.sample', { id: 5 });
+    assert.deepEqual(aged.samples, []);
+    const seg = mock.state.segments.find((s) => s.speaker === 5);
+    const code = await client.request('segments.audio', { id: seg.id }).then(
+      () => null,
+      (e) => e.code
+    );
+    assert.equal(code, 'gone', 'aged-out audio must be `gone`, not a generic failure');
+  } finally {
+    client.close();
+    mock.close();
+  }
+});
+
+test('a frame far bigger than the old guard still arrives whole', async () => {
+  // A segment's WAV travels inside one JSON frame, so the client's
+  // oversized-frame guard sits above what the daemon may produce (16 MB, the
+  // 10 MB audio cap once base64'd). At the old 4 MB it would have hung up on
+  // exactly the reply that carried the audio.
+  const { mock, path } = withMock({ feedMs: 100000 });
+  const client = new RecallClient({ socketPath: path });
+  try {
+    await connected(client);
+    await sleep(300); // the subscribe lands just after the connected state
+    const big = 'x'.repeat(5 * 1024 * 1024);
+    const got = waitFor(client, 'event', 20000);
+    mock.emit('segments', 'segment', { id: 4242, text: big });
+    const evt = await got;
+    assert.equal(evt.data.text.length, big.length);
+    assert.equal(client.status, 'connected', 'the big frame dropped the connection');
+  } finally {
+    client.close();
+    mock.close();
+  }
+});

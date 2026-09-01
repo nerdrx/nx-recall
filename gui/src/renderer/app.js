@@ -10,6 +10,7 @@ import { h, clear } from './lib/dom.js';
 import { store, applyEvent, reloadAll, mergeSegments, ask } from './lib/store.js';
 import { patchSpeakerLabels } from './lib/labels.js';
 import { toast } from './lib/sheets.js';
+import { stop as stopPreview, playbackState } from './lib/preview.js';
 import * as transcriptView from './views/transcript.js';
 import * as speakersView from './views/speakers.js';
 import * as searchView from './views/search.js';
@@ -44,6 +45,8 @@ const ctx = {
 
 function go(name) {
   if (!VIEWS[name]) return;
+  // Leaving a view takes its stop button off screen, so it takes the sound too.
+  stopPreview();
   currentName = name;
   for (const btn of document.querySelectorAll('.rail-item')) {
     btn.setAttribute('aria-selected', String(btn.dataset.view === name));
@@ -280,5 +283,19 @@ document.addEventListener('keydown', (e) => {
       speakers: store.speakers.size,
       sources: store.sources.length,
     }),
+    // Voice preview: the driver asserts against the real <audio> element, not
+    // against the UI's opinion of it.
+    audio: () => {
+      const a = window.__recallAudio ?? null;
+      return {
+        ...playbackState(),
+        exists: !!a,
+        paused: a ? a.paused : null,
+        ended: a ? a.ended : null,
+        currentTime: a ? a.currentTime : 0,
+        readyState: a ? a.readyState : 0,
+        error: a?.error ? a.error.code : null,
+      };
+    },
   };
 })();

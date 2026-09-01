@@ -34,6 +34,14 @@ const RECONNECT_MIN = 250;
 const RECONNECT_MAX = 5000;
 const REQUEST_TIMEOUT = 15000;
 
+// One NDJSON line's byte budget, matched by the daemon (service::MAX_FRAME_BYTES
+// in crates/recalld). It exists so a daemon that never sends a newline cannot
+// grow this buffer without bound — but `segments.audio` puts a whole WAV in one
+// frame (10 MB capped on disk, ~13.4 MB once base64'd), so the guard has to sit
+// above what the daemon is allowed to produce. Below it, the guard would hang up
+// mid-reply on exactly the request that asked for the audio.
+const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+
 export function defaultSocketPath() {
   if (process.env.NX_RECALL_SOCK) return process.env.NX_RECALL_SOCK;
   const run = process.env.XDG_RUNTIME_DIR || `/run/user/${typeof process.getuid === 'function' ? process.getuid() : 1000}`;
@@ -226,7 +234,7 @@ export class RecallClient extends EventEmitter {
       this._dispatch(msg);
     }
     // A daemon that never sends a newline must not grow us without bound.
-    if (this.buf.length > 4 * 1024 * 1024) {
+    if (this.buf.length > MAX_FRAME_BYTES) {
       this.emit('warn', 'oversized frame from daemon — dropping connection');
       if (this.sock) this.sock.destroy();
     }

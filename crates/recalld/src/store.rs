@@ -79,6 +79,20 @@ pub struct SegmentRow {
     pub audio_path: String,
 }
 
+/// One candidate clip for naming a voice: enough to rank it, label it in a
+/// list, and fetch its audio. Deliberately not a `SegmentRow` — the point of
+/// `speakers.sample` is to be cheap enough to call from a naming prompt.
+#[derive(Debug, Clone)]
+pub struct SampleRow {
+    pub segment_id: i64,
+    pub t_start_ns: i64,
+    pub t_end_ns: i64,
+    pub text: Option<String>,
+    pub match_score: Option<f32>,
+    /// Relative to the data dir, and never empty: the query filters those out.
+    pub audio_path: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MergeReport {
     pub from: i64,
@@ -1195,6 +1209,70 @@ impl Store {
             .conn
             .query_row(&sql, params![segment_id], Self::segment_row_from)
             .optional()?)
+    }
+
+    /// What `segments.audio` needs: the WAV's path (relative to the data dir)
+    /// and the segment's span. Soft-deleted rows are invisible here, so a
+    /// caller cannot play back something the user has already thrown away.
+    ///
+    /// `None` means there is no such live segment. `Some` with an empty path
+    /// means the row is still there but its audio is not — retention took it
+    /// (`retention::forget_audio` blanks the column), which is a different
+    /// answer and gets a different error code.
+    pub fn segment_audio(&self, segment_id: i64) -> Result<Option<(String, i64, i64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT audio_path, t_start_ns, t_end_ns FROM segments
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                params![segment_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Candidate clips for "play me this voice": that speaker's live segments
+    /// that still have a WAV, best first.
+    ///
+    /// Best means *long and confidently matched*, in that order. A two-second
+    /// "yeah" identifies nobody however sure the matcher was, so duration
+    /// leads; among clips of similar length the one the matcher was surest
+    /// about is the one least likely to be somebody else's voice. Bucketing
+    /// duration to whole seconds is what keeps a 4.1 s clip from beating a
+    /// 4.0 s one that scored far better.
+    ///
+    /// The speaker is resolved through `speaker_resolved`, so a merged-away id
+    /// still finds the surviving voice's clips.
+    pub fn speaker_sample_candidates(
+        &self,
+        speaker_id: i64,
+        limit: usize,
+    ) -> Result<Vec<SampleRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.t_start_ns, g.t_end_ns, g.text, g.match_score, g.audio_path
+             FROM segments g
+             LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             WHERE g.deleted_at IS NULL
+               AND g.audio_path <> ''
+               AND sp.canonical_id = ?1
+             ORDER BY (g.t_end_ns - g.t_start_ns) / 1000000000 DESC,
+                      COALESCE(g.match_score, -1) DESC,
+                      g.t_start_ns DESC, g.id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![speaker_id, limit as i64], |r| {
+                Ok(SampleRow {
+                    segment_id: r.get(0)?,
+                    t_start_ns: r.get(1)?,
+                    t_end_ns: r.get(2)?,
+                    text: r.get(3)?,
+                    match_score: r.get::<_, Option<f64>>(4)?.map(|v| v as f32),
+                    audio_path: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// `search`, narrowed. The FTS query drives the match; the rest are `AND`ed

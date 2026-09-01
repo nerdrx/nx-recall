@@ -6,6 +6,7 @@
 import { h, clear, fmtClock, fmtDay, fmtDayLabel, speakerColor } from '../lib/dom.js';
 import { store, speakerLabel, isUncertain, uncertainReason, ask } from '../lib/store.js';
 import { openSheet, toast } from '../lib/sheets.js';
+import { play, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 
 export const id = 'transcript';
 
@@ -251,7 +252,7 @@ export function mount(root, ctx) {
 export function openSegmentSheet(seg, ctx) {
   let picked = seg.speaker ?? null;
 
-  openSheet((close) => {
+  const build = (close) => {
     const pick = h('div', { class: 'sp-pick' });
     const rebuild = () => {
       clear(pick);
@@ -297,6 +298,50 @@ export function openSegmentSheet(seg, ctx) {
       }
     };
 
+    // "Who said this?" is a question about a sound, so the sound is one press
+    // away — same shared player as the speakers view, so the two can never be
+    // talking at once.
+    const key = `segment:${seg.id}`;
+    const hint = h('span', { class: 'sp-hint', id: 'segment-audio-hint' });
+    const listen = h('button', {
+      class: 'btn small preview',
+      id: 'segment-play',
+      title: 'Listen to this segment',
+      onclick: async () => {
+        if (isActive(key)) {
+          stopPreview();
+          return;
+        }
+        hint.textContent = '';
+        hint.classList.remove('shown');
+        const res = await play(key, [seg.id]);
+        if (!res.stopped && !res.played) {
+          hint.textContent = noAudioHint(res.error === 'empty' ? 'gone' : res.error);
+          hint.classList.add('shown');
+        }
+      },
+    });
+    const paint = () => {
+      const on = isActive(key);
+      listen.classList.toggle('on', on);
+      listen.textContent = on ? '■' : '▶';
+      listen.setAttribute('aria-pressed', String(on));
+      listen.setAttribute('aria-label', on ? 'Stop this segment' : 'Play this segment');
+    };
+    paint();
+    // The sheet is torn out of the DOM on close, which is also when this
+    // subscription stops being anyone's business. It only retires itself — the
+    // sheet's onClose does the stopping. A closed sheet that reached for the
+    // player here would kill the *next* preview on its very first event, which
+    // is exactly the bug the headless suite caught.
+    const off = onPlayback(() => {
+      if (!listen.isConnected) {
+        off();
+        return;
+      }
+      paint();
+    });
+
     return [
       h('h2', { text: 'Reassign or correct' }),
       h('p', {
@@ -305,7 +350,12 @@ export function openSegmentSheet(seg, ctx) {
           ? uncertainReason(seg)
           : `Matched at ${(seg.match_score ?? 0).toFixed(2)} confidence, ${Math.round((seg.overlap_frac ?? 0) * 100)}% overlapped.`,
       }),
-      h('div', { class: 'quote', text: `${fmtClock(seg.t_ms)} · ${seg.source ?? 'unknown source'}` }),
+      h(
+        'div',
+        { class: 'quote listen-row' },
+        listen,
+        h('span', {}, `${fmtClock(seg.t_ms)} · ${seg.source ?? 'unknown source'}`, hint)
+      ),
       h('div', { class: 'card-title', text: 'Who said this' }),
       pick,
       h('div', { class: 'card-title', text: 'What they said' }),
@@ -317,6 +367,9 @@ export function openSegmentSheet(seg, ctx) {
         h('button', { class: 'btn primary', id: 'segment-save', onclick: save }, 'Save')
       ),
     ];
-  });
+  };
+
+  // Closing the sheet takes the sound with it — the stop button just left.
+  openSheet(build, { onClose: () => stopPreview() });
   void ctx;
 }

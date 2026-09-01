@@ -12,6 +12,7 @@
 pub mod allowlist;
 pub mod analysis;
 pub mod asr;
+pub mod b64;
 pub mod bus;
 pub mod capture;
 pub mod client;

@@ -281,7 +281,7 @@ textarea.input { resize: vertical; min-height: 74px; line-height: 1.5; width: 10
 .banner .who-row { display: flex; flex-wrap: wrap; gap: var(--sp-1); }
 
 .sp-row {
-  display: grid; grid-template-columns: minmax(0, 1fr) 92px 104px auto;
+  display: grid; grid-template-columns: auto minmax(0, 1fr) 92px 104px auto;
   gap: var(--sp-2); align-items: center;
   padding: 11px var(--sp-2); border-radius: var(--radius-sm);
   background: var(--well); border: 1px solid transparent;
@@ -299,6 +299,41 @@ textarea.input { resize: vertical; min-height: 74px; line-height: 1.5; width: 10
 .sp-num { font: 500 13px/1 var(--mono); color: var(--text); text-align: right; }
 .sp-num small { display: block; margin-top: 4px; font: 400 10px/1 var(--font); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
 .sp-actions { display: flex; gap: 6px; }
+
+/* ------------------------------------------------------- voice preview --- */
+/* Listening is how you answer "who is this?", so the control sits ahead of the
+   name rather than behind a menu. It is a play control, not a brand moment:
+   violet only while it is actually sounding. */
+
+.btn.preview {
+  width: 28px; padding: 5px 0; text-align: center;
+  font-size: 11px; line-height: 1.4; color: var(--muted);
+  font-variant-emoji: text;
+}
+.btn.preview:hover { color: var(--text); }
+.btn.preview.on {
+  color: #fff; border-color: rgba(226, 200, 255, 0.34);
+  background: linear-gradient(180deg, rgba(119, 0, 255, 0.9) 0%, rgba(80, 0, 180, 0.9) 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.24), 0 0 18px -8px rgba(119, 0, 255, 0.9);
+}
+
+/* The row itself says which voice you are hearing — subtle, because it is a
+   transient state and the list is scanned, not stared at. */
+.sp-row.playing { background: rgba(119, 0, 255, 0.1); border-color: rgba(119, 0, 255, 0.34); }
+.sp-row.playing .sp-name { color: var(--text); }
+
+/* Its own line under the name: wrapped inline it reflows the row's baseline
+   and the list stops scanning cleanly. */
+.sp-hint { display: none; font-size: 11px; color: var(--amber); }
+.sp-hint.shown { display: block; margin-top: 3px; }
+.sheet .sp-hint.shown { display: inline-block; margin: 0 0 0 8px; }
+
+.who-pair { display: inline-flex; gap: 6px; align-items: stretch; }
+.who-pair .btn.preview { width: 32px; }
+.banner-hint { display: none; margin: var(--sp-1) 0 0; font-size: 12px; color: var(--amber); }
+.banner-hint.shown { display: block; }
+
+.sheet .quote.listen-row { display: flex; align-items: center; gap: 10px; }
 
 /* --------------------------------------------------------------- search -- */
 

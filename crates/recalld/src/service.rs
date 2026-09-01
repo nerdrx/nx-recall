@@ -33,6 +33,21 @@ const DELETE_BATCH: usize = 200;
 /// waited for (`bus`), so a big split must not be able to hang up every view.
 const SPLIT_EVENT_CAP: usize = 100;
 
+/// One NDJSON frame's byte budget. The GUI's client carries the same number as
+/// its oversized-frame guard (`gui/src/main/client.js`, MAX_FRAME_BYTES) — the
+/// two have to agree, or the daemon writes a reply that hangs up the client
+/// that asked for it.
+pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// The largest segment WAV `segments.audio` will put on the wire. A capped
+/// 30 s segment is ~960 KB at 16 kHz mono 16-bit, so this is a corruption
+/// guard rather than a working limit; base64 costs 4/3, which keeps the reply
+/// under `MAX_FRAME_BYTES` with room for the JSON around it.
+const MAX_AUDIO_BYTES: u64 = 10 * 1024 * 1024;
+
+/// How many clips `speakers.sample` returns when the caller does not say.
+const SAMPLE_LIMIT: usize = 3;
+
 /// One segment on the wire.
 ///
 /// Both time forms, deliberately (PROTOCOL "Field conventions"): `t_ms` is what
@@ -112,8 +127,10 @@ impl Service {
             "speakers.name" => self.speakers_name(req),
             "speakers.merge" => self.speakers_merge(req),
             "speakers.split" => self.speakers_split(req),
+            "speakers.sample" => self.speakers_sample(req),
             "segments.reassign" => self.segments_reassign(req),
             "segments.correct" => self.segments_correct(req),
+            "segments.audio" => self.segments_audio(req),
             "search" => self.search(req),
             "transcript" => self.transcript(req),
             "roster.now" => self.roster_now(),
@@ -648,7 +665,104 @@ impl Service {
         Ok(result)
     }
 
+    /// "Play me this voice." The clips a person would need to answer *who is
+    /// this?*, so the naming flow does not have to page through a transcript
+    /// hunting for a segment that still has audio.
+    ///
+    /// Only clips whose WAV is actually on disk come back: retention blanks
+    /// `audio_path` when it forgets a segment, but a file can also go missing
+    /// under the daemon, and a sample list whose entries answer `gone` when
+    /// played is worse than a short list.
+    fn speakers_sample(&self, req: &Request) -> Result<Value, Error> {
+        let id = req.i64("id")?;
+        let limit = req.usize_or("limit", SAMPLE_LIMIT)?.clamp(1, 20);
+        let store = self.store();
+        if store.speaker_name(id).map_err(Error::from)?.is_none() {
+            return Err(Error::not_found(format!("no speaker with id {id}")));
+        }
+        // Over-fetch: the file check below drops rows, and asking for exactly
+        // `limit` would hand back a short list whenever one clip has gone.
+        let candidates = store
+            .speaker_sample_candidates(id, (limit * 8).clamp(limit, 200))
+            .map_err(Error::from)?;
+        drop(store);
+
+        let mut samples = Vec::with_capacity(limit);
+        for c in candidates {
+            if samples.len() == limit {
+                break;
+            }
+            if !self.control.data_dir.join(&c.audio_path).is_file() {
+                continue;
+            }
+            samples.push(json!({
+                "segment_id": c.segment_id,
+                "t_ms": ns_to_ms(c.t_start_ns),
+                "t_ns": c.t_start_ns.to_string(),
+                "duration_ms": ns_to_ms(c.t_end_ns - c.t_start_ns),
+                "text": c.text,
+                "match_score": c.match_score,
+            }));
+        }
+        Ok(json!({"id": id, "samples": samples}))
+    }
+
     // ---- segments --------------------------------------------------------
+
+    /// One segment's audio, base64 in the reply. Small by construction (a
+    /// segment is capped at tens of seconds of 16 kHz mono), so it is served
+    /// inline rather than through a second channel the GUI would have to grow
+    /// a file path for — and a path would defeat the point of the 0700 data
+    /// directory being the access control.
+    fn segments_audio(&self, req: &Request) -> Result<Value, Error> {
+        let id = req.i64("id")?;
+        let (rel, t_start_ns, t_end_ns) = self
+            .store()
+            .segment_audio(id)
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::not_found(format!("no segment with id {id}")))?;
+        // A blanked path is retention having done its job, not a fault: the
+        // transcript outlives the recording on purpose (DESIGN §8).
+        if rel.is_empty() {
+            return Err(Error::new(
+                "gone",
+                format!(
+                    "segment {id} still has its text, but not its audio — \
+                     the audio retention window expired"
+                ),
+            ));
+        }
+        let path = self.control.data_dir.join(&rel);
+        let meta = std::fs::metadata(&path).map_err(|_| {
+            Error::new(
+                "gone",
+                format!(
+                    "segment {id} points at audio that is no longer on disk — \
+                     the audio retention window expired or the file was removed"
+                ),
+            )
+        })?;
+        if meta.len() > MAX_AUDIO_BYTES {
+            return Err(Error::new(
+                "refused",
+                format!(
+                    "segment {id}'s audio is {} bytes, over the {MAX_AUDIO_BYTES} byte \
+                     limit for one reply",
+                    meta.len()
+                ),
+            ));
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|e| Error::internal(format!("reading {}: {e}", path.display())))?;
+        let (sample_rate, duration_ms) = wav_span(&bytes, ns_to_ms(t_end_ns - t_start_ns));
+        Ok(json!({
+            "id": id,
+            "wav_b64": crate::b64::encode(&bytes),
+            "duration_ms": duration_ms,
+            "sample_rate": sample_rate,
+            "bytes": bytes.len(),
+        }))
+    }
 
     fn segments_reassign(&self, req: &Request) -> Result<Value, Error> {
         let segment_id = req.i64("segment_id")?;
@@ -956,6 +1070,21 @@ fn time_param(req: &Request, key: &str) -> Result<Option<i64>, Error> {
         Some(n) => Ok(Some(n * 1_000_000)),
         None => Err(Error::params(format!("{key} must be a string or a number"))),
     }
+}
+
+/// What the WAV itself says it is: `(sample_rate, duration_ms)`.
+///
+/// The row's span is the fallback, not the answer. A segment's stored span is
+/// the pipeline's clock; the file is what a `<audio>` element will actually
+/// play, and a progress bar that disagrees with the sound is a bug report.
+fn wav_span(bytes: &[u8], row_ms: i64) -> (u32, i64) {
+    let Ok(reader) = hound::WavReader::new(std::io::Cursor::new(bytes)) else {
+        return (16_000, row_ms);
+    };
+    let spec = reader.spec();
+    let frames = reader.duration() as i64;
+    let rate = spec.sample_rate.max(1);
+    (rate, frames * 1000 / rate as i64)
 }
 
 #[cfg(test)]
@@ -1717,5 +1846,201 @@ mod tests {
             .code,
             "resync"
         );
+    }
+
+    // ---- segments.audio / speakers.sample --------------------------------
+
+    /// A segment with a real WAV behind it, `secs` long, matched to `speaker`.
+    fn a_clip(rig: &Rig, sess: i64, name: &str, secs: f32, speaker: Option<(i64, f32)>) -> i64 {
+        let rel = format!("segments/{name}.wav");
+        let samples = vec![0.25f32; (16_000.0 * secs) as usize];
+        crate::pipeline::write_wav(&rig.dir.join(&rel), &samples).unwrap();
+        let store = rig.service.store();
+        let seg = store
+            .insert_segment(sess, 0, (secs * 1e9) as i64, &rel, 0)
+            .unwrap();
+        store
+            .set_segment_analysis(
+                seg,
+                &SegmentAnalysis {
+                    text: Some(format!("clip {name}")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        if let Some((id, score)) = speaker {
+            store
+                .set_segment_speaker(seg, Some(id), Some(score))
+                .unwrap();
+        }
+        seg
+    }
+
+    #[test]
+    fn a_segments_wav_comes_back_base64_with_its_own_rate_and_length() {
+        let r = rig("audio-ok");
+        let sess = a_session(&r);
+        let seg = a_clip(&r, sess, "one", 1.5, None);
+
+        let out = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"segments.audio","params":{{"id":{seg}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(out["id"], seg);
+        assert_eq!(out["sample_rate"], 16_000);
+        assert_eq!(out["duration_ms"], 1500);
+        // The payload is a real RIFF/WAVE file, not a hopeful string: "UklG"
+        // is what every base64 encoder makes of the first three bytes "RIF".
+        let b64 = out["wav_b64"].as_str().unwrap();
+        assert!(b64.starts_with("UklG"), "not a RIFF header: {}", &b64[..12]);
+        assert_eq!(b64.len() % 4, 0, "base64 must be padded to a multiple of 4");
+        assert_eq!(
+            b64.len(),
+            crate::b64::encoded_len(out["bytes"].as_u64().unwrap() as usize)
+        );
+    }
+
+    #[test]
+    fn audio_that_retention_took_is_gone_not_missing() {
+        let r = rig("audio-gone");
+        let sess = a_session(&r);
+        let kept = a_clip(&r, sess, "kept", 1.0, None);
+        let blanked = a_clip(&r, sess, "blanked", 1.0, None);
+        let unlinked = a_clip(&r, sess, "unlinked", 1.0, None);
+
+        // Retention's own move: the row and its text stay, the column empties.
+        r.service.store().forget_audio(&[blanked]).unwrap();
+        // And the other way round: the row still points somewhere, but the
+        // file is not there any more.
+        std::fs::remove_file(r.dir.join("segments/unlinked.wav")).unwrap();
+
+        let code = |id: i64| {
+            call(
+                &r,
+                &format!(r#"{{"id":1,"method":"segments.audio","params":{{"id":{id}}}}}"#),
+            )
+            .unwrap_err()
+        };
+        let e = code(blanked);
+        assert_eq!(e.code, "gone");
+        assert!(
+            e.msg.contains("retention"),
+            "the message must say why: {}",
+            e.msg
+        );
+        assert_eq!(code(unlinked).code, "gone");
+        // A soft-deleted segment is not "gone audio", it is not a segment.
+        r.service.store().soft_delete_segments(&[kept], 1).unwrap();
+        assert_eq!(code(kept).code, "not_found");
+        assert_eq!(code(999_999).code, "not_found");
+    }
+
+    #[test]
+    fn an_absurdly_large_wav_is_refused_rather_than_framed() {
+        let r = rig("audio-big");
+        let sess = a_session(&r);
+        let seg = a_clip(&r, sess, "big", 0.1, None);
+        // Bigger than any real segment could be, which is exactly the case the
+        // cap exists for: a corrupt or hand-placed file must not become a
+        // multi-megabyte frame nobody's client will accept.
+        std::fs::write(
+            r.dir.join("segments/big.wav"),
+            vec![0u8; MAX_AUDIO_BYTES as usize + 1],
+        )
+        .unwrap();
+        let e = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"segments.audio","params":{{"id":{seg}}}}}"#),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "refused");
+    }
+
+    #[test]
+    fn the_audio_cap_cannot_outgrow_the_frame_budget() {
+        // The two limits are one decision. If the cap ever rises past what a
+        // frame can carry, the daemon starts writing replies that hang up the
+        // client that asked for them — so it is asserted, not commented.
+        let worst = crate::b64::encoded_len(MAX_AUDIO_BYTES as usize);
+        assert!(
+            worst + 4096 < MAX_FRAME_BYTES,
+            "{MAX_AUDIO_BYTES} bytes encode to {worst}, which does not fit in {MAX_FRAME_BYTES}"
+        );
+    }
+
+    #[test]
+    fn a_voices_samples_are_its_longest_best_matched_clips_that_still_have_audio() {
+        let r = rig("sample");
+        let sess = a_session(&r);
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        let other = r.service.store().mint_speaker(0).unwrap();
+
+        let short = a_clip(&r, sess, "short", 1.0, Some((spk, 0.95)));
+        let long_weak = a_clip(&r, sess, "long-weak", 6.0, Some((spk, 0.30)));
+        let long_strong = a_clip(&r, sess, "long-strong", 6.0, Some((spk, 0.88)));
+        let gone = a_clip(&r, sess, "gone", 9.0, Some((spk, 0.99)));
+        a_clip(&r, sess, "elsewhere", 8.0, Some((other, 0.9)));
+
+        // The best clip of all, except its file is not there — it must not be
+        // offered, or the naming flow hands the user a play button that fails.
+        std::fs::remove_file(r.dir.join("segments/gone.wav")).unwrap();
+
+        let out = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"speakers.sample","params":{{"id":{spk}}}}}"#),
+        )
+        .unwrap();
+        let ids: Vec<i64> = out["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["segment_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![long_strong, long_weak, short], "got {out:#}");
+        assert!(!ids.contains(&gone), "a clip with no file was offered");
+
+        let first = &out["samples"][0];
+        assert_eq!(first["duration_ms"], 6000);
+        assert_eq!(first["text"], "clip long-strong");
+        // Both time forms, like every other segment-shaped reply.
+        assert!(first["t_ns"].is_string());
+        assert!(first["t_ms"].is_number());
+
+        // `limit` is honoured, and the default is three.
+        let one = call(
+            &r,
+            &format!(r#"{{"id":2,"method":"speakers.sample","params":{{"id":{spk},"limit":1}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(one["samples"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            call(
+                &r,
+                r#"{"id":3,"method":"speakers.sample","params":{"id":4242}}"#
+            )
+            .unwrap_err()
+            .code,
+            "not_found"
+        );
+    }
+
+    #[test]
+    fn a_voice_whose_audio_has_all_aged_out_samples_empty_rather_than_failing() {
+        let r = rig("sample-empty");
+        let sess = a_session(&r);
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        let seg = a_clip(&r, sess, "only", 4.0, Some((spk, 0.8)));
+        r.service.store().forget_audio(&[seg]).unwrap();
+
+        // Not an error: the voice exists, it simply has nothing to play. The
+        // GUI turns this into "no audio kept for this voice", which is a fact
+        // about retention rather than a failure to report.
+        let out = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"speakers.sample","params":{{"id":{spk}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(out["samples"].as_array().unwrap().len(), 0);
     }
 }

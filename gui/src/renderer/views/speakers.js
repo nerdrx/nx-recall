@@ -8,8 +8,12 @@
 import { h, clear, fmtDur, fmtDate, speakerColor } from '../lib/dom.js';
 import { store, speakerLabel, isNamed, onboardingCandidates, ask, reloadSpeakers } from '../lib/store.js';
 import { confirmSheet, openSheet, toast } from '../lib/sheets.js';
+import { playSpeaker, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 
 export const id = 'speakers';
+
+/** A voice's preview is keyed by its id, so any surface can drive the same one. */
+const previewKey = (spId) => `speaker:${spId}`;
 
 export function mount(root, ctx) {
   const bannerSlot = h('div', { id: 'onboarding-slot' });
@@ -34,10 +38,18 @@ export function mount(root, ctx) {
     for (const sp of ob.speakers) {
       row.append(
         h(
-          'button',
-          { class: 'btn primary', dataset: { onboard: String(sp.id) }, onclick: () => startRename(sp.id) },
-          h('span', { class: 'dot', style: `color:${speakerColor(sp.id)}` }),
-          ` Name ${speakerLabel(sp.id)} · ${fmtDur(sp.total_ms)}`
+          'span',
+          { class: 'who-pair' },
+          // Listening comes first, literally: you cannot answer "who is this?"
+          // from a name field alone. Naming autoplays the sample too, so either
+          // door leads to the same one motion.
+          previewButton(sp.id),
+          h(
+            'button',
+            { class: 'btn primary', dataset: { onboard: String(sp.id) }, onclick: () => startRename(sp.id, { listen: true }) },
+            h('span', { class: 'dot', style: `color:${speakerColor(sp.id)}` }),
+            ` Name ${speakerLabel(sp.id)} · ${fmtDur(sp.total_ms)}`
+          )
         )
       );
     }
@@ -47,11 +59,77 @@ export function mount(root, ctx) {
         { class: 'banner', id: 'onboarding-banner' },
         h('h2', { text: 'These voices are most of your conversations — who are they?' }),
         h('p', {
-          text: `${pct}% of everything captured so far came from voices that do not have a name yet. Naming one relabels every past segment it matched and every future one too — it is the only setup this needs.`,
+          text: `${pct}% of everything captured so far came from voices that do not have a name yet. Play a voice to hear who it is, then name it — naming relabels every past segment it matched and every future one too, and it is the only setup this needs.`,
         }),
-        row
+        row,
+        h('p', { class: 'banner-hint', id: 'onboarding-hint' })
       )
     );
+    paintPlayState();
+  }
+
+  // -- preview --------------------------------------------------------------
+
+  /** ▶ / ■ for one voice. Every surface uses this, so they cannot disagree. */
+  function previewButton(spId) {
+    const btn = h('button', {
+      class: 'btn small preview',
+      dataset: { preview: String(spId) },
+      title: 'Listen to this voice',
+      onclick: (e) => {
+        e.stopPropagation();
+        void togglePreview(spId);
+      },
+    });
+    paintButton(btn, spId);
+    return btn;
+  }
+
+  function paintButton(btn, spId) {
+    const on = isActive(previewKey(spId));
+    btn.classList.toggle('on', on);
+    btn.textContent = on ? '■' : '▶';
+    btn.setAttribute('aria-pressed', String(on));
+    btn.setAttribute('aria-label', on ? `Stop ${speakerLabel(spId)}` : `Play a sample of ${speakerLabel(spId)}`);
+  }
+
+  /** Repaint every play control and row indicator from the shared state. */
+  function paintPlayState() {
+    for (const btn of root.querySelectorAll('[data-preview]')) paintButton(btn, Number(btn.dataset.preview));
+    for (const row of list.querySelectorAll('.sp-row')) {
+      row.classList.toggle('playing', isActive(previewKey(Number(row.dataset.speaker))));
+    }
+  }
+
+  /**
+   * The hint belongs next to the thing that failed, not in a toast that has
+   * scrolled away by the time you look: "why is there no sound?" is answered
+   * on the row you pressed.
+   */
+  function setHint(spId, text) {
+    const show = (el) => {
+      if (!el) return;
+      el.textContent = text;
+      el.classList.toggle('shown', !!text);
+    };
+    show(list.querySelector(`.sp-hint[data-hint="${spId}"]`));
+    const banner = document.getElementById('onboarding-hint');
+    if (banner && Number(banner.dataset.for) === spId) show(banner);
+  }
+
+  async function togglePreview(spId) {
+    const key = previewKey(spId);
+    if (isActive(key)) {
+      stopPreview();
+      return null;
+    }
+    const banner = document.getElementById('onboarding-hint');
+    if (banner) banner.dataset.for = String(spId);
+    setHint(spId, '');
+    const res = await playSpeaker(key, spId);
+    // An interrupted preview is the user's own doing; it explains itself.
+    if (!res.stopped && !res.played) setHint(spId, noAudioHint(res.error));
+    return res;
   }
 
   // -- list -----------------------------------------------------------------
@@ -75,6 +153,8 @@ export function mount(root, ctx) {
       return;
     }
     for (const sp of rows) list.append(speakerRow(sp));
+    // A repaint must not lose the "this one is sounding right now" mark.
+    paintPlayState();
   }
 
   function speakerRow(sp) {
@@ -120,11 +200,18 @@ export function mount(root, ctx) {
     });
 
     row.append(
+      previewButton(sp.id),
       h(
         'span',
         { class: 'sp-id', dataset: { sp: String(sp.id) } },
         h('span', { class: 'dot', style: `color:${color}` }),
-        h('span', {}, name, h('span', { class: 'sp-sub', text: ` first heard ${fmtDate(sp.first_seen)}` }))
+        h(
+          'span',
+          {},
+          name,
+          h('span', { class: 'sp-sub', text: ` first heard ${fmtDate(sp.first_seen)}` }),
+          h('span', { class: 'sp-hint', dataset: { hint: String(sp.id) } })
+        )
       ),
       h('span', { class: 'sp-num' }, String(sp.segments ?? 0), h('small', { text: 'segments' })),
       h('span', { class: 'sp-num' }, fmtDur(sp.total_ms), h('small', { text: 'total speech' })),
@@ -141,14 +228,21 @@ export function mount(root, ctx) {
 
   // -- actions --------------------------------------------------------------
 
-  function startRename(spId) {
+  /**
+   * `listen: true` starts the voice playing as the field opens. It is not
+   * ambient autoplay — the person pressed "Name this voice", and the only way
+   * to answer that question is to hear it. Listening and typing become one
+   * motion instead of two round trips through the transcript.
+   */
+  function startRename(spId, { listen = false } = {}) {
     const row = list.querySelector(`.sp-row[data-speaker="${spId}"]`);
     const target = row?.querySelector('.sp-name');
     if (!target) {
       // The banner can ask to rename a voice while the list is elsewhere.
       renderList();
-      return startRename(spId);
+      return startRename(spId, { listen });
     }
+    if (listen && !isActive(previewKey(spId))) void togglePreview(spId);
     const sp = store.speakers.get(spId);
     const input = h('input', {
       class: 'input',
@@ -303,8 +397,20 @@ export function mount(root, ctx) {
     }
   }
 
+  // Playback state lives outside the view (one <audio> for the whole app), so
+  // the rows follow it rather than owning it. The view has no unmount hook, so
+  // the subscription retires itself once its DOM is gone.
+  const off = onPlayback(() => {
+    if (!list.isConnected) {
+      off();
+      return;
+    }
+    paintPlayState();
+  });
+
   renderBanner();
   renderList();
+  paintPlayState();
   void ctx;
   return { update, renderList, renderBanner, startRename };
 }

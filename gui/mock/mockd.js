@@ -59,6 +59,61 @@ const SPEAKERS = [
   { id: 6, name: null, auto: 'Speaker_44', first_seen: '2026-08-29T20:19:00Z' },
 ];
 
+// One voice whose audio has aged out of retention while its text stayed. The
+// GUI has to say so in place ("no audio kept for this voice") rather than
+// offering a play button that does nothing — so the mock always has a voice
+// that answers `gone`, and the e2e always exercises that branch.
+const NO_AUDIO_SPEAKER = 5;
+
+// --- generated audio --------------------------------------------------------
+// Real bytes, no fixtures: a short 16 kHz mono sine sweep per speaker, so the
+// GUI decodes and plays an actual WAV and two voices audibly differ. The pitch
+// is derived from the speaker id, which makes "did I press the right row?"
+// answerable by ear during a manual look.
+
+const TONE_MS = 1200;
+const TONE_RATE = 16000;
+const tones = new Map();
+
+function riffWav(pcm, rate) {
+  const head = Buffer.alloc(44);
+  head.write('RIFF', 0);
+  head.writeUInt32LE(36 + pcm.length, 4);
+  head.write('WAVE', 8);
+  head.write('fmt ', 12);
+  head.writeUInt32LE(16, 16); // fmt chunk size
+  head.writeUInt16LE(1, 20); // PCM
+  head.writeUInt16LE(1, 22); // mono
+  head.writeUInt32LE(rate, 24);
+  head.writeUInt32LE(rate * 2, 28); // byte rate
+  head.writeUInt16LE(2, 32); // block align
+  head.writeUInt16LE(16, 34); // bits
+  head.write('data', 36);
+  head.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([head, pcm]);
+}
+
+function toneFor(speakerId) {
+  const key = speakerId ?? 0;
+  const cached = tones.get(key);
+  if (cached) return cached;
+  const n = Math.round((TONE_RATE * TONE_MS) / 1000);
+  const from = 150 + ((Math.abs(Number(key)) * 53) % 320); // 150..470 Hz
+  const to = from * 1.5;
+  const pcm = Buffer.alloc(n * 2);
+  const fade = TONE_RATE * 0.02;
+  let phase = 0;
+  for (let i = 0; i < n; i += 1) {
+    phase += (2 * Math.PI * (from + ((to - from) * i) / n)) / TONE_RATE;
+    // Fade the ends, or every clip starts and stops with a click.
+    const env = Math.min(1, i / fade, (n - i) / fade);
+    pcm.writeInt16LE(Math.round(Math.sin(phase) * 0.28 * env * 32767), i * 2);
+  }
+  const wav = riffWav(pcm, TONE_RATE);
+  tones.set(key, wav);
+  return wav;
+}
+
 const CANNED_LINES = [
   [1, 'wait, which portal was it — the one behind the bar or the one in the stairwell?', 0.02, 0.71],
   [2, 'the stairwell one, but it only opens after the lights go down', 0.03, 0.66],
@@ -339,6 +394,55 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
         return { created: fresh.id };
       });
       return { op };
+    },
+
+    // PROTOCOL "Voice preview": the clips worth hearing when naming a voice,
+    // longest-first then best-matched, and only ones that still have audio.
+    'speakers.sample'(params) {
+      const sp = speakerById(Number(params?.id));
+      if (!sp) throw err('not_found', `no speaker ${params?.id}`);
+      const limit = Math.min(20, Math.max(1, Number(params?.limit ?? 3)));
+      // Retention took this one's audio: the voice is real, the clips are not.
+      if (sp.id === NO_AUDIO_SPEAKER) return { id: sp.id, samples: [] };
+      const rows = state.segments
+        .filter((s) => s.speaker != null && (state.tombstones.get(s.speaker) ?? s.speaker) === sp.id)
+        .sort(
+          (a, b) =>
+            Math.floor(b.dur_ms / 1000) - Math.floor(a.dur_ms / 1000) ||
+            (b.match_score ?? -1) - (a.match_score ?? -1)
+        )
+        .slice(0, limit);
+      return {
+        id: sp.id,
+        samples: rows.map((s) => ({
+          segment_id: s.id,
+          t_ms: s.t_ms,
+          t_ns: s.t_ns,
+          duration_ms: s.dur_ms,
+          text: s.text,
+          match_score: s.match_score ?? null,
+        })),
+      };
+    },
+
+    'segments.audio'(params) {
+      const seg = state.segments.find((s) => s.id === Number(params?.id));
+      if (!seg) throw err('not_found', `no segment ${params?.id}`);
+      const owner = seg.speaker == null ? null : (state.tombstones.get(seg.speaker) ?? seg.speaker);
+      if (owner === NO_AUDIO_SPEAKER) {
+        throw err(
+          'gone',
+          `segment ${seg.id} still has its text, but not its audio — the audio retention window expired`
+        );
+      }
+      const wav = toneFor(owner);
+      return {
+        id: seg.id,
+        wav_b64: wav.toString('base64'),
+        duration_ms: TONE_MS,
+        sample_rate: TONE_RATE,
+        bytes: wav.length,
+      };
     },
 
     'segments.reassign'(params) {
