@@ -267,9 +267,12 @@ impl Default for IdentityConfig {
     }
 }
 
-/// The memory graph (docs/GRAPH.md). Tier 1 only for now: conversation
-/// threads, which are derived deterministically from data already stored and
-/// therefore have exactly one knob — how long a silence ends a conversation.
+/// The memory graph (docs/GRAPH.md).
+///
+/// Tiers 1 and 2 are deterministic, always on, and have exactly one knob
+/// between them — how long a silence ends a conversation. Everything else here
+/// belongs to **Tier 3**, the tiny local model, and the first field is the one
+/// that matters: `enabled` is **false**, and that is the shipped default.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GraphConfig {
@@ -278,11 +281,68 @@ pub struct GraphConfig {
     /// pause in speech and a short one in an evening: below it the same people
     /// are still talking, above it the room has moved on.
     pub thread_gap_s: f32,
+
+    // ---- Tier 3 (GRAPH.md: "opt-in and idle-only") ----------------------
+    /// Run the local model over conversations nobody has looked at yet.
+    ///
+    /// **Off, and off is the default.** GRAPH.md: "Off by default. Its switch
+    /// sits next to the mic's, with equally plain copy." Turning it on costs a
+    /// 1.9 GB model on disk and four cores of somebody else's idle time; it
+    /// never runs while a game is being captured and never in the capture path.
+    pub enabled: bool,
+    /// Threads handed to llama.cpp (`-t`). Four is the user's stated budget and
+    /// the number the bake-off measured on: 3.3 s/case for Qwen2.5-3B Q4.
+    pub llm_threads: i32,
+    /// Layers offloaded to the GPU (`-ngl`). Zero, and meant to stay zero: the
+    /// GPU belongs to whatever is drawing frames. It exists for a machine that
+    /// is not gaming at all.
+    pub gpu_layers: i32,
+    /// Ceiling on one model call, in seconds, after which the child is killed.
+    /// Generous next to a 3.3 s median because a cold page-in of 1.9 GB is not
+    /// a hang — but finite, because a wedged child holding four cores is.
+    pub llm_timeout_s: u64,
+    /// Conversations per enrichment batch. The worker stops between batches to
+    /// re-check every gate, so this is really "how long the worker commits to
+    /// before looking up again".
+    pub batch_threads: usize,
+    /// Seconds to wait between batches, and between re-checks when a gate is
+    /// closed. Idle work has no deadline; being invisible matters more.
+    pub batch_pause_s: u64,
+    /// Conversations shorter than this are skipped: two lines of transcript
+    /// carry no commitment and no topic worth the name, and walking them would
+    /// spend the whole budget on nothing.
+    pub min_thread_segments: i64,
+    /// The most turns of one conversation the model is shown at once. A window,
+    /// not a summary: the bake-off ran on short windows because that is the
+    /// regime a 3B model is strong in.
+    pub llm_window_turns: usize,
+    /// Queue depth, in seconds of audio waiting for the inference thread, above
+    /// which the worker stands down. A turn storm means the machine is busy
+    /// being a tape recorder, which is the job that matters.
+    pub max_queue_seconds: i64,
+    /// The GGUF, relative to `[models].dir`.
+    pub llm_model: String,
+    /// The llama.cpp binaries, relative to `[models].dir`. `llama-cli` and the
+    /// shared objects it dlopens both live here.
+    pub llama_dir: String,
 }
 
 impl Default for GraphConfig {
     fn default() -> Self {
-        Self { thread_gap_s: 20.0 }
+        Self {
+            thread_gap_s: 20.0,
+            enabled: false,
+            llm_threads: 4,
+            gpu_layers: 0,
+            llm_timeout_s: 180,
+            batch_threads: 4,
+            batch_pause_s: 20,
+            min_thread_segments: 3,
+            llm_window_turns: 12,
+            max_queue_seconds: 5,
+            llm_model: "qwen2.5-3b-instruct-q4_k_m.gguf".into(),
+            llama_dir: "llama".into(),
+        }
     }
 }
 
@@ -700,6 +760,49 @@ mod tests {
         let back = Config::load(&path).unwrap();
         assert!(back.mic.enabled);
         assert_eq!(back.mic.mode, MicMode::Always);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The default that carries the whole privacy argument for Tier 3: the
+    /// local model is **off**, and nothing about a fresh install runs it.
+    #[test]
+    fn the_memory_graphs_local_model_is_off_by_default() {
+        let cfg = Config::default();
+        assert!(!cfg.graph.enabled);
+        assert_eq!(cfg.graph.thread_gap_s, 20.0);
+        // The user's stated budget, and the figure the bake-off measured on.
+        assert_eq!(cfg.graph.llm_threads, 4);
+        // The GPU belongs to whatever is drawing frames.
+        assert_eq!(cfg.graph.gpu_layers, 0);
+        assert_eq!(cfg.graph.llm_model, "qwen2.5-3b-instruct-q4_k_m.gguf");
+        assert_eq!(cfg.graph.llama_dir, "llama");
+        assert_eq!(cfg.graph.min_thread_segments, 3);
+        assert_eq!(cfg.graph.max_queue_seconds, 5);
+    }
+
+    #[test]
+    fn the_graph_section_parses_and_keeps_the_remaining_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [graph]
+            enabled = true
+            llm_threads = 2
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.graph.enabled);
+        assert_eq!(cfg.graph.llm_threads, 2);
+        assert_eq!(cfg.graph.gpu_layers, 0);
+        assert_eq!(cfg.graph.thread_gap_s, 20.0);
+
+        // …and it round-trips, because the GUI's switch writes it back.
+        let dir = std::env::temp_dir().join(format!("nx-recall-graph-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        cfg.save(&path).unwrap();
+        let back = Config::load(&path).unwrap();
+        assert!(back.graph.enabled);
+        assert_eq!(back.graph.llm_threads, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

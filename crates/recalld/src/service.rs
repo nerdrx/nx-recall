@@ -53,6 +53,15 @@ const SAMPLE_LIMIT: usize = 3;
 /// transcript is the right surface anyway.
 const PERSON_THREADS: usize = 12;
 
+/// How many commitments `commitments.list` returns when the caller does not
+/// say. The Memory view is a list of what is still owed, not an archive; past
+/// this it has stopped being answerable.
+const COMMITMENT_LIMIT: usize = 200;
+
+/// Topic labels one `topics.list` carries, and conversations per label.
+const TOPIC_LIMIT: usize = 100;
+const TOPIC_THREADS: usize = 12;
+
 /// What counts as a one-off voice for `speakers.prune`: at most this many
 /// segments and under this much speech in total. Both are deliberately far
 /// below anything a person produces in a conversation — a real voice reaches
@@ -157,6 +166,14 @@ impl Service {
             "speakers.sample" => self.speakers_sample(req),
             "person.get" => self.person_get(req),
             "thread.get" => self.thread_get(req),
+            // The memory graph's Tiers 2 and 3 (0.7.0, docs/GRAPH.md).
+            "graph.summary" => self.graph_summary(),
+            "graph.get" => self.graph_get(),
+            "graph.set" => self.graph_set(req),
+            "graph.enrich" => self.graph_enrich(req),
+            "commitments.list" => self.commitments_list(req),
+            "commitments.set_state" => self.commitments_set_state(req),
+            "topics.list" => self.topics_list(req),
             "segments.reassign" => self.segments_reassign(req),
             "segments.correct" => self.segments_correct(req),
             "segments.audio" => self.segments_audio(req),
@@ -291,6 +308,10 @@ impl Service {
             // polled every three seconds by every open client and the answer
             // costs a walk of the data directory (0.6.1).
             "storage": c.storage_json(),
+            // The memory graph's Tier 3 worker (0.7.0). Also pushed as its own
+            // `graph` event when it moves; carried here so a client that missed
+            // one still converges on the truth, exactly like the mic block.
+            "graph": c.graph_state().to_json(),
             "segments_total": store.segments_total()?,
             "counters": {
                 "sessions_opened": c.stats.sessions_opened.load(Ordering::Relaxed),
@@ -1383,6 +1404,287 @@ impl Service {
             "participants": participants,
             "preview": summary.preview,
             "segments": rows.iter().map(segment_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    // ---- the memory graph, Tiers 2 and 3 (0.7.0, docs/GRAPH.md) ----------
+
+    /// One commitment on the wire.
+    ///
+    /// Two things a client must render and must not conflate. `source` says
+    /// which tier claimed this — `"rules"` is a pattern match and a guess,
+    /// `"llm"` is the local model under a verdict-first grammar — and `state`
+    /// says what a person has decided about it. Nothing here has ever been
+    /// acted on: `candidate` means the daemon noticed something, and only a
+    /// human click moves it.
+    fn commitment_json(&self, c: &crate::store::CommitmentRow) -> Value {
+        json!({
+            "id": c.id,
+            "segment": c.segment_id,
+            "thread": c.thread_id,
+            // `name` is null until somebody names the voice; `auto` is always
+            // there. The same split as every other place a person appears.
+            "who": {"speaker_id": c.who_speaker_id, "name": c.who_name, "auto": c.who_auto},
+            "to": c.to_speaker_id.map(|_| json!({
+                "speaker_id": c.to_speaker_id, "name": c.to_name, "auto": c.to_auto,
+            })),
+            "what": c.what,
+            // The line the claim is about, so a person can disagree with it
+            // without leaving the view.
+            "said": c.said,
+            "due_ms": c.due_utc_ns.map(ns_to_ms),
+            "due_ns": c.due_utc_ns.map(|v| v.to_string()),
+            // The phrase as spoken. A resolved date nobody can trace back to a
+            // word is not evidence of anything.
+            "due_raw": c.due_raw,
+            "due_kind": c.due_kind,
+            "state": c.state,
+            "source": c.source,
+            "model_id": c.model_id,
+            "confidence": c.confidence,
+            "t_ms": ns_to_ms(c.t_start_ns),
+            "t_ns": c.t_start_ns.to_string(),
+            "created_ms": ns_to_ms(c.created_at),
+            "updated_ms": ns_to_ms(c.updated_at),
+        })
+    }
+
+    /// Everything the Memory view needs to paint itself once, in one round trip
+    /// — the same argument the person page makes.
+    fn graph_summary(&self) -> Result<Value, Error> {
+        let counts = self.store().graph_counts().map_err(Error::from)?;
+        let cfg = self.control.graph();
+        Ok(json!({
+            "counts": {
+                "time_refs": counts.time_refs,
+                "commitments": counts.commitments,
+                "open": counts.open,
+                "candidates": counts.candidates,
+                "confirmed": counts.confirmed,
+                "done": counts.done,
+                "dismissed": counts.dismissed,
+                "from_rules": counts.from_rules,
+                "from_llm": counts.from_llm,
+                "topics": counts.topics,
+                "threads": counts.threads,
+                "threads_enriched": counts.threads_enriched,
+                "threads_pending": counts.threads_pending,
+            },
+            "enrichment": self.control.graph_state().to_json(),
+            "config": self.graph_config_json(&cfg),
+        }))
+    }
+
+    /// The Tier 3 settings, plus the two facts a client needs to explain them:
+    /// whether the model is on disk at all, and what it weighs.
+    fn graph_config_json(&self, cfg: &crate::config::GraphConfig) -> Value {
+        let installed = self
+            .control
+            .models_root
+            .as_deref()
+            .map(|root| crate::models::GraphModels::resolve(root, cfg))
+            .map(|g| g.present())
+            .unwrap_or(false);
+        json!({
+            "enabled": cfg.enabled,
+            "installed": installed,
+            "llm_threads": cfg.llm_threads,
+            "gpu_layers": cfg.gpu_layers,
+            "llm_model": cfg.llm_model,
+            "thread_gap_s": cfg.thread_gap_s,
+            "batch_threads": cfg.batch_threads,
+            "min_thread_segments": cfg.min_thread_segments,
+            // What turning it on actually costs, so the copy in a client does
+            // not have to hard-code numbers that could drift.
+            "download_bytes": crate::models::total_download_bytes(&[crate::models::Group::Graph])
+                - crate::models::total_download_bytes(&[]),
+        })
+    }
+
+    fn graph_get(&self) -> Result<Value, Error> {
+        let cfg = self.control.graph();
+        Ok(json!({
+            "config": self.graph_config_json(&cfg),
+            "enrichment": self.control.graph_state().to_json(),
+        }))
+    }
+
+    /// Change the Tier 3 settings, live and persisted.
+    ///
+    /// Live because the switch is in the UI and a switch that needs a restart
+    /// is not a switch; persisted because a switch that forgets is worse.
+    fn graph_set(&self, req: &Request) -> Result<Value, Error> {
+        let enabled = req.opt_bool("enabled")?;
+        let llm_threads = req.opt_i64("llm_threads")?.map(|v| v as i32);
+        let gpu_layers = req.opt_i64("gpu_layers")?.map(|v| v as i32);
+        if enabled.is_none() && llm_threads.is_none() && gpu_layers.is_none() {
+            return Err(Error::params(
+                "graph.set needs at least one of enabled, llm_threads, gpu_layers",
+            ));
+        }
+        self.apply_graph(enabled, llm_threads, gpu_layers)
+    }
+
+    /// The one place the Tier 3 settings actually move, so `graph.set` and
+    /// `graph.enrich` cannot drift into behaving differently.
+    fn apply_graph(
+        &self,
+        enabled: Option<bool>,
+        llm_threads: Option<i32>,
+        gpu_layers: Option<i32>,
+    ) -> Result<Value, Error> {
+        if let Some(e) = enabled {
+            self.control.set_graph_enabled(e);
+            if !e {
+                // Say "off" now rather than in twenty seconds. The worker reads
+                // the switch between conversations and is authoritative about
+                // every other phase, but this one it cannot contradict: the
+                // switch IS off, and a client that flipped it must not be shown
+                // "idle" until the next tick.
+                self.control.set_graph_state(crate::enrich::GraphState {
+                    phase: crate::enrich::Phase::Off,
+                    reason: None,
+                    thread_id: None,
+                    batch_done: 0,
+                    batch_total: 0,
+                    ..self.control.graph_state()
+                });
+            }
+        }
+        let cfg = self.control.set_graph_tuning(llm_threads, gpu_layers);
+
+        let mut persisted = false;
+        if let Some(path) = &self.control.config_path {
+            match Config::load(path) {
+                Ok(mut file) => {
+                    file.graph.enabled = cfg.enabled;
+                    file.graph.llm_threads = cfg.llm_threads;
+                    file.graph.gpu_layers = cfg.gpu_layers;
+                    match file.save(path) {
+                        Ok(()) => persisted = true,
+                        Err(e) => warn!("could not persist the graph settings: {e:#}"),
+                    }
+                }
+                Err(e) => warn!("could not re-read the config to persist the graph: {e:#}"),
+            }
+        }
+        info!(
+            enabled = cfg.enabled,
+            threads = cfg.llm_threads,
+            persisted,
+            "memory graph settings changed"
+        );
+        let mut payload = self.graph_config_json(&cfg);
+        payload["persisted"] = json!(persisted);
+        // The worker reads the switch between conversations, so a client would
+        // otherwise see nothing move for up to one batch pause. Say what is
+        // true now and let the worker's own event correct it when it acts.
+        self.bus
+            .publish(Topic::Status, "graph", self.control.graph_state().to_json());
+        self.announce_status();
+        Ok(json!({
+            "config": payload,
+            "enrichment": self.control.graph_state().to_json(),
+        }))
+    }
+
+    /// The imperative wrapper over the same switch: "run it" / "stop".
+    ///
+    /// It exists because a person pressing a button in the Memory view is not
+    /// editing a setting, they are asking for the pass to happen — even though
+    /// underneath it is one flag. Nothing is interrupted mid-conversation; the
+    /// worker stands down at the next boundary, which is at most one model call.
+    fn graph_enrich(&self, req: &Request) -> Result<Value, Error> {
+        let action = req
+            .opt_str("action")?
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "start".into());
+        let start = match action.as_str() {
+            "start" => true,
+            "stop" => false,
+            other => {
+                return Err(Error::params(format!(
+                    "action must be \"start\" or \"stop\", not {other:?}"
+                )));
+            }
+        };
+        let cfg = self.control.graph();
+        if start != cfg.enabled {
+            // Starting is turning it on, and turning it on is a decision worth
+            // remembering — so it goes through the same persisted path.
+            return self.apply_graph(Some(start), None, None);
+        }
+        Ok(json!({
+            "config": self.graph_config_json(&cfg),
+            "enrichment": self.control.graph_state().to_json(),
+            "changed": false,
+        }))
+    }
+
+    /// Open commitments, soonest-due first. `state` filters; omitting it
+    /// returns every state, which is what a client showing history wants.
+    fn commitments_list(&self, req: &Request) -> Result<Value, Error> {
+        let state = match req.opt_str("state")? {
+            None => None,
+            Some(s) => Some(crate::store::commitment_state::parse(s).ok_or_else(|| {
+                Error::params(format!(
+                    "state must be one of {:?}, not {s:?}",
+                    crate::store::commitment_state::ALL
+                ))
+            })?),
+        };
+        let limit = req.usize_or("limit", COMMITMENT_LIMIT)?.clamp(1, 500);
+        let rows = self
+            .store()
+            .commitments(state, limit)
+            .map_err(Error::from)?;
+        Ok(json!({
+            "state": state,
+            "commitments": rows.iter().map(|c| self.commitment_json(c)).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// The state machine, and the only thing that moves a commitment off
+    /// `candidate`. Every transition is a person's click; nothing here is ever
+    /// called by the daemon itself.
+    fn commitments_set_state(&self, req: &Request) -> Result<Value, Error> {
+        let id = req.i64("id")?;
+        let state = req
+            .opt_str("state")?
+            .ok_or_else(|| Error::params("state is required"))?;
+        let state = crate::store::commitment_state::parse(state).ok_or_else(|| {
+            Error::params(format!(
+                "state must be one of {:?}, not {state:?}",
+                crate::store::commitment_state::ALL
+            ))
+        })?;
+        let row = self
+            .store()
+            .set_commitment_state(id, state, utc_now_ns())
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::not_found(format!("no commitment with id {id}")))?;
+        let payload = self.commitment_json(&row);
+        // Broadcast, like every other retroactive change: a decision made here
+        // has to reach the CLI and any other window without either re-querying.
+        self.bus.publish(Topic::Ops, "commitment", payload.clone());
+        Ok(payload)
+    }
+
+    /// The topic labels in use, most recently heard first.
+    fn topics_list(&self, req: &Request) -> Result<Value, Error> {
+        let per_topic = req.usize_or("per_topic", TOPIC_THREADS)?.clamp(1, 100);
+        let limit = req.usize_or("limit", TOPIC_LIMIT)?.clamp(1, 500);
+        let mut rows = self.store().topics(per_topic).map_err(Error::from)?;
+        rows.truncate(limit);
+        Ok(json!({
+            "topics": rows.iter().map(|t| json!({
+                "topic": t.topic,
+                "threads": t.threads,
+                "segments": t.segments,
+                "last_ms": ns_to_ms(t.last_ns),
+                "last_ns": t.last_ns.to_string(),
+                "thread_ids": t.thread_ids,
+            })).collect::<Vec<_>>(),
         }))
     }
 

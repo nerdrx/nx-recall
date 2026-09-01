@@ -164,6 +164,37 @@ Needs the running daemon: every connected client has to be told.")]
     /// Ask the running daemon how it is doing.
     Status,
 
+    /// The memory graph: what has been derived, and whether the local model is
+    /// allowed to run.
+    // Verbatim: clap would otherwise reflow the example block into a paragraph.
+    #[command(long_about = "\
+The memory graph (docs/GRAPH.md): who owes what to whom, and what conversations
+were about.
+
+Tiers 1 and 2 are deterministic and always on — conversation threads, time
+references, and rule-based promise candidates. They cost nothing and they are
+marked as guesses wherever they appear.
+
+Tier 3 is a 3B local model, and it is OFF by default. Turning it on spends four
+CPU cores at nice 19 on conversations nobody has looked at yet, and only while
+no captured application is running and capture is not paused. Nothing leaves the
+machine, at any tier.
+
+  recalld graph            what has been derived, and what the worker is doing
+  recalld graph on         allow the local model to run when the machine is idle
+  recalld graph off        stop it
+  recalld graph commitments   open promises, soonest first
+  recalld graph topics        the conversation labels in use
+
+`recalld models fetch --graph` installs the model (~1.9 GB); until then
+`recalld graph on` reports it as not installed rather than pretending to work.
+
+Needs the running daemon: the switch is live and every client has to be told.")]
+    Graph {
+        #[arg(value_enum, default_value_t = GraphAction::Status)]
+        action: GraphAction,
+    },
+
     /// Chronological transcript dump.
     Transcript {
         /// Restrict to one capture session.
@@ -236,6 +267,20 @@ pub enum MicAction {
     Status,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphAction {
+    /// What has been derived and what the worker is doing. Changes nothing.
+    Status,
+    /// Allow the local model to run while the machine is idle.
+    On,
+    /// Stop it. Everything already derived stays; nothing new is written.
+    Off,
+    /// Open promises, soonest due first.
+    Commitments,
+    /// The conversation labels in use.
+    Topics,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ModelsAction {
     /// Report which analysis models are present and which are missing.
@@ -267,6 +312,12 @@ pub enum ModelsAction {
         /// have it.
         #[arg(long)]
         fallback_asr: bool,
+
+        /// Also install the memory graph's local model (~1.9 GB) and the
+        /// llama.cpp binaries that run it. Optional, and the feature it serves
+        /// ships switched off — nothing needs these until `recalld graph on`.
+        #[arg(long)]
+        graph: bool,
 
         /// Do not write the resulting directory into config.toml. Without this
         /// the fetch points `[models].dir` at what it just installed, so

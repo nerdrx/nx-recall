@@ -36,24 +36,69 @@ pub enum Install {
     /// A `.tar.bz2` whose entries already carry the directory name we want,
     /// unpacked into the root as-is.
     TarBz2,
+    /// A `.tar.gz` whose entries all sit under one top-level directory named
+    /// after the upstream build. That directory is **stripped** (its name
+    /// carries a build number this catalogue should not have to spell twice)
+    /// and the entries whose file name starts with one of `keep` are written
+    /// flat into `<root>/<dir>`. Everything else in the archive is left on the
+    /// floor: a release tarball of a toolkit carries a dozen programs and this
+    /// daemon shells out to exactly one of them.
+    TarGzInto {
+        dir: &'static str,
+        keep: &'static [&'static str],
+    },
+}
+
+/// Which set an asset belongs to. Only [`Group::Speech`] is fetched by a bare
+/// `models fetch`; the rest are opt-in flags, because each of them costs
+/// hundreds of megabytes for something the daemon works perfectly well without.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    /// Capture's own models: ASR, embedding, segmentation. Without these the
+    /// daemon degrades to VAD-only, so they are not optional in any real sense.
+    Speech,
+    /// The English-only ASR export that was the default up to 0.5.5.
+    FallbackAsr,
+    /// The memory graph's Tier 3 (GRAPH.md): a ≤3B Q4 GGUF and the llama.cpp
+    /// binaries to run it. **Optional and off by default** — `[graph].enabled`
+    /// ships false, and a machine that never turns it on never needs these.
+    Graph,
+}
+
+impl Group {
+    pub fn is_default(self) -> bool {
+        matches!(self, Group::Speech)
+    }
+
+    /// One line for `models status`, said from the user's point of view.
+    pub fn note(self) -> &'static str {
+        match self {
+            Group::Speech => "required for transcription and speaker identity",
+            Group::FallbackAsr => "optional — the older English-only ASR export",
+            Group::Graph => {
+                "optional — the memory graph's local model; nothing needs it unless \
+                 [graph].enabled is on"
+            }
+        }
+    }
 }
 
 /// One thing to download. `download_bytes` is the size of the asset itself (the
-/// figure GitHub reports for the release asset, and what a completed download
-/// must weigh); `files` is what must exist under the models root afterwards.
+/// figure the host reports for it, and what a completed download must weigh);
+/// `files` is what must exist under the models root afterwards.
 #[derive(Debug, Clone)]
 pub struct RemoteAsset {
     pub role: &'static str,
     pub url: &'static str,
     pub download_bytes: u64,
     pub install: Install,
-    /// Part of the default set a bare `models fetch` installs. The one asset
-    /// that is not (the English-only ASR export) is still catalogued, so
-    /// `models status` can size it and `models fetch --fallback-asr` can pull
-    /// it, but a fresh install does not spend 103 MB on a model the default
-    /// already beats at English.
-    pub default: bool,
+    pub group: Group,
     /// `(path relative to the models root, exact byte size)`.
+    ///
+    /// Not necessarily every file the asset installs — the segmentation tarball
+    /// carries a README nobody checks, and the llama.cpp one carries thirty-odd
+    /// shared objects. These are the ones something actually opens, and the
+    /// whole transfer is byte-verified against `download_bytes` regardless.
     pub files: &'static [(&'static str, u64)],
 }
 
@@ -61,6 +106,10 @@ impl RemoteAsset {
     /// Last path component of the URL — also the name of the `.part` file.
     pub fn file_name(&self) -> &'static str {
         self.url.rsplit('/').next().unwrap_or(self.url)
+    }
+
+    pub fn default(&self) -> bool {
+        self.group.is_default()
     }
 }
 
@@ -76,7 +125,7 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
         download_bytes: 6_958_444,
         install: Install::TarBz2,
-        default: true,
+        group: Group::Speech,
         files: &[
             (
                 "sherpa-onnx-pyannote-segmentation-3-0/model.onnx",
@@ -96,7 +145,7 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
         // `embed_model_id`) says `eres2net_en`, and that name must not drift
         // with whatever upstream calls the file this year.
         install: Install::File("eres2net_en.onnx"),
-        default: true,
+        group: Group::Speech,
         files: &[("eres2net_en.onnx", 26_485_263)],
     },
     // The default since 0.5.6. Measured (spike/asr_multilang.py, 60 utterances
@@ -109,7 +158,7 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
         download_bytes: 487_170_055,
         install: Install::TarBz2,
-        default: true,
+        group: Group::Speech,
         files: &[
             (
                 "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/encoder.int8.onnx",
@@ -138,7 +187,7 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8.tar.bz2",
         download_bytes: 108_035_095,
         install: Install::TarBz2,
-        default: false,
+        group: Group::FallbackAsr,
         files: &[
             (
                 "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8/encoder.int8.onnx",
@@ -158,7 +207,109 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
             ),
         ],
     },
+    // ---- the memory graph's Tier 3 (GRAPH.md) -----------------------------
+    //
+    // Optional, and the flag is `models fetch --graph`. Two assets, ~1.95 GB
+    // together, for a feature that ships switched off — so a fresh install
+    // never pays for them and `models status` lists them as not required.
+    //
+    // The model is the bake-off's winner (spike/graph_bench, 20 gold cases
+    // including 9 traps, four pinned cores at nice 19): Qwen2.5-3B-Instruct Q4
+    // took 9/9 trap rejections and 9/9 on who-and-what, at 3.3 s/case. The 1.5B
+    // was faster and gullible (5/9 traps); a missed promise costs a shrug and
+    // an invented one poisons the feature.
+    RemoteAsset {
+        role: "graph.llm",
+        url: "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+        download_bytes: 1_929_903_264,
+        // Renamed on install for the same reason the embedding is: the config
+        // default names this file, and that name must not drift with whatever
+        // the upstream repository calls it this year.
+        install: Install::File("qwen2.5-3b-instruct-q4_k_m.gguf"),
+        group: Group::Graph,
+        files: &[("qwen2.5-3b-instruct-q4_k_m.gguf", 1_929_903_264)],
+    },
+    // The runtime, as an upstream release binary. Deliberately not a build
+    // dependency: `crate::llm` shells out to `llama-cli` exactly as the bake-off
+    // harness did, so Tier 3 costs this crate no cmake, no C++ toolchain and no
+    // new link-time anything. `llama-cli` and the shared objects it loads are
+    // the only entries kept out of the archive's sixty-odd.
+    RemoteAsset {
+        role: "graph.runtime",
+        url: "https://github.com/ggml-org/llama.cpp/releases/download/b10736/llama-b10736-bin-ubuntu-x64.tar.gz",
+        download_bytes: 16_701_436,
+        install: Install::TarGzInto {
+            dir: "llama",
+            keep: &["llama-cli", "lib"],
+        },
+        group: Group::Graph,
+        files: &[
+            ("llama/llama-cli", 1_453_352),
+            ("llama/libllama.so", 4_529_552),
+            ("llama/libggml-base.so", 920_216),
+            ("llama/libllama-common.so", 6_089_880),
+        ],
+    },
 ];
+
+/// The memory graph's Tier 3 assets, resolved on disk (GRAPH.md).
+///
+/// Separate from [`ModelSet`] on purpose: these are optional, and folding them
+/// into the set the daemon checks at start-up would turn "I have not fetched a
+/// 1.9 GB model I never asked for" into "analysis is incomplete".
+#[derive(Debug, Clone)]
+pub struct GraphModels {
+    pub root: PathBuf,
+    /// The GGUF.
+    pub model: PathBuf,
+    /// Where `llama-cli` and its shared objects live. Also what goes into
+    /// `LD_LIBRARY_PATH` for the child, because the release binaries find each
+    /// other by rpath-less name.
+    pub lib_dir: PathBuf,
+    pub cli: PathBuf,
+}
+
+impl GraphModels {
+    pub fn resolve(root: &Path, cfg: &crate::config::GraphConfig) -> Self {
+        let lib_dir = root.join(&cfg.llama_dir);
+        Self {
+            model: root.join(&cfg.llm_model),
+            cli: lib_dir.join("llama-cli"),
+            lib_dir,
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// Both halves are on disk and the runner is executable. Anything less is
+    /// "Tier 3 is not installed", which is a normal state and not an error.
+    pub fn present(&self) -> bool {
+        self.model.is_file() && self.cli.is_file()
+    }
+
+    /// What the graph's rows record as having produced them. The GGUF's own
+    /// file stem, so a row written by one model is never confused with a row
+    /// written by another — the same rule as `embed_model_id`.
+    pub fn model_id(&self) -> String {
+        stem(&self.model)
+    }
+
+    /// The optional entries `models status` lists under their own heading.
+    pub fn entries(&self) -> Vec<ModelEntry> {
+        [("graph.llm", &self.model), ("graph.runtime", &self.cli)]
+            .into_iter()
+            .map(|(role, path)| ModelEntry {
+                role,
+                path: path.clone(),
+                expected: path
+                    .strip_prefix(&self.root)
+                    .ok()
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+                    .as_deref()
+                    .and_then(expected_bytes),
+            })
+            .collect()
+    }
+}
 
 /// One published transducer export: the directory it unpacks to, the files
 /// inside it, and what it can actually transcribe.
@@ -242,12 +393,12 @@ impl AsrSelection {
     }
 }
 
-/// Total bytes the fetch has to pull down for a cold start. The optional
-/// English-only export is only counted when it is actually being asked for.
-pub fn total_download_bytes(include_optional: bool) -> u64 {
+/// Total bytes the fetch has to pull down for a cold start: the default set,
+/// plus whichever optional groups were actually asked for.
+pub fn total_download_bytes(extra: &[Group]) -> u64 {
     REMOTE_ASSETS
         .iter()
-        .filter(|a| a.default || include_optional)
+        .filter(|a| a.default() || extra.contains(&a.group))
         .map(|a| a.download_bytes)
         .sum()
 }

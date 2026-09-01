@@ -60,6 +60,19 @@
             </svg>
             <span>Search</span>
           </button>
+          <!-- The memory graph's own place (0.7.0, docs/GRAPH.md): who owes
+               what to whom, what you keep talking about, and whether the local
+               model is allowed to look. A rail item rather than pushed state,
+               because it is not a detail of any of the other four. The glyph is
+               a speech bubble with a thread through it — what was said, and
+               what was made of it. -->
+          <button class="rail-item" role="tab" data-view="memory" aria-selected="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+              <path d="M4 5h16v11H9l-5 4z M8 9h8M8 12.5h5" stroke-linecap="square" />
+            </svg>
+            <span>Memory</span>
+            <span class="badge" id="badge-memory">0</span>
+          </button>
           <button class="rail-item" role="tab" data-view="sources" aria-selected="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
               <path d="M4 8v8M8 5v14M12 9v6M16 3v18M20 8v8" stroke-linecap="square" />

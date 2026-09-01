@@ -360,6 +360,153 @@ the instant it is deleted.
   transcript, it is re-derivable from it, and an index into rows no view can
   reach is not a conversation.
 
+### The memory graph, Tiers 2 and 3 (schema 7)
+
+[GRAPH.md](GRAPH.md)'s remaining two tiers: when a turn was talking about, who
+owes what to whom, and what a conversation was about. Everything here is
+**derived, second-class and re-derivable** — every row carries its provenance,
+every read of it joins back to a live segment, and deleting the segment or the
+person deletes it.
+
+Additive, as always: a client that does not know these methods is a client that
+does not show the Memory view, and nothing else changes.
+
+#### `graph.summary` → the whole view in one round trip
+
+```json
+{"counts": {"time_refs": 41, "commitments": 12, "open": 5,
+            "candidates": 4, "confirmed": 1, "done": 6, "dismissed": 1,
+            "from_rules": 3, "from_llm": 9,
+            "topics": 7, "threads": 31, "threads_enriched": 24,
+            "threads_pending": 7},
+ "enrichment": {"phase": "idle", "reason": null, "thread": null,
+                "batch_done": 0, "batch_total": 0,
+                "walked": 24, "found": 9, "retracted": 2, "labelled": 24,
+                "last_error": null, "last_run_utc_ns": "..."},
+ "config": {"enabled": false, "installed": true, "llm_threads": 4,
+            "gpu_layers": 0, "llm_model": "qwen2.5-3b-instruct-q4_k_m.gguf",
+            "thread_gap_s": 20.0, "batch_threads": 4,
+            "min_thread_segments": 3, "download_bytes": 1946604700}}
+```
+
+- `open` is `candidates + confirmed` — what is still owed, in either sense. It
+  is what the GUI's rail badge counts, because a badge is a number you are
+  meant to act on and a settled commitment is not one.
+- `enrichment.phase` is one of **`off` · `unavailable` · `blocked` · `idle` ·
+  `running`**. `reason` is always present for `blocked` and `unavailable` and
+  is a sentence a person can act on ("VRChat is running and being captured —
+  the graph waits for an idle machine"). A client with copy for three states
+  should collapse `blocked` into idle-with-a-reason and `unavailable` into a
+  "not installed" note.
+- `config.installed` is whether the optional model is **on disk**, which is a
+  different question from `enabled`. Both are needed: on and not installed is a
+  real state, and it has to read as "fetch it" rather than as a failure.
+- `config.download_bytes` is what turning it on would cost, so a client's copy
+  does not hard-code a number that could drift.
+
+#### `commitments.list {state?, limit?}`
+
+`state` filters to one of `candidate` · `confirmed` · `done` · `dismissed`;
+omitting it returns every state, which is what a client showing history wants.
+An unknown state is `err:params`, never a silently empty list.
+
+Soonest-due first, and **undated rows sort last**: a promise with no date is not
+overdue, it is merely open.
+
+```json
+{"id": 41, "segment": 9012, "thread": 505,
+ "who": {"speaker_id": 4, "name": "Ash", "auto": "Speaker_18"},
+ "to":  {"speaker_id": 1, "name": "Kira", "auto": "Speaker_03"},
+ "what": "cut the recording and send it over",
+ "said": "I'll cut the recording and send it over on Friday",
+ "due_ms": 1788480000000, "due_ns": "1788480000000000000",
+ "due_raw": "on Friday", "due_kind": "weekday",
+ "state": "candidate", "source": "llm",
+ "model_id": "qwen2.5-3b-instruct-q4_k_m", "confidence": 0.75,
+ "t_ms": ..., "t_ns": "...", "created_ms": ..., "updated_ms": ...}
+```
+
+Field conventions, tightly:
+
+- **`source` and `state` are different questions and must never be conflated.**
+  `source` is which tier claimed this — `"rules"` is a modal-pattern match and
+  a guess, `"llm"` is the local model under a verdict-first grammar. `state` is
+  what a *person* has decided. A client must render the two distinctly; the
+  reference client marks the source in the row itself rather than in a tooltip.
+- **Nothing has ever been acted on.** `candidate` means the daemon noticed
+  something. Only `commitments.set_state` moves a row, and only a human calls it.
+- `confidence` on an `llm` row is the **bake-off's measured precision**, not a
+  per-answer score: the model does not report one, and inventing a per-row
+  number would be worse than reporting the one that was measured.
+- `said` is the transcript line the claim is about. It travels with the claim so
+  a person can disagree with it without going to look — a commitment nobody can
+  check against the words is not evidence of anything.
+- `due_raw` is the phrase as spoken ("morgen", "on Friday"); `due_ms`/`due_ns`
+  are it resolved against **when it was said**. `due_ms` is `null` when nobody
+  said a date, which is not the same as overdue. `due_kind` is the precision:
+  `weekday` · `day` · `week` · `weekend` · `clock` · `in`.
+- `name` is `null` until somebody names the voice; `auto` is always present.
+  Same split as everywhere else a person appears. Ids are canonical — a merge
+  tombstone is resolved before it goes on the wire.
+- `to` is `null` when the promise was made to a conversation with more than two
+  people in it: the daemon will not guess which of them was meant.
+
+#### `commitments.set_state {id, state}` → the updated row
+
+The one thing that moves a commitment, and the daemon never calls it itself.
+Broadcast as a `commitment` event on the **ops** topic, so a decision made in
+the CLI reaches an open window without either re-querying. Unknown id is
+`err:not_found`; an unknown state is `err:params`.
+
+#### `topics.list {limit?, per_topic?}`
+
+```json
+{"topics": [{"topic": "world portals", "threads": 4, "segments": 37,
+             "last_ms": ..., "last_ns": "...", "thread_ids": [606, 601, 500]}]}
+```
+
+Most recently heard first. `thread_ids` is newest-first and capped by
+`per_topic` — a topic is a way *into* conversations, not a list of every one
+that ever mentioned it. Topics are written by Tier 3, so with the local model
+off this is an empty list rather than an error, and a client renders "nothing
+yet".
+
+#### `graph.get` / `graph.set {enabled?, llm_threads?, gpu_layers?}`
+
+The Tier 3 settings, live **and** persisted to `config.toml` — live because the
+switch is in the UI and a switch that needs a restart is not a switch, persisted
+because a switch that forgets is worse. `graph.set` needs at least one field
+(`err:params` otherwise), clamps what it is given, and answers with what is now
+true rather than with what it was asked for. The reply carries
+`config.persisted`, exactly like `mic.set`.
+
+#### `graph.enrich {action}` — `"start"` | `"stop"`
+
+The imperative wrapper over the same switch, because a person pressing a button
+in the Memory view is not editing a setting, they are asking for the pass to
+happen. Asking for what is already true answers `{"changed": false}` and is not
+an error. Nothing is interrupted mid-conversation: the worker stands down at the
+next boundary, which is at most one model call away.
+
+#### The `graph` event (status topic)
+
+The worker's state, pushed whenever a client would render it differently — the
+same shape as `graph.summary`'s `enrichment` block. It also rides inside
+`status.graph`, so a client that missed an event still converges on the truth,
+exactly as the mic block does. A counter moving on its own is **not** an event:
+a loop that ticks every twenty seconds must not push a hundred and eighty
+identical frames an hour into everybody's replay buffer.
+
+#### Deletion
+
+Purging a segment deletes its `time_refs` and its `commitment`. Deleting a
+*person* deletes every commitment they made **and every commitment made to
+them** — "you owe Kira the shader link" must not survive deleting Kira — and
+`speakers.delete` reports both counts in its reply (`commitments`, `time_refs`).
+A *soft* delete needs no cascade: every graph read joins to a live segment, so
+hiding the transcript line hides what was inferred from it and undoing the
+delete brings both back.
+
 ## Versioning rules
 
 - `proto` bumps only on breaking changes; additive fields/methods/events are free.

@@ -22,8 +22,9 @@ use recalld::client;
 use recalld::clock::utc_now_ns;
 use recalld::config::{self, Config, SAMPLE_RATE};
 use recalld::control::Control;
+use recalld::enrich::{self, EnrichStop};
 use recalld::fetch;
-use recalld::models::{self, AsrSelection, EntryState, ModelSet};
+use recalld::models::{self, AsrSelection, EntryState, GraphModels, Group, ModelSet};
 use recalld::pipeline::{self, Pipeline, Stats};
 use recalld::queue::EventQueue;
 use recalld::retention::{self, SweeperStop};
@@ -32,7 +33,7 @@ use recalld::server;
 use recalld::service::Service;
 use recalld::store::Store;
 
-use crate::cli::{Cli, Command, MicAction, ModelsAction, SpeakersAction};
+use crate::cli::{Cli, Command, GraphAction, MicAction, ModelsAction, SpeakersAction};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -72,6 +73,7 @@ fn main() -> Result<()> {
                 dir,
                 force,
                 fallback_asr,
+                graph,
                 no_config,
             } => cmd_models_fetch(
                 &cfg,
@@ -81,6 +83,8 @@ fn main() -> Result<()> {
                 &fetch::FetchOptions {
                     force,
                     fallback_asr,
+                    graph,
+                    single_stream: false,
                 },
                 no_config,
             ),
@@ -109,6 +113,7 @@ fn main() -> Result<()> {
         Command::Pause => cmd_pause(&cfg, &data_dir, true),
         Command::Resume => cmd_pause(&cfg, &data_dir, false),
         Command::Status => cmd_status(&cfg, &data_dir),
+        Command::Graph { action } => cmd_graph(&cfg, &data_dir, action),
     }
 }
 
@@ -196,6 +201,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     let queue = EventQueue::for_seconds(cfg.capture.queue_seconds, SAMPLE_RATE);
     let stats = Arc::new(Stats::default());
     let analysis_stats = Arc::new(AnalysisStats::default());
+    let models_root = ModelSet::resolve(&cfg.models).map(|m| m.root);
     let control = Control::new(
         data_dir.to_path_buf(),
         Some(config_path.to_path_buf()),
@@ -209,7 +215,9 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     // The socket's own identity work (`speakers.split`) must use the same
     // operating point the pipeline labelled with, not the defaults.
     .with_identity(cfg.identity.clone())
-    .with_mic(cfg.mic.clone());
+    .with_mic(cfg.mic.clone())
+    // The memory graph's Tier 3 switch is live, like the microphone's.
+    .with_graph(cfg.graph.clone(), models_root.clone());
     // The ids clients see must be the ids that will be written on segments, so
     // resolve the ASR fallback here exactly as the pipeline does.
     if let Some(mut models) = ModelSet::resolve(&cfg.models) {
@@ -280,12 +288,33 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     // What is on disk, before anything has swept: a daemon that has just come
     // up must be able to answer "how much space is this using" without waiting
     // out a sweep interval. The sweeper re-measures after every pass.
-    let models_dir = ModelSet::resolve(&cfg.models).map(|m| m.root);
+    let models_dir = models_root.clone();
     control.set_storage(retention::measure(
         data_dir,
         models_dir.as_deref(),
         utc_now_ns(),
     ));
+
+    // The memory graph's Tier 3 worker (GRAPH.md). Started whether or not it is
+    // enabled: the switch is live, so something has to be watching it — and it
+    // is the thing that reports "off" to every client that asks.
+    let enrich_stop = Arc::new(EnrichStop::default());
+    let enrich_thread = {
+        let store = Arc::clone(&store);
+        let control = Arc::clone(&control);
+        let bus = Arc::clone(&bus);
+        let root = models_root.clone();
+        let runtime = cfg.runtime.clone();
+        let stop = Arc::clone(&enrich_stop);
+        std::thread::Builder::new()
+            .name("recalld-graph".into())
+            .spawn(move || enrich::run(store, control, bus, root, runtime, stop))
+            .map_err(|e| warn!("no enrichment worker: {e}"))
+            .ok()
+    };
+    if cfg.graph.enabled {
+        info!("the memory graph's local model is enabled; it runs only while nothing is captured");
+    }
 
     let sweeper_stop = Arc::new(SweeperStop::default());
     let sweeper_thread = if cfg.retention.enabled {
@@ -315,10 +344,14 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
 
     roster_stop.stop();
     sweeper_stop.stop();
+    enrich_stop.stop();
     if let Some(s) = socket {
         s.shutdown();
     }
-    for handle in [roster_thread, sweeper_thread].into_iter().flatten() {
+    for handle in [roster_thread, sweeper_thread, enrich_thread]
+        .into_iter()
+        .flatten()
+    {
         let _ = handle.join();
     }
 
@@ -616,6 +649,45 @@ fn cmd_models_status(
         );
     }
 
+    // The optional groups, under their own heading and never mixed in with the
+    // required table: a machine that has not fetched a 1.9 GB model it never
+    // asked for is not an incomplete machine.
+    println!();
+    println!("OPTIONAL  ({})", Group::Graph.note());
+    let graph = GraphModels::resolve(&models.root, &cfg.graph);
+    for e in graph.entries() {
+        println!(
+            "{:<14}  {:<9}  {:>10}  {:>10}  {}",
+            e.role,
+            match e.state() {
+                EntryState::Ok => "ok",
+                EntryState::Missing => "not here",
+                EntryState::WrongSize { .. } => "BAD SIZE",
+            },
+            e.bytes().map(fetch::human).unwrap_or_else(|| "-".into()),
+            e.expected.map(fetch::human).unwrap_or_else(|| "?".into()),
+            e.path.display()
+        );
+    }
+    if graph.present() {
+        println!(
+            "the memory graph's model is installed ({}); it is {} in config.toml",
+            graph.model_id(),
+            if cfg.graph.enabled {
+                "enabled"
+            } else {
+                "still off"
+            }
+        );
+    } else {
+        println!(
+            "not installed, and not required. `recalld models fetch --graph` adds it ({}).",
+            fetch::human(
+                models::total_download_bytes(&[Group::Graph]) - models::total_download_bytes(&[])
+            )
+        );
+    }
+
     if models.complete() && selection == AsrSelection::Fallback {
         println!("\nAnalysis runs — on the fallback ASR. The default set is not here.");
     } else if models.complete() {
@@ -644,17 +716,22 @@ fn cmd_models_fetch(
     let root = fetch::target_dir(dir, &cfg.models, data_dir);
     println!("models dir: {}", root.display());
     println!(
-        "up to {} to download from github.com/k2-fsa/sherpa-onnx\n",
-        fetch::human(models::total_download_bytes(opts.fallback_asr))
+        "up to {} to download\n",
+        fetch::human(models::total_download_bytes(&opts.extra_groups()))
     );
 
     let report = fetch::fetch_models(&root, &cfg.models, opts)?;
 
     println!(
-        "\n{} downloaded, {} already present ({} transferred).",
+        "\n{} downloaded, {} already present ({} transferred{}).",
         report.downloaded,
         report.skipped,
-        fetch::human(report.bytes)
+        fetch::human(report.bytes),
+        if report.connections > 1 {
+            format!(", up to {} connections at once", report.connections)
+        } else {
+            String::new()
+        }
     );
 
     // Point the config at what we just installed. Without this a fetch into the
@@ -964,6 +1041,161 @@ fn cmd_pause(cfg: &Config, data_dir: &Path, pause: bool) -> Result<()> {
         println!("Paused. Capture keeps running; nothing is written until `recalld resume`.");
     } else {
         println!("Resumed.");
+    }
+    Ok(())
+}
+
+/// `recalld graph` — the memory graph's scripting surface (docs/GRAPH.md).
+///
+/// Over the socket, like the microphone and for the same reasons: the Tier 3
+/// switch is live, and every connected client has to be told when it moves.
+fn cmd_graph(cfg: &Config, data_dir: &Path, action: GraphAction) -> Result<()> {
+    match action {
+        GraphAction::Commitments => return cmd_graph_commitments(cfg, data_dir),
+        GraphAction::Topics => return cmd_graph_topics(cfg, data_dir),
+        _ => {}
+    }
+    let out = match action {
+        GraphAction::On => call(cfg, data_dir, "graph.enrich", json!({"action": "start"}))?,
+        GraphAction::Off => call(cfg, data_dir, "graph.enrich", json!({"action": "stop"}))?,
+        _ => call(cfg, data_dir, "graph.summary", json!({}))?,
+    };
+    let config = &out["config"];
+    let state = &out["enrichment"];
+    let counts = &out["counts"];
+
+    println!(
+        "{:<20}{}",
+        "local model",
+        if config["enabled"].as_bool() == Some(true) {
+            "on — runs only while nothing is being captured"
+        } else {
+            "off (the default)"
+        }
+    );
+    println!(
+        "{:<20}{}",
+        "model on disk",
+        if config["installed"].as_bool() == Some(true) {
+            "yes"
+        } else {
+            "no — `recalld models fetch --graph` installs it"
+        }
+    );
+    let phase = state["phase"].as_str().unwrap_or("off");
+    println!(
+        "{:<20}{phase}{}",
+        "worker",
+        match state["reason"].as_str() {
+            Some(reason) => format!(" — {reason}"),
+            None => String::new(),
+        }
+    );
+    if phase == "running" {
+        println!(
+            "{:<20}{} of {} conversation(s) in this batch",
+            "progress",
+            state["batch_done"].as_i64().unwrap_or(0),
+            state["batch_total"].as_i64().unwrap_or(0),
+        );
+    }
+    if counts.is_object() {
+        let n = |k: &str| counts[k].as_i64().unwrap_or(0);
+        println!(
+            "{:<20}{} open ({} candidate, {} confirmed), {} done, {} dismissed",
+            "commitments",
+            n("open"),
+            n("candidates"),
+            n("confirmed"),
+            n("done"),
+            n("dismissed"),
+        );
+        println!(
+            "{:<20}{} from rules, {} from the model",
+            "  sourced",
+            n("from_rules"),
+            n("from_llm")
+        );
+        println!("{:<20}{}", "time references", n("time_refs"));
+        println!(
+            "{:<20}{} label(s) over {} of {} conversation(s), {} not looked at yet",
+            "topics",
+            n("topics"),
+            n("threads_enriched"),
+            n("threads"),
+            n("threads_pending"),
+        );
+    }
+    if let Some(err) = state["last_error"].as_str() {
+        println!("{:<20}{err}", "last error");
+    }
+    println!("\nNothing here leaves the machine, and nothing acts on a guess.");
+    Ok(())
+}
+
+fn cmd_graph_commitments(cfg: &Config, data_dir: &Path) -> Result<()> {
+    let out = call(cfg, data_dir, "commitments.list", json!({}))?;
+    let rows = out["commitments"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!(
+            "No commitments. Nothing has been noticed, which is not the same as nothing having been promised."
+        );
+        return Ok(());
+    }
+    println!(
+        "{:<4}  {:<10}  {:<7}  {:<18}  {:<18}  WHAT",
+        "ID", "STATE", "SOURCE", "WHO", "DUE"
+    );
+    for c in &rows {
+        let who = c["who"]["name"]
+            .as_str()
+            .or_else(|| c["who"]["auto"].as_str())
+            .unwrap_or("?");
+        let due = c["due_ms"]
+            .as_i64()
+            .map(|ms| format_time(ms * 1_000_000))
+            .unwrap_or_else(|| c["due_raw"].as_str().unwrap_or("—").to_string());
+        println!(
+            "{:<4}  {:<10}  {:<7}  {:<18}  {:<18}  {}",
+            c["id"].as_i64().unwrap_or(0),
+            c["state"].as_str().unwrap_or("?"),
+            c["source"].as_str().unwrap_or("?"),
+            who,
+            due,
+            c["what"].as_str().unwrap_or(""),
+        );
+    }
+    println!(
+        "\n`source: rules` is a pattern match and a guess; `llm` is the local model.\nNothing acts on either — they are suggestions until you say otherwise."
+    );
+    Ok(())
+}
+
+fn cmd_graph_topics(cfg: &Config, data_dir: &Path) -> Result<()> {
+    let out = call(cfg, data_dir, "topics.list", json!({}))?;
+    let rows = out["topics"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!(
+            "No topics yet. They are written by the local model, which is off by default —\n\
+             `recalld graph on` turns it on."
+        );
+        return Ok(());
+    }
+    println!(
+        "{:>6}  {:>8}  {:<19}  TOPIC",
+        "THREADS", "SEGMENTS", "LAST HEARD"
+    );
+    for t in &rows {
+        println!(
+            "{:>6}  {:>8}  {:<19}  {}",
+            t["threads"].as_i64().unwrap_or(0),
+            t["segments"].as_i64().unwrap_or(0),
+            t["last_ms"]
+                .as_i64()
+                .map(|ms| format_time(ms * 1_000_000))
+                .unwrap_or_else(|| "—".into()),
+            t["topic"].as_str().unwrap_or(""),
+        );
     }
     Ok(())
 }

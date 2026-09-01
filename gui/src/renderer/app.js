@@ -7,7 +7,7 @@
 // surviving a daemon restart (DESIGN §2).
 
 import { h, clear, fmtBytes } from './lib/dom.js';
-import { store, applyEvent, reloadAll, mergeSegments, ask } from './lib/store.js';
+import { store, applyEvent, reloadAll, reloadGraph, mergeSegments, ask } from './lib/store.js';
 import { patchSpeakerLabels } from './lib/labels.js';
 import { toast } from './lib/sheets.js';
 import { stop as stopPreview, playbackState } from './lib/preview.js';
@@ -16,19 +16,22 @@ import * as speakersView from './views/speakers.js';
 import * as searchView from './views/search.js';
 import * as sourcesView from './views/sources.js';
 import * as personView from './views/person.js';
+import * as memoryView from './views/memory.js';
 
 const VIEWS = {
   transcript: transcriptView,
   speakers: speakersView,
   search: searchView,
+  memory: memoryView,
   sources: sourcesView,
   // Not in the rail: the person page is pushed state, reached from a voice and
-  // left with Back. The app still has four places (docs/GRAPH.md).
+  // left with Back. The app has five places (docs/GRAPH.md) and this is not one
+  // of them — you arrive at a person FROM one.
   person: personView,
 };
 
 /** Views the rail can select. Anything else is pushed. */
-const RAIL_VIEWS = new Set(['transcript', 'speakers', 'search', 'sources']);
+const RAIL_VIEWS = new Set(['transcript', 'speakers', 'search', 'memory', 'sources']);
 
 const main = document.getElementById('main');
 const footer = document.getElementById('footer');
@@ -303,6 +306,11 @@ function renderBadges() {
   set('badge-transcript', store.segments.length);
   set('badge-speakers', store.speakers.size);
   set('badge-sources', store.sources.filter((s) => s.allowed).length);
+  // What is still owed. Deliberately the OPEN count and not the total: a badge
+  // is a number you are meant to act on, and a settled commitment is not one.
+  // It is also why nothing else in this feature ever nags — this is the only
+  // place the app mentions a commitment you did not ask to see.
+  set('badge-memory', store.graph?.counts?.open ?? 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +343,14 @@ window.recall.onEvent((evt) => {
     return;
   }
   renderBadges();
+  // The rail badge is the daemon's own count of what is still open, so a
+  // commitment moving states costs one small re-query rather than arithmetic
+  // this client would have to get right (docs/GRAPH.md).
+  if (change.commitment) {
+    reloadGraph()
+      .then(renderBadges)
+      .catch(() => {});
+  }
   // One path, every view: a rename made here, in the CLI, or in another client
   // all arrive as the same broadcast and repaint the same way.
   if (change.relabel) patchSpeakerLabels(change.relabel);
@@ -385,7 +401,7 @@ document.addEventListener('keydown', (e) => {
     current?.focusQuery?.();
     return;
   }
-  const map = { 1: 'transcript', 2: 'speakers', 3: 'search', 4: 'sources' };
+  const map = { 1: 'transcript', 2: 'speakers', 3: 'search', 4: 'memory', 5: 'sources' };
   if ((e.ctrlKey || e.altKey) && map[e.key]) {
     e.preventDefault();
     go(map[e.key]);
@@ -513,6 +529,54 @@ document.addEventListener('keydown', (e) => {
       markedThread: document.querySelector('#seg-list .seg.in-thread')?.dataset.thread ?? null,
       filter: (document.getElementById('transcript-filter') || {}).value ?? null,
       rows: document.querySelectorAll('#seg-list .seg').length,
+    }),
+    // 0.7.0, the memory graph's Tiers 2 and 3. Everything the driver has to be
+    // able to read back about the Memory view: the rows and, on each, the two
+    // facts that must never be conflated — which tier claimed it and what a
+    // person has decided about it — plus the three states the enrichment card
+    // has copy for.
+    memory: () => ({
+      mounted: currentName === 'memory',
+      sub: (document.getElementById('memory-sub') || {}).textContent ?? '',
+      badge: (document.getElementById('badge-memory') || {}).textContent ?? '',
+      commitments: [...document.querySelectorAll('#commit-list .commit-row')].map((r) => ({
+        id: Number(r.dataset.commitment),
+        state: r.dataset.state,
+        source: r.dataset.source,
+        // A row renders its new state optimistically and stays disabled until
+        // the daemon confirms. A driver that pressed a button in that window
+        // would be pressing nothing, so it has to be able to see the gap.
+        pending: r.classList.contains('pending'),
+        who: r.querySelector('.commit-name')?.textContent ?? '',
+        to: r.querySelector('.commit-to')?.textContent ?? '',
+        what: r.querySelector('.commit-what')?.textContent ?? '',
+        said: r.querySelector('.commit-said')?.textContent ?? '',
+        due: r.querySelector('.commit-due')?.firstChild?.textContent ?? '',
+        undated: !!r.querySelector('.commit-due.undated'),
+        // The visible mark, not the dataset: a class nobody can see is not a
+        // distinction a person can act on.
+        srcChip: r.querySelector('.chip.src')?.textContent ?? '',
+        srcTitle: r.querySelector('.chip.src')?.title ?? '',
+        actions: [...r.querySelectorAll('[data-act]')].map((b) => b.dataset.act),
+      })),
+      empty: (document.getElementById('commitments-empty') || {}).textContent ?? '',
+      note: (document.getElementById('commitments-note') || {}).textContent ?? '',
+      topics: [...document.querySelectorAll('#topic-list .topic-row')].map((r) => ({
+        topic: r.dataset.topic,
+        threads: Number(r.dataset.threads),
+        text: r.textContent,
+      })),
+      enrichment: {
+        phase: store.graph?.enrichment?.phase ?? null,
+        enabled: store.graph?.config?.enabled ?? null,
+        chip: (document.getElementById('enrich-chip') || {}).textContent ?? '',
+        pressed: (document.getElementById('enrich-toggle') || {}).getAttribute?.('aria-pressed') ?? null,
+        progress: (document.getElementById('enrich-progress-text') || {}).textContent ?? '',
+        reason: (document.getElementById('enrich-reason') || {}).textContent ?? '',
+        facts: [...document.querySelectorAll('#enrich-facts li')].map((li) => li.textContent),
+        note: (document.getElementById('enrich-note') || {}).textContent ?? '',
+        counts: (document.getElementById('enrich-counts') || {}).textContent ?? '',
+      },
     }),
     // The one line behind the native-widget fix: without `color-scheme: dark`
     // Chromium draws <select> option popups light-on-light over this palette.

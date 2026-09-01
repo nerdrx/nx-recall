@@ -12,22 +12,62 @@
 //! Everything here is idempotent. A file that is already on disk at exactly the
 //! catalogued size is left alone; a partial download is a `.part` file that is
 //! never renamed into place; an archive is verified before it is opened.
+//!
+//! ## Why this downloads in twelve pieces
+//!
+//! Measured on the dev machine's own line, 2026-09-01: **50 kB/s on a single
+//! connection against ~13 MB/s across twelve ranged ones.** A 620 MB model took
+//! hours as one stream. The line is not slow — it is *shaped per connection*,
+//! which is common on consumer uplinks and invisible to any speed test that
+//! opens more than one socket.
+//!
+//! So a large asset is split into ranges, fetched concurrently, and written
+//! into one preallocated file at the right offsets. Three properties are
+//! load-bearing and each has a test:
+//!
+//! - **The verification does not change.** The completed file must still weigh
+//!   exactly what the catalogue says, byte for byte, and every installed file
+//!   is size-checked afterwards exactly as before.
+//! - **It resumes.** Each range's progress is journalled next to the `.part`
+//!   file, so a fetch interrupted at 90% of two gigabytes restarts at 90%.
+//! - **It falls back.** A server that does not answer `Range` with a `206` gets
+//!   the old single stream, unchanged. Parallelism is an optimisation, never a
+//!   requirement, and a mirror that cannot do it must still work.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
 use crate::config::ModelsConfig;
-use crate::models::{EntryState, Install, ModelSet, REMOTE_ASSETS, RemoteAsset};
+use crate::models::{EntryState, Group, Install, ModelSet, REMOTE_ASSETS, RemoteAsset};
 
 /// Read timeout for a single chunk. The whole download has no deadline — a
-/// 130 MB model on a slow line is not an error — but a stalled connection is.
+/// 1.9 GB model on a slow line is not an error — but a stalled connection is.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Ranged connections a large asset is split across. Twelve is what the
+/// measurement above used; past about a dozen the per-connection shaping stops
+/// being the bottleneck and a host starts looking at you strangely.
+pub const CONNECTIONS: usize = 12;
+
+/// Below this, one stream wins: twelve TLS handshakes cost more than the file.
+pub const MIN_PARALLEL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Attempts per range before the whole download gives up. A dropped connection
+/// mid-file is ordinary on the line this exists for, and each retry resumes
+/// from what that range has already written rather than from its start.
+const MAX_ATTEMPTS: usize = 5;
+
+const BUF: usize = 256 * 1024;
+
+#[derive(Debug, Default)]
 pub struct FetchOptions {
     /// Re-download everything, even files that are already the right size.
     pub force: bool,
@@ -35,6 +75,30 @@ pub struct FetchOptions {
     /// multilingual set beats it at English too, and it only exists here so a
     /// machine that wants the small model can still get it.
     pub fallback_asr: bool,
+    /// Also install the memory graph's Tier 3 assets (GRAPH.md): the 1.9 GB
+    /// GGUF and the llama.cpp binaries. Off by default, like the feature.
+    pub graph: bool,
+    /// Force the single-stream path. Only the test suite sets this; it is how
+    /// the fallback is exercised without finding a server that lacks ranges.
+    pub single_stream: bool,
+}
+
+impl FetchOptions {
+    /// The optional groups this run was asked for.
+    pub fn extra_groups(&self) -> Vec<Group> {
+        let mut out = Vec::new();
+        if self.fallback_asr {
+            out.push(Group::FallbackAsr);
+        }
+        if self.graph {
+            out.push(Group::Graph);
+        }
+        out
+    }
+
+    fn wants(&self, asset: &RemoteAsset) -> bool {
+        asset.default() || self.extra_groups().contains(&asset.group)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -42,9 +106,13 @@ pub struct FetchReport {
     pub downloaded: usize,
     pub skipped: usize,
     pub bytes: u64,
+    /// Ranged connections the last large download actually used. Reported so
+    /// the command can say whether the fast path was available at all.
+    pub connections: usize,
 }
 
-/// Bring `root` up to the full default model set.
+/// Bring `root` up to the full default model set, plus whatever optional groups
+/// were asked for.
 pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Result<FetchReport> {
     fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
 
@@ -56,32 +124,34 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
         // being the default.
         if !opts.force && asset_satisfied(root, asset) {
             println!(
-                "  {:<13} present  ({})",
+                "  {:<14} present  ({})",
                 asset.role,
                 human(asset_installed_bytes(root, asset))
             );
             report.skipped += 1;
             continue;
         }
-        if !asset.default && !opts.fallback_asr {
+        if !opts.wants(asset) {
             continue;
         }
-        let n = fetch_one(root, asset)?;
+        let (n, connections) = fetch_one(root, asset, opts)?;
         report.downloaded += 1;
         report.bytes += n;
+        report.connections = report.connections.max(connections);
     }
 
     // The set is only useful if the daemon can resolve it through the same
     // config it will run with, so verify through `ModelSet` — including the
     // ASR selection the daemon itself will make — not through the catalogue we
-    // just wrote.
+    // just wrote. The optional groups are deliberately not part of this: a
+    // machine that never asked for the graph model is not incomplete.
     let mut set = ModelSet::resolve_at(root.to_path_buf(), cfg);
     set.select_asr();
     let missing = set.missing();
     if !missing.is_empty() {
         eprintln!();
         for e in &missing {
-            eprintln!("  ! {:<13} {}", e.role, describe(e.state(), &e.path));
+            eprintln!("  ! {:<14} {}", e.role, describe(e.state(), &e.path));
         }
         bail!(
             "{} model file(s) are still not usable after the fetch — \
@@ -108,13 +178,18 @@ fn asset_installed_bytes(root: &Path, asset: &RemoteAsset) -> u64 {
         .sum()
 }
 
-fn fetch_one(root: &Path, asset: &RemoteAsset) -> Result<u64> {
+fn fetch_one(root: &Path, asset: &RemoteAsset, opts: &FetchOptions) -> Result<(u64, usize)> {
     let part = root.join(format!("{}.part", asset.file_name()));
-    let _ = fs::remove_file(&part);
 
-    let got = download(asset, &part)?;
+    let plan = Plan::for_asset(asset, opts, &part)?;
+    let connections = plan.connections();
+    let got = plan.run(&part)?;
     if got != asset.download_bytes {
+        // The `.part` is removed here and only here: a file of the wrong LENGTH
+        // is not a partial download, it is a different file, and resuming into
+        // it would produce a plausible-looking corruption.
         let _ = fs::remove_file(&part);
+        let _ = fs::remove_file(journal_path(&part));
         bail!(
             "{}: downloaded {} bytes, expected exactly {} — refusing to install it \
              (the upstream asset changed, or the transfer was truncated)",
@@ -123,6 +198,7 @@ fn fetch_one(root: &Path, asset: &RemoteAsset) -> Result<u64> {
             asset.download_bytes
         );
     }
+    let _ = fs::remove_file(journal_path(&part));
 
     match asset.install {
         Install::File(dest_rel) => {
@@ -137,6 +213,12 @@ fn fetch_one(root: &Path, asset: &RemoteAsset) -> Result<u64> {
         }
         Install::TarBz2 => {
             unpack_tar_bz2(&part, root)
+                .with_context(|| format!("unpacking {}", asset.file_name()))?;
+            fs::remove_file(&part).ok();
+        }
+        Install::TarGzInto { dir, keep } => {
+            let into = root.join(dir);
+            unpack_tar_gz_into(&part, &into, keep)
                 .with_context(|| format!("unpacking {}", asset.file_name()))?;
             fs::remove_file(&part).ok();
         }
@@ -156,41 +238,389 @@ fn fetch_one(root: &Path, asset: &RemoteAsset) -> Result<u64> {
             );
         }
     }
-    println!("  {:<13} ok", asset.role);
-    Ok(got)
+    println!("  {:<14} ok", asset.role);
+    Ok((got, connections))
 }
 
-/// GET the asset into `dest`, drawing a progress line on stderr.
-///
-/// stderr on purpose: stdout carries the machine-ish report of what was
-/// installed, and a `\r`-redrawn bar has no business in it.
-fn download(asset: &RemoteAsset, dest: &Path) -> Result<u64> {
-    let agent = ureq::AgentBuilder::new()
+// ---------------------------------------------------------------------------
+// the transfer
+// ---------------------------------------------------------------------------
+
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(READ_TIMEOUT)
         .user_agent(concat!("nx-recall/", env!("CARGO_PKG_VERSION")))
-        .build();
+        .build()
+}
 
-    let resp = agent
-        .get(asset.url)
+/// How one asset is going to be fetched, decided before a byte moves.
+enum Plan<'a> {
+    /// One connection, start to finish. What every server gets when it declines
+    /// ranges, and what small assets get regardless.
+    Single {
+        role: &'a str,
+        url: &'a str,
+        total: u64,
+    },
+    /// `n` ranges in parallel over a file of known length.
+    Ranged {
+        role: &'a str,
+        url: &'a str,
+        total: u64,
+        chunks: Vec<Chunk>,
+    },
+}
+
+impl<'a> Plan<'a> {
+    fn for_asset(asset: &'a RemoteAsset, opts: &FetchOptions, part: &Path) -> Result<Self> {
+        let single = Plan::Single {
+            role: asset.role,
+            url: asset.url,
+            total: asset.download_bytes,
+        };
+        if opts.single_stream || asset.download_bytes < MIN_PARALLEL_BYTES {
+            let _ = fs::remove_file(part);
+            let _ = fs::remove_file(journal_path(part));
+            return Ok(single);
+        }
+        // One byte, to ask a question: does this host serve ranges, and does it
+        // agree with the catalogue about how long the file is?
+        let Some(total) = probe_ranges(asset.url)? else {
+            eprintln!(
+                "  {:<14} the server does not serve byte ranges — falling back to one stream",
+                asset.role
+            );
+            let _ = fs::remove_file(part);
+            let _ = fs::remove_file(journal_path(part));
+            return Ok(single);
+        };
+        if total != asset.download_bytes {
+            // Not a hard error yet: the size check after the transfer is the
+            // authority, and saying so now is more useful than failing now.
+            eprintln!(
+                "  {:<14} the server reports {} bytes, the catalogue says {} — \
+                 the transfer will be refused at the end",
+                asset.role, total, asset.download_bytes
+            );
+        }
+        Ok(Plan::Ranged {
+            role: asset.role,
+            url: asset.url,
+            total,
+            chunks: resume(part, total, CONNECTIONS)?,
+        })
+    }
+
+    fn connections(&self) -> usize {
+        match self {
+            Plan::Single { .. } => 1,
+            Plan::Ranged { chunks, .. } => chunks.len(),
+        }
+    }
+
+    fn run(self, dest: &Path) -> Result<u64> {
+        match self {
+            Plan::Single { role, url, total } => single_stream(role, url, total, dest),
+            Plan::Ranged {
+                role,
+                url,
+                total,
+                chunks,
+            } => ranged(role, url, total, chunks, dest),
+        }
+    }
+}
+
+/// `Some(total)` when the host answered a one-byte range request with a `206`
+/// and a `Content-Range` we can read a length out of. `None` means "one stream,
+/// then" — for any reason at all, including a host that simply said 200.
+fn probe_ranges(url: &str) -> Result<Option<u64>> {
+    let resp = match agent().get(url).set("Range", "bytes=0-0").call() {
+        Ok(r) => r,
+        // A transport error here is a real problem and is worth reporting now
+        // rather than after twelve threads have each hit it.
+        Err(e) => return Err(anyhow::anyhow!(e)).with_context(|| format!("GET {url}")),
+    };
+    if resp.status() != 206 {
+        return Ok(None);
+    }
+    // "bytes 0-0/16701436"
+    Ok(resp
+        .header("content-range")
+        .and_then(|v| v.rsplit('/').next().map(str::trim).map(str::to_string))
+        .and_then(|n| n.parse::<u64>().ok())
+        .filter(|n| *n > 0))
+}
+
+/// One range of the file, and how much of it is already on disk.
+struct Chunk {
+    start: u64,
+    /// Inclusive, as HTTP means it.
+    end: u64,
+    done: AtomicU64,
+}
+
+impl Chunk {
+    fn len(&self) -> u64 {
+        self.end - self.start + 1
+    }
+}
+
+fn journal_path(part: &Path) -> PathBuf {
+    let mut s = part.as_os_str().to_os_string();
+    s.push(".progress");
+    PathBuf::from(s)
+}
+
+/// Work out where to start, reading the journal next to a `.part` file that
+/// survived an interrupted run.
+///
+/// Anything the least bit inconsistent — a `.part` of the wrong length, a
+/// journal for a different split, a count that exceeds its range — starts the
+/// whole download again. Resuming into a file we cannot fully account for is
+/// how a download produces something that is the right size and the wrong
+/// bytes, which is the one outcome the size check cannot catch.
+fn resume(part: &Path, total: u64, n: usize) -> Result<Vec<Chunk>> {
+    let per = total.div_ceil(n as u64);
+    let mut chunks = Vec::with_capacity(n);
+    for i in 0..n {
+        let start = per * i as u64;
+        if start >= total {
+            break;
+        }
+        chunks.push(Chunk {
+            start,
+            end: (start + per - 1).min(total - 1),
+            done: AtomicU64::new(0),
+        });
+    }
+
+    let usable = fs::metadata(part).map(|m| m.len()).ok() == Some(total)
+        && read_journal(&journal_path(part), total, chunks.len())
+            .map(|done| {
+                for (chunk, have) in chunks.iter().zip(done) {
+                    chunk.done.store(have.min(chunk.len()), Ordering::SeqCst);
+                }
+            })
+            .is_some();
+    if !usable {
+        let _ = fs::remove_file(part);
+        let _ = fs::remove_file(journal_path(part));
+        for chunk in &chunks {
+            chunk.done.store(0, Ordering::SeqCst);
+        }
+    }
+    Ok(chunks)
+}
+
+/// `total`, then one line per range. Plain text on purpose: it has to be
+/// readable by a person wondering what a stalled download is doing.
+fn read_journal(path: &Path, total: u64, n: usize) -> Option<Vec<u64>> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()?.trim().parse::<u64>().ok()? != total {
+        return None;
+    }
+    let done: Vec<u64> = lines.filter_map(|l| l.trim().parse().ok()).collect();
+    (done.len() == n).then_some(done)
+}
+
+fn write_journal(path: &Path, total: u64, chunks: &[Chunk]) {
+    let mut text = format!("{total}\n");
+    for c in chunks {
+        text.push_str(&format!("{}\n", c.done.load(Ordering::SeqCst)));
+    }
+    let _ = fs::write(path, text);
+}
+
+/// The measured fast path: N ranges, N connections, one preallocated file.
+fn ranged(role: &str, url: &str, total: u64, chunks: Vec<Chunk>, dest: &Path) -> Result<u64> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .read(true)
+        .open(dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    file.set_len(total)
+        .with_context(|| format!("reserving {} for {}", human(total), dest.display()))?;
+
+    let already: u64 = chunks.iter().map(|c| c.done.load(Ordering::SeqCst)).sum();
+    let transferred = AtomicU64::new(0);
+    let stop = AtomicBool::new(false);
+    let mut bar = Progress::new(role, total, chunks.len());
+    if already > 0 {
+        eprintln!(
+            "  {:<14} resuming at {} of {}",
+            role,
+            human(already),
+            human(total)
+        );
+    }
+    let journal = journal_path(dest);
+    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for chunk in &chunks {
+            let file = &file;
+            let transferred = &transferred;
+            let stop = &stop;
+            let failures = &failures;
+            scope.spawn(move || {
+                if let Err(e) = fetch_range(url, chunk, file, transferred, stop) {
+                    // One range failing ends the download, but the others are
+                    // asked to stop rather than killed: whatever they have
+                    // already written stays in the journal and resumes.
+                    stop.store(true, Ordering::SeqCst);
+                    failures
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(format!("{e:#}"));
+                }
+            });
+        }
+
+        // The main thread does the two things that must not be done twelve
+        // times over: draw one bar, and journal one consistent set of offsets.
+        let mut last_journal = Instant::now();
+        loop {
+            let done: u64 = chunks.iter().map(|c| c.done.load(Ordering::SeqCst)).sum();
+            bar.update(done);
+            if last_journal.elapsed() > Duration::from_secs(2) {
+                write_journal(&journal, total, &chunks);
+                last_journal = Instant::now();
+            }
+            if done >= total || stop.load(Ordering::SeqCst) {
+                break;
+            }
+            // Short, because this loop is also what notices the download has
+            // FINISHED: a lazy poll here would put a floor under the wall time
+            // of every small transfer.
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    });
+
+    write_journal(&journal, total, &chunks);
+    let failures = failures.into_inner().unwrap_or_else(|p| p.into_inner());
+    if let Some(first) = failures.first() {
+        bail!("{role}: {first} (the partial download was kept; run the fetch again to resume)");
+    }
+    let done: u64 = chunks.iter().map(|c| c.done.load(Ordering::SeqCst)).sum();
+    file.sync_all().ok();
+    bar.finish(done);
+    let _ = transferred;
+    Ok(done)
+}
+
+/// One range, written straight into the destination at its own offsets.
+///
+/// `write_at` rather than seek-then-write: twelve threads share one file, and
+/// positioned writes are the only way that is not a race.
+fn fetch_range(
+    url: &str,
+    chunk: &Chunk,
+    file: &File,
+    transferred: &AtomicU64,
+    stop: &AtomicBool,
+) -> Result<()> {
+    // Its own agent, so this really is its own TCP connection rather than a
+    // turn at a shared pooled one — which is the entire point of the exercise.
+    let agent = agent();
+    let mut buf = vec![0u8; BUF];
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let done = chunk.done.load(Ordering::SeqCst);
+        if done >= chunk.len() {
+            return Ok(());
+        }
+        let from = chunk.start + done;
+        let range = format!("bytes={from}-{}", chunk.end);
+        let attempt_result = (|| -> Result<()> {
+            let resp = agent
+                .get(url)
+                .set("Range", &range)
+                .call()
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .with_context(|| format!("GET {url} [{range}]"))?;
+            if resp.status() != 206 {
+                bail!(
+                    "the server stopped honouring byte ranges mid-download \
+                     (status {} for {range})",
+                    resp.status()
+                );
+            }
+            let mut reader = resp.into_reader();
+            let mut at = from;
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                let n = n.min((chunk.end + 1 - at) as usize);
+                if n == 0 {
+                    return Ok(());
+                }
+                file.write_at(&buf[..n], at)?;
+                at += n as u64;
+                chunk.done.store(at - chunk.start, Ordering::SeqCst);
+                transferred.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        })();
+
+        match attempt_result {
+            Ok(()) if chunk.done.load(Ordering::SeqCst) >= chunk.len() => return Ok(()),
+            Ok(()) if stop.load(Ordering::SeqCst) => return Ok(()),
+            // A short body is a dropped connection, not an error the caller
+            // needs to see — go round again from where this range got to.
+            Ok(()) | Err(_) if attempt < MAX_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+            }
+            Ok(()) => bail!(
+                "the connection kept dropping: {} of {} bytes after {MAX_ATTEMPTS} attempts",
+                chunk.done.load(Ordering::SeqCst),
+                chunk.len()
+            ),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// GET the asset into `dest` over one connection, drawing a progress line on
+/// stderr. The path every small asset takes, and every server that declines
+/// ranges.
+///
+/// stderr on purpose: stdout carries the machine-ish report of what was
+/// installed, and a `\r`-redrawn bar has no business in it.
+fn single_stream(role: &str, url: &str, hint: u64, dest: &Path) -> Result<u64> {
+    let resp = agent()
+        .get(url)
         .call()
-        .with_context(|| format!("GET {}", asset.url))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("GET {url}"))?;
 
     let total = resp
         .header("content-length")
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(asset.download_bytes);
+        .unwrap_or(hint);
 
     let mut reader = resp.into_reader();
     let mut file = File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
-    let mut bar = Progress::new(asset.role, total);
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut bar = Progress::new(role, total, 1);
+    let mut buf = vec![0u8; BUF];
     let mut done: u64 = 0;
 
     loop {
         let n = reader
             .read(&mut buf)
-            .with_context(|| format!("reading {}", asset.url))?;
+            .with_context(|| format!("reading {url}"))?;
         if n == 0 {
             break;
         }
@@ -204,6 +634,10 @@ fn download(asset: &RemoteAsset, dest: &Path) -> Result<u64> {
     Ok(done)
 }
 
+// ---------------------------------------------------------------------------
+// unpacking
+// ---------------------------------------------------------------------------
+
 fn unpack_tar_bz2(archive: &Path, root: &Path) -> Result<()> {
     let file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
     let dec = bzip2::read::BzDecoder::new(io::BufReader::new(file));
@@ -214,32 +648,93 @@ fn unpack_tar_bz2(archive: &Path, root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Unpack the entries of a flat `.tar.gz` whose file name starts with one of
+/// `keep` into `into`, stripping the archive's own top-level directory.
+///
+/// Entry by entry rather than `Archive::unpack`, because two things have to be
+/// true that `unpack` will not give us: the build-numbered top directory has to
+/// go (the catalogue should not have to spell a build number in every path),
+/// and the thirty programs nobody shells out to have to stay out of the models
+/// directory. Every path is also checked to be a plain file name — a tarball
+/// entry called `../../.bashrc` is a well-known way to be interesting.
+fn unpack_tar_gz_into(archive: &Path, into: &Path, keep: &[&str]) -> Result<usize> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
+    let dec = flate2::read::GzDecoder::new(io::BufReader::new(file));
+    let mut tar = tar::Archive::new(dec);
+    fs::create_dir_all(into).with_context(|| format!("creating {}", into.display()))?;
+
+    let mut written = 0usize;
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path()?.into_owned();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.contains('/') || name.contains("..") {
+            bail!(
+                "{} contains a suspicious entry: {}",
+                archive.display(),
+                path.display()
+            );
+        }
+        if !keep.iter().any(|k| name.starts_with(k)) {
+            continue;
+        }
+        let dest = into.join(name);
+        let mut out = File::create(&dest).with_context(|| format!("writing {}", dest.display()))?;
+        io::copy(&mut entry, &mut out)?;
+        // The runner has to be runnable; the shared objects are marked the same
+        // way upstream ships them, and both come off the archive's own mode.
+        if let Ok(mode) = entry.header().mode() {
+            let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(mode | 0o600));
+        }
+        written += 1;
+    }
+    Ok(written)
+}
+
 // ---------------------------------------------------------------------------
 // progress
 // ---------------------------------------------------------------------------
 
 struct Progress {
-    role: &'static str,
+    role: String,
     total: u64,
+    connections: usize,
     started: Instant,
     last_draw: Instant,
     tty: bool,
 }
 
 impl Progress {
-    fn new(role: &'static str, total: u64) -> Self {
+    fn new(role: &str, total: u64, connections: usize) -> Self {
         // SAFETY: isatty only inspects the descriptor.
         let tty = unsafe { libc::isatty(libc::STDERR_FILENO) } == 1;
         let now = Instant::now();
         let p = Self {
-            role,
+            role: role.to_string(),
             total,
+            connections,
             started: now,
             // Force the first draw.
             last_draw: now - Duration::from_secs(60),
             tty,
         };
-        eprintln!("  {:<13} {} to download", role, human(total));
+        eprintln!(
+            "  {:<14} {} to download{}",
+            role,
+            human(total),
+            if connections > 1 {
+                format!(" over {connections} connections")
+            } else {
+                String::new()
+            }
+        );
         p
     }
 
@@ -271,12 +766,17 @@ impl Progress {
             0.0
         };
         let line = format!(
-            "  {:<13} {:>5.1}%  {} / {}  {}/s",
+            "  {:<14} {:>5.1}%  {} / {}  {}/s{}",
             self.role,
             pct,
             human(done),
             human(self.total),
-            human(rate as u64)
+            human(rate as u64),
+            if self.connections > 1 {
+                format!("  ×{}", self.connections)
+            } else {
+                String::new()
+            }
         );
         let mut err = io::stderr();
         if self.tty {
@@ -332,12 +832,22 @@ mod tests {
     use super::*;
     use crate::models::{expected_bytes, total_download_bytes};
 
+    // ---- the catalogue -----------------------------------------------------
+
     #[test]
-    fn every_catalogued_url_is_an_https_github_release_asset() {
+    fn every_catalogued_url_is_an_https_release_asset_from_a_host_we_named() {
+        // Two hosts, and only two: the speech models come from the sherpa-onnx
+        // releases and the graph's Tier 3 comes from the llama.cpp releases and
+        // the GGUF's own publisher. A URL that drifts off this list is a
+        // supply-chain change and has to be a visible diff.
+        const HOSTS: [&str; 3] = [
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/",
+            "https://github.com/ggml-org/llama.cpp/releases/download/",
+            "https://huggingface.co/bartowski/",
+        ];
         for a in REMOTE_ASSETS {
             assert!(
-                a.url
-                    .starts_with("https://github.com/k2-fsa/sherpa-onnx/releases/download/"),
+                HOSTS.iter().any(|h| a.url.starts_with(h)),
                 "{} points somewhere unexpected: {}",
                 a.role,
                 a.url
@@ -354,7 +864,7 @@ mod tests {
     #[test]
     fn the_default_asr_is_the_multilingual_export() {
         let a = REMOTE_ASSETS.iter().find(|a| a.role == "asr").unwrap();
-        assert!(a.default);
+        assert!(a.default());
         assert_eq!(
             a.url,
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/\
@@ -394,7 +904,8 @@ mod tests {
             .iter()
             .find(|a| a.role == "asr-fallback")
             .unwrap();
-        assert!(!a.default);
+        assert!(!a.default());
+        assert_eq!(a.group, Group::FallbackAsr);
         assert_eq!(a.download_bytes, 108_035_095);
         assert_eq!(
             expected_bytes(
@@ -402,7 +913,48 @@ mod tests {
             ),
             Some(131_113_202)
         );
-        assert_eq!(REMOTE_ASSETS.iter().filter(|a| !a.default).count(), 1);
+    }
+
+    /// GRAPH.md's Tier 3, in the catalogue: optional, byte-exact, and behind
+    /// its own flag. Nothing about a default install pays for it.
+    #[test]
+    fn the_graph_model_is_catalogued_as_an_optional_group() {
+        let llm = REMOTE_ASSETS
+            .iter()
+            .find(|a| a.role == "graph.llm")
+            .expect("the bake-off's winner is catalogued");
+        assert_eq!(llm.group, Group::Graph);
+        assert!(!llm.default(), "a fresh install must not fetch 1.9 GB");
+        // The exact figure the model weighs, checked byte for byte by the fetch.
+        assert_eq!(llm.download_bytes, 1_929_903_264);
+        assert_eq!(
+            llm.install,
+            Install::File("qwen2.5-3b-instruct-q4_k_m.gguf")
+        );
+        assert_eq!(
+            expected_bytes("qwen2.5-3b-instruct-q4_k_m.gguf"),
+            Some(1_929_903_264)
+        );
+
+        let rt = REMOTE_ASSETS
+            .iter()
+            .find(|a| a.role == "graph.runtime")
+            .expect("and so is the runtime it needs");
+        assert_eq!(rt.group, Group::Graph);
+        assert_eq!(rt.download_bytes, 16_701_436);
+        assert_eq!(
+            rt.install,
+            Install::TarGzInto {
+                dir: "llama",
+                keep: &["llama-cli", "lib"],
+            }
+        );
+        assert_eq!(expected_bytes("llama/llama-cli"), Some(1_453_352));
+        // The config's defaults have to name what the catalogue installs, or
+        // `models status` and the daemon would look in different places.
+        let graph = crate::config::GraphConfig::default();
+        assert_eq!(graph.llm_model, "qwen2.5-3b-instruct-q4_k_m.gguf");
+        assert_eq!(graph.llama_dir, "llama");
     }
 
     #[test]
@@ -420,20 +972,52 @@ mod tests {
     }
 
     #[test]
-    fn the_default_set_is_the_documented_size() {
-        // DESIGN §4's "~700 MB default set" on disk, now literally true: the
-        // multilingual encoder alone unpacks to 622 MB. ~496 MB compressed.
+    fn the_default_set_is_the_documented_size_and_the_options_add_to_it() {
+        // DESIGN §4's "~700 MB default set" on disk: the multilingual encoder
+        // alone unpacks to 622 MB. ~496 MB compressed.
+        let base = 6_958_444 + 26_485_263 + 487_170_055;
+        assert_eq!(total_download_bytes(&[]), base);
         assert_eq!(
-            total_download_bytes(false),
-            6_958_444 + 26_485_263 + 487_170_055
+            total_download_bytes(&[Group::FallbackAsr]),
+            base + 108_035_095
         );
-        // The optional English-only export is only counted when it is asked for.
+        // Tier 3 nearly quadruples a cold fetch, which is exactly why it is a
+        // flag and not a default.
         assert_eq!(
-            total_download_bytes(true),
-            total_download_bytes(false) + 108_035_095
+            total_download_bytes(&[Group::Graph]),
+            base + 1_929_903_264 + 16_701_436
         );
         assert_eq!(expected_bytes("eres2net_en.onnx"), Some(26_485_263));
         assert_eq!(expected_bytes("no/such/model.onnx"), None);
+    }
+
+    #[test]
+    fn the_fetch_only_wants_the_groups_it_was_asked_for() {
+        let bare = FetchOptions::default();
+        assert!(bare.extra_groups().is_empty());
+        for a in REMOTE_ASSETS {
+            assert_eq!(bare.wants(a), a.default(), "{}", a.role);
+        }
+        let graph = FetchOptions {
+            graph: true,
+            ..Default::default()
+        };
+        assert!(
+            graph.wants(
+                REMOTE_ASSETS
+                    .iter()
+                    .find(|a| a.role == "graph.llm")
+                    .unwrap()
+            )
+        );
+        assert!(
+            !graph.wants(
+                REMOTE_ASSETS
+                    .iter()
+                    .find(|a| a.role == "asr-fallback")
+                    .unwrap()
+            )
+        );
     }
 
     #[test]
@@ -495,5 +1079,424 @@ mod tests {
             target_dir(Some(Path::new("/tmp/m")), &configured, Path::new("/data")),
             PathBuf::from("/tmp/m")
         );
+    }
+
+    // ---- the transfer, against a local server ------------------------------
+    //
+    // A fixture, never the network: these tests have to run on a machine with
+    // no internet and must never depend on what GitHub feels like doing today.
+    // The server can be told to shape each connection, which is the whole
+    // reason the parallel path exists — and to refuse ranges, which is the
+    // reason the fallback does.
+
+    use super::testserver::{Serve, Shape};
+
+    fn blob(n: usize) -> Vec<u8> {
+        // Not zeroes: a positioned-write bug that lands a range at the wrong
+        // offset is invisible in a file of identical bytes.
+        (0..n).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nxr-fetch-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_ranged_download_reassembles_the_file_byte_for_byte() {
+        let body = blob(3 * 1024 * 1024 + 777);
+        let server = Serve::start(body.clone(), Shape::Ranges);
+        let dir = scratch("ranged");
+        let dest = dir.join("asset.bin");
+
+        let total = probe_ranges(&server.url())
+            .unwrap()
+            .expect("the fixture serves ranges");
+        assert_eq!(total, body.len() as u64);
+
+        let chunks = resume(&dest, total, CONNECTIONS).unwrap();
+        assert_eq!(chunks.len(), CONNECTIONS);
+        let got = ranged("test", &server.url(), total, chunks, &dest).unwrap();
+
+        assert_eq!(got, body.len() as u64);
+        assert_eq!(fs::read(&dest).unwrap(), body, "the bytes are not the file");
+        assert!(
+            server.connections() >= 2,
+            "only {} connection(s) — this was not parallel at all",
+            server.connections()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The fallback. A server that answers a ranged request with a plain 200
+    /// gets exactly the old code path, and the file still arrives.
+    #[test]
+    fn a_server_without_ranges_falls_back_to_one_stream() {
+        let body = blob(512 * 1024);
+        let server = Serve::start(body.clone(), Shape::NoRanges);
+        let dir = scratch("noranges");
+        let dest = dir.join("asset.bin");
+
+        assert_eq!(
+            probe_ranges(&server.url()).unwrap(),
+            None,
+            "a 200 to a Range request must not be read as range support"
+        );
+        let got = single_stream("test", &server.url(), body.len() as u64, &dest).unwrap();
+        assert_eq!(got, body.len() as u64);
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Resume: half the ranges are already on disk and journalled, and the
+    /// second run only fetches what is missing.
+    #[test]
+    fn an_interrupted_download_resumes_instead_of_starting_again() {
+        let body = blob(2 * 1024 * 1024);
+        let server = Serve::start(body.clone(), Shape::Ranges);
+        let dir = scratch("resume");
+        let dest = dir.join("asset.bin");
+        let total = body.len() as u64;
+
+        // Simulate an interrupted run: the file is preallocated, the first half
+        // of the ranges are written, and the journal says so. The split is
+        // computed the same way `resume` computes it, by hand, so the setup
+        // does not depend on the function under test.
+        let per = total.div_ceil(CONNECTIONS as u64);
+        {
+            let f = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&dest)
+                .unwrap();
+            f.set_len(total).unwrap();
+            let mut journal = format!("{total}\n");
+            for i in 0..CONNECTIONS {
+                let start = per * i as u64;
+                let end = (start + per - 1).min(total - 1);
+                if i < CONNECTIONS / 2 {
+                    f.write_at(&body[start as usize..=end as usize], start)
+                        .unwrap();
+                    journal.push_str(&format!("{}\n", end - start + 1));
+                } else {
+                    journal.push_str("0\n");
+                }
+            }
+            f.sync_all().unwrap();
+            fs::write(journal_path(&dest), journal).unwrap();
+        }
+
+        let chunks = resume(&dest, total, CONNECTIONS).unwrap();
+        let already: u64 = chunks.iter().map(|c| c.done.load(Ordering::SeqCst)).sum();
+        assert!(already > 0, "the journal was not believed");
+        assert!(already < total);
+
+        let served_before = server.bytes_served();
+        let got = ranged("test", &server.url(), total, chunks, &dest).unwrap();
+        assert_eq!(got, total);
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        let served = server.bytes_served() - served_before;
+        assert!(
+            served < total,
+            "resuming re-fetched {served} of {total} bytes — that is not a resume"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A journal that does not describe the file next to it is not trusted:
+    /// resuming into a file we cannot account for is how a download ends up the
+    /// right size and the wrong bytes.
+    #[test]
+    fn an_inconsistent_journal_starts_the_download_again() {
+        let dir = scratch("badjournal");
+        let dest = dir.join("asset.bin");
+        fs::write(&dest, vec![7u8; 1000]).unwrap();
+        fs::write(journal_path(&dest), "999999\n1\n2\n").unwrap();
+
+        let chunks = resume(&dest, 4096, 4).unwrap();
+        assert!(chunks.iter().all(|c| c.done.load(Ordering::SeqCst) == 0));
+        assert!(!dest.exists(), "the mismatched part file was kept");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The measurement this whole path exists for, reproduced on the fixture:
+    /// the server shapes every connection to a fixed rate, exactly as the
+    /// user's line does, and twelve of them beat one by close to twelvefold.
+    #[test]
+    fn parallel_ranges_beat_one_stream_on_a_per_connection_shaped_line() {
+        // 2 MB at 4 MB/s per connection: ~500 ms as one stream, and it should
+        // land near 12x faster split twelve ways. Sized so the test costs well
+        // under a second either way.
+        let body = blob(2_000_000);
+        let per_conn = 4_000_000;
+
+        let one = Serve::start(body.clone(), Shape::Shaped(per_conn));
+        let dir = scratch("speed");
+        let a = dir.join("single.bin");
+        let started = Instant::now();
+        single_stream("single", &one.url(), body.len() as u64, &a).unwrap();
+        let single = started.elapsed();
+
+        let many = Serve::start(body.clone(), Shape::ShapedRanges(per_conn));
+        let b = dir.join("parallel.bin");
+        let total = probe_ranges(&many.url()).unwrap().unwrap();
+        let chunks = resume(&b, total, CONNECTIONS).unwrap();
+        let started = Instant::now();
+        ranged("parallel", &many.url(), total, chunks, &b).unwrap();
+        let parallel = started.elapsed();
+
+        assert_eq!(fs::read(&a).unwrap(), body);
+        assert_eq!(fs::read(&b).unwrap(), body);
+        eprintln!(
+            "shaped at {}/s per connection: single {:?}, {CONNECTIONS}-way {:?} ({:.1}x)",
+            human(per_conn as u64),
+            single,
+            parallel,
+            single.as_secs_f64() / parallel.as_secs_f64().max(0.001)
+        );
+        // Deliberately a loose bound: this is a wall-clock assertion on a
+        // shared machine, and the claim being defended is "many connections
+        // are much faster", not a specific multiple.
+        assert!(
+            parallel * 3 < single,
+            "twelve connections were only {:?} against {:?} for one — \
+             the ranges are not running concurrently",
+            parallel,
+            single
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The one guarantee that must not change: whatever the transport did, the
+    /// file has to weigh exactly what the catalogue says or nothing is
+    /// installed.
+    #[test]
+    fn a_wrong_length_asset_is_refused_and_leaves_nothing_installed() {
+        let body = blob(9 * 1024 * 1024);
+        let server = Serve::start(body.clone(), Shape::Ranges);
+        let dir = scratch("wronglen");
+        // A catalogue entry that disagrees with the server by one byte.
+        let asset = RemoteAsset {
+            role: "test",
+            url: Box::leak(server.url().into_boxed_str()),
+            download_bytes: body.len() as u64 + 1,
+            install: Install::File("out.bin"),
+            group: Group::Speech,
+            files: &[("out.bin", 1)],
+        };
+        let err = fetch_one(&dir, &asset, &FetchOptions::default()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("refusing to install"),
+            "{err:#}"
+        );
+        assert!(!dir.join("out.bin").exists());
+        assert!(
+            !dir.join("asset.bin.part").exists(),
+            "a part file of the wrong length must not be left to resume into"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The install rule for the llama.cpp release: strip the build-numbered top
+    /// directory, keep the runner and its shared objects, drop the rest.
+    #[test]
+    fn a_tar_gz_installs_only_the_entries_it_was_told_to_keep() {
+        let dir = scratch("targz");
+        let archive = dir.join("bundle.tar.gz");
+        {
+            let out = File::create(&archive).unwrap();
+            let enc = flate2::write::GzEncoder::new(out, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(enc);
+            for (name, body, mode) in [
+                ("llama-b10736/llama-cli", &b"runner"[..], 0o755),
+                ("llama-b10736/libllama.so", &b"shared"[..], 0o755),
+                ("llama-b10736/llama-server", &b"not wanted"[..], 0o755),
+                ("llama-b10736/LICENSE", &b"nor this"[..], 0o644),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(mode);
+                header.set_cksum();
+                tar.append_data(&mut header, name, body).unwrap();
+            }
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+
+        let into = dir.join("llama");
+        let n = unpack_tar_gz_into(&archive, &into, &["llama-cli", "lib"]).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(fs::read(into.join("llama-cli")).unwrap(), b"runner");
+        assert_eq!(fs::read(into.join("libllama.so")).unwrap(), b"shared");
+        assert!(
+            !into.join("llama-server").exists(),
+            "the whole toolkit was unpacked, not the two files we shell out to"
+        );
+        assert!(!into.join("LICENSE").exists());
+        // The runner has to be runnable.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(into.join("llama-cli"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o100 != 0,
+            "llama-cli came out non-executable: {mode:o}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// A throwaway HTTP server for the fetch tests. Never compiled into the daemon.
+///
+/// It exists because the three properties the parallel path claims — ranges,
+/// resume, and a fallback — are all properties of a *conversation with a
+/// server*, and testing them against the real one would make the suite depend
+/// on the network the whole design is trying to stop depending on.
+#[cfg(test)]
+mod testserver {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    #[derive(Clone, Copy)]
+    pub enum Shape {
+        /// Honours `Range` with a 206.
+        Ranges,
+        /// Ignores `Range` and answers 200 with the whole body — the fallback
+        /// case, and what a plain static file server often does.
+        NoRanges,
+        /// One stream, rate-limited to N bytes per second.
+        Shaped(usize),
+        /// Ranges, each connection rate-limited to N bytes per second. The
+        /// user's own line, in miniature.
+        ShapedRanges(usize),
+    }
+
+    pub struct Serve {
+        port: u16,
+        connections: Arc<AtomicU64>,
+        bytes: Arc<AtomicU64>,
+    }
+
+    impl Serve {
+        pub fn start(body: Vec<u8>, shape: Shape) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+            let port = listener.local_addr().unwrap().port();
+            let connections = Arc::new(AtomicU64::new(0));
+            let bytes = Arc::new(AtomicU64::new(0));
+            let body = Arc::new(body);
+            {
+                let connections = Arc::clone(&connections);
+                let bytes = Arc::clone(&bytes);
+                std::thread::spawn(move || {
+                    for stream in listener.incoming().flatten() {
+                        connections.fetch_add(1, Ordering::SeqCst);
+                        let body = Arc::clone(&body);
+                        let bytes = Arc::clone(&bytes);
+                        std::thread::spawn(move || {
+                            let _ = handle(stream, &body, shape, &bytes);
+                        });
+                    }
+                });
+            }
+            Self {
+                port,
+                connections,
+                bytes,
+            }
+        }
+
+        pub fn url(&self) -> String {
+            format!("http://127.0.0.1:{}/asset.bin", self.port)
+        }
+
+        pub fn connections(&self) -> u64 {
+            self.connections.load(Ordering::SeqCst)
+        }
+
+        pub fn bytes_served(&self) -> u64 {
+            self.bytes.load(Ordering::SeqCst)
+        }
+    }
+
+    fn handle(
+        mut stream: TcpStream,
+        body: &[u8],
+        shape: Shape,
+        served: &AtomicU64,
+    ) -> std::io::Result<()> {
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut range: Option<(usize, usize)> = None;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                return Ok(());
+            }
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some(spec) = trimmed
+                .strip_prefix("Range: bytes=")
+                .or_else(|| trimmed.strip_prefix("range: bytes="))
+            {
+                let (a, b) = spec.split_once('-').unwrap_or((spec, ""));
+                let start: usize = a.parse().unwrap_or(0);
+                let end: usize = b.parse().unwrap_or(body.len() - 1);
+                range = Some((start.min(body.len() - 1), end.min(body.len() - 1)));
+            }
+        }
+
+        let honours = matches!(shape, Shape::Ranges | Shape::ShapedRanges(_));
+        let rate = match shape {
+            Shape::Shaped(n) | Shape::ShapedRanges(n) => Some(n),
+            _ => None,
+        };
+
+        let (head, slice) = match (honours, range) {
+            (true, Some((start, end))) => (
+                format!(
+                    "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
+                     Content-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len(),
+                    end - start + 1
+                ),
+                &body[start..=end],
+            ),
+            _ => (
+                format!(
+                    "HTTP/1.1 200 OK\r\nAccept-Ranges: none\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                ),
+                body,
+            ),
+        };
+        stream.write_all(head.as_bytes())?;
+
+        match rate {
+            None => {
+                stream.write_all(slice)?;
+                served.fetch_add(slice.len() as u64, Ordering::SeqCst);
+            }
+            Some(per_second) => {
+                // A hundred slices a second: fine-grained enough that a short
+                // transfer still sees the shaping rather than the sleep.
+                let step = (per_second / 100).max(1);
+                for piece in slice.chunks(step) {
+                    stream.write_all(piece)?;
+                    served.fetch_add(piece.len() as u64, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        stream.flush()
     }
 }

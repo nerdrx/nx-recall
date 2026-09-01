@@ -143,6 +143,14 @@ set). Measured selections:
 | ASR (EN) | Parakeet-TDT 110m int8 | 108 MB | 2.0% WER clean, RTF 0.011 |
 | ASR (EN, large) | Parakeet-TDT 0.6b int8 | 480 MB | 1.3% WER, RTF 0.026 |
 | ASR (non-EN) | evaluate parakeet-ja / parakeet-v3 **before** Whisper | — | Whisper base: 4× worse WER, hallucinates on all non-speech |
+| Memory graph (optional) | Qwen2.5-3B-Instruct Q4 GGUF, via llama.cpp | 1.9 GB | 9/9 trap rejections, 3.3 s/case on 4 pinned cores ([GRAPH.md](GRAPH.md)) |
+
+- The graph model is the **only optional** entry: `models fetch --graph`, off by
+  default in `[graph].enabled`, and `models status` lists it under its own
+  heading so a machine that never asked for it is not reported as incomplete.
+  It is also the only model this daemon does not link — it runs as a child
+  `llama-cli`, which keeps a 3B model's failure modes out of the capture process
+  and costs the build no C++ toolchain.
 
 - ~~Whisper hallucination filtering is mandatory~~ → **Parakeet emits zero ghost
   words on silence/noise/music (measured); the filter is Whisper-scoped.** If
@@ -316,6 +324,14 @@ preview; soft-delete undo window; panic-delete; source blocklist), plus:
   your own pinned voice (the microphone switch is what stops recording you) and,
   on the nuke path, a voice others were merged into — its tombstones would
   dangle, and keeping the voiceprint still takes every conversation.
+- **The memory graph has its own switch, and it is off (0.7.0).** Tier 3 of
+  [GRAPH.md](GRAPH.md) is a 3B local model reading conversations nobody has
+  looked at yet. It is a second consent question of the same shape as the
+  microphone's — the mic asks to hear the room, this asks to read what the room
+  said — so it gets the same treatment: its own switch, its own default (off),
+  its own copy stating what it costs, and its own card in the app rather than a
+  line in a settings list. It never runs while an allowed application is being
+  captured, never while capture is paused, and never in the capture path.
 - Socket: `$XDG_RUNTIME_DIR/nx-recall.sock`, mode 0600.
 - At-rest encryption: **honestly scoped.** A user-service that autostarts cannot
   prompt for a passphrase, so a local key would be theater against filesystem

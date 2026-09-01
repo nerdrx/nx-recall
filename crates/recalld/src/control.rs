@@ -26,7 +26,8 @@ use serde_json::{Value, json};
 use crate::allowlist::Allowlist;
 use crate::analysis::AnalysisStats;
 use crate::clock::utc_now_ns;
-use crate::config::{IdentityConfig, MicConfig, MicMode};
+use crate::config::{GraphConfig, IdentityConfig, MicConfig, MicMode};
+use crate::enrich::GraphState;
 use crate::pipeline::Stats;
 use crate::queue::EventQueue;
 
@@ -49,6 +50,10 @@ pub struct Control {
     /// Where `sources.set` persists a rule, so a toggle survives a restart.
     pub config_path: Option<PathBuf>,
     pub data_dir: PathBuf,
+    /// Where the analysis models live, when `[models].dir` names anywhere at
+    /// all. The socket needs it to answer whether the graph's optional model is
+    /// actually on disk, which is a different question from whether it is on.
+    pub models_root: Option<PathBuf>,
     pub queue: Option<Arc<EventQueue>>,
     pub stats: Arc<Stats>,
     pub analysis: Arc<AnalysisStats>,
@@ -62,6 +67,13 @@ pub struct Control {
     /// because `status` is polled every three seconds by every open client and
     /// the answer costs a walk of the whole data directory.
     storage: Mutex<Option<crate::retention::StorageUsage>>,
+    /// The memory graph's settings, live. The Tier 3 switch is the third thing
+    /// in this file that has to be movable while the daemon runs, and for the
+    /// same reason as the other two: it has a switch in the UI, and a switch
+    /// that needs a restart is not a switch.
+    graph: Mutex<GraphConfig>,
+    /// What the enrichment worker is doing right now, as it reports it.
+    graph_state: Mutex<GraphState>,
 }
 
 impl Control {
@@ -77,13 +89,29 @@ impl Control {
             started_at_ns: utc_now_ns(),
             config_path,
             data_dir,
+            models_root: None,
             queue: None,
             stats: Arc::new(Stats::default()),
             analysis: Arc::new(AnalysisStats::default()),
             identity: IdentityConfig::default(),
             models: Mutex::new(Vec::new()),
             storage: Mutex::new(None),
+            graph: Mutex::new(GraphConfig::default()),
+            graph_state: Mutex::new(GraphState::default()),
         })
+    }
+
+    /// The configured memory graph, and where its optional model would live.
+    /// Set before the handle is shared, like the rest of the wiring.
+    pub fn with_graph(
+        mut self: Arc<Self>,
+        graph: GraphConfig,
+        models_root: Option<PathBuf>,
+    ) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
+        *this.graph.get_mut().unwrap_or_else(|p| p.into_inner()) = graph;
+        this.models_root = models_root;
+        self
     }
 
     /// The configured identity operating point, if it differs from the
@@ -263,6 +291,60 @@ impl Control {
             Some(usage) => usage.to_json(),
             None => Value::Null,
         }
+    }
+
+    // ---- the memory graph (GRAPH.md Tiers 2 and 3) -----------------------
+
+    pub fn graph(&self) -> GraphConfig {
+        self.graph.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Flip the Tier 3 switch. Returns the resulting settings, so the caller
+    /// answers with what is true rather than with what it asked for.
+    ///
+    /// Nothing is interrupted here: the worker reads this between conversations
+    /// and stands down at the next boundary, which is at most one model call
+    /// away. Killing a running inference to honour a switch instantly would
+    /// leave a conversation half-annotated for no benefit anybody can see.
+    pub fn set_graph_enabled(&self, enabled: bool) -> GraphConfig {
+        let mut guard = self.graph.lock().unwrap_or_else(|p| p.into_inner());
+        guard.enabled = enabled;
+        guard.clone()
+    }
+
+    /// Change one or more of the numbers the worker runs under. `None` leaves a
+    /// field alone, so a client can set the switch without also having an
+    /// opinion about thread counts.
+    pub fn set_graph_tuning(
+        &self,
+        llm_threads: Option<i32>,
+        gpu_layers: Option<i32>,
+    ) -> GraphConfig {
+        let mut guard = self.graph.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = llm_threads {
+            guard.llm_threads = t.clamp(1, 64);
+        }
+        if let Some(g) = gpu_layers {
+            guard.gpu_layers = g.max(0);
+        }
+        guard.clone()
+    }
+
+    pub fn graph_state(&self) -> GraphState {
+        self.graph_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// The worker reporting what it is doing. Returns whether anything a client
+    /// would notice actually changed, so a loop that ticks every twenty seconds
+    /// does not push twenty identical events an hour.
+    pub fn set_graph_state(&self, next: GraphState) -> bool {
+        let mut guard = self.graph_state.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = !guard.same_to_a_client(&next);
+        *guard = next;
+        changed
     }
 
     // ---- status ----------------------------------------------------------

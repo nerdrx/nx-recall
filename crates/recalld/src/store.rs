@@ -18,6 +18,11 @@
 //! only derived table in the schema, it is re-derivable from the transcript,
 //! and the migration backfills it by replaying the same rule the live path
 //! uses.
+//! v7 adds the memory graph's Tiers 2 and 3: `time_refs` (when a turn was
+//! talking about), `commitments` (who owes what to whom) and `threads.topic`.
+//! All three are **derived, second-class and re-derivable** — every row carries
+//! its provenance (`source`, `model_id`, `confidence`, `created_at`) and every
+//! one of them is deleted when the segment, speaker or thread it hangs off is.
 //! Existing databases are migrated in place.
 
 use std::collections::{BTreeSet, HashMap};
@@ -29,7 +34,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::embed::Embedding;
 use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -214,6 +219,11 @@ pub struct SpeakerDeleteReport {
     /// Conversations left with nothing live in them, cleaned as the purge path
     /// cleans them (DESIGN §0's deletion rule).
     pub threads: usize,
+    /// Derived rows that went with the voice (schema v7): commitments it made
+    /// or was owed, and the time references on its turns. Reported because a
+    /// cascade nobody can see is a cascade nobody can check.
+    pub commitments: usize,
+    pub time_refs: usize,
     /// False when the voiceprint was kept: the identity is still in the bank
     /// and still matches future audio.
     pub removed_speaker: bool,
@@ -393,6 +403,156 @@ pub struct ThreadSummary {
     pub preview: Option<String>,
 }
 
+// ---- the memory graph, Tiers 2 and 3 (schema v7, GRAPH.md) ----------------
+
+/// `commitments.state`. A row only ever leaves `CANDIDATE` because a person
+/// clicked: nothing in this program acts on a guess, and nothing nags.
+pub mod commitment_state {
+    pub const CANDIDATE: &str = "candidate";
+    pub const CONFIRMED: &str = "confirmed";
+    pub const DONE: &str = "done";
+    pub const DISMISSED: &str = "dismissed";
+    pub const ALL: [&str; 4] = [CANDIDATE, CONFIRMED, DONE, DISMISSED];
+
+    pub fn parse(s: &str) -> Option<&'static str> {
+        ALL.into_iter().find(|k| *k == s)
+    }
+}
+
+/// `commitments.source` — which tier claimed this, and therefore how much a
+/// surface is allowed to imply. They are rendered differently because they are
+/// not the same claim.
+pub mod commitment_source {
+    /// A modal-pattern match. Cheap, wrong sometimes, always a guess.
+    pub const RULES: &str = "rules";
+    /// The tiny local model, under a verdict-first grammar (GRAPH.md Tier 3).
+    pub const LLM: &str = "llm";
+}
+
+/// One resolved time reference, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeRefRow {
+    pub id: i64,
+    pub segment_id: i64,
+    pub raw: String,
+    pub resolved_utc_ns: i64,
+    pub kind: String,
+}
+
+/// A commitment as it goes to a client: the row, plus the names and the
+/// transcript line it points at, so the list needs no second query per row.
+#[derive(Debug, Clone)]
+pub struct CommitmentRow {
+    pub id: i64,
+    pub segment_id: i64,
+    pub thread_id: Option<i64>,
+    pub who_speaker_id: Option<i64>,
+    pub who_name: Option<String>,
+    pub who_auto: Option<String>,
+    pub to_speaker_id: Option<i64>,
+    pub to_name: Option<String>,
+    pub to_auto: Option<String>,
+    pub what: String,
+    pub due_utc_ns: Option<i64>,
+    pub due_raw: Option<String>,
+    pub due_kind: Option<String>,
+    pub state: String,
+    pub source: String,
+    pub model_id: Option<String>,
+    pub confidence: Option<f64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// The segment's own start, so a row can land in the transcript.
+    pub t_start_ns: i64,
+    /// What was actually said. A commitment is a claim *about* a line, and the
+    /// line has to be readable next to it or there is no way to disagree.
+    pub said: Option<String>,
+}
+
+/// What a client needs to write a commitment down. `due` is whichever time
+/// reference the extractor settled on, kept in both forms.
+#[derive(Debug, Clone)]
+pub struct NewCommitment {
+    pub segment_id: i64,
+    pub thread_id: Option<i64>,
+    pub who_speaker_id: Option<i64>,
+    pub to_speaker_id: Option<i64>,
+    pub what: String,
+    pub due_utc_ns: Option<i64>,
+    pub due_raw: Option<String>,
+    pub due_kind: Option<String>,
+    pub source: &'static str,
+    pub model_id: Option<String>,
+    pub confidence: f64,
+}
+
+/// What `upsert_commitment` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitmentWrite {
+    /// There was nothing on this segment; a candidate was filed.
+    Inserted(i64),
+    /// A row was already there and this one carries more authority, so it was
+    /// upgraded in place — same id, same state, better provenance.
+    Upgraded(i64),
+    /// A row was already there and this one does not outrank it. Nothing moved.
+    /// A rules pass must never overwrite what the model said, and neither pass
+    /// may ever undo a person's click.
+    Kept(i64),
+}
+
+impl CommitmentWrite {
+    pub fn id(self) -> i64 {
+        match self {
+            CommitmentWrite::Inserted(id)
+            | CommitmentWrite::Upgraded(id)
+            | CommitmentWrite::Kept(id) => id,
+        }
+    }
+}
+
+/// One turn of a conversation, as a Tier 3 window needs it: the words, who said
+/// them, and when. Not a `SegmentRow` — the model is shown a transcript, not a
+/// database row, and keeping the shapes apart is what stops the prompt growing
+/// fields nobody meant to send it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadLine {
+    pub segment_id: i64,
+    pub speaker_id: Option<i64>,
+    pub t_start_ns: i64,
+    pub text: String,
+}
+
+/// One topic label, with the conversations wearing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicRow {
+    pub topic: String,
+    pub threads: i64,
+    pub segments: i64,
+    pub last_ns: i64,
+    /// Newest first, capped by the caller — a topic is a way into conversations,
+    /// not a list of every one that ever mentioned it.
+    pub thread_ids: Vec<i64>,
+}
+
+/// The one-glance state of the graph: what has been derived, and how much is
+/// left to derive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GraphCounts {
+    pub time_refs: i64,
+    pub commitments: i64,
+    pub open: i64,
+    pub candidates: i64,
+    pub confirmed: i64,
+    pub done: i64,
+    pub dismissed: i64,
+    pub from_rules: i64,
+    pub from_llm: i64,
+    pub topics: i64,
+    pub threads: i64,
+    pub threads_enriched: i64,
+    pub threads_pending: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscriptRow {
     pub segment_id: i64,
@@ -511,6 +671,7 @@ impl Store {
         self.apply_v4()?;
         self.apply_v5()?;
         self.apply_v6()?;
+        self.apply_v7()?;
 
         match current {
             None => {
@@ -795,6 +956,88 @@ impl Store {
         if fresh {
             self.backfill_threads()?;
         }
+        Ok(())
+    }
+
+    /// Everything schema v7 adds, written so it is a no-op on a v7 database.
+    ///
+    /// The memory graph's Tiers 2 and 3 (GRAPH.md). Two tables and three
+    /// columns, and every one of them is an **annotation referencing a
+    /// segment**, never a modification of one: the transcript stays the source
+    /// of truth and all of this is re-derivable from it.
+    ///
+    /// There is no backfill. Tier 2 runs on the way in (the pipeline extracts
+    /// each turn as it is stored) and Tier 3 is opt-in and idle-only, so a
+    /// database migrated up to v7 simply has no derived rows yet — which is the
+    /// correct state for a feature that is off by default. Turning the
+    /// enrichment on walks the history at its own pace.
+    fn apply_v7(&self) -> Result<()> {
+        self.conn.execute_batch(
+            // When a turn was talking about, resolved against the moment it was
+            // said (`crate::timeref`). `raw` is the phrase as spoken, because a
+            // date nobody can trace back to a word is not evidence of anything.
+            "CREATE TABLE IF NOT EXISTS time_refs (
+                 id              INTEGER PRIMARY KEY,
+                 segment_id      INTEGER NOT NULL REFERENCES segments(id),
+                 raw             TEXT    NOT NULL,
+                 resolved_utc_ns INTEGER NOT NULL,
+                 kind            TEXT    NOT NULL,
+                 extractor       TEXT    NOT NULL,
+                 version         INTEGER NOT NULL,
+                 created_at      INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_time_refs_segment ON time_refs(segment_id);
+             CREATE INDEX IF NOT EXISTS idx_time_refs_due ON time_refs(resolved_utc_ns);
+
+             -- Who owes what to whom. ONE row per segment, deliberately: the
+             -- LLM pass upgrades a rule candidate in place rather than filing a
+             -- second opinion next to it, so a person never has to read the
+             -- same promise twice and decide which copy is real.
+             CREATE TABLE IF NOT EXISTS commitments (
+                 id             INTEGER PRIMARY KEY,
+                 segment_id     INTEGER NOT NULL UNIQUE REFERENCES segments(id),
+                 -- SET NULL rather than a plain reference: a thread is only an
+                 -- index into the transcript and is deleted the moment nothing
+                 -- live is left in it, which must not be able to take a
+                 -- commitment whose own segment is merely hidden.
+                 thread_id      INTEGER REFERENCES threads(id) ON DELETE SET NULL,
+                 who_speaker_id INTEGER REFERENCES speakers(id),
+                 to_speaker_id  INTEGER REFERENCES speakers(id),
+                 what           TEXT    NOT NULL,
+                 due_utc_ns     INTEGER,
+                 due_raw        TEXT,
+                 due_kind       TEXT,
+                 -- candidate | confirmed | done | dismissed. Nothing but a
+                 -- human click ever moves a row off `candidate`.
+                 state          TEXT    NOT NULL,
+                 -- rules | llm. Rendered differently, because they are not the
+                 -- same claim.
+                 source         TEXT    NOT NULL,
+                 model_id       TEXT,
+                 confidence     REAL,
+                 created_at     INTEGER NOT NULL,
+                 updated_at     INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_commitments_state
+                 ON commitments(state, due_utc_ns);
+             CREATE INDEX IF NOT EXISTS idx_commitments_thread ON commitments(thread_id);
+             CREATE INDEX IF NOT EXISTS idx_commitments_who ON commitments(who_speaker_id);
+             CREATE INDEX IF NOT EXISTS idx_commitments_to ON commitments(to_speaker_id);",
+        )?;
+
+        // A short label for a conversation, written by the Tier 3 pass. On the
+        // thread rather than in a table of its own: it is one string per
+        // conversation, it dies with the conversation, and a `topics` table
+        // would be a second thing that can disagree with `threads`.
+        self.add_column_if_missing("threads", "topic", "TEXT")?;
+        self.add_column_if_missing("threads", "topic_model_id", "TEXT")?;
+        // When the enrichment pass last walked this conversation. NULL means
+        // "never", which is what the worker's queue is: threads with no stamp.
+        self.add_column_if_missing("threads", "enriched_at", "INTEGER")?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_threads_enriched ON threads(enriched_at);
+             CREATE INDEX IF NOT EXISTS idx_threads_topic ON threads(topic);",
+        )?;
         Ok(())
     }
 
@@ -2079,10 +2322,19 @@ impl Store {
             let mut orphan_prototypes = tx.prepare(
                 "UPDATE speaker_prototypes SET source_segment_id = NULL WHERE source_segment_id = ?1",
             )?;
+            // Schema v7. Derived rows are second-class citizens of deletion
+            // (GRAPH.md's charter guard): what was inferred from a line cannot
+            // outlive the line. Both are re-derivable if the same words ever
+            // come back, which is the whole reason this is safe to do.
+            let mut drop_time_refs = tx.prepare("DELETE FROM time_refs WHERE segment_id = ?1")?;
+            let mut drop_commitments =
+                tx.prepare("DELETE FROM commitments WHERE segment_id = ?1")?;
             let mut drop_segment = tx.prepare("DELETE FROM segments WHERE id = ?1")?;
             for id in ids {
                 drop_embeddings.execute(params![id])?;
                 orphan_prototypes.execute(params![id])?;
+                drop_time_refs.execute(params![id])?;
+                drop_commitments.execute(params![id])?;
                 n += drop_segment.execute(params![id])?;
             }
             // A thread is an index into the transcript and nothing else, so a
@@ -2525,6 +2777,442 @@ impl Store {
         )?)
     }
 
+    // ---- the memory graph, Tiers 2 and 3 (v7, GRAPH.md) ------------------
+    //
+    // Everything here is derived and every read of it joins back to a LIVE
+    // segment. That join is not an optimisation — it is how a soft delete works
+    // for derived rows: hiding the transcript line hides what was inferred from
+    // it, and undoing the delete brings both back. The hard cascades below
+    // (`purge_segments`, `delete_speaker`) are the other half.
+
+    /// Replace this segment's time references with `refs`.
+    ///
+    /// Replace, not append: the extractor is a pure function of the transcript,
+    /// so re-running it after a correction must leave exactly what the new text
+    /// says rather than the union of two readings.
+    pub fn replace_time_refs(
+        &self,
+        segment_id: i64,
+        refs: &[crate::timeref::TimeRef],
+        at_utc_ns: i64,
+    ) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM time_refs WHERE segment_id = ?1",
+            params![segment_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO time_refs
+                     (segment_id, raw, resolved_utc_ns, kind, extractor, version, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for r in refs {
+                stmt.execute(params![
+                    segment_id,
+                    r.raw,
+                    r.resolved_utc_ns,
+                    r.kind,
+                    crate::timeref::EXTRACTOR,
+                    crate::timeref::VERSION,
+                    at_utc_ns,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(refs.len())
+    }
+
+    pub fn time_refs_for(&self, segment_id: i64) -> Result<Vec<TimeRefRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, segment_id, raw, resolved_utc_ns, kind FROM time_refs
+             WHERE segment_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![segment_id], |r| {
+                Ok(TimeRefRow {
+                    id: r.get(0)?,
+                    segment_id: r.get(1)?,
+                    raw: r.get(2)?,
+                    resolved_utc_ns: r.get(3)?,
+                    kind: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// File a commitment against a segment, or upgrade the one already there.
+    ///
+    /// The precedence rule, in one place because it is the whole reason this is
+    /// not two inserts:
+    ///
+    /// - **A person's decision is final.** A row that has left `candidate` is
+    ///   never rewritten by either extractor. You confirmed it; a background
+    ///   pass does not get to re-open that.
+    /// - **The model outranks the rules.** An `llm` row replaces a `rules` one
+    ///   in place, keeping the id so nothing a client is looking at jumps.
+    /// - **The rules never outrank the model**, and never re-file what the model
+    ///   already looked at and described.
+    pub fn upsert_commitment(&self, c: &NewCommitment, at_utc_ns: i64) -> Result<CommitmentWrite> {
+        let existing: Option<(i64, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, state, source FROM commitments WHERE segment_id = ?1",
+                params![c.segment_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+
+        let Some((id, state, source)) = existing else {
+            self.conn.execute(
+                "INSERT INTO commitments
+                     (segment_id, thread_id, who_speaker_id, to_speaker_id, what,
+                      due_utc_ns, due_raw, due_kind, state, source, model_id,
+                      confidence, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                params![
+                    c.segment_id,
+                    c.thread_id,
+                    c.who_speaker_id,
+                    c.to_speaker_id,
+                    c.what,
+                    c.due_utc_ns,
+                    c.due_raw,
+                    c.due_kind,
+                    commitment_state::CANDIDATE,
+                    c.source,
+                    c.model_id,
+                    c.confidence,
+                    at_utc_ns,
+                ],
+            )?;
+            return Ok(CommitmentWrite::Inserted(self.conn.last_insert_rowid()));
+        };
+
+        let outranks = c.source == commitment_source::LLM && source == commitment_source::RULES;
+        if state != commitment_state::CANDIDATE || !outranks {
+            return Ok(CommitmentWrite::Kept(id));
+        }
+        self.conn.execute(
+            "UPDATE commitments SET
+                 thread_id = ?2, who_speaker_id = ?3, to_speaker_id = ?4, what = ?5,
+                 due_utc_ns = ?6, due_raw = ?7, due_kind = ?8, source = ?9,
+                 model_id = ?10, confidence = ?11, updated_at = ?12
+             WHERE id = ?1",
+            params![
+                id,
+                c.thread_id,
+                c.who_speaker_id,
+                c.to_speaker_id,
+                c.what,
+                c.due_utc_ns,
+                c.due_raw,
+                c.due_kind,
+                c.source,
+                c.model_id,
+                c.confidence,
+                at_utc_ns,
+            ],
+        )?;
+        Ok(CommitmentWrite::Upgraded(id))
+    }
+
+    /// Drop the rule candidate on a segment the model has now looked at and
+    /// found nothing in.
+    ///
+    /// This is the other half of "the model outranks the rules", and the half
+    /// that matters most: the bench's whole finding was that a small model under
+    /// a verdict-first grammar refuses cleanly, so letting it *retract* a
+    /// pattern match is worth more than letting it add one. A row a person has
+    /// already touched is left alone.
+    pub fn retract_rule_candidate(&self, segment_id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM commitments
+             WHERE segment_id = ?1 AND source = ?2 AND state = ?3",
+            params![
+                segment_id,
+                commitment_source::RULES,
+                commitment_state::CANDIDATE
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    // The canonical id, never the stored one: a merge tombstones an id without
+    // rewriting what pointed at it, and a client that is handed a tombstone
+    // cannot open the person page behind it.
+    const COMMITMENT_COLUMNS: &'static str = "
+        c.id, c.segment_id, c.thread_id,
+        COALESCE(who.canonical_id, c.who_speaker_id),
+        CASE WHEN whos.named_at IS NULL THEN NULL ELSE who.display_name END, whos.auto_label,
+        COALESCE(tow.canonical_id, c.to_speaker_id),
+        CASE WHEN tows.named_at IS NULL THEN NULL ELSE tow.display_name END, tows.auto_label,
+        c.what, c.due_utc_ns, c.due_raw, c.due_kind,
+        c.state, c.source, c.model_id, c.confidence, c.created_at, c.updated_at,
+        g.t_start_ns, g.text";
+
+    /// The joins [`Self::COMMITMENT_COLUMNS`] reads. The segment join is an
+    /// INNER one on purpose: it is what makes a soft-deleted line take its
+    /// commitment out of every read path, and put it back on undo.
+    const COMMITMENT_JOINS: &'static str = "
+        FROM commitments c
+        JOIN segments g ON g.id = c.segment_id AND g.deleted_at IS NULL
+        LEFT JOIN speaker_resolved who ON who.id = c.who_speaker_id
+        LEFT JOIN speakers whos ON whos.id = who.canonical_id
+        LEFT JOIN speaker_resolved tow ON tow.id = c.to_speaker_id
+        LEFT JOIN speakers tows ON tows.id = tow.canonical_id";
+
+    fn commitment_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<CommitmentRow> {
+        Ok(CommitmentRow {
+            id: r.get(0)?,
+            segment_id: r.get(1)?,
+            thread_id: r.get(2)?,
+            who_speaker_id: r.get(3)?,
+            who_name: r.get(4)?,
+            who_auto: r.get(5)?,
+            to_speaker_id: r.get(6)?,
+            to_name: r.get(7)?,
+            to_auto: r.get(8)?,
+            what: r.get(9)?,
+            due_utc_ns: r.get(10)?,
+            due_raw: r.get(11)?,
+            due_kind: r.get(12)?,
+            state: r.get(13)?,
+            source: r.get(14)?,
+            model_id: r.get(15)?,
+            confidence: r.get(16)?,
+            created_at: r.get(17)?,
+            updated_at: r.get(18)?,
+            t_start_ns: r.get(19)?,
+            said: r.get(20)?,
+        })
+    }
+
+    /// Commitments in one state, or all of them, soonest-due first.
+    ///
+    /// Undated rows sort last rather than first: a promise with no date is not
+    /// overdue, it is merely open, and putting it above everything with a real
+    /// deadline would make the list lie about urgency.
+    pub fn commitments(&self, state: Option<&str>, limit: usize) -> Result<Vec<CommitmentRow>> {
+        let sql = format!(
+            "SELECT {} {}
+             WHERE (?1 IS NULL OR c.state = ?1)
+             ORDER BY (c.due_utc_ns IS NULL) ASC, c.due_utc_ns ASC, g.t_start_ns ASC
+             LIMIT ?2",
+            Self::COMMITMENT_COLUMNS,
+            Self::COMMITMENT_JOINS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![state, limit as i64], Self::commitment_row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn commitment(&self, id: i64) -> Result<Option<CommitmentRow>> {
+        let sql = format!(
+            "SELECT {} {} WHERE c.id = ?1",
+            Self::COMMITMENT_COLUMNS,
+            Self::COMMITMENT_JOINS
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, params![id], Self::commitment_row_from)
+            .optional()?)
+    }
+
+    /// Move a commitment through its state machine. Returns the row as it now
+    /// is, or `None` when there is no such commitment.
+    pub fn set_commitment_state(
+        &self,
+        id: i64,
+        state: &str,
+        at_utc_ns: i64,
+    ) -> Result<Option<CommitmentRow>> {
+        let n = self.conn.execute(
+            "UPDATE commitments SET state = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, state, at_utc_ns],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        self.commitment(id)
+    }
+
+    /// Every topic label in use, most recently heard first.
+    pub fn topics(&self, per_topic: usize) -> Result<Vec<TopicRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.topic,
+                    COUNT(DISTINCT t.id)                                   AS threads,
+                    COUNT(g.id)                                            AS segments,
+                    MAX(g.t_end_ns)                                        AS last_ns
+             FROM threads t
+             JOIN segments g ON g.thread_id = t.id AND g.deleted_at IS NULL
+             WHERE t.topic IS NOT NULL AND TRIM(t.topic) <> ''
+             GROUP BY t.topic
+             ORDER BY last_ns DESC, threads DESC",
+        )?;
+        let heads: Vec<(String, i64, i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut out = Vec::with_capacity(heads.len());
+        for (topic, threads, segments, last_ns) in heads {
+            let thread_ids: Vec<i64> = self
+                .conn
+                .prepare(
+                    "SELECT t.id FROM threads t
+                     WHERE t.topic = ?1
+                       AND EXISTS (SELECT 1 FROM segments g
+                                   WHERE g.thread_id = t.id AND g.deleted_at IS NULL)
+                     ORDER BY t.ended_ns DESC LIMIT ?2",
+                )?
+                .query_map(params![topic, per_topic as i64], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            out.push(TopicRow {
+                topic,
+                threads,
+                segments,
+                last_ns,
+                thread_ids,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn set_thread_topic(
+        &self,
+        thread_id: i64,
+        topic: Option<&str>,
+        model_id: &str,
+        at_utc_ns: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE threads SET topic = ?2, topic_model_id = ?3, enriched_at = ?4 WHERE id = ?1",
+            params![thread_id, topic, model_id, at_utc_ns],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a conversation as walked by the enrichment pass, whether or not it
+    /// produced anything. A pass that found nothing must still not be re-run
+    /// for ever.
+    pub fn mark_thread_enriched(&self, thread_id: i64, at_utc_ns: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE threads SET enriched_at = ?2 WHERE id = ?1",
+            params![thread_id, at_utc_ns],
+        )?;
+        Ok(())
+    }
+
+    /// The enrichment worker's queue: conversations nobody has looked at yet,
+    /// newest first, that have enough transcript to be worth a model at all.
+    ///
+    /// Newest first because the answer to "what did I just promise" is worth
+    /// more than the answer to "what did I promise in July", and because a
+    /// worker that starts at the beginning of history never reaches today.
+    pub fn unenriched_threads(&self, min_segments: i64, limit: usize) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id FROM threads t
+             WHERE t.enriched_at IS NULL
+               AND (SELECT COUNT(*) FROM segments g
+                    WHERE g.thread_id = t.id AND g.deleted_at IS NULL
+                      AND g.text IS NOT NULL AND TRIM(g.text) <> '') >= ?1
+             ORDER BY t.ended_ns DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![min_segments, limit as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// One conversation as the model sees it: the turns that have words, in
+    /// order, with the speaker and the capture time each one needs.
+    pub fn thread_lines(&self, thread_id: i64) -> Result<Vec<ThreadLine>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, speaker_id, t_start_ns, text FROM segments
+             WHERE thread_id = ?1 AND deleted_at IS NULL
+               AND text IS NOT NULL AND TRIM(text) <> ''
+             ORDER BY t_start_ns ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![thread_id], |r| {
+                Ok(ThreadLine {
+                    segment_id: r.get(0)?,
+                    speaker_id: r.get(1)?,
+                    t_start_ns: r.get(2)?,
+                    text: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// How much of the graph exists, in one query per number.
+    pub fn graph_counts(&self) -> Result<GraphCounts> {
+        let one = |sql: &str| -> Result<i64> { Ok(self.conn.query_row(sql, [], |r| r.get(0))?) };
+        // Every count is scoped to live segments, for the same reason the reads
+        // are: a hidden row must not be counted in a summary the user reads.
+        let live = "JOIN segments g ON g.id = c.segment_id AND g.deleted_at IS NULL";
+        let by_state = |state: &str| -> Result<i64> {
+            Ok(self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM commitments c {live} WHERE c.state = ?1"),
+                params![state],
+                |r| r.get(0),
+            )?)
+        };
+        let by_source = |source: &str| -> Result<i64> {
+            Ok(self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM commitments c {live} WHERE c.source = ?1"),
+                params![source],
+                |r| r.get(0),
+            )?)
+        };
+        let candidates = by_state(commitment_state::CANDIDATE)?;
+        let confirmed = by_state(commitment_state::CONFIRMED)?;
+        Ok(GraphCounts {
+            time_refs: one("SELECT COUNT(*) FROM time_refs t
+                 JOIN segments g ON g.id = t.segment_id AND g.deleted_at IS NULL")?,
+            commitments: one(&format!("SELECT COUNT(*) FROM commitments c {live}"))?,
+            // "Open" is what the view leads with: still owed, in either sense.
+            open: candidates + confirmed,
+            candidates,
+            confirmed,
+            done: by_state(commitment_state::DONE)?,
+            dismissed: by_state(commitment_state::DISMISSED)?,
+            from_rules: by_source(commitment_source::RULES)?,
+            from_llm: by_source(commitment_source::LLM)?,
+            topics: one("SELECT COUNT(DISTINCT topic) FROM threads
+                 WHERE topic IS NOT NULL AND TRIM(topic) <> ''")?,
+            threads: one("SELECT COUNT(*) FROM threads")?,
+            threads_enriched: one("SELECT COUNT(*) FROM threads WHERE enriched_at IS NOT NULL")?,
+            threads_pending: one("SELECT COUNT(*) FROM threads t
+                 WHERE t.enriched_at IS NULL
+                   AND EXISTS (SELECT 1 FROM segments g
+                               WHERE g.thread_id = t.id AND g.deleted_at IS NULL
+                                 AND g.text IS NOT NULL AND TRIM(g.text) <> '')")?,
+        })
+    }
+
+    /// Forget every derived row: what the graph says, but not what was said.
+    ///
+    /// The escape hatch behind turning Tier 3 off — and the proof that the
+    /// graph is an index and never the source of truth. The transcript is
+    /// untouched and every one of these rows can be derived again.
+    pub fn clear_derived(&self) -> Result<(usize, usize, usize)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let commitments = tx.execute("DELETE FROM commitments", [])?;
+        let time_refs = tx.execute("DELETE FROM time_refs", [])?;
+        let topics = tx.execute(
+            "UPDATE threads SET topic = NULL, topic_model_id = NULL, enriched_at = NULL",
+            [],
+        )?;
+        tx.commit()?;
+        Ok((commitments, time_refs, topics))
+    }
+
     // ---- manual labelling ------------------------------------------------
 
     /// The fields an undo would have to put back.
@@ -2915,6 +3603,22 @@ impl Store {
              WHERE speaker_id = ?1 AND deleted_at IS NULL",
             params![speaker_id, at_utc_ns],
         )?;
+        // Schema v7, and GRAPH.md's charter guard in full: "purging a person
+        // purges their nodes, edges, topics-participation, commitments". A
+        // promise this voice made, and a promise anybody made *to* them, both
+        // stop existing — not merely stop being shown. The `to` half matters:
+        // "you owe Kira the shader link" must not survive deleting Kira.
+        let commitments = tx.execute(
+            "DELETE FROM commitments
+             WHERE who_speaker_id = ?1 OR to_speaker_id = ?1
+                OR segment_id IN (SELECT id FROM segments WHERE speaker_id = ?1)",
+            params![speaker_id],
+        )?;
+        let time_refs = tx.execute(
+            "DELETE FROM time_refs WHERE segment_id IN
+                 (SELECT id FROM segments WHERE speaker_id = ?1)",
+            params![speaker_id],
+        )?;
         let mut prototypes = 0;
         let mut embeddings = 0;
         if !keep_voiceprint {
@@ -2960,6 +3664,8 @@ impl Store {
             embeddings,
             goldens,
             threads,
+            commitments,
+            time_refs,
             removed_speaker: !keep_voiceprint,
         })
     }

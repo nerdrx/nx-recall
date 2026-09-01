@@ -19,6 +19,7 @@ anyhow.workspace = true
 bzip2.workspace = true
 clap.workspace = true
 dirs.workspace = true
+flate2.workspace = true
 hound.workspace = true
 libc.workspace = true
 ort.workspace = true

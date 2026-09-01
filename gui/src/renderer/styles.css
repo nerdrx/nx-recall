@@ -869,3 +869,119 @@ button.sp-num:focus-visible { outline: none; box-shadow: var(--clear-focus); }
   .dot.pulse { opacity: 1; }
   .toggle[aria-pressed="true"]::after { transform: translateX(18px); }
 }
+
+/* ------------------------------------------ the Memory view (0.7.0) ----- */
+/* docs/GRAPH.md Tiers 2 and 3. Built from the same card, well, chip and dot
+   this app already has: a graph that arrived with its own visual language
+   would read as a second app bolted on. The only new idea here is the SOURCE
+   chip, and it is new because the distinction it carries is new — a pattern
+   match and a language model are not the same claim, and a person deciding
+   whether to trust a row has to be able to see which one it is without
+   hovering anything. */
+
+.commit-list { display: flex; flex-direction: column; gap: 6px; }
+.commit-row {
+  display: grid; align-items: start; gap: var(--sp-2);
+  grid-template-columns: 128px minmax(0, 1fr) auto;
+  padding: 12px; border-radius: var(--clear-r-control);
+  background: var(--clear-tile); border: 1px solid var(--clear-line);
+  transition: background var(--dur-fast) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft),
+    opacity var(--dur-fast) var(--ease-soft);
+}
+.commit-row:hover { background: var(--clear-surface); border-color: var(--clear-line-accent); }
+/* Settled rows are still readable and plainly no longer live. Dimmed rather
+   than hidden: what you dismissed is part of the answer to "what did the
+   graph think", and hiding it would make the list look cleverer than it is. */
+.commit-row.state-done, .commit-row.state-dismissed { opacity: 0.6; }
+.commit-row.pending { opacity: 0.5; }
+
+.commit-due { font: 600 12px/1.3 var(--mono); color: var(--clear-ink); min-width: 0; }
+.commit-due small {
+  display: block; margin-top: 5px; font: 600 9.5px/1.3 var(--font);
+  letter-spacing: 0.11em; text-transform: uppercase; color: var(--clear-muted);
+}
+/* Amber, not red: a date that has gone by is not an error, and nothing in this
+   program was ever going to act on it. */
+.commit-due.past { color: var(--clear-warn); }
+.commit-due.soon { color: var(--violet); }
+/* No date said is not "overdue" and must not read as urgent — it is the
+   quietest thing on the row. */
+.commit-due.undated { color: var(--clear-muted); font-weight: 500; }
+
+.commit-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.commit-who { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; min-width: 0; }
+.commit-name { font-size: 13.5px; font-weight: 640; }
+.commit-arrow { color: var(--clear-muted); font-size: 12px; }
+.commit-to { font-size: 13px; color: var(--clear-muted); }
+.commit-what { font-size: 13.5px; line-height: 1.5; color: var(--clear-ink); }
+
+/* The evidence, as a well you can press. It is a quote, so it is set as one. */
+.commit-said {
+  display: block; width: 100%; text-align: left; cursor: pointer; font: inherit;
+  font-size: 12.5px; line-height: 1.5; color: var(--clear-muted);
+  padding: 8px 10px; border-radius: var(--clear-r-mini);
+  background: var(--clear-tile); border: 1px solid var(--clear-line);
+  transition: border-color var(--dur-fast) var(--ease-soft), color var(--dur-fast) var(--ease-soft);
+}
+.commit-row:hover .commit-said { background: var(--clear-tile); }
+.commit-said:hover { color: var(--clear-ink); border-color: var(--clear-line-strong); }
+.commit-said:focus-visible { outline: none; box-shadow: var(--clear-focus); }
+.commit-said .quote-mark { color: var(--clear-faint); }
+
+/* Which tier claimed this. The rule-sourced one is deliberately the quieter of
+   the two — it is a pattern match, and it should not look like a finding. */
+.chip.src { font: 600 9.5px/1 var(--font); letter-spacing: 0.1em; text-transform: uppercase; padding: 5px 8px; }
+.chip.src.guess { color: var(--clear-muted); border: 1px dashed var(--clear-line-strong); background: transparent; }
+.chip.src.model { color: var(--violet); background: var(--violet-soft); }
+.chip.state { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
+.chip.state.done { color: var(--clear-good); }
+.chip.state.dismissed { color: var(--clear-muted); }
+
+.commit-actions { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
+.commit-actions .btn { justify-content: center; white-space: nowrap; }
+/* Dismiss is not destructive — nothing is deleted — so it is quiet, not red. */
+.commit-actions .btn.quiet { color: var(--clear-muted); }
+.commit-actions .btn.quiet:hover:not(:disabled) { color: var(--clear-ink); }
+
+/* -------------------------------------------------------------- topics -- */
+
+.topic-list { display: flex; flex-direction: column; gap: 6px; }
+.topic-row {
+  display: grid; align-items: center; gap: var(--sp-2);
+  grid-template-columns: minmax(0, 1fr) 108px 72px 128px;
+  width: 100%; text-align: left; cursor: pointer; font: inherit;
+  padding: 11px 12px; border-radius: var(--clear-r-control);
+  background: var(--clear-tile); border: 1px solid var(--clear-line); color: var(--clear-ink);
+  transition: background var(--dur-fast) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft);
+}
+.topic-row:hover { background: var(--clear-surface); border-color: var(--clear-line-accent); }
+.topic-row:focus-visible { outline: none; box-shadow: var(--clear-focus); }
+.topic-name { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.topic-num { font: 600 13px/1 var(--mono); text-align: right; color: var(--clear-ink); }
+.topic-num small {
+  display: block; margin-top: 5px; font: 600 9.5px/1 var(--font);
+  letter-spacing: 0.11em; text-transform: uppercase; color: var(--clear-muted);
+}
+
+/* --------------------------------------------------- enrichment status -- */
+/* The card reuses the microphone's head, and for a reason: it is asking the
+   same kind of question. The microphone asks to hear the room; this asks to
+   read what the room said. Both are switches with copy that has to be read
+   before they are flipped, so they look alike on purpose. */
+
+.enrich-progress { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.enrich-progress .op-bar { width: 200px; }
+.enrich-progress-text { font-size: 12px; color: var(--clear-muted); }
+
+.enrich-reason { margin: 12px 0 0; font-size: 12.5px; color: var(--clear-warn); }
+.enrich-error { margin: 10px 0 0; font-size: 12px; color: var(--clear-danger); }
+
+/* Four flat statements, not a paragraph. Each line is a fact somebody might
+   object to, and a list makes each one answerable on its own. */
+.enrich-facts {
+  list-style: none; margin: 14px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 7px;
+  font-size: 12.5px; line-height: 1.5; color: var(--clear-ink); max-width: 70ch;
+}
+.enrich-facts li { display: flex; gap: 9px; align-items: baseline; }
+.enrich-facts .tick { color: var(--violet); font-weight: 700; flex: none; }

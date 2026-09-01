@@ -31,6 +31,7 @@ function reset() {
   store.ops = new Map();
   store.status = null;
   store.mic = { enabled: false, mode: 'follow', active: false, state: 'off', device: null, you_speaker: null };
+  store.graph = { counts: null, enrichment: { phase: 'off' }, config: null };
 }
 
 const seg = (id, over = { }) => ({
@@ -334,4 +335,51 @@ test('a voice whose conversations were deleted stays in the bank at zero', () =>
   assert.equal(store.speakers.get(1).total_ms, 0);
   assert.equal(store.segments.length, 0);
   assert.deepEqual(change.relabel, [1]);
+});
+
+// ---- the memory graph, Tiers 2 and 3 (0.7.0, docs/GRAPH.md) --------------
+
+test('the graph worker state arrives on its own event and on the status block', () => {
+  reset();
+  // Its own event, which is what makes a running batch visible without polling.
+  const change = applyEvent({
+    seq: 1,
+    ev: 'graph',
+    data: { phase: 'running', batch_done: 1, batch_total: 4, walked: 3 },
+  });
+  assert.equal(change.graph.phase, 'running');
+  assert.equal(store.graph.enrichment.batch_total, 4);
+
+  // …and on the status block, so a client that missed the event converges.
+  applyEvent({ seq: 2, ev: 'status', data: { queue_depth: 0, graph: { phase: 'idle' } } });
+  assert.equal(store.graph.enrichment.phase, 'idle');
+
+  // A status block from a daemon older than 0.7.0 carries no graph at all, and
+  // must not erase what this client already knows.
+  applyEvent({ seq: 3, ev: 'status', data: { queue_depth: 0 } });
+  assert.equal(store.graph.enrichment.phase, 'idle');
+});
+
+test('a commitment change is a broadcast the client never does arithmetic on', () => {
+  reset();
+  store.graph = { counts: { open: 3 }, enrichment: { phase: 'off' }, config: null };
+  const change = applyEvent({
+    seq: 1,
+    ev: 'commitment',
+    data: { id: 900, state: 'done', source: 'llm', what: 'send the link' },
+  });
+  assert.equal(change.commitment.id, 900);
+  assert.equal(change.commitment.state, 'done');
+  // The counts behind the rail badge are the daemon's arithmetic, not ours:
+  // the controller re-asks rather than guessing, so nothing moved here.
+  assert.equal(store.graph.counts.open, 3);
+
+  assert.equal(applyEvent({ seq: 2, ev: 'commitment', data: {} }), null);
+  assert.equal(applyEvent({ seq: 3, ev: 'commitment' }), null);
+});
+
+test('an unknown event is still ignored rather than being an error', () => {
+  reset();
+  assert.equal(applyEvent({ seq: 1, ev: 'something-from-0.8', data: { x: 1 } }), null);
+  assert.equal(applyEvent({ seq: 2, ev: 'graph' }), null);
 });

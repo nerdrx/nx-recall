@@ -1335,3 +1335,256 @@ fn the_daemons_own_client_speaks_the_same_protocol() {
     assert_eq!(client.call("resume", json!({})).unwrap()["paused"], false);
     assert!(client.call("nope", json!({})).is_err());
 }
+
+// ---- the memory graph, Tiers 2 and 3 over the wire (0.7.0) --------------
+
+/// A conversation with a promise in it, written the way the pipeline writes
+/// one: transcript, speaker, thread, then the Tier 2 pass. No models needed —
+/// Tier 2 is rules, which is the point of it.
+fn seed_a_promise(d: &Daemon) -> (i64, i64, i64) {
+    let store = d.store.lock().unwrap();
+    let a = store.mint_speaker(0).unwrap();
+    let b = store.mint_speaker(0).unwrap();
+    let mut at = 0i64;
+    let mut say = |who: i64, text: &str| {
+        at += 5;
+        let t = at * 1_000_000_000;
+        let id = store
+            .insert_segment(d.session, t, t + 3_000_000_000, "", t)
+            .unwrap();
+        store
+            .set_segment_analysis(
+                id,
+                &recalld::store::SegmentAnalysis {
+                    text: Some(text.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.set_segment_speaker(id, Some(who), Some(0.7)).unwrap();
+        recalld::threads::assign(&store, &recalld::config::GraphConfig::default(), id).unwrap();
+        recalld::commitment::extract(&store, id, 1).unwrap();
+        id
+    };
+    say(a, "hast du das Video noch?");
+    let promise = say(b, "ja klar, ich schick dir morgen den Link");
+    (a, b, promise)
+}
+
+#[test]
+fn the_graph_answers_its_summary_and_lists_what_the_rules_found() {
+    let d = Daemon::start("graph-summary");
+    let (a, b, promise) = seed_a_promise(&d);
+    let mut c = d.connect();
+    c.hello();
+
+    // The whole view in one round trip, like the person page.
+    let summary = c.call("graph.summary", json!({}));
+    assert_eq!(summary["counts"]["commitments"], json!(1));
+    assert_eq!(summary["counts"]["open"], json!(1));
+    assert_eq!(summary["counts"]["candidates"], json!(1));
+    assert_eq!(summary["counts"]["from_rules"], json!(1));
+    assert_eq!(summary["counts"]["from_llm"], json!(0));
+    assert_eq!(summary["counts"]["time_refs"], json!(1), "\"morgen\"");
+    // Tier 3 ships off, and the summary says so rather than implying anything.
+    assert_eq!(summary["config"]["enabled"], json!(false));
+    assert_eq!(summary["enrichment"]["phase"], json!("off"));
+
+    let listed = c.call("commitments.list", json!({}));
+    let rows = listed["commitments"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row["segment"], json!(promise));
+    assert_eq!(row["who"]["speaker_id"], json!(b));
+    assert_eq!(row["to"]["speaker_id"], json!(a));
+    assert_eq!(row["state"], json!("candidate"));
+    // The two fields a client must never conflate: which tier claimed this,
+    // and what a person has decided about it.
+    assert_eq!(row["source"], json!("rules"));
+    assert!(row["confidence"].as_f64().unwrap() < 0.5, "{row}");
+    // The evidence travels with the claim.
+    assert_eq!(
+        row["said"],
+        json!("ja klar, ich schick dir morgen den Link")
+    );
+    assert_eq!(row["due_raw"], json!("morgen"));
+    assert!(row["due_ns"].is_string(), "nanoseconds travel as strings");
+    assert!(row["due_ms"].as_i64().unwrap() > 0);
+
+    // Filtering by a state nobody is in is an empty list, not an error.
+    assert!(
+        c.call("commitments.list", json!({"state": "done"}))["commitments"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let err = c.call_err("commitments.list", json!({"state": "maybe"}));
+    assert_eq!(err["code"], json!("params"));
+}
+
+/// Only a person moves a commitment, and every other client hears about it.
+#[test]
+fn a_commitment_state_change_is_broadcast_to_every_client() {
+    let d = Daemon::start("graph-state");
+    seed_a_promise(&d);
+    let mut c = d.connect();
+    c.hello();
+    let mut watcher = d.connect();
+    watcher.hello();
+    watcher.subscribe(&["ops"]);
+
+    let id = c.call("commitments.list", json!({}))["commitments"][0]["id"]
+        .as_i64()
+        .unwrap();
+
+    let confirmed = c.call(
+        "commitments.set_state",
+        json!({"id": id, "state": "confirmed"}),
+    );
+    assert_eq!(confirmed["state"], json!("confirmed"));
+    let evt = watcher.wait_event("commitment");
+    assert_eq!(evt["data"]["id"], json!(id));
+    assert_eq!(evt["data"]["state"], json!("confirmed"));
+
+    // Confirmed is still open; done is not.
+    assert_eq!(
+        c.call("graph.summary", json!({}))["counts"]["open"],
+        json!(1)
+    );
+    c.call("commitments.set_state", json!({"id": id, "state": "done"}));
+    let after = c.call("graph.summary", json!({}))["counts"].clone();
+    assert_eq!(after["open"], json!(0));
+    assert_eq!(after["done"], json!(1));
+
+    assert_eq!(
+        c.call_err("commitments.set_state", json!({"id": id, "state": "nope"}))["code"],
+        json!("params")
+    );
+    assert_eq!(
+        c.call_err(
+            "commitments.set_state",
+            json!({"id": 99_999, "state": "done"})
+        )["code"],
+        json!("not_found")
+    );
+}
+
+/// The Tier 3 switch, over the wire: live, refused nothing, and honest about
+/// the model not being installed.
+#[test]
+fn the_tier_three_switch_is_live_and_says_whether_the_model_is_there() {
+    let d = Daemon::start("graph-switch");
+    let mut c = d.connect();
+    c.hello();
+
+    let before = c.call("graph.get", json!({}));
+    assert_eq!(
+        before["config"]["enabled"],
+        json!(false),
+        "off is the default"
+    );
+    assert_eq!(before["config"]["installed"], json!(false));
+    // The copy in a client should not have to hard-code what it costs.
+    assert!(before["config"]["download_bytes"].as_u64().unwrap() > 1_000_000_000);
+
+    let on = c.call("graph.enrich", json!({"action": "start"}));
+    assert_eq!(on["config"]["enabled"], json!(true));
+    assert!(d.control.graph().enabled);
+    // Nothing runs anyway: the model is not installed, and the worker says so
+    // rather than pretending.
+    assert_eq!(
+        c.call("graph.set", json!({"llm_threads": 2}))["config"]["llm_threads"],
+        json!(2)
+    );
+    assert_eq!(d.control.graph().llm_threads, 2);
+
+    let off = c.call("graph.enrich", json!({"action": "stop"}));
+    assert_eq!(off["config"]["enabled"], json!(false));
+    assert!(!d.control.graph().enabled);
+    // Asking twice for what is already true changes nothing and is not an error.
+    assert_eq!(
+        c.call("graph.enrich", json!({"action": "stop"}))["changed"],
+        json!(false)
+    );
+    assert_eq!(
+        c.call_err("graph.enrich", json!({"action": "sideways"}))["code"],
+        json!("params")
+    );
+    assert_eq!(c.call_err("graph.set", json!({}))["code"], json!("params"));
+}
+
+/// Topics are the model's work, so with Tier 3 off the list is empty rather
+/// than absent — a client renders "nothing yet", not an error.
+#[test]
+fn topics_are_empty_until_something_has_named_a_conversation() {
+    let d = Daemon::start("graph-topics");
+    let (_, _, promise) = seed_a_promise(&d);
+    let mut c = d.connect();
+    c.hello();
+    assert!(
+        c.call("topics.list", json!({}))["topics"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Write one the way the enrichment pass would.
+    let thread = {
+        let store = d.store.lock().unwrap();
+        let thread = store
+            .segment_row(promise)
+            .unwrap()
+            .unwrap()
+            .thread_id
+            .unwrap();
+        store
+            .set_thread_topic(thread, Some("video link"), "qwen2.5-3b-test", 5)
+            .unwrap();
+        thread
+    };
+    let topics = c.call("topics.list", json!({}));
+    let rows = topics["topics"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["topic"], json!("video link"));
+    assert_eq!(rows[0]["threads"], json!(1));
+    assert_eq!(rows[0]["segments"], json!(2));
+    assert_eq!(rows[0]["thread_ids"], json!([thread]));
+    assert!(rows[0]["last_ns"].is_string());
+    assert_eq!(
+        c.call("graph.summary", json!({}))["counts"]["topics"],
+        json!(1)
+    );
+}
+
+/// Deletion means deletion, over the wire as well as in the store: purging the
+/// person takes what they promised with them.
+#[test]
+fn deleting_a_voice_takes_its_commitments_off_the_wire_too() {
+    let d = Daemon::start("graph-delete");
+    let (_, b, _) = seed_a_promise(&d);
+    let mut c = d.connect();
+    c.hello();
+    assert_eq!(
+        c.call("commitments.list", json!({}))["commitments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    c.call(
+        "speakers.delete",
+        json!({"id": b, "keep_voiceprint": false}),
+    );
+    assert!(
+        c.call("commitments.list", json!({}))["commitments"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a promise outlived the person who made it"
+    );
+    assert_eq!(
+        c.call("graph.summary", json!({}))["counts"]["commitments"],
+        json!(0)
+    );
+}

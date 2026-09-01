@@ -104,7 +104,11 @@ settle_compositor() {
         [[ -z "$extra" ]] && break
         sleep 0.2
     done
-    sleep 2
+    # The socket going is not the whole story: gamescope releases its XWayland
+    # DISPLAY separately and a little later, and a second pass that starts into
+    # that gap dies with "X connection error" — which looks exactly like a
+    # failing UI and is not one. Four seconds is empirically past it.
+    sleep 4
 }
 
 # ---------------------------------------------------------------------------
@@ -163,7 +167,7 @@ run_pass() {
     # and -ei/.lock siblings), and only a socket that was NOT there when this run
     # began is ours — never one belonging to the developer's own session.
     local SOCK="" cand
-    for _ in $(seq 1 150); do
+    for _ in $(seq 1 400); do
         for cand in $(gs_socks); do
             [[ " $PRE_SOCKS " == *" $cand "* ]] && continue
             SOCK="$cand"

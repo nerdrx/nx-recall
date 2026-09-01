@@ -407,3 +407,107 @@ test('deleting a voice offers both halves of the choice, and the empty one still
     mock.close();
   }
 });
+
+// ---- the memory graph over the wire (0.7.0, docs/GRAPH.md) --------------
+
+test('the graph answers its summary, its list, and its state machine', async () => {
+  const { mock, path } = withMock({ feedMs: 100000 });
+  const client = new RecallClient({ socketPath: path });
+  try {
+    await connected(client);
+
+    const summary = await client.request('graph.summary', {});
+    assert.ok(summary.counts.commitments > 0, 'the fixture has promises in it');
+    assert.equal(summary.counts.open, summary.counts.commitments);
+    // Both tiers are represented, because the GUI renders them differently.
+    assert.ok(summary.counts.from_rules > 0);
+    assert.ok(summary.counts.from_llm > 0);
+    // Tier 3 ships off, exactly as the daemon does.
+    assert.equal(summary.config.enabled, false);
+    assert.equal(summary.enrichment.phase, 'off');
+
+    const { commitments } = await client.request('commitments.list', {});
+    assert.equal(commitments.length, summary.counts.commitments);
+    // Undated last, never first: a promise with no date is not overdue.
+    const undated = commitments.findIndex((c) => c.due_ms == null);
+    assert.equal(undated, commitments.length - 1, 'an undated promise sorted above a dated one');
+    for (const c of commitments) {
+      assert.ok(c.who.name || c.who.auto, 'a commitment with nobody to owe it');
+      assert.ok(c.said, 'the evidence has to travel with the claim');
+      assert.ok(['rules', 'llm'].includes(c.source));
+      assert.equal(c.state, 'candidate', 'nothing has been acted on');
+    }
+
+    // The state machine, and its broadcast.
+    const id = commitments[0].id;
+    const done = await client.request('commitments.set_state', { id, state: 'done' });
+    assert.equal(done.state, 'done');
+    const after = await client.request('graph.summary', {});
+    assert.equal(after.counts.done, 1);
+    assert.equal(after.counts.open, summary.counts.open - 1);
+
+    await assert.rejects(() => client.request('commitments.set_state', { id, state: 'nope' }));
+    await assert.rejects(() => client.request('commitments.set_state', { id: 1, state: 'done' }));
+  } finally {
+    client.close();
+    mock.close();
+  }
+});
+
+test('turning the local model on walks a batch and comes back idle', async () => {
+  const { mock, path } = withMock({ feedMs: 100000 });
+  const client = new RecallClient({ socketPath: path });
+  try {
+    await connected(client);
+    assert.equal((await client.request('graph.get', {})).config.enabled, false);
+
+    const on = await client.request('graph.enrich', { action: 'start' });
+    assert.equal(on.config.enabled, true);
+    assert.equal(on.enrichment.phase, 'running');
+
+    // It gets there on its own, reporting progress the way a delete does.
+    const deadline = Date.now() + 8000;
+    let phase = 'running';
+    while (Date.now() < deadline && phase !== 'idle') {
+      await sleep(200);
+      phase = (await client.request('graph.get', {})).enrichment.phase;
+    }
+    assert.equal(phase, 'idle', 'the batch never finished');
+
+    const off = await client.request('graph.enrich', { action: 'stop' });
+    assert.equal(off.config.enabled, false);
+    assert.equal(off.enrichment.phase, 'off');
+    // Asking again for what is already true is not an error.
+    assert.equal((await client.request('graph.enrich', { action: 'stop' })).changed, false);
+    await assert.rejects(() => client.request('graph.enrich', { action: 'sideways' }));
+  } finally {
+    client.close();
+    mock.close();
+  }
+});
+
+test('topics group conversations and name the threads behind them', async () => {
+  const { mock, path } = withMock({ feedMs: 100000 });
+  const client = new RecallClient({ socketPath: path });
+  try {
+    await connected(client);
+    const { topics } = await client.request('topics.list', {});
+    assert.ok(topics.length > 0);
+    for (const t of topics) {
+      assert.ok(t.topic.length > 0);
+      assert.ok(t.threads >= 1);
+      assert.ok(t.segments >= 1);
+      assert.ok(Array.isArray(t.thread_ids) && t.thread_ids.length > 0);
+      // A topic is a way INTO conversations, so every id it names has to open.
+      const thread = await client.request('thread.get', { id: t.thread_ids[0] });
+      assert.ok(thread.segments.length > 0);
+    }
+    // Newest first, because the answer to "what have we been talking about" is
+    // about now.
+    const last = topics.map((t) => t.last_ms);
+    assert.deepEqual(last, [...last].sort((a, b) => b - a));
+  } finally {
+    client.close();
+    mock.close();
+  }
+});

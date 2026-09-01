@@ -39,6 +39,18 @@ const ALLOWED = new Set([
   // transcript can land on it. Both are additive and both are read-only.
   'person.get',
   'thread.get',
+  // The memory graph's Tiers 2 and 3 (0.7.0, docs/GRAPH.md). Everything the
+  // Memory view reaches: three reads, one state machine, and the Tier 3
+  // switch. `graph.set` is here as well as `graph.enrich` because the card
+  // offers both a switch and, in future, the thread count — a method the UI
+  // calls and this set forgets is a dead button.
+  'graph.summary',
+  'graph.get',
+  'graph.set',
+  'graph.enrich',
+  'commitments.list',
+  'commitments.set_state',
+  'topics.list',
   'segments.audio',
   'segments.reassign',
   'segments.correct',

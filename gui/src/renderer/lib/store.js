@@ -22,6 +22,11 @@ export const store = {
   // hears the room rather than one program, so it has its own method, its own
   // card, and its own default (off).
   mic: { enabled: false, mode: 'follow', active: false, state: 'off', device: null, you_speaker: null },
+  // The memory graph (docs/GRAPH.md, schema 7). Only the counts and the
+  // worker's state live here, because only those two are wanted OUTSIDE the
+  // Memory view — the rail badge needs "how many are open" wherever you are,
+  // and nothing else does. The commitments themselves are that view's own.
+  graph: { counts: null, enrichment: { phase: 'off' }, config: null },
   ops: new Map(), // op id → {kind, frac, done}
 
   loaded: false,
@@ -121,13 +126,15 @@ export { ask };
 
 /** Full resync: every view's data re-fetched from scratch. */
 export async function reloadAll() {
-  const [speakers, transcript, sources, mic] = await Promise.all([
+  const [speakers, transcript, sources, mic, graph] = await Promise.all([
     ask('speakers.list').catch(() => ({ speakers: [] })),
     ask('transcript', { limit: MAX_SEGMENTS }).catch(() => ({ segments: [] })),
     ask('sources.list').catch(() => ({ sources: [] })),
     // A daemon older than 0.6.0 has no mic at all; its `unknown_method` is not
     // an error worth showing, it is just an older half of the app.
     ask('mic.get').catch(() => null),
+    // …and one older than 0.7.0 has no memory graph. Same rule.
+    ask('graph.summary').catch(() => null),
   ]);
 
   store.speakers = new Map((speakers.speakers ?? []).map((s) => [s.id, s]));
@@ -135,6 +142,7 @@ export async function reloadAll() {
   store.segById = new Map(store.segments.map((s) => [s.id, s]));
   store.sources = sources.sources ?? [];
   if (mic) applyMic(mic);
+  store.graph = graph ?? { counts: null, enrichment: { phase: 'off' }, config: null };
   store.loaded = true;
   return store;
 }
@@ -205,6 +213,13 @@ export async function reloadSpeakers() {
   const r = await ask('speakers.list');
   store.speakers = new Map((r.speakers ?? []).map((s) => [s.id, s]));
   return store.speakers;
+}
+
+/** The graph's counts, re-asked. What the rail badge is drawn from. */
+export async function reloadGraph() {
+  const g = await ask('graph.summary');
+  store.graph = g;
+  return g;
 }
 
 // -- event application ------------------------------------------------------
@@ -329,8 +344,29 @@ export function applyEvent(evt, opts = {}) {
       // The daemon's status block carries the mic too, so a client that missed
       // a `mic` event still converges on the truth.
       if (d?.mic) applyMic(d.mic);
-      return { status: true, mic: true };
+      // …and the graph worker's state, for exactly the same reason (0.7.0).
+      if (d?.graph) store.graph = { ...store.graph, enrichment: d.graph };
+      return { status: true, mic: true, graph: d?.graph ?? null };
     }
+
+    // The memory graph's Tier 3 worker, on the status topic. It arrives when
+    // the switch moves and while a batch runs, so the Memory card follows a
+    // pass without that view polling anything.
+    case 'graph': {
+      if (!d) return null;
+      store.graph = { ...store.graph, enrichment: d };
+      return { graph: d };
+    }
+
+    // A commitment moved states — here, in the CLI, or in another window. It
+    // is retroactive like a rename, so it is a broadcast and not a re-query.
+    //
+    // The counts behind the rail badge are NOT adjusted here. They are the
+    // daemon's arithmetic and this client does not get to guess at it; the
+    // controller re-asks `graph.summary`, which is one small query and is
+    // always right.
+    case 'commitment':
+      return !d || d.id == null ? null : { commitment: d };
 
     // PROTOCOL: the mic block, on the status topic. It arrives both when the
     // switch moves and when the capture thread opens or closes the stream —

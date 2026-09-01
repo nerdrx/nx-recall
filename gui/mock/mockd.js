@@ -26,7 +26,7 @@ import path from 'node:path';
 
 const PROTO = 1;
 const DAEMON = 'recalld-mock/0.5';
-const SCHEMA = 6;
+const SCHEMA = 7;
 const REPLAY_MAX = 200; // deliberately small: overrunning it must be reachable
 
 export function defaultMockSocket() {
@@ -98,6 +98,10 @@ const SPEAKERS = [
   // carry one of these and the e2e has to delete it through the real UI.
   { id: 10, name: null, auto: 'Speaker_58', first_seen: '2026-08-30T21:41:00Z' },
 ];
+
+/// The commitment state machine. Nothing but a human click moves a row off
+/// `candidate`, at either end of the socket.
+const COMMITMENT_STATES = ['candidate', 'confirmed', 'done', 'dismissed'];
 
 /// What counts as a one-off voice, matching the daemon's own bar.
 const PRUNE_MAX_SEGMENTS = 1;
@@ -261,8 +265,91 @@ function buildHistory() {
     lang: null,
     thread: threadFor(27),
   });
+
+  // schema v7, the memory graph's Tiers 2 and 3: three turns that are actually
+  // promises, so the Memory view has something real to point at. Appended
+  // rather than woven into CANNED_LINES, because the indices of those rows are
+  // load-bearing for half the e2e suite.
+  PROMISES.forEach((p, i) => {
+    const t = base2 + (2 + i) * 47_000;
+    out.push({
+      id: p.segment,
+      session: SESSIONS[2].id,
+      source: 'VRChat.exe',
+      speaker: p.who,
+      text: p.said,
+      t_ms: t,
+      t_ns: String(t) + '000000',
+      dur_ms: 2600 + i * 300,
+      overlap_frac: 0.02,
+      match_score: 0.66,
+      label_via: 'match',
+      lang: p.lang,
+      thread: threadFor(28 + i),
+    });
+  });
   return out;
 }
+
+/// The commitments the graph found, and the turns they were found in.
+///
+/// Two sources on purpose, because the GUI has to render them differently:
+/// `rules` is a pattern match and a guess, `llm` is the local model under a
+/// verdict-first grammar. One of each has a due date and one has none, because
+/// "sure, I'll send it over" is a promise with no deadline and the list has to
+/// sort that honestly (undated last, never first).
+const DAY = 86_400_000;
+const PROMISES = [
+  {
+    segment: 1102,
+    who: 2,
+    lang: 'de',
+    said: 'ja klar, ich schick dir morgen den Link zu der Map',
+    what: 'den Link zu der Map schicken',
+    to: 3,
+    due_raw: 'morgen',
+    due_in: DAY,
+    due_kind: 'day',
+    source: 'llm',
+    confidence: 0.75,
+  },
+  {
+    segment: 1103,
+    who: 4,
+    lang: 'en',
+    said: "I'll cut the recording and send it over on Friday",
+    what: 'cut the recording and send it over',
+    to: 1,
+    due_raw: 'on Friday',
+    due_in: 3 * DAY,
+    due_kind: 'weekday',
+    source: 'llm',
+    confidence: 0.75,
+  },
+  {
+    segment: 1104,
+    who: 1,
+    lang: 'de',
+    said: 'mach ich, versprochen',
+    what: 'mach ich, versprochen',
+    to: 2,
+    due_raw: null,
+    due_in: null,
+    due_kind: null,
+    source: 'rules',
+    confidence: 0.25,
+  },
+];
+
+/// Topic labels, as the Tier 3 pass would have written them: one string per
+/// conversation, on the thread itself.
+const THREAD_TOPICS = {
+  500: 'world portals',
+  501: 'shader work',
+  502: 'avatar troubles',
+  503: 'the meetup photo',
+  [500 + Math.floor(28 / THREAD_BLOCK)]: 'shader work',
+};
 
 // ---------------------------------------------------------------------------
 // server
@@ -279,6 +366,42 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
     sources: SOURCES.map((s) => ({ ...s })),
     // Off by default, exactly as the real daemon ships it.
     mic: { enabled: false, mode: 'follow', active: false, device: null },
+    // The memory graph (schema v7). Tier 3 is off, like the real daemon, and
+    // the model IS installed — so the view's "turn it on" path is reachable
+    // rather than blocked behind a 1.9 GB download nobody can do in a test.
+    graph: { enabled: false, installed: true, llm_threads: 4, gpu_layers: 0 },
+    enrichment: {
+      phase: 'off',
+      reason: null,
+      thread: null,
+      batch_done: 0,
+      batch_total: 0,
+      walked: 0,
+      found: 0,
+      retracted: 0,
+      labelled: 0,
+      last_error: null,
+      last_run_utc_ns: null,
+    },
+    enrichTimer: null,
+    commitments: PROMISES.map((p, i) => ({
+      id: 900 + i,
+      segment: p.segment,
+      who: p.who,
+      to: p.to,
+      what: p.what,
+      said: p.said,
+      due_ms: p.due_in == null ? null : Date.now() + p.due_in,
+      due_raw: p.due_raw,
+      due_kind: p.due_kind,
+      state: 'candidate',
+      source: p.source,
+      model_id: p.source === 'llm' ? 'qwen2.5-3b-instruct-q4_k_m' : 'promise-rules@1',
+      confidence: p.confidence,
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    })),
+    topics: { ...THREAD_TOPICS },
     myLineIdx: 0,
     tombstones: new Map(), // merged-away speaker id → surviving id (never chained)
     replay: [],
@@ -465,6 +588,117 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
     };
   }
 
+  // --- the memory graph ---------------------------------------------------
+
+  function graphConfig() {
+    return {
+      enabled: state.graph.enabled,
+      installed: state.graph.installed,
+      llm_threads: state.graph.llm_threads,
+      gpu_layers: state.graph.gpu_layers,
+      llm_model: 'qwen2.5-3b-instruct-q4_k_m.gguf',
+      thread_gap_s: 20,
+      batch_threads: 4,
+      min_thread_segments: 3,
+      download_bytes: 1_946_604_700,
+    };
+  }
+
+  function commitmentPayload(c) {
+    return {
+      id: c.id,
+      segment: c.segment,
+      thread: state.segments.find((s) => s.id === c.segment)?.thread ?? null,
+      who: { speaker_id: c.who, ...person(c.who) },
+      to: c.to == null ? null : { speaker_id: c.to, ...person(c.to) },
+      what: c.what,
+      said: c.said,
+      due_ms: c.due_ms,
+      due_ns: c.due_ms == null ? null : String(c.due_ms) + '000000',
+      due_raw: c.due_raw,
+      due_kind: c.due_kind,
+      state: c.state,
+      source: c.source,
+      model_id: c.model_id,
+      confidence: c.confidence,
+      t_ms: state.segments.find((s) => s.id === c.segment)?.t_ms ?? null,
+      t_ns: state.segments.find((s) => s.id === c.segment)?.t_ns ?? null,
+      created_ms: c.created_at,
+      updated_ms: c.updated_at,
+    };
+  }
+
+  function graphCounts() {
+    const by = (k) => state.commitments.filter((c) => c.state === k).length;
+    const src = (k) => state.commitments.filter((c) => c.source === k).length;
+    const threads = new Set(state.segments.map((s) => s.thread).filter((t) => t != null));
+    const enriched = new Set(Object.keys(state.topics).map(Number));
+    return {
+      time_refs: state.commitments.filter((c) => c.due_raw).length,
+      commitments: state.commitments.length,
+      open: by('candidate') + by('confirmed'),
+      candidates: by('candidate'),
+      confirmed: by('confirmed'),
+      done: by('done'),
+      dismissed: by('dismissed'),
+      from_rules: src('rules'),
+      from_llm: src('llm'),
+      topics: new Set(Object.values(state.topics)).size,
+      threads: threads.size,
+      threads_enriched: [...enriched].filter((t) => threads.has(t)).length,
+      threads_pending: [...threads].filter((t) => !enriched.has(t)).length,
+    };
+  }
+
+  /// Flip the Tier 3 switch, and act like a worker that has been asked to run.
+  ///
+  /// Turning it on walks a short batch so the GUI can be driven through all
+  /// three states it has copy for — off, running with a progress line, and idle
+  /// — without a 1.9 GB model in the test rig.
+  function setEnrichment(on) {
+    state.graph.enabled = on;
+    if (state.enrichTimer) {
+      clearInterval(state.enrichTimer);
+      state.enrichTimer = null;
+    }
+    if (!on) {
+      state.enrichment = { ...state.enrichment, phase: 'off', reason: null, thread: null, batch_done: 0, batch_total: 0 };
+      return;
+    }
+    if (!state.graph.installed) {
+      state.enrichment = {
+        ...state.enrichment,
+        phase: 'unavailable',
+        reason: 'the local model is not installed — `recalld models fetch --graph` downloads it (1.9 GB)',
+      };
+      return;
+    }
+    const total = 4;
+    state.enrichment = { ...state.enrichment, phase: 'running', reason: null, batch_done: 0, batch_total: total };
+    const op = `graph_${state.nextOp++}`;
+    let done = 0;
+    state.enrichTimer = setInterval(() => {
+      done += 1;
+      state.enrichment = {
+        ...state.enrichment,
+        batch_done: done,
+        walked: state.enrichment.walked + 1,
+        labelled: state.enrichment.labelled + 1,
+        last_run_utc_ns: String(Date.now()) + '000000',
+      };
+      emit('ops', 'op.progress', { op, kind: 'graph.enrich', done, total, frac: done / total });
+      emit('status', 'graph', { ...state.enrichment });
+      if (done >= total) {
+        clearInterval(state.enrichTimer);
+        state.enrichTimer = null;
+        state.enrichment = { ...state.enrichment, phase: 'idle', thread: null, batch_done: 0, batch_total: 0 };
+        emit('ops', 'op.done', { op, kind: 'graph.enrich', done: total, total });
+        emit('status', 'graph', { ...state.enrichment });
+      }
+    }, 700);
+    if (state.enrichTimer.unref) state.enrichTimer.unref();
+  }
+
   function statusPayload() {
     return {
       uptime_s: Math.round((Date.now() - state.startedAt) / 1000),
@@ -479,6 +713,9 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       // figure moves as the feed runs, so the footer and the Sources card have
       // something that actually changes to render.
       storage: storagePayload(),
+      // The memory graph's Tier 3 state rides on `status` too, so a client that
+      // missed the `graph` event still converges on the truth.
+      graph: { ...state.enrichment },
       models: ['silero-vad', 'segmentation-3.0', 'eres2net-en', 'parakeet-tdt-110m'],
       segments_total: state.segments.length,
       daemon: daemonId(),
@@ -914,6 +1151,99 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       return { ...threadPayload(id), segments: rows };
     },
 
+    // --- the memory graph, Tiers 2 and 3 (0.7.0) --------------------------
+
+    'graph.summary': () => ({
+      counts: graphCounts(),
+      enrichment: { ...state.enrichment },
+      config: graphConfig(),
+    }),
+
+    'graph.get': () => ({ config: graphConfig(), enrichment: { ...state.enrichment } }),
+
+    'graph.set'(params) {
+      const { enabled, llm_threads: threads, gpu_layers: layers } = params ?? {};
+      if (enabled === undefined && threads === undefined && layers === undefined) {
+        throw err('params', 'graph.set needs at least one of enabled, llm_threads, gpu_layers');
+      }
+      if (enabled !== undefined) setEnrichment(!!enabled);
+      if (threads !== undefined) state.graph.llm_threads = Math.max(1, Math.min(64, Number(threads)));
+      if (layers !== undefined) state.graph.gpu_layers = Math.max(0, Number(layers));
+      emit('status', 'graph', { ...state.enrichment });
+      emit('status', 'status', statusPayload());
+      return { config: { ...graphConfig(), persisted: true }, enrichment: { ...state.enrichment } };
+    },
+
+    'graph.enrich'(params) {
+      const action = String(params?.action ?? 'start').toLowerCase();
+      if (action !== 'start' && action !== 'stop') {
+        throw err('params', `action must be "start" or "stop", not ${JSON.stringify(params?.action)}`);
+      }
+      const want = action === 'start';
+      if (want === state.graph.enabled) {
+        return { config: graphConfig(), enrichment: { ...state.enrichment }, changed: false };
+      }
+      setEnrichment(want);
+      emit('status', 'graph', { ...state.enrichment });
+      emit('status', 'status', statusPayload());
+      return { config: { ...graphConfig(), persisted: true }, enrichment: { ...state.enrichment } };
+    },
+
+    'commitments.list'(params) {
+      const want = params?.state;
+      if (want != null && !COMMITMENT_STATES.includes(want)) {
+        throw err('params', `state must be one of ${JSON.stringify(COMMITMENT_STATES)}, not ${JSON.stringify(want)}`);
+      }
+      const rows = state.commitments
+        .filter((c) => want == null || c.state === want)
+        // Undated last, never first: a promise with no date is not overdue, it
+        // is merely open, and sorting it above a real deadline would lie.
+        .sort((a, b) => (a.due_ms == null) - (b.due_ms == null) || (a.due_ms ?? 0) - (b.due_ms ?? 0));
+      return { state: want ?? null, commitments: rows.map(commitmentPayload) };
+    },
+
+    'commitments.set_state'(params) {
+      const id = Number(params?.id);
+      const next = params?.state;
+      if (!COMMITMENT_STATES.includes(next)) {
+        throw err('params', `state must be one of ${JSON.stringify(COMMITMENT_STATES)}, not ${JSON.stringify(next)}`);
+      }
+      const row = state.commitments.find((c) => c.id === id);
+      if (!row) throw err('not_found', `no commitment with id ${params?.id}`);
+      row.state = next;
+      row.updated_at = Date.now();
+      const payload = commitmentPayload(row);
+      // Broadcast, like every other retroactive change.
+      emit('ops', 'commitment', payload);
+      return payload;
+    },
+
+    'topics.list'(params) {
+      const perTopic = Math.min(100, Math.max(1, Number(params?.per_topic ?? 12)));
+      const groups = new Map();
+      for (const [threadId, topic] of Object.entries(state.topics)) {
+        const rows = state.segments.filter((s) => s.thread === Number(threadId));
+        if (!rows.length) continue;
+        const g = groups.get(topic) ?? { topic, threads: [], segments: 0, last: 0 };
+        g.threads.push(Number(threadId));
+        g.segments += rows.length;
+        g.last = Math.max(g.last, ...rows.map((s) => s.t_ms + s.dur_ms));
+        groups.set(topic, g);
+      }
+      return {
+        topics: [...groups.values()]
+          .sort((a, b) => b.last - a.last)
+          .map((g) => ({
+            topic: g.topic,
+            threads: g.threads.length,
+            segments: g.segments,
+            last_ms: g.last,
+            last_ns: String(g.last) + '000000',
+            thread_ids: g.threads.sort((a, b) => b - a).slice(0, perTopic),
+          })),
+      };
+    },
+
     'segments.audio'(params) {
       const seg = state.segments.find((s) => s.id === Number(params?.id));
       if (!seg) throw err('not_found', `no segment ${params?.id}`);
@@ -1128,6 +1458,7 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
     },
     close() {
       stopFeed();
+      if (state.enrichTimer) clearInterval(state.enrichTimer);
       for (const c of clients) c.sock.destroy();
       clients.clear();
       server.close();

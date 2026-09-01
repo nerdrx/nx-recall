@@ -147,6 +147,28 @@ pub fn parse_iso8601(text: &str) -> Option<i64> {
     Some(secs * 1_000_000_000 + nanos)
 }
 
+/// Seconds east of UTC the machine's own timezone is at `utc_ns`.
+///
+/// The one place local time is consulted at all, and it is consulted rather
+/// than stored: a person who says "Freitag" means Friday where they are
+/// sitting, so resolving that reference has to know the offset — and the
+/// *result* is written back as UTC nanoseconds like every other instant in the
+/// schema (`crate::timeref`). Reading it per-instant rather than once is what
+/// makes a reference spoken in August and one spoken in December both land on
+/// the right hour.
+pub fn local_offset_s(utc_ns: i64) -> i64 {
+    let t = utc_ns.div_euclid(1_000_000_000) as libc::time_t;
+    // SAFETY: `tm` is a zeroed struct we own; localtime_r writes into it and
+    // returns null rather than failing destructively.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
 /// Howard Hinnant's `days_from_civil`: a calendar date to days since the epoch.
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };

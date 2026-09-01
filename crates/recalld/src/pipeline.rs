@@ -518,6 +518,18 @@ impl Pipeline {
             if let Err(e) = crate::threads::assign(&store, &self.cfg.graph, segment_id) {
                 warn!(segment_id, "could not thread a segment: {e:#}");
             }
+            // Tier 2 (GRAPH.md): the deterministic extractors, always on and
+            // never optional. A handful of regex scans over one line of text,
+            // so it belongs here for the same reason threading does — the
+            // annotations are already there when a client reads the turn, and
+            // no pass has to have run.
+            //
+            // After threading, because a promise needs a counterparty and the
+            // thread is where the counterparty is. Failures are logged and
+            // dropped: a derived annotation never costs a recording.
+            if let Err(e) = crate::commitment::extract(&store, segment_id, utc_now_ns()) {
+                warn!(segment_id, "tier-2 extraction failed: {e:#}");
+            }
             publish_segment(&self.bus, &store, segment_id);
             for id in also_changed {
                 publish_segment(&self.bus, &store, id);

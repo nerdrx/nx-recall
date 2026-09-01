@@ -596,11 +596,11 @@ export function runE2E(deps) {
         `a stat rendered no value: ${JSON.stringify(p.strip)}`
       );
       assert(/conversation/.test(p.sub), `the page's subtitle does not summarise it: "${p.sub}"`);
-      // The rail still has four items and none of them is selected here: this
-      // is pushed state, not a fifth place in the app.
+      // The rail has five items (Memory joined in 0.7.0) and none of them is
+      // selected here: the person page is pushed state, not a place in the app.
       const rail = await js('document.querySelectorAll(".rail-item").length');
       const selected = await js('document.querySelectorAll(\'.rail-item[aria-selected="true"]\').length');
-      assert(rail === 4, `the rail grew to ${rail} items`);
+      assert(rail === 5, `the rail has ${rail} items, not the five it should`);
       assert(selected === 0, 'a rail item claims to be selected on the person page');
       return { speaker: target, strip: p.strip, sub: p.sub, file: await shot('person-page') };
     });
@@ -691,6 +691,253 @@ export function runE2E(deps) {
       await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
       await waitFor('the speaker list again', async () => js('document.querySelectorAll("#speaker-list .sp-row").length > 0'));
       return { separators: t.separators.slice(0, 3) };
+    });
+
+    // 6n — 0.7.0: the memory graph gets a place of its own. The user's own
+    // question was "when do the ai thing do thing? i dont see a tab for it?",
+    // and this is the answer being there at all.
+    await step('memory-is-the-fifth-rail-item', async () => {
+      const rail = await js('[...document.querySelectorAll(".rail-item")].map(b => b.dataset.view)');
+      assert(rail.length === 5, `the rail has ${rail.length} items: ${JSON.stringify(rail)}`);
+      assert(rail.includes('memory'), `no Memory item in the rail: ${JSON.stringify(rail)}`);
+      // Between Search and Sources: it is about what was said, not about what
+      // the program is allowed to listen to.
+      assert(
+        rail.indexOf('memory') === rail.indexOf('sources') - 1,
+        `Memory sits at ${rail.indexOf('memory')} in ${JSON.stringify(rail)}`
+      );
+      const label = await js('document.querySelector(\'.rail-item[data-view="memory"] span\').textContent');
+      assert(label === 'Memory', `the item is called ${JSON.stringify(label)}`);
+
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await waitFor('the memory view', async () => js('window.__recallDebug.view() === "memory"'));
+      const railSelected = await js(
+        'document.querySelector(\'.rail-item[data-view="memory"]\').getAttribute("aria-selected")'
+      );
+      assert(railSelected === 'true', 'the rail does not mark Memory as selected');
+      const m = await waitFor('the view to fill in', async () => {
+        const m = await js('window.__recallDebug.memory()');
+        return m.mounted && m.commitments.length ? m : null;
+      });
+      // The badge is what is still OPEN, not the total: a badge is a number you
+      // are meant to act on.
+      assert(/^\d+$/.test(m.badge) && Number(m.badge) > 0, `the rail badge reads ${JSON.stringify(m.badge)}`);
+      assert(/open/.test(m.sub), `the subtitle does not summarise: "${m.sub}"`);
+      return { rail, badge: m.badge, sub: m.sub, file: await shot('memory') };
+    });
+
+    // 6o — the rule this whole feature turns on: a guess has to LOOK like a
+    // guess, in the row, without hovering anything. A pattern match and a
+    // language model are not the same claim.
+    await step('commitments-say-which-tier-claimed-them', async () => {
+      const m = await js('window.__recallDebug.memory()');
+      assert(m.commitments.length >= 2, `only ${m.commitments.length} commitment(s) rendered`);
+      const sources = [...new Set(m.commitments.map((c) => c.source))].sort();
+      assert(
+        sources.join(',') === 'llm,rules',
+        `the fixture should carry both tiers, got ${JSON.stringify(sources)}`
+      );
+      for (const c of m.commitments) {
+        assert(c.srcChip.trim().length > 0, `a row carries no visible source mark: ${JSON.stringify(c)}`);
+        assert(c.srcTitle.length > 30, `the source mark does not explain itself: "${c.srcTitle}"`);
+        assert(c.who && c.what, `a row is missing who or what: ${JSON.stringify(c)}`);
+        // The evidence travels with the claim, so you can disagree here.
+        assert(c.said.length > 5, `a row shows no transcript line: ${JSON.stringify(c)}`);
+      }
+      const rules = m.commitments.find((c) => c.source === 'rules');
+      const llm = m.commitments.find((c) => c.source === 'llm');
+      assert(/pattern/i.test(rules.srcChip), `the rule mark does not say what it is: "${rules.srcChip}"`);
+      assert(/model|local/i.test(llm.srcChip), `the model mark does not say what it is: "${llm.srcChip}"`);
+      assert(rules.srcChip !== llm.srcChip, 'both tiers wear the same mark');
+
+      // Undated last, never first: no date said is not "overdue".
+      const undatedAt = m.commitments.findIndex((c) => c.undated);
+      assert(
+        undatedAt === -1 || undatedAt === m.commitments.length - 1,
+        `an undated promise sorted above a dated one (index ${undatedAt})`
+      );
+      // And nothing nags: the card says so in as many words.
+      assert(/nothing here reminds you/i.test(m.note), `the list does not disclaim itself: "${m.note}"`);
+      return { sources, rules: rules.srcChip, llm: llm.srcChip, undatedAt };
+    });
+
+    // 6p — the state machine. Only a click moves a row, and the whole app
+    // hears about it: the rail badge is drawn from the daemon's own count.
+    await step('a-commitment-moves-only-when-a-person-says-so', async () => {
+      const before = await js('window.__recallDebug.memory()');
+      const target = before.commitments.find((c) => c.state === 'candidate');
+      assert(target, 'every commitment is already settled');
+      assert(
+        target.actions.join(',') === 'confirmed,done,dismissed',
+        `a candidate offers ${JSON.stringify(target.actions)}`
+      );
+
+      await js(`document.querySelector('[data-act="confirmed"][data-commitment="${target.id}"]').click()`);
+      // Settled, not merely optimistic: the row paints its new state
+      // immediately and keeps its buttons disabled until the daemon agrees.
+      const confirmed = await waitFor('the row to confirm', async () => {
+        const m = await js('window.__recallDebug.memory()');
+        const row = m.commitments.find((c) => c.id === target.id);
+        return row && row.state === 'confirmed' && !row.pending ? m : null;
+      });
+      // Confirmed is still open, so the badge has not moved.
+      assert(confirmed.badge === before.badge, `confirming changed the open count (${before.badge} → ${confirmed.badge})`);
+
+      // …and the daemon really has it, not just this window.
+      const listed = await js(`(async () => {
+        const r = await window.recall.request('commitments.list', {});
+        return r.data.commitments.find(c => c.id === ${target.id}).state;
+      })()`);
+      assert(listed === 'confirmed', `the daemon still says ${listed}`);
+
+      // Done takes it off the open list, and the badge follows.
+      await js(`document.querySelector('[data-act="done"][data-commitment="${target.id}"]').click()`);
+      const done = await waitFor('the open count to fall', async () => {
+        const m = await js('window.__recallDebug.memory()');
+        return Number(m.badge) < Number(before.badge) ? m : null;
+      });
+      const gone = done.commitments.find((c) => c.id === target.id);
+      assert(!gone, 'a settled commitment is still on the open list');
+      // Nothing was deleted — it is still there under "settled".
+      await js('document.getElementById("commitments-toggle").click()');
+      const all = await waitFor('the settled rows', async () => {
+        const m = await js('window.__recallDebug.memory()');
+        return m.commitments.some((c) => c.id === target.id) ? m : null;
+      });
+      assert(
+        all.commitments.find((c) => c.id === target.id).state === 'done',
+        'the settled row lost its state'
+      );
+      await js('document.getElementById("commitments-toggle").click()');
+      return { id: target.id, badgeBefore: before.badge, badgeAfter: done.badge, file: await shot('memory-commitments') };
+    });
+
+    // 6q — a commitment is a claim about a LINE, and the line has to be one
+    // click away or there is no way to disagree with it.
+    await step('a-commitment-opens-its-line-in-the-transcript', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await waitFor('the memory view', async () => js('window.__recallDebug.view() === "memory"'));
+      // The view mounts empty and fills in from one query, so the list is not
+      // there on the first frame.
+      await waitFor('the commitment list', async () =>
+        js('document.querySelectorAll("#commit-list .commit-said").length > 0')
+      );
+      await js('document.querySelector("#commit-list .commit-said").click()');
+      await waitFor('the transcript to mount', async () => js('window.__recallDebug.view() === "transcript"'));
+      const t = await waitFor(
+        'the conversation to be marked',
+        async () => {
+          const t = await js('window.__recallDebug.threads()');
+          return t.marked > 0 ? t : null;
+        },
+        { timeout: 15000 }
+      );
+      assert(t.filter === '', `the speaker filter was left set to "${t.filter}"`);
+      return { marked: t.marked, rows: t.rows };
+    });
+
+    // 6r — topics: what you keep talking about, and a door into each one.
+    await step('topics-group-conversations-and-open-them', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      const m = await waitFor('the topic list', async () => {
+        const m = await js('window.__recallDebug.memory()');
+        return m.topics.length ? m : null;
+      });
+      for (const t of m.topics) {
+        assert(t.topic && t.topic.length > 1, `a topic has no label: ${JSON.stringify(t)}`);
+        assert(t.threads >= 1, `a topic names no conversations: ${JSON.stringify(t)}`);
+        assert(/conversation/.test(t.text), `a topic row does not say how many: "${t.text}"`);
+        assert(/last heard/i.test(t.text), `a topic row does not say when: "${t.text}"`);
+      }
+      await js('document.querySelector("#topic-list .topic-row").click()');
+      await waitFor('the transcript to mount', async () => js('window.__recallDebug.view() === "transcript"'));
+      const rows = await js('document.querySelectorAll("#seg-list .seg").length');
+      assert(rows > 0, 'opening a topic rendered nothing');
+      return { topics: m.topics.map((t) => t.topic), rows };
+    });
+
+    // 6s — the enrichment card, in all three states it has copy for, and the
+    // copy itself. This is the honest-cost half of the feature: what it runs,
+    // what it costs, when it runs, that it is off by default, and that nothing
+    // leaves the machine.
+    await step('enrichment-is-off-by-default-and-says-what-it-would-cost', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      const off = await waitFor('the enrichment card', async () => {
+        const m = await js('window.__recallDebug.memory()');
+        return m.enrichment.chip ? m.enrichment : null;
+      });
+      assert(off.pressed === 'false', 'the local model is on by default');
+      assert(off.chip === 'off', `the chip reads "${off.chip}"`);
+      assert(off.progress === '', 'a progress line is showing with nothing running');
+
+      const facts = off.facts.join(' ');
+      assert(/\bGB\b/.test(facts), `the copy does not say how big the model is: ${JSON.stringify(off.facts)}`);
+      assert(/CPU cores/i.test(facts), `the copy does not say what it spends: ${JSON.stringify(off.facts)}`);
+      assert(/not being captured|gaming/i.test(facts), `the copy does not say when it runs: ${JSON.stringify(off.facts)}`);
+      assert(/off until you turn it on/i.test(facts), `the copy does not say it is off by default`);
+      assert(/leaves this machine/i.test(facts), `the copy does not say nothing leaves the machine`);
+      assert(/never changes a transcript/i.test(off.note), `the card does not say what it writes: "${off.note}"`);
+      // The card sits under the commitments and the topics, so a shot of the
+      // top of the page would not document the thing this step is about.
+      await js('document.getElementById("enrich-card").scrollIntoView({block: "end"})');
+      const fileOff = await shot('memory-enrichment-off');
+
+      // On: it runs, and the progress line says which conversation.
+      await js('document.getElementById("enrich-toggle").click()');
+      const running = await waitFor(
+        'the worker to start reading',
+        async () => {
+          const m = await js('window.__recallDebug.memory()');
+          return m.enrichment.phase === 'running' ? m.enrichment : null;
+        },
+        { timeout: 15000, every: 150 }
+      );
+      assert(running.pressed === 'true', 'the switch did not follow');
+      assert(/reading/i.test(running.chip), `the chip did not follow the state: "${running.chip}"`);
+      assert(
+        /conversation \d+ of \d+/.test(running.progress),
+        `the progress line says nothing useful: "${running.progress}"`
+      );
+      await js('document.getElementById("enrich-card").scrollIntoView({block: "end"})');
+      const fileRunning = await shot('memory-enrichment-running');
+
+      // …and idle when the batch is done.
+      const idle = await waitFor(
+        'the batch to finish',
+        async () => {
+          const m = await js('window.__recallDebug.memory()');
+          return m.enrichment.phase === 'idle' ? m.enrichment : null;
+        },
+        { timeout: 20000, every: 200 }
+      );
+      assert(/idle/i.test(idle.chip), `the chip did not settle: "${idle.chip}"`);
+      assert(idle.progress === '', 'the progress line outlived the batch');
+      assert(/read/.test(idle.counts), `the card does not report what it did: "${idle.counts}"`);
+
+      // Off again, and the switch is the only thing that moved.
+      await js('document.getElementById("enrich-toggle").click()');
+      const back = await waitFor(
+        'the worker to stop',
+        async () => {
+          const m = await js('window.__recallDebug.memory()');
+          return m.enrichment.phase === 'off' ? m.enrichment : null;
+        },
+        { timeout: 10000, every: 150 }
+      );
+      assert(back.pressed === 'false', 'the switch did not go back');
+
+      // Leave the UI where the later steps expect to find it.
+      await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
+      await waitFor('the speaker list again', async () =>
+        js('document.querySelectorAll("#speaker-list .sp-row").length > 0')
+      );
+      return {
+        off: off.chip,
+        running: running.progress,
+        idle: idle.chip,
+        counts: idle.counts,
+        files: [fileOff, fileRunning],
+      };
     });
 
     // 7 — inline rename through the real UI, then the retroactive broadcast
