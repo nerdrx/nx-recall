@@ -198,6 +198,9 @@ export function mount(root, ctx) {
     const menu = h(
       'div',
       { class: 'row-menu', role: 'menu', 'aria-label': `Actions for ${speakerLabel(spId)}` },
+      // First, because it is the least destructive and the most often wanted:
+      // "who is this person" is the question a list of voices raises.
+      item('Person page', () => openPerson(spId), 'menu-person'),
       item('Show in transcript', () => showInTranscript(spId)),
       // Which languages this voice speaks. It sits here and in the rename flow
       // because it is the same question — "who is this?" — asked about the
@@ -276,6 +279,29 @@ export function mount(root, ctx) {
 
   function showInTranscript(spId) {
     ctx.showSpeakerInTranscript?.(spId);
+  }
+
+  function openPerson(spId) {
+    ctx.openPerson?.(spId);
+  }
+
+  /** One of the row's two counts, as a way into the person page. */
+  function statButton(spId, value, label) {
+    return h(
+      'button',
+      {
+        class: 'sp-num stats',
+        type: 'button',
+        dataset: { stats: String(spId) },
+        title: `Open ${speakerLabel(spId)}'s page`,
+        onclick: (e) => {
+          e.stopPropagation();
+          openPerson(spId);
+        },
+      },
+      value,
+      h('small', { text: label })
+    );
   }
 
   // -- list -----------------------------------------------------------------
@@ -372,8 +398,12 @@ export function mount(root, ctx) {
           h('span', { class: 'sp-hint', dataset: { hint: String(sp.id) } })
         )
       ),
-      h('span', { class: 'sp-num' }, String(sp.segments ?? 0), h('small', { text: 'segments' })),
-      h('span', { class: 'sp-num' }, fmtDur(sp.total_ms), h('small', { text: 'total speech' })),
+      // The counts are the second door to the person page. "412 segments" is
+      // already a question about a person — pressing it should answer it,
+      // rather than being the one part of the row that does nothing. The name
+      // is left alone: that still renames, inline, as it always has.
+      statButton(sp.id, String(sp.segments ?? 0), 'segments'),
+      statButton(sp.id, fmtDur(sp.total_ms), 'total speech'),
       h(
         'span',
         { class: 'sp-actions' },

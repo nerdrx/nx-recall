@@ -48,6 +48,8 @@ Methods (initial set):
 | `speakers.split` | `{id}` | **async op** (below); work completes inline — the reply carries the op handle **plus** the outcome: `{op, kept, minted, auto, moved_segments, moved_prototypes, ambiguous, centroid_similarity, embed_model_id, resync, seq}`. Data-driven refusals (one voice, golden conflict) come back as `err:refused`. The minted speaker's `relabel` carries `split_from`. Past ~100 changed rows the per-segment events are skipped and `resync: true` tells clients to re-query. |
 | `segments.reassign` | `{segment_id, speaker_id}` | |
 | `segments.correct` | `{segment_id, text}` | feeds anchor per DESIGN §5 |
+| `person.get` | `{id}` | the person page in one reply: totals, co-presence edges, recent conversations |
+| `thread.get` | `{id}` | one conversation's segments, in order |
 | `search` | `{q, speaker?, source?, from?, to?, limit?}` | FTS now, +vec later |
 | `transcript` | `{session?, speaker?, from?, to?}` | chronological page |
 | `delete.preview` / `delete.run` | `{speaker?, session?, from?, to?}` | preview returns counts+bytes; run is an **async op** |
@@ -231,6 +233,86 @@ only *what*.
 
 - **`status.counters`** gains `too_slight` (turns that matched nobody and were
   under the mint bar), `proximity_labelled`, `redecoded` and `lang_mismatch`.
+
+### Conversation threads and the person page (schema 6)
+
+The memory graph's Tier 1 ([GRAPH.md](GRAPH.md)): derived, deterministic, always
+on. Two read methods and one additive field, and nothing here is stored twice —
+every number is a query over live segments, so a deleted segment stops counting
+the instant it is deleted.
+
+- **Segment rows carry `thread`**: the id of the conversation the turn belongs
+  to, or `null`. A client draws a boundary where it changes and renders a `null`
+  exactly as it rendered every row before threading existed — which is what
+  makes this additive rather than a proto bump. Threads are per session, cut by
+  `[graph].thread_gap_s` (20 s) of silence and by turn-taking: two pairs talking
+  past each other in one instance are two threads. The rule is written out in
+  `crates/recalld/src/threads.rs`, including what it gets wrong on purpose.
+
+  A turn is threaded **once**, when it is stored. A later rename, merge or
+  reassignment does not re-thread it: which conversation a turn was part of is a
+  fact about the clock and the room, and re-deriving it on every relabel would
+  make the same transcript thread differently depending on when you looked.
+
+- **`person.get {id}`** → the whole person page in one round trip, because the
+  page is one question and half a person is worse than a spinner:
+
+  ```json
+  {"id": 12,
+   "speaker": {"id": 12, "you": false, "name": "Kira", "auto": "Speaker_03",
+               "languages": ["de"], "first_seen": "2026-07-02T18:24:00Z"},
+   "languages": ["de"],
+   "totals": {"segments": 412, "speech_ms": 1832000, "speech_ns": "1832000000000",
+              "sessions": 9, "threads": 31,
+              "first_heard_ms": ..., "first_heard_ns": "...",
+              "last_heard_ms": ...,  "last_heard_ns": "..."},
+   "edges": [{"speaker_id": 4, "name": "Ash", "auto": "Speaker_18",
+              "threads": 9, "seconds": 412.5, "speech_ms": 412500,
+              "last_ns": "...", "last_ms": ..., "roster_seconds": null}],
+   "recent_threads": [{"thread_id": 31, "session": 3,
+                       "started_ns": "...", "started_ms": ...,
+                       "ended_ns": "...", "ended_ms": ...,
+                       "segments": 14,
+                       "participants": [{"speaker_id": 12, "name": "Kira",
+                                         "auto": "Speaker_03"}],
+                       "preview": "wait, which portal was it —"}]}
+  ```
+
+  Field conventions, tightly:
+
+  - `name` is `null` until a person names the voice; `auto` is the generated
+    label and is always present. Same split as `speakers.list`, in every place a
+    person appears here — edges and thread participants included, so a client
+    can render a voice it has never queried.
+  - **An edge means a shared *conversation*, not a shared instance.** A public
+    lobby has forty people in it and you spoke to two; edges come from threads,
+    which is the whole reason threads exist. `threads` is how many they shared.
+  - `seconds` (and the identical `speech_ms`) is **how much the other person
+    spoke in those shared conversations** — their speech, not the intersection
+    of two speech timelines. People take turns, so an intersection would be
+    near zero and would say nothing about a friendship.
+  - `roster_seconds` is the co-presence the VRChat roster can vouch for: time
+    both display names were in the same instance. It is `null` — not `0` —
+    whenever either voice has no user-given name matching a roster line, which
+    is the common case. Zero would be a claim; `null` is the truth.
+  - `last_ns`/`started_ns`/`ended_ns` are **strings**, like every nanosecond
+    value on the wire; the `_ms` twins are for rendering.
+  - `recent_threads` is newest-first and capped (12). `preview` is the first
+    thing anybody said in the conversation, or `null` — a handle, never a
+    summary. Tier 1 does not summarise.
+  - `participants` is ordered most-talkative-first, which is the order a person
+    reads a list of names in.
+  - An unknown id is `err:not_found`, not an empty page.
+
+- **`thread.get {id}`** → `{thread_id, session, started_ns/ms, ended_ns/ms,
+  participants, preview, segments}`. `segments` are **the ordinary segment
+  shape**, in time order, so a client renders a conversation with the code it
+  already has for a transcript. Unknown id is `err:not_found`.
+
+- Deleting is deletion: purging a segment drops it from every total and every
+  edge, and a thread whose last row goes is deleted with it. A soft delete
+  (the undo window) hides the rows but keeps the thread, because the rows are
+  still coming back.
 
 ## Versioning rules
 

@@ -37,6 +37,7 @@ pub mod server;
 pub mod service;
 pub mod split;
 pub mod store;
+pub mod threads;
 pub mod turns;
 pub mod vad;
 

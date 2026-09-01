@@ -26,7 +26,7 @@ import path from 'node:path';
 
 const PROTO = 1;
 const DAEMON = 'recalld-mock/0.5';
-const SCHEMA = 5;
+const SCHEMA = 6;
 const REPLAY_MAX = 200; // deliberately small: overrunning it must be reachable
 
 export function defaultMockSocket() {
@@ -174,6 +174,13 @@ const CANNED_LINES = [
   [3, 'give me five minutes, I need to fix my avatar first', 0.02, 0.63],
 ];
 
+/// Which conversation a canned row belongs to (schema v6). Blocks of five, so
+/// the history really does contain several threads with different people in
+/// them — the transcript's separators and the person page's "people they talk
+/// with" both need more than one to say anything.
+const THREAD_BLOCK = 5;
+const threadFor = (i) => 500 + Math.floor(i / THREAD_BLOCK);
+
 // A fixed history so every run of the GUI and every screenshot looks the same.
 function buildHistory() {
   const out = [];
@@ -207,6 +214,8 @@ function buildHistory() {
       // changes what a client renders is "proximity" (below).
       label_via: speaker == null ? null : mine ? 'mic' : 'match',
       lang: speaker === 1 ? 'de' : 'en',
+      // schema v6: which conversation this turn is part of.
+      thread: threadFor(i),
     });
   }
 
@@ -228,6 +237,7 @@ function buildHistory() {
     match_score: null,
     label_via: 'proximity',
     lang: null,
+    thread: threadFor(26),
   });
   out.push({
     // The one-off voice: one grunt, and the whole reason a sweep exists.
@@ -243,6 +253,7 @@ function buildHistory() {
     match_score: 0.38,
     label_via: 'match',
     lang: null,
+    thread: threadFor(27),
   });
   return out;
 }
@@ -306,6 +317,46 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
   function speakerById(id) {
     const resolved = state.tombstones.get(id) ?? id;
     return state.speakers.find((s) => s.id === resolved) ?? null;
+  }
+
+  /// A segment's canonical speaker, following tombstones like the daemon does.
+  function owner(seg) {
+    if (seg.speaker == null) return null;
+    return state.tombstones.get(seg.speaker) ?? seg.speaker;
+  }
+
+  /// The `{name, auto}` pair every place a person appears in the graph, so a
+  /// client can render a voice it has never queried.
+  function person(id) {
+    const sp = speakerById(id);
+    return { name: sp?.name ?? null, auto: sp?.auto ?? `Speaker_${id}` };
+  }
+
+  /// One conversation, without its words — the shape both graph methods share.
+  function threadPayload(id) {
+    const rows = state.segments.filter((s) => s.thread === id);
+    const spoke = new Map();
+    for (const seg of rows) {
+      const who = owner(seg);
+      if (who == null) continue;
+      spoke.set(who, (spoke.get(who) ?? 0) + seg.dur_ms);
+    }
+    const started = rows.length ? Math.min(...rows.map((s) => s.t_ms)) : 0;
+    const ended = rows.length ? Math.max(...rows.map((s) => s.t_ms + s.dur_ms)) : 0;
+    return {
+      thread_id: id,
+      session: rows[0]?.session ?? null,
+      started_ms: started,
+      started_ns: String(started) + '000000',
+      ended_ms: ended,
+      ended_ns: String(ended) + '000000',
+      segments: rows.length,
+      // Most talkative first: the order a person reads a list of names in.
+      participants: [...spoke.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([id]) => ({ speaker_id: id, ...person(id) })),
+      preview: rows.find((s) => s.speaker != null && s.text)?.text ?? null,
+    };
   }
 
   function counts() {
@@ -468,6 +519,7 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       dur_ms: 1600 + ((state.feedIdx * 911) % 3800),
       overlap_frac: overlap,
       match_score: overlap > 0.1 ? null : score,
+      thread: liveThread(),
     };
     state.segments.push(seg);
     state.queue = state.feedIdx % 4;
@@ -491,9 +543,17 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       dur_ms: 2200 + ((state.myLineIdx * 617) % 3400),
       overlap_frac: 0.02,
       match_score: null,
+      thread: liveThread(),
     };
     state.segments.push(seg);
     emit('segments', 'segment', seg);
+  }
+
+  /// The conversation the live feed is currently in. It rolls over every few
+  /// turns so a running GUI sees a thread boundary appear rather than only
+  /// finding old ones in the history.
+  function liveThread() {
+    return 600 + Math.floor(state.feedIdx / 6);
   }
 
   function startFeed() {
@@ -724,6 +784,80 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
           match_score: s.match_score ?? null,
         })),
       };
+    },
+
+    // --- the memory graph, Tier 1 (0.6.2) ---------------------------------
+    // Computed from the canned segments the same way the daemon computes it
+    // from its own: an edge is a shared CONVERSATION, not a shared instance.
+
+    'person.get'(params) {
+      const sp = speakerById(Number(params?.id));
+      if (!sp) throw err('not_found', `no speaker ${params?.id}`);
+      const mine = state.segments.filter((s) => owner(s) === sp.id);
+      const threads = new Set(mine.map((s) => s.thread).filter((t) => t != null));
+
+      const edges = new Map();
+      for (const seg of state.segments) {
+        if (seg.thread == null || !threads.has(seg.thread)) continue;
+        const who = owner(seg);
+        if (who == null || who === sp.id) continue;
+        const e = edges.get(who) ?? { threads: new Set(), ms: 0, last: 0 };
+        e.threads.add(seg.thread);
+        e.ms += seg.dur_ms;
+        e.last = Math.max(e.last, seg.t_ms);
+        edges.set(who, e);
+      }
+
+      const totals = {
+        segments: mine.length,
+        speech_ms: mine.reduce((n, s) => n + s.dur_ms, 0),
+        sessions: new Set(mine.map((s) => s.session)).size,
+        threads: threads.size,
+        first_heard_ms: mine.length ? Math.min(...mine.map((s) => s.t_ms)) : null,
+        last_heard_ms: mine.length ? Math.max(...mine.map((s) => s.t_ms)) : null,
+      };
+      totals.speech_ns = String(totals.speech_ms) + '000000';
+      totals.first_heard_ns = totals.first_heard_ms == null ? null : String(totals.first_heard_ms) + '000000';
+      totals.last_heard_ns = totals.last_heard_ms == null ? null : String(totals.last_heard_ms) + '000000';
+
+      return {
+        id: sp.id,
+        speaker: {
+          id: sp.id,
+          you: sp.id === youSpeaker(),
+          name: sp.name,
+          auto: sp.auto,
+          languages: sp.languages ?? null,
+          first_seen: sp.first_seen,
+        },
+        languages: sp.languages ?? null,
+        totals,
+        edges: [...edges.entries()]
+          .map(([id, e]) => ({
+            speaker_id: id,
+            ...person(id),
+            threads: e.threads.size,
+            seconds: e.ms / 1000,
+            speech_ms: e.ms,
+            last_ms: e.last,
+            last_ns: String(e.last) + '000000',
+            // Only voices the user has named can be linked to a roster line,
+            // and null is the honest answer for everyone else.
+            roster_seconds: person(id).name && sp.name ? Math.round(e.ms / 100) / 10 : null,
+          }))
+          .sort((a, b) => b.threads - a.threads || b.speech_ms - a.speech_ms),
+        recent_threads: [...threads]
+          .sort((a, b) => b - a)
+          .slice(0, 12)
+          .map((t) => threadPayload(t)),
+      };
+    },
+
+    'thread.get'(params) {
+      const id = Number(params?.id);
+      const rows = state.segments.filter((s) => s.thread === id);
+      if (!rows.length) throw err('not_found', `no thread ${params?.id}`);
+      return { ...threadPayload(id), segments: rows };
     },
 
     'segments.audio'(params) {

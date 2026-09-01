@@ -48,6 +48,11 @@ const MAX_AUDIO_BYTES: u64 = 10 * 1024 * 1024;
 /// How many clips `speakers.sample` returns when the caller does not say.
 const SAMPLE_LIMIT: usize = 3;
 
+/// How many recent conversations `person.get` carries. The person page is a
+/// way in, not an archive: past a dozen the list stops being scannable and the
+/// transcript is the right surface anyway.
+const PERSON_THREADS: usize = 12;
+
 /// What counts as a one-off voice for `speakers.prune`: at most this many
 /// segments and under this much speech in total. Both are deliberately far
 /// below anything a person produces in a conversation — a real voice reaches
@@ -84,6 +89,10 @@ pub fn segment_json(row: &SegmentRow) -> Value {
         // turns around it rather than heard, so it is shown as uncertain.
         "lang": row.lang,
         "label_via": row.label_via,
+        // Schema v6: which conversation this turn is part of, or `null` on a
+        // row older than threading. A client draws a boundary where this
+        // changes and renders a null exactly as it always did.
+        "thread": row.thread_id,
     })
 }
 
@@ -145,6 +154,8 @@ impl Service {
             "speakers.merge" => self.speakers_merge(req),
             "speakers.split" => self.speakers_split(req),
             "speakers.sample" => self.speakers_sample(req),
+            "person.get" => self.person_get(req),
+            "thread.get" => self.thread_get(req),
             "segments.reassign" => self.segments_reassign(req),
             "segments.correct" => self.segments_correct(req),
             "segments.audio" => self.segments_audio(req),
@@ -1031,6 +1042,140 @@ impl Service {
             }));
         }
         Ok(json!({"id": id, "samples": samples}))
+    }
+
+    // ---- the memory graph, Tier 1 (docs/GRAPH.md) ------------------------
+
+    /// Everything the person page needs about one voice, in one round trip.
+    ///
+    /// Deliberately one method rather than five: the page is a single question
+    /// ("who is this, and who do they talk to?") and answering it in pieces
+    /// would let a client render half a person while the other half is still in
+    /// flight. Nothing here is stored — every number is a query over live
+    /// segments, so a deleted segment stops counting immediately (DESIGN §0).
+    fn person_get(&self, req: &Request) -> Result<Value, Error> {
+        let id = req.i64("id")?;
+        let store = self.store();
+        let speaker = store
+            .speaker_summary(id)
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::not_found(format!("no speaker with id {id}")))?;
+        let you = store.you_speaker_id().map_err(Error::from)?;
+        let totals = store.person_totals(id).map_err(Error::from)?;
+        let edges = store.person_edges(id).map_err(Error::from)?;
+        let threads = store
+            .person_threads(id, PERSON_THREADS)
+            .map_err(Error::from)?;
+        // Participant *names*, resolved here rather than in the client: the
+        // page lists people who may not be in the client's speaker list at all
+        // (a merged-away id, a voice minted since the last query).
+        let mut names: HashMap<i64, Value> = HashMap::new();
+        for t in &threads {
+            for p in &t.participants {
+                if let std::collections::hash_map::Entry::Vacant(slot) = names.entry(*p) {
+                    let summary = store.speaker_summary(*p).map_err(Error::from)?;
+                    slot.insert(json!({
+                        "speaker_id": p,
+                        "name": summary.as_ref().and_then(|s| s.name()),
+                        "auto": summary.as_ref().map(|s| s.auto_label.clone()),
+                    }));
+                }
+            }
+        }
+        drop(store);
+
+        Ok(json!({
+            "id": speaker.id,
+            "speaker": {
+                "id": speaker.id,
+                "you": Some(speaker.id) == you,
+                "name": speaker.name(),
+                "auto": speaker.auto_label,
+                "languages": speaker.languages,
+                "first_seen": iso8601(speaker.created_at),
+            },
+            // The same tags `speakers.list` carries, lifted to the top level
+            // because the page has a chip for them and should not have to know
+            // they live on the speaker row.
+            "languages": speaker.languages,
+            "totals": {
+                "segments": totals.segments,
+                "speech_ms": ns_to_ms(totals.speech_ns),
+                "speech_ns": totals.speech_ns.to_string(),
+                "sessions": totals.sessions,
+                "threads": totals.threads,
+                "first_heard_ms": totals.first_ns.map(ns_to_ms),
+                "first_heard_ns": totals.first_ns.map(|v| v.to_string()),
+                "last_heard_ms": totals.last_ns.map(ns_to_ms),
+                "last_heard_ns": totals.last_ns.map(|v| v.to_string()),
+            },
+            "edges": edges
+                .iter()
+                .map(|e| json!({
+                    "speaker_id": e.speaker_id,
+                    "name": e.named_at.map(|_| e.display_name.clone()),
+                    "auto": e.auto_label,
+                    "threads": e.threads,
+                    // Seconds, as the brief's shape asks; `speech_ms` is the
+                    // same number a client can render without arithmetic.
+                    "seconds": e.speech_ns as f64 / 1e9,
+                    "speech_ms": ns_to_ms(e.speech_ns),
+                    "last_ns": e.last_ns.to_string(),
+                    "last_ms": ns_to_ms(e.last_ns),
+                    "roster_seconds": e.roster_ns.map(|ns| ns as f64 / 1e9),
+                }))
+                .collect::<Vec<_>>(),
+            "recent_threads": threads
+                .iter()
+                .map(|t| json!({
+                    "thread_id": t.id,
+                    "session": t.session_id,
+                    "started_ns": t.started_ns.to_string(),
+                    "started_ms": ns_to_ms(t.started_ns),
+                    "ended_ns": t.ended_ns.to_string(),
+                    "ended_ms": ns_to_ms(t.ended_ns),
+                    "segments": t.segments,
+                    "participants": t.participants
+                        .iter()
+                        .map(|p| names.get(p).cloned().unwrap_or(json!({"speaker_id": p})))
+                        .collect::<Vec<_>>(),
+                    "preview": t.preview,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// One conversation, in order. The rows are the ordinary segment shape, so
+    /// a client renders a thread with the code it already has for a transcript.
+    fn thread_get(&self, req: &Request) -> Result<Value, Error> {
+        let id = req.i64("id")?;
+        let store = self.store();
+        let summary = store
+            .thread_summary(id)
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::not_found(format!("no thread with id {id}")))?;
+        let rows = store.thread_rows(id).map_err(Error::from)?;
+        let mut participants = Vec::with_capacity(summary.participants.len());
+        for p in &summary.participants {
+            let summary = store.speaker_summary(*p).map_err(Error::from)?;
+            participants.push(json!({
+                "speaker_id": p,
+                "name": summary.as_ref().and_then(|s| s.name()),
+                "auto": summary.as_ref().map(|s| s.auto_label.clone()),
+            }));
+        }
+        drop(store);
+        Ok(json!({
+            "thread_id": summary.id,
+            "session": summary.session_id,
+            "started_ns": summary.started_ns.to_string(),
+            "started_ms": ns_to_ms(summary.started_ns),
+            "ended_ns": summary.ended_ns.to_string(),
+            "ended_ms": ns_to_ms(summary.ended_ns),
+            "participants": participants,
+            "preview": summary.preview,
+            "segments": rows.iter().map(segment_json).collect::<Vec<_>>(),
+        }))
     }
 
     // ---- segments --------------------------------------------------------
@@ -2586,5 +2731,199 @@ mod tests {
         // The timestamp is a string, like every other nanosecond value on the
         // wire: 1.8e18 does not survive a JSON number in a browser.
         assert_eq!(after["storage"]["measured_at_utc_ns"], json!("42"));
+    }
+
+    // ---- 0.6.2: the memory graph, Tier 1 ---------------------------------
+
+    /// A session of turns, threaded through the live path. `script` is one
+    /// speaker per turn, five seconds apart — the shape the threading rule is
+    /// specified on.
+    fn a_conversation(rig: &Rig, script: &[i64]) -> Vec<i64> {
+        const SEC: i64 = 1_000_000_000;
+        let store = rig.service.store();
+        let src = store.upsert_source("VRChat.exe", "VRChat.exe", 0).unwrap();
+        let sess = store.begin_session(src, 0).unwrap();
+        let cfg = crate::config::GraphConfig::default();
+        let mut ids = Vec::new();
+        for (i, speaker) in script.iter().enumerate() {
+            let at = i as i64 * 5 * SEC;
+            let seg = store
+                .insert_segment(sess, at, at + 3 * SEC, "segments/x.wav", 0)
+                .unwrap();
+            store
+                .set_segment_speaker(seg, Some(*speaker), Some(0.9))
+                .unwrap();
+            store
+                .set_segment_analysis(
+                    seg,
+                    &SegmentAnalysis {
+                        text: Some(format!("turn {i}")),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            crate::threads::assign(&store, &cfg, seg).unwrap();
+            ids.push(seg);
+        }
+        ids
+    }
+
+    #[test]
+    fn person_get_answers_the_whole_page_in_one_round_trip() {
+        let r = rig("person-get");
+        let (a, b, c) = {
+            let store = r.service.store();
+            let a = store.create_speaker("A", 0).unwrap();
+            store.rename_speaker(a, "Kira", 1).unwrap();
+            let b = store.create_speaker("B", 0).unwrap();
+            let c = store.create_speaker("C", 0).unwrap();
+            (a, b, c)
+        };
+        // A and B talk; C says one thing beside them, in their own thread.
+        a_conversation(&r, &[a, b, a, b, c]);
+
+        let p = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"person.get","params":{{"id":{a}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(p["id"], json!(a));
+        assert_eq!(p["speaker"]["name"], json!("Kira"));
+        assert_eq!(p["speaker"]["you"], json!(false));
+        assert_eq!(p["totals"]["segments"], json!(2));
+        assert_eq!(p["totals"]["sessions"], json!(1));
+        assert_eq!(p["totals"]["threads"], json!(1));
+        // Nanoseconds are strings on the wire; milliseconds are for rendering.
+        assert!(p["totals"]["speech_ns"].is_string());
+        assert!(p["totals"]["first_heard_ms"].is_number());
+
+        let edges = p["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1, "C was never in A's conversation");
+        assert_eq!(edges[0]["speaker_id"], json!(b));
+        assert_eq!(edges[0]["threads"], json!(1));
+        assert_eq!(edges[0]["seconds"], json!(6.0));
+        assert!(edges[0]["last_ns"].is_string());
+        // No roster in this database, so nothing is claimed about one.
+        assert_eq!(edges[0]["roster_seconds"], Value::Null);
+
+        let threads = p["recent_threads"].as_array().unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0]["preview"], json!("turn 0"));
+        let names: Vec<i64> = threads[0]["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["speaker_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(names, vec![a, b]);
+        assert_eq!(threads[0]["participants"][0]["name"], json!("Kira"));
+
+        // A voice that is not there is not found, rather than an empty page.
+        let e = call(&r, r#"{"id":2,"method":"person.get","params":{"id":9999}}"#).unwrap_err();
+        assert_eq!(e.code, "not_found");
+    }
+
+    #[test]
+    fn thread_get_returns_the_conversation_in_the_ordinary_segment_shape() {
+        let r = rig("thread-get");
+        let (a, b) = {
+            let store = r.service.store();
+            (
+                store.create_speaker("A", 0).unwrap(),
+                store.create_speaker("B", 0).unwrap(),
+            )
+        };
+        let ids = a_conversation(&r, &[a, b, a, b]);
+        let thread = {
+            let store = r.service.store();
+            store
+                .segment_row(ids[0])
+                .unwrap()
+                .unwrap()
+                .thread_id
+                .unwrap()
+        };
+
+        let t = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"thread.get","params":{{"id":{thread}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(t["thread_id"], json!(thread));
+        let segs = t["segments"].as_array().unwrap();
+        assert_eq!(
+            segs.iter()
+                .map(|s| s["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        // The ordinary shape, so a client renders it with the code it has —
+        // and every row names the thread it is in.
+        assert_eq!(segs[0]["thread"], json!(thread));
+        assert!(segs[0]["t_ns"].is_string());
+        assert_eq!(t["participants"].as_array().unwrap().len(), 2);
+
+        let e = call(&r, r#"{"id":2,"method":"thread.get","params":{"id":404}}"#).unwrap_err();
+        assert_eq!(e.code, "not_found");
+    }
+
+    #[test]
+    fn two_conversations_at_once_come_back_as_two() {
+        let r = rig("two-threads");
+        let (a, b, c, d) = {
+            let store = r.service.store();
+            (
+                store.create_speaker("A", 0).unwrap(),
+                store.create_speaker("B", 0).unwrap(),
+                store.create_speaker("C", 0).unwrap(),
+                store.create_speaker("D", 0).unwrap(),
+            )
+        };
+        a_conversation(&r, &[a, b, a, b, c, d, c, d]);
+
+        let p = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"person.get","params":{{"id":{a}}}}}"#),
+        )
+        .unwrap();
+        let edges: Vec<i64> = p["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["speaker_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            edges,
+            vec![b],
+            "sharing a room is not sharing a conversation"
+        );
+        assert_eq!(p["totals"]["threads"], json!(1));
+
+        let p = call(
+            &r,
+            &format!(r#"{{"id":2,"method":"person.get","params":{{"id":{c}}}}}"#),
+        )
+        .unwrap();
+        let edges: Vec<i64> = p["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["speaker_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(edges, vec![d]);
+    }
+
+    #[test]
+    fn a_transcript_row_names_the_conversation_it_belongs_to() {
+        let r = rig("segment-thread-field");
+        let a = {
+            let store = r.service.store();
+            store.create_speaker("A", 0).unwrap()
+        };
+        a_conversation(&r, &[a, a]);
+        let t = call(&r, r#"{"id":1,"method":"transcript","params":{}}"#).unwrap();
+        let segs = t["segments"].as_array().unwrap();
+        assert!(segs.iter().all(|s| s["thread"].is_i64()));
+        assert_eq!(segs[0]["thread"], segs[1]["thread"]);
     }
 }

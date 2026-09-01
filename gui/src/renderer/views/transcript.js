@@ -14,6 +14,10 @@ export function mount(root, ctx) {
   let follow = true;
   let filterSpeaker = null;
   let lastYou = store.mic.you_speaker;
+  // The conversation the view was sent to, if any. Subtle by design: it marks a
+  // span rather than hiding everything else, because the point of arriving at a
+  // conversation is to see it in the evening it happened in.
+  let highlightThread = null;
 
   const list = h('div', { class: 'seg-list', id: 'seg-list' });
   const card = h('div', { class: 'card' }, list);
@@ -100,16 +104,52 @@ export function mount(root, ctx) {
       return;
     }
     let day = null;
+    let thread = null;
     for (const seg of rows) {
       const d = fmtDay(seg.t_ms);
       if (d !== day) {
         day = d;
+        thread = null; // a new day is a new conversation whatever the ids say
         list.append(h('div', { class: 'day-sep', text: fmtDayLabel(seg.t_ms) }));
       }
+      const sep = threadSep(seg, thread);
+      if (sep) list.append(sep);
+      if (seg.thread != null) thread = seg.thread;
       list.append(segRow(seg));
     }
     updateCount();
     scrollToEnd(true);
+  }
+
+  /**
+   * The hairline where one conversation becomes another (docs/GRAPH.md).
+   *
+   * Only where threads exist: a row the daemon never threaded — anything older
+   * than 0.6.2 — carries no id and renders exactly as it always did, which is
+   * what keeps this additive rather than a change to every transcript ever
+   * captured. The names are the people in the new conversation, because "a
+   * conversation started" is only useful if it says whose.
+   */
+  function threadSep(seg, previous) {
+    if (seg.thread == null || seg.thread === previous) return null;
+    // The first thread of a page has nothing to be a boundary from.
+    if (previous == null && !list.querySelector('.seg')) return null;
+    const names = threadNames(seg.thread);
+    return h(
+      'div',
+      { class: 'thread-sep', dataset: { thread: String(seg.thread) } },
+      h('span', { class: 'thread-sep-label', text: names.length ? names.join(' · ') : 'another conversation' })
+    );
+  }
+
+  /** Who is in a thread, as far as the loaded window can see. */
+  function threadNames(threadId) {
+    const seen = [];
+    for (const s of store.segments) {
+      if (s.thread !== threadId || s.speaker == null) continue;
+      if (!seen.includes(s.speaker)) seen.push(s.speaker);
+    }
+    return seen.map((id) => speakerLabel(id));
   }
 
   function segRow(seg, isNew = false) {
@@ -122,8 +162,10 @@ export function mount(root, ctx) {
     const mine = isYou(seg.speaker);
     const color = speakerColor(seg.speaker);
     const row = h('div', {
-      class: `seg${uncertain ? ' uncertain' : ''}${mine ? ' you' : ''}${isNew ? ' new' : ''}${seg.corrected ? ' corrected' : ''}`,
-      dataset: { seg: String(seg.id) },
+      class: `seg${uncertain ? ' uncertain' : ''}${mine ? ' you' : ''}${isNew ? ' new' : ''}${seg.corrected ? ' corrected' : ''}${
+        highlightThread != null && seg.thread === highlightThread ? ' in-thread' : ''
+      }`,
+      dataset: { seg: String(seg.id), ...(seg.thread != null ? { thread: String(seg.thread) } : {}) },
       role: 'button',
       tabindex: '0',
       title: 'Click to reassign or correct this segment',
@@ -231,10 +273,16 @@ export function mount(root, ctx) {
         if (filterSpeaker != null && seg.speaker !== filterSpeaker) continue;
         const lastRow = list.querySelector('.seg:last-of-type');
         const lastSeg = lastRow ? store.segById.get(Number(lastRow.dataset.seg)) : null;
-        if (!lastSeg || fmtDay(lastSeg.t_ms) !== fmtDay(seg.t_ms)) {
+        const newDay = !lastSeg || fmtDay(lastSeg.t_ms) !== fmtDay(seg.t_ms);
+        if (newDay) {
           if (list.querySelector('.empty')) clear(list);
           list.append(h('div', { class: 'day-sep', text: fmtDayLabel(seg.t_ms) }));
         }
+        // The live feed crosses conversation boundaries too, and a separator
+        // that only ever appeared on a full repaint would be a boundary you
+        // could only see by leaving the view and coming back.
+        const sep = newDay ? null : threadSep(seg, lastSeg?.thread ?? null);
+        if (sep) list.append(sep);
         list.append(segRow(seg, true));
       }
       // The window is bounded (store.MAX_SEGMENTS); drop rows the model dropped.
@@ -308,6 +356,28 @@ export function mount(root, ctx) {
         last.scrollIntoView({ block: 'center', behavior: 'smooth' });
       }
       return { speaker: spId, rows: rows.length };
+    },
+    /**
+     * "Read this conversation", from a person page: the transcript lands on
+     * the thread with the speaker filter **cleared** and the thread's own span
+     * marked. Clearing is the whole point — you came to read what everybody
+     * said, and arriving filtered to one voice would answer a question nobody
+     * asked. The marking is deliberately quiet: a tinted rail down the span,
+     * not a colour that competes with the words.
+     */
+    focusThread(threadId) {
+      follow = false;
+      followBtn.setAttribute('aria-pressed', 'false');
+      followBtn.textContent = 'Follow';
+      highlightThread = threadId;
+      setFilter(null);
+      const rows = [...list.querySelectorAll(`.seg[data-thread="${threadId}"]`)];
+      for (const el of list.querySelectorAll('.seg.hit')) el.classList.remove('hit');
+      rows[0]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      // Nothing on screen means the conversation is older than the window the
+      // merge could reach; say so rather than leaving a still transcript.
+      if (!rows.length) toast('That conversation is outside the loaded window.', '');
+      return { thread: threadId, rows: rows.length };
     },
     refreshLiveChip,
   };

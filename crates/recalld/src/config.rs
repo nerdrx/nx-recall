@@ -267,6 +267,25 @@ impl Default for IdentityConfig {
     }
 }
 
+/// The memory graph (docs/GRAPH.md). Tier 1 only for now: conversation
+/// threads, which are derived deterministically from data already stored and
+/// therefore have exactly one knob — how long a silence ends a conversation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GraphConfig {
+    /// Silence, in seconds, after which the next turn starts a new
+    /// conversation rather than continuing the last one. Twenty is a long
+    /// pause in speech and a short one in an evening: below it the same people
+    /// are still talking, above it the room has moved on.
+    pub thread_gap_s: f32,
+}
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        Self { thread_gap_s: 20.0 }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -382,6 +401,7 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     pub models: ModelsConfig,
     pub identity: IdentityConfig,
+    pub graph: GraphConfig,
     pub socket: SocketConfig,
     pub roster: RosterConfig,
     pub retention: RetentionConfig,

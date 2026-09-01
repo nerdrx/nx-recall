@@ -29,6 +29,11 @@ const ALLOWED = new Set([
   // Reads only, both of them: which clips identify a voice, and one clip's
   // bytes so it can be played (docs/PROTOCOL.md, "Voice preview").
   'speakers.sample',
+  // The memory graph's Tier 1 (0.6.2, docs/GRAPH.md). Two reads: everything the
+  // person page shows about one voice, and one conversation's segments so the
+  // transcript can land on it. Both are additive and both are read-only.
+  'person.get',
+  'thread.get',
   'segments.audio',
   'segments.reassign',
   'segments.correct',

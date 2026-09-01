@@ -2,10 +2,10 @@
 
 **people ↔ topics ↔ promises ↔ dates — locally, or not at all.**
 
-Status: design. Scheduled after the 0.6.x batch (per-speaker languages, storage
-panel, grunt handling). Everything here obeys the hard constraints in
-[DESIGN.md](DESIGN.md) §0: no network at inference time, no torch, the user is
-the only subject, deletion cascades.
+Status: **Tier 1 shipped in 0.6.2** (conversation threads, co-presence edges,
+the person page); Tiers 2 and 3 are still design. Everything here obeys the hard
+constraints in [DESIGN.md](DESIGN.md) §0: no network at inference time, no
+torch, the user is the only subject, deletion cascades.
 
 ## Why a graph when FTS works
 
@@ -17,16 +17,48 @@ conversations.
 
 ## Three tiers, by trust
 
-### Tier 1 — derived, deterministic, always on
+### Tier 1 — derived, deterministic, always on — **shipped in 0.6.2**
 
 Pure SQL/code over data we already store. No models, no judgement calls.
 
 - **Conversation threads**: turn-taking adjacency (A,B,A,B interleaving from
-  the original brief) materialised as `threads(id)` + `segment_thread`.
-- **Co-presence edges**: `person_edges(a, b, sessions, seconds_together,
-  last_seen)` from sessions × roster × threads. Powers the person page's
-  "you two, over time."
-- **Talk-time and cadence per person**: already computable; becomes indexed.
+  the original brief) materialised as `threads(id)` + `segments.thread_id`
+  (schema v6). The rule lives in `crates/recalld/src/threads.rs` as a pure
+  function with a table of tests; it is documented there in full, including
+  what it gets wrong on purpose.
+
+  Three decisions worth keeping in one place:
+
+  - **Incremental, not a batch job.** Each turn is threaded as it is stored, so
+    the transcript a client is reading is already threaded. There is no pass
+    that has to have run.
+  - **A turn is threaded once.** A later rename, merge or reassignment does not
+    re-thread it. Which conversation a turn belonged to is a fact about the
+    clock and the room; re-deriving it on every relabel would make the same
+    transcript thread differently depending on when you looked at it.
+  - **The interleaved case is only recoverable once each conversation has a
+    rhythm.** Two threads that begin interleaved from their very first turns
+    carry no signal separating "C answered A" from "C started talking to
+    someone else"; they merge. Once each pair has taken a second turn, every
+    later turn sorts correctly — which is the case an evening's transcript is
+    actually made of.
+
+- **Co-presence edges**: **not** a stored table. `person.edges` turned out to be
+  a group-by over `segments` keyed on `thread_id`, cheap enough that a
+  `person_edges` cache would only have been a second thing that could be wrong;
+  the sketch above is superseded by covering indexes (`idx_segments_thread`,
+  `idx_segments_speaker_thread`), per this document's own rule that the graph is
+  an index and never the source of truth.
+
+  An edge means **a shared conversation, not a shared instance** — a public
+  lobby has forty people in it and you spoke to two. Its weight is how much the
+  *other* person spoke in the threads you shared (people take turns, so the
+  intersection of two speech timelines is near zero and says nothing). The
+  roster adds a column and never a row: `roster_seconds` is real co-presence
+  when both voices carry names the VRChat log wrote down, and `null` — not
+  zero — when either does not.
+
+- **Talk-time and cadence per person**: `person.get` totals, indexed.
 
 ### Tier 2 — extracted, rule-based, marked as such
 
@@ -83,11 +115,19 @@ it, and pre-conversation briefs ("last time: you owed her the shader link").
 
 ## Surfaces
 
-- **Person page**: the voice, shared history timeline, common topics, open
-  commitments both directions, co-presence sparkline.
+- **Person page** *(0.6.2)*: the voice, its totals, "people they talk with"
+  (each one a door to their own page), and the recent conversations — each of
+  which lands in the transcript at that conversation, with the speaker filter
+  *cleared*, because the point of opening a thread is to read what everybody
+  said. Common topics and open commitments join it at Tiers 2 and 3.
+  It is pushed state, not a fifth rail item: you arrive at a person from a
+  voice, and Back takes you where you came from.
 - **Commitments view**: candidate → confirmed → done/dismissed, due dates from
   time_refs. Confirmation is a human click; the tool never nags on a guess.
-- **Thread view in the transcript**: the interleaved lobby untangled.
+- **Thread view in the transcript** *(0.6.2)*: the interleaved lobby untangled —
+  a hairline where the conversation changes, naming who is in the new one. It
+  only appears where threads exist; rows older than threading render exactly as
+  they always did.
 
 ## Charter guards
 

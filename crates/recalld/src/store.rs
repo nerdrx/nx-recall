@@ -12,17 +12,24 @@
 //! so a wrong-language decode can be corrected rather than merely noticed) and
 //! two provenance columns on `segments`: `label_via`, how the speaker got
 //! there, and `lang_via`, how the language did.
+//! v6 adds `threads` and `segments.thread_id` — the memory graph's Tier 1
+//! (docs/GRAPH.md): which conversation a turn belongs to, derived
+//! deterministically from turn-taking adjacency (`crate::threads`). It is the
+//! only derived table in the schema, it is re-derivable from the transcript,
+//! and the migration backfills it by replaying the same rule the live path
+//! uses.
 //! Existing databases are migrated in place.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::embed::Embedding;
+use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -148,6 +155,10 @@ pub struct SegmentRow {
     /// How the speaker got here (`store::label_via`), so a client can distrust
     /// an inherited label without distrusting a matched one.
     pub label_via: Option<String>,
+    /// Which conversation this turn belongs to (v6). `None` on a row written
+    /// before threading existed and never backfilled, which a client renders
+    /// exactly as it always did.
+    pub thread_id: Option<i64>,
 }
 
 /// One candidate clip for naming a voice: enough to rank it, label it in a
@@ -313,6 +324,63 @@ impl SegmentFilter {
     }
 }
 
+/// What one person's page adds up to. Every number here is a `COUNT` or a
+/// `SUM` over live segments — nothing is stored, nothing is cached, and a
+/// deleted segment stops counting the moment it is deleted (DESIGN §0).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PersonTotals {
+    pub segments: i64,
+    pub speech_ns: i64,
+    /// Distinct capture sessions this voice was heard in.
+    pub sessions: i64,
+    /// Distinct conversation threads it took part in.
+    pub threads: i64,
+    /// First and last time it was heard at all. `None` on a voice whose every
+    /// segment has been deleted, which is a real state and not an error.
+    pub first_ns: Option<i64>,
+    pub last_ns: Option<i64>,
+}
+
+/// One co-presence edge: somebody this voice actually talks *with*.
+///
+/// Not a stored table (GRAPH.md sketched `person_edges`; the query turned out
+/// to be cheap enough that a cache would only be a way to be wrong). It is
+/// computed from threads, so it means "we were in the same conversation",
+/// which is a far stronger statement than "we were in the same instance".
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersonEdge {
+    pub speaker_id: i64,
+    pub display_name: String,
+    pub auto_label: String,
+    pub named_at: Option<i64>,
+    /// Conversations the two shared.
+    pub threads: i64,
+    /// How much the *other* person spoke in those conversations. Their speech,
+    /// not the overlap of two speech timelines: people take turns, so an
+    /// intersection would be near zero and would say nothing.
+    pub speech_ns: i64,
+    /// The last time they were in a conversation together.
+    pub last_ns: i64,
+    /// Seconds the two were in the same VRChat instance, from the roster —
+    /// `None` when either voice has no name that matches a roster entry, which
+    /// is the common case and is reported rather than guessed at.
+    pub roster_ns: Option<i64>,
+}
+
+/// One conversation, summarised for a list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadSummary {
+    pub id: i64,
+    pub session_id: i64,
+    pub started_ns: i64,
+    pub ended_ns: i64,
+    pub segments: i64,
+    /// Canonical speaker ids, most talkative first.
+    pub participants: Vec<i64>,
+    /// The first thing anybody said in it, as the list's one line of content.
+    pub preview: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscriptRow {
     pub segment_id: i64,
@@ -410,12 +478,16 @@ impl Store {
 
         let migrating = current == Some(1);
         self.apply_v2()?;
-        self.apply_v3()?;
-        self.apply_v4()?;
-        self.apply_v5()?;
         if migrating {
             // Backfill the index for rows that predate it. New rows arrive
             // through the triggers.
+            //
+            // Before the later migrations and not after, which is load-bearing:
+            // the v2 triggers turn every UPDATE of a segment into a delete and
+            // an insert against this external-content index, and doing that to
+            // an index that has never been populated corrupts it. v5's
+            // provenance backfill and v6's threading backfill are both such
+            // updates, so the index has to be real before they run.
             self.conn
                 .execute(
                     "INSERT INTO segments_fts(segments_fts) VALUES('rebuild')",
@@ -423,6 +495,10 @@ impl Store {
                 )
                 .context("rebuilding the transcript index")?;
         }
+        self.apply_v3()?;
+        self.apply_v4()?;
+        self.apply_v5()?;
+        self.apply_v6()?;
 
         match current {
             None => {
@@ -665,6 +741,109 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS idx_segments_label_via ON segments(label_via);",
         )?;
         Ok(())
+    }
+
+    /// Everything schema v6 adds, written so it is a no-op on a v6 database.
+    ///
+    /// One table and one column: which conversation a turn belongs to. The
+    /// indexes are the whole performance story of the person page — every graph
+    /// query below is a group-by over `segments` keyed on `thread_id` or on
+    /// `speaker_id`, and GRAPH.md's rule is that a slow query gets a covering
+    /// index rather than a cache, because a cache of something derived is just
+    /// a second thing that can be wrong.
+    ///
+    /// The backfill replays `crate::threads` over every existing session in
+    /// time order, so a database threaded on the way up is identical to one
+    /// threaded turn by turn as it was captured.
+    fn apply_v6(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS threads (
+                 id         INTEGER PRIMARY KEY,
+                 session_id INTEGER NOT NULL REFERENCES sessions(id),
+                 started_ns INTEGER NOT NULL,
+                 ended_ns   INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_threads_session
+                 ON threads(session_id, ended_ns);",
+        )?;
+        let fresh = self.add_column_if_missing("segments", "thread_id", "INTEGER")?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_segments_thread
+                 ON segments(thread_id, t_start_ns);
+             -- The threading write path asks one question per stored turn:
+             -- 'what has been said in this session lately'. Without this it is
+             -- a scan of every segment ever captured.
+             CREATE INDEX IF NOT EXISTS idx_segments_session_start
+                 ON segments(session_id, t_start_ns);
+             -- person.edges groups a person's threads by the other voices in
+             -- them; this is the covering index for that group-by.
+             CREATE INDEX IF NOT EXISTS idx_segments_speaker_thread
+                 ON segments(speaker_id, thread_id);",
+        )?;
+        if fresh {
+            self.backfill_threads()?;
+        }
+        Ok(())
+    }
+
+    /// Thread every session's existing segments by replaying the live rule.
+    ///
+    /// Deliberately not clever: sessions in id order, turns in time order, the
+    /// same [`Threader`] the pipeline uses. A backfill that took a shortcut
+    /// would be a second implementation of the rule, and two implementations of
+    /// a rule are two rules.
+    fn backfill_threads(&self) -> Result<usize> {
+        let gap_s = crate::config::GraphConfig::default().thread_gap_s;
+        let sessions: Vec<i64> = self
+            .conn
+            .prepare("SELECT id FROM sessions ORDER BY id ASC")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let tx = self.conn.unchecked_transaction()?;
+        let mut threaded = 0usize;
+        for session_id in sessions {
+            let turns: Vec<(i64, Turn)> = tx
+                .prepare(
+                    "SELECT id, t_start_ns, t_end_ns, speaker_id FROM segments
+                     WHERE session_id = ?1 AND deleted_at IS NULL
+                     ORDER BY t_start_ns ASC, id ASC",
+                )?
+                .query_map(params![session_id], |r| {
+                    Ok((
+                        r.get(0)?,
+                        Turn {
+                            t_start_ns: r.get(1)?,
+                            t_end_ns: r.get(2)?,
+                            speaker: r.get(3)?,
+                        },
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+
+            let mut threader = Threader::new(gap_s);
+            for (segment_id, turn) in turns {
+                let thread_id = threader.push(&turn, |t| -> Result<i64> {
+                    tx.execute(
+                        "INSERT INTO threads (session_id, started_ns, ended_ns)
+                         VALUES (?1, ?2, ?3)",
+                        params![session_id, t.t_start_ns, t.t_end_ns],
+                    )?;
+                    Ok(tx.last_insert_rowid())
+                })?;
+                tx.execute(
+                    "UPDATE segments SET thread_id = ?2 WHERE id = ?1",
+                    params![segment_id, thread_id],
+                )?;
+                tx.execute(
+                    "UPDATE threads SET ended_ns = MAX(ended_ns, ?2) WHERE id = ?1",
+                    params![thread_id, turn.t_end_ns],
+                )?;
+                threaded += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(threaded)
     }
 
     /// Returns whether the column had to be added, so a caller can backfill it.
@@ -1621,7 +1800,7 @@ impl Store {
     const SEGMENT_COLUMNS: &'static str =
         "g.id, g.session_id, sc.match_key, g.t_start_ns, g.t_end_ns,
          sp.canonical_id, sp.display_name, g.text, g.overlap_frac, g.match_score, g.audio_path,
-         g.lang, g.label_via";
+         g.lang, g.label_via, g.thread_id";
 
     fn segment_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentRow> {
         Ok(SegmentRow {
@@ -1638,6 +1817,7 @@ impl Store {
             audio_path: r.get(10)?,
             lang: r.get(11)?,
             label_via: r.get(12)?,
+            thread_id: r.get(13)?,
         })
     }
 
@@ -1763,7 +1943,7 @@ impl Store {
                 |r| {
                     Ok(SearchHit {
                         row: Self::segment_row_from(r)?,
-                        snippet: r.get(13)?,
+                        snippet: r.get(14)?,
                     })
                 },
             )?
@@ -1893,6 +2073,15 @@ impl Store {
                 orphan_prototypes.execute(params![id])?;
                 n += drop_segment.execute(params![id])?;
             }
+            // A thread is an index into the transcript and nothing else, so a
+            // thread whose last row just went is not an empty conversation —
+            // it is not a conversation (DESIGN §0's deletion rule).
+            tx.execute(
+                "DELETE FROM threads WHERE NOT EXISTS (
+                     SELECT 1 FROM segments g WHERE g.thread_id = threads.id
+                 )",
+                [],
+            )?;
         }
         tx.commit()?;
         Ok(n)
@@ -1943,6 +2132,378 @@ impl Store {
     pub fn vacuum(&self) -> Result<()> {
         self.conn.execute_batch("VACUUM")?;
         Ok(())
+    }
+
+    // ---- conversation threads (v6, GRAPH.md Tier 1) ----------------------
+
+    /// The session's threads that a turn starting at `at_ns` could still
+    /// continue, with the state [`crate::threads::place`] reads.
+    ///
+    /// Threading is incremental — one question per stored turn, never a batch
+    /// job — so this has to be cheap: one indexed range over `threads`, then
+    /// one bounded read of each candidate's recent turns. In practice a session
+    /// has one or two open threads at any moment.
+    pub fn open_threads(
+        &self,
+        session_id: i64,
+        at_ns: i64,
+        gap_ns: i64,
+    ) -> Result<Vec<OpenThread>> {
+        let since = at_ns.saturating_sub(gap_ns);
+        let ids: Vec<(i64, i64)> = self
+            .conn
+            .prepare(
+                "SELECT id, ended_ns FROM threads
+                 WHERE session_id = ?1 AND ended_ns >= ?2
+                 ORDER BY ended_ns DESC, id DESC",
+            )?
+            .query_map(params![session_id, since], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut out = Vec::with_capacity(ids.len());
+        for (id, last_ns) in ids {
+            // Turns and distinct voices decide whether the thread has found a
+            // rhythm; only labelled turns count, because an anonymous one says
+            // nothing about who is in the conversation.
+            let turns: i64 = self.conn.query_row(
+                "SELECT COUNT(speaker_id) FROM segments
+                 WHERE thread_id = ?1 AND deleted_at IS NULL",
+                params![id],
+                |r| r.get(0),
+            )?;
+            let voices: BTreeSet<i64> = self
+                .conn
+                .prepare(
+                    "SELECT DISTINCT speaker_id FROM segments
+                     WHERE thread_id = ?1 AND speaker_id IS NOT NULL AND deleted_at IS NULL",
+                )?
+                .query_map(params![id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            // The recent participants, newest first. Read a small window and
+            // de-duplicate here: SQLite cannot both DISTINCT and ORDER BY a
+            // column it is not selecting, and the window is tiny.
+            let mut recent: Vec<i64> = Vec::new();
+            let mut seen = BTreeSet::new();
+            let window: Vec<i64> = self
+                .conn
+                .prepare(
+                    "SELECT speaker_id FROM segments
+                     WHERE thread_id = ?1 AND speaker_id IS NOT NULL AND deleted_at IS NULL
+                     ORDER BY t_start_ns DESC, id DESC LIMIT 64",
+                )?
+                .query_map(params![id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for speaker in window {
+                if seen.insert(speaker) {
+                    recent.push(speaker);
+                }
+                if recent.len() == RECENT_SPEAKERS {
+                    break;
+                }
+            }
+            out.push(OpenThread {
+                id,
+                last_ns,
+                recent,
+                voices,
+                turns: turns as usize,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Open a conversation.
+    pub fn create_thread(&self, session_id: i64, started_ns: i64, ended_ns: i64) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO threads (session_id, started_ns, ended_ns) VALUES (?1, ?2, ?3)",
+            params![session_id, started_ns, ended_ns],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Put a turn in a conversation and extend the conversation to cover it.
+    pub fn set_segment_thread(&self, segment_id: i64, thread_id: i64, t_end_ns: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let n = tx.execute(
+            "UPDATE segments SET thread_id = ?2 WHERE id = ?1",
+            params![segment_id, thread_id],
+        )?;
+        if n == 0 {
+            bail!("no segment with id {segment_id}");
+        }
+        tx.execute(
+            "UPDATE threads SET ended_ns = MAX(ended_ns, ?2) WHERE id = ?1",
+            params![thread_id, t_end_ns],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The threading rule's view of one stored segment.
+    pub fn segment_turn(&self, segment_id: i64) -> Result<Option<(i64, Turn)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT session_id, t_start_ns, t_end_ns, speaker_id FROM segments
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                params![segment_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        Turn {
+                            t_start_ns: r.get(1)?,
+                            t_end_ns: r.get(2)?,
+                            speaker: r.get(3)?,
+                        },
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
+    /// One conversation, in order — what `thread.get` returns.
+    pub fn thread_rows(&self, thread_id: i64) -> Result<Vec<SegmentRow>> {
+        let sql = format!(
+            "SELECT {}
+             FROM segments g
+             JOIN sessions ss ON ss.id = g.session_id
+             JOIN sources sc ON sc.id = ss.source_id
+             LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             WHERE g.thread_id = ?1 AND g.deleted_at IS NULL
+             ORDER BY g.t_start_ns ASC, g.id ASC",
+            Self::SEGMENT_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![thread_id], Self::segment_row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// One conversation's shape, without its words.
+    pub fn thread_summary(&self, thread_id: i64) -> Result<Option<ThreadSummary>> {
+        let base = self
+            .conn
+            .query_row(
+                "SELECT id, session_id, started_ns, ended_ns FROM threads WHERE id = ?1",
+                params![thread_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, session_id, started_ns, ended_ns)) = base else {
+            return Ok(None);
+        };
+        Ok(Some(ThreadSummary {
+            id,
+            session_id,
+            started_ns,
+            ended_ns,
+            segments: self.conn.query_row(
+                "SELECT COUNT(*) FROM segments WHERE thread_id = ?1 AND deleted_at IS NULL",
+                params![id],
+                |r| r.get(0),
+            )?,
+            participants: self.thread_participants(id)?,
+            preview: self.thread_preview(id)?,
+        }))
+    }
+
+    /// Who spoke in a conversation, most talkative first — the order a person
+    /// reads a participant list in.
+    pub fn thread_participants(&self, thread_id: i64) -> Result<Vec<i64>> {
+        let rows = self
+            .conn
+            .prepare(
+                "SELECT sp.canonical_id, SUM(g.t_end_ns - g.t_start_ns) AS spoke
+                 FROM segments g
+                 JOIN speaker_resolved sp ON sp.id = g.speaker_id
+                 WHERE g.thread_id = ?1 AND g.deleted_at IS NULL
+                 GROUP BY sp.canonical_id
+                 ORDER BY spoke DESC, sp.canonical_id ASC",
+            )?
+            .query_map(params![thread_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(rows)
+    }
+
+    /// The first thing anybody said in a conversation. A preview is a handle,
+    /// not a summary — Tier 1 does not summarise, it points.
+    fn thread_preview(&self, thread_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT g.text FROM segments g
+                 WHERE g.thread_id = ?1 AND g.deleted_at IS NULL
+                   AND g.speaker_id IS NOT NULL AND g.text IS NOT NULL AND g.text <> ''
+                 ORDER BY g.t_start_ns ASC, g.id ASC LIMIT 1",
+                params![thread_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Conversations this voice took part in, newest first.
+    pub fn person_threads(&self, speaker_id: i64, limit: usize) -> Result<Vec<ThreadSummary>> {
+        let ids: Vec<i64> = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT g.thread_id FROM segments g
+                 JOIN speaker_resolved sp ON sp.id = g.speaker_id
+                 JOIN threads t ON t.id = g.thread_id
+                 WHERE sp.canonical_id = ?1 AND g.deleted_at IS NULL
+                 ORDER BY t.started_ns DESC, t.id DESC
+                 LIMIT ?2",
+            )?
+            .query_map(params![speaker_id, limit as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(s) = self.thread_summary(id)? {
+                out.push(s);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Everything one voice adds up to.
+    pub fn person_totals(&self, speaker_id: i64) -> Result<PersonTotals> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(g.t_end_ns - g.t_start_ns), 0),
+                    COUNT(DISTINCT g.session_id),
+                    COUNT(DISTINCT g.thread_id),
+                    MIN(g.t_start_ns),
+                    MAX(g.t_end_ns)
+             FROM segments g
+             JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             WHERE sp.canonical_id = ?1 AND g.deleted_at IS NULL",
+            params![speaker_id],
+            |r| {
+                Ok(PersonTotals {
+                    segments: r.get(0)?,
+                    speech_ns: r.get(1)?,
+                    sessions: r.get(2)?,
+                    threads: r.get(3)?,
+                    first_ns: r.get(4)?,
+                    last_ns: r.get(5)?,
+                })
+            },
+        )?)
+    }
+
+    /// Who this voice actually talks *with*: the other voices in the
+    /// conversations it took part in, ordered by how much of a habit it is.
+    ///
+    /// Sharing an instance is not a relationship — a VRChat public lobby has
+    /// forty people in it and you spoke to two. Sharing a *thread* is, which is
+    /// why this is computed from threads and why the roster only ever adds a
+    /// column, never a row.
+    pub fn person_edges(&self, speaker_id: i64) -> Result<Vec<PersonEdge>> {
+        let mut edges: Vec<PersonEdge> = self
+            .conn
+            .prepare(
+                "WITH mine AS (
+                     SELECT DISTINCT g.thread_id AS tid
+                     FROM segments g
+                     JOIN speaker_resolved sp ON sp.id = g.speaker_id
+                     WHERE sp.canonical_id = ?1
+                       AND g.thread_id IS NOT NULL AND g.deleted_at IS NULL
+                 )
+                 SELECT other.canonical_id,
+                        s.display_name,
+                        COALESCE(s.auto_label, s.display_name),
+                        s.named_at,
+                        COUNT(DISTINCT g.thread_id),
+                        COALESCE(SUM(g.t_end_ns - g.t_start_ns), 0),
+                        MAX(g.t_end_ns)
+                 FROM segments g
+                 JOIN mine ON mine.tid = g.thread_id
+                 JOIN speaker_resolved other ON other.id = g.speaker_id
+                 JOIN speakers s ON s.id = other.canonical_id
+                 WHERE g.deleted_at IS NULL AND other.canonical_id <> ?1
+                 GROUP BY other.canonical_id
+                 ORDER BY 5 DESC, 6 DESC, 1 ASC",
+            )?
+            .query_map(params![speaker_id], |r| {
+                Ok(PersonEdge {
+                    speaker_id: r.get(0)?,
+                    display_name: r.get(1)?,
+                    auto_label: r.get(2)?,
+                    named_at: r.get(3)?,
+                    threads: r.get(4)?,
+                    speech_ns: r.get(5)?,
+                    last_ns: r.get(6)?,
+                    roster_ns: None,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // The roster column, for the voices that can be linked to a name the
+        // VRChat log wrote down. Most cannot, and `None` says so.
+        let mine = self.roster_intervals(speaker_id)?;
+        if !mine.is_empty() {
+            for edge in &mut edges {
+                let theirs = self.roster_intervals(edge.speaker_id)?;
+                if theirs.is_empty() {
+                    continue;
+                }
+                edge.roster_ns = Some(overlap_ns(&mine, &theirs));
+            }
+        }
+        Ok(edges)
+    }
+
+    /// When a voice's *name* was present in a VRChat instance, per the roster.
+    ///
+    /// The link is the display name and nothing else: the roster knows names,
+    /// the voicebank knows voices, and the only honest bridge between them is
+    /// that the user typed the same string. An unnamed voice has no intervals,
+    /// which is why `roster_ns` is so often null.
+    fn roster_intervals(&self, speaker_id: i64) -> Result<Vec<(i64, i64)>> {
+        let name: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT s.display_name FROM speakers s
+                 JOIN speaker_resolved sp ON sp.canonical_id = s.id
+                 WHERE sp.id = ?1 AND s.named_at IS NOT NULL",
+                params![speaker_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(name) = name else {
+            return Ok(Vec::new());
+        };
+        let open_end = crate::clock::utc_now_ns();
+        let rows = self
+            .conn
+            .prepare(
+                "SELECT joined_at_utc_ns, COALESCE(left_at_utc_ns, ?2)
+                 FROM session_roster WHERE display_name = ?1
+                 ORDER BY joined_at_utc_ns ASC",
+            )?
+            .query_map(params![name, open_end], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Threads with nothing live left in them. A thread is an index into the
+    /// transcript, so when the transcript goes the index goes with it — DESIGN
+    /// §0's deletion rule, applied to the one derived table the schema has.
+    pub fn prune_empty_threads(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM threads WHERE NOT EXISTS (
+                 SELECT 1 FROM segments g WHERE g.thread_id = threads.id
+             )",
+            [],
+        )?)
     }
 
     // ---- manual labelling ------------------------------------------------
@@ -2357,6 +2918,26 @@ impl Store {
     }
 }
 
+/// Total time two sets of half-open intervals are both running.
+///
+/// Both are sorted by start, so one pass with two cursors settles it. Roster
+/// rows are few per person and this is called once per edge, so the honest
+/// linear thing is also the fast thing.
+fn overlap_ns(a: &[(i64, i64)], b: &[(i64, i64)]) -> i64 {
+    let (mut i, mut j, mut total) = (0usize, 0usize, 0i64);
+    while i < a.len() && j < b.len() {
+        let lo = a[i].0.max(b[j].0);
+        let hi = a[i].1.min(b[j].1);
+        total += (hi - lo).max(0);
+        if a[i].1 < b[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2636,6 +3217,81 @@ mod tests {
         );
         assert_eq!(s.you_speaker_id().unwrap(), Some(you));
         assert_eq!(s.speaker_languages(you).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The v6 backfill has one job and it is the whole feature: a database
+    /// captured before threading existed must come up threaded exactly as it
+    /// would have been had every turn been threaded as it arrived.
+    #[test]
+    fn a_v5_database_is_threaded_on_the_way_up() {
+        let dir = std::env::temp_dir().join(format!("nx-recall-mig6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let sec = 1_000_000_000i64;
+        let mut ids: Vec<i64> = Vec::new();
+        {
+            // A v5-shaped database: the same interleaving the pure rule is
+            // tested on, written the way 0.6.1 would have written it.
+            let s = Store::open(&dir).unwrap();
+            let src = s.upsert_source("VRChat.exe", "VRChat.exe", 1).unwrap();
+            let sess = s.begin_session(src, 0).unwrap();
+            let a = s.create_speaker("A", 1).unwrap();
+            let b = s.create_speaker("B", 1).unwrap();
+            let c = s.create_speaker("C", 1).unwrap();
+            let d = s.create_speaker("D", 1).unwrap();
+            for (i, sp) in [a, b, a, b, c, d, c, d].iter().enumerate() {
+                let at = i as i64 * 5 * sec;
+                let id = s
+                    .insert_segment(sess, at, at + 3 * sec, "x.wav", 0)
+                    .unwrap();
+                s.set_segment_speaker(id, Some(*sp), Some(0.8)).unwrap();
+                ids.push(id);
+            }
+            s.conn
+                .execute_batch(
+                    "DROP INDEX IF EXISTS idx_segments_thread;
+                     DROP INDEX IF EXISTS idx_segments_session_start;
+                     DROP INDEX IF EXISTS idx_segments_speaker_thread;
+                     DROP TABLE threads;
+                     ALTER TABLE segments DROP COLUMN thread_id;
+                     UPDATE schema_version SET version = 5;",
+                )
+                .unwrap();
+        }
+
+        let s = Store::open(&dir).unwrap();
+        let threads: Vec<i64> = ids
+            .iter()
+            .map(|id| s.segment_row(*id).unwrap().unwrap().thread_id.unwrap())
+            .collect();
+        assert_eq!(
+            threads[0], threads[3],
+            "A and B's four turns are one conversation"
+        );
+        assert_eq!(
+            threads[4], threads[7],
+            "C and D's four turns are another one"
+        );
+        assert_ne!(
+            threads[0], threads[4],
+            "two pairs talking past each other are not one conversation"
+        );
+        let n: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+
+        // Re-opening does not thread anything twice: the column exists now, so
+        // the backfill does not run again.
+        drop(s);
+        let s = Store::open(&dir).unwrap();
+        let again: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(again, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3917,5 +4573,254 @@ mod tests {
         assert_eq!(s.empty_unlabelled_older_than(1_000).unwrap().len(), 1);
         // Nothing before the cutoff.
         assert!(s.empty_unlabelled_older_than(50).unwrap().is_empty());
+    }
+
+    // ---- the memory graph, Tier 1 (v6) -----------------------------------
+
+    const SEC: i64 = 1_000_000_000;
+
+    /// A session with `script` turns, one every five seconds, threaded through
+    /// the live path exactly as the pipeline threads them. Returns the segment
+    /// ids in order.
+    fn a_threaded_session(s: &Store, script: &[Option<i64>]) -> (i64, Vec<i64>) {
+        let src = s.upsert_source("VRChat.exe", "VRChat.exe", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let cfg = crate::config::GraphConfig::default();
+        let mut ids = Vec::new();
+        for (i, sp) in script.iter().enumerate() {
+            let at = i as i64 * 5 * SEC;
+            let id = s
+                .insert_segment(sess, at, at + 3 * SEC, "x.wav", 0)
+                .unwrap();
+            if let Some(sp) = sp {
+                s.set_segment_speaker(id, Some(*sp), Some(0.8)).unwrap();
+            }
+            crate::threads::assign(s, &cfg, id).unwrap();
+            ids.push(id);
+        }
+        (sess, ids)
+    }
+
+    fn thread_of(s: &Store, segment_id: i64) -> i64 {
+        s.segment_row(segment_id)
+            .unwrap()
+            .unwrap()
+            .thread_id
+            .unwrap()
+    }
+
+    #[test]
+    fn threading_a_live_session_matches_the_rule_it_is_written_from() {
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let b = s.create_speaker("B", 1).unwrap();
+        let c = s.create_speaker("C", 1).unwrap();
+        let d = s.create_speaker("D", 1).unwrap();
+        let (_, ids) = a_threaded_session(
+            &s,
+            &[
+                Some(a),
+                Some(b),
+                Some(a),
+                Some(b),
+                Some(c),
+                Some(d),
+                Some(c),
+                Some(d),
+            ],
+        );
+        let t: Vec<i64> = ids.iter().map(|id| thread_of(&s, *id)).collect();
+        assert_eq!(t[0], t[1]);
+        assert_eq!(t[0], t[3]);
+        assert_eq!(t[4], t[7]);
+        assert_ne!(t[0], t[4]);
+
+        // The thread rows carry the span of what is in them, which is what
+        // makes "open" answerable without touching segments.
+        let first = s.thread_summary(t[0]).unwrap().unwrap();
+        assert_eq!(first.started_ns, 0);
+        assert_eq!(first.ended_ns, 18 * SEC);
+        assert_eq!(first.segments, 4);
+        assert_eq!(first.participants.len(), 2);
+    }
+
+    #[test]
+    fn a_threads_rows_come_back_in_order_with_a_preview() {
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let b = s.create_speaker("B", 1).unwrap();
+        let (_, ids) = a_threaded_session(&s, &[Some(a), Some(b), Some(a)]);
+        for (i, id) in ids.iter().enumerate() {
+            s.correct_segment_text(*id, &format!("line {i}")).unwrap();
+        }
+        let tid = thread_of(&s, ids[0]);
+        let rows = s.thread_rows(tid).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            ids,
+            "a conversation reads in the order it happened"
+        );
+        assert_eq!(
+            s.thread_summary(tid).unwrap().unwrap().preview.as_deref(),
+            Some("line 0")
+        );
+    }
+
+    /// The person page's headline claim, on a session built to make it
+    /// falsifiable: A talks with B constantly and with C once.
+    #[test]
+    fn person_edges_rank_the_people_you_actually_talk_with() {
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let b = s.create_speaker("B", 1).unwrap();
+        let c = s.create_speaker("C", 1).unwrap();
+
+        let src = s.upsert_source("VRChat.exe", "VRChat.exe", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let cfg = crate::config::GraphConfig::default();
+        let mut at = 0i64;
+        let add = |at: &mut i64, speaker: i64, seconds: i64| {
+            let id = s
+                .insert_segment(sess, *at, *at + seconds * SEC, "x.wav", 0)
+                .unwrap();
+            s.set_segment_speaker(id, Some(speaker), Some(0.8)).unwrap();
+            crate::threads::assign(&s, &cfg, id).unwrap();
+            *at += (seconds + 2) * SEC;
+            id
+        };
+        // Three A-B conversations…
+        for _ in 0..3 {
+            add(&mut at, a, 3);
+            add(&mut at, b, 3);
+            add(&mut at, a, 3);
+            add(&mut at, b, 3);
+            at += 60 * SEC; // past the gap: a new conversation each time
+        }
+        // …and one short A-C one.
+        add(&mut at, a, 3);
+        add(&mut at, c, 2);
+
+        let edges = s.person_edges(a).unwrap();
+        assert_eq!(
+            edges.iter().map(|e| e.speaker_id).collect::<Vec<_>>(),
+            vec![b, c],
+            "the habit outranks the one-off"
+        );
+        assert_eq!(edges[0].threads, 3);
+        assert_eq!(edges[1].threads, 1);
+        assert_eq!(
+            edges[0].speech_ns,
+            6 * 3 * SEC,
+            "an edge counts what the OTHER person said in the shared threads"
+        );
+        assert_eq!(edges[1].speech_ns, 2 * SEC);
+        assert!(edges[0].last_ns < edges[1].last_ns);
+        // Nothing in the roster, so nothing is claimed about the roster.
+        assert!(edges.iter().all(|e| e.roster_ns.is_none()));
+
+        // …and it reads the same from the other end.
+        let from_c = s.person_edges(c).unwrap();
+        assert_eq!(
+            from_c.iter().map(|e| e.speaker_id).collect::<Vec<_>>(),
+            vec![a]
+        );
+
+        let totals = s.person_totals(a).unwrap();
+        assert_eq!(totals.segments, 7);
+        assert_eq!(totals.threads, 4);
+        assert_eq!(totals.sessions, 1);
+        assert_eq!(totals.first_ns, Some(0));
+    }
+
+    #[test]
+    fn an_edge_carries_roster_seconds_only_when_both_names_are_in_the_log() {
+        let s = store();
+        let kira = s.create_speaker("Kira", 1).unwrap();
+        s.rename_speaker(kira, "Kira", 1).unwrap();
+        let ash = s.create_speaker("Ash", 1).unwrap();
+        s.rename_speaker(ash, "Ash", 1).unwrap();
+        let nameless = s.create_speaker("Speaker_09", 1).unwrap();
+        // All four turns in one conversation: the newcomers arrive before
+        // anybody has taken a second turn, so nobody starts a thread of their
+        // own and Kira shares an edge with both.
+        a_threaded_session(
+            &s,
+            &[Some(kira), Some(nameless), Some(ash), Some(kira), Some(ash)],
+        );
+
+        // Kira was in the instance for a minute; Ash joined halfway.
+        s.roster_join(Some("wrld_x"), Some("1"), "Kira", 0).unwrap();
+        s.roster_leave("Kira", 60 * SEC).unwrap();
+        s.roster_join(Some("wrld_x"), Some("1"), "Ash", 30 * SEC)
+            .unwrap();
+        s.roster_leave("Ash", 90 * SEC).unwrap();
+
+        let edges = s.person_edges(kira).unwrap();
+        let to_ash = edges.iter().find(|e| e.speaker_id == ash).unwrap();
+        assert_eq!(
+            to_ash.roster_ns,
+            Some(30 * SEC),
+            "the half-minute both were in the instance"
+        );
+        let to_nameless = edges.iter().find(|e| e.speaker_id == nameless).unwrap();
+        assert_eq!(
+            to_nameless.roster_ns, None,
+            "an unnamed voice cannot be linked to a roster line, and says so"
+        );
+    }
+
+    #[test]
+    fn a_persons_recent_conversations_are_newest_first() {
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let b = s.create_speaker("B", 1).unwrap();
+        let (_, ids) = a_threaded_session(&s, &[Some(a), Some(b), Some(a), Some(b)]);
+        let src = s.upsert_source("VRChat.exe", "VRChat.exe", 1).unwrap();
+        let sess2 = s.begin_session(src, 0).unwrap();
+        let cfg = crate::config::GraphConfig::default();
+        let later = s
+            .insert_segment(sess2, 500 * SEC, 503 * SEC, "y.wav", 0)
+            .unwrap();
+        s.set_segment_speaker(later, Some(a), Some(0.8)).unwrap();
+        crate::threads::assign(&s, &cfg, later).unwrap();
+
+        let recent = s.person_threads(a, 10).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].id, thread_of(&s, later), "newest first");
+        assert_eq!(recent[1].id, thread_of(&s, ids[0]));
+        assert_eq!(s.person_threads(a, 1).unwrap().len(), 1, "the limit holds");
+    }
+
+    #[test]
+    fn deleting_the_last_row_of_a_conversation_deletes_the_conversation() {
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let b = s.create_speaker("B", 1).unwrap();
+        let (_, ids) = a_threaded_session(&s, &[Some(a), Some(b)]);
+        let tid = thread_of(&s, ids[0]);
+        assert!(s.thread_summary(tid).unwrap().is_some());
+
+        // A soft delete keeps the thread — the rows are still undoable.
+        s.soft_delete_segments(&ids, 10).unwrap();
+        assert!(s.thread_summary(tid).unwrap().is_some());
+        assert_eq!(s.thread_summary(tid).unwrap().unwrap().segments, 0);
+        assert!(s.person_edges(a).unwrap().is_empty());
+
+        // The purge takes the index with the transcript.
+        s.purge_segments(&ids).unwrap();
+        assert!(s.thread_summary(tid).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unlabelled_turn_still_lands_in_the_conversation_around_it() {
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let b = s.create_speaker("B", 1).unwrap();
+        let (_, ids) = a_threaded_session(&s, &[Some(a), Some(b), None, Some(a)]);
+        let tid = thread_of(&s, ids[0]);
+        assert_eq!(thread_of(&s, ids[2]), tid);
+        assert_eq!(thread_of(&s, ids[3]), tid);
+        // …and it is not a participant, because nobody knows who it was.
+        assert_eq!(s.thread_participants(tid).unwrap(), vec![a, b]);
     }
 }

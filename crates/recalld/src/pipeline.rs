@@ -509,6 +509,15 @@ impl Pipeline {
                 .store
                 .lock()
                 .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
+            // Which conversation this turn belongs to (GRAPH.md Tier 1).
+            // Between the analysis and the broadcast on purpose: the speaker
+            // is what the rule reads, and the event has to carry the thread or
+            // every client would have to re-query to draw one separator. A
+            // threading failure is logged and the turn keeps its transcript —
+            // a derived index is never allowed to cost a recording.
+            if let Err(e) = crate::threads::assign(&store, &self.cfg.graph, segment_id) {
+                warn!(segment_id, "could not thread a segment: {e:#}");
+            }
             publish_segment(&self.bus, &store, segment_id);
             for id in also_changed {
                 publish_segment(&self.bus, &store, id);

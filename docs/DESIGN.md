@@ -241,6 +241,15 @@ every row), with these additions:
   `re-decode` | `mismatch`). The backfill reads the old convention as faithfully
   as it can: every labelled row is `match`, except the pinned voice's scoreless
   ones, which were the microphone.
+- v6: `threads(id, session_id, started_ns, ended_ns)` and `segments.thread_id` —
+  which conversation a turn belongs to ([GRAPH.md](GRAPH.md) Tier 1). The one
+  derived table in the schema, and it earns that by obeying the two rules the
+  graph is bound by: it is re-derivable from the transcript alone (the migration
+  backfills it by replaying the live rule), and it dies with the rows it indexes
+  — purging a segment deletes any thread it emptied. There is deliberately **no**
+  `person_edges` table: edges turned out to be a group-by over `segments` keyed
+  on `thread_id`, and a cache of something derived is only a second thing that
+  can be wrong. Covering indexes instead.
 - `session_roster(session_id, display_name, joined_at, left_at)` — the roster is
   load-bearing for candidate pruning and the Orbit name-picker, so it must be stored,
   not just observed live.

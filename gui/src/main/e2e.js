@@ -440,6 +440,137 @@ export function runE2E(deps) {
 
     await step('shot-speakers', async () => ({ file: await shot('speakers') }));
 
+    // 6i — 0.6.2, the memory graph's first surface. A voice is a person: the
+    // page has to say who they talk to, and each of those has to be a door.
+    await step('person-page-from-a-voice', async () => {
+      // Both entry points exist. The ⋯ menu's first item is the deliberate
+      // one; the row's counts are the one you find by accident.
+      const target = await js('Number(document.querySelector("#speaker-list .sp-row").dataset.speaker)');
+      const stats = await js(`document.querySelectorAll('.sp-row[data-speaker="${target}"] [data-stats]').length`);
+      assert(stats === 2, `the row's counts are not a way in (${stats} clickable)`);
+
+      await js(`document.querySelector('.sp-row[data-speaker="${target}"] [data-more]').click()`);
+      await waitFor('the row menu', async () => js('!!document.querySelector(".row-menu")'));
+      const items = await js('[...document.querySelectorAll(".row-menu .menu-item")].map(b => b.textContent)');
+      assert(items[0] === 'Person page', `"Person page" is not the first menu item: ${JSON.stringify(items)}`);
+      await js('document.querySelector(".row-menu .menu-item").click()');
+
+      const p = await waitFor(
+        'the person page to fill in',
+        async () => {
+          const p = await js('window.__recallDebug.person()');
+          return p.mounted && p.strip.length ? p : null;
+        },
+        { timeout: 15000 }
+      );
+      assert(p.id === target, `the page is about ${p.id}, not ${target}`);
+      assert(p.back, 'the person page has no way back');
+      const keys = p.strip.map(([k]) => k);
+      for (const want of ['total-speech', 'segments', 'sessions', 'conversations', 'first-heard', 'last-heard']) {
+        assert(keys.includes(want), `the stat strip is missing "${want}": ${JSON.stringify(keys)}`);
+      }
+      assert(
+        p.strip.every(([, v]) => v && v.trim().length > 0),
+        `a stat rendered no value: ${JSON.stringify(p.strip)}`
+      );
+      assert(/conversation/.test(p.sub), `the page's subtitle does not summarise it: "${p.sub}"`);
+      // The rail still has four items and none of them is selected here: this
+      // is pushed state, not a fifth place in the app.
+      const rail = await js('document.querySelectorAll(".rail-item").length');
+      const selected = await js('document.querySelectorAll(\'.rail-item[aria-selected="true"]\').length');
+      assert(rail === 4, `the rail grew to ${rail} items`);
+      assert(selected === 0, 'a rail item claims to be selected on the person page');
+      return { speaker: target, strip: p.strip, sub: p.sub, file: await shot('person-page') };
+    });
+
+    // 6j — the edges. "People they talk with" is the claim the graph exists to
+    // make, and every one of them has to lead to their own page.
+    await step('person-edges-lead-to-another-person', async () => {
+      const p = await waitFor('edges to render', async () => {
+        const p = await js('window.__recallDebug.person()');
+        return p.edges.length ? p : null;
+      });
+      assert(p.edges.every((e) => e.name), `an edge rendered without a name: ${JSON.stringify(p.edges)}`);
+      const counts = await js(
+        '[...document.querySelectorAll("#edge-list .edge-row .edge-num")].map(e => e.textContent).slice(0, 3)'
+      );
+      assert(
+        counts.some((c) => /conversation/.test(c)),
+        `an edge does not say how many conversations: ${JSON.stringify(counts)}`
+      );
+
+      const first = p.edges[0];
+      await js(`document.querySelector('#edge-list [data-edge="${first.id}"]').click()`);
+      const next = await waitFor(
+        'the second person page',
+        async () => {
+          const q = await js('window.__recallDebug.person()');
+          return q.mounted && q.id === first.id && q.strip.length ? q : null;
+        },
+        { timeout: 15000 }
+      );
+      assert(next.id !== p.id, 'clicking an edge stayed on the same person');
+      return { from: p.id, to: next.id, edges: p.edges.length, file: await shot('person-edges') };
+    });
+
+    // 6k — a conversation on the page lands in the TRANSCRIPT, unfiltered, with
+    // its own span marked. Unfiltered is the point: you opened a conversation
+    // to read what everybody said.
+    await step('a-conversation-opens-in-the-transcript', async () => {
+      // Back to a person with conversations to open.
+      const p = await waitFor('recent conversations', async () => {
+        const p = await js('window.__recallDebug.person()');
+        return p.threads.length ? p : null;
+      });
+      const thread = p.threads[0];
+      assert(thread.names, 'a conversation row names nobody');
+      assert(thread.preview, 'a conversation row has no preview line');
+      // The card sits under the edges, so a shot of the top of the page would
+      // not document it.
+      await js('document.getElementById("person-threads").scrollIntoView({block: "end"})');
+      const listShot = await shot('person-conversations');
+
+      await js(`document.querySelector('#thread-list [data-thread="${thread.id}"]').click()`);
+      await waitFor('the transcript to mount', async () => js('window.__recallDebug.view() === "transcript"'));
+      const t = await waitFor(
+        'the conversation to be marked',
+        async () => {
+          const t = await js('window.__recallDebug.threads()');
+          return t.marked > 0 ? t : null;
+        },
+        { timeout: 15000 }
+      );
+      assert(t.filter === '', `the speaker filter was left set to "${t.filter}" — a thread is not one voice`);
+      assert(t.rows > t.marked, 'the whole transcript is marked — that is not a span');
+      assert(
+        String(t.markedThread) === String(thread.id),
+        `the marked span is thread ${t.markedThread}, not ${thread.id}`
+      );
+      return { thread: thread.id, marked: t.marked, rows: t.rows, listShot, file: await shot('transcript-thread') };
+    });
+
+    // 6l — the boundary itself, in the transcript: a hairline naming who is in
+    // the conversation that just started.
+    await step('transcript-separates-conversations', async () => {
+      const t = await waitFor(
+        'thread separators',
+        async () => {
+          const t = await js('window.__recallDebug.threads()');
+          return t.separators.length ? t : null;
+        },
+        { timeout: 15000 }
+      );
+      assert(t.separators.length > 1, `only ${t.separators.length} conversation boundary in the whole page`);
+      assert(
+        t.separators.some((s) => s.trim().length > 2),
+        `a separator names nobody: ${JSON.stringify(t.separators)}`
+      );
+      // Back to the speakers list, where the later steps expect to be.
+      await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
+      await waitFor('the speaker list again', async () => js('document.querySelectorAll("#speaker-list .sp-row").length > 0'));
+      return { separators: t.separators.slice(0, 3) };
+    });
+
     // 7 — inline rename through the real UI, then the retroactive broadcast
     await step('rename-propagates-in-place', async () => {
       // The voice the banner is asking about.

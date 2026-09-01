@@ -15,13 +15,20 @@ import * as transcriptView from './views/transcript.js';
 import * as speakersView from './views/speakers.js';
 import * as searchView from './views/search.js';
 import * as sourcesView from './views/sources.js';
+import * as personView from './views/person.js';
 
 const VIEWS = {
   transcript: transcriptView,
   speakers: speakersView,
   search: searchView,
   sources: sourcesView,
+  // Not in the rail: the person page is pushed state, reached from a voice and
+  // left with Back. The app still has four places (docs/GRAPH.md).
+  person: personView,
 };
+
+/** Views the rail can select. Anything else is pushed. */
+const RAIL_VIEWS = new Set(['transcript', 'speakers', 'search', 'sources']);
 
 const main = document.getElementById('main');
 const footer = document.getElementById('footer');
@@ -31,12 +38,19 @@ const pauseIco = document.getElementById('pause-ico');
 const pauseHint = document.getElementById('pause-hint');
 
 let currentName = 'transcript';
+let currentArg = null;
 let current = null;
+// Where Back goes from a pushed view. One level deep, because the app is one
+// level deep: you get to a person from a list of voices and you go back to it.
+let returnTo = 'speakers';
 
 const ctx = {
   go,
   jumpToSegment,
   showSpeakerInTranscript,
+  openPerson,
+  showThreadInTranscript,
+  back,
   toast,
 };
 
@@ -44,19 +58,55 @@ const ctx = {
 // views
 // ---------------------------------------------------------------------------
 
-function go(name) {
+function go(name, arg = null) {
   if (!VIEWS[name]) return;
   // Leaving a view takes its stop button off screen, so it takes the sound too.
   stopPreview();
   // …and any menu it left hanging over a row that is about to stop existing.
   current?.closeMenu?.();
+  // Remember the rail view a push came from, so Back is where you were rather
+  // than wherever the code happens to think you should be.
+  if (!RAIL_VIEWS.has(name) && RAIL_VIEWS.has(currentName)) returnTo = currentName;
   currentName = name;
+  currentArg = arg;
   for (const btn of document.querySelectorAll('.rail-item')) {
     btn.setAttribute('aria-selected', String(btn.dataset.view === name));
   }
   clear(main);
-  current = VIEWS[name].mount(main, ctx);
+  current = VIEWS[name].mount(main, ctx, arg);
   document.body.dataset.view = name;
+}
+
+/** A voice → the person behind it (docs/GRAPH.md). */
+function openPerson(spId) {
+  if (spId == null) return;
+  go('person', { id: Number(spId) });
+}
+
+/** Leave a pushed view for the rail view it was opened from. */
+function back() {
+  go(RAIL_VIEWS.has(returnTo) ? returnTo : 'speakers');
+}
+
+/**
+ * A conversation → the transcript, positioned on it.
+ *
+ * The speaker filter is CLEARED on purpose: the reason to open a thread is to
+ * read what everybody said, and arriving filtered to one voice would answer a
+ * question nobody asked. The thread's own span is marked instead.
+ */
+async function showThreadInTranscript(threadId) {
+  let rows = [];
+  try {
+    const res = await ask('thread.get', { id: threadId });
+    rows = res.segments ?? [];
+  } catch (e) {
+    toast(`Could not open that conversation — ${e.message}`, 'error');
+    return null;
+  }
+  mergeSegments(rows);
+  go('transcript');
+  return current?.focusThread?.(threadId) ?? null;
 }
 
 for (const btn of document.querySelectorAll('.rail-item')) {
@@ -304,7 +354,7 @@ window.recall.onEvent((evt) => {
 window.recall.onResync(async (info) => {
   // Everything on screen may be stale. Rebuild from queries and remount.
   await reloadAll().catch(() => {});
-  go(currentName);
+  go(currentName, currentArg);
   renderFooter();
   renderBadges();
   if (info?.reason && info.reason !== 'first-connect') {
@@ -431,6 +481,39 @@ document.addEventListener('keydown', (e) => {
         why: rows[0]?.querySelector('.qmark')?.title ?? '',
       };
     },
+    // 0.6.2, the memory graph. Three things the driver has to read back: what
+    // the person page is actually showing, and whether the transcript really
+    // separates and marks conversations.
+    person: () => {
+      const strip = [...document.querySelectorAll('#person-strip .person-stat')].map((s) => [
+        s.dataset.stat,
+        s.querySelector('b').textContent,
+      ]);
+      return {
+        mounted: currentName === 'person',
+        id: currentArg?.id ?? null,
+        name: (document.getElementById('person-name') || {}).textContent ?? '',
+        sub: (document.getElementById('person-sub') || {}).textContent ?? '',
+        strip,
+        edges: [...document.querySelectorAll('#edge-list .edge-row')].map((r) => ({
+          id: Number(r.dataset.edge),
+          name: r.querySelector('.edge-name').textContent,
+        })),
+        threads: [...document.querySelectorAll('#thread-list .thread-row')].map((r) => ({
+          id: Number(r.dataset.thread),
+          names: r.querySelector('.thread-names').textContent,
+          preview: r.querySelector('.thread-preview').textContent,
+        })),
+        back: !!document.getElementById('person-back'),
+      };
+    },
+    threads: () => ({
+      separators: [...document.querySelectorAll('#seg-list .thread-sep')].map((s) => s.textContent),
+      marked: document.querySelectorAll('#seg-list .seg.in-thread').length,
+      markedThread: document.querySelector('#seg-list .seg.in-thread')?.dataset.thread ?? null,
+      filter: (document.getElementById('transcript-filter') || {}).value ?? null,
+      rows: document.querySelectorAll('#seg-list .seg').length,
+    }),
     // The one line behind the native-widget fix: without `color-scheme: dark`
     // Chromium draws <select> option popups light-on-light over this palette.
     colorScheme: () => getComputedStyle(document.documentElement).colorScheme,

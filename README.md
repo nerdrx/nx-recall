@@ -139,6 +139,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.5.6 | +29h | German. And 23 other languages. The default ASR goes multilingual |
 | 0.6.0 | +30h | your own voice joins the transcript, pre-labelled — mic as a source |
 | 0.6.1 | +31h | voices get languages, grunts stop becoming people, disk stops being a mystery |
+| 0.6.2 | +32h | the lobby untangles: conversation threads, who you talk with, the person page |
 
 Golden fixtures gate every release: the equal-loudness mixes carry
 `expect: refuse` — a pipeline that labels them correctly *by luck* fails the
@@ -152,7 +153,9 @@ suite. Silence and noise must produce zero words, always.
 | 4 · Socket · tray · GUI · pause · roster · split | `[ SHIPPED ]` 284 tests, real-daemon interop |
 | NX Hub packaging · signed releases · delta-updated hub | `[ SHIPPED ]` |
 | Mic as a source — off by default, follows the allowed apps, enrols itself | `[ SHIPPED ]` |
-| Per-speaker languages · storage panel | `[ BUILDING ]` |
+| Per-speaker languages · storage panel | `[ SHIPPED ]` |
+| Memory graph Tier 1 — conversation threads · co-presence · the person page | `[ SHIPPED ]` 390 cargo · 32 node · 42 e2e |
+| Memory graph Tiers 2–3 — time refs · topics · commitments · tiny local LLM | `[ MAPPED ]` [docs/GRAPH.md](docs/GRAPH.md) |
 | Windows backend | `[ MAPPED ]` |
 
 ## Quickstart

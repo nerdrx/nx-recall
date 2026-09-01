@@ -621,6 +621,113 @@ select.input option, select.input optgroup {
 .empty b { display: block; font-size: 16px; margin-bottom: 6px; }
 .empty p { margin: 0 auto var(--sp-2); color: var(--muted); font-size: 13px; max-width: 46ch; line-height: 1.6; }
 
+/* --------------------------------------------- the memory graph (0.6.2) -- */
+/* docs/GRAPH.md Tier 1. Two surfaces: a hairline in the transcript where one
+   conversation becomes another, and the person page behind a voice. Both are
+   built from what is already here — a card, a well, a dot — because a graph
+   that arrives with its own visual language would read as a second app. */
+
+/* A conversation boundary. Quieter than the day separator above it: a day is a
+   fact about the calendar, a thread is a fact about a room, and the calendar
+   wins the louder mark. */
+.thread-sep {
+  display: flex; align-items: center; gap: 10px;
+  margin: var(--sp-2) 0 6px; padding: 0 2px;
+  font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted);
+}
+.thread-sep::before {
+  content: ""; width: 18px; height: 1px; flex: none;
+  background: rgba(154, 60, 255, 0.5);
+}
+.thread-sep::after { content: ""; flex: 1; height: 1px; background: var(--hairline); opacity: 0.6; }
+.thread-sep .thread-sep-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 52ch; }
+
+/* Arriving at a conversation from a person page. A tinted rail down the span,
+   not a highlight over the words: you were sent here to READ it, and the mark
+   only has to say where it starts and stops. */
+.seg.in-thread {
+  background: rgba(119, 0, 255, 0.055);
+  box-shadow: inset 2px 0 0 rgba(154, 60, 255, 0.55);
+}
+
+/* The counts on a voice's row are a way into its page. */
+button.sp-num {
+  border: 0; background: transparent; cursor: pointer;
+  padding: 4px 6px; border-radius: var(--radius-xs);
+  transition: background var(--dur-fast) var(--ease-soft), color var(--dur-fast) var(--ease-soft);
+}
+button.sp-num:hover { background: rgba(255, 255, 255, 0.06); }
+button.sp-num:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+/* ---------------------------------------------------------- person page -- */
+
+.person-head { display: flex; align-items: center; gap: var(--sp-2); }
+.person-head .dot.big { width: 12px; height: 12px; }
+.person-head .spacer { flex: 1; }
+.person-who { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.person-name { font-size: 19px; font-weight: 700; letter-spacing: -0.01em; }
+.person-name.unnamed { color: var(--muted); font-family: var(--mono); font-size: 16px; font-weight: 500; }
+.person-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.person-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(116px, 1fr)); gap: var(--sp-1); }
+.person-stat {
+  padding: 12px var(--sp-2); border-radius: var(--radius-sm);
+  background: var(--well); border: 1px solid transparent;
+}
+.person-stat b { display: block; font: 600 17px/1.2 var(--mono); color: var(--text); }
+.person-stat small {
+  display: block; margin-top: 6px; font-size: 10px; letter-spacing: 0.11em;
+  text-transform: uppercase; color: var(--muted);
+}
+
+.edge-list, .thread-list { display: flex; flex-direction: column; gap: 6px; }
+.edge-row, .thread-row {
+  display: flex; align-items: center; gap: var(--sp-2); width: 100%;
+  padding: 11px var(--sp-2); border-radius: var(--radius-sm); text-align: left;
+  background: var(--well); border: 1px solid transparent; color: var(--text);
+  font: inherit; cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft);
+}
+/* A grid, not a flex row: the roster column is empty for most people, and with
+   flex those rows would pull their other numbers rightwards and the list would
+   stop being a table you can read down. Every row has every column, whether or
+   not it has something to put in it. */
+.edge-row {
+  display: grid; align-items: center;
+  grid-template-columns: auto minmax(0, 1fr) 96px 88px 128px;
+}
+/* The roster column only exists when the roster can vouch for somebody on this
+   page. Reserved for the whole list rather than per row — otherwise the one
+   named pair pushes everyone else's numbers sideways — and absent entirely
+   when it would be a column of nothing. */
+.edge-list.has-roster .edge-row { grid-template-columns: auto minmax(0, 1fr) 96px 88px 128px 128px; }
+.edge-row:hover, .thread-row:hover { background: rgba(255, 255, 255, 0.05); border-color: rgba(255, 255, 255, 0.09); }
+.edge-row:focus-visible, .thread-row:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.edge-name { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.edge-num { font: 500 13px/1 var(--mono); text-align: right; }
+.edge-num small {
+  display: block; margin-top: 4px; font: 400 10px/1 var(--font);
+  letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted);
+}
+/* Roster co-presence is a weaker claim than a shared conversation — it says
+   "in the same instance", which forty people can be — so it reads quieter. */
+.edge-num.roster { color: var(--muted); }
+
+.thread-row { align-items: flex-start; }
+.thread-when { font: 500 12px/1.3 var(--mono); color: var(--muted); min-width: 116px; flex: none; }
+.thread-when small {
+  display: block; margin-top: 4px; font: 400 10px/1 var(--font);
+  letter-spacing: 0.1em; text-transform: uppercase;
+}
+.thread-body { display: flex; flex-direction: column; gap: 5px; min-width: 0; flex: 1; }
+.thread-who { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.thread-who .dot { width: 7px; height: 7px; }
+.thread-names { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-preview {
+  font-size: 13px; color: var(--muted); line-height: 1.5;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
 /* ------------------------------------------------------- reduced motion -- */
 
 @media (prefers-reduced-motion: reduce) {
