@@ -922,6 +922,55 @@ export function runE2E(deps) {
       return { separators: t.separators.slice(0, 3) };
     });
 
+    // 6m2 — audit finding #18: the person page was frozen at mount. Everything
+    // on it is a query over live segments (docs/GRAPH.md) — totals, "last
+    // heard", the edges, the recent conversations — so a page left open while
+    // that person keeps talking has to follow them rather than quietly claim
+    // they were last heard whenever the page happened to be opened.
+    await step('the-person-page-follows-the-live-feed', async () => {
+      // A voice the feed is actually using, read off the live transcript
+      // rather than assumed: earlier steps delete and merge the fixtures.
+      const target = await waitFor('a voice the live feed keeps using', async () =>
+        js(`(() => {
+          const d = window.__recallDebug;
+          const tally = new Map();
+          for (const s of d.store.segments.slice(-80)) {
+            if (s.speaker == null || !d.store.speakers.has(s.speaker)) continue;
+            tally.set(s.speaker, (tally.get(s.speaker) ?? 0) + 1);
+          }
+          const best = [...tally.entries()].sort((a, b) => b[1] - a[1])[0];
+          return best ? best[0] : null;
+        })()`)
+      );
+
+      await js(`window.__recallDebug.go('person', { id: ${target} })`);
+      const before = await waitFor('the person page to fill in', async () => {
+        const p = await js('window.__recallDebug.person()');
+        return p.mounted && p.strip.length ? p : null;
+      });
+      assert(before.lastHeardMs > 0, `the page renders no "last heard" instant: ${JSON.stringify(before.strip)}`);
+
+      // The rendered date is minute-resolution, so the instant behind it is
+      // what proves the page re-asked rather than repainted the same answer.
+      const after = await waitFor(
+        'the page to follow the feed',
+        async () => {
+          const p = await js('window.__recallDebug.person()');
+          return p.mounted && (p.lastHeardMs > before.lastHeardMs || p.segments > before.segments) ? p : null;
+        },
+        { timeout: 45000, every: 500 }
+      );
+      assert(after.id === before.id, 'the page moved to another person mid-check');
+
+      await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
+      await waitFor('the speaker list again', async () => js('document.querySelectorAll("#speaker-list .sp-row").length > 0'));
+      return {
+        speaker: target,
+        lastHeard: [before.lastHeardMs, after.lastHeardMs],
+        segments: [before.segments, after.segments],
+      };
+    });
+
     // 6n — 0.7.0: the memory graph gets a place of its own. The user's own
     // question was "when do the ai thing do thing? i dont see a tab for it?",
     // and this is the answer being there at all.
@@ -1625,7 +1674,46 @@ export function runE2E(deps) {
         { timeout: 12000, every: 150 }
       );
       assert(/capturing/i.test(capturing.chip), `the chip did not follow the state: "${capturing.chip}"`);
-      return { denied, waiting: waiting.chip, capturing: capturing.chip, file };
+
+      // The microphone is now an ALLOWED source row in the daemon's own
+      // `sources.list`, which is the state audit finding #25a lived in: the
+      // rail badge counted that row, the Sources view excluded it, so the same
+      // daemon read 2 or 1 depending on which painted last.
+      //
+      // The switch does not broadcast a `source` event for its own row (it has
+      // its own `mic` event), so the model only learns this on a resync — which
+      // is what the daemon's answer is folded in here to reproduce, from ANOTHER
+      // view, because the Sources view used to paint over the wrong number.
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      const listed = await js(`(async () => {
+        const res = await window.recall.request('sources.list');
+        const rows = res?.data?.sources ?? [];
+        window.__recallDebug.store.sources = rows;
+        return {
+          apps: rows.filter((s) => s.kind !== 'mic' && s.allowed).length,
+          micAllowed: rows.some((s) => s.kind === 'mic' && s.allowed),
+        };
+      })()`);
+      assert(listed.micAllowed, 'the daemon does not list the microphone as allowed — the case cannot be reproduced');
+
+      // The badges are painted from the event stream, so wait for one to land.
+      const seen = (await js('window.__recallDebug.counts()')).appended;
+      const badge = await waitFor(
+        'the rail badge to be repainted',
+        async () => {
+          const b = await js(`(() => ({
+            appended: window.__recallDebug.counts().appended,
+            badge: Number(document.getElementById('badge-sources').textContent),
+          }))()`);
+          return b.appended > seen ? b : null;
+        },
+        { timeout: 15000, every: 250 }
+      );
+      assert(
+        badge.badge === listed.apps,
+        `the rail badge says ${badge.badge} allowed sources; ${listed.apps} applications are allowed — the microphone is being counted as one`
+      );
+      return { denied, waiting: waiting.chip, capturing: capturing.chip, badge: badge.badge, apps: listed.apps, file };
     });
 
     // 12c — "You" renders distinctly, and it is a DIFFERENT treatment from
@@ -1830,6 +1918,26 @@ export function runE2E(deps) {
 
         process.kill(Number(process.env.NX_RECALL_MOCK_PID), 'SIGUSR1');
         await waitFor('the connection to drop', async () => deps.getUi().conn.status !== 'connected', { timeout: 8000 });
+
+        // Audit finding #25b, caught in the one window where it is visible: the
+        // footer used to keep the last daemon's numbers on screen — "queue 3 ·
+        // db 1.2 GB" — right next to the words "daemon offline". A number with
+        // no daemon behind it is a lie, so they go quiet and read "—".
+        const offline = await waitFor(
+          'the offline footer',
+          async () => {
+            const f = await js('window.__recallDebug.resync()');
+            return /daemon offline/.test(f.footer) ? f : null;
+          },
+          { timeout: 8000, every: 100 }
+        );
+        assert(!/queue \d/.test(offline.footer), `the footer is still quoting a dead daemon: "${offline.footer}"`);
+        assert(!/db \d/.test(offline.footer), `the footer is still quoting storage from a dead daemon: "${offline.footer}"`);
+        assert(
+          offline.stats.some(([t, stale]) => stale && /queue/.test(t)),
+          `the daemon numbers are not greyed while offline: ${JSON.stringify(offline.stats)}`
+        );
+
         await waitFor('the reconnect', async () => deps.getUi().conn.status === 'connected', { timeout: 20000 });
 
         // The user is told, and the views are rebuilt from queries rather than
@@ -1848,6 +1956,19 @@ export function runE2E(deps) {
           { timeout: 15000 }
         );
         assert(told, 'the user was never told the daemon restarted');
+
+        // …and the resync really finished. A slice that failed keeps its old
+        // data and says so in the footer (audit finding #11), so "green again"
+        // has to mean every query answered rather than merely "socket back".
+        const fresh = await waitFor(
+          'the resync to finish',
+          async () => {
+            const r = await js('window.__recallDebug.resync()');
+            return r.conn === 'connected' && r.stale.length === 0 ? r : null;
+          },
+          { timeout: 15000, every: 250 }
+        );
+        assert(!/catching up/.test(fresh.connText), `the footer still says it is catching up: "${fresh.connText}"`);
 
         // The live feed has to actually resume. This is the assertion that
         // caught the client holding its pre-restart sequence number and

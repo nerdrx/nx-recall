@@ -8,7 +8,7 @@
 // it ever makes a sound (DESIGN §3).
 
 import { h, svg, clear, fmtDate, fmtBytes, speakerHue } from '../lib/dom.js';
-import { store, ask, applyMic, micChip } from '../lib/store.js';
+import { store, ask, applyMic, micChip, appSources, allowedAppCount } from '../lib/store.js';
 import { toast } from '../lib/sheets.js';
 
 export const id = 'sources';
@@ -208,11 +208,13 @@ export function mount(root, ctx) {
     renderStorage();
     clear(list);
     // The microphone has its own card above; it must not also appear as a row
-    // in a list whose every other entry is opted in through the allowlist.
-    const rows = [...store.sources]
-      .filter((s) => s.kind !== 'mic')
-      .sort((a, b) => Number(b.allowed) - Number(a.allowed) || String(a.display ?? a.match_key).localeCompare(String(b.display ?? b.match_key)));
-    const allowed = rows.filter((s) => s.allowed).length;
+    // in a list whose every other entry is opted in through the allowlist —
+    // nor in the count the rail badge draws from (audit finding #25a), which is
+    // why both come from the same rule in store.js.
+    const rows = appSources().sort(
+      (a, b) => Number(b.allowed) - Number(a.allowed) || String(a.display ?? a.match_key).localeCompare(String(b.display ?? b.match_key))
+    );
+    const allowed = allowedAppCount();
     sub.textContent = `${allowed} allowed · ${rows.length - allowed} denied`;
     const badge = document.getElementById('badge-sources');
     if (badge) badge.textContent = String(allowed);

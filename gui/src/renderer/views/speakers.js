@@ -23,6 +23,36 @@ import { playSpeaker, stop as stopPreview, isActive, onPlayback, noAudioHint } f
 
 export const id = 'speakers';
 
+/**
+ * What a `speakers.split` reply means for the client (audit finding #17).
+ *
+ * The split is SYNCHRONOUS in the daemon — the work is done by the time the
+ * reply is written (crates/recalld/src/service.rs) — and the reply carries the
+ * outcome, not just an op handle. Two fields were being thrown away with it:
+ *
+ * - `resync: true` means the daemon deliberately SUPPRESSED the per-row
+ *   `segment` events, because past SPLIT_EVENT_CAP (100 changed rows)
+ *   announcing them one by one would cost every client its connection. It is
+ *   an instruction: re-run your queries. Ignoring it left every one of those
+ *   rows showing the old voice's name and colour indefinitely — on the busiest
+ *   voices, the only ones anybody ever splits.
+ * - `moved_segments` is the one number that says what actually happened.
+ *
+ * Pure, and exported, so the rule is checked in test/store.test.js rather than
+ * inferred from a screenshot of a toast.
+ */
+export function splitOutcome(res, label) {
+  const resync = res?.resync === true;
+  const moved = Number(res?.moved_segments);
+  const into = res?.auto ?? (res?.minted != null ? `Speaker ${res.minted}` : 'a new voice');
+  const what = Number.isFinite(moved)
+    ? `Split ${label} — ${moved.toLocaleString()} segment${moved === 1 ? '' : 's'} moved to ${into}.`
+    : `Split ${label}.`;
+  // The old copy promised "Progress shows in the status bar" for an operation
+  // that had already finished by the time the sentence was rendered.
+  return { resync, text: resync ? `${what} Reloading the views.` : what, kind: 'ok' };
+}
+
 /** A voice's preview is keyed by its id, so any surface can drive the same one. */
 const previewKey = (spId) => `speaker:${spId}`;
 
@@ -679,16 +709,35 @@ export function mount(root, ctx) {
   async function doSplit(spId) {
     const ok = await confirmSheet({
       title: `Split ${speakerLabel(spId)}?`,
-      body: 'The recordings matched to this voice are re-clustered, which can take a while. Progress shows in the status bar and the rest of the app keeps working.',
+      body: 'The recordings matched to this voice are re-clustered into two identities and the transcript is relabelled retroactively. It happens in one step, as soon as you confirm, and the views reload themselves when it lands.',
       confirmLabel: 'Split',
     });
     if (!ok) return;
+    const label = speakerLabel(spId);
+    let res;
     try {
-      const res = await ask('speakers.split', { id: spId });
-      toast(`Re-clustering started (${res.op}).`, 'ok');
+      res = await ask('speakers.split', { id: spId });
     } catch (e) {
       toast(`Could not split — ${e.message}`, 'error');
+      return;
     }
+    const out = splitOutcome(res, label);
+    // Past the daemon's event cap there were no per-row events at all, so
+    // nothing on screen knows the rows moved. Re-query and repaint everything;
+    // below the cap the events did the same job already and the list only needs
+    // its counts back.
+    if (out.resync) {
+      await ctx.resync?.();
+    } else {
+      try {
+        await reloadSpeakers();
+        renderList();
+        renderBanner();
+      } catch {
+        /* the relabel events already repainted the rows; the counts follow */
+      }
+    }
+    toast(out.text, out.kind);
   }
 
   /**

@@ -713,6 +713,11 @@ select.input option, select.input optgroup {
 }
 .footer .stat { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 .footer .stat b { color: var(--clear-ink); font-weight: 600; font-family: var(--mono); font-size: 11px; }
+/* Offline: the daemon's numbers are a memory, not a reading. They stay in place
+   so the footer does not reflow, and they go quiet so nobody reads them as
+   live (audit finding #25b). */
+.footer .stat.stale { opacity: .42; }
+.footer .stat.stale b { color: var(--clear-muted); font-weight: 500; }
 .footer .spacer { flex: 1; }
 .footer .conn.ok { color: var(--recall-live); }
 .footer .conn.bad { color: var(--clear-danger); }

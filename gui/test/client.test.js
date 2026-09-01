@@ -5,10 +5,11 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RecallClient } from '../src/main/client.js';
-import { startMock } from '../mock/mockd.js';
+import { startMock, SPLIT_EVENT_CAP } from '../mock/mockd.js';
 
 let n = 0;
 const sockPath = () => join(tmpdir(), `nx-recall-test-${process.pid}-${++n}.sock`);
@@ -541,6 +542,114 @@ test('topics group conversations and name the threads behind them', async () => 
     // about now.
     const last = topics.map((t) => t.last_ms);
     assert.deepEqual(last, [...last].sort((a, b) => b - a));
+  } finally {
+    client.close();
+    mock.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// audit finding #13 — a connection without a subscription
+// ---------------------------------------------------------------------------
+
+/**
+ * A daemon that completes the handshake and then refuses the first N
+ * subscriptions. Deliberately hand-rolled rather than a mockd option: the whole
+ * point is the shape mockd never produces, and it is fifteen lines.
+ */
+function pickySubscribeDaemon(path, failures = 1) {
+  const seen = { hellos: 0, subscribes: 0, subscribed: 0 };
+  let seq = 5000;
+  const server = net.createServer((sock) => {
+    sock.setEncoding('utf8');
+    let buf = '';
+    sock.on('error', () => {});
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const msg = JSON.parse(line);
+        if (msg.hello) {
+          seen.hellos += 1;
+          sock.write(JSON.stringify({ welcome: { proto: 1, daemon: 'recalld-picky/1', schema: 7, seq: (seq += 1) } }) + '\n');
+          continue;
+        }
+        if (msg.method === 'subscribe') {
+          seen.subscribes += 1;
+          if (seen.subscribes <= failures) {
+            sock.write(JSON.stringify({ id: msg.id, err: { code: 'internal', msg: 'no topics for you' } }) + '\n');
+          } else {
+            seen.subscribed += 1;
+            sock.write(JSON.stringify({ id: msg.id, ok: { topics: msg.params?.topics ?? [] } }) + '\n');
+          }
+          continue;
+        }
+        sock.write(JSON.stringify({ id: msg.id, ok: {} }) + '\n');
+      }
+    });
+  });
+  server.on('error', () => {});
+  return new Promise((resolve) => server.listen(path, () => resolve({ seen, close: () => server.close() })));
+}
+
+test('a subscribe that fails drops the connection and is retried, not shrugged off', async () => {
+  const path = sockPath();
+  const daemon = await pickySubscribeDaemon(path, 1);
+  const client = new RecallClient({ socketPath: path });
+  try {
+    client.on('warn', () => {});
+    // The old code caught the failure, warned, and carried on into catch-up:
+    // the app stayed "connected" and could not hear another event for as long
+    // as it ran. The only honest thing is to treat it as a dead connection.
+    await connected(client);
+    for (let i = 0; i < 100 && daemon.seen.subscribed === 0; i += 1) await sleep(100);
+    assert.equal(daemon.seen.subscribes >= 2, true, `the failed subscribe was never retried (${daemon.seen.subscribes})`);
+    assert.equal(daemon.seen.subscribed, 1, 'the client never ended up subscribed');
+    assert.equal(daemon.seen.hellos >= 2, true, 'the socket was reused rather than reconnected');
+    for (let i = 0; i < 50 && client.status !== 'connected'; i += 1) await sleep(100);
+    assert.equal(client.status, 'connected', 'the client gave up instead of reconnecting');
+  } finally {
+    client.close();
+    daemon.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// audit finding #17 — the split reply, and the mock that has to produce it
+// ---------------------------------------------------------------------------
+
+test('a split answers inline, with the outcome and whether events were suppressed', async () => {
+  const { mock, path } = withMock({ feedMs: 100000 });
+  const client = new RecallClient({ socketPath: path });
+  try {
+    await connected(client);
+    await waitFor(client, 'resync');
+    const rows = [];
+    client.on('event', (e) => {
+      if (e.ev === 'segment') rows.push(e.data.id);
+    });
+
+    // A busy voice: more moved rows than the daemon will announce one by one,
+    // so the per-row events are suppressed and the reply says to re-query.
+    const big = await client.request('speakers.split', { id: 1 });
+    assert.match(big.op, /^op_/);
+    assert.equal(big.kept, 1);
+    assert.ok(big.minted > 1);
+    assert.ok(big.moved_segments > SPLIT_EVENT_CAP, `only ${big.moved_segments} rows moved — the cap is not reachable`);
+    assert.equal(big.resync, true, 'past the cap the reply must ask for a re-query');
+    await sleep(200);
+    assert.equal(rows.length, 0, 'the row events were supposed to be suppressed');
+
+    // …and a voice with almost nothing under it stays below the cap, so the
+    // events do the work and no re-query is asked for.
+    const small = await client.request('speakers.split', { id: 5 });
+    assert.ok(small.moved_segments <= SPLIT_EVENT_CAP);
+    assert.equal(small.resync, false);
+    await sleep(200);
+    assert.equal(rows.length, small.moved_segments, 'the per-row events did not arrive below the cap');
   } finally {
     client.close();
     mock.close();
