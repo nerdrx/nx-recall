@@ -12,8 +12,13 @@ Type=simple
 # The daemon, not the GUI. The GUI is a client that may or may not be running
 # (DESIGN §2), and pause survives it either way.
 ExecStart=%h/.local/bin/recalld run
-Restart=on-failure
-RestartSec=5
+# An update should update: with NXR_EXIT_ON_UPGRADE the daemon notices its
+# binary was replaced on disk, drains, and exits cleanly — Restart=always then
+# brings up the new version. `systemctl --user stop` still stops it for real
+# (Restart= never applies to a manual stop).
+Environment=NXR_EXIT_ON_UPGRADE=1
+Restart=always
+RestartSec=2
 
 # DESIGN §4: "analysis must never win a scheduling contest against a VR frame."
 # The whole pipeline is under 5% of one core, so this costs nothing and removes

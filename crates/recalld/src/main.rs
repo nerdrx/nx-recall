@@ -114,8 +114,45 @@ fn block_shutdown_signals() {
     }
 }
 
+/// Has the file we are executing been replaced on disk? After an unlink+copy
+/// upgrade the kernel keeps us on the old inode and marks the exe link as
+/// deleted — the unambiguous "a new version is installed" signal.
+fn exe_replaced(link_target: &std::ffi::OsStr) -> bool {
+    link_target.as_encoded_bytes().ends_with(b" (deleted)")
+}
+
+/// An update should update: when the binary on disk is replaced (NX Hub
+/// unlinks + copies), drain and exit cleanly so systemd's Restart=always
+/// brings up the new version. Gated on NXR_EXIT_ON_UPGRADE=1, which only the
+/// unit file sets — a `recalld run` in a terminal never exits by surprise.
+fn spawn_upgrade_watcher() {
+    if std::env::var_os("NXR_EXIT_ON_UPGRADE").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("recalld-upgrade".into())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            match std::fs::read_link("/proc/self/exe") {
+                Ok(p) if exe_replaced(p.as_os_str()) => {
+                    info!("binary replaced on disk — restarting onto the new version");
+                    // The signalfd shutdown path: identical to systemctl stop,
+                    // so the queue drains and the session closes cleanly. Must
+                    // be PROCESS-directed (kill, not raise): every thread
+                    // blocks SIGTERM for the signalfd, and a thread-directed
+                    // signal would sit pending on this thread unseen.
+                    unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+                    return;
+                }
+                _ => {}
+            }
+        })
+        .ok();
+}
+
 fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     block_shutdown_signals();
+    spawn_upgrade_watcher();
 
     let store = Store::open(data_dir)?;
     let closed = store.close_dangling_sessions(utc_now_ns())?;
@@ -713,6 +750,17 @@ fn format_duration(ns: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exe_replaced_detects_the_deleted_suffix() {
+        use std::ffi::OsStr;
+        assert!(super::exe_replaced(OsStr::new(
+            "/home/u/.local/lib/nx-recall/recalld (deleted)"
+        )));
+        assert!(!super::exe_replaced(OsStr::new("/home/u/.local/lib/nx-recall/recalld")));
+        // a path that merely CONTAINS the marker mid-string is not a match
+        assert!(!super::exe_replaced(OsStr::new("/tmp/x (deleted)/recalld")));
+    }
+
     use super::*;
 
     #[test]
