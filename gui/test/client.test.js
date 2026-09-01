@@ -363,3 +363,47 @@ test('a frame far bigger than the old guard still arrives whole', async () => {
     mock.close();
   }
 });
+
+test('deleting a voice offers both halves of the choice, and the empty one still goes', async () => {
+  // The 0.6.4 bug, at the protocol seam the GUI actually calls: a voice with no
+  // segments left could not be deleted at all, because `delete.run` is scoped
+  // by SEGMENTS and there were none — and no delete ever touched the voiceprint
+  // behind it, so the ghost went on matching future audio.
+  const { mock, path } = withMock({ feedMs: 100000 });
+  const client = new RecallClient({ socketPath: path });
+  try {
+    await connected(client);
+    const listed = async () => (await client.request('speakers.list')).speakers;
+
+    // The ghost: in the bank, with nothing under it.
+    const ghost = (await listed()).find((s) => s.segments === 0);
+    assert.ok(ghost, 'the mock has no 0-segment voice to reproduce the bug with');
+    const gone = await client.request('speakers.delete', { id: ghost.id });
+    assert.equal(gone.segments, 0);
+    assert.equal(gone.removed_speaker, true);
+    assert.ok(!(await listed()).some((s) => s.id === ghost.id), 'the empty voice survived its delete');
+
+    // Keeping the voiceprint: the words go, the voice does not — and the reply
+    // says so, because a delete that leaves something behind has to admit it.
+    const kira = (await listed()).find((s) => s.name === 'Kira');
+    const kept = await client.request('speakers.delete', { id: kira.id, keep_voiceprint: true });
+    assert.ok(kept.segments > 0);
+    assert.equal(kept.removed_speaker, false);
+    assert.match(kept.msg, /voiceprint was kept/i);
+    const after = (await listed()).find((s) => s.id === kira.id);
+    assert.ok(after, 'the kept voice left the bank anyway');
+    assert.equal(after.segments, 0);
+
+    // And your own pinned voice is refused, with the switch that works named.
+    const you = (await listed()).find((s) => s.you);
+    const refusal = await client.request('speakers.delete', { id: you.id }).then(
+      () => null,
+      (e) => e
+    );
+    assert.equal(refusal?.code, 'refused');
+    assert.match(refusal.message, /microphone/i);
+  } finally {
+    client.close();
+    mock.close();
+  }
+});

@@ -823,6 +823,103 @@ fn a_bulk_delete_runs_as_an_operation_with_progress_and_a_terminal_event() {
     assert!(d.wav_count() > 0);
 }
 
+/// 0.6.4, and the bug it was written for: a voice sitting at "0 segments · 0s"
+/// that Delete could not touch, because delete-by-speaker only ever scoped
+/// SEGMENTS and there were none left — while the voiceprint behind it stayed
+/// live and went on matching. Over the real wire, both halves of DESIGN §8's
+/// choice, and the refusal that guards the pinned voice.
+#[test]
+fn an_empty_voice_is_deletable_over_the_wire_and_the_pin_is_not() {
+    let d = Daemon::start("delete-speaker");
+    let mut c = d.connect();
+    c.hello();
+    c.subscribe(&["relabel", "segments"]);
+
+    let (ghost, keeper, you, seg) = {
+        let store = d.store.lock().unwrap();
+        let ghost = store.mint_speaker(0).unwrap();
+        let keeper = store.mint_speaker(0).unwrap();
+        let you = store.ensure_you_speaker(0).unwrap();
+        let e = recalld::embed::Embedding::new("m@1", vec![1.0, 0.0]);
+        for id in [ghost, keeper, you] {
+            store.add_prototype(id, &e, None, false, 20, 0).unwrap();
+        }
+        // The ghost's words are already gone; the keeper still has one.
+        let gone = store
+            .insert_segment(d.session, 0, 1_000_000_000, "", 0)
+            .unwrap();
+        store
+            .set_segment_speaker(gone, Some(ghost), Some(0.9))
+            .unwrap();
+        store.soft_delete_segments(&[gone], 1).unwrap();
+        let seg = store
+            .insert_segment(d.session, 2_000_000_000, 6_000_000_000, "", 0)
+            .unwrap();
+        store
+            .set_segment_speaker(seg, Some(keeper), Some(0.9))
+            .unwrap();
+        (ghost, keeper, you, seg)
+    };
+    c.drain();
+
+    let listed = |c: &mut Conn| -> Vec<i64> {
+        c.call("speakers.list", json!({}))["speakers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_i64().unwrap())
+            .collect()
+    };
+    assert!(listed(&mut c).contains(&ghost), "the ghost is not listed");
+
+    // Your own voice: refused, with the switch that does work named.
+    let refused = c.call_err("speakers.delete", json!({"id": you}));
+    assert_eq!(refused["code"], "refused");
+    assert!(
+        refused["msg"].as_str().unwrap().contains("microphone"),
+        "{refused}"
+    );
+
+    // The ghost: nothing to purge, and it goes anyway.
+    let out = c.call("speakers.delete", json!({"id": ghost}));
+    assert_eq!(out["segments"], json!(0));
+    assert_eq!(out["removed_speaker"], json!(true));
+    let ev = c.wait_event("relabel");
+    assert_eq!(ev["data"]["speaker"], json!(ghost));
+    assert_eq!(ev["data"]["pruned"], json!(true));
+    assert!(!listed(&mut c).contains(&ghost));
+
+    // The other half of the choice: the words go, the voice stays.
+    let out = c.call(
+        "speakers.delete",
+        json!({"id": keeper, "keep_voiceprint": true}),
+    );
+    assert_eq!(out["segments"], json!(1));
+    assert_eq!(out["removed_speaker"], json!(false));
+    let purge = c.wait_event("purge");
+    assert_eq!(purge["data"]["ids"], json!([seg]));
+    assert!(listed(&mut c).contains(&keeper), "the kept voice vanished");
+    assert!(
+        c.call("transcript", json!({"speaker": keeper}))["segments"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    {
+        let store = d.store.lock().unwrap();
+        assert_eq!(store.prototype_count(keeper).unwrap(), 1);
+        assert!(
+            store
+                .prototypes("m@1")
+                .unwrap()
+                .iter()
+                .any(|(sp, _)| *sp == keeper),
+            "a kept voiceprint has to go on matching"
+        );
+        assert_eq!(store.prototype_count(ghost).unwrap(), 0);
+    }
+}
+
 // ---- 7. the field conventions a JavaScript client depends on -------------
 
 #[test]

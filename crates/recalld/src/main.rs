@@ -88,6 +88,10 @@ fn main() -> Result<()> {
         Command::Speakers { action } => match action {
             None => cmd_speakers(&data_dir),
             Some(SpeakersAction::Prune { apply }) => cmd_prune(&cfg, &data_dir, apply),
+            Some(SpeakersAction::Delete {
+                speaker_id,
+                keep_voiceprint,
+            }) => cmd_delete_speaker(&cfg, &data_dir, speaker_id, keep_voiceprint),
         },
         Command::Languages { speaker_id, codes } => {
             cmd_languages(&cfg, &data_dir, speaker_id, &codes)
@@ -788,6 +792,48 @@ fn cmd_prune(cfg: &Config, data_dir: &Path, apply: bool) -> Result<()> {
             out["max_segments"].as_i64().unwrap_or(1),
             out["max_speech_ms"].as_i64().unwrap_or(3000),
         );
+    }
+    Ok(())
+}
+
+/// `recalld speakers delete <id> [--keep-voiceprint]` — DESIGN §8's choice.
+///
+/// Over the socket rather than straight at the database: a voice leaving the
+/// bank changes what the *next* segment matches, and every open client has to
+/// drop the row. Only the running daemon can say both.
+fn cmd_delete_speaker(
+    cfg: &Config,
+    data_dir: &Path,
+    speaker_id: i64,
+    keep_voiceprint: bool,
+) -> Result<()> {
+    let out = call(
+        cfg,
+        data_dir,
+        "speakers.delete",
+        json!({"id": speaker_id, "keep_voiceprint": keep_voiceprint}),
+    )?;
+    let who = out["name"]
+        .as_str()
+        .or_else(|| out["auto"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Speaker {speaker_id}"));
+    let segments = out["segments"].as_i64().unwrap_or(0);
+    println!(
+        "{who}: {segments} conversation(s) deleted (undoable until the retention window \
+         closes)."
+    );
+    if out["removed_speaker"].as_bool().unwrap_or(false) {
+        println!(
+            "  {:>4} prototype(s), {} embedding(s) and {} golden sample(s) removed with the \
+             voice itself.",
+            out["prototypes"].as_i64().unwrap_or(0),
+            out["embeddings"].as_i64().unwrap_or(0),
+            out["goldens"].as_i64().unwrap_or(0),
+        );
+        println!("  This voice is out of the bank: it has to enrol again to be recognised.");
+    } else {
+        println!("  The voiceprint was kept — this voice is still labelled going forward.");
     }
     Ok(())
 }

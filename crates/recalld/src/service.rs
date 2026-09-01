@@ -151,6 +151,7 @@ impl Service {
             "speakers.name" => self.speakers_name(req),
             "speakers.set_languages" => self.speakers_set_languages(req),
             "speakers.prune" => self.speakers_prune(req),
+            "speakers.delete" => self.speakers_delete(req),
             "speakers.merge" => self.speakers_merge(req),
             "speakers.split" => self.speakers_split(req),
             "speakers.sample" => self.speakers_sample(req),
@@ -681,7 +682,7 @@ impl Service {
         for voice in &candidates {
             match store.prune_speaker(voice.id, at) {
                 Ok(report) => {
-                    segments += report.soft_deleted;
+                    segments += report.soft_deleted.len();
                     files.extend(report.goldens.clone());
                     store
                         .log_operation(
@@ -732,6 +733,213 @@ impl Service {
             "removed": removed,
             "segments": segments,
             "voices": preview,
+        }))
+    }
+
+    /// Delete one voice — DESIGN §8's choice, finally made askable.
+    ///
+    /// §8 always specified two halves and only one was ever built: the segments
+    /// went and the *bank entry* stayed, with its prototypes intact, so the
+    /// voice went on matching new audio while its row sat in the list at
+    /// "0 segments · 0s" and every further Delete matched nothing and did
+    /// nothing. The missing half is the parameter:
+    ///
+    /// * `keep_voiceprint: true` — "keep the bank entry (still labeled going
+    ///   forward)". The conversations go; the identity stays and keeps
+    ///   matching. The reply says so, because a delete that leaves something
+    ///   behind has to admit it.
+    /// * `keep_voiceprint: false` (the default, and what the CLI does without
+    ///   `--keep-voiceprint`) — "nuke it so they re-enroll fresh": prototypes,
+    ///   this voice's embeddings, its goldens and their files, and the speaker
+    ///   row itself.
+    ///
+    /// A voice with **no live segments** is the case this method exists for,
+    /// so it is explicitly not an error: it succeeds and removes the ghost.
+    ///
+    /// Two refusals, both `refused`, both deliberate:
+    ///
+    /// * **The pinned "You" voice.** Deleting your own identity would not stop
+    ///   you being recorded — the microphone would mint a fresh pin on the next
+    ///   turn — so it is a destructive act that does not do what it looks like.
+    ///   The switch that actually stops it is the microphone, and the refusal
+    ///   names it. (Your *words* are still deletable: `delete.run` by date or
+    ///   session takes them like anyone else's.)
+    /// * **A merge target**, on the nuke path only. Other voices are tombstoned
+    ///   onto this row; removing it would dangle every one of them, and
+    ///   `speakers.merged_into` is a real foreign key, so the write would fail
+    ///   anyway. The message names the count and points at the half that does
+    ///   work — keeping the voiceprint still takes the conversations. It is the
+    ///   same rule `prune_candidates` already applies for the same reason.
+    fn speakers_delete(&self, req: &Request) -> Result<Value, Error> {
+        let id = req.i64("id")?;
+        let keep = req.opt_bool("keep_voiceprint")?.unwrap_or(false);
+        let store = self.store();
+
+        if store.speaker_name(id).map_err(Error::from)?.is_none() {
+            return Err(Error::not_found(format!("no speaker with id {id}")));
+        }
+        // A tombstone owns no rows: deleting it would silently take the voice
+        // it was merged into. Same shape of refusal `speakers.split` gives.
+        let canonical = store.resolve_speaker(id).map_err(Error::from)?;
+        if canonical != id {
+            return Err(Error::new(
+                "conflict",
+                format!(
+                    "speaker {id} was merged into {canonical}; delete {canonical} instead — \
+                     that is the voice holding the rows"
+                ),
+            ));
+        }
+        let Some(summary) = store.speaker_summary(id).map_err(Error::from)? else {
+            return Err(Error::not_found(format!("no speaker with id {id}")));
+        };
+        if store.you_speaker_id().map_err(Error::from)? == Some(id) {
+            return Err(Error::new(
+                "refused",
+                "that is your own voice, pinned by your microphone rather than matched. \
+                 Deleting it would not stop you being recorded — the next turn through the \
+                 mic would mint the pin again. Turn the microphone off (mic.set {enabled: \
+                 false}) to stop recording yourself; to remove what you have already said, \
+                 delete by date or session instead",
+            ));
+        }
+        if !keep {
+            let tombstones = store.merge_tombstones(id).map_err(Error::from)?;
+            if !tombstones.is_empty() {
+                let n = tombstones.len();
+                return Err(Error::new(
+                    "refused",
+                    format!(
+                        "speaker {id} is a merge target: {n} other voice(s) were merged into \
+                         it and point at it. Removing the voiceprint would leave them \
+                         dangling. Delete with keep_voiceprint: true — that still takes every \
+                         conversation — or split the voice apart first"
+                    ),
+                ));
+            }
+        }
+
+        // Everything an audit would need to reconstruct what was here, read
+        // before anything moves.
+        let languages = store.speaker_languages(id).map_err(Error::from)?;
+        let prototypes_before = store.prototype_count(id).map_err(Error::from)?;
+        let goldens_before = store.golden_samples_for(id).map_err(Error::from)?;
+        let at = utc_now_ns();
+        let report = store
+            .delete_speaker(id, keep, at)
+            .map_err(|e| Error::new("conflict", format!("{e:#}")))?;
+
+        // The segment ids go into the log the way `delete.run` writes them —
+        // one row per batch — so one operations row never has to carry a
+        // hundred thousand ids, and the identity itself gets a row of its own.
+        for batch in report.soft_deleted.chunks(DELETE_BATCH) {
+            store
+                .log_operation(
+                    "speakers.delete",
+                    &serde_json::to_string(batch).unwrap_or_else(|_| "[]".into()),
+                    &json!({"speaker": id, "deleted_at": at, "soft": true}).to_string(),
+                    at,
+                )
+                .map_err(Error::from)?;
+        }
+        store
+            .log_operation(
+                "speakers.delete",
+                &json!([id]).to_string(),
+                &json!({
+                    "id": id,
+                    "display_name": summary.name(),
+                    "auto_label": summary.auto_label,
+                    "languages": languages,
+                    "created_at": summary.created_at,
+                    "keep_voiceprint": keep,
+                    "segments": report.segments.len(),
+                    "soft_deleted": report.soft_deleted.len(),
+                    "prototypes": prototypes_before,
+                    "embeddings": report.embeddings,
+                    "goldens": goldens_before
+                        .iter()
+                        .map(|g| g.audio_path.clone())
+                        .collect::<Vec<_>>(),
+                    "threads": report.threads,
+                    "removed_speaker": report.removed_speaker,
+                })
+                .to_string(),
+                at,
+            )
+            .map_err(Error::from)?;
+        drop(store);
+
+        // Rows first, then files: a file with no row is residue the
+        // reconciliation sweep understands, a row with no file is a lie.
+        for rel in &report.goldens {
+            if !rel.is_empty() {
+                let _ = std::fs::remove_file(self.control.data_dir.join(rel));
+            }
+        }
+
+        // Named rows, batched: a client drops exactly these without re-querying
+        // a whole transcript, and one frame never has to carry every id.
+        for batch in report.soft_deleted.chunks(DELETE_BATCH) {
+            self.bus
+                .publish(Topic::Segments, "purge", json!({"ids": batch}));
+        }
+        let name = summary.name().map(str::to_string);
+        let seq = if report.removed_speaker {
+            // The same shape a sweep uses: not a merge — nothing moved
+            // anywhere, the id simply stops existing.
+            self.bus.publish(
+                Topic::Relabel,
+                "relabel",
+                json!({"speaker": id, "name": Value::Null, "pruned": true}),
+            )
+        } else {
+            // The voice is still there and still matching; only its counts
+            // moved, and the `purge` above already told every view by how much.
+            self.bus.publish(
+                Topic::Relabel,
+                "relabel",
+                json!({"speaker": id, "name": name, "languages": languages}),
+            )
+        };
+
+        info!(
+            speaker = id,
+            keep_voiceprint = keep,
+            segments = report.soft_deleted.len(),
+            "deleted a voice"
+        );
+        self.announce_status();
+        let msg = if report.removed_speaker {
+            format!(
+                "{} conversation(s) deleted and the voiceprint removed — this voice has to \
+                 enrol again from scratch before it is recognised.",
+                report.soft_deleted.len()
+            )
+        } else {
+            format!(
+                "{} conversation(s) deleted. The voiceprint was kept: this voice stays in the \
+                 bank and will still be labelled going forward.",
+                report.soft_deleted.len()
+            )
+        };
+        Ok(json!({
+            "id": id,
+            "name": name,
+            // The generated label, so a caller that has not got the speakers
+            // list can still say which voice this was — an unnamed voice is
+            // the common case here, and "Speaker 7" is not what it is called.
+            "auto": summary.auto_label,
+            "keep_voiceprint": keep,
+            "removed_speaker": report.removed_speaker,
+            "segments": report.soft_deleted.len(),
+            "total_segments": report.segments.len(),
+            "prototypes": report.prototypes,
+            "embeddings": report.embeddings,
+            "goldens": report.goldens.len(),
+            "threads": report.threads,
+            "msg": msg,
+            "seq": seq,
         }))
     }
 
@@ -2701,6 +2909,378 @@ mod tests {
             call(&r, r#"{"id":4,"method":"speakers.prune"}"#).unwrap()["count"],
             json!(0)
         );
+    }
+
+    // ---- 0.6.4: deleting a voice -----------------------------------------
+
+    /// One voice with everything a voice can own: clips on disk, embeddings,
+    /// the prototypes those seeded, a golden sample with a real file, and a
+    /// conversation the clips belong to. Exactly the arrangement the pipeline
+    /// writes, and the one a delete has to take apart without collateral.
+    struct AVoice {
+        id: i64,
+        segments: Vec<i64>,
+        golden: String,
+        thread: i64,
+    }
+
+    fn a_full_voice(r: &Rig, sess: i64, tag: &str, clips: usize) -> AVoice {
+        let id = r.service.store().mint_speaker(0).unwrap();
+        let thread = r.service.store().create_thread(sess, 0, 1).unwrap();
+        let mut segments = Vec::new();
+        for n in 0..clips {
+            let seg = a_clip(r, sess, &format!("{tag}{n}"), 4.0, Some((id, 0.9)));
+            let store = r.service.store();
+            let e = crate::embed::Embedding::new("m@1", vec![1.0, n as f32 / 10.0]);
+            store.store_embedding(seg, &e).unwrap();
+            store
+                .add_prototype(id, &e, Some(seg), false, 20, 0)
+                .unwrap();
+            store.set_segment_thread(seg, thread, 1).unwrap();
+            segments.push(seg);
+        }
+        let golden = format!("goldens/{tag}.wav");
+        std::fs::create_dir_all(r.dir.join("goldens")).unwrap();
+        std::fs::write(r.dir.join(&golden), b"RIFFgolden").unwrap();
+        r.service
+            .store()
+            .add_golden_sample(id, &golden, 4.0)
+            .unwrap();
+        AVoice {
+            id,
+            segments,
+            golden,
+            thread,
+        }
+    }
+
+    fn thread_exists(r: &Rig, thread: i64) -> bool {
+        r.service.store().thread_summary(thread).unwrap().is_some()
+    }
+
+    fn delete_speaker(r: &Rig, id: i64, keep: bool) -> Result<Value, Error> {
+        call(
+            r,
+            &format!(
+                r#"{{"id":1,"method":"speakers.delete","params":{{"id":{id},"keep_voiceprint":{keep}}}}}"#
+            ),
+        )
+    }
+
+    /// The reported bug, exactly: three voices at "0 SEGMENTS · 0s" that Delete
+    /// could not touch, because a delete scoped by segment matched nothing and
+    /// the voiceprint behind them was never in scope at all.
+    #[test]
+    fn a_voice_with_no_conversations_left_is_still_deletable() {
+        let r = rig("delete-empty-voice");
+        let sess = a_session(&r);
+        let ghost = a_full_voice(&r, sess, "ghost", 1);
+        // The state the user was actually in: the words are already gone, the
+        // voice is not, and it still has a live prototype that would match the
+        // next thing it heard.
+        r.service
+            .store()
+            .soft_delete_segments(&ghost.segments, 1)
+            .unwrap();
+        assert_eq!(
+            r.service
+                .store()
+                .speaker_summary(ghost.id)
+                .unwrap()
+                .unwrap()
+                .segments,
+            0,
+            "the fixture is not the reported state"
+        );
+        assert_eq!(r.service.store().prototype_count(ghost.id).unwrap(), 1);
+
+        let out = delete_speaker(&r, ghost.id, false).unwrap();
+        // No live rows to take, and it still did the thing that was asked.
+        assert_eq!(out["segments"], json!(0));
+        assert_eq!(out["removed_speaker"], json!(true));
+        assert_eq!(out["prototypes"], json!(1));
+        assert!(
+            r.service
+                .store()
+                .speaker_summary(ghost.id)
+                .unwrap()
+                .is_none(),
+            "the empty voice is still in the bank"
+        );
+        assert_eq!(r.service.store().prototype_count(ghost.id).unwrap(), 0);
+        assert!(
+            !r.service
+                .store()
+                .prototypes("m@1")
+                .unwrap()
+                .iter()
+                .any(|(sp, _)| *sp == ghost.id),
+            "the ghost can still match future audio"
+        );
+    }
+
+    #[test]
+    fn the_nuke_path_takes_the_whole_voice_and_nothing_around_it() {
+        let r = rig("delete-nuke");
+        let sess = a_session(&r);
+        let doomed = a_full_voice(&r, sess, "doomed", 3);
+        let bystander = a_full_voice(&r, sess, "bystander", 2);
+
+        let out = delete_speaker(&r, doomed.id, false).unwrap();
+        assert_eq!(out["segments"], json!(3));
+        assert_eq!(out["prototypes"], json!(3));
+        assert_eq!(out["embeddings"], json!(3));
+        assert_eq!(out["goldens"], json!(1));
+        assert_eq!(out["keep_voiceprint"], json!(false));
+
+        let store = r.service.store();
+        // Segments: soft-deleted, not purged. The undo window is the same one
+        // `delete.run` leaves behind, and the sweeper still finalises them.
+        for seg in &doomed.segments {
+            let f = store.segment_fields(*seg).unwrap();
+            assert!(
+                f["deleted_at"].is_some(),
+                "segment {seg} was not soft-deleted"
+            );
+            assert!(f["speaker_id"].is_none(), "segment {seg} kept its label");
+            assert!(
+                store.segment_embedding(*seg).unwrap().is_none(),
+                "segment {seg} kept its embedding"
+            );
+        }
+        // Identity: gone, with everything the voicebank rested on.
+        assert!(store.speaker_summary(doomed.id).unwrap().is_none());
+        assert_eq!(store.prototype_count(doomed.id).unwrap(), 0);
+        assert!(store.golden_samples_for(doomed.id).unwrap().is_empty());
+        assert!(
+            !r.dir.join(&doomed.golden).exists(),
+            "the golden sample's file is still on disk"
+        );
+        // The conversation went with its last live row; the bystander's did not.
+        drop(store);
+        assert!(!thread_exists(&r, doomed.thread));
+        assert!(thread_exists(&r, bystander.thread));
+
+        // "and nothing else": the other voice is untouched, down to its bytes.
+        let store = r.service.store();
+        assert_eq!(
+            store
+                .speaker_summary(bystander.id)
+                .unwrap()
+                .unwrap()
+                .segments,
+            2
+        );
+        assert_eq!(store.prototype_count(bystander.id).unwrap(), 2);
+        assert_eq!(store.golden_samples_for(bystander.id).unwrap().len(), 1);
+        assert!(r.dir.join(&bystander.golden).exists());
+        for seg in &bystander.segments {
+            assert!(store.segment_fields(*seg).unwrap()["deleted_at"].is_none());
+            assert!(store.segment_embedding(*seg).unwrap().is_some());
+        }
+        drop(store);
+
+        // The audit trail: the identity row carries what was here, and the
+        // segments are logged in batches the way `delete.run` logs them.
+        let ops = call(&r, r#"{"id":9,"method":"operations.list"}"#).unwrap();
+        let rows: Vec<&Value> = ops["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["op"] == "speakers.delete")
+            .collect();
+        let identity = rows
+            .iter()
+            .find(|o| o["prior_state"]["id"] == json!(doomed.id))
+            .unwrap_or_else(|| panic!("no identity row in the audit log: {ops:#}"));
+        assert_eq!(identity["prior_state"]["keep_voiceprint"], json!(false));
+        assert_eq!(identity["prior_state"]["segments"], json!(3));
+        assert_eq!(identity["prior_state"]["prototypes"], json!(3));
+        assert_eq!(identity["prior_state"]["embeddings"], json!(3));
+        assert_eq!(
+            identity["prior_state"]["goldens"],
+            json!([doomed.golden.clone()])
+        );
+        assert!(
+            identity["prior_state"]["auto_label"].is_string(),
+            "an audit that cannot name the voice cannot audit it: {identity:#}"
+        );
+        let logged: Vec<i64> = rows
+            .iter()
+            .filter(|o| o["prior_state"]["soft"] == json!(true))
+            .flat_map(|o| {
+                o["target_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_i64().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            logged, doomed.segments,
+            "the deleted rows are not auditable"
+        );
+
+        // And the views were told: the rows by id, the identity as a
+        // disappearance rather than a merge.
+        let evs = events(&r);
+        let purged: Vec<i64> = evs
+            .iter()
+            .filter(|e| e["ev"] == "purge")
+            .flat_map(|e| {
+                e["data"]["ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_i64().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(purged, doomed.segments);
+        assert!(
+            evs.iter().any(|e| e["ev"] == "relabel"
+                && e["data"]["speaker"] == json!(doomed.id)
+                && e["data"]["pruned"] == json!(true)),
+            "no view was told the voice stopped existing: {evs:#?}"
+        );
+    }
+
+    #[test]
+    fn keeping_the_voiceprint_takes_the_words_and_leaves_the_voice_matching() {
+        let r = rig("delete-keep");
+        let sess = a_session(&r);
+        let kira = a_full_voice(&r, sess, "kira", 3);
+
+        let out = delete_speaker(&r, kira.id, true).unwrap();
+        assert_eq!(out["segments"], json!(3));
+        assert_eq!(out["removed_speaker"], json!(false));
+        assert_eq!(out["prototypes"], json!(0));
+        assert_eq!(out["embeddings"], json!(0));
+        assert!(
+            out["msg"].as_str().unwrap().contains("voiceprint was kept"),
+            "a delete that leaves something behind has to admit it: {out:#}"
+        );
+
+        let store = r.service.store();
+        // The words are gone from every read path…
+        for seg in &kira.segments {
+            let f = store.segment_fields(*seg).unwrap();
+            assert!(f["deleted_at"].is_some(), "segment {seg} survived");
+            // …but the label stays: nothing was reassigned, it was deleted.
+            assert_eq!(f["speaker_id"], Some(kira.id.to_string()));
+        }
+        assert_eq!(store.transcript(None, Some(kira.id)).unwrap().len(), 0);
+        // …and the voice is still a voice.
+        let summary = store.speaker_summary(kira.id).unwrap().unwrap();
+        assert_eq!(summary.segments, 0);
+        assert_eq!(store.prototype_count(kira.id).unwrap(), 3);
+        assert_eq!(store.golden_samples_for(kira.id).unwrap().len(), 1);
+        assert!(r.dir.join(&kira.golden).exists());
+        assert!(
+            store
+                .prototypes("m@1")
+                .unwrap()
+                .iter()
+                .any(|(sp, _)| *sp == kira.id),
+            "the kept voice can no longer match future audio"
+        );
+        drop(store);
+        // The conversation is still an index into nothing live, so it goes.
+        assert!(!thread_exists(&r, kira.thread));
+
+        // Deleting again is not a no-op the second time round: this is the
+        // path out of the ghost state the bug left people in.
+        let again = delete_speaker(&r, kira.id, false).unwrap();
+        assert_eq!(again["segments"], json!(0));
+        assert_eq!(again["removed_speaker"], json!(true));
+        assert!(
+            r.service
+                .store()
+                .speaker_summary(kira.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn your_own_pinned_voice_is_refused_and_the_refusal_names_the_switch() {
+        let r = rig("delete-you");
+        let sess = a_session(&r);
+        let you = r.service.store().ensure_you_speaker(0).unwrap();
+        a_clip(&r, sess, "mine", 4.0, Some((you, 0.9)));
+
+        for keep in [true, false] {
+            let e = delete_speaker(&r, you, keep).unwrap_err();
+            assert_eq!(e.code, "refused");
+            assert!(
+                e.msg.contains("microphone"),
+                "the refusal must name the switch that does work: {}",
+                e.msg
+            );
+        }
+        // Refused means refused: the pin, the row and the words are all still
+        // there.
+        assert_eq!(r.service.store().you_speaker_id().unwrap(), Some(you));
+        assert_eq!(
+            r.service
+                .store()
+                .speaker_summary(you)
+                .unwrap()
+                .unwrap()
+                .segments,
+            1
+        );
+    }
+
+    #[test]
+    fn a_merge_target_is_refused_by_count_and_its_tombstones_never_dangle() {
+        let r = rig("delete-merge-target");
+        let sess = a_session(&r);
+        let target = a_full_voice(&r, sess, "target", 2);
+        let one = a_full_voice(&r, sess, "one", 1);
+        let two = a_full_voice(&r, sess, "two", 1);
+        for from in [one.id, two.id] {
+            r.service.store().merge_speakers(from, target.id).unwrap();
+        }
+
+        // The nuke path would leave two tombstones pointing at a row that is
+        // not there. It is refused, and the refusal says how many.
+        let e = delete_speaker(&r, target.id, false).unwrap_err();
+        assert_eq!(e.code, "refused");
+        assert!(
+            e.msg.contains('2') && e.msg.contains("keep_voiceprint"),
+            "the refusal must name the count and the way out: {}",
+            e.msg
+        );
+        // A tombstone itself is not a voice, and says which one is.
+        let e = delete_speaker(&r, one.id, false).unwrap_err();
+        assert_eq!(e.code, "conflict");
+        assert!(e.msg.contains(&target.id.to_string()));
+
+        // The half that does work still works, and afterwards every tombstone
+        // still resolves to a row that exists — one hop, no chains, no dangle.
+        let out = delete_speaker(&r, target.id, true).unwrap();
+        assert_eq!(out["removed_speaker"], json!(false));
+        let store = r.service.store();
+        for id in [one.id, two.id] {
+            let canonical = store.resolve_speaker(id).unwrap();
+            assert_eq!(canonical, target.id);
+            assert!(
+                store.speaker_name(canonical).unwrap().is_some(),
+                "tombstone {id} points at a speaker that is not there"
+            );
+        }
+        assert!(store.speaker_summary(target.id).unwrap().is_some());
+        // Every merged voice's words went too: the target owns them now.
+        assert_eq!(store.transcript(None, Some(target.id)).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn deleting_a_voice_that_is_not_there_is_not_found() {
+        let r = rig("delete-missing");
+        let e = delete_speaker(&r, 999_999, false).unwrap_err();
+        assert_eq!(e.code, "not_found");
     }
 
     // ---- 0.6.1: storage --------------------------------------------------

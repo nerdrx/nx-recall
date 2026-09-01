@@ -186,6 +186,40 @@ pub enum SpeakersAction {
         #[arg(long)]
         apply: bool,
     },
+
+    /// Delete one voice: its conversations always, and — unless you keep the
+    /// voiceprint — the identity behind them too.
+    // Verbatim: clap would reflow the two halves into one paragraph, and the
+    // difference between them is the whole point of the command.
+    #[command(long_about = "\
+Delete one voice.
+
+Both halves soft-delete every conversation the voice still has, so the undo
+window applies exactly as it does to any other delete. What differs is whether
+the voiceprint survives:
+
+  recalld speakers delete 7                    the voice goes too: prototypes,
+                                               embeddings and golden samples are
+                                               removed and it must enrol again
+  recalld speakers delete 7 --keep-voiceprint  the words go, the identity stays
+                                               and keeps being labelled
+
+A voice with no conversations left is still deletable — that is the case this
+exists for: once the segments are gone there is nothing left to delete BY, and
+the voiceprint would otherwise go on matching new audio for ever.
+
+Refused for your own pinned voice (turn the microphone off instead) and, on the
+nuke path, for a voice other voices were merged into.
+
+Needs the running daemon: every connected client has to be told.")]
+    Delete {
+        #[arg(value_name = "SPEAKER_ID")]
+        speaker_id: i64,
+        /// Keep the voice in the bank: delete the conversations only, and go on
+        /// labelling this voice in future.
+        #[arg(long)]
+        keep_voiceprint: bool,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

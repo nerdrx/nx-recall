@@ -411,6 +411,9 @@ select.input option, select.input optgroup {
 .sp-name:hover { border-color: var(--clear-line-strong); background: var(--clear-surface); }
 .sp-name.unnamed { color: var(--clear-muted); font-family: var(--mono); font-size: 13px; font-weight: 500; }
 .sp-sub { font-size: 11px; color: var(--clear-muted); }
+/* A voice with nothing left under it. Muted, on the same line as "first heard":
+   it is a fact about the row, not a warning — the row is prunable, not broken. */
+.sp-empty { font-size: 11px; color: var(--clear-muted); font-style: italic; }
 .sp-num { font: 600 13px/1 var(--mono); color: var(--clear-ink); text-align: right; }
 .sp-num small {
   display: block; margin-top: 5px; font: 600 9.5px/1 var(--font);
@@ -688,6 +691,12 @@ select.input option, select.input optgroup {
 .sheet .sheet-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-2); }
 .sheet .sheet-head .card-title { margin-bottom: var(--sp-1); }
 .sheet .actions { display: flex; gap: var(--sp-1); justify-content: flex-end; margin-top: var(--sp-3); }
+/* A confirm whose answers are choices rather than yes/no (DESIGN §8's "keep
+   the bank entry, or nuke it"). The labels have to say what each one takes, so
+   they get a line each, read top to bottom by how much they destroy, and
+   Cancel sits last and plain. */
+.sheet .actions.stacked { flex-direction: column; align-items: stretch; gap: 8px; }
+.sheet .actions.stacked .btn { justify-content: center; }
 /* A well: the recessed surface inside a sheet. Tile fill, hairline, no shadow —
    a sheet holds wells; a well never holds a sheet. */
 .sheet .quote {

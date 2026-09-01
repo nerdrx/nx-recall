@@ -5,7 +5,7 @@
 // banner over this list saying "these voices are most of your conversations —
 // who are they?" with the names right there to type.
 
-import { h, clear, fmtDur, fmtFirstSeen, speakerColor } from '../lib/dom.js';
+import { h, clear, fmtBytes, fmtDur, fmtFirstSeen, speakerColor } from '../lib/dom.js';
 import {
   store,
   speakerLabel,
@@ -18,7 +18,7 @@ import {
   languageValue,
   languageLabel,
 } from '../lib/store.js';
-import { confirmSheet, openSheet, toast } from '../lib/sheets.js';
+import { chooseSheet, confirmSheet, openSheet, toast } from '../lib/sheets.js';
 import { playSpeaker, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 
 export const id = 'speakers';
@@ -395,6 +395,18 @@ export function mount(root, ctx) {
           {},
           name,
           h('span', { class: 'sp-sub', text: ` first heard ${fmtFirstSeen(sp.first_seen)}` }),
+          // A voice at "0 segments · 0s" is not a broken row, it is an empty
+          // one: the words have gone and only the voiceprint is left, still
+          // matching. Saying so is what makes the row read as prunable rather
+          // than as a bug — which is exactly how it read before 0.6.4.
+          (sp.segments ?? 0) === 0
+            ? h('span', {
+                class: 'sp-empty',
+                dataset: { empty: String(sp.id) },
+                text: ' · no conversations left',
+                title: 'Only the voiceprint is left. It still matches new audio — delete the voice to clear it.',
+              })
+            : null,
           h('span', { class: 'sp-hint', dataset: { hint: String(sp.id) } })
         )
       ),
@@ -679,27 +691,58 @@ export function mount(root, ctx) {
     }
   }
 
+  /**
+   * Delete a voice — DESIGN §8's choice, which the UI never used to offer.
+   *
+   * The old sheet asked one question ("delete everything from X?") and then ran
+   * `delete.run`, which only ever scoped SEGMENTS. So the voiceprint survived
+   * every delete and went on matching new audio, and once the segments were
+   * gone the button matched nothing at all: pressing it did nothing, for ever,
+   * with no way out of the GUI. Two things fix it — the second action, and
+   * `speakers.delete`, which is scoped by the voice rather than by its rows and
+   * therefore still works when there are none.
+   *
+   * `delete.run` stays exactly where it belongs: deletes scoped by date or by
+   * session, which are about words rather than about a person.
+   */
   async function doDelete(spId) {
-    let preview;
+    const sp = store.speakers.get(spId);
+    const label = speakerLabel(spId);
+    let preview = { segments: sp?.segments ?? 0, bytes: 0 };
     try {
       preview = await ask('delete.preview', { speaker: spId });
-    } catch (e) {
-      toast(`Could not check what that would delete — ${e.message}`, 'error');
-      return;
+    } catch {
+      // An older daemon, or a voice with nothing to preview. The row's own
+      // counts are the honest fallback — never a reason to block the delete,
+      // which is the one thing that has to keep working.
     }
-    const ok = await confirmSheet({
-      title: `Delete everything from ${speakerLabel(spId)}?`,
-      body: 'This is a real purge: the segments, their text and their audio are removed and the space is reclaimed. It cannot be undone after the undo window closes.',
-      detail: `${preview.segments} segments · ${Math.round((preview.bytes ?? 0) / 1024)} KB of audio`,
-      confirmLabel: `Delete ${preview.segments} segments`,
-      danger: true,
+    const segments = preview.segments ?? 0;
+    const empty = segments === 0;
+    const scope = empty
+      ? `${label} · no conversations left`
+      : `${label} · ${segments.toLocaleString()} segments · ${fmtDur(sp?.total_ms ?? 0)} · ${fmtBytes(preview.bytes ?? 0)}`;
+
+    const choice = await chooseSheet({
+      title: `Delete ${label}?`,
+      body: empty
+        ? 'There are no conversations left under this voice — only the voiceprint, which is still in the bank and still matches new audio. Removing it is the whole of what is left to do: if this person is heard again they arrive as a new, unnamed voice.'
+        : 'Two different things can go. The conversations are the words and the audio: deleting those leaves the voiceprint in the bank, so this voice keeps being recognised and labelled from here on. Deleting everything takes the voiceprint too — this person would have to be heard and named again from scratch. Either way the words are recoverable until the undo window closes.',
+      detail: empty ? `${scope} — this removes the empty voice and its voiceprint` : scope,
+      choices: empty
+        ? [{ key: 'all', value: 'all', label: 'Delete this empty voice and its voiceprint', danger: true }]
+        : [
+            { key: 'keep', value: 'keep', label: 'Delete conversations, keep the voice' },
+            { key: 'all', value: 'all', label: 'Delete everything, including the voiceprint', danger: true },
+          ],
     });
-    if (!ok) return;
+    if (!choice) return;
     try {
-      const res = await ask('delete.run', { speaker: spId });
-      toast(`Deleting (${res.op}) — progress is in the status bar.`, 'ok');
+      const res = await ask('speakers.delete', { id: spId, keep_voiceprint: choice === 'keep' });
+      // The daemon's own sentence, because it is the one that knows what
+      // actually went — and a delete that left something behind has to say so.
+      toast(res.msg ?? `Deleted ${label}.`, 'ok');
     } catch (e) {
-      toast(`Could not delete — ${e.message}`, 'error');
+      toast(`Could not delete ${label} — ${e.message}`, 'error');
     }
   }
 

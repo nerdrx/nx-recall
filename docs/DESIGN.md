@@ -301,6 +301,21 @@ preview; soft-delete undo window; panic-delete; source blocklist), plus:
   requirement. No hotkey, no Wayland GlobalShortcuts spike, no in-world trigger.
   For anything said before a pause: panic-delete-last-N-minutes and retention
   limits cover it after the fact.
+- **Delete-by-speaker is a choice, and both halves exist (0.6.4).** Deleting a
+  voice asks which of two things should go: the conversations, or the
+  conversations *and* the bank entry — keep it and the voice is still labelled
+  going forward, nuke it and that person re-enrolls from scratch. Until 0.6.4
+  only the segments were ever in scope, so every "delete" kept the voiceprint
+  and went on matching, and a voice whose rows had already gone could not be
+  deleted at all: the button matched zero rows and did nothing, with
+  `recalld speakers prune --apply` as the only escape and no way to know it.
+  The method is `speakers.delete {id, keep_voiceprint}` (PROTOCOL), the GUI asks
+  in a confirm sheet that states the real scope, and the speakers list says
+  "no conversations left" on a voice that has none, so an empty entry reads as
+  prunable rather than broken. Two things are refused rather than guessed at:
+  your own pinned voice (the microphone switch is what stops recording you) and,
+  on the nuke path, a voice others were merged into — its tombstones would
+  dangle, and keeping the voiceprint still takes every conversation.
 - Socket: `$XDG_RUNTIME_DIR/nx-recall.sock`, mode 0600.
 - At-rest encryption: **honestly scoped.** A user-service that autostarts cannot
   prompt for a passphrase, so a local key would be theater against filesystem

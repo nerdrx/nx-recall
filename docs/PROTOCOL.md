@@ -44,6 +44,7 @@ Methods (initial set):
 | `speakers.name` | `{id, name}` | retroactive; broadcasts `relabel` |
 | `speakers.set_languages` | `{id, languages}` | which languages this voice speaks; broadcasts `relabel` |
 | `speakers.prune` | `{apply?}` | list (default) or sweep the one-off voices |
+| `speakers.delete` | `{id, keep_voiceprint?}` | delete one voice: its conversations always, its voiceprint unless kept. Works on a voice with **no segments left** — see below |
 | `speakers.merge` | `{from, into}` | tombstone, no chains; broadcasts `relabel` |
 | `speakers.split` | `{id}` | **async op** (below); work completes inline — the reply carries the op handle **plus** the outcome: `{op, kept, minted, auto, moved_segments, moved_prototypes, ambiguous, centroid_similarity, embed_model_id, resync, seq}`. Data-driven refusals (one voice, golden conflict) come back as `err:refused`. The minted speaker's `relabel` carries `split_from`. Past ~100 changed rows the per-segment events are skipped and `resync: true` tells clients to re-query. |
 | `segments.reassign` | `{segment_id, speaker_id}` | |
@@ -234,6 +235,47 @@ only *what*.
 - **`status.counters`** gains `too_slight` (turns that matched nobody and were
   under the mint bar), `proximity_labelled`, `redecoded` and `lang_mismatch`.
 
+### Deleting a voice (0.6.4)
+
+**`speakers.delete {id, keep_voiceprint?}`** → `{id, name, keep_voiceprint,
+removed_speaker, segments, total_segments, prototypes, embeddings, goldens,
+threads, msg, seq}`.
+
+DESIGN §8 always specified a choice here — "keep the bank entry (still labeled
+going forward) or nuke it so they re-enroll fresh" — and only the first half of
+the *first* option was ever built. Deleting by speaker went through
+`delete.run`, which is scoped by **segments**: it never touched the speaker row,
+its prototypes, its embeddings or its goldens, so a deleted voice kept its
+voiceprint and went on matching new audio — and once its segments were gone the
+same call matched zero rows and did nothing at all, for ever. This is the method
+that is scoped by the **voice**.
+
+- Both halves soft-delete the voice's live segments, with the same undo window
+  and the same `purge` events (batched, ids named) `delete.run` produces, and
+  the same operations rows: one per batch of segment ids, plus one for the
+  identity carrying what it was called, what it owned and which half ran.
+- `keep_voiceprint: true` — the speaker row, prototypes, goldens and embeddings
+  stay. The voice keeps matching and keeps being labelled. Announced as a plain
+  `relabel`; the reply's `msg` says the voiceprint was kept, and a client should
+  show it rather than inventing its own sentence.
+- `keep_voiceprint: false` (the default) — prototypes, this voice's embeddings,
+  its goldens (rows and files) and the speaker row go too. Announced exactly as
+  a sweep is, `relabel` with `pruned: true`: not a merge, nothing moved, the id
+  stops existing.
+- **A voice with no live segments is a normal input**, not an error: it is the
+  case the method exists for.
+- Two refusals, both `err:refused`. The pinned **"You"** voice — deleting it
+  would not stop you being recorded, since the next turn through the microphone
+  mints the pin again, so the message names `mic.set` as the switch that does
+  work and date/session deletes as the way to remove what you have said. And a
+  **merge target** on the nuke path: other voices are tombstoned onto that row
+  and `speakers.merged_into` is a real foreign key, so the refusal names the
+  count and points at `keep_voiceprint: true`, which still takes every
+  conversation. A tombstone id is `err:conflict` naming the canonical voice, as
+  `speakers.split` does.
+- `delete.run` is unchanged and stays the method for deletes scoped by **date or
+  session** — those are about words rather than about a person.
+
 ### Conversation threads and the person page (schema 6)
 
 The memory graph's Tier 1 ([GRAPH.md](GRAPH.md)): derived, deterministic, always
@@ -310,9 +352,13 @@ the instant it is deleted.
   already has for a transcript. Unknown id is `err:not_found`.
 
 - Deleting is deletion: purging a segment drops it from every total and every
-  edge, and a thread whose last row goes is deleted with it. A soft delete
-  (the undo window) hides the rows but keeps the thread, because the rows are
-  still coming back.
+  edge, and a thread whose last row goes is deleted with it. A soft delete by
+  date or session (`delete.run`) hides the rows but keeps the thread, because
+  the rows are still coming back. `speakers.delete` is the exception and says
+  so in its reply's `threads`: deleting a *person* takes the conversations that
+  have nothing live left in them, because a thread is only an index into the
+  transcript, it is re-derivable from it, and an index into rows no view can
+  reach is not a conversation.
 
 ## Versioning rules
 

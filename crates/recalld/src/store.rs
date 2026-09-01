@@ -194,17 +194,29 @@ impl NeighbourSegment {
     }
 }
 
-/// What sweeping one one-off voice removed. `goldens` are paths the caller
-/// unlinks — the rows are already gone.
+/// What deleting one voice removed — the sweep (`speakers.prune`) and the
+/// deliberate delete (`speakers.delete`) both report through this, because they
+/// are the same cascade with one switch. `goldens` are paths the caller unlinks
+/// — the rows are already gone.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PruneReport {
+pub struct SpeakerDeleteReport {
     pub speaker_id: i64,
     /// Every segment that pointed at the voice, live or already soft-deleted.
     pub segments: Vec<i64>,
-    /// How many of those this call was the one to soft-delete.
-    pub soft_deleted: usize,
+    /// The ones this call was the one to soft-delete — exactly the ids the
+    /// `purge` event names, and never the rows a previous delete already took.
+    pub soft_deleted: Vec<i64>,
     pub prototypes: usize,
+    /// Rows out of `embeddings` for this voice's segments. Only the nuke path
+    /// takes these: they are what a re-cluster and a re-enrolment rest on.
+    pub embeddings: usize,
     pub goldens: Vec<String>,
+    /// Conversations left with nothing live in them, cleaned as the purge path
+    /// cleans them (DESIGN §0's deletion rule).
+    pub threads: usize,
+    /// False when the voiceprint was kept: the identity is still in the bank
+    /// and still matches future audio.
+    pub removed_speaker: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2497,10 +2509,17 @@ impl Store {
     /// Threads with nothing live left in them. A thread is an index into the
     /// transcript, so when the transcript goes the index goes with it — DESIGN
     /// §0's deletion rule, applied to the one derived table the schema has.
+    ///
+    /// "Live" is the whole point: a soft-deleted row has already left every
+    /// read path, so a thread made only of soft-deleted rows is a conversation
+    /// no view can reach. It is also the one derived table in the schema and
+    /// re-derivable from the transcript, which is what makes deleting it ahead
+    /// of the sweeper safe rather than lossy.
     pub fn prune_empty_threads(&self) -> Result<usize> {
         Ok(self.conn.execute(
             "DELETE FROM threads WHERE NOT EXISTS (
-                 SELECT 1 FROM segments g WHERE g.thread_id = threads.id
+                 SELECT 1 FROM segments g
+                 WHERE g.thread_id = threads.id AND g.deleted_at IS NULL
              )",
             [],
         )?)
@@ -2808,19 +2827,63 @@ impl Store {
         Ok(rows)
     }
 
-    /// Remove one voice and everything that rests on it, in one transaction.
+    /// Every speaker tombstoned onto this one — the ids a merge folded into it.
     ///
-    /// The cascade is the one `delete.run` performs, plus the identity itself:
-    /// the voice's segments are soft-deleted (so the undo window still applies
-    /// and the sweeper still finalises them), their labels are cleared so the
-    /// foreign key can go, and the prototypes and goldens that made this a
-    /// recognisable voice are removed for real. The golden files are returned
-    /// rather than unlinked — the row goes first, because a file with no row is
-    /// residue the reconciliation sweep understands and a row with no file is a
-    /// lie.
-    pub fn prune_speaker(&self, speaker_id: i64, at_utc_ns: i64) -> Result<PruneReport> {
+    /// A caller that wants to remove the row itself has to know about these:
+    /// `speakers.merged_into` is a real foreign key, so deleting a merge target
+    /// out from under its tombstones is not merely untidy, it is refused by
+    /// SQLite. The count is what the refusal message is built from.
+    pub fn merge_tombstones(&self, speaker_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM speakers WHERE merged_into = ?1 ORDER BY id")?;
+        let rows = stmt
+            .query_map(params![speaker_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Remove one voice's conversations, and — unless the voiceprint is kept —
+    /// the voice itself, in one transaction.
+    ///
+    /// This is DESIGN §8's choice made real. Both halves soft-delete the
+    /// voice's live segments, so the undo window still applies and the
+    /// retention sweeper still finalises them exactly as `delete.run` leaves
+    /// them; what differs is whether the identity survives:
+    ///
+    /// * `keep_voiceprint` — the speaker row, its prototypes, its goldens and
+    ///   its embeddings all stay. The words are gone and the voice keeps
+    ///   matching future audio, which is what "keep the bank entry (still
+    ///   labeled going forward)" means.
+    /// * otherwise — the labels are cleared so the foreign key can go, and the
+    ///   prototypes, the embeddings behind them, the goldens and the speaker
+    ///   row are removed for real. That voice has to re-enrol from scratch.
+    ///
+    /// The golden files are returned rather than unlinked: the row goes first,
+    /// because a file with no row is residue the reconciliation sweep
+    /// understands and a row with no file is a lie.
+    ///
+    /// A voice with **no live segments at all** is a normal input, not an
+    /// error. It is in fact the case this exists for: once a voice's rows have
+    /// gone, a delete scoped by segment matches nothing, and without this the
+    /// ghost keeps its voiceprint and goes on matching new audio for ever.
+    pub fn delete_speaker(
+        &self,
+        speaker_id: i64,
+        keep_voiceprint: bool,
+        at_utc_ns: i64,
+    ) -> Result<SpeakerDeleteReport> {
         if self.resolve_speaker(speaker_id)? != speaker_id {
             bail!("speaker {speaker_id} is a tombstone, not a voice");
+        }
+        if !keep_voiceprint {
+            let tombstones = self.merge_tombstones(speaker_id)?;
+            if !tombstones.is_empty() {
+                bail!(
+                    "speaker {speaker_id} is a merge target: {} other voice(s) were merged into it",
+                    tombstones.len()
+                );
+            }
         }
         let segments: Vec<i64> = {
             let mut stmt = self
@@ -2829,7 +2892,16 @@ impl Store {
             stmt.query_map(params![speaker_id], |r| r.get(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let goldens: Vec<String> = {
+        let live: Vec<i64> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM segments WHERE speaker_id = ?1 AND deleted_at IS NULL ORDER BY id",
+            )?;
+            stmt.query_map(params![speaker_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let goldens: Vec<String> = if keep_voiceprint {
+            Vec::new()
+        } else {
             let mut stmt = self
                 .conn
                 .prepare("SELECT audio_path FROM golden_samples WHERE speaker_id = ?1")?;
@@ -2838,34 +2910,65 @@ impl Store {
         };
 
         let tx = self.conn.unchecked_transaction()?;
-        let soft_deleted = tx.execute(
+        tx.execute(
             "UPDATE segments SET deleted_at = ?2
              WHERE speaker_id = ?1 AND deleted_at IS NULL",
             params![speaker_id, at_utc_ns],
         )?;
-        tx.execute(
-            "UPDATE segments SET speaker_id = NULL, match_score = NULL, label_via = NULL
-             WHERE speaker_id = ?1",
-            params![speaker_id],
+        let mut prototypes = 0;
+        let mut embeddings = 0;
+        if !keep_voiceprint {
+            // Order matters: the embeddings are found *through* the segments,
+            // so they go before the labels that identify them are cleared.
+            embeddings = tx.execute(
+                "DELETE FROM embeddings WHERE segment_id IN
+                     (SELECT id FROM segments WHERE speaker_id = ?1)",
+                params![speaker_id],
+            )?;
+            tx.execute(
+                "UPDATE segments SET speaker_id = NULL, match_score = NULL, label_via = NULL
+                 WHERE speaker_id = ?1",
+                params![speaker_id],
+            )?;
+            prototypes = tx.execute(
+                "DELETE FROM speaker_prototypes WHERE speaker_id = ?1",
+                params![speaker_id],
+            )?;
+            tx.execute(
+                "DELETE FROM golden_samples WHERE speaker_id = ?1",
+                params![speaker_id],
+            )?;
+            tx.execute("DELETE FROM speakers WHERE id = ?1", params![speaker_id])?;
+        }
+        // A thread is an index into the transcript and nothing else, so one
+        // with nothing live left in it is not an empty conversation — it is not
+        // a conversation. Same rule the hard purge applies (`purge_segments`).
+        let threads = tx.execute(
+            "DELETE FROM threads WHERE NOT EXISTS (
+                 SELECT 1 FROM segments g
+                 WHERE g.thread_id = threads.id AND g.deleted_at IS NULL
+             )",
+            [],
         )?;
-        let prototypes = tx.execute(
-            "DELETE FROM speaker_prototypes WHERE speaker_id = ?1",
-            params![speaker_id],
-        )?;
-        tx.execute(
-            "DELETE FROM golden_samples WHERE speaker_id = ?1",
-            params![speaker_id],
-        )?;
-        tx.execute("DELETE FROM speakers WHERE id = ?1", params![speaker_id])?;
         tx.commit()?;
 
-        Ok(PruneReport {
+        Ok(SpeakerDeleteReport {
             speaker_id,
             segments,
-            soft_deleted,
+            soft_deleted: live,
             prototypes,
+            embeddings,
             goldens,
+            threads,
+            removed_speaker: !keep_voiceprint,
         })
+    }
+
+    /// The sweep's per-voice cascade: `delete_speaker` with the voiceprint
+    /// going too, because a voice that is not a person has no bank entry worth
+    /// keeping.
+    pub fn prune_speaker(&self, speaker_id: i64, at_utc_ns: i64) -> Result<SpeakerDeleteReport> {
+        self.delete_speaker(speaker_id, false, at_utc_ns)
     }
 
     /// Live segments that are past the audio window and carry **no memory
@@ -2890,7 +2993,7 @@ impl Store {
         let mut out = HashMap::new();
         self.conn.query_row(
             "SELECT text, asr_model_id, overlap_frac, speaker_id, match_score, lang, lang_via,
-                    label_via
+                    label_via, deleted_at
              FROM segments WHERE id = ?1",
             params![segment_id],
             |r| {
@@ -2911,6 +3014,12 @@ impl Store {
                 out.insert("lang".into(), r.get::<_, Option<String>>(5)?);
                 out.insert("lang_via".into(), r.get::<_, Option<String>>(6)?);
                 out.insert("label_via".into(), r.get::<_, Option<String>>(7)?);
+                // Whether the row is soft-deleted, which is the one fact about
+                // a segment that decides whether any read path can see it.
+                out.insert(
+                    "deleted_at".into(),
+                    r.get::<_, Option<i64>>(8)?.map(|v| v.to_string()),
+                );
                 Ok(())
             },
         )?;
@@ -4511,7 +4620,7 @@ mod tests {
 
         let report = s.prune_speaker(grunt, 500).unwrap();
         assert_eq!(report.segments, vec![seg]);
-        assert_eq!(report.soft_deleted, 1);
+        assert_eq!(report.soft_deleted, vec![seg]);
         assert_eq!(report.prototypes, 1);
         assert_eq!(report.goldens, vec!["goldens/000009/a.wav".to_string()]);
 

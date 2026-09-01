@@ -24,6 +24,11 @@ const ALLOWED = new Set([
   // a dead button.
   'speakers.set_languages',
   'speakers.prune',
+  // Delete one voice, with DESIGN §8's choice as a parameter (0.6.4). It is the
+  // only delete the ⋯ menu reaches now: `delete.run` is scoped by SEGMENTS, so
+  // it silently did nothing for a voice that had none left, and it never
+  // touched the voiceprint at all.
+  'speakers.delete',
   'speakers.merge',
   'speakers.split',
   // Reads only, both of them: which clips identify a voice, and one clip's

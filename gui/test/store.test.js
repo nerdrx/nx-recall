@@ -315,3 +315,23 @@ test('a swept voice disappears and its rows go back to nameless', () => {
   assert.equal(store.segments[0].speaker, null);
   assert.ok(change.speakers, 'the speakers view has to repaint');
 });
+
+test('a voice whose conversations were deleted stays in the bank at zero', () => {
+  // DESIGN §8's other half (0.6.4): "keep the bank entry (still labeled going
+  // forward)". The rows go as a `purge`, the identity is announced as a plain
+  // relabel — NOT a prune — and what is left is a voice at zero, which the
+  // speakers view has to be able to render as empty rather than as broken.
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', auto: 'Speaker_03', segments: 0, total_ms: 0 });
+  applyEvent({ seq: 1, ev: 'segment', data: seg(1) });
+  applyEvent({ seq: 2, ev: 'segment', data: seg(2) });
+
+  applyEvent({ seq: 3, ev: 'purge', data: { ids: [1, 2] } });
+  const change = applyEvent({ seq: 4, ev: 'relabel', data: { speaker: 1, name: 'Kira', languages: null } });
+
+  assert.ok(store.speakers.has(1), 'keeping the voiceprint must keep the voice');
+  assert.equal(store.speakers.get(1).segments, 0);
+  assert.equal(store.speakers.get(1).total_ms, 0);
+  assert.equal(store.segments.length, 0);
+  assert.deepEqual(change.relabel, [1]);
+});

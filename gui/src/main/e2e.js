@@ -448,7 +448,91 @@ export function runE2E(deps) {
       return { speaker: target, options, listed, chip: after.chip, file };
     });
 
-    // 6h — 0.6.1: voices that are not people. The affordance only exists when
+    // 6h — 0.6.4, the reported bug: a voice at "0 segments · 0s" whose Delete
+    // did nothing, repeatedly, because delete-by-speaker only ever scoped
+    // SEGMENTS and there were none — while the voiceprint behind it stayed live
+    // and went on matching. This drives the whole fix through the real UI: the
+    // row says it is empty, the sweep counts it, the sheet offers DESIGN §8's
+    // choice, and the destructive half actually removes the voice.
+    await step('delete-a-voice-and-choose-what-goes', async () => {
+      const openDelete = async (spId) => {
+        await js(`document.querySelector('.sp-row[data-speaker="${spId}"] [data-more]').click()`);
+        await waitFor('the row menu', async () => js('!!document.querySelector(".row-menu")'));
+        await js('[...document.querySelectorAll(".row-menu .menu-item")].find(b => b.textContent === "Delete").click()');
+        await waitFor('the delete sheet', async () => js('!!document.querySelector(".sheet .actions.stacked")'));
+        return js(`(() => {
+          const sheet = document.querySelector('.sheet');
+          return {
+            title: sheet.querySelector('h2').textContent,
+            body: sheet.querySelector('.sub').textContent,
+            detail: (sheet.querySelector('.quote') || {}).textContent ?? '',
+            choices: [...sheet.querySelectorAll('.actions .btn')].map(b => [b.dataset.choice, b.textContent, b.className]),
+          };
+        })()`);
+      };
+
+      // A voice that still has conversations: both halves of the choice, and
+      // only the one that takes the voiceprint is styled as destructive.
+      const full = await js(`Number([...document.querySelectorAll('#speaker-list .sp-row')]
+        .find(r => !r.querySelector('[data-empty]')).dataset.speaker)`);
+      const rich = await openDelete(full);
+      assert(
+        rich.choices.map((c) => c[0]).join(',') === 'keep,all,cancel',
+        `the sheet does not offer the §8 choice: ${JSON.stringify(rich.choices)}`
+      );
+      assert(/keep the voice/i.test(rich.choices[0][1]), `the keep action does not say so: ${rich.choices[0][1]}`);
+      assert(/voiceprint/i.test(rich.choices[1][1]), `the nuke action does not say so: ${rich.choices[1][1]}`);
+      assert(!/danger/.test(rich.choices[0][2]), 'keeping the voice is styled as destructive');
+      assert(/danger/.test(rich.choices[1][2]), 'deleting the voiceprint is not styled as destructive');
+      assert(/segments/.test(rich.detail), `the sheet does not state the real scope: ${rich.detail}`);
+      // Enter must never be one keystroke from taking the voiceprint.
+      const richFocus = await js('(document.activeElement.dataset || {}).choice ?? ""');
+      assert(richFocus === 'keep', `the keyboard lands on "${richFocus}", not the safe action`);
+      const fileChoice = await shot('delete-choice');
+      await js('document.querySelector(\'.sheet [data-choice="cancel"]\').click()');
+      await waitFor('the sheet to close', async () => js('!document.querySelector(".sheet")'));
+
+      // The empty voice: the row says so plainly, rather than reading as broken.
+      const empty = await js(
+        'Number((document.querySelector("#speaker-list .sp-row [data-empty]") || {dataset:{empty:0}}).dataset.empty)'
+      );
+      assert(empty > 0, 'the fixture has no 0-segment voice, so the reported bug is not reachable');
+      const note = await js(`document.querySelector('[data-empty="${empty}"]').textContent`);
+      assert(/no conversations left/i.test(note), `an empty voice reads as broken, not prunable: "${note}"`);
+
+      // …and the sweep counts it too — same rule the daemon applies, checked
+      // against the daemon rather than against the view's own opinion.
+      const sweepable = await js(
+        "(async () => (await window.recall.request('speakers.prune', {apply: false})).data.voices.map(v => v.id))()"
+      );
+      assert(sweepable.includes(empty), `the sweep does not see the empty voice: ${JSON.stringify(sweepable)}`);
+
+      const ghost = await openDelete(empty);
+      assert(
+        ghost.choices.map((c) => c[0]).join(',') === 'all,cancel',
+        `an empty voice is offered a choice it does not have: ${JSON.stringify(ghost.choices)}`
+      );
+      assert(
+        /no conversations left/i.test(ghost.detail) && /voiceprint/i.test(ghost.detail),
+        `the copy does not degrade honestly: "${ghost.detail}"`
+      );
+      const ghostFocus = await js('(document.activeElement.dataset || {}).choice ?? ""');
+      assert(ghostFocus === 'cancel', `the only action is destructive and the keyboard is on it: "${ghostFocus}"`);
+      const fileEmpty = await shot('delete-empty-voice');
+
+      // The act itself — the one that used to do nothing at all.
+      await js('document.querySelector(\'.sheet [data-choice="all"]\').click()');
+      await waitFor('the empty voice to go from the list', async () =>
+        js(`!document.querySelector('.sp-row[data-speaker="${empty}"]')`)
+      );
+      const listed = await js(
+        "(async () => (await window.recall.request('speakers.list')).data.speakers.map(s => s.id))()"
+      );
+      assert(!listed.includes(empty), `the daemon still has the voice: ${JSON.stringify(listed)}`);
+      return { full, empty, choices: rich.choices.map((c) => c[1]), files: [fileChoice, fileEmpty] };
+    });
+
+    // 6i — 0.6.1: voices that are not people. The affordance only exists when
     // there is something to sweep, and it says how many.
     await step('sweep-one-off-voices', async () => {
       const before = await js('window.__recallDebug.sweep()');
@@ -478,7 +562,7 @@ export function runE2E(deps) {
 
     await step('shot-speakers', async () => ({ file: await shot('speakers') }));
 
-    // 6i — 0.6.2, the memory graph's first surface. A voice is a person: the
+    // 6j — 0.6.2, the memory graph's first surface. A voice is a person: the
     // page has to say who they talk to, and each of those has to be a door.
     await step('person-page-from-a-voice', async () => {
       // Both entry points exist. The ⋯ menu's first item is the deliberate
@@ -521,7 +605,7 @@ export function runE2E(deps) {
       return { speaker: target, strip: p.strip, sub: p.sub, file: await shot('person-page') };
     });
 
-    // 6j — the edges. "People they talk with" is the claim the graph exists to
+    // 6k — the edges. "People they talk with" is the claim the graph exists to
     // make, and every one of them has to lead to their own page.
     await step('person-edges-lead-to-another-person', async () => {
       const p = await waitFor('edges to render', async () => {
@@ -551,7 +635,7 @@ export function runE2E(deps) {
       return { from: p.id, to: next.id, edges: p.edges.length, file: await shot('person-edges') };
     });
 
-    // 6k — a conversation on the page lands in the TRANSCRIPT, unfiltered, with
+    // 6l — a conversation on the page lands in the TRANSCRIPT, unfiltered, with
     // its own span marked. Unfiltered is the point: you opened a conversation
     // to read what everybody said.
     await step('a-conversation-opens-in-the-transcript', async () => {
@@ -587,7 +671,7 @@ export function runE2E(deps) {
       return { thread: thread.id, marked: t.marked, rows: t.rows, listShot, file: await shot('transcript-thread') };
     });
 
-    // 6l — the boundary itself, in the transcript: a hairline naming who is in
+    // 6m — the boundary itself, in the transcript: a hairline naming who is in
     // the conversation that just started.
     await step('transcript-separates-conversations', async () => {
       const t = await waitFor(

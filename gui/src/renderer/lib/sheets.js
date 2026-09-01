@@ -76,6 +76,76 @@ export function confirmSheet({ title, body, confirmLabel = 'Confirm', danger = f
   });
 }
 
+/**
+ * A confirm with more than one way to say yes (DESIGN §8).
+ *
+ * `confirmSheet` asks a yes/no question. Some destructive acts are not one:
+ * deleting a voice is "the words, or the words and the voice", and offering
+ * only the second would delete more than anybody asked for while offering only
+ * the first is the bug this exists to fix. So the choices are the buttons —
+ * each with its own label and its own weight — and Cancel is always last and
+ * always plain.
+ *
+ * Resolves with the chosen `value`, or `null` for Cancel / Escape / a click on
+ * the scrim. A choice can be `danger: true`; more than one should not be, or
+ * the styling stops meaning anything.
+ */
+export function chooseSheet({ title, body, detail = null, choices = [], cancelLabel = 'Cancel' }) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
+    const close = openSheet(
+      () => [
+        h('h2', { text: title }),
+        h('p', { class: 'sub', text: body }),
+        detail ? h('div', { class: 'quote', text: detail }) : null,
+        h(
+          'div',
+          { class: 'actions stacked' },
+          ...choices.map((c) =>
+            h(
+              'button',
+              {
+                class: `btn ${c.danger ? 'danger' : 'primary'}`,
+                dataset: c.key ? { choice: c.key } : {},
+                onclick: () => {
+                  finish(c.value);
+                  close(c.value);
+                },
+              },
+              c.label
+            )
+          ),
+          h(
+            'button',
+            {
+              class: 'btn',
+              dataset: { choice: 'cancel' },
+              onclick: () => {
+                finish(null);
+                close(null);
+              },
+            },
+            cancelLabel
+          )
+        ),
+      ],
+      { onClose: () => finish(null) }
+    );
+    // `openSheet` focuses the first control, which here is the most emphasised
+    // action — and when the only action is destructive that would put Enter one
+    // keystroke from a delete. The keyboard lands on the first thing that
+    // destroys nothing instead, which is the safe choice when there is one and
+    // Cancel when there is not.
+    const scrims = document.querySelectorAll('#sheet-root .scrim');
+    scrims[scrims.length - 1]?.querySelector('.actions .btn:not(.danger)')?.focus();
+  });
+}
+
 export function toast(text, kind = '') {
   const box = document.getElementById('toasts');
   const el = h('div', { class: `toast ${kind}`.trim(), text });

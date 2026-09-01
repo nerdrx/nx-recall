@@ -91,6 +91,12 @@ const SPEAKERS = [
   // mint bar now prevents and `speakers.prune` sweeps up when it slipped
   // through anyway (0.6.1).
   { id: 9, name: null, auto: 'Speaker_52', first_seen: '2026-08-31T18:07:00Z' },
+  // The 0.6.4 bug, sitting in the fixture where it can be pressed: a voice with
+  // NO segments at all. Its words were deleted at some point; the voiceprint
+  // stayed and goes on matching. Delete-by-segment matched nothing here, so the
+  // ⋯ menu's Delete was a silent no-op for ever — which is why the list has to
+  // carry one of these and the e2e has to delete it through the real UI.
+  { id: 10, name: null, auto: 'Speaker_58', first_seen: '2026-08-30T21:41:00Z' },
 ];
 
 /// What counts as a one-off voice, matching the daemon's own bar.
@@ -716,6 +722,54 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       for (const id of ids) emit('relabel', 'relabel', { speaker: id, name: null, pruned: true });
       emit('status', 'status', statusPayload());
       return { apply: true, count: ids.size, removed: [...ids], segments: removedSegments.length, voices };
+    },
+
+    // 0.6.4: delete one voice, with DESIGN §8's choice as a parameter. Unlike
+    // `delete.run` this is scoped by the VOICE, so a voice with no segments
+    // left is a normal input rather than a no-op — that is the whole bug.
+    'speakers.delete'(params) {
+      const id = Number(params?.id);
+      const sp = state.speakers.find((s) => s.id === id);
+      if (!sp) {
+        const canonical = state.tombstones.get(id);
+        if (canonical != null) throw err('conflict', `speaker ${id} was merged into ${canonical}; delete ${canonical} instead`);
+        throw err('not_found', `no speaker ${id}`);
+      }
+      const keep = params?.keep_voiceprint === true;
+      if (id === youSpeaker()) {
+        throw err(
+          'refused',
+          'that is your own voice, pinned by your microphone rather than matched. Deleting it would not stop you being recorded — turn the microphone off instead'
+        );
+      }
+      const merged = [...state.tombstones.entries()].filter(([, into]) => into === id);
+      if (!keep && merged.length) {
+        throw err(
+          'refused',
+          `speaker ${id} is a merge target: ${merged.length} other voice(s) point at it. Delete with keep_voiceprint: true, or split it apart first`
+        );
+      }
+      const removed = state.segments.filter((s) => owner(s) === id).map((s) => s.id);
+      state.segments = state.segments.filter((s) => owner(s) !== id);
+      if (removed.length) emit('segments', 'purge', { ids: removed });
+      if (keep) {
+        emit('relabel', 'relabel', { speaker: id, name: sp.name, languages: sp.languages ?? null });
+      } else {
+        state.speakers = state.speakers.filter((s) => s.id !== id);
+        // Not a merge: nothing moved anywhere, the id stops existing.
+        emit('relabel', 'relabel', { speaker: id, name: null, pruned: true });
+      }
+      emit('status', 'status', statusPayload());
+      return {
+        id,
+        name: sp.name,
+        keep_voiceprint: keep,
+        removed_speaker: !keep,
+        segments: removed.length,
+        msg: keep
+          ? `${removed.length} conversation(s) deleted. The voiceprint was kept: this voice stays in the bank and will still be labelled going forward.`
+          : `${removed.length} conversation(s) deleted and the voiceprint removed — this voice has to enrol again from scratch before it is recognised.`,
+      };
     },
 
     'speakers.merge'(params) {
