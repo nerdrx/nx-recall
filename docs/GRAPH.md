@@ -45,13 +45,26 @@ row (`extractor`, `version`, `confidence`).
   `commitments(who, to_whom, what_segment, due?, state=candidate)`. Expected
   recall is modest; that is fine — candidates are suggestions, never actions.
 
-### Tier 3 — understood, local LLM, opt-in and idle-only
+### Tier 3 — understood, tiny local LLM, opt-in and idle-only
 
 Commitment extraction done properly, topic naming that reads like a human wrote
 it, and pre-conversation briefs ("last time: you owed her the shader link").
 
-- llama.cpp + a small GGUF (Qwen-class, few GB) on the local GPU. No network,
-  no torch, model fetched once like the ASR models.
+- **Tiny by requirement, not by concession** (user constraint: ~4 CPU cores,
+  GPU only if it must). Budget: ≤ 3B parameters, Q4 GGUF, ≤ ~2 GB on disk.
+  Candidates to evaluate, de+en capable: Qwen2.5-1.5B-Instruct (primary),
+  Gemma-2-2B, Qwen2.5-3B as the ceiling. This works because the task is
+  narrow extraction over short windows with **grammar-constrained decoding**
+  (GBNF → the model physically cannot emit anything but schema-valid JSON) —
+  the regime where small models are strong. Anything the small model marks
+  low-confidence stays a candidate; it never gets a bigger model's swagger.
+- llama.cpp, CPU-first: `n_threads = 4`, pinned via the existing
+  `[runtime] inference_cpus` mechanism, nice 19 — the same discipline as ASR.
+  Napkin math: a 1.5B Q4 at ~30 tok/s on 4 Zen 5 cores chews through a full
+  evening's transcript in low minutes of idle time. Optional
+  `[graph] gpu_layers` for ROCm offload exists but the default is 0.
+- No network, no torch; the model is fetched once by `models fetch` like
+  everything else, byte-verified.
 - Runs ONLY as an idle-time enrichment pass: never while a game runs (same
   detection §4 uses), never in the capture path, budgeted and interruptible.
 - Output is annotations referencing segments (`derived_*` tables), never
