@@ -235,11 +235,15 @@ pub fn assign(
     cfg: &crate::config::GraphConfig,
     segment_id: i64,
 ) -> anyhow::Result<Option<i64>> {
-    let Some((session_id, turn)) = store.segment_turn(segment_id)? else {
+    let Some((session_id, is_mic, turn)) = store.segment_turn(segment_id)? else {
         return Ok(None);
     };
     let gap_ns = (cfg.thread_gap_s.max(0.0) as f64 * 1e9) as i64;
-    let open = store.open_threads(session_id, turn.t_start_ns, gap_ns)?;
+    // The mic's turns may join ANY live conversation — the user is the one
+    // voice that exists across sessions, and pinning them to their own
+    // session made every thread a monologue (2026-09-02).
+    let scope = if is_mic { None } else { Some(session_id) };
+    let open = store.open_threads(scope, turn.t_start_ns, gap_ns)?;
     let thread_id = match place(&open, &turn, gap_ns) {
         Placement::Join(id) => id,
         Placement::New => store.create_thread(session_id, turn.t_start_ns, turn.t_end_ns)?,

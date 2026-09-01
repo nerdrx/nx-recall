@@ -225,8 +225,138 @@ pub fn gate(control: &Control, cfg: &GraphConfig) -> Option<String> {
     None
 }
 
-/// One conversation, enriched. Returns `(commitments written, guesses
-/// retracted, topic written)`.
+/// What the model concluded about one conversation, computed WITHOUT the
+/// store lock. The 2026-09-02 night shift proved why the split exists: the
+/// worker held the store mutex across multi-second llama-cli calls, the
+/// capture pipeline blocked behind it on every segment insert, and the queue
+/// overflowed into audio gaps — 128 dropped-buffer warnings in one evening.
+/// Model time and lock time must never overlap.
+pub struct Plan {
+    upserts: Vec<NewCommitment>,
+    /// Segments whose rule guesses the model actually judged and found empty.
+    /// A window skipped for having no counterparty is NOT judged — retracting
+    /// on it would erase a rule guess the model never looked at.
+    retract: Vec<i64>,
+    topic: Option<String>,
+}
+
+/// The model's half: every llama call happens here, and no store handle is in
+/// scope — the signature is what enforces the lock split.
+pub fn judge(llm: &Llm, cfg: &GraphConfig, lines: &[Line]) -> Result<Plan> {
+    let width = cfg.llm_window_turns.max(4);
+    let step = width.saturating_sub(WINDOW_OVERLAP).max(1);
+    let mut plan = Plan {
+        upserts: Vec::new(),
+        retract: Vec::new(),
+        topic: None,
+    };
+
+    for window in lines
+        .chunks(1)
+        .step_by(step)
+        .take(MAX_WINDOWS)
+        .enumerate()
+        .filter_map(|(i, _)| {
+            let start = i * step;
+            (start < lines.len()).then(|| &lines[start..(start + width).min(lines.len())])
+        })
+    {
+        let roster = crate::llm::roster(window);
+        if roster.len() < 2 {
+            // Nobody to promise anything to — common before cross-session
+            // threading, rare after. The model is not consulted, so nothing
+            // here counts as judged: rule guesses in this window stand.
+            continue;
+        }
+        match llm.commitment(window) {
+            Ok(Some(found_it)) => {
+                let Some(&who) = roster.get(found_it.who) else {
+                    continue;
+                };
+                // The promise is the LAST thing that speaker said in the
+                // window. Short windows are the regime this model is strong in
+                // and the regime the bench measured, so "last" is almost always
+                // "the line it just read"; picking the first would attach a
+                // promise to whatever they happened to open with.
+                let Some(line) = window.iter().rev().find(|l| l.speaker_id == Some(who)) else {
+                    continue;
+                };
+                // The due phrase comes back in the language it was said in, so
+                // it is resolved by the same Tier 2 parser, against the same
+                // capture time. One clock, one calendar, two tiers.
+                let due = found_it
+                    .due
+                    .as_deref()
+                    .map(|phrase| crate::timeref::extract(phrase, line.t_start_ns))
+                    .and_then(|refs| refs.into_iter().next());
+                let others: Vec<i64> = roster.iter().copied().filter(|s| *s != who).collect();
+                plan.upserts.push(NewCommitment {
+                    segment_id: line.segment_id,
+                    thread_id: None, // stamped at commit, where the id is certain
+                    who_speaker_id: Some(who),
+                    to_speaker_id: (others.len() == 1).then(|| others[0]),
+                    what: found_it.what.clone(),
+                    due_utc_ns: due.as_ref().map(|d| d.resolved_utc_ns),
+                    // The model's phrase, not the parser's match: what the
+                    // person actually said is the evidence, and the parser
+                    // may have found only part of it.
+                    due_raw: found_it.due.clone(),
+                    due_kind: due.as_ref().map(|d| d.kind.to_string()),
+                    source: commitment_source::LLM,
+                    model_id: Some(llm.model_id().to_string()),
+                    confidence: LLM_CONFIDENCE,
+                });
+            }
+            Ok(None) => {
+                // The refusal is worth as much as the extraction — arguably
+                // more. Every rule guess in this window that a person has not
+                // touched goes, because the model looked at the same words and
+                // said there was nothing there.
+                plan.retract.extend(window.iter().map(|l| l.segment_id));
+            }
+            Err(e) => {
+                // One window failing is not a reason to abandon the
+                // conversation, but it IS a reason not to mark it walked.
+                return Err(e);
+            }
+        }
+    }
+
+    // One label per conversation, from its opening window: what a conversation
+    // is about is set early, and paying for a model call per window to
+    // re-decide it would spend the budget on a question nobody asked.
+    let head = &lines[..cfg.llm_window_turns.max(4).min(lines.len())];
+    plan.topic = llm.topic(head)?;
+    Ok(plan)
+}
+
+/// The store's half: quick writes only, safe to run under the lock.
+pub fn commit(
+    store: &Store,
+    plan: Plan,
+    thread_id: i64,
+    model_id: &str,
+    at_utc_ns: i64,
+) -> Result<(usize, usize, bool)> {
+    let mut found = 0usize;
+    let mut retracted = 0usize;
+    for mut c in plan.upserts {
+        c.thread_id = Some(thread_id);
+        store.upsert_commitment(&c, at_utc_ns)?;
+        found += 1;
+    }
+    for segment_id in plan.retract {
+        if store.retract_rule_candidate(segment_id)? {
+            retracted += 1;
+        }
+    }
+    store.set_thread_topic(thread_id, plan.topic.as_deref(), model_id, at_utc_ns)?;
+    Ok((found, retracted, plan.topic.is_some()))
+}
+
+/// One conversation, enriched in one call — the shape the tests use. The
+/// worker calls the three phases itself so the store lock is dropped for the
+/// [`judge`] half.
 pub fn enrich_thread(
     store: &Store,
     llm: &Llm,
@@ -248,93 +378,8 @@ pub fn enrich_thread(
         store.mark_thread_enriched(thread_id, at_utc_ns)?;
         return Ok((0, 0, false));
     }
-
-    let width = cfg.llm_window_turns.max(4);
-    let step = width.saturating_sub(WINDOW_OVERLAP).max(1);
-    let mut found = 0usize;
-    let mut retracted = 0usize;
-
-    for window in lines
-        .chunks(1)
-        .step_by(step)
-        .take(MAX_WINDOWS)
-        .enumerate()
-        .filter_map(|(i, _)| {
-            let start = i * step;
-            (start < lines.len()).then(|| &lines[start..(start + width).min(lines.len())])
-        })
-    {
-        match llm.commitment(window) {
-            Ok(Some(found_it)) => {
-                let roster = crate::llm::roster(window);
-                let Some(&who) = roster.get(found_it.who) else {
-                    continue;
-                };
-                // The promise is the LAST thing that speaker said in the
-                // window. Short windows are the regime this model is strong in
-                // and the regime the bench measured, so "last" is almost always
-                // "the line it just read"; picking the first would attach a
-                // promise to whatever they happened to open with.
-                let Some(line) = window.iter().rev().find(|l| l.speaker_id == Some(who)) else {
-                    continue;
-                };
-                // The due phrase comes back in the language it was said in, so
-                // it is resolved by the same Tier 2 parser, against the same
-                // capture time. One clock, one calendar, two tiers.
-                let due = found_it
-                    .due
-                    .as_deref()
-                    .map(|phrase| crate::timeref::extract(phrase, line.t_start_ns))
-                    .and_then(|refs| refs.into_iter().next());
-                let others: Vec<i64> = roster.iter().copied().filter(|s| *s != who).collect();
-                store.upsert_commitment(
-                    &NewCommitment {
-                        segment_id: line.segment_id,
-                        thread_id: Some(thread_id),
-                        who_speaker_id: Some(who),
-                        to_speaker_id: (others.len() == 1).then(|| others[0]),
-                        what: found_it.what.clone(),
-                        due_utc_ns: due.as_ref().map(|d| d.resolved_utc_ns),
-                        // The model's phrase, not the parser's match: what the
-                        // person actually said is the evidence, and the parser
-                        // may have found only part of it.
-                        due_raw: found_it.due.clone(),
-                        due_kind: due.as_ref().map(|d| d.kind.to_string()),
-                        source: commitment_source::LLM,
-                        model_id: Some(llm.model_id().to_string()),
-                        confidence: LLM_CONFIDENCE,
-                    },
-                    at_utc_ns,
-                )?;
-                found += 1;
-            }
-            Ok(None) => {
-                // The refusal is worth as much as the extraction — arguably
-                // more. Every rule guess in this window that a person has not
-                // touched goes, because the model looked at the same words and
-                // said there was nothing there.
-                for line in window {
-                    if store.retract_rule_candidate(line.segment_id)? {
-                        retracted += 1;
-                    }
-                }
-            }
-            Err(e) => {
-                // One window failing is not a reason to abandon the
-                // conversation, but it IS a reason not to mark it walked.
-                warn!(thread_id, "the model failed on a window: {e:#}");
-                return Err(e);
-            }
-        }
-    }
-
-    // One label per conversation, from its opening window: what a conversation
-    // is about is set early, and paying for a model call per window to
-    // re-decide it would spend the budget on a question nobody asked.
-    let head = &lines[..cfg.llm_window_turns.max(4).min(lines.len())];
-    let topic = llm.topic(head)?;
-    store.set_thread_topic(thread_id, topic.as_deref(), llm.model_id(), at_utc_ns)?;
-    Ok((found, retracted, topic.is_some()))
+    let plan = judge(llm, cfg, &lines)?;
+    commit(store, plan, thread_id, llm.model_id(), at_utc_ns)
 }
 
 /// The background thread. Started by the daemon whether or not Tier 3 is
@@ -497,10 +542,43 @@ fn batch(
         // applies to the next conversation, and never to one already open.
         let tuned = llm.with_threads(control.graph().llm_threads);
         let at = utc_now_ns();
-        let outcome = {
+        // Three phases so the store lock and the model never overlap: a lock
+        // held across llama-cli stalls the capture pipeline's segment writes,
+        // which is an audio gap, which is lost speech (measured live,
+        // 2026-09-02). Gather under the lock, judge without it, commit under
+        // it again.
+        let lines: Option<Vec<Line>> = {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-            enrich_thread(&guard, &tuned, cfg, thread_id, at)
+            let lines: Vec<Line> = match guard.thread_lines(thread_id) {
+                Ok(ls) => ls
+                    .into_iter()
+                    .map(|l| Line {
+                        segment_id: l.segment_id,
+                        speaker_id: l.speaker_id,
+                        t_start_ns: l.t_start_ns,
+                        text: l.text,
+                    })
+                    .collect(),
+                Err(e) => {
+                    warn!(thread_id, "could not read a conversation: {e:#}");
+                    continue;
+                }
+            };
+            if lines.is_empty() {
+                let _ = guard.mark_thread_enriched(thread_id, at);
+                None
+            } else {
+                Some(lines)
+            }
         };
+        let Some(lines) = lines else {
+            state.walked += 1;
+            continue;
+        };
+        let outcome = judge(&tuned, cfg, &lines).and_then(|plan| {
+            let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+            commit(&guard, plan, thread_id, tuned.model_id(), at)
+        });
         match outcome {
             Ok((found, retracted, labelled)) => {
                 state.walked += 1;

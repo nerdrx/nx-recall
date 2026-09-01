@@ -2576,9 +2576,13 @@ impl Store {
     /// job — so this has to be cheap: one indexed range over `threads`, then
     /// one bounded read of each candidate's recent turns. In practice a session
     /// has one or two open threads at any moment.
+    /// `session_id = None` considers open threads from EVERY session — the
+    /// microphone's rule, because the user's voice belongs to whatever
+    /// conversation is live, not to a session of its own. App turns keep the
+    /// per-session scope: two apps emitting at once are two conversations.
     pub fn open_threads(
         &self,
-        session_id: i64,
+        session_id: Option<i64>,
         at_ns: i64,
         gap_ns: i64,
     ) -> Result<Vec<OpenThread>> {
@@ -2587,7 +2591,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id, ended_ns FROM threads
-                 WHERE session_id = ?1 AND ended_ns >= ?2
+                 WHERE (?1 IS NULL OR session_id = ?1) AND ended_ns >= ?2
                  ORDER BY ended_ns DESC, id DESC",
             )?
             .query_map(params![session_id, since], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -2672,21 +2676,34 @@ impl Store {
         Ok(())
     }
 
-    /// The threading rule's view of one stored segment.
-    pub fn segment_turn(&self, segment_id: i64) -> Result<Option<(i64, Turn)>> {
+    /// The threading rule's view of one stored segment: its session, whether
+    /// that session is the user's microphone, and the turn itself.
+    ///
+    /// The mic flag exists because a conversation SPANS sessions: the user's
+    /// half lives in the mic session while everyone else's lives in an app
+    /// session, and threading them apart made every thread single-voiced —
+    /// which starved the person graph of edges and the commitment extractor
+    /// of counterparties (found live, 2026-09-02: 465 threads, roster of one
+    /// in every window, found=0 forever).
+    pub fn segment_turn(&self, segment_id: i64) -> Result<Option<(i64, bool, Turn)>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT session_id, t_start_ns, t_end_ns, speaker_id FROM segments
-                 WHERE id = ?1 AND deleted_at IS NULL",
+                "SELECT g.session_id, (sc.kind = 'mic') AS is_mic,
+                        g.t_start_ns, g.t_end_ns, g.speaker_id
+                 FROM segments g
+                 JOIN sessions ss ON ss.id = g.session_id
+                 JOIN sources sc ON sc.id = ss.source_id
+                 WHERE g.id = ?1 AND g.deleted_at IS NULL",
                 params![segment_id],
                 |r| {
                     Ok((
                         r.get(0)?,
+                        r.get(1)?,
                         Turn {
-                            t_start_ns: r.get(1)?,
-                            t_end_ns: r.get(2)?,
-                            speaker: r.get(3)?,
+                            t_start_ns: r.get(2)?,
+                            t_end_ns: r.get(3)?,
+                            speaker: r.get(4)?,
                         },
                     ))
                 },
@@ -3985,6 +4002,71 @@ fn overlap_ns(a: &[(i64, i64)], b: &[(i64, i64)]) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_microphone_joins_the_conversation_it_is_actually_in() {
+        // The user's half of a conversation lives in the mic session while
+        // everyone else's lives in an app session. Threading them apart made
+        // every thread a monologue (2026-09-02): no counterparties for the
+        // commitment extractor, no shared threads for the person graph. The
+        // mic bridges; two APP sessions at the same moment stay separate.
+        let dir = std::env::temp_dir().join(format!("nxr-micbridge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir).unwrap();
+
+        let app = store.upsert_source("VRChat.exe", "VRChat", 0).unwrap();
+        let mic = store
+            .upsert_source_kind("mic", "Microphone", KIND_MIC, 0)
+            .unwrap();
+        let other_app = store.upsert_source("Discord", "Discord", 0).unwrap();
+        let s_app = store.begin_session(app, 0).unwrap();
+        let s_mic = store.begin_session(mic, 0).unwrap();
+        let s_other = store.begin_session(other_app, 0).unwrap();
+
+        let sec = 1_000_000_000i64;
+        let cfg = crate::config::GraphConfig::default();
+        let mut seg = |session: i64, t: i64, speaker: Option<i64>| {
+            let id = store
+                .insert_segment(session, t, t + sec, "x.wav", t)
+                .unwrap();
+            if let Some(sp) = speaker {
+                store
+                    .set_segment_speaker_via(id, Some(sp), Some(0.9), None)
+                    .unwrap();
+            }
+            crate::threads::assign(&store, &cfg, id).unwrap();
+            store
+                .conn
+                .query_row(
+                    "SELECT thread_id FROM segments WHERE id = ?1",
+                    params![id],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+                .expect("threaded")
+        };
+
+        let rowan = store.create_speaker("Rowan", 0).unwrap();
+        let you = store.create_speaker("You", 0).unwrap();
+        let ines = store.create_speaker("Ines", 0).unwrap();
+
+        // Rowan speaks in the app; the user answers on the mic seconds later:
+        // one conversation, across two sessions.
+        let t1 = seg(s_app, 0, Some(rowan));
+        let t2 = seg(s_mic, 3 * sec, Some(you));
+        assert_eq!(t1, t2, "the mic joins the live conversation");
+
+        // A different APP starting at the same moment is its own conversation.
+        let t3 = seg(s_other, 5 * sec, Some(ines));
+        assert_ne!(t1, t3, "two app sessions never merge by time alone");
+
+        // And the mic keeps alternating with the first conversation.
+        let t4 = seg(s_mic, 8 * sec, Some(you));
+        assert_eq!(t4, t1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn store() -> Store {
