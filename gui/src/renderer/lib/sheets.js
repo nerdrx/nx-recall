@@ -1,5 +1,7 @@
-// Sheets, confirms and toasts — the only floating layers in the app, and the
-// only places real backdrop-filter is spent (DESIGN §4: glass on chrome only).
+// Sheets, confirms and toasts — the only floating layers in the app. The scrim
+// behind a sheet is the one place real backdrop-filter is spent: NX Clear
+// reserves it for the single layer that overlaps live content (§14 axis 3), and
+// everything else here is a flat surface with a hairline and a soft shadow.
 
 import { h, clear } from './dom.js';
 

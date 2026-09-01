@@ -8,7 +8,7 @@
 // model of the transcript at all: it relays events and lets the renderer
 // rebuild itself on resync.
 
-import { app, BrowserWindow, Tray, Menu, nativeImage } from 'electron';
+import { app, BrowserWindow, Tray, Menu, nativeImage, nativeTheme } from 'electron';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -70,6 +70,28 @@ const startMinimized =
   process.argv.includes('--minimized') || process.env.NX_RECALL_START_MINIMIZED === '1';
 
 // ---------------------------------------------------------------------------
+// theme
+//
+// NX Clear ships two grounds (DESIGN §14.1) and the app follows the OS: the
+// renderer's whole palette hangs off `prefers-color-scheme`, and setting
+// `nativeTheme.themeSource` is what drives that inside Chromium — so forcing a
+// theme here is the same code path an OS switch takes, which is exactly why the
+// headless suite uses it to photograph both.
+//
+// NX_RECALL_THEME=light|dark pins it; anything else follows the desktop.
+// ---------------------------------------------------------------------------
+
+const THEME_OVERRIDE = ['light', 'dark'].includes(process.env.NX_RECALL_THEME)
+  ? process.env.NX_RECALL_THEME
+  : null;
+
+// The ground each theme paints (tokens.css --clear-bg). The window has to be
+// told separately: it is the colour of the frame between map and first paint,
+// and getting it wrong is a white flash on dark or a black one on light.
+const GROUND = { light: '#fafafc', dark: '#000000' };
+const groundColor = () => (nativeTheme.shouldUseDarkColors ? GROUND.dark : GROUND.light);
+
+// ---------------------------------------------------------------------------
 // window
 // ---------------------------------------------------------------------------
 
@@ -80,9 +102,7 @@ function createWindow({ show = true } = {}) {
     minWidth: 900,
     minHeight: 560,
     show: false,
-    // The ground is true black (DESIGN §13) — matching it here kills the white
-    // flash between window map and first paint.
-    backgroundColor: '#000000',
+    backgroundColor: groundColor(),
     icon: WINDOW_ICON,
     title: 'NX Recall',
     webPreferences: {
@@ -315,6 +335,14 @@ function startClient() {
 // ---------------------------------------------------------------------------
 
 async function bootstrap() {
+  // Before the first window: themeSource is what makes the renderer's
+  // `prefers-color-scheme` report, and the window's own backgroundColor is read
+  // at construction.
+  nativeTheme.themeSource = THEME_OVERRIDE ?? 'system';
+  nativeTheme.on('updated', () => {
+    if (win && !win.isDestroyed()) win.setBackgroundColor(groundColor());
+  });
+
   registerIpc({
     request: (method, params) => client.request(method, params),
     setPaused,
@@ -343,6 +371,11 @@ async function bootstrap() {
       buildTrayMenu,
       statusLine,
       showWindow,
+      theme: () => ({
+        forced: THEME_OVERRIDE,
+        dark: nativeTheme.shouldUseDarkColors,
+        ground: groundColor(),
+      }),
       quit: () => {
         quitting = true;
         app.quit();

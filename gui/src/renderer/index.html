@@ -20,16 +20,10 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <!-- The light the glass refracts (DESIGN §3): drifting nebula, a vignette,
-         and the noise film that keeps the gradients from banding on OLED. -->
-    <div id="field" aria-hidden="true">
-      <span class="neb neb-1"></span>
-      <span class="neb neb-2"></span>
-      <span class="neb neb-3"></span>
-      <span class="vignette"></span>
-      <span class="grain"></span>
-    </div>
-
+    <!-- NX Clear (DESIGN §14): there is no living background any more. The
+         drifting nebula, the vignette and the anti-banding noise film all
+         belonged to the deep-space ground and went with it; the page is a flat
+         token colour with one soft off-screen bloom, painted on <body>. -->
     <div class="shell">
       <!-- The daemon can replace itself under a running window (0.5.3). When it
            comes back as a different version this says so above every view, not

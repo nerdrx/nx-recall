@@ -1,76 +1,129 @@
-/* NX design language v1.6 — "liquid glass on deep space", OLED ground.
-   Vendored verbatim from nx-hub/docs/DESIGN.md §2 + §13. Frozen brand tokens:
-   never restyle these, compose with them (styles.css).
+/* NX Recall — NX Clear (nx-hub/docs/DESIGN.md §14, v1.7).
+ *
+ * This app used to be deep space: a drifting nebula behind real glass, lit
+ * gradient edges, angular 3–6px corners, violet everywhere. That sheet is gone
+ * from this file — not overridden, deleted. §§1–13 stay normative for the
+ * immersive apps; NX Hub moved to Clear (v0.14.0) and Recall follows it.
+ *
+ *   ground    — a chosen off-white with a faint violet bias (light), true
+ *               #000000 (dark). Flat, plus at most one soft corner bloom.
+ *   depth     — one soft diffuse shadow + a 1px solid --clear-line hairline.
+ *               On the dark variant a shadow cannot fall on black, so the
+ *               hairline carries the separation alone (§14.1, amended).
+ *   geometry  — rounded: 20px panels/sheets, 14px cards, 11px controls and
+ *               rows, 9px micro-tags. Pills return, for chips and toggles.
+ *   accent    — #7700FF is a spark, never a field: the primary action, the
+ *               active rail item, focus, the mark, the update notice.
+ *   cyan      — a value colour and nothing else: capture that is live right
+ *               now. Green is success, amber attention, red danger.
+ *
+ * Themes: light on bare :root; the dark block is written twice — once under
+ * prefers-color-scheme so no choice follows the OS, once under
+ * :root[data-theme="dark"] so an explicit stamp wins in both directions.
+ * Components read tokens; only tokens change between themes.
+ *
+ * NX Recall's one app-specific identity signal is --recall-live ("audio is
+ * being captured right now"). On Clear it is the theme's readable cyan: brand
+ * #00e5ff measures 1.6:1 on white and is not a colour you can put words in.
+ */
 
-   NX Recall's one app-specific identity accent is --recall-live, used ONLY for
-   the "audio is being captured right now" signal — never as an action colour,
-   never as generic status. Violet still leads every screen. */
 :root {
   /* Native widgets Chromium draws OUTSIDE the page — <select> option popups,
      the date picker's calendar, default scrollbars — take their colours from
-     this and from nothing we can style. Without it they render light-on-light
-     against this palette and a dropdown is unreadable. It is one line and it
-     is load-bearing. */
-  color-scheme: dark;
+     this and from nothing we can style. It has to follow the theme in both
+     directions or one of the two gets an unreadable dropdown. Load-bearing. */
+  color-scheme: light;
 
-  /* brand (frozen) — the ground is TRUE BLACK (§13) */
-  --bg-top: #000000;
-  --bg-bottom: #000000;
-  --panel: #0c0818;
-  --panel-2: #120c22;
-  --violet: #7700ff;
-  --violet-soft: #9a3cff;
-  --cyan: #00e5ff;
-  --amber: #ffb300;
-  --text: #efeaff;
-  --muted: #9a8fc0;
-  --line: #241a3c;
-  --danger: #ff5470;
+  /* --------------------------------------------- neutrals (DESIGN §14.1) -- */
+  --clear-bg: #fafafc;          /* page ground — off-white, faint violet bias */
+  --clear-surface: #ffffff;     /* cards, panels, sheets, menus */
+  --clear-tile: #faf9fd;        /* recessed row / well fill */
+  --clear-ink: #1a1823;         /* body text — never pure #000 */
+  /* §14.1 prints #78748a for muted; measured, that is 4.30:1 on --clear-tile
+     and under AA for the 11–13px secondary text this app is full of. Darkened
+     until it clears 4.5:1 on every surface it is allowed to sit on, including
+     --violet-soft (4.70:1), which rows use when they are selected. */
+  --clear-muted: #6c687e;
+  /* Ornament ONLY — separators, inert marks, disabled glyphs. It never carries
+     a word anyone has to read, but it still clears 3:1 on bg/surface/tile.
+     (It does NOT clear 3:1 on --violet-soft in dark, so nothing faint is ever
+     placed on an accent wash.) */
+  --clear-faint: #8b8799;
+  --clear-line: #ece9f4;        /* the 1px hairline — solid, low contrast */
+  --clear-line-strong: #ddd8ea; /* inputs and rules, where it must survive on white */
+  --clear-line-accent: #ded0ff; /* a hairline warmed toward the accent */
 
-  /* Recall identity accent — live capture only. */
-  --recall-live: #00e5ff;
+  /* ---------------------------------------------------- identity (§8, §14) */
+  --violet: #7700ff;            /* actions, active state, focus, the mark */
+  --violet-2: #9a4dff;          /* hover brighten */
+  --violet-soft: #f4edff;       /* accent wash: active row, icon well, chip */
+  /* White on --violet-2 measures 4.30:1, so a literal violet→violet-2 fill
+     would put a sub-AA band across the top of every primary button. The
+     gradient stays; its light stop is the darkest violet that still clears AA
+     under white (5.12:1). */
+  --accent-fill: linear-gradient(180deg, #8c37ff 0%, var(--violet) 100%);
+  --accent-fill-hover: linear-gradient(180deg, #9a4dff 0%, #8412ff 100%);
+  --on-accent: #ffffff;
 
-  /* geometry — ANGULAR. Pills banned; circles are dots and spinners only. */
-  --radius: 6px;
-  --radius-sm: 4px;
-  --radius-xs: 3px;
-  --pill: 5px;
+  /* ------------------------------------------------ status (§1 semantics) */
+  --cyan: #00707f;              /* LIVE capture only. Brand cyan is 1.6:1 on white. */
+  --cyan-soft: #e4f5f8;
+  --clear-good: #0c6f3c;
+  --clear-good-soft: #e6f6ec;
+  --clear-warn: #8a6100;
+  --clear-warn-soft: #fdf3e0;
+  --clear-danger: #c22030;
+  --clear-danger-soft: #fdecee;
+
+  /* The one identity accent this app is allowed (§1): audio arriving live. */
+  --recall-live: var(--cyan);
+  --recall-live-soft: var(--cyan-soft);
+
+  /* --------------------------------------- speaker identity hues (§8) ----
+     A voice's hue is hashed from its id and clamped to the cyan→violet band
+     (187–290°) so identities separate without inventing a colour that competes
+     with violet or means "attention". The HUE is the identity and is the same
+     in both themes; only saturation and lightness move, so a person's colour
+     never changes meaning when the OS flips. Measured across the whole band:
+     worst case 5.13:1 (light) and 5.59:1 (dark) against bg, surface, tile and
+     --violet-soft — every ground a name is ever painted on. */
+  --sp-s: 72%;                  /* dots and names */
+  --sp-l: 28%;
+  --sp-plate-s: 72%;            /* the source monogram plate */
+  --sp-plate-l: 93%;
+  --sp-plate-line-s: 62%;
+  --sp-plate-line-l: 82%;
+
+  /* ------------------------------------------- geometry — ROUNDED (§14.2) */
+  --clear-r-panel: 20px;        /* sheets, the onboarding banner */
+  --clear-r-card: 14px;         /* cards, menus */
+  --clear-r-control: 11px;      /* buttons, inputs, rows, list items */
+  --clear-r-mini: 9px;          /* micro-tags, inline marks — band floor */
+  --clear-r-chip: 999px;        /* pills: chips and toggles ONLY */
+
+  /* ------------------------------------------------------------ elevation */
+  --clear-shadow-card: 0 1px 2px rgba(40, 20, 90, 0.05), 0 4px 12px -4px rgba(40, 20, 90, 0.1);
+  --clear-shadow-lift: 0 2px 4px rgba(40, 20, 90, 0.06), 0 12px 26px -10px rgba(40, 20, 90, 0.16);
+  --clear-shadow-pop: 0 24px 60px -20px rgba(40, 20, 90, 0.35), 0 6px 20px -8px rgba(40, 20, 90, 0.18);
+  /* §14.1 prints the spread ring first, but a 3px spread listed before a 1px
+     one paints over it and the violet never renders. Same two bands, ordered
+     so both are visible. */
+  --clear-focus: 0 0 0 2px var(--violet), 0 0 0 5px var(--violet-soft);
+
+  /* One soft off-screen bloom, light theme only. Dark stays flat: §13 forbids
+     anything large, bright and fixed on an OLED ground. */
+  --clear-bloom: radial-gradient(58% 40% at 100% 0%, rgba(119, 0, 255, 0.055), transparent 68%);
+  /* The only real backdrop-filter left in the app: the sheet scrim, which is
+     the one layer that floats over live content. */
+  --blur-scrim: blur(8px);
+  --scrim: rgba(26, 24, 35, 0.32);
+
+  /* -------------------------------------------------------- type (§7) --- */
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", Cantarell, sans-serif;
   --mono: ui-monospace, "JetBrains Mono", "Fira Code", Consolas, monospace;
 
-  /* glass fills — light collects top-left and drains to a cool shadow */
-  --glass-bar: linear-gradient(180deg, rgba(22, 14, 40, 0.72) 0%, rgba(4, 2, 10, 0.86) 100%);
-  --glass-1: linear-gradient(157deg, rgba(255, 255, 255, 0.09) 0%, rgba(255, 255, 255, 0.026) 34%, rgba(23, 16, 40, 0.34) 100%);
-  --glass-2: linear-gradient(158deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.03) 30%, rgba(19, 12, 34, 0.66) 100%);
-  --glass-chip: linear-gradient(180deg, rgba(255, 255, 255, 0.09) 0%, rgba(255, 255, 255, 0.028) 100%);
-  --well: linear-gradient(180deg, rgba(0, 0, 0, 0.62) 0%, rgba(0, 0, 0, 0.42) 100%);
-
-  /* structural surfaces are OPAQUE elevation steps, sitting just off black */
-  --surface-1: linear-gradient(157deg, #130d24 0%, #0d0819 46%, #070410 100%);
-  --surface-1-hover: linear-gradient(157deg, #181031 0%, #110c22 46%, #0a0616 100%);
-  --well-deep: linear-gradient(180deg, rgba(4, 2, 10, 0.62) 0%, rgba(4, 2, 10, 0.46) 100%);
-
-  /* blur strengths — ONLY these three exist */
-  --blur-bar: blur(22px) saturate(170%);
-  --blur-sheet: blur(34px) saturate(185%);
-  --blur-chip: blur(16px) saturate(160%);
-
-  /* lit edges — 1px gradient borders, bright top-left → dark bottom-right */
-  --edge: linear-gradient(147deg, rgba(255, 255, 255, 0.34) 0%, rgba(255, 255, 255, 0.09) 24%, rgba(255, 255, 255, 0.015) 52%, rgba(0, 0, 0, 0.34) 100%);
-  --edge-lit: linear-gradient(147deg, rgba(226, 200, 255, 0.62) 0%, rgba(154, 60, 255, 0.28) 30%, rgba(0, 229, 255, 0.1) 58%, rgba(0, 0, 0, 0.3) 100%);
-  --edge-top: rgba(255, 255, 255, 0.18);
-  --hairline: linear-gradient(90deg, rgba(255, 255, 255, 0) 0%, rgba(255, 255, 255, 0.09) 18%, rgba(255, 255, 255, 0.13) 50%, rgba(255, 255, 255, 0.09) 82%, rgba(255, 255, 255, 0) 100%);
-  --sheen: linear-gradient(112deg, rgba(255, 255, 255, 0) 30%, rgba(255, 255, 255, 0.085) 45%, rgba(214, 190, 255, 0.05) 52%, rgba(255, 255, 255, 0) 68%);
-
-  /* elevation — on black, shadows stop working, so they carry a violet ambient */
-  --shadow: 0 14px 34px -12px rgba(0, 0, 0, 0.72), 0 0 26px -14px rgba(119, 0, 255, 0.22);
-  --shadow-lift: 0 26px 54px -16px rgba(0, 0, 0, 0.8), 0 0 40px -8px rgba(119, 0, 255, 0.34);
-  --shadow-bar: 0 20px 44px -24px rgba(0, 0, 0, 0.9), 0 1px 0 rgba(255, 255, 255, 0.04);
-  --shadow-sheet: 0 48px 96px -32px rgba(0, 0, 0, 0.86), 0 0 0 1px rgba(255, 255, 255, 0.06);
-  --focus-ring: 0 0 0 2px rgba(119, 0, 255, 0.6), 0 0 0 5px rgba(119, 0, 255, 0.2);
-
-  /* motion — nothing interactive exceeds 320ms */
-  --ease-spring: cubic-bezier(0.32, 1.35, 0.42, 1);
+  /* ------------------------------------- motion (§6, calmer register) ---- */
+  --ease-spring: cubic-bezier(0.32, 1.28, 0.42, 1);
   --ease-soft: cubic-bezier(0.2, 0.8, 0.2, 1);
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --dur-fast: 150ms;
@@ -82,15 +135,129 @@
   --sp-2: 16px;
   --sp-3: 24px;
   --sp-4: 32px;
+
+  /* Aliases, so component rules read as prose and so the few colours the
+     renderer names in JS (speakerColor's fallback, the search mark) keep
+     resolving. Clear values, not the old dark-glass ones. */
+  --text: var(--clear-ink);
+  --muted: var(--clear-muted);
+  --faint: var(--clear-faint);
+  --line: var(--clear-line);
+  --amber: var(--clear-warn);
+  --amber-soft: var(--clear-warn-soft);
+  --good: var(--clear-good);
+  --good-soft: var(--clear-good-soft);
+  --danger: var(--clear-danger);
+  --danger-soft: var(--clear-danger-soft);
+  --focus-ring: var(--clear-focus);
+}
+
+/* The dark variant leans OLED (§14.1, amended 2026-09-01): the ground is
+   #000000, surfaces lift to #121017, and every card keeps its 1px hairline
+   because a shadow cannot fall on black. Written twice on purpose — once for
+   "follow the OS", once for the explicit stamp. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --clear-bg: #000000;
+    --clear-surface: #121017;
+    --clear-tile: #17141f;
+    --clear-ink: #f4f3f8;
+    --clear-muted: #9c98ab;
+    --clear-faint: #6a6678;
+    --clear-line: #262330;
+    --clear-line-strong: #302c3d;
+    --clear-line-accent: #3d2f5c;
+
+    --violet: #a566ff;
+    --violet-2: #c79bff;
+    --violet-soft: #241a38;
+    --accent-fill: linear-gradient(180deg, var(--violet-2) 0%, var(--violet) 100%);
+    --accent-fill-hover: linear-gradient(180deg, #d6b3ff 0%, #b47dff 100%);
+    /* White on #a566ff is 3.53:1. The ink that reads on this accent is dark. */
+    --on-accent: #140b22;
+
+    --cyan: #00e5ff;
+    --cyan-soft: #0e2429;
+    --clear-good: #4cd97b;
+    --clear-good-soft: #12291b;
+    --clear-warn: #ffc14d;
+    --clear-warn-soft: #2a2110;
+    --clear-danger: #ff7385;
+    --clear-danger-soft: #2a1218;
+
+    --sp-l: 74%;
+    --sp-plate-s: 40%;
+    --sp-plate-l: 18%;
+    --sp-plate-line-s: 34%;
+    --sp-plate-line-l: 30%;
+
+    --clear-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 12px -4px rgba(0, 0, 0, 0.5);
+    --clear-shadow-lift: 0 2px 6px rgba(0, 0, 0, 0.5), 0 12px 26px -10px rgba(0, 0, 0, 0.6);
+    --clear-shadow-pop: 0 24px 60px -20px rgba(0, 0, 0, 0.6), 0 6px 20px -8px rgba(0, 0, 0, 0.5);
+
+    --clear-bloom: none;
+    --scrim: rgba(0, 0, 0, 0.62);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --clear-bg: #000000;
+  --clear-surface: #121017;
+  --clear-tile: #17141f;
+  --clear-ink: #f4f3f8;
+  --clear-muted: #9c98ab;
+  --clear-faint: #6a6678;
+  --clear-line: #262330;
+  --clear-line-strong: #302c3d;
+  --clear-line-accent: #3d2f5c;
+
+  --violet: #a566ff;
+  --violet-2: #c79bff;
+  --violet-soft: #241a38;
+  --accent-fill: linear-gradient(180deg, var(--violet-2) 0%, var(--violet) 100%);
+  --accent-fill-hover: linear-gradient(180deg, #d6b3ff 0%, #b47dff 100%);
+  --on-accent: #140b22;
+
+  --cyan: #00e5ff;
+  --cyan-soft: #0e2429;
+  --clear-good: #4cd97b;
+  --clear-good-soft: #12291b;
+  --clear-warn: #ffc14d;
+  --clear-warn-soft: #2a2110;
+  --clear-danger: #ff7385;
+  --clear-danger-soft: #2a1218;
+
+  --sp-l: 74%;
+  --sp-plate-s: 40%;
+  --sp-plate-l: 18%;
+  --sp-plate-line-s: 34%;
+  --sp-plate-line-l: 30%;
+
+  --clear-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 12px -4px rgba(0, 0, 0, 0.5);
+  --clear-shadow-lift: 0 2px 6px rgba(0, 0, 0, 0.5), 0 12px 26px -10px rgba(0, 0, 0, 0.6);
+  --clear-shadow-pop: 0 24px 60px -20px rgba(0, 0, 0, 0.6), 0 6px 20px -8px rgba(0, 0, 0, 0.5);
+
+  --clear-bloom: none;
+  --scrim: rgba(0, 0, 0, 0.62);
 }
 
 * { box-sizing: border-box; }
 html, body { height: 100%; }
+
+/* The body paints an explicit token ground — a transparent body borrows the
+   host's, which is exactly how a light app ends up grey (§14.3). */
 body {
   margin: 0;
   font-family: var(--font);
   font-size: 14px;
-  color: var(--text);
-  background: var(--bg-top);
+  line-height: 1.5;
+  color: var(--clear-ink);
+  background-color: var(--clear-bg);
+  background-image: var(--clear-bloom);
+  background-attachment: fixed;
+  background-repeat: no-repeat;
+  -webkit-font-smoothing: antialiased;
   overflow: hidden;
 }

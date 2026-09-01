@@ -168,7 +168,9 @@ export function mount(root, ctx) {
       const at = hay.indexOf(needle, i);
       if (at < 0) break;
       if (at > i) out.push(text.slice(i, at));
-      out.push(h('b', { text: text.slice(at, at + needle.length), style: 'color:var(--text)' }));
+      // On the dark ground the mark was bold-and-brighter; on a light one that
+      // vanishes, so it carries the accent wash a chip uses (styles.css .hl).
+      out.push(h('b', { class: 'hl', text: text.slice(at, at + needle.length) }));
       i = at + needle.length;
     }
     out.push(text.slice(i));

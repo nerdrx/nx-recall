@@ -16,6 +16,10 @@ import { dirname, join } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUT = process.env.NX_RECALL_E2E_OUT || join(__dirname, '..', '..', 'test-artifacts');
+// NX Clear ships two grounds (DESIGN §14.1) and the suite photographs both, so
+// one pass must not overwrite the other's artefacts. The harness sets this to
+// "-light" / "-dark"; run by hand it is empty and nothing is renamed.
+const SUFFIX = process.env.NX_RECALL_E2E_SUFFIX || '';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -38,7 +42,7 @@ export function runE2E(deps) {
     win().webContents.invalidate?.();
     await sleep(500);
     const img = await win().webContents.capturePage();
-    const file = join(OUT, `${String(++shots).padStart(2, '0')}-${name}.png`);
+    const file = join(OUT, `${String(++shots).padStart(2, '0')}-${name}${SUFFIX}.png`);
     writeFileSync(file, img.toPNG());
     return file;
   }
@@ -85,6 +89,40 @@ export function runE2E(deps) {
     await step('connect', async () => {
       await waitFor('connected', async () => deps.getUi().conn.status === 'connected');
       return { daemon: deps.getUi().conn.daemon, socket: deps.getUi().conn.socketPath };
+    });
+
+    // 1b — which of NX Clear's two grounds this pass is photographing.
+    //
+    // The theme is driven through nativeTheme in the main process, which is the
+    // same path an OS switch takes, so the first thing to establish is that the
+    // renderer really followed it — otherwise a "dark" pass would quietly
+    // photograph the light one. If it did not follow, the explicit [data-theme]
+    // stamp §14.1 prescribes is applied, so the pass stays honest either way.
+    await step('theme-pass', async () => {
+      const asked = deps.theme?.().forced ?? null;
+      const read = () =>
+        js(`(() => {
+          const root = getComputedStyle(document.documentElement);
+          return {
+            scheme: root.colorScheme,
+            ground: getComputedStyle(document.body).backgroundColor,
+            stamp: document.documentElement.getAttribute('data-theme'),
+          };
+        })()`);
+      let got = await read();
+      let stamped = false;
+      if (asked && !got.scheme.includes(asked)) {
+        await js(`document.documentElement.setAttribute('data-theme', ${JSON.stringify(asked)})`);
+        got = await read();
+        stamped = true;
+      }
+      if (asked) {
+        assert(
+          got.scheme.includes(asked),
+          `this pass asked for the ${asked} ground; the document reports color-scheme "${got.scheme}"`
+        );
+      }
+      return { asked, stamped, ...got, window: deps.theme?.().ground ?? null };
     });
 
     // 2 — history rendered from the transcript query
@@ -876,11 +914,17 @@ export function runE2E(deps) {
 
     // 12d — native widgets Chromium draws outside the page (a <select> option
     // popup above all) take their colours from `color-scheme` and from nothing
-    // we can style. Without it the Search view's speaker dropdown is
-    // light-on-light and unreadable.
-    await step('native-widgets-render-dark', async () => {
+    // we can style. It used to be pinned to dark because the app had one ground;
+    // NX Clear has two (DESIGN §14.1), so what matters now is that it FOLLOWS —
+    // light widgets on the light ground are correct, and a stale `dark` here
+    // would put a black dropdown in the middle of a white app.
+    await step('native-widgets-follow-the-theme', async () => {
       const scheme = await js('window.__recallDebug.colorScheme()');
-      assert(/dark/.test(scheme), `the document declares color-scheme "${scheme}", so native popups render light`);
+      const want = deps.theme?.().dark ? 'dark' : 'light';
+      assert(
+        scheme === want,
+        `the document declares color-scheme "${scheme}" on the ${want} ground, so native popups are drawn the wrong way round`
+      );
 
       await js('document.querySelector(\'.rail-item[data-view="search"]\').click()');
       await waitFor('the search facets', async () => js('!!document.getElementById("search-q")'));
@@ -905,7 +949,7 @@ export function runE2E(deps) {
         };
       })()`);
       assert(sel, 'the search view has no speaker <select> to check');
-      assert(/dark/.test(sel.scheme), `the select itself inherits "${sel.scheme}"`);
+      assert(sel.scheme === want, `the select itself inherits "${sel.scheme}", not "${want}"`);
       assert(sel.options > 1, `the speaker dropdown has nothing in it (${sel.options})`);
       // Belt and braces behind the scheme, for platforms whose popup ignores it.
       assert(sel.rule, 'no explicit option colours are declared');
@@ -913,6 +957,56 @@ export function runE2E(deps) {
       const file = await shot('search-select');
       await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
       return { ...sel, file };
+    });
+
+    // 12e — both of NX Clear's grounds are real, at token level (DESIGN §14.1,
+    // §14.3's first checklist item). The explicit [data-theme] stamp is applied
+    // each way in turn and the two must genuinely differ — a Clear app that
+    // ships one palette plus a media query it never honours is exactly the
+    // failure this catches, and it is invisible in a single-theme screenshot
+    // run. `color-scheme` has to follow too, or the native dropdown lands on
+    // the wrong ground (12d).
+    await step('both-themes-are-defined', async () => {
+      const was = await js('document.documentElement.getAttribute("data-theme")');
+      const read = (t) =>
+        js(`(() => {
+          document.documentElement.setAttribute('data-theme', ${JSON.stringify(t)});
+          const root = getComputedStyle(document.documentElement);
+          const body = getComputedStyle(document.body);
+          return {
+            scheme: root.colorScheme,
+            ground: body.backgroundColor,
+            ink: body.color,
+            surface: root.getPropertyValue('--clear-surface').trim(),
+            line: root.getPropertyValue('--clear-line').trim(),
+            spL: root.getPropertyValue('--sp-l').trim(),
+          };
+        })()`);
+
+      const light = await read('light');
+      const dark = await read('dark');
+
+      // Put the pass back on its own ground before anything else is
+      // photographed. The stamp wins over the media query in both directions,
+      // so removing it is what hands the page back to the OS.
+      await js(
+        was == null
+          ? 'document.documentElement.removeAttribute("data-theme")'
+          : `document.documentElement.setAttribute('data-theme', ${JSON.stringify(was)})`
+      );
+
+      assert(light.ground !== dark.ground, `both stamps paint the same ground (${light.ground})`);
+      assert(light.ink !== dark.ink, `both stamps use the same body ink (${light.ink})`);
+      assert(light.surface !== dark.surface, `--clear-surface does not move between themes (${light.surface})`);
+      assert(light.line !== dark.line, `--clear-line does not move between themes (${light.line})`);
+      assert(light.scheme === 'light', `the light stamp declares color-scheme "${light.scheme}"`);
+      assert(dark.scheme === 'dark', `the dark stamp declares color-scheme "${dark.scheme}"`);
+      // §14.1 as amended: Clear's dark variant is grounded at true black.
+      assert(dark.ground === 'rgb(0, 0, 0)', `the dark ground is ${dark.ground}, not #000000`);
+      // The speaker hue band is the same identity on both grounds; only its
+      // lightness moves, which is what keeps a voice's colour meaning one thing.
+      assert(light.spL !== dark.spL, `the speaker palette does not re-tune per theme (${light.spL})`);
+      return { light, dark, restored: was };
     });
 
     // 13 — the footer is the status surface the design asks for
@@ -1031,12 +1125,13 @@ export function runE2E(deps) {
     const report = {
       when: new Date().toISOString(),
       socket: deps.getUi().conn.socketPath,
+      theme: deps.theme?.() ?? null,
       passed,
       failed: results.length - passed,
       results,
     };
     mkdirSync(OUT, { recursive: true });
-    writeFileSync(join(OUT, 'e2e-report.json'), JSON.stringify(report, null, 2));
+    writeFileSync(join(OUT, `e2e-report${SUFFIX}.json`), JSON.stringify(report, null, 2));
     console.log(`[e2e] ${passed}/${results.length} steps passed`);
   }
 

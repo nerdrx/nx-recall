@@ -247,10 +247,14 @@ export function mount(root, ctx) {
     });
 
     row.append(
+      // Only the hue travels: the plate, its hairline and the ink are all
+      // composed from it in styles.css out of theme tokens, so the same app
+      // keeps the same identity colour on both grounds and stays readable on
+      // each (see .src-mono).
       h('span', {
         class: 'src-mono',
         text: String(s.display ?? s.match_key).slice(0, 2).toUpperCase(),
-        style: `--mono-a:hsl(${hue} 80% 72%);--mono-b:hsl(${hue} 70% 42%)`,
+        style: `--sp-h:${hue}`,
       }),
       h(
         'span',
