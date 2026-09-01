@@ -1,0 +1,27 @@
+{
+  "_doc": "Gold set for the tier-3 commitment extractor bake-off. Windows are lobby-shaped dialogue between A and B (B is always the user's side where it matters). expect=null means: a correct model outputs no commitment. what_contains are lowercase keywords the extracted 'what' must contain (any language). due_contains matches the raw due phrase. Traps are labeled in _why.",
+  "cases": [
+    {"id": "en_pos_link", "window": [{"who": "A", "text": "send me the link, I want to look at how you did the shaders"}, {"who": "B", "text": "yeah I'll send it to you tonight after the meetup"}], "expect": {"who": "B", "what_contains": ["link"], "due_contains": "tonight"}},
+    {"id": "de_pos_link", "window": [{"who": "A", "text": "hast du das Video noch?"}, {"who": "B", "text": "ja klar, ich schick dir morgen den Link"}], "expect": {"who": "B", "what_contains": ["link"], "due_contains": "morgen"}},
+    {"id": "de_pos_doc", "window": [{"who": "B", "text": "ich mach die Doku bis Freitag fertig, versprochen"}], "expect": {"who": "B", "what_contains": ["doku"], "due_contains": "freitag"}},
+    {"id": "en_pos_intro", "window": [{"who": "A", "text": "you have to meet Kira, she builds worlds too"}, {"who": "B", "text": "next time she is online I will introduce you two"}], "expect": {"who": "B", "what_contains": ["introduce"], "due_contains": "next time"}},
+    {"id": "en_pos_other_way", "window": [{"who": "A", "text": "I owe you the avatar files, I will drop them in your DMs on Friday"}, {"who": "B", "text": "no rush"}], "expect": {"who": "A", "what_contains": ["avatar"], "due_contains": "friday"}},
+    {"id": "de_pos_zeigen", "window": [{"who": "A", "text": "die Map klingt nice"}, {"who": "B", "text": "wenn du Sonntag da bist zeig ich sie dir"}], "expect": {"who": "B", "what_contains": ["map", "zeig"], "due_contains": "sonntag"}},
+    {"id": "mixed_pos_denglisch", "window": [{"who": "B", "text": "ich hab das mal gequickfixt, I will push the update tomorrow"}], "expect": {"who": "B", "what_contains": ["update", "push"], "due_contains": "tomorrow"}},
+    {"id": "en_pos_no_due", "window": [{"who": "A", "text": "can I get the recording?"}, {"who": "B", "text": "sure, I will cut it and send it over"}], "expect": {"who": "B", "what_contains": ["recording", "send", "cut"], "due_contains": null}},
+
+    {"id": "en_neg_self_future", "window": [{"who": "B", "text": "I will probably just sleep after this"}], "expect": null, "_why": "future tense about oneself, no obligation to anyone"},
+    {"id": "en_neg_suggestion", "window": [{"who": "A", "text": "we should do the photo thing before everyone logs off"}, {"who": "B", "text": "yeah true"}], "expect": null, "_why": "suggestion, nobody committed"},
+    {"id": "de_neg_frage", "window": [{"who": "A", "text": "kannst du mir das nachher schicken?"}, {"who": "B", "text": "mal schauen"}], "expect": null, "_why": "request met with a non-answer; 'mal schauen' is not a promise"},
+    {"id": "de_neg_vergangenheit", "window": [{"who": "B", "text": "ich hab dir den Link doch gestern schon geschickt"}], "expect": null, "_why": "past tense, already done"},
+    {"id": "en_neg_hypothetical", "window": [{"who": "B", "text": "if I ever finish this world I would show it at the meetup I guess"}], "expect": null, "_why": "hypothetical, hedged twice"},
+    {"id": "en_neg_third_party", "window": [{"who": "A", "text": "Kira said she would upload the photos somewhere"}], "expect": null, "_why": "reported speech about an absent third person; neither A nor B committed"},
+    {"id": "de_neg_smalltalk", "window": [{"who": "A", "text": "ich sollte wirklich weniger Sachen trinken oder essen"}, {"who": "B", "text": "haha ja"}], "expect": null, "_why": "self-directed shoulda, no counterparty"},
+    {"id": "en_neg_game_context", "window": [{"who": "B", "text": "I will kill you next round, watch"}], "expect": null, "_why": "in-game banter shaped like a promise"},
+
+    {"id": "en_pos_buried", "window": [{"who": "A", "text": "my mic keeps cutting out, is it better now?"}, {"who": "B", "text": "much better"}, {"who": "A", "text": "cool. oh and I will send you that noise gate preset on the weekend"}, {"who": "B", "text": "nice"}], "expect": {"who": "A", "what_contains": ["preset"], "due_contains": "weekend"}},
+    {"id": "de_pos_buried", "window": [{"who": "A", "text": "welche Welt war das nochmal?"}, {"who": "B", "text": "Ghost Club glaub ich"}, {"who": "A", "text": "ah ok"}, {"who": "B", "text": "ich lad dich Mittwoch mal in die neue Instanz ein"}], "expect": {"who": "B", "what_contains": ["instanz", "einlad"], "due_contains": "mittwoch"}},
+    {"id": "en_neg_declined", "window": [{"who": "A", "text": "will you send me the file?"}, {"who": "B", "text": "honestly no, it is way too messy right now"}], "expect": null, "_why": "explicit refusal"},
+    {"id": "de_pos_conditional_real", "window": [{"who": "B", "text": "sobald der Fix durch ist schick ich dir die neue Version"}], "expect": {"who": "B", "what_contains": ["version"], "due_contains": "sobald"}}
+  ]
+}

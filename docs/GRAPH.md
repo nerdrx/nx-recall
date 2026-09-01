@@ -52,8 +52,17 @@ it, and pre-conversation briefs ("last time: you owed her the shader link").
 
 - **Tiny by requirement, not by concession** (user constraint: ~4 CPU cores,
   GPU only if it must). Budget: ≤ 3B parameters, Q4 GGUF, ≤ ~2 GB on disk.
-  Candidates to evaluate, de+en capable: Qwen2.5-1.5B-Instruct (primary),
-  Gemma-2-2B, Qwen2.5-3B as the ceiling. This works because the task is
+  **Bake-off done (spike/graph_bench, 20 gold cases incl. 9 traps, de/en/mixed,
+  4 pinned cores at nice 19): Qwen2.5-3B-Instruct Q4 wins** — 9/9 trap
+  rejections (zero invented obligations), 9/9 who and what on everything it
+  extracted, 3.3 s/case, 1.9 GB. The 1.5B was fast but gullible (5/9 traps);
+  Gemma-2-2B close behind (8/9). Two design facts the bench proved: the schema
+  must force a boolean verdict BEFORE any extractable fields exist (plain
+  object-or-null grammars bias every model toward extraction — bigger models
+  were WORSE until the verdict-first fix), and few-shot examples in the prompt
+  are load-bearing. A missed promise costs a shrug; an invented one poisons the
+  feature — the 3B fails in the right direction, same philosophy as the
+  overlap gate. This works because the task is
   narrow extraction over short windows with **grammar-constrained decoding**
   (GBNF → the model physically cannot emit anything but schema-valid JSON) —
   the regime where small models are strong. Anything the small model marks
