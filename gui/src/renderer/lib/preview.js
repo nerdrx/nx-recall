@@ -93,7 +93,11 @@ export function stop() {
   }
 }
 
+// Throws on anything that is not base64 — which is the point: the caller has to
+// treat a malformed reply as a failed clip rather than as an exception escaping
+// a click handler (audit finding #25c).
 function toBlob(b64) {
+  if (typeof b64 !== 'string' || !b64) throw new Error('no audio in the reply');
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
@@ -136,7 +140,7 @@ function playOne(url, durationMs, mine) {
  *
  * Never throws: a preview that fails is a hint in the UI, not an exception in
  * a click handler. The result says what happened —
- *   {played, stopped, error: null | 'gone' | 'empty' | <daemon code>}
+ *   {played, stopped, error: null | 'gone' | 'empty' | 'corrupt' | <daemon code>}
  * A `gone` from one clip does not abandon the rest: the samples are evidence
  * for a naming decision, and partial evidence still helps.
  */
@@ -172,7 +176,17 @@ export async function play(key, segmentIds) {
     if (token !== mine) return { played, stopped: true, error: null };
 
     release();
-    blobUrl = URL.createObjectURL(toBlob(clip.wav_b64));
+    // `atob` throws on a truncated or non-base64 payload, and this function is
+    // documented "never throws" — so it used to reject out of a click handler
+    // and strand the row in `loading` with no hint and no way back (audit
+    // finding #25c). A clip that cannot be decoded is a failed clip, exactly
+    // like one the daemon refused, and the rest of the sequence still plays.
+    try {
+      blobUrl = URL.createObjectURL(toBlob(clip?.wav_b64));
+    } catch {
+      error = error ?? 'corrupt';
+      continue;
+    }
     const why = await playOne(blobUrl, clip.duration_ms, mine);
     if (token !== mine) return { played, stopped: true, error: null };
     if (why === 'ended') played += 1;
@@ -214,5 +228,7 @@ export function noAudioHint(error) {
   if (error === 'empty' || error === 'gone') return 'no audio kept for this voice (retention)';
   if (error === 'refused') return 'that clip is too large to preview';
   if (error === 'playback') return 'this clip could not be played';
+  // The daemon answered, but not with audio anybody can decode.
+  if (error === 'corrupt') return 'that clip came back unreadable';
   return error ? `could not play that — ${error}` : '';
 }

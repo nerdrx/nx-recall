@@ -9,7 +9,14 @@ import assert from 'node:assert/strict';
 import {
   store,
   applyEvent,
+  applyConnState,
   applyMic,
+  appSources,
+  allowedAppCount,
+  cancelResyncRetry,
+  isCatchingUp,
+  liveStatus,
+  reloadAll,
   isUncertain,
   uncertainReason,
   isYou,
@@ -30,6 +37,7 @@ import {
   languageValue,
   languageLabel,
 } from '../src/renderer/lib/store.js';
+import { splitOutcome } from '../src/renderer/views/speakers.js';
 
 function reset() {
   store.speakers = new Map();
@@ -38,8 +46,11 @@ function reset() {
   store.sources = [];
   store.ops = new Map();
   store.status = null;
+  store.statusLive = false;
   store.appended = 0;
   store.window = { following: true, anchor: null, capped: false, beginning: false, firstMs: null };
+  cancelResyncRetry();
+  store.resync = { stale: [], attempt: 0, retrying: false, since: null };
   store.mic = { enabled: false, mode: 'follow', active: false, state: 'off', device: null, you_speaker: null };
   store.graph = { counts: null, enrichment: { phase: 'off' }, config: null };
 }
@@ -622,4 +633,183 @@ test('collapseToTail is idempotent and safe on an empty window', () => {
   fill(MAX_SEGMENTS);
   assert.equal(collapseToTail(), 0, 'exactly at the window is not over it');
   assert.equal(store.segments.length, MAX_SEGMENTS);
+});
+
+// ---------------------------------------------------------------------------
+// the resync, and what a half-answered one is allowed to do (audit finding #11)
+// ---------------------------------------------------------------------------
+
+/**
+ * A daemon made of five answers, any of which may throw. `ask` reads
+ * `window.recall.request`, so this is the whole seam — no Electron, no socket.
+ */
+function fakeDaemon(answers) {
+  const calls = [];
+  globalThis.window = {
+    recall: {
+      request: async (method, params) => {
+        calls.push(method);
+        const fn = answers[method];
+        if (!fn) return { ok: false, err: { code: 'unknown_method', msg: method } };
+        try {
+          return { ok: true, data: fn(params) };
+        } catch (e) {
+          return { ok: false, err: { code: e.code ?? 'failed', msg: e.message } };
+        }
+      },
+    },
+  };
+  return calls;
+}
+
+const boom = (code = 'io') => () => {
+  throw Object.assign(new Error('the socket flapped'), { code });
+};
+
+test('a resync whose voicebank query fails keeps the voices it had — and retries', async () => {
+  reset();
+  store.speakers.set(12, { id: 12, name: 'Kira', segments: 4, total_ms: 8000 });
+  store.sources = [{ match_key: 'VRChat.exe', kind: 'app', allowed: true }];
+
+  let speakersUp = false;
+  const calls = fakeDaemon({
+    'speakers.list': () => {
+      if (!speakersUp) throw Object.assign(new Error('the socket flapped'), { code: 'io' });
+      return { speakers: [{ id: 12, name: 'Kira', segments: 9, total_ms: 9000 }] };
+    },
+    transcript: () => ({ segments: [seg(1), seg(2)] }),
+    'sources.list': () => ({ sources: [{ match_key: 'VRChat.exe', kind: 'app', allowed: true }] }),
+    'mic.get': () => ({ enabled: false, mode: 'follow', state: 'off' }),
+    'graph.summary': () => ({ counts: { open: 2 }, enrichment: { phase: 'off' } }),
+  });
+
+  await reloadAll({ retryMin: 5 });
+
+  // The old code assigned `{speakers: []}` over the live model here: the
+  // voicebank read as deleted and every transcript row fell back to "Speaker 12".
+  assert.equal(store.speakers.size, 1, 'a failed query emptied the voicebank');
+  assert.equal(speakerLabel(12), 'Kira');
+  assert.deepEqual(store.resync.stale, ['speakers']);
+  assert.equal(isCatchingUp(), true, 'the footer would still be green');
+  assert.equal(store.loaded, false, 'a half-answered resync must not claim to have loaded');
+  assert.equal(store.resync.retrying, true, 'nothing was scheduled to try again');
+  // The slices that DID answer are fresh.
+  assert.deepEqual(store.segments.map((s) => s.id), [1, 2]);
+  assert.equal(store.graph.counts.open, 2);
+
+  speakersUp = true;
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(isCatchingUp(), false, 'the retry never landed');
+  assert.equal(store.speakers.get(12).segments, 9, 'the retry did not refresh the stale slice');
+  assert.equal(store.loaded, true);
+  assert.ok(calls.filter((m) => m === 'speakers.list').length >= 2, 'the failed query was never re-asked');
+  cancelResyncRetry();
+});
+
+test('a resync that fails outright changes nothing and says so', async () => {
+  reset();
+  store.speakers.set(12, { id: 12, name: 'Kira', segments: 4, total_ms: 8000 });
+  store.segments = [seg(1), seg(2), seg(3)];
+  store.segById = new Map(store.segments.map((s) => [s.id, s]));
+  store.sources = [{ match_key: 'VRChat.exe', kind: 'app', allowed: true }];
+  store.graph = { counts: { open: 5 }, enrichment: { phase: 'off' }, config: null };
+
+  fakeDaemon({
+    'speakers.list': boom(),
+    transcript: boom(),
+    'sources.list': boom(),
+    'mic.get': boom(),
+    'graph.summary': boom(),
+  });
+  await reloadAll({ retry: false });
+
+  // This is the daemon-restart case: the socket flaps once more as the client
+  // re-asks, all five reject, and the old code declared the world empty.
+  assert.equal(store.speakers.size, 1, 'the voicebank was wiped');
+  assert.equal(store.segments.length, 3, 'the transcript was wiped');
+  assert.equal(store.sources.length, 1, 'the sources were wiped');
+  assert.equal(store.graph.counts.open, 5, 'the graph counts were wiped');
+  assert.deepEqual(store.resync.stale, ['speakers', 'transcript', 'sources', 'mic', 'graph']);
+  assert.equal(isCatchingUp(), true);
+});
+
+test('a daemon too old for a method is not a stale slice', async () => {
+  reset();
+  fakeDaemon({
+    'speakers.list': () => ({ speakers: [{ id: 1, name: 'Ash' }] }),
+    transcript: () => ({ segments: [] }),
+    'sources.list': () => ({ sources: [] }),
+    // no mic.get, no graph.summary → unknown_method, which is an ANSWER: this
+    // daemon predates those halves of the app (0.6.0 / 0.7.0).
+  });
+  await reloadAll({ retry: false });
+  assert.deepEqual(store.resync.stale, []);
+  assert.equal(isCatchingUp(), false, 'an older daemon must not read as a failed resync');
+  assert.equal(store.loaded, true);
+  assert.equal(store.graph.counts, null);
+});
+
+// ---------------------------------------------------------------------------
+// the two footer/badge rules the views used to disagree about (finding #25)
+// ---------------------------------------------------------------------------
+
+test('the sources badge counts applications, never the microphone', () => {
+  reset();
+  store.sources = [
+    { match_key: 'VRChat.exe', kind: 'app', allowed: true },
+    { match_key: 'Discord', kind: 'app', allowed: true },
+    { match_key: 'firefox', kind: 'app', allowed: false },
+    // Allowed, and still not one of these: the mic has its own card, its own
+    // method and its own default. The rail used to count it and the view did
+    // not, so the same daemon read 3 or 2 depending on which painted last.
+    { match_key: 'mic', kind: 'mic', allowed: true },
+  ];
+  assert.equal(allowedAppCount(), 2);
+  assert.deepEqual(appSources().map((s) => s.match_key), ['VRChat.exe', 'Discord', 'firefox']);
+});
+
+test('a disconnect stops the footer quoting the daemon it lost', () => {
+  reset();
+  const status = { queue_depth: 3, drops: 0, storage: { db_bytes: 1 }, semantic: { available: true } };
+  applyConnState({ conn: { status: 'connected' }, status });
+  assert.equal(liveStatus().queue_depth, 3);
+
+  // Main nulls its status the moment the connection drops. The renderer used
+  // to keep the last one and go on quoting "queue 3 · db 1.2 GB" next to the
+  // words "daemon offline". The counters are no longer live…
+  applyConnState({ conn: { status: 'offline' }, status: null });
+  assert.equal(liveStatus(), null, 'the footer would still be quoting a dead daemon');
+  assert.equal(store.statusLive, false);
+  // …but the STRUCTURAL facts in the block survive, because "the semantic model
+  // is not installed on this machine" would be a different wrong claim.
+  assert.equal(store.status.semantic.available, true);
+
+  applyConnState({ conn: { status: 'connected' }, status: { ...status, queue_depth: 7 } });
+  assert.equal(liveStatus().queue_depth, 7);
+});
+
+// ---------------------------------------------------------------------------
+// what a split reply means (audit finding #17)
+// ---------------------------------------------------------------------------
+
+test('a split past the event cap asks for a re-query, and says what moved', () => {
+  // The daemon's reply shape, verbatim from PROTOCOL and service.rs.
+  const big = splitOutcome(
+    { op: 'op_7', kept: 1, minted: 9, auto: 'Speaker_09', moved_segments: 412, resync: true },
+    'Kira'
+  );
+  assert.equal(big.resync, true, 'resync:true was discarded — those rows keep the old name for ever');
+  assert.match(big.text, /412 segments/);
+  assert.match(big.text, /Speaker_09/);
+  // The old toast said "Re-clustering started (op_7)" over an operation that
+  // had already finished, and the sheet promised progress in the status bar.
+  assert.doesNotMatch(big.text, /status bar/i);
+  assert.doesNotMatch(big.text, /started/i);
+
+  const small = splitOutcome(
+    { op: 'op_8', kept: 1, minted: 9, auto: 'Speaker_09', moved_segments: 1, resync: false },
+    'Kira'
+  );
+  assert.equal(small.resync, false, 'below the cap the per-row events already did the work');
+  assert.match(small.text, /1 segment moved/);
 });

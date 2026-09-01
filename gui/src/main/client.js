@@ -106,7 +106,6 @@ export class RecallClient extends EventEmitter {
   }
 
   async _onConnect() {
-    this.backoff = RECONNECT_MIN;
     let welcome;
     try {
       welcome = await this._handshake();
@@ -128,8 +127,23 @@ export class RecallClient extends EventEmitter {
     try {
       await this.request('subscribe', { topics: TOPICS });
     } catch (e) {
-      this.emit('warn', `subscribe failed: ${e.message}`);
+      // A connection without a subscription is the worst state this client can
+      // be in: the socket is open, the status bar is green, and not one event
+      // will ever arrive again (audit finding #13). It used to warn and carry
+      // on into catch-up, which made the app permanently deaf until somebody
+      // restarted it. Drop the socket instead — `_onClose` then schedules the
+      // ordinary bounded-backoff reconnect, and the next handshake subscribes.
+      this.emit('warn', `subscribe failed: ${e.message} — dropping the connection so it is retried`);
+      this.catchingUp = false;
+      this.queued = [];
+      if (this.sock) this.sock.destroy();
+      return;
     }
+
+    // Only NOW is the connection worth anything, so only now does the backoff
+    // reset. Resetting it on the socket opening would turn a daemon that
+    // accepts connections and refuses subscriptions into a 250 ms hot loop.
+    this.backoff = RECONNECT_MIN;
 
     if (prior == null) {
       // First connection of this session: nothing to catch up, everything to load.

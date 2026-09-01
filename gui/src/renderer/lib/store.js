@@ -29,6 +29,11 @@ export const store = {
   paused: false,
   pausePending: false,
   status: null,
+  // Is that block a READING or a memory? False the moment the connection
+  // drops, so the footer stops quoting a daemon that is not there while the
+  // structural facts in it (storage, whether the semantic model is installed)
+  // stay available to the views that want them. See `liveStatus`.
+  statusLive: false,
   update: null, // {from, to} — the daemon came back as a different version
 
   speakers: new Map(), // id → {id, name, auto, segments, total_ms, first_seen, you}
@@ -75,6 +80,23 @@ export const store = {
   // and nothing else does. The commitments themselves are that view's own.
   graph: { counts: null, enrichment: { phase: 'off' }, config: null },
   ops: new Map(), // op id → {kind, frac, done}
+
+  /**
+   * How the last resync actually went, per slice (audit finding #11).
+   *
+   * A resync is five independent queries and any of them can fail on its own —
+   * a socket that flaps while the daemon restarts fails ALL of them, which is
+   * exactly when it matters. `stale` names the slices whose query did not
+   * answer, and the rule the whole thing turns on: **a slice that failed keeps
+   * the data it already had.** An empty model is a claim ("no voices yet") and
+   * a failed query is not entitled to make it.
+   *
+   * `attempt` counts consecutive failed resyncs and drives the backoff;
+   * `retrying` is true while one is scheduled. While `stale` is non-empty the
+   * footer says so rather than showing a green "connected" over data that is
+   * quietly out of date.
+   */
+  resync: { stale: [], attempt: 0, retrying: false, since: null },
 
   loaded: false,
   lastError: null,
@@ -171,37 +193,124 @@ async function ask(method, params) {
 
 export { ask };
 
-/** Full resync: every view's data re-fetched from scratch. */
-export async function reloadAll() {
+// -- the resync, and what a failed half of one is allowed to do ---------------
+
+/** How long before a resync that could not finish tries the rest again. */
+export const RESYNC_RETRY_MIN = 1500;
+export const RESYNC_RETRY_MAX = 20000;
+
+let resyncTimer = null;
+
+/** Stop any scheduled retry. Called whenever a fresh resync starts. */
+export function cancelResyncRetry() {
+  if (resyncTimer) clearTimeout(resyncTimer);
+  resyncTimer = null;
+  store.resync.retrying = false;
+}
+
+/** Is some part of the model known to be out of date? */
+export function isCatchingUp() {
+  return (store.resync.stale?.length ?? 0) > 0;
+}
+
+/**
+ * One query of a resync, run so that it can fail without taking the others —
+ * or the data it already has — with it.
+ *
+ * Three outcomes, not two. `ok` is an answer. `absent` is an HONEST no: the
+ * daemon is older than the method (mic before 0.6.0, the graph before 0.7.0),
+ * which is a fact about the daemon rather than a failure to refresh. Anything
+ * else is a failure, and a failure means the previous slice stands.
+ */
+async function slice(name, run) {
+  try {
+    return { name, ok: true, data: await run() };
+  } catch (e) {
+    return { name, ok: false, absent: e?.code === 'unknown_method', error: e };
+  }
+}
+
+/**
+ * Full resync: every view's data re-fetched from scratch.
+ *
+ * Audit finding #11 lived in the `.catch(() => ({speakers: []}))` this used to
+ * open with. Every slice was assigned unconditionally afterwards, so a resync
+ * whose queries all rejected — the ordinary shape of a daemon restart, where
+ * the socket flaps once more just as the client re-asks — replaced the whole
+ * model with empty lists and set `loaded`. The footer stayed green and every
+ * view said "No voices yet"; a PARTIAL failure was worse, because a voicebank
+ * that came back empty while the transcript did not made the rows fall back to
+ * "Speaker 12" and read as a real, catastrophic data loss.
+ *
+ * The rule now: a slice is only ever overwritten by an ANSWER. What failed is
+ * named in `store.resync.stale`, retried with a bounded backoff, and said out
+ * loud in the footer until it comes back.
+ */
+export async function reloadAll({ retry = true, retryMin = RESYNC_RETRY_MIN, onRepaint = null } = {}) {
+  cancelResyncRetry();
   const [speakers, transcript, sources, mic, graph] = await Promise.all([
-    ask('speakers.list').catch(() => ({ speakers: [] })),
-    ask('transcript', { limit: MAX_SEGMENTS }).catch(() => ({ segments: [] })),
-    ask('sources.list').catch(() => ({ sources: [] })),
-    // A daemon older than 0.6.0 has no mic at all; its `unknown_method` is not
-    // an error worth showing, it is just an older half of the app.
-    ask('mic.get').catch(() => null),
-    // …and one older than 0.7.0 has no memory graph. Same rule.
-    ask('graph.summary').catch(() => null),
+    slice('speakers', () => ask('speakers.list')),
+    slice('transcript', () => ask('transcript', { limit: MAX_SEGMENTS })),
+    slice('sources', () => ask('sources.list')),
+    slice('mic', () => ask('mic.get')),
+    slice('graph', () => ask('graph.summary')),
   ]);
 
-  store.speakers = new Map((speakers.speakers ?? []).map((s) => [s.id, s]));
-  store.segments = [...(transcript.segments ?? [])].sort((a, b) => a.t_ms - b.t_ms);
-  store.segById = new Map(store.segments.map((s) => [s.id, s]));
-  // A resync lands you back on the live tail, which is where a resync means
-  // you were. A first page SHORTER than the window is the whole archive, so
-  // the beginning is already loaded and the scrollback has nowhere to go.
-  store.window = {
-    following: true,
-    anchor: null,
-    capped: false,
-    beginning: store.segments.length < MAX_SEGMENTS,
-    firstMs: store.segments[0]?.t_ms ?? null,
-    detached: false,
+  if (speakers.ok) store.speakers = new Map((speakers.data?.speakers ?? []).map((s) => [s.id, s]));
+  if (transcript.ok) {
+    store.segments = [...(transcript.data?.segments ?? [])].sort((a, b) => a.t_ms - b.t_ms);
+    store.segById = new Map(store.segments.map((s) => [s.id, s]));
+    // A resync lands you back on the live tail, which is where a resync means
+    // you were. A first page SHORTER than the window is the whole archive, so
+    // the beginning is already loaded and the scrollback has nowhere to go.
+    store.window = {
+      following: true,
+      anchor: null,
+      capped: false,
+      beginning: store.segments.length < MAX_SEGMENTS,
+      firstMs: store.segments[0]?.t_ms ?? null,
+      detached: false,
+    };
+  }
+  if (sources.ok) store.sources = sources.data?.sources ?? [];
+  if (mic.ok && mic.data) applyMic(mic.data);
+  if (graph.ok) store.graph = graph.data ?? { counts: null, enrichment: { phase: 'off' }, config: null };
+  else if (graph.absent) store.graph = { counts: null, enrichment: { phase: 'off' }, config: null };
+
+  const stale = [speakers, transcript, sources, mic, graph].filter((s) => !s.ok && !s.absent).map((s) => s.name);
+  store.resync = {
+    stale,
+    attempt: stale.length ? store.resync.attempt + 1 : 0,
+    retrying: false,
+    since: stale.length ? (store.resync.since ?? Date.now()) : null,
   };
-  store.sources = sources.sources ?? [];
-  if (mic) applyMic(mic);
-  store.graph = graph ?? { counts: null, enrichment: { phase: 'off' }, config: null };
-  store.loaded = true;
+  // "Loaded" means the model has been filled from the daemon at least once, so
+  // a half-answered resync must not be able to claim it.
+  if (!stale.length) store.loaded = true;
+
+  if (stale.length && retry) {
+    // Bounded exponential backoff. The connection may be flapping under this,
+    // and the client's own reconnect will drive another resync when it settles;
+    // this covers the case where the socket is fine and the daemon was merely
+    // too busy to answer.
+    const wait = Math.min(RESYNC_RETRY_MAX, retryMin * 2 ** Math.max(0, store.resync.attempt - 1));
+    store.resync.retrying = true;
+    resyncTimer = setTimeout(() => {
+      resyncTimer = null;
+      store.resync.retrying = false;
+      const before = store.resync.stale.length;
+      reloadAll({ retry, retryMin, onRepaint })
+        .then(() => {
+          // Repaint only when the retry actually recovered something. A repaint
+          // remounts the view, and doing that every twenty seconds under a
+          // daemon that is simply gone would take the reader's scroll position
+          // with it for as long as the outage lasts.
+          if (store.resync.stale.length < before) onRepaint?.();
+        })
+        .catch(() => {});
+    }, wait);
+    if (resyncTimer.unref) resyncTimer.unref();
+  }
   return store;
 }
 
@@ -243,6 +352,59 @@ export function micChip(state = store.mic.state) {
     default:
       return { text: 'off', cls: 'chip' };
   }
+}
+
+/**
+ * The sources a person opts in through the ALLOWLIST — everything except the
+ * microphone (audit finding #25a).
+ *
+ * The mic is a source row on the wire (schema 4) but it is not one of these: it
+ * hears the room rather than one program, it has its own card, its own method
+ * and its own default. It used to be excluded by the Sources view and included
+ * by the rail badge, so the badge read 2 or 1 for the same daemon depending on
+ * which of the two happened to paint last. One rule, one place, both callers.
+ */
+export function appSources() {
+  return store.sources.filter((s) => s.kind !== 'mic');
+}
+
+/** What the rail badge counts: allowed applications. */
+export function allowedAppCount() {
+  return appSources().filter((s) => s.allowed).length;
+}
+
+/**
+ * Fold the main process's state push into the model.
+ *
+ * The status block is where audit finding #25b lived. Main sets `ui.status =
+ * null` the moment the connection drops; the renderer took that with an
+ * `if (st.status)` guard and simply kept the last one, so the footer went on
+ * quoting "queue 3 · db 1.2 GB" from a daemon that was no longer there, right
+ * next to the words "daemon offline".
+ *
+ * The block is still KEPT, because not all of it is a live reading: whether the
+ * semantic model is installed and how much is on disk are facts about this
+ * machine, and blanking them would trade one wrong claim ("semantic search is
+ * not installed") for another. What changes is that it is now MARKED — the
+ * counters are only quoted while a daemon is behind them (`liveStatus`).
+ */
+export function applyConnState(st) {
+  store.conn = st?.conn ?? store.conn;
+  store.paused = !!st?.paused;
+  store.pausePending = !!st?.pausePending;
+  if (st?.status) store.status = st.status;
+  store.statusLive = st?.conn?.status === 'connected' && !!st?.status;
+  store.update = st?.update ?? null;
+  return store;
+}
+
+/**
+ * The status block, but only while a daemon is answering. What the footer's
+ * counters are drawn from: offline they read "—" and go grey rather than
+ * presenting the last daemon's numbers as the current ones.
+ */
+export function liveStatus() {
+  return store.statusLive ? store.status : null;
 }
 
 // -- the resident window ----------------------------------------------------
@@ -615,6 +777,9 @@ export function applyEvent(evt, opts = {}) {
 
     case 'status': {
       store.status = d ?? null;
+      // An event only ever arrives over a live socket, so this block is a
+      // reading by definition.
+      store.statusLive = !!d;
       // The daemon's status block carries the mic too, so a client that missed
       // a `mic` event still converges on the truth.
       if (d?.mic) applyMic(d.mic);

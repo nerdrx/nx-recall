@@ -7,7 +7,18 @@
 // surviving a daemon restart (DESIGN §2).
 
 import { h, clear, fmtBytes } from './lib/dom.js';
-import { store, applyEvent, reloadAll, reloadGraph, mergeSegments, ask } from './lib/store.js';
+import {
+  store,
+  applyEvent,
+  applyConnState,
+  allowedAppCount,
+  isCatchingUp,
+  liveStatus,
+  reloadAll,
+  reloadGraph,
+  mergeSegments,
+  ask,
+} from './lib/store.js';
 import { patchSpeakerLabels } from './lib/labels.js';
 import { toast } from './lib/sheets.js';
 import { stop as stopPreview, playbackState } from './lib/preview.js';
@@ -55,7 +66,28 @@ const ctx = {
   showThreadInTranscript,
   back,
   toast,
+  resync,
 };
+
+/**
+ * Re-fetch everything and repaint. The daemon's own `resync` takes this path,
+ * and so does any reply that says "re-run your queries" — `speakers.split` past
+ * its event cap is the one that exists today (audit finding #17).
+ *
+ * A slice that fails keeps the data it had and retries itself (store.js); the
+ * retry repaints through here too, so a view that came back late is not left
+ * rendering the model from before it arrived.
+ */
+async function resync() {
+  await reloadAll({ onRepaint: repaintAll }).catch(() => {});
+  repaintAll();
+}
+
+function repaintAll() {
+  go(currentName, currentArg);
+  renderFooter();
+  renderBadges();
+}
 
 // ---------------------------------------------------------------------------
 // views
@@ -245,34 +277,56 @@ function renderUpdateBar() {
 function renderFooter() {
   clear(footer);
   const st = store.conn;
-  const cls = st.status === 'connected' ? 'ok' : st.status === 'connecting' ? 'mid' : 'bad';
-  const text =
-    st.status === 'connected'
+  const online = st.status === 'connected';
+  // A resync that could not finish is not "connected" in the sense a green dot
+  // makes: the socket is back, the views are not (audit finding #11). It is a
+  // quiet mid state and it names itself, rather than a green light over data
+  // the app knows is stale.
+  const catching = online && isCatchingUp();
+  const cls = catching ? 'mid' : online ? 'ok' : st.status === 'connecting' ? 'mid' : 'bad';
+  const text = catching
+    ? 'reconnected — still catching up'
+    : online
       ? `connected · ${st.daemon ?? 'recalld'}`
       : st.status === 'connecting'
         ? 'connecting…'
         : 'daemon offline — retrying';
 
+  // Numbers only mean something while a daemon is answering. Offline, the last
+  // ones it said are not "the current queue depth", they are a memory — so they
+  // go grey and read "—" rather than sitting next to "daemon offline" as if
+  // they were live (audit finding #25b).
+  // Grey says "there is no daemon behind these"; "—" says "no number yet".
+  // They are different states and the boot moment — connected, first status
+  // still in flight — is neither offline nor stale.
+  const live = liveStatus();
+  const statCls = online ? 'stat' : 'stat stale';
+
   // Element.append() stringifies null, so every optional child is filtered out
   // rather than passed through — a literal "null" in the status bar is exactly
   // the kind of thing a screenshot review catches and a diff does not.
   const parts = [
-    h('span', { class: `stat conn ${cls}` }, h('span', { class: `dot${st.status === 'connected' && !store.paused ? ' pulse' : ''}` }), text),
-    h('span', { class: 'stat' }, 'seq ', h('b', { text: String(st.seq ?? '—') })),
-    h('span', { class: 'stat' }, 'queue ', h('b', { text: String(store.status?.queue_depth ?? '—') })),
-    h('span', { class: 'stat' }, 'drops ', h('b', { text: String(store.status?.drops ?? '—') })),
-    h('span', { class: 'stat' }, 'sources ', h('b', { text: String(store.status?.sources_capturing ?? 0) })),
+    h(
+      'span',
+      { class: `stat conn ${cls}`, id: 'conn-stat', title: catching ? 'Some views could not be re-fetched yet — retrying.' : null },
+      h('span', { class: `dot${online && !catching && !store.paused ? ' pulse' : ''}` }),
+      text
+    ),
+    h('span', { class: statCls }, 'seq ', h('b', { text: String(st.seq ?? '—') })),
+    h('span', { class: statCls }, 'queue ', h('b', { text: String(live?.queue_depth ?? '—') })),
+    h('span', { class: statCls }, 'drops ', h('b', { text: String(live?.drops ?? '—') })),
+    h('span', { class: statCls }, 'sources ', h('b', { text: String(live?.sources_capturing ?? '—') })),
     // The two halves of disk usage that actually move, in the one place a
     // person already looks for "what is this program doing". The full
     // breakdown, and what each part means, is the Sources view's card.
-    store.status?.storage
+    live?.storage
       ? h(
           'span',
           { class: 'stat', id: 'storage-stat', title: 'Database and recordings on disk — the breakdown is in Sources' },
           'db ',
-          h('b', { text: fmtBytes(store.status.storage.db_bytes ?? 0) }),
+          h('b', { text: fmtBytes(live.storage.db_bytes ?? 0) }),
           ' · audio ',
-          h('b', { text: fmtBytes(store.status.storage.audio_bytes ?? 0) })
+          h('b', { text: fmtBytes(live.storage.audio_bytes ?? 0) })
         )
       : null,
     store.paused ? h('span', { class: 'chip warn' }, h('span', { class: 'dot' }), 'capture paused') : null,
@@ -305,7 +359,11 @@ function renderBadges() {
   };
   set('badge-transcript', store.segments.length);
   set('badge-speakers', store.speakers.size);
-  set('badge-sources', store.sources.filter((s) => s.allowed).length);
+  // The microphone is excluded here for the same reason the Sources view
+  // excludes it from its list: it is not an application on the allowlist, it
+  // has its own card. One rule in store.js, so the badge and the view can no
+  // longer disagree by one (audit finding #25a).
+  set('badge-sources', allowedAppCount());
   // What is still owed. Deliberately the OPEN count and not the total: a badge
   // is a number you are meant to act on, and a settled commitment is not one.
   // It is also why nothing else in this feature ever nags — this is the only
@@ -318,11 +376,7 @@ function renderBadges() {
 // ---------------------------------------------------------------------------
 
 window.recall.onState((st) => {
-  store.conn = st.conn ?? store.conn;
-  store.paused = !!st.paused;
-  store.pausePending = !!st.pausePending;
-  if (st.status) store.status = st.status;
-  store.update = st.update ?? null;
+  applyConnState(st);
   renderPause();
   renderUpdateBar();
   renderFooter();
@@ -369,10 +423,7 @@ window.recall.onEvent((evt) => {
 
 window.recall.onResync(async (info) => {
   // Everything on screen may be stale. Rebuild from queries and remount.
-  await reloadAll().catch(() => {});
-  go(currentName, currentArg);
-  renderFooter();
-  renderBadges();
+  await resync();
   if (info?.reason && info.reason !== 'first-connect') {
     toast(
       info.reason === 'daemon-restart'
@@ -414,14 +465,13 @@ document.addEventListener('keydown', (e) => {
 
 (async function boot() {
   const st = await window.recall.getState();
-  store.conn = st.conn ?? store.conn;
-  store.paused = !!st.paused;
-  store.status = st.status ?? null;
-  store.update = st.update ?? null;
+  applyConnState(st);
   renderPause();
   renderUpdateBar();
   renderFooter();
-  await reloadAll().catch(() => {});
+  // A first load that only half answered keeps whatever it did get, says so in
+  // the footer, and retries itself — the retry repaints through repaintAll.
+  await reloadAll({ onRepaint: repaintAll }).catch(() => {});
   go('transcript');
   renderFooter();
   renderBadges();
@@ -561,6 +611,12 @@ document.addEventListener('keydown', (e) => {
         name: (document.getElementById('person-name') || {}).textContent ?? '',
         sub: (document.getElementById('person-sub') || {}).textContent ?? '',
         strip,
+        // The rendered date is minute-resolution; this is the instant behind
+        // it, so "the page followed the feed" is a fact rather than a guess.
+        lastHeardMs: Number(document.querySelector('#person-strip [data-stat="last-heard"]')?.dataset.ms ?? 0),
+        segments: Number(
+          document.querySelector('#person-strip [data-stat="segments"] b')?.textContent?.replace(/\D/g, '') ?? 0
+        ),
         edges: [...document.querySelectorAll('#edge-list .edge-row')].map((r) => ({
           id: Number(r.dataset.edge),
           name: r.querySelector('.edge-name').textContent,
@@ -639,6 +695,18 @@ document.addEventListener('keydown', (e) => {
     // The one line behind the native-widget fix: without `color-scheme: dark`
     // Chromium draws <select> option popups light-on-light over this palette.
     colorScheme: () => getComputedStyle(document.documentElement).colorScheme,
+    // What a resync managed to refresh, and what the footer is saying about
+    // it. The driver has to be able to tell "connected" from "connected but
+    // still missing half the model" (audit finding #11).
+    resync: () => ({
+      stale: [...(store.resync?.stale ?? [])],
+      attempt: store.resync?.attempt ?? 0,
+      retrying: !!store.resync?.retrying,
+      conn: store.conn.status,
+      connText: (document.getElementById('conn-stat') || {}).textContent ?? '',
+      footer: (document.getElementById('footer') || {}).textContent ?? '',
+      stats: [...document.querySelectorAll('#footer .stat')].map((s) => [s.textContent, s.classList.contains('stale')]),
+    }),
     // The update banner, and whether its Restart really goes anywhere. The
     // driver may not press it — a relaunch would end the run — so the wiring is
     // read instead: the button's own handler, and the bridge it calls.

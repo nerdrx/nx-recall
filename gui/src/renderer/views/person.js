@@ -19,6 +19,16 @@ import { playSpeaker, stop as stopPreview, isActive, onPlayback, noAudioHint } f
 
 export const id = 'person';
 
+/**
+ * How long the page waits before re-asking after the feed moved (finding #18).
+ *
+ * Long enough that a burst of live segments costs ONE `person.get` rather than
+ * one each, short enough that a page left open follows the conversation it is
+ * about. Everything here is derived from live segments (docs/GRAPH.md), so
+ * "last heard" is only ever as true as the last query.
+ */
+const REFRESH_MS = 2000;
+
 /** The same key the Speakers view uses, so the two can never sound at once. */
 const previewKey = (spId) => `speaker:${spId}`;
 
@@ -135,10 +145,15 @@ export function mount(root, ctx, arg) {
 
   // -- stat strip -----------------------------------------------------------
 
-  function stat(label, value, note) {
+  // `ms` is the raw instant behind a rendered date. The visible text is only
+  // minute-resolution, so it is not something a test — or a person watching a
+  // conversation happen — can read a change out of.
+  function stat(label, value, note, ms = null) {
+    const dataset = { stat: label.toLowerCase().replace(/\s+/g, '-') };
+    if (ms != null) dataset.ms = String(ms);
     return h(
       'div',
-      { class: 'person-stat', dataset: { stat: label.toLowerCase().replace(/\s+/g, '-') } },
+      { class: 'person-stat', dataset },
       h('b', { text: value }),
       h('small', { text: label }),
       note ? h('em', { text: note }) : null
@@ -161,8 +176,8 @@ export function mount(root, ctx, arg) {
         stat('segments', String(t.segments ?? 0)),
         stat('sessions', String(t.sessions ?? 0)),
         stat('conversations', String(t.threads ?? 0)),
-        stat('first heard', t.first_heard_ms ? fmtDate(new Date(t.first_heard_ms).toISOString()) : '—'),
-        stat('last heard', t.last_heard_ms ? fmtDate(new Date(t.last_heard_ms).toISOString()) : '—')
+        stat('first heard', t.first_heard_ms ? fmtDate(new Date(t.first_heard_ms).toISOString()) : '—', null, t.first_heard_ms ?? 0),
+        stat('last heard', t.last_heard_ms ? fmtDate(new Date(t.last_heard_ms).toISOString()) : '—', null, t.last_heard_ms ?? 0)
       )
     );
   }
@@ -297,11 +312,19 @@ export function mount(root, ctx, arg) {
 
   // -- loading --------------------------------------------------------------
 
+  // The last answer, serialised. A refresh that brings back exactly what is
+  // already on screen must not rebuild the DOM: the page re-asks while the
+  // conversation is happening, and rebuilding it under a reader's cursor for no
+  // reason is its own kind of wrong.
+  let lastPayload = null;
+
   async function load() {
+    let fetched;
     try {
-      page = await ask('person.get', { id: spId });
+      fetched = await ask('person.get', { id: spId });
     } catch (e) {
       page = null;
+      lastPayload = null;
       sub.textContent = 'could not be loaded';
       clear(header);
       header.append(
@@ -321,6 +344,10 @@ export function mount(root, ctx, arg) {
       clear(threads);
       return;
     }
+    const payload = JSON.stringify(fetched);
+    if (page && payload === lastPayload) return;
+    page = fetched;
+    lastPayload = payload;
     const t = page.totals ?? {};
     sub.textContent = `${t.threads ?? 0} conversation${t.threads === 1 ? '' : 's'} · ${(page.edges ?? []).length} ${
       (page.edges ?? []).length === 1 ? 'person' : 'people'
@@ -329,6 +356,29 @@ export function mount(root, ctx, arg) {
     renderStats();
     renderEdges();
     renderThreads();
+  }
+
+  /**
+   * The page was frozen at mount (audit finding #18): it loaded once and then
+   * only ever reacted to a rename or a merge. Everything ELSE on it moves —
+   * total speech, segments, sessions, conversations, "last heard", the edges,
+   * the recent-conversation list — because every one of those is a query over
+   * live segments. A person page left open while the person is talking sat
+   * there claiming they were last heard when the page happened to be opened.
+   *
+   * Debounced rather than per-event: a burst of segments is one re-fetch, and
+   * the timer dies with the page rather than outliving it.
+   */
+  let refreshTimer = null;
+  function scheduleRefresh() {
+    if (refreshTimer) return;
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      // Mounted-only. `go()` clears the root, so a page that has been left
+      // behind must not keep querying on a DOM nobody can see.
+      if (!body.isConnected) return;
+      void load();
+    }, REFRESH_MS);
   }
 
   // Playback lives outside the view (one <audio> for the whole app), so the
@@ -362,7 +412,15 @@ export function mount(root, ctx, arg) {
           return;
         }
         void load();
+        return;
       }
+      // Everything else on this page is a query over live segments, so it
+      // moves on exactly these: a turn arriving, rows being deleted, and an
+      // operation (a merge, a split, a purge) finishing. `detached` is a live
+      // turn that arrived while the TRANSCRIPT window is parked on another day
+      // — this page is not, so it counts here even though that view did not
+      // file the row.
+      if (change.added || change.detached || change.purged || change.opFinished) scheduleRefresh();
     },
     reload: load,
   };

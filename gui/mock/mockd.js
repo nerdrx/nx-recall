@@ -29,6 +29,10 @@ const PROTO = 1;
 const DAEMON = 'recalld-mock/0.5';
 const SCHEMA = 7;
 const REPLAY_MAX = 200; // deliberately small: overrunning it must be reachable
+// Copied from crates/recalld/src/service.rs::SPLIT_EVENT_CAP. Past it a split
+// stops publishing one `segment` event per moved row and says `resync: true`
+// instead; a mock that never did that is how a client ends up ignoring the flag.
+export const SPLIT_EVENT_CAP = 100;
 
 export function defaultMockSocket() {
   if (process.env.NX_RECALL_MOCK_SOCK) return process.env.NX_RECALL_MOCK_SOCK;
@@ -1267,26 +1271,59 @@ export function startMock({
       return { from: a.id, into: b.id };
     },
 
+    // PROTOCOL "speakers.split": the work happens INLINE and the reply carries
+    // the outcome, not just a handle. This used to answer `{op}` and grind
+    // through runOp, which is neither what recalld does nor a shape any client
+    // could be written against — and it is why the GUI shipped ignoring
+    // `resync` (audit finding #17). Mirrors crates/recalld/src/service.rs:
+    // two relabels, the per-row `segment` events UNLESS there are more of them
+    // than SPLIT_EVENT_CAP, and `resync` saying which of the two happened.
     'speakers.split'(params) {
       const sp = speakerById(Number(params?.id));
       if (!sp) throw err('not_found', `no speaker ${params?.id}`);
-      const op = runOp('speakers.split', 6, () => {
-        const fresh = {
-          id: Math.max(...state.speakers.map((s) => s.id)) + 1,
-          name: null,
-          auto: `Speaker_${String(50 + state.nextOp % 40).padStart(2, '0')}`,
-          first_seen: new Date().toISOString(),
-        };
-        state.speakers.push(fresh);
-        // Hand a third of the source speaker's segments to the new identity.
-        let n = 0;
-        for (const seg of state.segments) {
-          if (seg.speaker === sp.id && n++ % 3 === 0) seg.speaker = fresh.id;
+      const fresh = {
+        id: Math.max(...state.speakers.map((s) => s.id)) + 1,
+        name: null,
+        auto: `Speaker_${String(50 + (state.nextOp % 40)).padStart(2, '0')}`,
+        first_seen: new Date().toISOString(),
+        segments: 0,
+        total_ms: 0,
+      };
+      state.speakers.push(fresh);
+      // Every second row of the source voice goes to the new identity — enough
+      // that a busy voice lands past the cap and a one-line voice does not, so
+      // both branches are reachable from a test.
+      const changed = [];
+      let n = 0;
+      for (const seg of state.segments) {
+        if (seg.speaker === sp.id && n++ % 2 === 0) {
+          seg.speaker = fresh.id;
+          changed.push(seg);
         }
-        emit('relabel', 'relabel', { speaker: fresh.id, name: null });
-        return { created: fresh.id };
-      });
-      return { op };
+      }
+      const seq = emit('relabel', 'relabel', { speaker: sp.id, name: sp.name ?? null }).seq;
+      emit('relabel', 'relabel', { speaker: fresh.id, name: null, auto: fresh.auto, split_from: sp.id });
+      const resync = changed.length > SPLIT_EVENT_CAP;
+      if (!resync) for (const seg of changed) emit('segments', 'segment', seg);
+
+      const op = `op_${state.nextOp++}`;
+      const result = {
+        op,
+        kept: sp.id,
+        minted: fresh.id,
+        auto: fresh.auto,
+        moved_segments: changed.length,
+        moved_prototypes: 1,
+        ambiguous: 0,
+        centroid_similarity: 0.42,
+        embed_model_id: 'mock-embed/1',
+        // True when the row-level events were suppressed: re-run your queries
+        // rather than trusting what you have.
+        resync,
+        seq,
+      };
+      emit('ops', 'op.done', { ...result, kind: 'speakers.split' });
+      return result;
     },
 
     // PROTOCOL "Voice preview": the clips worth hearing when naming a voice,
