@@ -282,16 +282,22 @@ pub struct GraphConfig {
     /// are still talking, above it the room has moved on.
     pub thread_gap_s: f32,
 
-    // ---- Tier 3 (GRAPH.md: "opt-in and idle-only") ----------------------
+    // ---- Tier 3 (GRAPH.md: "opt-in, and running whenever it is on") ------
     /// Run the local model over conversations nobody has looked at yet.
     ///
     /// **Off, and off is the default.** GRAPH.md: "Off by default. Its switch
     /// sits next to the mic's, with equally plain copy." Turning it on costs a
-    /// 1.9 GB model on disk and four cores of somebody else's idle time; it
-    /// never runs while a game is being captured and never in the capture path.
+    /// 1.9 GB model on disk and `llm_threads` pinned cores at nice 19 — and
+    /// once it is on it runs, including while a game is being captured (0.7.2,
+    /// see `crate::enrich`). Never in the capture path.
     pub enabled: bool,
-    /// Threads handed to llama.cpp (`-t`). Four is the user's stated budget and
-    /// the number the bake-off measured on: 3.3 s/case for Qwen2.5-3B Q4.
+    /// Threads handed to llama.cpp (`-t`), and the one number in this table a
+    /// person is expected to turn: it is how much of the machine the model may
+    /// use while they are playing. Four is the user's stated budget and the
+    /// number the bake-off measured on (3.3 s/case for Qwen2.5-3B Q4); the
+    /// Memory tab sets it live over `graph.set`, clamped to
+    /// [`crate::control::GRAPH_THREADS`], and it applies to the next model call
+    /// because threads are an argument to an invocation.
     pub llm_threads: i32,
     /// Layers offloaded to the GPU (`-ngl`). Zero, and meant to stay zero: the
     /// GPU belongs to whatever is drawing frames. It exists for a machine that
@@ -299,14 +305,14 @@ pub struct GraphConfig {
     pub gpu_layers: i32,
     /// Ceiling on one model call, in seconds, after which the child is killed.
     /// Generous next to a 3.3 s median because a cold page-in of 1.9 GB is not
-    /// a hang — but finite, because a wedged child holding four cores is.
+    /// a hang — but finite, because a wedged child holding its cores is.
     pub llm_timeout_s: u64,
     /// Conversations per enrichment batch. The worker stops between batches to
     /// re-check every gate, so this is really "how long the worker commits to
     /// before looking up again".
     pub batch_threads: usize,
     /// Seconds to wait between batches, and between re-checks when a gate is
-    /// closed. Idle work has no deadline; being invisible matters more.
+    /// closed. Background work has no deadline; being invisible matters more.
     pub batch_pause_s: u64,
     /// Conversations shorter than this are skipped: two lines of transcript
     /// carry no commitment and no topic worth the name, and walking them would

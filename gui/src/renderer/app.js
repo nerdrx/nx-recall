@@ -574,6 +574,14 @@ document.addEventListener('keydown', (e) => {
         progress: (document.getElementById('enrich-progress-text') || {}).textContent ?? '',
         reason: (document.getElementById('enrich-reason') || {}).textContent ?? '',
         facts: [...document.querySelectorAll('#enrich-facts li')].map((li) => li.textContent),
+        // 0.7.2: how much of the machine the model may use. The rendered value,
+        // not the store's — the point of the control is that a person can see
+        // what they set, and the hint that says when it takes effect.
+        threads: (document.getElementById('enrich-threads-value') || {}).textContent ?? '',
+        threadsPending:
+          (document.getElementById('enrich-threads') || {}).dataset?.pending === 'true',
+        threadsHint: (document.getElementById('enrich-threads-hint') || {}).textContent ?? '',
+        threadsConfig: store.graph?.config?.llm_threads ?? null,
         note: (document.getElementById('enrich-note') || {}).textContent ?? '',
         counts: (document.getElementById('enrich-counts') || {}).textContent ?? '',
       },

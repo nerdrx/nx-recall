@@ -858,8 +858,14 @@ export function runE2E(deps) {
 
     // 6s — the enrichment card, in all three states it has copy for, and the
     // copy itself. This is the honest-cost half of the feature: what it runs,
-    // what it costs, when it runs, that it is off by default, and that nothing
-    // leaves the machine.
+    // what it costs, that it keeps working while you play, that a pause stops
+    // it too, that it is off by default, and that nothing leaves the machine.
+    //
+    // 0.7.2 changed what "when it runs" means. The old copy promised "never
+    // while you are gaming" and the daemon kept that promise by standing down,
+    // which meant promises surfaced hours after the evening they were made in.
+    // The assertions below are the new contract, and the negative one is the
+    // point of the change: this card must not tell somebody it waits.
     await step('enrichment-is-off-by-default-and-says-what-it-would-cost', async () => {
       await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
       const off = await waitFor('the enrichment card', async () => {
@@ -871,12 +877,86 @@ export function runE2E(deps) {
       assert(off.progress === '', 'a progress line is showing with nothing running');
 
       const facts = off.facts.join(' ');
-      assert(/\bGB\b/.test(facts), `the copy does not say how big the model is: ${JSON.stringify(off.facts)}`);
-      assert(/CPU cores/i.test(facts), `the copy does not say what it spends: ${JSON.stringify(off.facts)}`);
-      assert(/not being captured|gaming/i.test(facts), `the copy does not say when it runs: ${JSON.stringify(off.facts)}`);
+      assert(/\b1\.9 GB\b/.test(facts), `the copy does not say how big the model is: ${JSON.stringify(off.facts)}`);
+      assert(/CPU cores?/i.test(facts), `the copy does not say what it spends: ${JSON.stringify(off.facts)}`);
+      assert(/lowest priority/i.test(facts), `the copy does not say what priority it runs at`);
+      assert(
+        /keeps working while you play/i.test(facts),
+        `the copy does not say it keeps running: ${JSON.stringify(off.facts)}`
+      );
+      assert(
+        /cannot win a scheduling contest/i.test(facts),
+        `the copy does not say why that is affordable: ${JSON.stringify(off.facts)}`
+      );
+      assert(
+        !/never while you are gaming|waits for an idle|only while nothing is being captured/i.test(facts),
+        `the card still promises to stand down while you play: ${JSON.stringify(off.facts)}`
+      );
+      assert(/paused means paused/i.test(facts), `the copy does not say a pause stops this too`);
       assert(/off until you turn it on/i.test(facts), `the copy does not say it is off by default`);
+      assert(/suggestion you can dismiss/i.test(facts), `the copy does not say what it writes is dismissible`);
       assert(/leaves this machine/i.test(facts), `the copy does not say nothing leaves the machine`);
       assert(/never changes a transcript/i.test(off.note), `the card does not say what it writes: "${off.note}"`);
+
+      // The setting that replaced standing down: how much of the machine the
+      // model may use. It has to say when it takes effect, because threads are
+      // an argument to an invocation and a conversation already open keeps the
+      // width it started with.
+      assert(off.threads === '4', `the stepper does not show the daemon's value: "${off.threads}"`);
+      assert(
+        /applies to the next conversation/i.test(off.threadsHint),
+        `the stepper does not say when it takes effect: "${off.threadsHint}"`
+      );
+      assert(/1–32/.test(off.threadsHint), `the stepper does not say its range: "${off.threadsHint}"`);
+      assert(
+        new RegExp(`\\b${off.threads} CPU cores\\b`).test(facts),
+        `the facts and the stepper disagree about the core count: ${JSON.stringify(off.facts)}`
+      );
+      // Turn it up two cores and watch the whole card follow: the value, the
+      // fact line above it, and the daemon — which is asserted by leaving the
+      // view and coming back, so what is read is a fresh `graph.summary` and
+      // not this view's own optimism.
+      //
+      // One press at a time: the stepper disables itself while the daemon is
+      // answering, exactly like every other optimistic control in this app, so
+      // a second click fired into that window would land on nothing.
+      const stepThreads = async (delta, want) => {
+        await waitFor('the stepper to accept a press', async () => {
+          const m = await js('window.__recallDebug.memory()');
+          return m.enrichment.threads && !m.enrichment.threadsPending ? m.enrichment : null;
+        });
+        await js(`document.querySelector('#enrich-threads [data-step="${delta}"]').click()`);
+        return waitFor(`the thread count to reach ${want}`, async () => {
+          const m = await js('window.__recallDebug.memory()');
+          // Settled, not merely optimistic: the value AND the daemon's answer.
+          return m.enrichment.threads === want && !m.enrichment.threadsPending
+            ? m.enrichment
+            : null;
+        });
+      };
+      await stepThreads(1, '5');
+      const tuned = await stepThreads(1, '6');
+      assert(
+        /\b6 CPU cores\b/.test(tuned.facts.join(' ')),
+        `the fact line did not follow the stepper: ${JSON.stringify(tuned.facts)}`
+      );
+      assert(tuned.threadsConfig === 6, `the daemon was not told: ${tuned.threadsConfig}`);
+      await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      // A remounted card paints its default before `graph.summary` answers, so
+      // the wait is for the value itself: settling on 6 is the proof that the
+      // daemon, and not this view's optimism, is where it came from.
+      const reread = await waitFor('the setting to survive a re-read', async () => {
+        const m = await js('window.__recallDebug.memory()');
+        return m.enrichment.threads === '6' ? m.enrichment : null;
+      });
+      assert(reread.threadsConfig === 6, `the store disagrees: ${reread.threadsConfig}`);
+
+      // …and back to the shipped default, so the shot below documents what a
+      // person actually opens this card to.
+      await stepThreads(-1, '5');
+      await stepThreads(-1, '4');
+
       // The card sits under the commitments and the topics, so a shot of the
       // top of the page would not document the thing this step is about.
       await js('document.getElementById("enrich-card").scrollIntoView({block: "end"})');
@@ -933,6 +1013,7 @@ export function runE2E(deps) {
       );
       return {
         off: off.chip,
+        threads: `${off.threads} → ${tuned.threads} → 4`,
         running: running.progress,
         idle: idle.chip,
         counts: idle.counts,

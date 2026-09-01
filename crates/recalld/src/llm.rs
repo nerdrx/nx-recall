@@ -35,6 +35,13 @@
 //! and exec so llama.cpp's own threads inherit both. `--temp 0`, so the same
 //! window always produces the same answer. A per-call timeout, after which the
 //! child is killed rather than waited on.
+//!
+//! Since 0.7.2 this is the *whole* protection: `crate::enrich` no longer waits
+//! for an idle machine, so the two lines in `pre_exec` below are what keeps a
+//! commitment pass from ever being felt in a frame time. `-t` comes from
+//! `[graph].llm_threads`, which a person can turn while the daemon runs — it is
+//! read here, per call, which is why a change applies to the next conversation
+//! and not to one already being read.
 
 use std::io::Read;
 use std::os::unix::process::CommandExt;
@@ -184,6 +191,27 @@ impl Llm {
             nice: runtime.inference_nice,
             cpus: runtime.inference_cpus.clone(),
         })
+    }
+
+    /// The same runner, at a different thread count.
+    ///
+    /// `[graph].llm_threads` is live as of 0.7.2 — a person turns it in the
+    /// Memory tab while the daemon runs — and `-t` is an argument to an
+    /// invocation, so the worker re-reads the setting between conversations and
+    /// hands the next one a runner tuned to whatever it says now. Cloning a
+    /// resolved runner is three paths and a handful of integers, which is
+    /// nothing next to the model call it precedes.
+    pub fn with_threads(&self, threads: i32) -> Self {
+        Self {
+            threads: threads.max(1),
+            ..self.clone()
+        }
+    }
+
+    /// What `-t` this runner would pass. Read by the test that proves the
+    /// setting is live.
+    pub fn threads(&self) -> i32 {
+        self.threads
     }
 
     /// Stored on every row this model writes, so a row produced by one model is
@@ -344,7 +372,7 @@ impl Llm {
         let status = match wait_with_timeout(&mut child, self.timeout)? {
             Some(status) => status,
             None => {
-                // A wedged child is holding four cores. Kill it, reap it, and
+                // A wedged child is holding its cores. Kill it, reap it, and
                 // let the worker move on: one conversation is not worth a
                 // process that will not stop.
                 let _ = child.kill();
@@ -711,6 +739,38 @@ mod tests {
         let cfg = GraphConfig::default();
         let rt = RuntimeConfig::default();
         assert!(Llm::resolve(Path::new("/definitely/not/here"), &cfg, &rt).is_none());
+    }
+
+    /// 0.7.2: the thread count is a live setting, and `-t` is an argument to an
+    /// invocation. A resolved runner therefore has to be able to be re-tuned
+    /// without being re-resolved — which is what makes "applies to the next
+    /// conversation" true rather than "applies after a restart".
+    #[test]
+    fn the_thread_count_can_be_turned_without_re_resolving_the_model() {
+        let root = std::env::temp_dir().join(format!("nxr-llm-threads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cfg = GraphConfig::default();
+        std::fs::create_dir_all(root.join(&cfg.llama_dir)).unwrap();
+        std::fs::write(root.join(&cfg.llm_model), b"").unwrap();
+        std::fs::write(root.join(&cfg.llama_dir).join("llama-cli"), b"").unwrap();
+
+        let llm = Llm::resolve(&root, &cfg, &RuntimeConfig::default()).expect("a staged runner");
+        assert_eq!(llm.threads(), cfg.llm_threads, "the configured default");
+
+        let more = llm.with_threads(16);
+        assert_eq!(more.threads(), 16);
+        assert_eq!(
+            more.model_id(),
+            llm.model_id(),
+            "re-tuning must not change what a row records as having written it"
+        );
+        assert_eq!(more.model_path(), llm.model_path());
+        // Below one is not a runner that runs slowly, it is a runner that does
+        // not run. The control layer clamps too; this is the second net.
+        assert_eq!(llm.with_threads(0).threads(), 1);
+        assert_eq!(llm.threads(), cfg.llm_threads, "the original is untouched");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---- against the real model --------------------------------------------

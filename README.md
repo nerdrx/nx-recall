@@ -143,6 +143,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.6.3 | +33h | the lights come on: the whole UI moves to NX Clear, in both grounds |
 | 0.6.4 | +34h | Delete stops lying: deleting a voice asks whether the voiceprint goes too, and an empty voice can finally be deleted at all |
 | 0.7.0 | +36h | the memory graph gets a tab: dates and promises by rule, a 3B local model that reads them properly when the machine is idle, and a Memory view that never nags |
+| 0.7.2 | +37h | the local model stops waiting for an idle machine — it reads while you play, jailed to as many cores as you hand it, and how many is now a setting |
 
 Golden fixtures gate every release: the equal-loudness mixes carry
 `expect: refuse` — a pipeline that labels them correctly *by luck* fails the

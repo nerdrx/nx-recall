@@ -1499,6 +1499,12 @@ impl Service {
             "enabled": cfg.enabled,
             "installed": installed,
             "llm_threads": cfg.llm_threads,
+            // The range the setting is clamped to, on the wire for the same
+            // reason `download_bytes` is: a client builds its stepper out of
+            // what the daemon will accept rather than out of a number in its
+            // own source that can drift away from this one.
+            "llm_threads_min": *crate::control::GRAPH_THREADS.start(),
+            "llm_threads_max": *crate::control::GRAPH_THREADS.end(),
             "gpu_layers": cfg.gpu_layers,
             "llm_model": cfg.llm_model,
             "thread_gap_s": cfg.thread_gap_s,
@@ -1523,9 +1529,17 @@ impl Service {
     ///
     /// Live because the switch is in the UI and a switch that needs a restart
     /// is not a switch; persisted because a switch that forgets is worse.
+    ///
+    /// `llm_threads` is clamped to [`crate::control::GRAPH_THREADS`] rather
+    /// than refused, like every other tuning number here, and the reply says
+    /// what is now true. It takes effect on the **next** model call: threads
+    /// are an argument to a `llama-cli` invocation, and a conversation already
+    /// being read finishes at the width it started with.
     fn graph_set(&self, req: &Request) -> Result<Value, Error> {
         let enabled = req.opt_bool("enabled")?;
-        let llm_threads = req.opt_i64("llm_threads")?.map(|v| v as i32);
+        let llm_threads = req
+            .opt_i64("llm_threads")?
+            .map(|v| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32);
         let gpu_layers = req.opt_i64("gpu_layers")?.map(|v| v as i32);
         if enabled.is_none() && llm_threads.is_none() && gpu_layers.is_none() {
             return Err(Error::params(

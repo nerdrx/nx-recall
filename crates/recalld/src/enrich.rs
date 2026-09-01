@@ -1,13 +1,32 @@
-//! The idle-time enrichment pass (GRAPH.md Tier 3).
-//!
-//! > "Runs ONLY as an idle-time enrichment pass: never while a game runs (same
-//! > detection §4 uses), never in the capture path, budgeted and interruptible."
+//! The background enrichment pass (GRAPH.md Tier 3).
 //!
 //! One background thread, walking conversations nobody has looked at yet,
 //! newest first. It does two things per conversation: ask the model whether
 //! anybody promised anything ([`crate::llm::Llm::commitment`]) and ask it what
 //! the conversation was about. Everything it writes is an annotation
 //! referencing segments, never a modification of one.
+//!
+//! ## Why it no longer waits for an idle machine (0.7.2)
+//!
+//! It used to. Through 0.7.1 there was a fifth gate — "no allowed application
+//! has an open stream", §4's own game detection, reused — and the gate defeated
+//! the feature it was protecting. A pass that stands down the moment VRChat
+//! opens a stream is a pass that never runs while there is anything to enrich:
+//! the conversations worth reading happen *during* the evening, and their
+//! promises would surface hours after the evening they were made in, if the
+//! machine ever went idle at all.
+//!
+//! **The protection was never the schedule. It is the jail.** Every model call
+//! is a child process pinned to `[runtime] inference_cpus` and dropped to nice
+//! 19 between fork and exec ([`crate::llm`]), so llama.cpp's own threads
+//! inherit both. It cannot take a core the capture path is pinned away from,
+//! and on the cores it does share it loses every scheduling contest it enters
+//! by construction — which is the actual content of the rule "analysis never
+//! wins against a VR frame". Standing down entirely was a second, cruder copy
+//! of a promise the scheduler was already keeping, and it cost the feature its
+//! reason to exist. How much of the machine it may use is now a setting
+//! (`[graph].llm_threads`, live over `graph.set`), which is the honest shape of
+//! that trade: enabled means running.
 //!
 //! ## The gates, in the order they are checked
 //!
@@ -21,15 +40,11 @@
 //! 3. **Capture is not paused.** Pause means nothing is written down. A
 //!    background pass writing derived rows through a pause would make that
 //!    sentence false, and it is the sentence the panic button rests on.
-//! 4. **No captured application is producing audio.** This is §4's own
-//!    detection, reused exactly: a source that is allowed and has an open
-//!    stream *is* the game running. Four cores at nice 19 are cheap, but the
-//!    rule the whole daemon is built on is that analysis never wins a
-//!    scheduling contest against a VR frame — and the safest way to keep that
-//!    promise is to not be running.
-//! 5. **The capture queue is short.** Even between games, a burst of turns
-//!    waiting for ASR means the machine is busy being a tape recorder, which is
-//!    the job that matters.
+//! 4. **The capture queue is short.** A burst of turns waiting for ASR means
+//!    the machine is busy being a tape recorder, which is the job that matters.
+//!    Unlike the gate that went, this one is transient by construction: it
+//!    clears as soon as the queue drains, and it is re-checked between
+//!    conversations rather than deciding the worker's whole evening.
 //!
 //! ## Budget and cancellation
 //!
@@ -188,31 +203,14 @@ impl EnrichStop {
 /// Separated from the loop so the rules are one readable function that a test
 /// can drive directly — the scheduling is the feature here, and a scheduling
 /// rule buried in a loop is a scheduling rule nobody can check.
-pub fn gate(store: &Store, control: &Control, cfg: &GraphConfig) -> Option<String> {
+///
+/// Two rules, both transient. Nothing here asks what the machine is *doing*:
+/// live capture is exactly when there is most to enrich, and the pinned cores
+/// and nice 19 in [`crate::llm`] are what keeps that affordable (see the module
+/// note above).
+pub fn gate(control: &Control, cfg: &GraphConfig) -> Option<String> {
     if control.is_paused() {
         return Some("capture is paused — nothing is written down, including this".to_string());
-    }
-    // §4's detection, reused: an allowed application with an open stream is a
-    // game that is running. The microphone does not count — it is a device, not
-    // a program, and it is open precisely when somebody is talking, which is
-    // when there is most to enrich later.
-    let allowlist = control.allowlist();
-    match store.list_sources() {
-        Ok(sources) => {
-            if let Some(busy) = sources.iter().find(|s| {
-                s.kind == crate::store::KIND_APP
-                    && s.streams > 0
-                    && allowlist.decide(&s.match_key).captures()
-            }) {
-                return Some(format!(
-                    "{} is running and being captured — the graph waits for an idle machine",
-                    busy.display_name
-                ));
-            }
-        }
-        // A database that will not answer is a reason to do nothing, not a
-        // reason to do something.
-        Err(e) => return Some(format!("the database did not answer: {e}")),
     }
     let queued = control
         .queue
@@ -381,7 +379,7 @@ pub fn run(
                     .and_then(|root| Llm::resolve(root, &cfg, &runtime));
                 resolved_for = Some(key);
             }
-            match (&llm, gate_now(&store, &control, &cfg)) {
+            match (&llm, gate(&control, &cfg)) {
                 (None, _) => GraphState {
                     phase: Phase::Unavailable,
                     reason: Some(
@@ -426,7 +424,7 @@ pub fn run(
         };
         publish(&control, &bus, &mut state, next);
 
-        // Idle work has no deadline; being invisible matters more. The sleep is
+        // Background work has no deadline; being invisible matters more. The sleep is
         // in small steps so a stop is honoured promptly.
         let pause = Duration::from_secs(cfg.batch_pause_s.max(1));
         let step = Duration::from_millis(200);
@@ -439,15 +437,6 @@ pub fn run(
             slept += step;
         }
     }
-}
-
-fn gate_now(
-    store: &Arc<std::sync::Mutex<Store>>,
-    control: &Control,
-    cfg: &GraphConfig,
-) -> Option<String> {
-    let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-    gate(&guard, control, cfg)
 }
 
 /// One batch. `Ok(true)` means work was done, `Ok(false)` that there was none.
@@ -485,7 +474,7 @@ fn batch(
         if stop.stopped() || !control.graph().enabled {
             break;
         }
-        if let Some(reason) = gate_now(store, control, cfg) {
+        if let Some(reason) = gate(control, cfg) {
             info!(%op, "standing down mid-batch: {reason}");
             bus.publish(
                 Topic::Ops,
@@ -503,10 +492,14 @@ fn batch(
         state.batch_done = i;
         publish_state(control, bus, state);
 
+        // `-t` is an argument to an invocation, so the live setting is read
+        // here rather than at resolve time: turning the model threads down
+        // applies to the next conversation, and never to one already open.
+        let tuned = llm.with_threads(control.graph().llm_threads);
         let at = utc_now_ns();
         let outcome = {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-            enrich_thread(&guard, llm, cfg, thread_id, at)
+            enrich_thread(&guard, &tuned, cfg, thread_id, at)
         };
         match outcome {
             Ok((found, retracted, labelled)) => {
@@ -599,54 +592,44 @@ mod tests {
         store
     }
 
-    /// A captured application with an open stream: that is the game running,
-    /// and it is the one gate the whole tier's acceptability rests on.
+    /// The 0.7.2 correction, asserted rather than remembered.
+    ///
+    /// Through 0.7.1 an allowed application with an open stream stood the
+    /// worker down — and that is precisely the hour the feature exists for. A
+    /// promise is made in a live lobby; extracting it after the lobby empties
+    /// is extracting it too late. The cost is paid by the pinned cores and
+    /// nice 19 in `crate::llm`, not by refusing to run.
     #[test]
-    fn a_captured_application_with_an_open_stream_blocks_the_worker() {
+    fn a_captured_application_with_an_open_stream_does_not_stop_the_worker() {
         let store = store_with_sources();
         let control = control(&store);
         let cfg = GraphConfig::default();
-        assert_eq!(
-            gate(&store, &control, &cfg),
-            None,
-            "an idle machine is clear"
-        );
+        assert_eq!(gate(&control, &cfg), None, "an idle machine is clear");
 
-        // Open a session on the allowed app: `sources.streams` counts it.
+        // The exact condition 0.7.1 blocked on: an allowed app, capturing, with
+        // an open stream. Asserted here so the test fails if the situation it
+        // is about stops being reachable.
         let src = store.upsert_source("VRChat.exe", "VRChat", 0).unwrap();
         let session = store.begin_session(src, 0).unwrap();
-        let reason = gate(&store, &control, &cfg).expect("blocked");
-        assert!(reason.contains("VRChat"), "{reason}");
-        assert!(reason.contains("idle"), "{reason}");
+        let sources = store.list_sources().unwrap();
+        let allowlist = control.allowlist();
+        assert!(
+            sources.iter().any(|s| s.match_key == "VRChat.exe"
+                && s.kind == crate::store::KIND_APP
+                && s.streams > 0
+                && allowlist.decide(&s.match_key).captures()),
+            "the test no longer sets up a captured app with an open stream"
+        );
+        assert!(!control.is_paused());
 
+        assert_eq!(
+            gate(&control, &cfg),
+            None,
+            "enrichment stood down while the user was in a lobby — that is the \
+             hour it exists for"
+        );
         store.end_session(session, 1).unwrap();
-        assert_eq!(gate(&store, &control, &cfg), None, "and it clears again");
-    }
-
-    /// A stream from a program nobody allowed is not being captured, so it is
-    /// none of the graph's business.
-    #[test]
-    fn a_denied_applications_stream_does_not_block_anything() {
-        let store = store_with_sources();
-        let control = control(&store);
-        let src = store.upsert_source("firefox", "Firefox", 0).unwrap();
-        store.begin_session(src, 0).unwrap();
-        assert_eq!(gate(&store, &control, &GraphConfig::default()), None);
-    }
-
-    /// The microphone is a device, not a program. It is open exactly when
-    /// somebody is talking — which is when there is most to enrich later — so
-    /// blocking on it would be blocking on the wrong thing.
-    #[test]
-    fn the_microphone_being_open_is_not_a_game_running() {
-        let store = store_with_sources();
-        let control = control(&store);
-        store.set_allowed("mic", true, 0).unwrap();
-        let src = store
-            .upsert_source_kind("mic", "Microphone", KIND_MIC, 0)
-            .unwrap();
-        store.begin_session(src, 0).unwrap();
-        assert_eq!(gate(&store, &control, &GraphConfig::default()), None);
+        assert_eq!(gate(&control, &cfg), None);
     }
 
     /// Pause means nothing is written down. That has to include this.
@@ -655,15 +638,28 @@ mod tests {
         let store = store_with_sources();
         let control = control(&store);
         control.pause();
-        let reason = gate(&store, &control, &GraphConfig::default()).expect("blocked");
+        let reason = gate(&control, &GraphConfig::default()).expect("blocked");
         assert!(reason.contains("paused"), "{reason}");
         control.resume();
-        assert_eq!(gate(&store, &control, &GraphConfig::default()), None);
+        assert_eq!(gate(&control, &GraphConfig::default()), None);
+    }
+
+    /// A microphone session is not a reason to stand down either — it is open
+    /// exactly when somebody is talking, which is when there is most to enrich.
+    #[test]
+    fn the_microphone_being_open_is_not_a_reason_to_stand_down() {
+        let store = store_with_sources();
+        let control = control(&store);
+        store.set_allowed("mic", true, 0).unwrap();
+        let src = store
+            .upsert_source_kind("mic", "Microphone", KIND_MIC, 0)
+            .unwrap();
+        store.begin_session(src, 0).unwrap();
+        assert_eq!(gate(&control, &GraphConfig::default()), None);
     }
 
     #[test]
     fn a_backlog_of_audio_waiting_for_asr_blocks_the_worker() {
-        let store = store_with_sources();
         let queue = crate::queue::EventQueue::for_seconds(30.0, crate::config::SAMPLE_RATE);
         let control = Control::new(
             PathBuf::from("/nonexistent"),
@@ -676,7 +672,7 @@ mod tests {
             Arc::new(crate::analysis::AnalysisStats::default()),
         );
         let cfg = GraphConfig::default();
-        assert_eq!(gate(&store, &control, &cfg), None);
+        assert_eq!(gate(&control, &cfg), None);
 
         // Ten seconds of audio queued, against a five-second ceiling.
         queue.push(crate::queue::CaptureEvent::Audio(
@@ -686,7 +682,7 @@ mod tests {
                 samples: vec![0.0f32; crate::config::SAMPLE_RATE as usize * 10],
             },
         ));
-        let reason = gate(&store, &control, &cfg).expect("blocked");
+        let reason = gate(&control, &cfg).expect("blocked");
         assert!(reason.contains("transcribed"), "{reason}");
     }
 
@@ -700,11 +696,21 @@ mod tests {
         assert!(!control.set_graph_enabled(false).enabled);
 
         // The tuning knobs are clamped rather than trusted: a client that asks
-        // for zero threads must not get a daemon that cannot run the model.
+        // for zero threads must not get a daemon that cannot run the model, and
+        // one that asks for two hundred must not get a daemon that tries.
         let tuned = control.set_graph_tuning(Some(0), Some(-4));
+        assert_eq!(tuned.llm_threads, *crate::control::GRAPH_THREADS.start());
         assert_eq!(tuned.llm_threads, 1);
         assert_eq!(tuned.gpu_layers, 0);
+        assert_eq!(
+            control.set_graph_tuning(Some(200), None).llm_threads,
+            *crate::control::GRAPH_THREADS.end(),
+        );
+        assert_eq!(*crate::control::GRAPH_THREADS.end(), 32);
         assert_eq!(control.set_graph_tuning(Some(6), None).llm_threads, 6);
+        // The default is inside the range a client will offer, or the stepper
+        // would open on a value it cannot show.
+        assert!(GraphConfig::default().llm_threads <= *crate::control::GRAPH_THREADS.end());
     }
 
     #[test]

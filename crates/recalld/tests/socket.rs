@@ -1500,6 +1500,21 @@ fn the_tier_three_switch_is_live_and_says_whether_the_model_is_there() {
         json!(2)
     );
     assert_eq!(d.control.graph().llm_threads, 2);
+    // 0.7.2: how much of the machine the model may use is the setting that
+    // replaced standing down while a game runs, so the range travels with it —
+    // a client builds its control out of what the daemon will accept.
+    assert_eq!(before["config"]["llm_threads_min"], json!(1));
+    assert_eq!(before["config"]["llm_threads_max"], json!(32));
+    // Clamped at both ends, never refused: the reply says what is now true.
+    assert_eq!(
+        c.call("graph.set", json!({"llm_threads": 0}))["config"]["llm_threads"],
+        json!(1)
+    );
+    assert_eq!(
+        c.call("graph.set", json!({"llm_threads": 4096}))["config"]["llm_threads"],
+        json!(32)
+    );
+    assert_eq!(d.control.graph().llm_threads, 32);
 
     let off = c.call("graph.enrich", json!({"action": "stop"}));
     assert_eq!(off["config"]["enabled"], json!(false));

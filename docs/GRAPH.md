@@ -123,7 +123,7 @@ has to have run before a client can read the annotations.
   `topics` table would only be a second thing that could disagree with
   `threads`. The semantic-search half of that idea is untouched and still owed.
 
-### Tier 3 — understood, tiny local LLM, opt-in and idle-only — **shipped in 0.7.0**
+### Tier 3 — understood, tiny local LLM, opt-in and jailed — **shipped in 0.7.0**
 
 Commitment extraction done properly, topic naming that reads like a human wrote
 it, and pre-conversation briefs ("last time: you owed her the shader link").
@@ -159,9 +159,9 @@ it, and pre-conversation briefs ("last time: you owed her the shader link").
   `llama-cli` exactly as the bench harness did, so Tier 3 costs this crate no
   cmake, no C++ toolchain and no new link-time anything — and a wedged model is
   killed and forgotten where a wedged thread would be a lost evening.
-- Runs ONLY as an idle-time enrichment pass: never while a game runs (same
-  detection §4 uses), never in the capture path, budgeted and interruptible.
-  The gates, all five re-checked **between conversations** so the worker stands
+- Runs as a background enrichment pass: never in the capture path, budgeted and
+  interruptible, and — since **0.7.2** — **not** waiting for an idle machine.
+  The gates, all four re-checked **between conversations** so the worker stands
   down within one model call of anything changing:
 
   1. `[graph].enabled` — off by default, and the switch is live.
@@ -169,12 +169,29 @@ it, and pre-conversation briefs ("last time: you owed her the shader link").
      `unavailable`, not an error.
   3. Capture is not paused. Pause means nothing is written down, and that has
      to include derived rows or the sentence the panic button rests on is false.
-  4. **No allowed application has an open stream.** That is §4's own detection,
-     reused: a captured app producing audio *is* the game running. The
-     microphone does not count — it is a device, and it is open exactly when
-     there is most to enrich later.
-  5. The capture queue is short. A turn storm means the machine is busy being a
-     tape recorder, which is the job that matters.
+  4. The capture queue is short. A turn storm means the machine is busy being a
+     tape recorder, which is the job that matters. Transient by construction: it
+     clears when the queue drains.
+
+- **The fifth gate, and why it went (0.7.2).** Through 0.7.1 there was one more:
+  "no allowed application has an open stream", §4's own game detection, reused.
+  It was the wrong promise. The conversations worth reading happen *during* the
+  evening, so a pass that stands down whenever VRChat holds a stream is a pass
+  that surfaces a promise hours after it was made, if the machine ever goes idle
+  at all — the feature's whole point, deferred past its usefulness.
+
+  **The protection was never the schedule. It is the jail.** Every model call is
+  a child process pinned to `[runtime] inference_cpus` and dropped to nice 19
+  between fork and exec, so llama.cpp's threads inherit both: it cannot touch a
+  core the capture path is pinned away from, and on the cores it shares it loses
+  every scheduling contest it enters. "Analysis never wins against a VR frame"
+  is already true by construction; standing down was a second, cruder copy of a
+  promise the scheduler keeps, and it cost the feature its reason to exist.
+  What replaced it is a number: `[graph].llm_threads`, 1–32, live over
+  `graph.set` and in the Memory tab, which is the honest shape of the trade —
+  how much of the machine, rather than whether at all. Enabled means running.
+  Threads are an argument to a `llama-cli` invocation, so a change applies to
+  the next conversation the worker reads, never to one already open.
 
 - Output is annotations referencing segments (`time_refs`, `commitments`,
   `threads.topic`), never modifications of the transcript. Deleting a
@@ -189,7 +206,10 @@ it, and pre-conversation briefs ("last time: you owed her the shader link").
   rather than filing a second opinion next to it. Precedence, in one place:
   a person's decision is final, the model outranks the rules, the rules never
   outrank the model.
-- Off by default. Its switch sits next to the mic's, with equally plain copy.
+- Off by default. Its switch sits next to the mic's, with equally plain copy —
+  and next to the switch, the one number that sizes it (`llm_threads`), because
+  "how much of the machine" is the question the switch used to answer by
+  refusing to run.
 
 ## Surfaces
 

@@ -384,6 +384,7 @@ does not show the Memory view, and nothing else changes.
                 "walked": 24, "found": 9, "retracted": 2, "labelled": 24,
                 "last_error": null, "last_run_utc_ns": "..."},
  "config": {"enabled": false, "installed": true, "llm_threads": 4,
+            "llm_threads_min": 1, "llm_threads_max": 32,
             "gpu_layers": 0, "llm_model": "qwen2.5-3b-instruct-q4_k_m.gguf",
             "thread_gap_s": 20.0, "batch_threads": 4,
             "min_thread_segments": 3, "download_bytes": 1946604700}}
@@ -394,15 +395,19 @@ does not show the Memory view, and nothing else changes.
   meant to act on and a settled commitment is not one.
 - `enrichment.phase` is one of **`off` · `unavailable` · `blocked` · `idle` ·
   `running`**. `reason` is always present for `blocked` and `unavailable` and
-  is a sentence a person can act on ("VRChat is running and being captured —
-  the graph waits for an idle machine"). A client with copy for three states
-  should collapse `blocked` into idle-with-a-reason and `unavailable` into a
-  "not installed" note.
+  is a sentence a person can act on ("capture is paused — nothing is written
+  down, including this"). A client with copy for three states should collapse
+  `blocked` into idle-with-a-reason and `unavailable` into a "not installed"
+  note. As of **0.7.2** `blocked` has exactly two causes, both transient — a
+  pause and a full capture queue. A running game is **not** one of them: the
+  worker keeps reading while you play, pinned and at nice 19 (GRAPH.md Tier 3).
 - `config.installed` is whether the optional model is **on disk**, which is a
   different question from `enabled`. Both are needed: on and not installed is a
   real state, and it has to read as "fetch it" rather than as a failure.
 - `config.download_bytes` is what turning it on would cost, so a client's copy
-  does not hard-code a number that could drift.
+  does not hard-code a number that could drift. `config.llm_threads_min` and
+  `config.llm_threads_max` are there for the same reason: a client builds the
+  control for `llm_threads` out of the range `graph.set` will accept.
 
 #### `commitments.list {state?, limit?}`
 
@@ -479,6 +484,13 @@ because a switch that forgets is worse. `graph.set` needs at least one field
 (`err:params` otherwise), clamps what it is given, and answers with what is now
 true rather than with what it was asked for. The reply carries
 `config.persisted`, exactly like `mic.set`.
+
+`llm_threads` is clamped to **1–32** (`config.llm_threads_min`/`_max`), never
+refused: zero threads is a daemon that cannot run the model, and two hundred is
+one that tries. It is the setting that replaced standing down while a game runs
+(0.7.2), and it takes effect on the **next** model call — threads are an
+argument to a `llama-cli` invocation, so a conversation already being read
+finishes at the width it started with.
 
 #### `graph.enrich {action}` — `"start"` | `"stop"`
 

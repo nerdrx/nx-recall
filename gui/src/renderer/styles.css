@@ -985,3 +985,28 @@ button.sp-num:focus-visible { outline: none; box-shadow: var(--clear-focus); }
 }
 .enrich-facts li { display: flex; gap: 9px; align-items: baseline; }
 .enrich-facts .tick { color: var(--violet); font-weight: 700; flex: none; }
+
+/* How much of the machine the model may use. It sits directly under the facts
+   because it is the one of them a person can change: the line above says how
+   many cores, and this is where that number comes from. */
+.enrich-tune {
+  display: flex; align-items: center; gap: 14px;
+  margin-top: 14px; padding: 10px 12px; max-width: 70ch;
+  border: 1px solid var(--clear-line); border-radius: var(--clear-r-control);
+  background: var(--clear-tile);
+}
+.enrich-tune .tune-label { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.enrich-tune .tune-label b { font-size: 13px; font-weight: 640; }
+.enrich-tune .tune-label small { font-size: 11.5px; color: var(--clear-muted); }
+.tune-stepper { display: flex; align-items: center; gap: 8px; flex: none; }
+/* `.btn` is an inline-flex row that does not centre its own content — the
+   overflow button solves this the same way, and a one-glyph button has to. */
+.tune-stepper .btn.step {
+  width: 30px; padding: 4px 0; justify-content: center;
+  font: 600 14px/1.2 var(--font);
+}
+.tune-value {
+  min-width: 2.2ch; text-align: center;
+  font: 600 15px/1 var(--mono); color: var(--clear-ink);
+  font-variant-numeric: tabular-nums;
+}

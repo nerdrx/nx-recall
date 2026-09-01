@@ -103,6 +103,11 @@ const SPEAKERS = [
 /// `candidate`, at either end of the socket.
 const COMMITMENT_STATES = ['candidate', 'confirmed', 'done', 'dismissed'];
 
+/// What `[graph].llm_threads` may be set to — `crate::control::GRAPH_THREADS`,
+/// as `[min, max]`. Kept here rather than in the view so the mock refuses the
+/// same values the daemon refuses.
+const GRAPH_THREADS = [1, 32];
+
 /// What counts as a one-off voice, matching the daemon's own bar.
 const PRUNE_MAX_SEGMENTS = 1;
 const PRUNE_MAX_SPEECH_MS = 3000;
@@ -595,6 +600,11 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
       enabled: state.graph.enabled,
       installed: state.graph.installed,
       llm_threads: state.graph.llm_threads,
+      // The range `graph.set` clamps to, on the wire exactly as the daemon
+      // sends it (crate::control::GRAPH_THREADS): the Memory tab builds its
+      // stepper out of this rather than out of a number in its own source.
+      llm_threads_min: GRAPH_THREADS[0],
+      llm_threads_max: GRAPH_THREADS[1],
       gpu_layers: state.graph.gpu_layers,
       llm_model: 'qwen2.5-3b-instruct-q4_k_m.gguf',
       thread_gap_s: 20,
@@ -1167,7 +1177,9 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
         throw err('params', 'graph.set needs at least one of enabled, llm_threads, gpu_layers');
       }
       if (enabled !== undefined) setEnrichment(!!enabled);
-      if (threads !== undefined) state.graph.llm_threads = Math.max(1, Math.min(64, Number(threads)));
+      if (threads !== undefined) {
+        state.graph.llm_threads = Math.max(GRAPH_THREADS[0], Math.min(GRAPH_THREADS[1], Number(threads)));
+      }
       if (layers !== undefined) state.graph.gpu_layers = Math.max(0, Number(layers));
       emit('status', 'graph', { ...state.enrichment });
       emit('status', 'status', statusPayload());

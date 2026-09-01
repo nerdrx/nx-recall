@@ -31,6 +31,16 @@ use crate::enrich::GraphState;
 use crate::pipeline::Stats;
 use crate::queue::EventQueue;
 
+/// What `[graph].llm_threads` may be set to, over the wire and in the UI.
+///
+/// One is "as little of the machine as the model can be given and still run";
+/// thirty-two is past any consumer core count this daemon has ever been pointed
+/// at, and well past the point where more threads stop buying tokens per second
+/// on a Q4 3B. The number is a share of the machine, not a promise about
+/// latency: whatever it is set to, the child is still pinned to
+/// `[runtime] inference_cpus` and still runs at nice 19.
+pub const GRAPH_THREADS: std::ops::RangeInclusive<i32> = 1..=32;
+
 pub struct Control {
     paused: AtomicBool,
     paused_since_ns: AtomicU64,
@@ -315,6 +325,12 @@ impl Control {
     /// Change one or more of the numbers the worker runs under. `None` leaves a
     /// field alone, so a client can set the switch without also having an
     /// opinion about thread counts.
+    ///
+    /// Both are clamped rather than trusted. `llm_threads` is the one a person
+    /// actually turns (0.7.2 puts it in the Memory tab): [`GRAPH_THREADS`] is
+    /// its range, and it is a range rather than a free integer because the
+    /// number is how much of the machine the model may use while a game is
+    /// running — the setting that replaced standing down.
     pub fn set_graph_tuning(
         &self,
         llm_threads: Option<i32>,
@@ -322,7 +338,7 @@ impl Control {
     ) -> GraphConfig {
         let mut guard = self.graph.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(t) = llm_threads {
-            guard.llm_threads = t.clamp(1, 64);
+            guard.llm_threads = t.clamp(*GRAPH_THREADS.start(), *GRAPH_THREADS.end());
         }
         if let Some(g) = gpu_layers {
             guard.gpu_layers = g.max(0);

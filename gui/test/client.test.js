@@ -486,6 +486,41 @@ test('turning the local model on walks a batch and comes back idle', async () =>
   }
 });
 
+// 0.7.2 — how much of the machine the model may use is a live setting, and the
+// range it is clamped to travels with it so the Memory tab's stepper is built
+// out of what the daemon will accept rather than out of a literal in the view.
+test('the model thread count is live and clamped to the range it advertises', async () => {
+  const { mock, path } = withMock({ feedMs: 100000 });
+  const client = new RecallClient({ socketPath: path });
+  try {
+    await connected(client);
+    const { config } = await client.request('graph.get', {});
+    assert.equal(config.llm_threads_min, 1);
+    assert.equal(config.llm_threads_max, 32);
+    assert.ok(
+      config.llm_threads >= config.llm_threads_min && config.llm_threads <= config.llm_threads_max,
+      'the shipped default sits outside the range a client may offer'
+    );
+
+    const up = await client.request('graph.set', { llm_threads: 8 });
+    assert.equal(up.config.llm_threads, 8);
+    assert.equal(up.config.persisted, true, 'a setting that forgets is worse than none');
+    assert.equal((await client.request('graph.get', {})).config.llm_threads, 8);
+
+    // Clamped, not refused, at both ends — the same contract as every other
+    // tuning number: the reply says what is now true.
+    assert.equal((await client.request('graph.set', { llm_threads: 0 })).config.llm_threads, 1);
+    assert.equal((await client.request('graph.set', { llm_threads: 999 })).config.llm_threads, 32);
+
+    // Threads alone is a complete request; nothing at all is not.
+    assert.equal((await client.request('graph.get', {})).config.enabled, false);
+    await assert.rejects(() => client.request('graph.set', {}));
+  } finally {
+    client.close();
+    mock.close();
+  }
+});
+
 test('topics group conversations and name the threads behind them', async () => {
   const { mock, path } = withMock({ feedMs: 100000 });
   const client = new RecallClient({ socketPath: path });

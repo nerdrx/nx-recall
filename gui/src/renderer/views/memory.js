@@ -278,7 +278,7 @@ export function mount(root, ctx) {
           { class: 'empty', id: 'topics-empty' },
           h('b', { text: 'No topics yet' }),
           h('p', {
-            text: 'Conversations get a short label from the local model. It is off until you turn it on below, and it only runs while you are not gaming.',
+            text: 'Conversations get a short label from the local model. It is off until you turn it on below — and once it is on it keeps working while you play, on as much of the machine as you give it.',
           })
         )
       );
@@ -330,6 +330,7 @@ export function mount(root, ctx) {
   // turning it on actually does, in words rather than in a settings reference.
 
   let switchPending = false;
+  let threadsPending = false;
 
   function renderEnrichment() {
     clear(enrichCard);
@@ -399,18 +400,29 @@ export function mount(root, ctx) {
       );
     }
 
-    // The honest copy, as four flat statements. Not a paragraph anybody skims:
-    // four lines, each of which is a fact somebody might object to.
+    // The honest copy, as flat statements. Not a paragraph anybody skims: each
+    // line is a fact somebody might object to, answerable on its own.
+    //
+    // 0.7.2 rewrote the third line. It used to say "never while you are
+    // gaming", which was true and was the wrong promise: a pass that waits for
+    // an idle machine surfaces a promise hours after the evening it was made
+    // in. What keeps it affordable is the jail — pinned cores, lowest priority
+    // — and that is what the copy says now, next to the setting that sizes it.
+    const threads = cfg.llm_threads ?? 4;
     enrichCard.append(
       h(
         'ul',
         { class: 'enrich-facts', id: 'enrich-facts' },
         fact(`A ${fmtGb(cfg.download_bytes)} language model, running on this machine.`),
-        fact(`${cfg.llm_threads ?? 4} CPU cores at the lowest priority — never the GPU unless you say so.`),
-        fact('Only while nothing is being captured and capture is not paused. Never while you are gaming.'),
+        fact(
+          `${threads} CPU core${threads === 1 ? '' : 's'} at the lowest priority — never the GPU unless you say so.`
+        ),
+        fact('It keeps working while you play. Pinned to those cores and running last in line, it cannot win a scheduling contest against your game.'),
+        fact('Paused means paused. While capture is paused nothing is written down, and that includes this.'),
         fact('Off until you turn it on, and everything it finds is a suggestion you can dismiss.'),
         fact('Nothing leaves this machine. There is no network in this program except the one-time model download.')
       ),
+      threadStepper(cfg),
       h('p', {
         class: 'rail-hint',
         id: 'enrich-note',
@@ -439,6 +451,101 @@ export function mount(root, ctx) {
 
   function fact(text) {
     return h('li', {}, h('span', { class: 'tick', 'aria-hidden': 'true', text: '·' }), text);
+  }
+
+  /// How much of the machine the model may use — the setting that replaced
+  /// standing down while you played.
+  ///
+  /// A stepper rather than a slider: the useful range is small integers and
+  /// every one of them is a whole core, so there is nothing to interpolate. The
+  /// bounds come from the daemon (`llm_threads_min`/`max`), not from a number
+  /// in this file that could drift away from what `graph.set` will accept.
+  function threadStepper(cfg) {
+    const min = cfg.llm_threads_min ?? 1;
+    const max = cfg.llm_threads_max ?? 32;
+    const value = Math.min(max, Math.max(min, cfg.llm_threads ?? 4));
+    const step = (delta, label, title) =>
+      h(
+        'button',
+        {
+          class: 'btn small step',
+          dataset: { step: String(delta) },
+          'aria-label': title,
+          title,
+          disabled:
+            threadsPending ||
+            store.conn.status !== 'connected' ||
+            value + delta < min ||
+            value + delta > max,
+          onclick: () => void setThreads(value + delta),
+        },
+        label
+      );
+    return h(
+      'div',
+      {
+        class: 'enrich-tune',
+        id: 'enrich-threads',
+        // The optimistic window, made visible. The value moves the instant a
+        // person presses, and the buttons are dead until the daemon answers —
+        // a driver that pressed into that gap would be pressing nothing, so it
+        // has to be able to see it, exactly as a commitment row exposes its own.
+        dataset: { pending: String(threadsPending) },
+      },
+      h(
+        'span',
+        { class: 'tune-label' },
+        h('b', { text: 'Model threads' }),
+        h('small', {
+          id: 'enrich-threads-hint',
+          text: `${min}–${max} of this machine's cores. Applies to the next conversation it reads.`,
+        })
+      ),
+      h('span', { class: 'spacer' }),
+      h(
+        'span',
+        {
+          class: 'tune-stepper',
+          role: 'group',
+          'aria-label': 'How many CPU cores the local model may use',
+        },
+        step(-1, '−', 'One core fewer'),
+        h('output', {
+          class: 'tune-value',
+          id: 'enrich-threads-value',
+          'aria-live': 'polite',
+          text: String(value),
+        }),
+        step(1, '+', 'One core more')
+      )
+    );
+  }
+
+  async function setThreads(next) {
+    const before = summary?.config?.llm_threads;
+    threadsPending = true;
+    // Optimistic, like every other control in this app: the daemon answers
+    // with what is now true and a failure puts the old number back.
+    if (summary?.config) summary.config.llm_threads = next;
+    renderEnrichment();
+    try {
+      const out = await ask('graph.set', { llm_threads: next });
+      summary = { ...(summary ?? {}), config: out.config, enrichment: out.enrichment };
+      // The shared store carries the config for anything outside this view;
+      // leaving it stale would make the app disagree with itself about a
+      // number the daemon has already accepted.
+      store.graph = { ...store.graph, config: out.config, enrichment: out.enrichment };
+      // No toast on success, unlike the switch. The number is right under the
+      // cursor and the line above it moves with it, so a notification would
+      // only be a second copy of what a person is already looking at — and
+      // stepping from four to eight would raise four of them.
+    } catch (e) {
+      if (summary?.config) summary.config.llm_threads = before;
+      toast(`Could not change that — ${e.message}`, 'error');
+    } finally {
+      threadsPending = false;
+      renderEnrichment();
+    }
   }
 
   /** Three states a person acts on, out of the daemon's five. */
@@ -560,8 +667,13 @@ export function mount(root, ctx) {
   };
 }
 
+/// GB as the rest of this project says GB — decimal, the unit a download size
+/// is quoted in and the unit `models fetch` and GRAPH.md both use. Dividing by
+/// 2^30 instead made this card say "1.8 GB" for a 1,929,903,264-byte file that
+/// every other surface calls 1.9 GB, which is the kind of small lie that makes
+/// a person doubt the large truths next to it.
 function fmtGb(bytes) {
-  const gb = (Number(bytes) || 1_946_604_700) / 1_073_741_824;
+  const gb = (Number(bytes) || 1_946_604_700) / 1_000_000_000;
   return `${gb.toFixed(1)} GB`;
 }
 
