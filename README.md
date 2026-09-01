@@ -1,20 +1,20 @@
 <div align="center">
 
-# ◢ NX RECALL ◣
-
-### Total recall for your social life. On your silicon. Nowhere else.
-
-**The always-on conversation memory for VR — local transcription, persistent
-speaker identity, instant search. Zero cloud. Zero telemetry. Zero exceptions.**
+<img src="assets/readme/banner.svg" width="100%" alt="NX RECALL — total recall for your social life">
 
 <br>
 
-![local-first](https://img.shields.io/badge/inference-100%25_local-7700FF?style=for-the-badge)
+**The always-on conversation memory for VR. Local transcription, persistent
+speaker identity, instant search — on your silicon, nowhere else.**
+
+<br>
+
+![local](https://img.shields.io/badge/inference-100%25_local-7700FF?style=for-the-badge)
 ![telemetry](https://img.shields.io/badge/telemetry-none._ever.-0a0714?style=for-the-badge)
+![languages](https://img.shields.io/badge/languages-25-7700FF?style=for-the-badge)
 ![rust](https://img.shields.io/badge/daemon-rust-b7410e?style=for-the-badge)
-![tests](https://img.shields.io/badge/tests-263_passing-2ea44f?style=for-the-badge)
-![wer](https://img.shields.io/badge/WER_clean-1.3%25-7700FF?style=for-the-badge)
-![footprint](https://img.shields.io/badge/pipeline_cost-%3C5%25_of_one_core-2ea44f?style=for-the-badge)
+![tests](https://img.shields.io/badge/tests-284-2ea44f?style=for-the-badge)
+![footprint](https://img.shields.io/badge/pipeline-%3C5%25_of_one_core-2ea44f?style=for-the-badge)
 
 <br>
 
@@ -24,154 +24,156 @@ speaker identity, instant search. Zero cloud. Zero telemetry. Zero exceptions.**
 
 </div>
 
----
+<br>
+
+```console
+$ recalld probe
+ NODE   MATCH KEY    APPLICATION           PID     CAPTURE
+  190   VRChat.exe   VRChat.exe            635606  unknown (default-deny)
+  313   Discord      WEBRTC VoiceEngine    4206    unknown (default-deny)
+  380   firefox      Firefox               6917    unknown (default-deny)
+
+$ recalld allow VRChat.exe
+$ recalld search "portal"
+2026-09-01 20:16  Kira   wait, which [portal] was it — the one behind the bar
+                         or the one in the stairwell?
+```
+
+Nothing is recorded until you say so. Then everything you allow becomes
+searchable — who said it, when, in which app — seconds after it is said.
 
 ## The problem nobody shipped a fix for
 
-You spend your evenings in VRChat lobbies where five conversations run at once
-through one spatialized stereo mix. You meet someone brilliant, talk for an hour,
-and three days later you can't remember their name, their voice, or the world they
+You spend your evenings in lobbies where five conversations run at once through
+one spatialized stereo mix. You meet someone brilliant, talk for an hour, and
+three days later you cannot remember their name, their voice, or the world they
 recommended. Every cloud transcription product would happily fix this — by
 uploading your friends' voices to someone else's datacenter.
 
 That is not a fix. That is a breach with a subscription fee.
 
-**NX Recall is the other path**: a Rust daemon that captures audio only from apps
-you explicitly allow, transcribes it on your CPU, recognizes *who* said it with
-voice fingerprints that never leave your disk, and hands you a search box over your
-own social memory. The GPU keeps rendering your headset. The network cable stays
-cold.
+**NX Recall is the other path**: a Rust daemon that captures audio only from
+apps you explicitly allow, transcribes it on your CPU in 25 languages,
+recognizes *who* said it with voice fingerprints that never leave your disk,
+and hands you a search box over your own social memory. The GPU keeps rendering
+your headset. The network cable stays cold.
 
-## Engineering you can audit, numbers we actually measured
+## The pipeline
 
-This project runs on receipts, not vibes. Before writing the daemon we built a
-measurement harness ([`spike/`](spike/FINDINGS.md)) and let it kill our own
-assumptions — two of the original design's core claims died in the lab, and the
-architecture is what survived.
+<img src="assets/readme/pipeline.svg" width="100%" alt="capture to search, one machine, no exits">
+
+The box that earns its keep is the **overlap gate**. Every naive approach
+confidently mislabels overlapping speakers about half the time — and confidence
+scores *cannot see it happening* (we measured the cheap defenses; they are
+falsified in [FINDINGS.md](spike/FINDINGS.md) so nobody retries them). NX
+Recall would rather write *several voices* than write the wrong name into your
+memory. A missed label costs a shrug. A false one corrupts the voicebank
+forever. We chose accordingly.
+
+## Numbers we actually measured
+
+This project runs on receipts, not vibes. The measurement harness came first;
+two of the original design's core claims died in it, and the architecture is
+what survived.
 
 | Claim | Measured |
 |---|---|
-| Transcription accuracy (clean) | **1.4% WER English, 8.4% German** — Parakeet-TDT 0.6b v3, 25 languages, fully offline |
-| VRChat's voice codec "quality ceiling" | **Debunked**: Opus down to 8 kbps costs 0.2 pp WER, ~0.02 cosine for identity |
-| Speaker ID from 1 second of speech | **96% coverage, 2.5% EER** |
-| Real lobby, 20 min field recording | **9.8% overlapped speech** — the failure regime is rare in the wild |
-| Two named friends | cover **38% of all lobby speech**; ~95% of their later speech auto-matches |
-| ASR ghost words on silence / noise / music | **Zero.** (Whisper hallucinated on all three; so Whisper isn't in the default stack) |
-| Full pipeline: VAD → overlap gate → ASR → speaker ID | **< 5% of one CPU core** — your framerate never hears it |
-| Equal-loudness crosstalk (the poison case) | **Detected and refused** — 0.0% false alarms on single-speaker audio |
+| Transcription, English | **1.4% WER** — and German **8.4%**, same model, no mode switch |
+| What the old English-only model made of German | 103% WER — "The Vision Shaftwise Nooner of Hindus Deemers" |
+| VRChat's voice codec as "quality ceiling" | Debunked — Opus to 8 kbps costs ~0.2 pp WER, ~0.02 cosine |
+| Speaker ID from one second of speech | 96% coverage, 2.5% EER |
+| A real 20-minute lobby, measured | 9.8% overlapped speech — the failure regime is rare in the wild |
+| Two named friends | cover 38% of all lobby speech; ~95% of their later speech auto-matches |
+| Ghost words on silence / noise / music | Zero. (Whisper hallucinated on all three; it is not in the default stack) |
+| Full pipeline: VAD, gate, ASR, identity | under 5% of one CPU core — your framerate never hears it |
 
-The last row is the moat. Every naive approach confidently mislabels overlapping
-speakers ~50% of the time — and confidence scores *cannot see it* (we tried the
-cheap defenses; they're falsified in [FINDINGS.md](spike/FINDINGS.md) so nobody
-retries them). NX Recall runs an independent overlapped-speech detector and would
-rather tell you *"two people were talking"* than write the wrong name into your
-memory. A missed label costs a shrug. A false one corrupts the voicebank forever.
-We chose accordingly.
+## Built like it means it
 
-## Architecture
-
-```mermaid
-flowchart LR
-    A[PipeWire<br>per-app taps] -->|default-deny<br>allowlist| B[16 kHz mono<br>monotonic clock]
-    B --> C[Silero VAD<br>+ turn merge]
-    C --> D{Overlap gate<br>pyannote powerset}
-    D -->|always| E[ASR<br>Parakeet-TDT]
-    D -->|single-speaker only| F[ERes2Net<br>voicebank match]
-    E --> G[(SQLite · WAL<br>FTS5 · provenance)]
-    F --> G
-    G --> H[Unix socket<br>0600 · NDJSON]
-    H --> I[Electron GUI<br>tray · liquid glass]
-    H --> J[CLI]
-```
-
-- **Default-deny capture.** Unknown apps trigger a history entry, never a recording.
-  VRChat in, banking tab out, forever.
-- **Label, don't separate.** Voice timbre is invariant to the exact things VR
-  scrambles — position, distance, head movement. We fingerprint, tag, and thread
-  conversations after the fact.
-- **Two-threshold identity.** Labeling and enrollment are separate gates; automatic
-  enrollment additionally requires the overlap detector's blessing. The voicebank
-  cannot poison itself on a confident mistake.
-- **Everything has provenance.** Every segment carries its model IDs, confidence,
-  and overlap fraction. Reprocess-proof. Merge tombstones never chain. Renames are
+- **Default-deny capture.** Unknown apps trigger a history entry, never a
+  recording. VRChat in, banking tab out, forever.
+- **Label, don't separate.** Voice timbre is invariant to exactly what VR
+  scrambles — position, distance, head movement. Fingerprint, tag, thread the
+  conversations afterwards.
+- **Two-threshold identity.** Labeling and enrollment are separate gates;
+  auto-enrollment additionally requires the overlap detector's blessing. The
+  voicebank cannot poison itself on a confident mistake.
+- **Updates update.** The hub replaces the running binary; the daemon notices
+  its own executable was swapped, drains, and restarts onto the new version;
+  the GUI offers one-click restart. Proven in the journal, three releases in a
+  row.
+- **Deletion means deletion.** Delete-by-speaker with a preview, soft-delete
+  undo window, nightly purge, `VACUUM`, and a sweeper that reconciles loose
+  audio against the database.
+- **Everything has provenance.** Every segment carries its model ids,
+  confidence, and overlap fraction. Merge tombstones never chain. Renames are
   retroactive and broadcast live to every client.
-- **Deletion means deletion.** Delete-by-speaker is a first-class cascade with a
-  preview (`Kira: 1,247 segments, 31 hrs, 340 MB — confirm?`), soft-delete undo
-  window, nightly purge, `VACUUM`, and a sweeper that reconciles loose audio files
-  against the database.
-
-## Quickstart
-
-```bash
-cargo build --release
-./target/release/recalld models fetch   # ~500 MB of ONNX models, once, into the data dir
-./target/release/recalld probe          # see every app making sound, none captured
-./target/release/recalld allow VRChat.exe
-./target/release/recalld run            # first light
-./target/release/recalld search "that portal world"
-```
-
-`models fetch` is the only command in the program that opens a network socket. It
-verifies every file's exact byte size, skips anything already correct, and points
-`[models].dir` at what it installed so `models status` agrees with it. Everything
-after it runs offline.
-
-The ASR model is multilingual (25 languages, German and English included). An
-install that still only has the older English-only export keeps transcribing on
-it — the daemon says so at start-up and `models status` shows it as a fallback —
-so an update can cost accuracy but never the transcripts.
-
-Pause lives in the tray dropdown and the GUI — instant, zero writes.
-
-## Packaging
-
-```bash
-packaging/build-release.sh              # dist/nx-recall-<version>-linux-x86_64.tar.gz
-```
-
-One `usr/`-shaped tarball for NX Hub's `tarball-prefix` engine: the daemon and its
-two ONNX libraries in `lib/nx-recall/`, the packaged Electron client beside them,
-launchers in `bin/`, and — the only two files outside its own subtrees — a systemd
-user unit and a desktop entry, both accounted for in
-[`nx-app.json`](nx-app.json) and removed exactly on uninstall. Your database and
-models live in the data dir, which is deliberately *not* in that manifest and
-survives uninstall. The script never publishes; it prints the `gh release` command.
 
 ## What never leaves this machine
 
 | Artifact | Lives | Leaves |
 |---|---|---|
-| Audio segments | encrypted disk, retention-capped (default: days) | never |
+| Audio segments | your disk, retention-capped (default: days) | never |
 | Transcripts | SQLite on your disk | never |
 | Voice fingerprints | your voicebank | never |
 | Golden enrollment samples | your disk, retention-exempt | never |
-| Telemetry, analytics, crash reports | nowhere — they don't exist | n/a |
+| Telemetry, analytics, crash reports | nowhere — they do not exist | n/a |
 
-No network calls at inference time. Models are fetched once at setup, then the
-feature is done having opinions about the internet. This repo is private by design
-and the software contains **no export or sharing surface at all** — that's not a
-missing feature, it's the [legal architecture](docs/DESIGN.md#12-legal-note).
+`models fetch` is the only command in the program that opens a network socket:
+once, at setup, byte-verified. After that the feature is done having opinions
+about the internet. This repo is private by design and the software contains
+**no export or sharing surface at all** — not a missing feature, the
+[legal architecture](docs/DESIGN.md#12-legal-note).
 
-## Status
+## Ship log
+
+Installed by its first user on day one; every finding became a release.
+
+| Version | Clock | What |
+|---|---|---|
+| 0.5.0 | install +0h | first light: capture, VAD, gate, ASR, voicebank, GUI, tray |
+| 0.5.1 | +1h | hub Launch self-heals the daemon |
+| 0.5.2 | +2h | speakers view learns about voices minted mid-session |
+| 0.5.3 | +26h | an update should update: the daemon restarts itself onto new binaries |
+| 0.5.4 | +27h | you can hear a voice before you are asked to name it |
+| 0.5.5 | +28h | usability: update banner, calm rows, honest "several voices" labels |
+| 0.5.6 | +29h | German. And 23 other languages. The default ASR goes multilingual |
+
+Golden fixtures gate every release: the equal-loudness mixes carry
+`expect: refuse` — a pipeline that labels them correctly *by luck* fails the
+suite. Silence and noise must produce zero words, always.
 
 | Milestone | State |
 |---|---|
-| 0 · Measurement spike (identity + ASR + field recording) | ✅ shipped, [findings public to the repo](spike/FINDINGS.md) |
-| 1 · Capture · VAD · allowlist | ✅ first light on a live 40-player lobby |
-| 2+3 · ASR · voicebank · overlap gate | ✅ golden fixtures enforced |
-| 4 · Socket protocol · tray · GUI · pause · roster · split | ✅ 263 tests, real-daemon interop 49/49 |
-| 5 · Windows backend | 🗺 mapped |
-| NX Hub packaging | ✅ prefix tarball, manifest, model fetch |
+| 0 · Measurement spike — identity, ASR, field recording | `[ SHIPPED ]` |
+| 1 · Capture · VAD · allowlist | `[ SHIPPED ]` first light on a live 40-player lobby |
+| 2+3 · ASR · voicebank · overlap gate | `[ SHIPPED ]` |
+| 4 · Socket · tray · GUI · pause · roster · split | `[ SHIPPED ]` 284 tests, real-daemon interop |
+| NX Hub packaging · signed releases · delta-updated hub | `[ SHIPPED ]` |
+| Mic as a source · per-speaker languages · storage panel | `[ BUILDING ]` |
+| Windows backend | `[ MAPPED ]` |
 
-Golden fixtures gate every change: the equal-loudness mixes carry
-`expect: refuse` — a pipeline that labels them "correctly" by luck **fails CI**.
+## Quickstart
+
+```bash
+cargo build --release
+./target/release/recalld models fetch     # once; the only network use in the program
+./target/release/recalld probe            # see every app making sound — none captured
+./target/release/recalld allow VRChat.exe
+./target/release/recalld run              # first light
+```
+
+Or install it like a product: it ships through NX Hub as a signed prefix
+tarball — daemon, GUI, tray, systemd unit, and an exact-manifest uninstall that
+leaves your data untouched. Pause lives in the tray dropdown and the GUI,
+instant and write-free. `packaging/build-release.sh` builds the artifact and
+prints the release command; it never publishes on its own.
 
 ## The NX suite
 
-Recall runs alongside [nx-hub](../nx-hub), [nx-orbit](../nx-orbit), and the rest of
-the NX family — liquid glass on deep space, `#7700FF`, local-first to the bone.
-Orbit integration is deliberately one-way and manual: Recall may read Orbit's
-name-picker once; **nothing ever flows back**. Orbit's charter stays clean.
+Recall runs alongside nx-hub, nx-orbit, and the rest of the NX family — liquid
+glass on deep space, `#7700FF`, local-first to the bone. Orbit integration is
+deliberately one-way and manual: Recall may read Orbit's name-picker once;
+nothing ever flows back. Orbit's charter stays clean.
 
 ---
 

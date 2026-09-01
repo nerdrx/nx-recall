@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="360" viewBox="0 0 1400 360">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b0716"/>
+      <stop offset=".55" stop-color="#0e0a1d"/>
+      <stop offset="1" stop-color="#150b2a"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7700FF" stop-opacity="0"/>
+      <stop offset=".5" stop-color="#a56bff"/>
+      <stop offset="1" stop-color="#7700FF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="wm" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f2eefc"/>
+      <stop offset="1" stop-color="#b9a8e6"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1400" height="360" fill="url(#sky)"/>
+
+  <!-- starfield -->
+  <g fill="#cbb8ff">
+    <circle cx="93" cy="52" r="1.1" opacity=".5"/><circle cx="241" cy="118" r=".8" opacity=".35"/>
+    <circle cx="388" cy="41" r="1.3" opacity=".6"/><circle cx="512" cy="86" r=".7" opacity=".3"/>
+    <circle cx="676" cy="33" r="1" opacity=".45"/><circle cx="804" cy="72" r=".8" opacity=".35"/>
+    <circle cx="957" cy="47" r="1.2" opacity=".55"/><circle cx="1093" cy="103" r=".7" opacity=".3"/>
+    <circle cx="1222" cy="59" r="1" opacity=".5"/><circle cx="1341" cy="128" r=".9" opacity=".4"/>
+    <circle cx="152" cy="300" r=".9" opacity=".35"/><circle cx="465" cy="322" r=".7" opacity=".3"/>
+    <circle cx="731" cy="311" r="1" opacity=".4"/><circle cx="1035" cy="329" r=".8" opacity=".3"/>
+    <circle cx="1288" cy="296" r="1.1" opacity=".45"/>
+  </g>
+
+  <!-- waveform: speech, then the gap where two voices overlapped, refused -->
+  <g stroke-linecap="round" fill="none">
+    <path d="M40 262 L70 262 80 250 88 274 96 244 104 279 112 252 120 268 130 262 176 262 186 246 194 277 202 238 210 283 218 249 226 271 236 262 300 262"
+          stroke="#5b3f96" stroke-width="2.5"/>
+    <path d="M300 262 330 262 340 254 348 270 356 248 364 275 372 251 380 266 390 262 430 262"
+          stroke="#5b3f96" stroke-width="2.5" opacity=".55"/>
+    <path d="M430 262 470 262" stroke="#3a2a63" stroke-width="2.5" stroke-dasharray="2 7"/>
+    <path d="M470 262 500 262 512 240 522 281 532 233 542 287 552 241 562 276 572 250 582 268 592 258 604 262 660 262"
+          stroke="#a56bff" stroke-width="2.5" filter="url(#glow)"/>
+    <path d="M660 262 1360 262" stroke="#2c2050" stroke-width="2"/>
+  </g>
+
+  <!-- angular field marks -->
+  <g fill="none" stroke="#7700FF" stroke-width="3" opacity=".9">
+    <path d="M40 40 h34 M40 40 v34"/>
+    <path d="M1360 40 h-34 M1360 40 v34"/>
+    <path d="M40 320 h34 M40 320 v-34"/>
+    <path d="M1360 320 h-34 M1360 320 v-34"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="700" y="150" text-anchor="middle" fill="url(#wm)"
+        font-family="ui-monospace,'Cascadia Code','JetBrains Mono',Menlo,monospace"
+        font-size="86" font-weight="700" letter-spacing="26">NX RECALL</text>
+  <rect x="470" y="176" width="460" height="3" fill="url(#beam)"/>
+  <text x="700" y="212" text-anchor="middle" fill="#8f83b8"
+        font-family="ui-monospace,'Cascadia Code','JetBrains Mono',Menlo,monospace"
+        font-size="19" letter-spacing="6">TOTAL RECALL FOR YOUR SOCIAL LIFE</text>
+
+  <!-- spec line -->
+  <g font-family="ui-monospace,'Cascadia Code','JetBrains Mono',Menlo,monospace" font-size="14" letter-spacing="2">
+    <text x="700" y="304" text-anchor="middle" fill="#6f6396">
+      <tspan fill="#a56bff">LOCAL</tspan><tspan> </tspan><tspan>INFERENCE</tspan>
+      <tspan dx="26" fill="#a56bff">ZERO</tspan><tspan> </tspan><tspan>TELEMETRY</tspan>
+      <tspan dx="26" fill="#a56bff">25</tspan><tspan> </tspan><tspan>LANGUAGES</tspan>
+      <tspan dx="26" fill="#a56bff">&lt;5%</tspan><tspan> </tspan><tspan>OF ONE CORE</tspan>
+    </text>
+  </g>
+</svg>
