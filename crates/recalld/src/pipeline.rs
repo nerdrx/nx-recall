@@ -74,6 +74,9 @@ pub fn deprioritise_current_thread(nice: i32, cpus: &[usize]) {
 struct SessionPipeline {
     vad_state: VadState,
     segmenter: crate::vad::Segmenter,
+    /// Kept so the segmenter can be replaced mid-session when a gap forces the
+    /// buffered turn to be discarded (`discard_across_gap`).
+    seg_cfg: SegmenterConfig,
     /// Joins VAD segments separated by a short silence, so what reaches storage
     /// and the analysis leg is a turn rather than a breath-sized fragment.
     turns: TurnMerger,
@@ -105,6 +108,7 @@ impl SessionPipeline {
         Self {
             vad_state,
             segmenter: crate::vad::Segmenter::new(seg_cfg),
+            seg_cfg,
             turns,
             ring: Vec::new(),
             ring_base: 0,
@@ -126,7 +130,10 @@ impl SessionPipeline {
     /// comparing the buffer's own monotonic stamp against where the sample
     /// counter thinks we are, and re-anchor so later segments are not shifted
     /// by the missing time.
-    fn maybe_reanchor(&mut self, chunk_mono_ns: u64) {
+    ///
+    /// Returns whether a gap was found, because re-anchoring the clock is only
+    /// half the answer: see [`Self::discard_across_gap`].
+    fn maybe_reanchor(&mut self, chunk_mono_ns: u64) -> bool {
         let predicted = self
             .anchor
             .mono_ns
@@ -142,7 +149,36 @@ impl SessionPipeline {
                 utc_ns: self.anchor.utc_of(chunk_mono_ns),
             };
             self.anchor_sample = self.received;
+            return true;
         }
+        false
+    }
+
+    /// Throw away everything buffered before a gap.
+    ///
+    /// Re-anchoring alone kept the audio on either side of the hole in one
+    /// open turn, so a drop in the middle of somebody speaking was spliced into
+    /// a single segment: words from before the gap joined to words from after
+    /// it, timed from the re-anchored clock, and the embedding taken over the
+    /// splice. That is wrong three ways at once — the transcript says a
+    /// sentence nobody said, the clip jump-cuts, and a vector over two
+    /// disjoint pieces of speech can mint a voice that does not exist
+    /// (audit finding #21).
+    ///
+    /// So the pre-gap half is dropped, by exactly the mechanics of the pause
+    /// discard: the VAD's context, the segmenter, the open turn and the ring go
+    /// together, because a turn half of whose audio is gone is not a turn. The
+    /// clock, the sample counter and the segment sequence stay — they are the
+    /// session's, not the turn's. What comes back is a clean segment starting
+    /// after the gap.
+    fn discard_across_gap(&mut self, vad_state: VadState) {
+        self.vad_state = vad_state;
+        self.segmenter = crate::vad::Segmenter::resuming_at(self.seg_cfg, self.received);
+        // Dropped on the floor, deliberately: this is the turn that would
+        // otherwise have been spliced across the hole.
+        let _ = self.turns.flush();
+        self.ring.clear();
+        self.ring_base = self.received;
     }
 
     fn extract(&self, start: u64, end: u64) -> Vec<f32> {
@@ -180,6 +216,11 @@ pub struct Stats {
     pub segments_written: AtomicU64,
     pub frames_analysed: AtomicU64,
     pub sessions_opened: AtomicU64,
+    /// Turns thrown away because the audio under them had a hole in it. The
+    /// count matters: it is the difference between "the queue dropped buffers"
+    /// (which `drops` already says) and "a turn was actually lost because of
+    /// it", and it is the number that says whether the queue is big enough.
+    pub gaps_discarded: AtomicU64,
 }
 
 pub struct Pipeline {
@@ -320,11 +361,23 @@ impl Pipeline {
         } else {
             self.session_is_mic(chunk.session_id)
         };
+        let fresh_state = self.vad.new_state();
         let entry = self.sessions.entry(chunk.session_id).or_insert_with(|| {
             SessionPipeline::new(new_state, seg_cfg, merger, chunk.capture_mono_ns, is_mic)
         });
 
-        entry.maybe_reanchor(chunk.capture_mono_ns);
+        // A gap is not only a clock problem. Re-anchoring keeps later segments
+        // in the right place; discarding what was buffered before the hole is
+        // what keeps the words on either side of it out of the same segment
+        // (audit finding #21).
+        if entry.maybe_reanchor(chunk.capture_mono_ns) {
+            entry.discard_across_gap(fresh_state);
+            self.stats.gaps_discarded.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                session_id = chunk.session_id,
+                "audio gap: discarded the turn in progress rather than splicing across it"
+            );
+        }
         entry.ring.extend_from_slice(&chunk.samples);
         entry.received += chunk.samples.len() as u64;
 
@@ -737,6 +790,90 @@ mod tests {
         s.maybe_reanchor(1_010_000_000); // 10 ms early/late
         assert_eq!(s.anchor_sample, 0);
         assert_eq!(s.anchor.mono_ns, 0);
+    }
+
+    /// Audit finding #21. A queue drop mid-turn used to be *only* a clock
+    /// problem: the anchor moved, and the audio on either side of the hole
+    /// stayed in one open turn. What came out was a single segment splicing
+    /// pre-gap words onto post-gap words at a shifted timestamp — wrong
+    /// transcript, jump-cut clip, and an embedding taken across two disjoint
+    /// pieces of speech, which is how a voice that never existed gets minted.
+    #[test]
+    fn a_gap_discards_the_turn_in_progress_instead_of_splicing_across_it() {
+        let cfg = SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE);
+        let mut s = SessionPipeline::new(
+            VadState_stub(),
+            cfg,
+            TurnMerger::new(24_000, 480_000),
+            0,
+            false,
+        );
+        s.anchor = Anchor {
+            mono_ns: 0,
+            utc_ns: 1_000_000_000,
+        };
+        s.received = 16_000;
+        s.ring = vec![0.25; 16_000];
+        s.ring_base = 0;
+        // Somebody is mid-sentence: a turn is open and pinning the ring back to
+        // where they started speaking.
+        let _ = s.turns.push(crate::vad::SegmentSpan {
+            start: 1_000,
+            end: 15_000,
+            voiced_start: 1_200,
+            voiced_end: 14_800,
+        });
+        assert_eq!(s.turns.pending_start(), Some(1_000));
+
+        // Four seconds of audio never arrived.
+        assert!(
+            s.maybe_reanchor(5_000_000_000),
+            "a gap this size is a gap, and the caller has to be told"
+        );
+        s.discard_across_gap(VadState_stub());
+
+        assert_eq!(
+            s.turns.pending_start(),
+            None,
+            "the half-turn from before the hole is gone, not waiting to be joined"
+        );
+        assert!(s.ring.is_empty(), "and so is the audio under it");
+        assert_eq!(
+            s.ring_base, s.received,
+            "the ring restarts where the session's sample counter actually is"
+        );
+        assert_eq!(
+            s.segmenter.cursor(),
+            s.received,
+            "the segmenter agrees, so no frame is read from before the gap"
+        );
+        assert!(
+            s.extract(1_000, 15_000).is_empty(),
+            "nothing from before the gap can reach a segment any more"
+        );
+        // The clock still absorbed the gap: later turns are not shifted.
+        assert_eq!(s.anchor_sample, 16_000);
+        assert_eq!(s.utc_of_sample(16_000), 6_000_000_000);
+
+        // Ordinary jitter is not a gap and takes nothing away.
+        let mut fine = SessionPipeline::new(
+            VadState_stub(),
+            cfg,
+            TurnMerger::new(24_000, 480_000),
+            0,
+            false,
+        );
+        fine.received = 16_000;
+        fine.ring = vec![0.25; 16_000];
+        let _ = fine.turns.push(crate::vad::SegmentSpan {
+            start: 1_000,
+            end: 15_000,
+            voiced_start: 1_200,
+            voiced_end: 14_800,
+        });
+        assert!(!fine.maybe_reanchor(1_010_000_000));
+        assert_eq!(fine.turns.pending_start(), Some(1_000));
+        assert_eq!(fine.ring.len(), 16_000);
     }
 
     #[test]

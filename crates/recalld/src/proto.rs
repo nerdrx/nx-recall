@@ -12,6 +12,33 @@ pub fn daemon_id() -> String {
     format!("recalld/{}", env!("CARGO_PKG_VERSION"))
 }
 
+/// This process's boot id: one value for the life of the daemon, a different
+/// one after every restart.
+///
+/// Sequence numbers start at 0 on every start, and `events.since` could only
+/// reject a `seq` that was *higher* than the live counter. So a client that
+/// remembered seq 40 across a restart, reconnecting once the new daemon had
+/// published 60 events, was handed events 41–60 of a completely different
+/// stream and applied them as if they continued its own (audit finding #20).
+/// The boot id is what makes those two streams distinguishable: a client sends
+/// back the one it was welcomed with, and a mismatch is a resync rather than a
+/// silent splice.
+///
+/// A string, not a number: it is an opaque token, and 64 bits of it would not
+/// survive a JSON number in a JavaScript client. Start time in nanoseconds
+/// mixed with the pid — two restarts inside the same nanosecond are not a case,
+/// and the pid covers the clock going backwards across one.
+pub fn boot_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        format!("{:016x}", ns ^ ((std::process::id() as u64) << 40))
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
     /// Echoed verbatim on the reply. Absent is allowed; the reply then carries
@@ -154,6 +181,10 @@ pub fn welcome(seq: u64, schema: i64) -> Vec<u8> {
         "daemon": daemon_id(),
         "seq": seq,
         "schema": schema,
+        // Which run of the daemon this stream belongs to. A client that keeps
+        // a `seq` across a reconnect MUST send this back on `events.since`;
+        // see `boot_id`.
+        "boot": boot_id(),
     }}))
 }
 
@@ -258,6 +289,15 @@ mod tests {
         assert_eq!(w["seq"], 41823);
         assert_eq!(w["schema"], 3);
         assert!(w["daemon"].as_str().unwrap().starts_with("recalld/"));
+        // Which *run* this stream belongs to. A string, because it is an opaque
+        // token and because 64 bits of it would not survive a JSON number in a
+        // JavaScript client; and stable, because two welcomes from one process
+        // describe one stream.
+        let boot = w["boot"].as_str().expect("the welcome names the run");
+        assert_eq!(boot.len(), 16);
+        assert_eq!(boot, boot_id());
+        let again = as_json(welcome(1, 3))["welcome"]["boot"].clone();
+        assert_eq!(again, json!(boot));
     }
 
     #[test]

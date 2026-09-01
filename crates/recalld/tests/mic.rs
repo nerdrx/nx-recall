@@ -561,9 +561,12 @@ fn a_golden_outlives_the_retention_window_that_takes_the_segment() {
     let kept = r.dir.join(&golden[0].audio_path);
     assert!(kept.is_file());
 
-    // A sweep that ages out every segment and reconciles every loose file. The
-    // goldens directory is not under segments/, so the sweeper never walks it
-    // and never has to know it exists (DESIGN §6).
+    // A sweep that ages out every segment and reconciles every loose file.
+    // Goldens live outside `segments/` so no retention clock ever reaches them
+    // (DESIGN §6) — the sweep does walk `goldens/` now, but only to reconcile
+    // the directory against the table in both directions (0.7.5, audit finding
+    // #19), never to age anything out. A golden with a row and a file survives
+    // any date whatsoever, which is what this asserts.
     let cfg = RetentionConfig {
         audio_days: 1,
         undo_window_days: 0,

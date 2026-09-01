@@ -297,6 +297,21 @@ impl SearchHit {
     }
 }
 
+/// What [`Store::roster_reconcile`] had to change to make the table agree with
+/// the log: rows closed for people who are no longer here, rows opened for
+/// people who are.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RosterReconcile {
+    pub closed: usize,
+    pub opened: usize,
+}
+
+impl RosterReconcile {
+    pub fn is_empty(self) -> bool {
+        self.closed == 0 && self.opened == 0
+    }
+}
+
 /// One person's presence in a VRChat instance, as read from the output log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterRow {
@@ -943,8 +958,18 @@ impl Store {
     /// a second thing that can be wrong.
     ///
     /// The backfill replays `crate::threads` over every existing session in
-    /// time order, so a database threaded on the way up is identical to one
-    /// threaded turn by turn as it was captured.
+    /// time order, with the same rule the live path uses.
+    ///
+    /// It is **not** guaranteed to reproduce what live threading would have
+    /// produced, and the difference is worth naming (audit finding #24). A turn
+    /// is threaded once, from what was known when it was stored, and
+    /// `crate::threads::assign` deliberately never re-threads it afterwards: a
+    /// later relabel, merge or split does not move it. The backfill has no
+    /// "when it was stored" to work from — it sees today's labels — so a
+    /// database whose speakers were merged or split after capture threads
+    /// differently on the way up than it did on the way in. That is the price
+    /// of not rewriting history on every rename, and it is paid once, at the
+    /// migration, rather than continuously.
     fn apply_v6(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS threads (
@@ -1204,29 +1229,53 @@ impl Store {
         Ok(())
     }
 
+    /// The columns of one `sources` row, in the order [`Self::source_row_from`]
+    /// reads them. One string so `sources.list` and the single-row read behind
+    /// a `source` event cannot disagree about the shape (finding #2).
+    const SOURCE_COLUMNS: &'static str =
+        "s.id, s.match_key, s.display_name, COALESCE(s.kind, ?1), s.allowed,
+         s.first_seen, COALESCE(s.last_seen, s.first_seen),
+         (SELECT COUNT(*) FROM sessions ss
+           WHERE ss.source_id = s.id AND ss.ended_at_utc_ns IS NULL)";
+
+    fn source_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRow> {
+        Ok(SourceRow {
+            id: r.get(0)?,
+            match_key: r.get(1)?,
+            display_name: r.get(2)?,
+            kind: r.get(3)?,
+            allowed: r.get::<_, i64>(4)? != 0,
+            first_seen: r.get(5)?,
+            last_seen: r.get(6)?,
+            streams: r.get(7)?,
+        })
+    }
+
     pub fn list_sources(&self) -> Result<Vec<SourceRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.match_key, s.display_name, COALESCE(s.kind, ?1), s.allowed,
-                    s.first_seen, COALESCE(s.last_seen, s.first_seen),
-                    (SELECT COUNT(*) FROM sessions ss
-                      WHERE ss.source_id = s.id AND ss.ended_at_utc_ns IS NULL)
-             FROM sources s ORDER BY s.allowed DESC, s.match_key ASC",
-        )?;
+        let sql = format!(
+            "SELECT {} FROM sources s ORDER BY s.allowed DESC, s.match_key ASC",
+            Self::SOURCE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![KIND_APP], |r| {
-                Ok(SourceRow {
-                    id: r.get(0)?,
-                    match_key: r.get(1)?,
-                    display_name: r.get(2)?,
-                    kind: r.get(3)?,
-                    allowed: r.get::<_, i64>(4)? != 0,
-                    first_seen: r.get(5)?,
-                    last_seen: r.get(6)?,
-                    streams: r.get(7)?,
-                })
-            })?
+            .query_map(params![KIND_APP], Self::source_row_from)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// One source by its match key, in the same shape `sources.list` returns.
+    /// The capture thread reads this back after every change it makes to the
+    /// table, so the `source` event it publishes says what a client would have
+    /// seen had it re-listed (finding #2).
+    pub fn source_row(&self, match_key: &str) -> Result<Option<SourceRow>> {
+        let sql = format!(
+            "SELECT {} FROM sources s WHERE s.match_key = ?2",
+            Self::SOURCE_COLUMNS
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, params![KIND_APP, match_key], Self::source_row_from)
+            .optional()?)
     }
 
     pub fn begin_session(&self, source_id: i64, started_at_utc_ns: i64) -> Result<i64> {
@@ -1478,7 +1527,7 @@ impl Store {
         is_golden: bool,
         cap: usize,
         created_at: i64,
-    ) -> Result<i64> {
+    ) -> Result<Option<i64>> {
         let existing = self.speaker_prototypes(speaker_id, &embedding.model_id)?;
         if !is_golden && cap > 0 && existing.len() >= cap {
             match crate::identity::prototype_to_evict(embedding, &existing)? {
@@ -1490,7 +1539,10 @@ impl Store {
                 }
                 // Every slot is golden: hand-enrolled audio outranks anything
                 // the daemon inferred, so the new vector is simply dropped.
-                None => return Ok(0),
+                // `None` and not a rowid: 0 is a plausible id, and a caller
+                // that reads it as one reports an enrolment that never
+                // happened (audit finding #25).
+                None => return Ok(None),
             }
         }
         self.conn.execute(
@@ -1506,7 +1558,7 @@ impl Store {
                 created_at
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(Some(self.conn.last_insert_rowid()))
     }
 
     pub fn prototype_count(&self, speaker_id: i64) -> Result<i64> {
@@ -1778,11 +1830,19 @@ impl Store {
         let mut out: Vec<crate::split::Vector> = Vec::new();
         let mut from_prototypes: HashMap<i64, usize> = HashMap::new();
 
+        // A prototype whose source segment has been deleted is evidence the
+        // user threw away: it must not come back through a re-cluster, and the
+        // segment id it carries must never reach a client as a live row
+        // (audit finding #10). Prototypes with no source segment — a hand
+        // enrolment, or one whose segment predates the column — are kept: they
+        // are not evidence *of* anything that was deleted.
         let mut stmt = self.conn.prepare(
-            "SELECT id, vector, is_golden, source_segment_id
-             FROM speaker_prototypes
-             WHERE speaker_id = ?1 AND embed_model_id = ?2
-             ORDER BY id",
+            "SELECT p.id, p.vector, p.is_golden, p.source_segment_id
+             FROM speaker_prototypes p
+             LEFT JOIN segments g ON g.id = p.source_segment_id
+             WHERE p.speaker_id = ?1 AND p.embed_model_id = ?2
+               AND (p.source_segment_id IS NULL OR (g.id IS NOT NULL AND g.deleted_at IS NULL))
+             ORDER BY p.id",
         )?;
         let rows = stmt
             .query_map(params![speaker_id, embed_model_id], |r| {
@@ -1899,12 +1959,16 @@ impl Store {
             for id in &write.prototypes {
                 prototypes += move_prototype.execute(params![id, minted, from])?;
             }
+            // `AND deleted_at IS NULL` on both segment writes: a soft-deleted
+            // row is invisible to every read path, so moving it would be a
+            // write nobody can see — and the event the caller publishes about
+            // it would resurrect deleted words in every client (finding #10).
             // A moved row carries a score again, so its provenance is a match
             // whatever it was before — including an inherited label, which the
             // re-cluster has just replaced with a measured one.
             let mut move_segment = tx.prepare(
                 "UPDATE segments SET speaker_id = ?2, match_score = ?3, label_via = 'match'
-                 WHERE id = ?1 AND speaker_id = ?4",
+                 WHERE id = ?1 AND speaker_id = ?4 AND deleted_at IS NULL",
             )?;
             for (id, score) in &write.segments {
                 segments += move_segment.execute(params![id, minted, *score as f64, from])?;
@@ -1913,7 +1977,8 @@ impl Store {
             // confidence: the correction UI reads `match_score` to know which
             // labels to distrust (DESIGN §6).
             let mut soften = tx.prepare(
-                "UPDATE segments SET match_score = ?2 WHERE id = ?1 AND speaker_id = ?3",
+                "UPDATE segments SET match_score = ?2
+                 WHERE id = ?1 AND speaker_id = ?3 AND deleted_at IS NULL",
             )?;
             for (id, score) in &write.ambiguous {
                 ambiguous += soften.execute(params![id, *score as f64, from])?;
@@ -2107,6 +2172,12 @@ impl Store {
     }
 
     /// One segment, in the shape clients read.
+    /// One live segment in the shape every read path returns.
+    ///
+    /// Soft-deleted rows are invisible here, like everywhere else. This is the
+    /// row the `segment` event is built from, so without the filter a delete
+    /// followed by a split or a reassign would broadcast the deleted words
+    /// straight back into every client (audit finding #10).
     pub fn segment_row(&self, segment_id: i64) -> Result<Option<SegmentRow>> {
         let sql = format!(
             "SELECT {}
@@ -2114,7 +2185,7 @@ impl Store {
              JOIN sessions ss ON ss.id = g.session_id
              JOIN sources sc ON sc.id = ss.source_id
              LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
-             WHERE g.id = ?1",
+             WHERE g.id = ?1 AND g.deleted_at IS NULL",
             Self::SEGMENT_COLUMNS
         );
         Ok(self
@@ -2468,6 +2539,23 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare("SELECT id, audio_path FROM segments WHERE audio_path <> ''")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every golden clip the database still expects to exist, `(row id, path)`.
+    ///
+    /// The mirror of [`Self::all_audio_paths`], and it exists for the same
+    /// reason: goldens live outside `segments/` precisely so the audio tier
+    /// never ages them out, but "exempt from retention" was read as "exempt
+    /// from reconciliation", and nothing ever compared the directory against
+    /// the table in either direction (audit finding #19).
+    pub fn all_golden_paths(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, audio_path FROM golden_samples WHERE audio_path <> ''")?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3297,11 +3385,15 @@ impl Store {
     // ---- manual labelling ------------------------------------------------
 
     /// The fields an undo would have to put back.
+    /// What a correction is about to replace. Soft-deleted rows are not
+    /// correctable: they are gone from every view, and a caller that could
+    /// still reassign one would be editing something the user threw away
+    /// (finding #10). `Err` here is what the socket turns into `not_found`.
     pub fn segment_state(&self, segment_id: i64) -> Result<(Option<i64>, Option<String>)> {
         let row = self
             .conn
             .query_row(
-                "SELECT speaker_id, text FROM segments WHERE id = ?1",
+                "SELECT speaker_id, text FROM segments WHERE id = ?1 AND deleted_at IS NULL",
                 params![segment_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -3319,7 +3411,7 @@ impl Store {
         };
         let n = self.conn.execute(
             "UPDATE segments SET speaker_id = ?2, match_score = NULL, label_via = ?3
-             WHERE id = ?1",
+             WHERE id = ?1 AND deleted_at IS NULL",
             params![
                 segment_id,
                 speaker_id,
@@ -3337,7 +3429,7 @@ impl Store {
     /// words and no longer by its old ones.
     pub fn correct_segment_text(&self, segment_id: i64, text: &str) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE segments SET text = ?2 WHERE id = ?1",
+            "UPDATE segments SET text = ?2 WHERE id = ?1 AND deleted_at IS NULL",
             params![segment_id, text],
         )?;
         if n == 0 {
@@ -3451,6 +3543,63 @@ impl Store {
             "UPDATE session_roster SET left_at_utc_ns = ?1 WHERE left_at_utc_ns IS NULL",
             params![left_at_utc_ns],
         )?)
+    }
+
+    /// Make the table say what `present` says, and report what moved.
+    ///
+    /// Two moments need this, and both are moments where the table and the log
+    /// have been allowed to drift (audit finding #9):
+    ///
+    /// * **Start-up.** The tailer replays the log into memory to learn who is
+    ///   in the instance. Writing only the present half leaves everyone who
+    ///   left while the daemon was down with `left_at_utc_ns` NULL forever —
+    ///   and `person.edges` reads an open row as *still here* through
+    ///   `COALESCE(left_at, now())`, so a single missed leave grows a shared
+    ///   time that never stops growing.
+    /// * **Resuming from pause.** While paused nothing is written down, but the
+    ///   log keeps being consumed into memory, so the difference between the
+    ///   table and the world is exactly this diff.
+    ///
+    /// A join stamp observed during a pause is written here, at resume, with
+    /// the time it really happened rather than the time the write became
+    /// allowed. That is deliberate: the alternative is a roster that says
+    /// somebody arrived when the user un-paused.
+    pub fn roster_reconcile(
+        &self,
+        world_id: Option<&str>,
+        instance: Option<&str>,
+        present: &[(String, i64)],
+        at_utc_ns: i64,
+    ) -> Result<RosterReconcile> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut out = RosterReconcile::default();
+        for row in self.roster_present()? {
+            let still_here = present
+                .iter()
+                .any(|(name, joined)| name == &row.display_name && *joined == row.joined_at_utc_ns);
+            if !still_here {
+                // `at_utc_ns`, not the join stamp: the only honest thing we can
+                // say is that they were gone by the time we looked.
+                tx.execute(
+                    "UPDATE session_roster SET left_at_utc_ns = ?2 WHERE id = ?1",
+                    params![row.id, at_utc_ns],
+                )?;
+                out.closed += 1;
+            }
+        }
+        tx.commit()?;
+        let open_now = self.roster_present()?;
+        for (name, joined) in present {
+            let kept = open_now
+                .iter()
+                .any(|r| &r.display_name == name && r.joined_at_utc_ns == *joined);
+            if kept {
+                continue;
+            }
+            self.roster_join(world_id, instance, name, *joined)?;
+            out.opened += 1;
+        }
+        Ok(out)
     }
 
     /// Who is in the instance right now.
@@ -4350,15 +4499,24 @@ mod tests {
     fn golden_prototypes_are_not_subject_to_the_cap() {
         let s = store();
         let spk = s.create_speaker("A", 0).unwrap();
-        s.add_prototype(spk, &emb("m@1", &[1.0, 0.0]), None, true, 1, 0)
+        let first = s
+            .add_prototype(spk, &emb("m@1", &[1.0, 0.0]), None, true, 1, 0)
             .unwrap();
         s.add_prototype(spk, &emb("m@1", &[0.0, 1.0]), None, true, 1, 0)
             .unwrap();
         assert_eq!(s.prototype_count(spk).unwrap(), 2);
+        assert!(first.is_some(), "a stored prototype answers with its rowid");
 
-        // An auto-enrolled vector cannot displace them, so it is dropped.
-        s.add_prototype(spk, &emb("m@1", &[1.0, 0.0]), None, false, 1, 0)
+        // An auto-enrolled vector cannot displace them, so it is dropped — and
+        // saying so is the point (audit finding #25). This used to answer
+        // `Ok(0)`, a perfectly plausible rowid, and `commit_mic` read it as an
+        // enrolment: `mic_enrolled` counted turns that added nothing to the
+        // bank, for exactly the voice whose bank was already full of the best
+        // audio it will ever have.
+        let dropped = s
+            .add_prototype(spk, &emb("m@1", &[1.0, 0.0]), None, false, 1, 0)
             .unwrap();
+        assert_eq!(dropped, None, "nothing was stored, and the answer says so");
         assert_eq!(s.prototype_count(spk).unwrap(), 2);
     }
 

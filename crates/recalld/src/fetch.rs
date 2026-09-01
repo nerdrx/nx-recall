@@ -46,8 +46,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::ModelsConfig;
 use crate::models::{
-    EntryState, Group, Install, ModelSet, REMOTE_ASSETS, RemoteAsset, SEMANTIC_ROLE,
-    SEMANTIC_TOKENIZER_ROLE, SemanticModel,
+    EntryState, Group, Install, ModelSet, REMOTE_ASSETS, RemoteAsset, SemanticModel,
 };
 
 /// Read timeout for a single chunk. The whole download has no deadline — a
@@ -847,7 +846,12 @@ pub fn target_dir(explicit: Option<&Path>, cfg: &ModelsConfig, data_dir: &Path) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{expected_bytes, total_download_bytes};
+    // The two semantic roles are a test-only concern here: the download paths
+    // treat every asset alike, and only the catalogue assertions below care
+    // which role an asset carries.
+    use crate::models::{
+        SEMANTIC_ROLE, SEMANTIC_TOKENIZER_ROLE, expected_bytes, total_download_bytes,
+    };
 
     // ---- the catalogue -----------------------------------------------------
 

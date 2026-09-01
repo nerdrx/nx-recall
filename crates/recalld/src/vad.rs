@@ -207,6 +207,21 @@ impl Segmenter {
         }
     }
 
+    /// A fresh segmenter that picks up at `cursor` instead of at sample zero.
+    ///
+    /// For the one case where a session throws its buffered audio away without
+    /// ending: a queue drop or an xrun leaves a hole, and the half-built
+    /// segment on the near side of it is discarded rather than spliced onto the
+    /// far side (`pipeline::SessionPipeline::discard_across_gap`). The session's
+    /// sample counter is continuous across that, so the segmenter that replaces
+    /// this one has to agree with it about where "now" is.
+    pub fn resuming_at(cfg: SegmenterConfig, cursor: u64) -> Self {
+        Self {
+            cursor,
+            ..Self::new(cfg)
+        }
+    }
+
     pub fn cursor(&self) -> u64 {
         self.cursor
     }

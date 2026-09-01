@@ -356,15 +356,24 @@ impl Analyzer {
             if overlap_frac <= self.cfg.enroll_max_overlap
                 && duration_s >= self.cfg.enroll_min_duration_s
             {
-                store.add_prototype(
-                    mic.speaker_id,
-                    &embedding,
-                    Some(segment_id),
-                    false,
-                    self.cfg.max_prototypes,
-                    now_utc_ns,
-                )?;
-                enrolled = true;
+                // `enrolled` follows what the store actually did. Every slot
+                // being golden means the vector is dropped — hand-enrolled
+                // audio outranks anything inferred — and reporting that as an
+                // enrolment made `mic_enrolled` count turns that added nothing
+                // to the bank (audit finding #25).
+                enrolled = store
+                    .add_prototype(
+                        mic.speaker_id,
+                        &embedding,
+                        Some(segment_id),
+                        false,
+                        self.cfg.max_prototypes,
+                        now_utc_ns,
+                    )?
+                    .is_some();
+                // The golden is kept on the strength of the audio, not of the
+                // enrolment: a turn good enough to enrol from is good enough to
+                // keep whether or not the bank had room for its vector.
                 golden = keep_golden(store, mic, segment_id, duration_s)?;
             }
         } else {

@@ -71,6 +71,23 @@ const DEFAULT_SOURCE_KEY: &str = "default.audio.source";
 pub const MIC_MATCH_KEY: &str = "mic";
 pub const MIC_DISPLAY_NAME: &str = "Microphone";
 
+/// The `state` a `source` event carries: what this source is doing at the
+/// instant the event was published (PROTOCOL, `source`).
+///
+/// It is the live answer and the row's `streams` count is the database's, which
+/// can trail it by one queue hop: a capture that has just stopped still has an
+/// open session row until the pipeline drains the end event and writes the last
+/// segment. A client rendering a "capturing now" light should believe `state`.
+/// On the graph, not being captured — either not allowed, or allowed and not
+/// yet attached.
+pub const SOURCE_SEEN: &str = "seen";
+/// A capture stream is open on it right now.
+pub const SOURCE_CAPTURING: &str = "capturing";
+/// Was being captured; the capture was stopped while the application stayed.
+pub const SOURCE_STOPPED: &str = "stopped";
+/// The node left the graph — the application closed its stream or quit.
+pub const SOURCE_GONE: &str = "gone";
+
 /// How long to wait before trying the microphone again after a failed attach.
 /// A device that is not there yet (or was just unplugged) must retry, not spin.
 const MIC_RETRY: Duration = Duration::from_secs(5);
@@ -130,6 +147,21 @@ pub struct MicSituation<'a> {
     /// The device the tap should be on: an explicit `[mic].device`, else the
     /// default source, else `None` for "let the session manager route it".
     pub target: Option<&'a str>,
+    /// Whether that target can be honoured right now. True when there is no
+    /// explicit pin — the session manager routes a plain capture stream and a
+    /// missing default is not an error — and, when there is one, whether that
+    /// device is on the graph at all.
+    ///
+    /// This is the input the machine was missing (audit finding #7). Without
+    /// it, a pinned microphone that is unplugged keeps `target == open_on`, so
+    /// the plan is `Hold`: the session stays open forever over a dead stream,
+    /// `status` reports the mic as active, and replugging does not recover
+    /// because nothing ever re-resolves the name.
+    pub target_on_graph: bool,
+    /// Whether the open stream has reported `StreamState::Error`. A device that
+    /// vanishes under a live tap lands here, and an errored stream is not a
+    /// recording however open its session looks.
+    pub open_failed: bool,
 }
 
 /// What to do about the microphone right now.
@@ -158,6 +190,12 @@ pub enum MicPlan {
 ///    reason it is a deliberate second choice rather than the default.
 /// 4. A device change reopens rather than silently continuing, so one session's
 ///    audio never spans two physical microphones.
+/// 5. A session whose device is gone — an unplugged pin, or a stream the graph
+///    put into `Error` — is **closed**, not held. The daemon does not get to
+///    report a microphone as recording when there is no microphone; the state
+///    goes honestly back to `following:idle` / `always:idle`, the session row
+///    ends, and the ordinary retry re-resolves the pin by name when the device
+///    comes back on a new serial.
 ///
 /// Global pause is deliberately **not** an input: pausing must not tear down a
 /// capture stream (that would cost a re-negotiation and lose the session), so
@@ -173,6 +211,9 @@ pub fn mic_plan(s: &MicSituation<'_>) -> MicPlan {
         (false, None) => MicPlan::Hold,
         (false, Some(_)) => MicPlan::Close,
         (true, None) => MicPlan::Open,
+        // Rule 5 before rule 4: a tap whose device is gone is not a tap that
+        // moved, and reopening it on the same missing name would only fail.
+        (true, Some(_)) if s.open_failed || !s.target_on_graph => MicPlan::Close,
         (true, Some(on)) if on == s.target => MicPlan::Hold,
         (true, Some(_)) => MicPlan::Reopen,
     }
@@ -285,6 +326,12 @@ struct StreamData {
     channels: u32,
     resampler: LinearResampler,
     warned_about_format: bool,
+    /// Set when the graph puts this stream into `StreamState::Error` — a device
+    /// pulled out from under a live tap. The callback runs on the PipeWire
+    /// loop and `Shared` is borrowed there, so the news comes back as a flag
+    /// the next `sync_mic` reads rather than as a call into the state machine
+    /// (audit finding #7).
+    failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A live capture: the stream, its listener, and the session row it feeds.
@@ -323,6 +370,8 @@ struct MicCapture {
     /// it changes, the user swapped devices and the session is reopened, so
     /// provenance never spans two physical microphones.
     target: Option<String>,
+    /// Shared with the stream's callbacks: set when the graph errors it out.
+    failed: Arc<std::sync::atomic::AtomicBool>,
     _stream: pw::stream::StreamRc,
     _listener: pw::stream::StreamListener<StreamData>,
 }
@@ -346,11 +395,58 @@ struct Shared {
 }
 
 impl Shared {
-    /// Note a node in the sources table and, if allowed, start capturing it.
-    fn on_node(&mut self, core: &pw::core::CoreRc, node: NodeInfo) {
+    /// Tell every client what a `sources` row says now.
+    ///
+    /// Every change this thread makes to the table gets one of these (audit
+    /// finding #2). Before it, the only `source` event in the daemon came from
+    /// `sources.set` — so an application that started *after* the GUI opened
+    /// never appeared in the Sources list, which meant it could never be
+    /// allowed without restarting the GUI. First sighting, capture start,
+    /// capture stop and the node going away are all things a client cannot
+    /// infer and now all publish.
+    ///
+    /// The payload is the `sources.list` row shape, read back from the database
+    /// rather than assembled from what this thread believes, plus `state`: what
+    /// this row is doing right now, in one word a view can render without
+    /// cross-referencing anything.
+    fn publish_source(&self, match_key: &str, state: &'static str) {
+        let row = {
+            let store = match self.store.lock() {
+                Ok(s) => s,
+                Err(p) => p.into_inner(),
+            };
+            match store.source_row(match_key) {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    warn!(key = %match_key, "no source row to announce");
+                    return;
+                }
+                Err(e) => {
+                    warn!(key = %match_key, "could not read a source row to announce: {e:#}");
+                    return;
+                }
+            }
+        };
+        let allowed = if row.kind == KIND_MIC {
+            self.control.mic().enabled
+        } else {
+            self.allowlist.decide(&row.match_key).captures()
+        };
+        let mut data = crate::service::source_json(&row, allowed);
+        data["state"] = serde_json::Value::from(state);
+        self.bus.publish(Topic::Sources, "source", data);
+    }
+
+    /// Record a node in the sources table and announce it, whatever the
+    /// allowlist says about it. Returns the row's id, and `None` if the write
+    /// failed (there is nothing to attach to a source that is not on record).
+    ///
+    /// Split out of `on_node` because this half needs no PipeWire core and is
+    /// where the whole of finding #2 lives: a source appearing has to reach the
+    /// clients that are already connected, or it can never be allowed.
+    fn note_source(&mut self, node: &NodeInfo) -> Option<i64> {
         let match_key = node.ident.match_key();
         let display_name = node.ident.display_name();
-        let decision = self.allowlist.decide(&match_key);
         self.nodes.insert(node.node_id, node.clone());
 
         // Record every source we see, allowed or not. Default-deny is only
@@ -364,9 +460,25 @@ impl Shared {
                 Ok(id) => id,
                 Err(e) => {
                     error!("recording source {match_key}: {e:#}");
-                    return;
+                    return None;
                 }
             }
+        };
+
+        // Announced before the decision is acted on: a source the daemon
+        // refused is exactly the one the user needs to be able to see in order
+        // to allow it. Default-deny is only usable if what was denied shows up.
+        self.publish_source(&match_key, SOURCE_SEEN);
+        Some(source_id)
+    }
+
+    /// Note a node in the sources table and, if allowed, start capturing it.
+    fn on_node(&mut self, core: &pw::core::CoreRc, node: NodeInfo) {
+        let match_key = node.ident.match_key();
+        let display_name = node.ident.display_name();
+        let decision = self.allowlist.decide(&match_key);
+        let Some(source_id) = self.note_source(&node) else {
+            return;
         };
 
         if !decision.captures() {
@@ -455,6 +567,10 @@ impl Shared {
             channels: 1,
             resampler: LinearResampler::new(),
             warned_about_format: false,
+            // An application tap sets `stream.dont-reconnect`, so a stream
+            // error here is followed by the node-removed path closing the
+            // session. Nothing reads the flag; it exists for the mic.
+            failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let listener = register_stream(&stream, data)?;
@@ -494,6 +610,9 @@ impl Shared {
                 _listener: listener,
             },
         );
+        // The session row exists now, so `streams` has moved: the "capturing
+        // now" light in every client turns on from this event.
+        self.publish_source(match_key, SOURCE_CAPTURING);
         Ok(())
     }
 
@@ -554,10 +673,11 @@ impl Shared {
             session_id: capture.session_id,
             mono_ns: monotonic_ns(),
         });
+        self.publish_source(&capture.match_key, SOURCE_STOPPED);
     }
 
     fn on_node_removed(&mut self, core: &pw::core::CoreRc, node_id: u32) {
-        self.nodes.remove(&node_id);
+        let gone = self.nodes.remove(&node_id);
         // A capture device leaving is normal (headset unplugged, dock removed);
         // the mic tap re-resolves and either reopens on the new default or
         // waits, but never brings the daemon down with it.
@@ -565,6 +685,11 @@ impl Shared {
             self.sync_mic(core);
         }
         let Some(capture) = self.captures.remove(&node_id) else {
+            // Not captured, but still worth announcing: the application quit,
+            // and a list that goes on showing it as present is wrong.
+            if let Some(node) = gone {
+                self.publish_source(&node.ident.match_key(), SOURCE_GONE);
+            }
             // An app session closing is what ends a `follow`-mode mic session.
             self.sync_mic(core);
             return;
@@ -581,6 +706,7 @@ impl Shared {
             session_id: capture.session_id,
             mono_ns: monotonic_ns(),
         });
+        self.publish_source(&capture.match_key, SOURCE_GONE);
         self.sync_mic(core);
     }
 
@@ -615,6 +741,24 @@ impl Shared {
             .or_else(|| self.mic.default_source.clone())
     }
 
+    /// Is the explicitly pinned `[mic].device` on the graph right now?
+    ///
+    /// True when there is no pin at all: a plain capture stream with no target
+    /// is routed by the session manager, which is what every other client does
+    /// and is not a failure. The lookup is by `node.name` and never by serial —
+    /// a device that is unplugged and plugged back in keeps its name and gets a
+    /// **new** `object.serial`, so a pin that resolved through the old serial
+    /// could never recover (audit finding #7).
+    fn pin_on_graph(&self) -> bool {
+        let Some(pin) = self.mic.cfg.device_override() else {
+            return true;
+        };
+        self.mic
+            .nodes
+            .values()
+            .any(|n| n.name.as_deref() == Some(pin))
+    }
+
     /// Resolve the target name to a `PW_KEY_TARGET_OBJECT` value.
     ///
     /// An explicit `[mic].device` that is not on the graph is an error, because
@@ -646,21 +790,33 @@ impl Shared {
     /// the second the design promises.
     fn sync_mic(&mut self, core: &pw::core::CoreRc) {
         let target = self.mic_target();
+        let target_on_graph = self.pin_on_graph();
+        let open_failed = self
+            .mic
+            .capture
+            .as_ref()
+            .is_some_and(|c| c.failed.load(Ordering::SeqCst));
         let plan = mic_plan(&MicSituation {
             enabled: self.mic.cfg.enabled,
             mode: self.mic.cfg.mode,
             app_captures: self.captures.len(),
             open_on: self.mic.capture.as_ref().map(|c| c.target.as_deref()),
             target: target.as_deref(),
+            target_on_graph,
+            open_failed,
         });
 
         match plan {
             MicPlan::Hold => return,
             MicPlan::Close => {
-                let why = if self.mic.cfg.enabled {
-                    "no allowed application is capturing"
-                } else {
+                let why = if !self.mic.cfg.enabled {
                     "the microphone was switched off"
+                } else if open_failed {
+                    "the capture stream failed"
+                } else if !target_on_graph {
+                    "the pinned device left the graph"
+                } else {
+                    "no allowed application is capturing"
                 };
                 info!("microphone: {why}; closing the mic session");
                 self.stop_mic();
@@ -742,6 +898,7 @@ impl Shared {
         let stream = pw::stream::StreamRc::new(core.clone(), "nx-recall-mic", props)
             .context("creating the microphone stream")?;
 
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let data = StreamData {
             session_id,
             label: MIC_MATCH_KEY.to_string(),
@@ -750,6 +907,7 @@ impl Shared {
             channels: 1,
             resampler: LinearResampler::new(),
             warned_about_format: false,
+            failed: Arc::clone(&failed),
         };
         // Resampled and stamped through exactly the same callbacks as an app
         // stream: a mic turn and a VRChat turn must be comparable on one clock.
@@ -787,6 +945,7 @@ impl Shared {
         self.mic.capture = Some(MicCapture {
             session_id,
             target,
+            failed,
             _stream: stream,
             _listener: listener,
         });
@@ -836,8 +995,10 @@ fn register_stream(
         .state_changed(|_, data, old, new| {
             debug!(session = data.session_id, label = %data.label, "stream {old:?} -> {new:?}");
             if let pw::stream::StreamState::Error(msg) = &new {
-                // A device vanishing (headset unplugged) lands here. Log and
-                // let the node-remove path close the session; do not panic.
+                // A device vanishing (headset unplugged) lands here. Log, flag
+                // it so the mic state machine can close the session instead of
+                // reporting a dead stream as a recording; do not panic.
+                data.failed.store(true, Ordering::SeqCst);
                 warn!(session = data.session_id, label = %data.label, "capture stream error: {msg}");
             }
         })
@@ -1372,6 +1533,10 @@ mod tests {
             app_captures: apps,
             open_on,
             target,
+            // The ordinary world: the target is there and the stream is fine.
+            // The tests that care take this apart themselves.
+            target_on_graph: true,
+            open_failed: false,
         }
     }
 
@@ -1612,5 +1777,202 @@ mod tests {
             ..probe
         };
         assert_eq!(no_default.mic_target(None), None);
+    }
+
+    // ---- audit finding #2: a source nobody was told about ----------------
+
+    /// Everything `note_source` needs, and nothing that needs a PipeWire graph.
+    /// The registry callbacks cannot run in a test — there is no daemon and no
+    /// core — but the half that decides what the rest of the program is told
+    /// can, and it is the half the finding is about.
+    fn graphless(dir: &std::path::Path, rules: &[(&str, bool)]) -> (Shared, Arc<Bus>) {
+        let store = Store::open(dir).unwrap();
+        let mic_source_id = store
+            .upsert_source_kind(MIC_MATCH_KEY, MIC_DISPLAY_NAME, KIND_MIC, 0)
+            .unwrap();
+        let bus = Bus::new(64, 32);
+        let allowlist = Allowlist::from_rules(rules.iter().copied());
+        let control = Control::new(dir.to_path_buf(), None, &allowlist);
+        (
+            Shared {
+                allowlist,
+                store: Arc::new(std::sync::Mutex::new(store)),
+                queue: crate::queue::EventQueue::new(1024),
+                stats: Arc::new(Stats::default()),
+                control,
+                bus: Arc::clone(&bus),
+                captures: HashMap::new(),
+                nodes: HashMap::new(),
+                mic: Mic {
+                    cfg: MicConfig::default(),
+                    source_id: mic_source_id,
+                    capture: None,
+                    default_source: None,
+                    nodes: HashMap::new(),
+                    retry_after: None,
+                    announced: None,
+                },
+                // Never read here: nothing in this test opens a stream.
+                format_param: Vec::new(),
+                quantum: 1024,
+            },
+            bus,
+        )
+    }
+
+    /// The consequence in the audit, as a test: open a client, then have an
+    /// application appear. Before this, the only `source` event in the daemon
+    /// came from `sources.set` — so a program launched after the GUI connected
+    /// never turned up in its Sources list, and could therefore never be
+    /// allowed without restarting the GUI.
+    #[test]
+    fn an_application_appearing_is_broadcast_to_the_clients_already_connected() {
+        let dir = std::env::temp_dir().join(format!("nx-recall-capture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut shared, bus) = graphless(&dir, &[("VRChat.exe", true)]);
+        let (client, rx) = bus.attach(None);
+        client.subscribe(&[Topic::Sources]);
+
+        // A program that is not allowed. Default-deny only works if what was
+        // denied is visible, so this is exactly the event that matters.
+        let node = NodeInfo {
+            node_id: 42,
+            serial: Some("9001".into()),
+            ident: SourceIdent {
+                process_binary: Some("Discord".into()),
+                application_name: Some("Discord".into()),
+                node_name: Some("discord-node".into()),
+                process_id: Some(4242),
+            },
+        };
+        let key = node.ident.match_key();
+        assert!(shared.note_source(&node).is_some());
+
+        let raw = rx.try_recv().expect("a source event, on first sighting");
+        let ev: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(ev["ev"], "source");
+        let data = &ev["data"];
+        assert_eq!(data["match_key"], serde_json::json!(key));
+        assert_eq!(data["state"], serde_json::json!(SOURCE_SEEN));
+        assert_eq!(data["allowed"], serde_json::json!(false));
+        assert_eq!(data["kind"], serde_json::json!(crate::store::KIND_APP));
+        assert_eq!(data["streams"], serde_json::json!(0));
+        // The `sources.list` row shape, whole: a client folds this in exactly
+        // as it folds in a list entry and cannot end up with a half-row.
+        for field in [
+            "id",
+            "match_key",
+            "kind",
+            "binary",
+            "display",
+            "display_name",
+            "allowed",
+            "first_seen",
+            "last_seen",
+            "streams",
+        ] {
+            assert!(data.get(field).is_some(), "the event must carry {field}");
+        }
+
+        // And the shape really is the list's, field for field.
+        let listed = {
+            let store = shared.store.lock().unwrap();
+            store.source_row(&key).unwrap().unwrap()
+        };
+        let mut expected = crate::service::source_json(&listed, false);
+        expected["state"] = serde_json::json!(SOURCE_SEEN);
+        assert_eq!(data, &expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- audit finding #7: a microphone that is not there ----------------
+
+    /// The bug, in one table. A pinned `[mic].device` that is unplugged keeps
+    /// `target == open_on` — the pin is read from the config, not from the
+    /// graph — so the machine said `Hold` forever: the session row never
+    /// closed, `sources_capturing` went on counting it, and `status` reported
+    /// `always:active` over a stream sitting in `StreamState::Error`.
+    #[test]
+    fn a_pinned_microphone_that_left_the_graph_is_closed_not_held() {
+        let pin = Some("usb-yeti");
+        let mut s = situation(true, MicMode::Always, 0, Some(pin), pin);
+
+        // Present: this is the ordinary steady state and must stay `Hold`.
+        assert_eq!(mic_plan(&s), MicPlan::Hold);
+
+        // Unplugged. Same name, same config, no such device.
+        s.target_on_graph = false;
+        assert_eq!(
+            mic_plan(&s),
+            MicPlan::Close,
+            "a microphone that is not there must not read as recording"
+        );
+
+        // Still gone and still closed: nothing to do, and in particular no
+        // attempt to reopen on a name the graph does not answer to.
+        assert_eq!(
+            mic_plan(&MicSituation { open_on: None, ..s }),
+            MicPlan::Open,
+            "with the session closed the ordinary retry takes over"
+        );
+
+        // Replugged. The device comes back on a NEW object.serial — serials are
+        // never reused — which is exactly why the pin is resolved by node.name.
+        s.target_on_graph = true;
+        assert_eq!(mic_plan(&s), MicPlan::Hold);
+
+        // And in follow mode the same is true, with the app list on top.
+        let mut f = situation(true, MicMode::Follow, 1, Some(pin), pin);
+        assert_eq!(mic_plan(&f), MicPlan::Hold);
+        f.target_on_graph = false;
+        assert_eq!(mic_plan(&f), MicPlan::Close);
+    }
+
+    /// A stream the graph errored out is not a recording, whatever the config
+    /// still says the device is called. This is the other half of #7: the
+    /// device can vanish under a live tap without the node-removed path being
+    /// the thing that notices.
+    #[test]
+    fn a_failed_stream_closes_the_session_rather_than_reporting_it_open() {
+        let t = Some("usb-yeti");
+        let mut s = situation(true, MicMode::Always, 0, Some(t), t);
+        assert_eq!(mic_plan(&s), MicPlan::Hold);
+
+        s.open_failed = true;
+        assert_eq!(mic_plan(&s), MicPlan::Close);
+
+        // A failed stream on a device that has ALSO gone is still one Close,
+        // not a reopen onto nothing.
+        s.target_on_graph = false;
+        assert_eq!(mic_plan(&s), MicPlan::Close);
+
+        // Off beats everything, including this — rule 1 is still rule 1.
+        s.enabled = false;
+        assert_eq!(mic_plan(&s), MicPlan::Close);
+        assert_eq!(
+            mic_plan(&MicSituation { open_on: None, ..s }),
+            MicPlan::Hold
+        );
+    }
+
+    /// The default-source path is deliberately untouched by the two inputs
+    /// above: a *default* that names nothing on the graph is not an error —
+    /// connecting with no target lets the session manager route the stream,
+    /// which is what every other capture client does. Only an explicit pin can
+    /// be "missing".
+    #[test]
+    fn an_unresolvable_default_is_not_the_same_as_a_missing_pin() {
+        // No pin configured: `target_on_graph` is true whatever the default
+        // resolves to, so a routed stream holds rather than flapping.
+        let t = Some("some-default");
+        assert_eq!(
+            mic_plan(&situation(true, MicMode::Always, 0, Some(t), t)),
+            MicPlan::Hold
+        );
+        assert_eq!(
+            mic_plan(&situation(true, MicMode::Always, 0, Some(None), None)),
+            MicPlan::Hold
+        );
     }
 }

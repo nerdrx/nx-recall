@@ -105,6 +105,35 @@ pub fn segment_json(row: &SegmentRow) -> Value {
     })
 }
 
+/// One source on the wire — a `sources.list` entry and the body of a `source`
+/// event, from one function so the two cannot drift (audit finding #2).
+///
+/// `allowed` is passed in rather than read from the row: the live allowlist (or,
+/// for the microphone, `[mic].enabled`) is the truth, and the mirrored column
+/// can be a moment behind it between a toggle and its write.
+pub fn source_json(row: &crate::store::SourceRow, allowed: bool) -> Value {
+    json!({
+        "id": row.id,
+        "match_key": row.match_key,
+        // "app" or "mic" (schema v4). The microphone is a row here like
+        // anything else and is governed by `[mic]` rather than by the
+        // allowlist, so a client that does not know the difference must not
+        // render it as an app.
+        "kind": row.kind,
+        // `binary` is the process this was keyed on; `display` is what the
+        // application calls itself. For a Wine program these differ, which is
+        // exactly why the key is the PE name and not the shared loader
+        // (DESIGN §3).
+        "binary": row.match_key,
+        "display": row.display_name,
+        "display_name": row.display_name,
+        "allowed": allowed,
+        "first_seen": iso8601(row.first_seen),
+        "last_seen": iso8601(row.last_seen),
+        "streams": row.streams,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpState {
     Running,
@@ -251,11 +280,25 @@ impl Service {
         if since < 0 {
             return Err(Error::params("seq must not be negative"));
         }
+        // Which daemon that `seq` was counted by. Optional, so a client written
+        // against an older daemon still works — but without it a reconnect
+        // across a restart lands an old sequence inside the new ring and gets
+        // somebody else's events replayed as its own (audit finding #20).
+        if let Some(boot) = req.opt_str("boot")?
+            && boot != crate::proto::boot_id()
+        {
+            return Err(Error::new(
+                "resync",
+                "that sequence number belongs to an earlier run of this daemon; \
+                 re-run your queries and follow the stream from the current seq",
+            ));
+        }
         match self.bus.events_since(client, since as u64) {
             Ok((events, seq)) => Ok(json!({
                 "events": events,
                 "replayed": events.len(),
                 "seq": seq,
+                "boot": crate::proto::boot_id(),
             })),
             Err(_) => Err(Error::new(
                 "resync",
@@ -355,6 +398,11 @@ impl Service {
             // polled every three seconds by every open client and the answer
             // costs a walk of the data directory (0.6.1).
             "storage": c.storage_json(),
+            // What the last retention sweep did, or `null` before one has run.
+            // Also pushed as its own `sweep` event on this topic: a sweep that
+            // quietly stopped working — or started destroying files — used to
+            // be visible only in the daemon's log (0.7.5, audit finding #22).
+            "last_sweep": c.last_sweep_json(),
             // The memory graph's Tier 3 worker (0.7.0). Also pushed as its own
             // `graph` event when it moves; carried here so a client that missed
             // one still converges on the truth, exactly like the mic block.
@@ -362,6 +410,10 @@ impl Service {
             "segments_total": store.segments_total()?,
             "counters": {
                 "sessions_opened": c.stats.sessions_opened.load(Ordering::Relaxed),
+                // Turns discarded because the audio had a hole in it (0.7.5,
+                // audit finding #21). `drops` says buffers were lost; this says
+                // a turn was.
+                "gaps_discarded": c.stats.gaps_discarded.load(Ordering::Relaxed),
                 "segments_written": c.stats.segments_written.load(Ordering::Relaxed),
                 "frames_analysed": c.stats.frames_analysed.load(Ordering::Relaxed),
                 "analysed": c.analysis.analysed.load(Ordering::Relaxed),
@@ -425,32 +477,17 @@ impl Service {
         let mic = self.control.mic();
         Ok(json!({
             "sources": rows
-                .into_iter()
+                .iter()
                 .map(|r| {
-                    let is_mic = r.kind == crate::store::KIND_MIC;
-                    json!({
-                        "id": r.id,
-                        "match_key": r.match_key,
-                        // "app" or "mic" (schema v4). The microphone is a row
-                        // here like anything else and is governed by `[mic]`
-                        // rather than by the allowlist, so a client that does
-                        // not know the difference must not render it as an app.
-                        "kind": r.kind,
-                        // `binary` is the process this was keyed on; `display`
-                        // is what the application calls itself. For a Wine
-                        // program these differ, which is exactly why the key is
-                        // the PE name and not the shared loader (DESIGN §3).
-                        "binary": r.match_key,
-                        "display": r.display_name,
-                        "display_name": r.display_name,
-                        // The live answer, which may be ahead of the database
-                        // for the instant between a toggle and its mirror. The
-                        // microphone's switch is `[mic].enabled`, never a rule.
-                        "allowed": if is_mic { mic.enabled } else { live.decide(&r.match_key).captures() },
-                        "first_seen": iso8601(r.first_seen),
-                        "last_seen": iso8601(r.last_seen),
-                        "streams": r.streams,
-                    })
+                    // The live answer, which may be ahead of the database for
+                    // the instant between a toggle and its mirror. The
+                    // microphone's switch is `[mic].enabled`, never a rule.
+                    let allowed = if r.kind == crate::store::KIND_MIC {
+                        mic.enabled
+                    } else {
+                        live.decide(&r.match_key).captures()
+                    };
+                    source_json(r, allowed)
                 })
                 .collect::<Vec<_>>(),
         }))
@@ -501,11 +538,30 @@ impl Service {
         }
 
         info!(key = %match_key, allowed, persisted, "source rule changed");
-        self.bus.publish(
-            Topic::Sources,
-            "source",
-            json!({"match_key": match_key, "allowed": allowed}),
-        );
+        // The whole row, on the same event the capture thread publishes when a
+        // source appears or starts being captured (finding #2): one shape, so a
+        // client folds a toggle in exactly as it folds in an arrival. `state`
+        // is what the table can say from here — the capture thread announces
+        // again a quarter-second later when it has actually attached.
+        let row = self.store().source_row(&match_key).map_err(Error::from)?;
+        match row {
+            Some(row) => {
+                let mut data = source_json(&row, allowed);
+                data["state"] = json!(if row.streams > 0 {
+                    crate::capture::SOURCE_CAPTURING
+                } else {
+                    crate::capture::SOURCE_SEEN
+                });
+                self.bus.publish(Topic::Sources, "source", data);
+            }
+            None => {
+                self.bus.publish(
+                    Topic::Sources,
+                    "source",
+                    json!({"match_key": match_key, "allowed": allowed}),
+                );
+            }
+        }
         // The count of capturing sources is part of the status line, so a
         // toggle changes it.
         self.announce_status();
@@ -594,6 +650,26 @@ impl Service {
 
     // ---- speakers --------------------------------------------------------
 
+    /// Refuse a write aimed at a tombstone, naming the voice that holds the
+    /// rows. `speakers.split` and `speakers.delete` already did this; the
+    /// per-voice edits did not, and silently wrote onto rows nothing reads
+    /// (audit finding #8). The caller must already have established that the
+    /// id names a speaker at all, so a missing one is `not_found` there rather
+    /// than `conflict` here.
+    fn tombstone_check(store: &Store, id: i64) -> Result<(), Error> {
+        let canonical = store.resolve_speaker(id).map_err(Error::from)?;
+        if canonical != id {
+            return Err(Error::new(
+                "conflict",
+                format!(
+                    "speaker {id} was merged into {canonical}; use {canonical} instead — \
+                     that is the voice holding the rows"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn speakers_list(&self) -> Result<Value, Error> {
         let store = self.store();
         let rows = store.list_speakers().map_err(Error::from)?;
@@ -665,6 +741,12 @@ impl Service {
             .speaker_name(id)
             .map_err(Error::from)?
             .ok_or_else(|| Error::not_found(format!("no speaker with id {id}")))?;
+        // Worse than the rename (finding #8): `speaker_languages` READS through
+        // the tombstone to the canonical voice while `set_speaker_languages`
+        // WRITES the tombstone, so this wrote nowhere, reported success, and
+        // logged the canonical voice's languages as the prior state — the audit
+        // trail lied too. Refused, like the split.
+        Self::tombstone_check(&store, id)?;
         store
             .set_speaker_languages(id, languages.as_deref())
             .map_err(Error::from)?;
@@ -805,12 +887,26 @@ impl Service {
             segments, "swept one-off voices out of the voicebank"
         );
         self.announce_status();
+        // `voices` is what was **removed**, not what was previewed (audit
+        // finding #25). `count` only ever counted the successes, so a voice
+        // that failed to prune used to be reported as gone by one field and
+        // present by the other — and the client had already shown the preview
+        // in its confirmation dialog, so repeating it bought nothing.
+        let removed_voices: Vec<Value> = preview
+            .iter()
+            .filter(|v| {
+                v.get("id")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|id| removed.contains(&id))
+            })
+            .cloned()
+            .collect();
         Ok(json!({
             "apply": true,
             "count": removed.len(),
             "removed": removed,
             "segments": segments,
-            "voices": preview,
+            "voices": removed_voices,
         }))
     }
 
@@ -1032,6 +1128,12 @@ impl Service {
             .speaker_name(id)
             .map_err(Error::from)?
             .ok_or_else(|| Error::not_found(format!("no speaker with id {id}")))?;
+        // A tombstone holds no rows: naming it writes a display name nothing
+        // ever reads (every path resolves through `speaker_resolved`), while
+        // the reply and the `relabel` event both claim the name took — so a
+        // client draws a ghost voice that does not exist (audit finding #8).
+        // Same refusal `speakers.split` gives, for the same reason.
+        Self::tombstone_check(&store, id)?;
         store
             .rename_speaker(id, &name, utc_now_ns())
             .map_err(Error::from)?;
@@ -1441,6 +1543,15 @@ impl Service {
             .map_err(Error::from)?
             .ok_or_else(|| Error::not_found(format!("no thread with id {id}")))?;
         let rows = store.thread_rows(id).map_err(Error::from)?;
+        // A conversation whose every turn has been deleted is not a
+        // conversation with nothing in it — it is gone, and saying so is the
+        // only honest answer (audit finding #15). The sweeper removes the row
+        // itself; until it runs, this is what a link to it answers.
+        if rows.is_empty() {
+            return Err(Error::not_found(format!(
+                "thread {id} has no segments left; it was deleted"
+            )));
+        }
         let mut participants = Vec::with_capacity(summary.participants.len());
         for p in &summary.participants {
             let summary = store.speaker_summary(*p).map_err(Error::from)?;
@@ -2189,6 +2300,18 @@ impl Service {
             // re-query a whole transcript to find out what went.
             self.bus
                 .publish(Topic::Segments, "purge", json!({"ids": batch}));
+        }
+
+        // A conversation whose every turn just went is not an empty
+        // conversation, it is no conversation — and `prune_empty_threads` had
+        // no callers at all, so a fully deleted thread stayed in the table
+        // forever and `thread.get` went on answering with an empty shell
+        // (audit finding #15). Here and in the sweeper's purge pass, which is
+        // the other place segments leave in bulk.
+        match self.store().prune_empty_threads() {
+            Ok(0) => {}
+            Ok(n) => info!(%op, threads = n, "removed conversations left with no turns"),
+            Err(e) => warn!(%op, "could not prune empty threads: {e:#}"),
         }
 
         self.finish_op(&op, OpState::Done);
@@ -4054,5 +4177,435 @@ mod tests {
         let segs = t["segments"].as_array().unwrap();
         assert!(segs.iter().all(|s| s["thread"].is_i64()));
         assert_eq!(segs[0]["thread"], segs[1]["thread"]);
+    }
+
+    // ---- audit finding #8: writes onto a tombstone ------------------------
+
+    /// A tombstone holds no rows. `speakers.name` wrote a display name onto one
+    /// anyway — invisible, because every read resolves through
+    /// `speaker_resolved` — and then reported success and broadcast a `relabel`
+    /// for it, from which clients dutifully created a voice that does not
+    /// exist. `speakers.split` has always refused this; these two did not.
+    #[test]
+    fn naming_a_tombstone_is_refused_and_names_the_voice_that_holds_the_rows() {
+        let r = rig("name-tombstone");
+        let FalseMerge {
+            kept, tombstone, ..
+        } = a_false_merge(&r);
+        call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"speakers.name","params":{{"id":{kept},"name":"Ines"}}}}"#
+            ),
+        )
+        .unwrap();
+        events(&r);
+
+        let e = call(
+            &r,
+            &format!(
+                r#"{{"id":2,"method":"speakers.name","params":{{"id":{tombstone},"name":"Kestrel"}}}}"#
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "conflict");
+        assert!(
+            e.msg.contains(&kept.to_string()),
+            "the refusal has to say which voice to use instead: {}",
+            e.msg
+        );
+        assert!(
+            events(&r).is_empty(),
+            "and no relabel goes out, or clients draw a voice that is not there"
+        );
+        let store = r.service.store();
+        assert_eq!(
+            store.speaker_name(kept).unwrap().as_deref(),
+            Some("Ines"),
+            "the surviving voice keeps its name"
+        );
+        assert_ne!(
+            store.speaker_name(tombstone).unwrap().as_deref(),
+            Some("Kestrel")
+        );
+    }
+
+    /// Worse than the rename, and the reason it is worth its own test:
+    /// `speaker_languages` READS through the tombstone to the canonical voice
+    /// while `set_speaker_languages` WROTE the tombstone. So the call changed
+    /// nothing, answered as though it had, and filed the *canonical* voice's
+    /// languages as the prior state — the audit trail lied too.
+    #[test]
+    fn declaring_languages_on_a_tombstone_is_refused_rather_than_written_nowhere() {
+        let r = rig("langs-tombstone");
+        let FalseMerge {
+            kept, tombstone, ..
+        } = a_false_merge(&r);
+        call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"speakers.set_languages","params":{{"id":{kept},"languages":["de"]}}}}"#
+            ),
+        )
+        .unwrap();
+        events(&r);
+
+        let e = call(
+            &r,
+            &format!(
+                r#"{{"id":2,"method":"speakers.set_languages","params":{{"id":{tombstone},"languages":["en"]}}}}"#
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "conflict");
+        assert!(e.msg.contains(&kept.to_string()));
+        assert!(events(&r).is_empty());
+
+        let store = r.service.store();
+        assert_eq!(
+            store.speaker_languages(kept).unwrap(),
+            Some(vec!["de".to_string()]),
+            "the canonical voice's declaration is untouched"
+        );
+        // Reading the tombstone resolves to the canonical voice, which is
+        // exactly why writing it was invisible.
+        assert_eq!(
+            store.speaker_languages(tombstone).unwrap(),
+            Some(vec!["de".to_string()])
+        );
+        let ops = store.operations(10).unwrap();
+        assert!(
+            !ops.iter().any(|o| o.op == "speakers.set_languages"
+                && o.target_ids.contains(&tombstone.to_string())),
+            "and nothing was filed about a write that did not happen"
+        );
+    }
+
+    // ---- audit finding #10: deleted content coming back -------------------
+
+    /// Delete, then split. `segment_row` had no `deleted_at` filter, and it is
+    /// what the `segment` events are built from — so a split re-broadcast the
+    /// deleted rows into every open client, words and all. `split_speaker`'s
+    /// UPDATEs had no guard either, so it really did relabel them.
+    #[test]
+    fn splitting_a_voice_never_broadcasts_the_rows_that_were_deleted() {
+        let r = rig("split-after-delete");
+        let FalseMerge {
+            kept, ours, theirs, ..
+        } = a_false_merge(&r);
+
+        // One turn from each side of the false merge is thrown away first.
+        let (gone_ours, gone_theirs) = (ours[0], theirs[0]);
+        {
+            let store = r.service.store();
+            store
+                .soft_delete_segments(&[gone_ours, gone_theirs], 1_000)
+                .unwrap();
+        }
+        events(&r);
+
+        let out = split(&r, kept).unwrap();
+        let minted = out["minted"].as_i64().unwrap();
+
+        let announced: Vec<i64> = events(&r)
+            .iter()
+            .filter(|e| e["ev"] == "segment")
+            .filter_map(|e| e["data"]["id"].as_i64())
+            .collect();
+        assert!(
+            !announced.contains(&gone_ours) && !announced.contains(&gone_theirs),
+            "a deleted turn must never come back as a segment event: {announced:?}"
+        );
+        assert!(
+            !announced.is_empty(),
+            "the live rows are still announced, or this proves nothing"
+        );
+
+        let store = r.service.store();
+        // The deleted rows kept the speaker they had; the split did not touch
+        // them, so undoing the delete cannot resurrect them onto a voice they
+        // were never on.
+        for seg in [gone_ours, gone_theirs] {
+            assert!(
+                store.segment_row(seg).unwrap().is_none(),
+                "and they are still invisible to every read path"
+            );
+        }
+        let moved = store.segment_labels(&theirs).unwrap();
+        assert!(
+            moved
+                .iter()
+                .filter(|l| l.segment_id != gone_theirs)
+                .all(|l| l.speaker_id == Some(minted)),
+            "the live rows still moved: the guard is about deleted ones only"
+        );
+        assert_eq!(
+            moved
+                .iter()
+                .find(|l| l.segment_id == gone_theirs)
+                .unwrap()
+                .speaker_id,
+            Some(kept),
+            "the deleted row was left exactly where it was"
+        );
+    }
+
+    /// The other two doors into the same room: a soft-deleted segment could
+    /// still be reassigned and re-worded, and each write broadcast the deleted
+    /// row as a live one.
+    #[test]
+    fn a_deleted_segment_cannot_be_reassigned_or_corrected() {
+        let r = rig("edit-after-delete");
+        let (_, seg) = a_segment(&r, "something said");
+        let spk = {
+            let store = r.service.store();
+            store.create_speaker("Ines", 0).unwrap()
+        };
+        r.service
+            .store()
+            .soft_delete_segments(&[seg], 1_000)
+            .unwrap();
+        events(&r);
+
+        let e = call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"segments.reassign","params":{{"segment_id":{seg},"speaker_id":{spk}}}}}"#
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "not_found");
+
+        let e = call(
+            &r,
+            &format!(
+                r#"{{"id":2,"method":"segments.correct","params":{{"segment_id":{seg},"text":"rewritten"}}}}"#
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "not_found");
+
+        assert!(
+            events(&r).is_empty(),
+            "a refused edit announces nothing, least of all a deleted row"
+        );
+        let store = r.service.store();
+        let (speaker, text) = store
+            .segment_fields(seg)
+            .map(|f| (f.get("speaker_id").cloned(), f.get("text").cloned()))
+            .unwrap();
+        assert!(speaker.flatten().is_none(), "nothing was assigned");
+        assert_eq!(
+            text.flatten().as_deref(),
+            Some("something said"),
+            "and nothing was rewritten"
+        );
+    }
+
+    // ---- audit finding #15: threads that outlive their conversation -------
+
+    /// A fully deleted conversation left a `threads` row that `thread.get`
+    /// answered with `segments: []`, `participants: []`, `preview: null` —
+    /// a conversation-shaped hole in the UI. `prune_empty_threads` existed to
+    /// clean exactly this up and had no callers anywhere.
+    #[test]
+    fn deleting_every_turn_in_a_conversation_removes_the_conversation() {
+        let r = rig("thread-after-delete");
+        let a = {
+            let store = r.service.store();
+            store.create_speaker("A", 0).unwrap()
+        };
+        let segs = a_conversation(&r, &[a, a, a]);
+        let thread = {
+            let store = r.service.store();
+            store.segment_row(segs[0]).unwrap().unwrap().thread_id
+        }
+        .expect("the fixture threads its turns");
+
+        let got = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"thread.get","params":{{"id":{thread}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(got["segments"].as_array().unwrap().len(), 3);
+
+        let out = call(
+            &r,
+            &format!(
+                r#"{{"id":2,"method":"delete.run","params":{{"speaker":{a},"confirm_everything":false}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(out["segments"], 3);
+        // `delete.run` answers with an operation handle and finishes on its own
+        // thread; wait for it the way a client would.
+        let op = out["op"].as_str().unwrap().to_string();
+        for _ in 0..300 {
+            if r.service.op_state(&op) == Some(OpState::Done) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(r.service.op_state(&op), Some(OpState::Done));
+
+        let e = call(
+            &r,
+            &format!(r#"{{"id":3,"method":"thread.get","params":{{"id":{thread}}}}}"#),
+        )
+        .unwrap_err();
+        assert_eq!(
+            e.code, "not_found",
+            "a conversation with nothing left in it is gone, not empty"
+        );
+        assert!(
+            r.service.store().thread_summary(thread).unwrap().is_none(),
+            "and the row went with it"
+        );
+    }
+
+    // ---- audit finding #20: a sequence number from another daemon ---------
+
+    /// Sequence numbers restart at 0 on every start and `events.since` could
+    /// only reject a `seq` *higher* than the live counter. So a client that
+    /// remembered seq 3 across a restart, reconnecting once the new daemon had
+    /// published more than that, was handed events 4..N of a completely
+    /// different stream and applied them as its own history.
+    #[test]
+    fn a_sequence_number_from_an_earlier_run_is_a_resync_not_a_replay() {
+        let r = rig("boot-id");
+        let welcome: Value = serde_json::from_slice(&crate::proto::welcome(
+            r.service.bus.current_seq(),
+            crate::store::SCHEMA_VERSION,
+        ))
+        .unwrap();
+        let boot = welcome["welcome"]["boot"].as_str().unwrap().to_string();
+        assert!(!boot.is_empty(), "the welcome has to name the run");
+
+        for i in 0..5 {
+            r.service
+                .bus
+                .publish(Topic::Segments, "segment", json!({"id": i}));
+        }
+
+        // The ordinary catch-up, with the boot id this connection was welcomed
+        // with: served.
+        let out = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"events.since","params":{{"seq":2,"boot":"{boot}"}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(out["replayed"], 3);
+        assert_eq!(out["boot"], json!(boot));
+
+        // The same seq, remembered from a daemon that is no longer running. It
+        // is well inside this daemon's ring — that is exactly the trap — and it
+        // must not be served.
+        let e = call(
+            &r,
+            r#"{"id":2,"method":"events.since","params":{"seq":2,"boot":"0000000000000000"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "resync");
+        assert!(
+            e.msg.contains("earlier run"),
+            "the message has to say why: {}",
+            e.msg
+        );
+
+        // A client that never learned about boot ids still works, because the
+        // parameter is optional — it just does not get this protection.
+        assert!(call(&r, r#"{"id":3,"method":"events.since","params":{"seq":2}}"#).is_ok());
+    }
+
+    // ---- audit finding #2 / #25: what a reply and an event actually say ---
+
+    /// A toggle now carries the whole `sources.list` row, the same shape the
+    /// capture thread publishes when a source appears or starts being captured
+    /// — so a client folds a toggle in exactly as it folds in an arrival.
+    #[test]
+    fn a_source_event_carries_the_whole_row_not_just_the_switch() {
+        let r = rig("source-event-shape");
+        {
+            let store = r.service.store();
+            store.upsert_source("VRChat.exe", "VRChat", 0).unwrap();
+        }
+        events(&r);
+        call(
+            &r,
+            r#"{"id":1,"method":"sources.set","params":{"match_key":"VRChat.exe","allowed":true}}"#,
+        )
+        .unwrap();
+
+        let ev = events(&r)
+            .into_iter()
+            .find(|e| e["ev"] == "source")
+            .expect("a toggle is broadcast");
+        let data = &ev["data"];
+        assert_eq!(data["match_key"], json!("VRChat.exe"));
+        assert_eq!(data["allowed"], json!(true));
+        assert_eq!(data["display"], json!("VRChat"));
+        assert_eq!(data["kind"], json!(crate::store::KIND_APP));
+        assert_eq!(data["streams"], json!(0));
+        assert_eq!(data["state"], json!(crate::capture::SOURCE_SEEN));
+        assert!(data["id"].is_i64());
+
+        // And it is the list's shape, field for field.
+        let listed = call(&r, r#"{"id":2,"method":"sources.list"}"#).unwrap();
+        let row = listed["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["match_key"] == json!("VRChat.exe"))
+            .unwrap()
+            .clone();
+        let mut expected = row;
+        expected["state"] = data["state"].clone();
+        assert_eq!(data, &expected);
+    }
+
+    /// `speakers.prune` reported `count` as the successes and `voices` as the
+    /// whole preview, so the two fields could disagree about what happened.
+    /// The client had already shown the preview in its confirmation dialog;
+    /// what it needs back is what actually went.
+    #[test]
+    fn prune_answers_with_the_voices_it_removed_not_the_ones_it_offered() {
+        let r = rig("prune-reply");
+        let sess = a_session(&r);
+        for tag in ["a", "b"] {
+            let spk = r.service.store().mint_speaker(0).unwrap();
+            let store = r.service.store();
+            let t = store.segments_total().unwrap() * 1_000;
+            let seg = store
+                .insert_segment(sess, t, t + 500_000_000, &format!("segments/{tag}.wav"), 0)
+                .unwrap();
+            store
+                .set_segment_speaker(seg, Some(spk), Some(0.9))
+                .unwrap();
+        }
+
+        let preview = call(&r, r#"{"id":1,"method":"speakers.prune"}"#).unwrap();
+        assert_eq!(preview["apply"], json!(false));
+        let offered = preview["voices"].as_array().unwrap().len();
+        assert!(offered >= 2, "the fixture has to produce candidates");
+
+        let out = call(
+            &r,
+            r#"{"id":2,"method":"speakers.prune","params":{"apply":true}}"#,
+        )
+        .unwrap();
+        let removed: Vec<i64> = out["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        let voices = out["voices"].as_array().unwrap();
+        assert_eq!(
+            voices.len(),
+            out["count"].as_u64().unwrap() as usize,
+            "`voices` and `count` describe the same set or they describe nothing"
+        );
+        let listed: Vec<i64> = voices.iter().map(|v| v["id"].as_i64().unwrap()).collect();
+        assert_eq!(listed, removed);
     }
 }

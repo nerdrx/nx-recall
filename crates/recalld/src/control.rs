@@ -77,6 +77,10 @@ pub struct Control {
     /// because `status` is polled every three seconds by every open client and
     /// the answer costs a walk of the whole data directory.
     storage: Mutex<Option<crate::retention::StorageUsage>>,
+    /// What the retention sweeper did on its last pass. `None` until one has
+    /// run — a client renders that as "not swept yet", which is honest, where
+    /// a block of zeroes would claim a clean sweep that never happened.
+    last_sweep: Mutex<Option<Value>>,
     /// The memory graph's settings, live. The Tier 3 switch is the third thing
     /// in this file that has to be movable while the daemon runs, and for the
     /// same reason as the other two: it has a switch in the UI, and a switch
@@ -106,6 +110,7 @@ impl Control {
             identity: IdentityConfig::default(),
             models: Mutex::new(Vec::new()),
             storage: Mutex::new(None),
+            last_sweep: Mutex::new(None),
             graph: Mutex::new(GraphConfig::default()),
             graph_state: Mutex::new(GraphState::default()),
         })
@@ -301,6 +306,22 @@ impl Control {
             Some(usage) => usage.to_json(),
             None => Value::Null,
         }
+    }
+
+    /// The sweeper reporting what it just did (`retention::SweepReport`).
+    pub fn set_last_sweep(&self, report: Value) {
+        *self.last_sweep.lock().unwrap_or_else(|p| p.into_inner()) = Some(report);
+    }
+
+    /// The `last_sweep` block `status` carries, or `null` before the first
+    /// sweep. Unlink failures, orphan removals and dangling paths reached no
+    /// client at all before this (audit finding #22).
+    pub fn last_sweep_json(&self) -> Value {
+        self.last_sweep
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .unwrap_or(Value::Null)
     }
 
     // ---- the memory graph (GRAPH.md Tiers 2 and 3) -----------------------

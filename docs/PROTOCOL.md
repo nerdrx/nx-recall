@@ -15,16 +15,28 @@ Client speaks first:
 {"hello": {"proto": 1, "client": "nx-recall-gui/0.1"}}
 ```
 
-Daemon replies with its version and the current event sequence number:
+Daemon replies with its version, the current event sequence number, and the id of
+this **run** of the daemon:
 
 ```json
-{"welcome": {"proto": 1, "daemon": "recalld/0.3", "seq": 41823, "schema": 2}}
+{"welcome": {"proto": 1, "daemon": "recalld/0.7", "seq": 41823, "schema": 9, "boot": "18f3c0a1d4b2e900"}}
 ```
 
 If `proto` is unsupported the daemon replies `{"error": {"code": "proto", ...}}` and
 closes. A client reconnecting after a daemon restart compares `seq`: if it is lower
 than the client's last-seen (daemon restarted) or the gap exceeds the replay buffer,
 the client does a full resync (re-runs its queries).
+
+**`boot` (0.7.5).** An opaque string, constant for the life of one daemon process and
+different after every restart. Sequence numbers restart at 0 with the process, so a
+`seq` alone cannot tell two runs apart: a client that remembered 40 across a restart,
+reconnecting once the new daemon had published 60 events, used to be handed events
+41–60 of an unrelated stream and applied them as the continuation of its own. A client
+that keeps a `seq` across a reconnect **MUST** send the `boot` it was welcomed with on
+`events.since`; a mismatch is answered `err: resync` instead of a replay. The parameter
+is optional so that older clients still work — they simply do not get this protection.
+A client that only ever follows the live stream from the current `welcome.seq` does
+not need it.
 
 ## Requests
 
@@ -41,16 +53,16 @@ Methods (initial set):
 | `sources.list` / `sources.set` | `{match_key, allowed}` | live toggle, no restart. `sources.set` **refuses** `match_key: "mic"` — see `mic.set` |
 | `mic.get` / `mic.set` | `{enabled?, mode?}` | the microphone switch; live, no restart |
 | `speakers.list` | | id, name, counts, total time, `languages` |
-| `speakers.name` | `{id, name}` | retroactive; broadcasts `relabel` |
-| `speakers.set_languages` | `{id, languages}` | which languages this voice speaks; broadcasts `relabel` |
-| `speakers.prune` | `{apply?}` | list (default) or sweep the one-off voices |
+| `speakers.name` | `{id, name}` | retroactive; broadcasts `relabel`. On a **merge tombstone**: `err:conflict` naming the canonical voice (0.7.5) — it holds no rows, so the write would land nowhere while the reply and the event claimed otherwise |
+| `speakers.set_languages` | `{id, languages}` | which languages this voice speaks; broadcasts `relabel`. Same `err:conflict` on a tombstone (0.7.5), and for a sharper reason: the read resolved through the tombstone while the write did not |
+| `speakers.prune` | `{apply?}` | list (default) or sweep the one-off voices. With `apply`, `voices` is what was **removed** (0.7.5) — it used to repeat the preview, which the client had already shown in its own confirmation |
 | `speakers.delete` | `{id, keep_voiceprint?}` | delete one voice: its conversations always, its voiceprint unless kept. Works on a voice with **no segments left** — see below |
 | `speakers.merge` | `{from, into}` | tombstone, no chains; broadcasts `relabel` |
 | `speakers.split` | `{id}` | **async op** (below); work completes inline — the reply carries the op handle **plus** the outcome: `{op, kept, minted, auto, moved_segments, moved_prototypes, ambiguous, centroid_similarity, embed_model_id, resync, seq}`. Data-driven refusals (one voice, golden conflict) come back as `err:refused`. The minted speaker's `relabel` carries `split_from`. Past ~100 changed rows the per-segment events are skipped and `resync: true` tells clients to re-query. |
-| `segments.reassign` | `{segment_id, speaker_id}` | |
-| `segments.correct` | `{segment_id, text}` | feeds anchor per DESIGN §5 |
+| `segments.reassign` | `{segment_id, speaker_id}` | a soft-deleted segment is `err:not_found` (0.7.5) |
+| `segments.correct` | `{segment_id, text}` | feeds anchor per DESIGN §5; a soft-deleted segment is `err:not_found` (0.7.5) |
 | `person.get` | `{id}` | the person page in one reply: totals, co-presence edges, recent conversations |
-| `thread.get` | `{id}` | one conversation's segments, in order |
+| `thread.get` | `{id}` | one conversation's segments, in order. A conversation whose every turn has been deleted is `err:not_found` (0.7.5), not an empty shell |
 | `search` | `{q, speaker?, source?, from?, to?, limit?}` | FTS5 over transcripts |
 | `search.semantic` | `{q, mode?, speaker?, source?, from?, to?, limit?}` | search by meaning; `mode: "hybrid"` fuses it with FTS. `err:unavailable` when the optional model is not installed — see below |
 | `transcript` | `{session?, speaker?, from?, to?, limit?}` | chronological page — see "Paging the transcript" |
@@ -152,8 +164,45 @@ Every event carries a monotonically increasing `seq`:
 
 `relabel` events mean: every view showing that speaker id updates in place — clients
 never need to re-query for a rename. The daemon keeps a short replay buffer;
-`{"method": "events.since", "params": {"seq": N}}` replays it or returns
-`err: resync` if N has fallen out.
+`{"method": "events.since", "params": {"seq": N, "boot": "..."}}` replays it, or
+returns `err: resync` if N has fallen out **or** if `boot` names a different run of
+the daemon (see the handshake). The reply carries `{events, replayed, seq, boot}`.
+
+### The `source` event (sources topic, 0.7.5)
+
+```json
+{"seq": 41827, "ev": "source", "data": {
+  "id": 3, "match_key": "VRChat.exe", "kind": "app", "binary": "VRChat.exe",
+  "display": "VRChat", "display_name": "VRChat", "allowed": true,
+  "first_seen": "2026-08-31T18:45:50Z", "last_seen": "2026-09-01T20:11:03Z",
+  "streams": 1, "state": "capturing"
+}}
+```
+
+The body is a `sources.list` row, field for field, plus `state`. One shape, so a
+client folds an arrival in exactly as it folds in a toggle and can never end up with
+a half-described row.
+
+`state` is what the source is doing at the instant the event was published:
+
+| state | meaning |
+|---|---|
+| `seen` | on the graph, not being captured — either not allowed, or allowed and not yet attached |
+| `capturing` | a capture stream is open on it right now |
+| `stopped` | it was being captured; the capture stopped while the application stayed |
+| `gone` | the node left the graph — the application closed its stream or quit |
+
+Published on: an application first appearing on the graph (**whatever the allowlist
+says about it** — default-deny is only usable if a client can show the user what was
+refused), a capture starting, a capture stopping, the node going away, and a
+`sources.set` toggle. Before 0.7.5 only the toggle published anything at all, so a
+program launched after a client connected never appeared in its Sources list and
+could therefore never be allowed without restarting the client.
+
+`state` is the live answer; the row's `streams` count is the database's and can trail
+it by one queue hop, because a capture that has just stopped still has an open session
+row until the pipeline has drained the end event and written the last segment. A
+client rendering a "capturing now" light should believe `state`.
 
 ## Field conventions (v1 clarifications, born from the first real client)
 
@@ -303,7 +352,37 @@ only *what*.
   render it as such; zeroes would be a claim about an empty disk.
 
 - **`status.counters`** gains `too_slight` (turns that matched nobody and were
-  under the mint bar), `proximity_labelled`, `redecoded` and `lang_mismatch`.
+  under the mint bar), `proximity_labelled`, `redecoded` and `lang_mismatch`; and,
+  in 0.7.5, `gaps_discarded` — turns thrown away because the audio under them had
+  a hole in it. `drops` says buffers were lost; this says a *turn* was, which is
+  the number that tells a user whether the queue is big enough. A gap is never
+  spliced: the half-built turn on the near side of it is discarded rather than
+  joined to the words on the far side.
+
+- **`status` carries `last_sweep` (0.7.5)**, or `null` before the sweeper has run
+  once. The same block is pushed as a `sweep` event on the `status` topic after
+  every pass:
+
+  ```json
+  {"seq": 41830, "ev": "sweep", "data": {
+    "started_at_utc_ns": "1788283200000000000",
+    "purged": 12, "purged_rows": 12, "purged_empty": 0, "aged_audio": 40,
+    "unlinked_files": 52, "orphans_removed": 1, "orphan_files": 1,
+    "orphan_goldens": 0, "dangling": 0, "dangling_paths": 0,
+    "dangling_goldens": 0, "pruned_threads": 2, "errors": 0, "vacuumed": true
+  }}
+  ```
+
+  Everything the retention sweeper does used to reach the daemon's log and
+  nowhere else: an unlink that failed, an orphan removed, a row pointing at a
+  file that is gone. Those are the outcomes that say whether deletion is really
+  happening and whether anything is being destroyed that should not be, so they
+  are now something a client can show. `errors` is the number of things the
+  sweep tried and could not do — a sweep that has quietly stopped working, or
+  started failing, is visible as a non-zero count rather than as silence. A
+  failed sweep reports `errors: 1` and a `failed` string saying why.
+  `started_at_utc_ns` is a **string**, like every nanosecond value on the wire.
+  `null` means "not swept yet"; zeroes would claim a clean sweep that never ran.
 
 ### Deleting a voice (0.6.4)
 

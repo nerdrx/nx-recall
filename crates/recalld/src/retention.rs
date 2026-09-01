@@ -49,8 +49,56 @@ pub struct SweepReport {
     /// Rows purged outright because they carried no memory value: no words and
     /// no speaker, past the audio window. See `sweep`.
     pub purged_empty: usize,
+    /// Files under `goldens/` that no `golden_samples` row claims. Removed.
+    pub orphan_goldens: usize,
+    /// `golden_samples` rows whose file is gone. **Removed**, unlike a dangling
+    /// segment: a segment row without audio is still the transcript, which is
+    /// the memory; a golden without its clip is nothing at all — it exists only
+    /// to be re-embedded by a future model, and it cannot be.
+    pub dangling_goldens: usize,
+    /// Conversations left with no live turns, removed (`prune_empty_threads`).
+    pub pruned_threads: usize,
+    /// Things the sweep tried and could not do: an unlink that failed, an
+    /// orphan it could not remove, a row it could not delete. Counted rather
+    /// than only logged, because a sweep that quietly stops working is exactly
+    /// the failure nobody notices (audit finding #22).
+    pub errors: usize,
     pub vacuumed: bool,
 }
+
+impl SweepReport {
+    /// The `last_sweep` block `status` carries and the `sweep` event repeats.
+    pub fn to_json(&self, started_at_utc_ns: i64) -> Value {
+        json!({
+            "started_at_utc_ns": started_at_utc_ns.to_string(),
+            "purged": self.purged_rows + self.purged_empty,
+            "purged_rows": self.purged_rows,
+            "purged_empty": self.purged_empty,
+            "aged_audio": self.aged_audio,
+            "unlinked_files": self.unlinked_files,
+            "orphans_removed": self.orphan_files + self.orphan_goldens,
+            "orphan_files": self.orphan_files,
+            "orphan_goldens": self.orphan_goldens,
+            "dangling": self.dangling_paths + self.dangling_goldens,
+            "dangling_paths": self.dangling_paths,
+            "dangling_goldens": self.dangling_goldens,
+            "pruned_threads": self.pruned_threads,
+            "errors": self.errors,
+            "vacuumed": self.vacuumed,
+        })
+    }
+}
+
+/// How recently a file may have been written and still be treated as settled.
+///
+/// The reconciliation pass removes every `.wav` no row claims, and the pipeline
+/// writes the file *before* it inserts the row — deliberately, and outside the
+/// store lock, so audio never waits on a query. A sweep that snapshots the
+/// table and then unlinks a file finished in the gap destroys a segment
+/// mid-write and leaves the row pointing at nothing (audit finding #3). A
+/// minute of grace is far more than that gap and far less than the age of any
+/// real orphan, which is residue from a crash in a previous run.
+const SETTLE: Duration = Duration::from_secs(60);
 
 /// What NX Recall is using on disk, in the four parts that behave differently.
 ///
@@ -151,11 +199,34 @@ impl SweeperStop {
 }
 
 /// One pass. Separated from the loop so it is testable without waiting hours.
+///
+/// `now_ns` is the retention clock — what the undo window and the audio tier
+/// are measured against, and a test moves it by days. The file-settling cutoff
+/// is a *different* clock and cannot be derived from it: it is about wall-clock
+/// mtimes on disk, so it comes from the real one. [`sweep_at`] is the same pass
+/// with that cutoff given explicitly, which is the only way to test the
+/// interleaving in finding #3.
 pub fn sweep(
     cfg: &RetentionConfig,
     store: &Store,
     data_dir: &Path,
     now_ns: i64,
+) -> Result<SweepReport> {
+    let settled_before = std::time::SystemTime::now()
+        .checked_sub(SETTLE)
+        .unwrap_or(std::time::UNIX_EPOCH);
+    sweep_at(cfg, store, data_dir, now_ns, settled_before)
+}
+
+/// [`sweep`], with the "a file this new might still be being written" cutoff
+/// passed in. Files modified after `settled_before` are left alone by the
+/// reconciliation pass whatever the database says about them.
+pub fn sweep_at(
+    cfg: &RetentionConfig,
+    store: &Store,
+    data_dir: &Path,
+    now_ns: i64,
+    settled_before: std::time::SystemTime,
 ) -> Result<SweepReport> {
     let mut report = SweepReport::default();
 
@@ -167,8 +238,10 @@ pub fn sweep(
             let ids: Vec<i64> = expired.iter().map(|(id, _)| *id).collect();
             report.purged_rows = store.purge_segments(&ids)?;
             for (_, rel) in &expired {
-                if unlink(data_dir, rel) {
-                    report.unlinked_files += 1;
+                match unlink(data_dir, rel) {
+                    Unlinked::Removed => report.unlinked_files += 1,
+                    Unlinked::Absent => {}
+                    Unlinked::Failed => report.errors += 1,
                 }
             }
         }
@@ -195,8 +268,10 @@ pub fn sweep(
             let ids: Vec<i64> = empty.iter().map(|(id, _)| *id).collect();
             report.purged_empty = store.purge_segments(&ids)?;
             for (_, rel) in &empty {
-                if unlink(data_dir, rel) {
-                    report.unlinked_files += 1;
+                match unlink(data_dir, rel) {
+                    Unlinked::Removed => report.unlinked_files += 1,
+                    Unlinked::Absent => {}
+                    Unlinked::Failed => report.errors += 1,
                 }
             }
         }
@@ -206,14 +281,23 @@ pub fn sweep(
             let ids: Vec<i64> = aged.iter().map(|(id, _)| *id).collect();
             report.aged_audio = store.forget_audio(&ids)?;
             for (_, rel) in &aged {
-                if unlink(data_dir, rel) {
-                    report.unlinked_files += 1;
+                match unlink(data_dir, rel) {
+                    Unlinked::Removed => report.unlinked_files += 1,
+                    Unlinked::Absent => {}
+                    Unlinked::Failed => report.errors += 1,
                 }
             }
         }
     }
 
-    // 3. Loose files against the database.
+    // 2b. Conversations the purges above emptied out. `prune_empty_threads`
+    //     had no callers at all before this (audit finding #15), so a fully
+    //     deleted conversation left a `threads` row behind forever.
+    if report.purged_rows > 0 || report.purged_empty > 0 {
+        report.pruned_threads = store.prune_empty_threads()?;
+    }
+
+    // 3. Loose files against the database, both trees and both directions.
     if cfg.reconcile {
         let known = store.all_audio_paths()?;
         let mut expected: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -231,17 +315,80 @@ pub fn sweep(
             }
         }
         for file in wav_files(&data_dir.join("segments")) {
-            if !expected.contains(&file) {
-                match std::fs::remove_file(&file) {
-                    Ok(()) => {
-                        report.orphan_files += 1;
-                        info!(path = %file.display(), "removed an orphaned segment file");
-                    }
-                    Err(e) => warn!(path = %file.display(), "could not remove an orphan: {e}"),
+            if expected.contains(&file) {
+                continue;
+            }
+            // Written since the sweep's cutoff: this is a file the pipeline may
+            // be finishing right now, whose row is not in the snapshot above
+            // because it does not exist *yet*. Removing it would destroy a
+            // segment mid-write (finding #3). It will still be here next sweep,
+            // by which time it is either claimed or genuinely orphaned.
+            if !settled(&file, settled_before) {
+                debug!(path = %file.display(), "leaving a just-written file for the next sweep");
+                continue;
+            }
+            match std::fs::remove_file(&file) {
+                Ok(()) => {
+                    report.orphan_files += 1;
+                    info!(path = %file.display(), "removed an orphaned segment file");
+                }
+                Err(e) => {
+                    report.errors += 1;
+                    warn!(path = %file.display(), "could not remove an orphan: {e}");
                 }
             }
         }
         prune_empty_dirs(&data_dir.join("segments"));
+
+        // Goldens. Exempt from *retention* — they are what a future embedding
+        // model gets re-enrolled from (DESIGN §5) — but nothing ever reconciled
+        // them in either direction, while two paths write a golden file and its
+        // row separately and a third deletes them separately (audit finding
+        // #19). Both halves, and the exemption is untouched: nothing here looks
+        // at a golden's age.
+        let goldens = store.all_golden_paths()?;
+        let mut expected_goldens: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        for (id, rel) in &goldens {
+            let abs = data_dir.join(rel);
+            if abs.exists() {
+                expected_goldens.insert(abs);
+                continue;
+            }
+            // Removed, not merely logged: a segment row without audio is still
+            // the transcript, and the transcript is the memory. A golden row
+            // without its clip is nothing — it exists only to be re-embedded,
+            // and a row claiming a voiceprint it cannot produce is a lie the
+            // migration would trip over.
+            report.dangling_goldens += 1;
+            match store.delete_golden_sample(*id) {
+                Ok(_) => warn!(
+                    golden = id,
+                    path = %rel,
+                    "a golden sample lost its audio; the row went with it"
+                ),
+                Err(e) => {
+                    report.errors += 1;
+                    warn!(golden = id, "could not remove a golden with no file: {e:#}");
+                }
+            }
+        }
+        for file in wav_files(&data_dir.join("goldens")) {
+            if expected_goldens.contains(&file) || !settled(&file, settled_before) {
+                continue;
+            }
+            match std::fs::remove_file(&file) {
+                Ok(()) => {
+                    report.orphan_goldens += 1;
+                    info!(path = %file.display(), "removed an orphaned golden clip");
+                }
+                Err(e) => {
+                    report.errors += 1;
+                    warn!(path = %file.display(), "could not remove an orphaned golden: {e}");
+                }
+            }
+        }
+        prune_empty_dirs(&data_dir.join("goldens"));
     }
 
     if cfg.vacuum_after_purge && (report.purged_rows > 0 || report.purged_empty > 0) {
@@ -251,18 +398,38 @@ pub fn sweep(
     Ok(report)
 }
 
-fn unlink(data_dir: &Path, rel: &str) -> bool {
+/// What happened to one file the sweep tried to remove. "Was not there" and
+/// "could not be removed" are different facts and only the second is a problem.
+enum Unlinked {
+    Removed,
+    Absent,
+    Failed,
+}
+
+fn unlink(data_dir: &Path, rel: &str) -> Unlinked {
     if rel.is_empty() {
-        return false;
+        return Unlinked::Absent;
     }
     let path = data_dir.join(rel);
     match std::fs::remove_file(&path) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(()) => Unlinked::Removed,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Unlinked::Absent,
         Err(e) => {
             warn!(path = %path.display(), "could not remove segment audio: {e}");
-            false
+            Unlinked::Failed
         }
+    }
+}
+
+/// Has this file been still long enough to be judged against the database?
+///
+/// A file we cannot stat is treated as settled: an unreadable file is not
+/// evidence of a write in progress, and refusing to ever clean it up would
+/// leave residue forever.
+fn settled(path: &Path, before: std::time::SystemTime) -> bool {
+    match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(mtime) => mtime <= before,
+        Err(_) => true,
     }
 }
 
@@ -307,28 +474,55 @@ pub fn run(
     data_dir: PathBuf,
     models_dir: Option<PathBuf>,
     control: Arc<Control>,
+    bus: Arc<crate::bus::Bus>,
     stop: Arc<SweeperStop>,
 ) {
     let interval = Duration::from_secs(cfg.sweep_interval_s.max(60));
     loop {
-        {
+        let started_at = utc_now_ns();
+        // What the sweep did, in a shape a client can see. Everything the
+        // sweeper does was warn!/info! only — so the two failures it exists to
+        // catch (a file destroyed mid-write, a golden that lost its clip) would
+        // have recurred entirely inside the log (audit finding #22). Cached for
+        // `status` and pushed as its own event, which is what makes #3 and #19
+        // visible if they ever come back.
+        let outcome = {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-            match sweep(cfg, &guard, &data_dir, utc_now_ns()) {
-                Ok(report) if report != SweepReport::default() => {
-                    info!(
-                        purged_rows = report.purged_rows,
-                        purged_empty = report.purged_empty,
-                        aged_audio = report.aged_audio,
-                        unlinked_files = report.unlinked_files,
-                        orphan_files = report.orphan_files,
-                        dangling_paths = report.dangling_paths,
-                        "retention sweep"
-                    );
+            match sweep(cfg, &guard, &data_dir, started_at) {
+                Ok(report) => {
+                    if report != SweepReport::default() {
+                        info!(
+                            purged_rows = report.purged_rows,
+                            purged_empty = report.purged_empty,
+                            aged_audio = report.aged_audio,
+                            unlinked_files = report.unlinked_files,
+                            orphan_files = report.orphan_files,
+                            dangling_paths = report.dangling_paths,
+                            orphan_goldens = report.orphan_goldens,
+                            dangling_goldens = report.dangling_goldens,
+                            pruned_threads = report.pruned_threads,
+                            errors = report.errors,
+                            "retention sweep"
+                        );
+                    } else {
+                        debug!("retention sweep: nothing to do");
+                    }
+                    report.to_json(started_at)
                 }
-                Ok(_) => debug!("retention sweep: nothing to do"),
-                Err(e) => warn!("retention sweep failed: {e:#}"),
+                Err(e) => {
+                    warn!("retention sweep failed: {e:#}");
+                    let mut failed = SweepReport {
+                        errors: 1,
+                        ..Default::default()
+                    }
+                    .to_json(started_at);
+                    failed["failed"] = json!(format!("{e:#}"));
+                    failed
+                }
             }
-        }
+        };
+        control.set_last_sweep(outcome.clone());
+        bus.publish(crate::bus::Topic::Status, "sweep", outcome);
         // Measured after the sweep, so what `status` reports is what is on disk
         // now rather than what was there before the sweeper freed it. Outside
         // the store lock: this is a directory walk, not a query.
@@ -389,6 +583,14 @@ mod tests {
             )
             .unwrap();
         id
+    }
+
+    /// "Everything currently on disk has finished being written." The cutoff
+    /// the reconciliation pass judges files against; a second in the future so
+    /// a fixture written microseconds ago counts as settled whatever the
+    /// filesystem's timestamp granularity is.
+    fn settled_now() -> std::time::SystemTime {
+        std::time::SystemTime::now() + Duration::from_secs(1)
     }
 
     fn session(rig: &Rig) -> i64 {
@@ -475,9 +677,10 @@ mod tests {
             audio_days: 0,
             ..Default::default()
         };
-        let report = sweep(&cfg, &r.store, &r.dir, now).unwrap();
+        let report = sweep_at(&cfg, &r.store, &r.dir, now, settled_now()).unwrap();
         assert_eq!(report.orphan_files, 1);
         assert_eq!(report.dangling_paths, 1);
+        assert_eq!(report.errors, 0);
         assert!(!r.dir.join("segments/000001/orphan.wav").exists());
         assert!(r.dir.join("segments/000001/kept.wav").exists());
         // The dangling row is kept: it is the only record of what was said.
@@ -503,9 +706,273 @@ mod tests {
             audio_days: 0,
             ..Default::default()
         };
-        let report = sweep(&cfg, &r.store, &r.dir, now + DAY_NS).unwrap();
+        let report = sweep_at(&cfg, &r.store, &r.dir, now + DAY_NS, settled_now()).unwrap();
         assert_eq!(report.orphan_files, 0);
         assert!(r.dir.join("segments/000001/a.wav").exists());
+    }
+
+    /// Audit finding #3. The pipeline writes a segment's WAV **before** it
+    /// inserts the row, and does it outside the store lock so audio never waits
+    /// on a query. The sweeper snapshots the table and then unlinks every file
+    /// the snapshot did not name — so a file finished in that gap used to be
+    /// destroyed while it was being written, and the row that arrived a
+    /// millisecond later pointed at nothing.
+    #[test]
+    fn a_file_written_during_the_sweep_is_not_mistaken_for_an_orphan() {
+        let r = rig("mid-write");
+        let s = session(&r);
+        let now = 100 * DAY_NS;
+        let settled = segment(&r, s, now, "segments/000001/settled.wav");
+
+        // The interleaving, exactly: the sweep's view of "what has finished
+        // being written" is taken, and only then does the pipeline finish a
+        // file whose row does not exist yet.
+        let cutoff = std::time::SystemTime::now();
+        std::thread::sleep(Duration::from_millis(20));
+        let in_flight = r.dir.join("segments/000001/in-flight.wav");
+        std::fs::write(&in_flight, vec![0u8; 64]).unwrap();
+
+        let cfg = RetentionConfig {
+            undo_window_days: 0,
+            audio_days: 0,
+            ..Default::default()
+        };
+        let report = sweep_at(&cfg, &r.store, &r.dir, now, cutoff).unwrap();
+        assert_eq!(
+            report.orphan_files, 0,
+            "a file younger than the sweep's cutoff is left alone"
+        );
+        assert!(
+            in_flight.is_file(),
+            "the segment being written must survive its own sweep"
+        );
+
+        // The row lands, and the next sweep — by which time the file has
+        // settled — agrees it belongs.
+        r.store
+            .insert_segment(s, now, now + 1_000, "segments/000001/in-flight.wav", now)
+            .unwrap();
+        let report = sweep_at(&cfg, &r.store, &r.dir, now, settled_now()).unwrap();
+        assert_eq!(report.orphan_files, 0);
+        assert_eq!(report.dangling_paths, 0);
+        assert!(in_flight.is_file());
+        assert!(r.dir.join("segments/000001/settled.wav").exists());
+        let _ = settled;
+
+        // And the guard is a grace period, not an amnesty: a file that really
+        // is an orphan goes as soon as it has stopped moving.
+        std::fs::write(r.dir.join("segments/000001/junk.wav"), b"x").unwrap();
+        let report = sweep_at(&cfg, &r.store, &r.dir, now, settled_now()).unwrap();
+        assert_eq!(report.orphan_files, 1);
+        assert!(!r.dir.join("segments/000001/junk.wav").exists());
+    }
+
+    /// Audit finding #19. Goldens are exempt from *retention* — they are what a
+    /// future embedding model gets re-enrolled from — which was read as exempt
+    /// from *reconciliation*, so nothing ever compared `goldens/` against the
+    /// table in either direction.
+    #[test]
+    fn goldens_are_reconciled_in_both_directions_without_ever_ageing_out() {
+        let r = rig("goldens");
+        let now = 100 * DAY_NS;
+        let spk = r.store.mint_speaker(0).unwrap();
+        std::fs::create_dir_all(r.dir.join("goldens/000001")).unwrap();
+
+        // One good golden, one row whose file went, one file no row claims.
+        for name in ["kept.wav", "lost.wav", "stray.wav"] {
+            std::fs::write(r.dir.join("goldens/000001").join(name), vec![0u8; 64]).unwrap();
+        }
+        r.store
+            .add_golden_sample(spk, "goldens/000001/kept.wav", 4.0)
+            .unwrap();
+        let lost = r
+            .store
+            .add_golden_sample(spk, "goldens/000001/lost.wav", 3.0)
+            .unwrap();
+        std::fs::remove_file(r.dir.join("goldens/000001/lost.wav")).unwrap();
+
+        let cfg = RetentionConfig {
+            undo_window_days: 0,
+            audio_days: 1,
+            ..Default::default()
+        };
+        // A year in the future: if goldens were on the audio clock at all, this
+        // is the sweep that would take them.
+        let report = sweep_at(&cfg, &r.store, &r.dir, now + 400 * DAY_NS, settled_now()).unwrap();
+
+        assert_eq!(report.orphan_goldens, 1, "the file no row claims goes");
+        assert!(!r.dir.join("goldens/000001/stray.wav").exists());
+        assert_eq!(report.dangling_goldens, 1, "the row with no file goes too");
+        assert_eq!(report.errors, 0);
+
+        let rows = r.store.golden_samples_for(spk).unwrap();
+        assert_eq!(rows.len(), 1, "one golden left, and it is the whole one");
+        assert_eq!(rows[0].audio_path, "goldens/000001/kept.wav");
+        assert!(
+            r.dir.join("goldens/000001/kept.wav").is_file(),
+            "a golden with a row and a file never ages out, whatever the date"
+        );
+        assert!(!rows.iter().any(|g| g.id == lost));
+
+        // Idempotent: with the two halves agreeing there is nothing to do.
+        let again = sweep_at(&cfg, &r.store, &r.dir, now + 800 * DAY_NS, settled_now()).unwrap();
+        assert_eq!(again.orphan_goldens, 0);
+        assert_eq!(again.dangling_goldens, 0);
+        assert!(r.dir.join("goldens/000001/kept.wav").is_file());
+    }
+
+    /// Audit finding #15. `prune_empty_threads` had no callers at all.
+    ///
+    /// `purge_segments` already dropped a thread whose every *row* was gone;
+    /// what nothing covered is the thread left holding only rows that are no
+    /// longer in any read path. It is not a conversation with nothing in it —
+    /// it is not a conversation, and `thread.get` answering it with
+    /// `segments: []` was the visible half of the same bug.
+    #[test]
+    fn a_conversation_whose_turns_all_left_the_read_paths_leaves_no_thread_behind() {
+        let r = rig("threads");
+        let s = session(&r);
+        let now = 100 * DAY_NS;
+
+        // One turn with words, deleted five minutes ago — still undoable, so
+        // its row is still there and the thread cannot go on its account.
+        let deleted = segment(&r, s, now, "segments/000001/gone.wav");
+        r.store.soft_delete_segments(&[deleted], now).unwrap();
+        // One turn with neither words nor a voice, old enough to expire: this
+        // is the purge that empties the thread out.
+        std::fs::write(r.dir.join("segments/000001/empty.wav"), vec![0u8; 64]).unwrap();
+        let empty = r
+            .store
+            .insert_segment(
+                s,
+                now - 40 * DAY_NS,
+                now - 40 * DAY_NS + 1_000,
+                "segments/000001/empty.wav",
+                0,
+            )
+            .unwrap();
+
+        let thread = r.store.create_thread(s, now - 40 * DAY_NS, now).unwrap();
+        for seg in [deleted, empty] {
+            r.store.set_segment_thread(seg, thread, now).unwrap();
+        }
+        assert!(r.store.thread_summary(thread).unwrap().is_some());
+
+        let cfg = RetentionConfig {
+            reconcile: false,
+            ..Default::default()
+        };
+        let report = sweep(&cfg, &r.store, &r.dir, now).unwrap();
+        assert_eq!(report.purged_empty, 1);
+        assert_eq!(report.pruned_threads, 1);
+        assert!(
+            r.store.thread_summary(thread).unwrap().is_none(),
+            "the row went with the last turn anybody could read"
+        );
+    }
+
+    /// Audit finding #22. Everything the sweeper does was `warn!`/`info!` only,
+    /// so the two failures it exists to catch would have recurred entirely
+    /// inside the log. The report is cached for `status` and pushed as an
+    /// event, which is what makes #3 and #19 visible if they ever come back.
+    #[test]
+    fn a_sweep_reports_itself_to_every_client_and_to_status() {
+        let r = rig("last-sweep");
+        let s = session(&r);
+        let now = 100 * DAY_NS;
+        let seg = segment(&r, s, now - 40 * DAY_NS, "segments/000001/old.wav");
+        std::fs::write(r.dir.join("segments/000001/orphan.wav"), b"x").unwrap();
+        let _ = seg;
+
+        let report = sweep_at(
+            &RetentionConfig::default(),
+            &r.store,
+            &r.dir,
+            now,
+            settled_now(),
+        )
+        .unwrap();
+        let json = report.to_json(now);
+        assert_eq!(
+            json["started_at_utc_ns"],
+            serde_json::json!(now.to_string())
+        );
+        assert_eq!(json["orphans_removed"], serde_json::json!(1));
+        assert_eq!(json["aged_audio"], serde_json::json!(1));
+        assert_eq!(json["errors"], serde_json::json!(0));
+        assert!(json.get("dangling").is_some());
+        assert!(json.get("purged").is_some());
+
+        let control = crate::control::Control::new(
+            r.dir.clone(),
+            None,
+            &crate::allowlist::Allowlist::from_rules([("x", false)]),
+        );
+        assert_eq!(
+            control.last_sweep_json(),
+            Value::Null,
+            "never swept is null, not a block of zeroes claiming a clean sweep"
+        );
+        control.set_last_sweep(json.clone());
+        assert_eq!(control.last_sweep_json(), json);
+    }
+
+    /// The sweeper thread's own contract: one pass, then a `sweep` event on the
+    /// `status` topic, then it waits. Nobody had to be able to see a sweep
+    /// before 0.7.5 and so nobody could.
+    #[test]
+    fn the_sweeper_publishes_what_it_did() {
+        let r = rig("sweeper-event");
+        let s = session(&r);
+        let now = 100 * DAY_NS;
+        segment(&r, s, now - 40 * DAY_NS, "segments/000001/old.wav");
+
+        let store = Arc::new(std::sync::Mutex::new(Store::open(&r.dir).unwrap()));
+        let control = crate::control::Control::new(
+            r.dir.clone(),
+            None,
+            &crate::allowlist::Allowlist::from_rules([("x", false)]),
+        );
+        let bus = crate::bus::Bus::new(16, 16);
+        let (client, rx) = bus.attach(None);
+        client.subscribe(&[crate::bus::Topic::Status]);
+        let stop = Arc::new(SweeperStop::default());
+
+        let cfg = RetentionConfig::default();
+        let handle = {
+            let (store, control, bus, stop) = (
+                Arc::clone(&store),
+                Arc::clone(&control),
+                Arc::clone(&bus),
+                Arc::clone(&stop),
+            );
+            let dir = r.dir.clone();
+            let cfg = cfg.clone();
+            std::thread::spawn(move || run(&cfg, store, dir, None, control, bus, stop))
+        };
+
+        let mut seen = None;
+        for _ in 0..200 {
+            if let Ok(line) = rx.try_recv() {
+                let ev: Value = serde_json::from_slice(&line).unwrap();
+                if ev["ev"] == "sweep" {
+                    seen = Some(ev);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.stop();
+        handle.join().unwrap();
+
+        let ev = seen.expect("the sweeper must announce what it did");
+        assert_eq!(ev["data"]["aged_audio"], serde_json::json!(1));
+        assert_eq!(ev["data"]["errors"], serde_json::json!(0));
+        assert_eq!(
+            control.last_sweep_json()["aged_audio"],
+            serde_json::json!(1),
+            "and `status` serves the same block it published"
+        );
     }
 
     /// A row with no words and no voice is neither searchable nor

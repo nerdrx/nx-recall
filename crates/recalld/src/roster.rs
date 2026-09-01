@@ -349,11 +349,22 @@ fn tail_one(
     }
     let mut pos = file.stream_position()?;
     record_snapshot(&state, store, bus, control);
+    let mut was_paused = control.is_paused();
 
     loop {
         if stop.stopped() {
             return Ok(());
         }
+        // Coming back from a pause. The log kept being folded into `state`
+        // while writes were off (that is what makes a swallowed World line
+        // survivable), so the difference between the table and the world is
+        // exactly this diff — and applying it here is what stops the old
+        // instance's roster standing forever (audit finding #9).
+        let paused = control.is_paused();
+        if was_paused && !paused {
+            reconcile(&state, store, bus, control, "resume");
+        }
+        was_paused = paused;
         // A world change rotates the log; so does a VRChat restart.
         if let Some(newest) = dirs.iter().find_map(|d| newest_log(d))
             && newest != log
@@ -400,9 +411,16 @@ fn tail_one(
 
 /// Write one accepted line down and tell every subscriber.
 ///
-/// Paused means paused: the roster is a list of people, so while writes are
-/// off it is neither stored nor broadcast. The file position still advances,
-/// so resuming does not replay a backlog of who came and went.
+/// Paused means paused: the roster is a list of people, so while writes are off
+/// it is neither stored nor broadcast. The file position still advances, and so
+/// does the *in-memory* `RosterState` — the caller folds every line in whether
+/// or not this one writes it, which is what keeps a pause from being a hole in
+/// the daemon's idea of who is present. What used to be missing is the other
+/// half: the table is brought back in line with that state on resume
+/// (`reconcile`, audit finding #9). Without it, a World line swallowed by a
+/// pause meant `roster_close_all` never ran and everybody from the old
+/// instance stayed present forever — and changing instances is exactly when a
+/// person reaches for pause.
 fn record(
     line: &LogLine,
     state: &RosterState,
@@ -441,28 +459,61 @@ fn record(
     bus.publish(Topic::Roster, "roster", data);
 }
 
-/// After replaying a log's history: persist who is present and announce the
-/// snapshot, so a client that connects mid-session sees the instance.
+/// After replaying a log's history: make the table say what the log says, and
+/// announce the snapshot so a client that connects mid-session sees the
+/// instance.
+///
+/// The reconciliation is both directions, which it was not before (audit
+/// finding #9). Writing only the present half left everyone who departed while
+/// the daemon was down with `left_at_utc_ns` NULL — permanently, because
+/// nothing ever revisits an open row — and `person.edges` reads an open row as
+/// *still here* through `COALESCE(left_at, now())`. One missed leave and two
+/// people's shared time grows for as long as the database exists.
 fn record_snapshot(
     state: &RosterState,
     store: &Arc<std::sync::Mutex<Store>>,
     bus: &Arc<Bus>,
     control: &Arc<Control>,
 ) {
+    reconcile(state, store, bus, control, "startup");
+}
+
+/// Bring the roster table in line with the replayed state, then announce it.
+///
+/// `why` is for the log only: `startup` (the log's history has just been
+/// replayed) or `resume` (writes were off while the log moved on).
+///
+/// A join stamp observed during a pause is written here, at resume, with the
+/// time it really happened rather than the time writing became allowed. That is
+/// deliberate and it is the only choice that keeps the roster true: the
+/// alternative says somebody arrived when the user un-paused, which is a claim
+/// about a person that is simply false.
+fn reconcile(
+    state: &RosterState,
+    store: &Arc<std::sync::Mutex<Store>>,
+    bus: &Arc<Bus>,
+    control: &Arc<Control>,
+    why: &'static str,
+) {
     if control.is_paused() {
         return;
     }
     {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-        for (who, joined) in &state.present {
-            if let Err(e) = guard.roster_join(
-                state.world_id.as_deref(),
-                state.instance.as_deref(),
-                who,
-                *joined,
-            ) {
-                warn!("could not record {who} as present: {e:#}");
-            }
+        match guard.roster_reconcile(
+            state.world_id.as_deref(),
+            state.instance.as_deref(),
+            &state.present,
+            crate::clock::utc_now_ns(),
+        ) {
+            Ok(r) if r.is_empty() => debug!(why, "roster already agreed with the log"),
+            Ok(r) => info!(
+                why,
+                closed = r.closed,
+                opened = r.opened,
+                "reconciled the roster against the log"
+            ),
+            Err(e) => warn!(why, "could not reconcile the roster: {e:#}"),
         }
     }
     bus.publish(
@@ -621,6 +672,235 @@ mod tests {
         assert!(state.apply(&parse_line(next).unwrap()));
         assert!(state.names().is_empty());
         assert_eq!(state.instance.as_deref(), Some("99"));
+    }
+
+    // ---- audit finding #9: pause, restart, and rows that never close ------
+
+    struct TailRig {
+        dir: PathBuf,
+        log: PathBuf,
+        store: Arc<std::sync::Mutex<Store>>,
+        bus: Arc<Bus>,
+        control: Arc<Control>,
+        stop: Arc<RosterStop>,
+    }
+
+    impl Drop for TailRig {
+        fn drop(&mut self) {
+            self.stop.stop();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl TailRig {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("nx-recall-roster-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let log = dir.join("output_log_2026-08-31_18-00-00.txt");
+            std::fs::write(&log, b"").unwrap();
+            let store = Store::open(&dir).unwrap();
+            let control = Control::new(
+                dir.clone(),
+                None,
+                &crate::allowlist::Allowlist::from_rules([("x", false)]),
+            );
+            Self {
+                dir,
+                log,
+                store: Arc::new(std::sync::Mutex::new(store)),
+                bus: Bus::new(64, 32),
+                control,
+                stop: Arc::new(RosterStop::default()),
+            }
+        }
+
+        fn append(&self, lines: &[&str]) {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.log)
+                .unwrap();
+            for line in lines {
+                writeln!(f, "{line}").unwrap();
+            }
+            f.flush().unwrap();
+        }
+
+        fn tail(&self) -> std::thread::JoinHandle<()> {
+            let (log, dirs) = (self.log.clone(), vec![self.dir.clone()]);
+            let (store, bus, control, stop) = (
+                Arc::clone(&self.store),
+                Arc::clone(&self.bus),
+                Arc::clone(&self.control),
+                Arc::clone(&self.stop),
+            );
+            std::thread::spawn(move || {
+                let _ = tail_one(
+                    &log,
+                    &dirs,
+                    Duration::from_millis(10),
+                    &store,
+                    &bus,
+                    &control,
+                    &stop,
+                );
+            })
+        }
+
+        fn present(&self) -> Vec<String> {
+            let guard = self.store.lock().unwrap();
+            let mut names: Vec<String> = guard
+                .roster_present()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.display_name)
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// Wait for the table to say `want`, or give up and let the assertion
+        /// report what it really said.
+        fn settle(&self, want: &[&str]) -> Vec<String> {
+            for _ in 0..300 {
+                let now = self.present();
+                if now.iter().map(String::as_str).eq(want.iter().copied()) {
+                    return now;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.present()
+        }
+    }
+
+    fn joined(t: &str, who: &str) -> String {
+        format!("2026.08.31 {t} Debug      -  [Behaviour] OnPlayerJoined {who}")
+    }
+
+    /// (a) A pause that swallows a world change. The log is still folded into
+    /// memory while writes are off — that part was always true — but nothing
+    /// ever put the table back in line with it, so the `roster_close_all` the
+    /// World line should have caused simply never happened and everybody from
+    /// the old instance stayed present forever. Pausing while changing
+    /// instances is the likeliest moment anybody ever pauses.
+    #[test]
+    fn a_world_change_swallowed_by_a_pause_is_applied_on_resume() {
+        let r = TailRig::new("pause-world");
+        r.append(&[
+            "2026.08.31 18:00:00 Debug      -  [Behaviour] Joining wrld_aaaaaaaa-0000-0000-0000-000000000000:11",
+            &joined("18:00:10", "Ines"),
+            &joined("18:00:20", "Kestrel"),
+        ]);
+        let handle = r.tail();
+        assert_eq!(r.settle(&["Ines", "Kestrel"]), vec!["Ines", "Kestrel"]);
+
+        // Pause, then change worlds. Nothing may be written while paused.
+        r.control.pause();
+        r.append(&[
+            "2026.08.31 18:30:00 Debug      -  [Behaviour] Joining wrld_bbbbbbbb-0000-0000-0000-000000000000:22",
+            &joined("18:30:10", "Mira"),
+        ]);
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(
+            r.present(),
+            vec!["Ines", "Kestrel"],
+            "paused means paused: the roster is a list of people and nothing about \
+             it may be written down"
+        );
+
+        r.control.resume();
+        let after = r.settle(&["Mira"]);
+        r.stop.stop();
+        handle.join().unwrap();
+
+        assert_eq!(
+            after,
+            vec!["Mira"],
+            "the old instance's roster is closed and the new one is recorded"
+        );
+        // Mira's row carries the moment she really arrived, not the moment the
+        // user un-paused. A roster that says otherwise is making a false claim
+        // about a person.
+        let guard = r.store.lock().unwrap();
+        let rows = guard.roster_present().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].joined_at_utc_ns,
+            local_stamp_to_utc_ns("2026.08.31 18:30:10").unwrap()
+        );
+        assert_eq!(rows[0].instance.as_deref(), Some("22"));
+    }
+
+    /// (b) The daemon was down while people left. `record_snapshot` wrote only
+    /// the present half of the replayed state, so a row for somebody who
+    /// departed meanwhile kept `left_at_utc_ns` NULL — permanently, since
+    /// nothing revisits an open row — and `person.edges` reads an open row as
+    /// *still here* through `COALESCE(left_at, now())`.
+    #[test]
+    fn people_who_left_while_the_daemon_was_down_stop_being_present() {
+        let r = TailRig::new("startup");
+        r.append(&[
+            "2026.08.31 18:00:00 Debug      -  [Behaviour] Joining wrld_aaaaaaaa-0000-0000-0000-000000000000:11",
+            &joined("18:00:10", "Ines"),
+            &joined("18:00:20", "Kestrel"),
+        ]);
+        let handle = r.tail();
+        assert_eq!(r.settle(&["Ines", "Kestrel"]), vec!["Ines", "Kestrel"]);
+        r.stop.stop();
+        handle.join().unwrap();
+
+        // The daemon is off. Ines leaves and Mira arrives; nobody is watching.
+        r.append(&[
+            "2026.08.31 19:00:00 Debug      -  [Behaviour] OnPlayerLeft Ines",
+            &joined("19:05:00", "Mira"),
+        ]);
+
+        // It comes back and replays the log from the top.
+        let stop = Arc::new(RosterStop::default());
+        let restarted = TailRig {
+            dir: r.dir.clone(),
+            log: r.log.clone(),
+            store: Arc::clone(&r.store),
+            bus: Arc::clone(&r.bus),
+            control: Arc::clone(&r.control),
+            stop: Arc::clone(&stop),
+        };
+        let handle = restarted.tail();
+        let after = restarted.settle(&["Kestrel", "Mira"]);
+        stop.stop();
+        handle.join().unwrap();
+        std::mem::forget(restarted); // the original rig owns the directory
+
+        assert_eq!(
+            after,
+            vec!["Kestrel", "Mira"],
+            "Ines left while nobody was watching and her row has to close"
+        );
+        let guard = r.store.lock().unwrap();
+        let ines = guard
+            .roster_between(0, i64::MAX)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.display_name == "Ines")
+            .expect("her presence is still on record, just not open");
+        assert!(
+            ines.left_at_utc_ns.is_some(),
+            "an open row grows shared time forever; that is the whole bug"
+        );
+        // Kestrel never left, so his row is untouched — same id, same stamp.
+        let kestrel = guard
+            .roster_present()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.display_name == "Kestrel")
+            .unwrap();
+        assert_eq!(
+            kestrel.joined_at_utc_ns,
+            local_stamp_to_utc_ns("2026.08.31 18:00:20").unwrap(),
+            "somebody who stayed keeps the moment they actually arrived"
+        );
     }
 
     #[test]

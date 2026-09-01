@@ -368,10 +368,21 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         let dir = data_dir.to_path_buf();
         let models = models_dir.clone();
         let control = Arc::clone(&control);
+        let sweeper_bus = Arc::clone(&bus);
         let stop = Arc::clone(&sweeper_stop);
         std::thread::Builder::new()
             .name("recalld-sweeper".into())
-            .spawn(move || retention::run(&retention_cfg, store, dir, models, control, stop))
+            .spawn(move || {
+                retention::run(
+                    &retention_cfg,
+                    store,
+                    dir,
+                    models,
+                    control,
+                    sweeper_bus,
+                    stop,
+                )
+            })
             .map_err(|e| warn!("no retention sweeper: {e}"))
             .ok()
     } else {
@@ -426,6 +437,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         lang_mismatch = analysis_stats.lang_mismatch.load(Ordering::Relaxed),
         dropped_buffers = queue.dropped_chunks(),
         dropped_seconds = queue.dropped_samples() as f32 / SAMPLE_RATE as f32,
+        gaps_discarded = stats.gaps_discarded.load(Ordering::Relaxed),
         "stopped"
     );
     result
