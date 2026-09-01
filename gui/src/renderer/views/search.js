@@ -10,7 +10,21 @@ import { toast } from '../lib/sheets.js';
 export const id = 'search';
 
 // Facet state outlives the view so switching away and back keeps the query.
-const facetState = { q: '', speaker: '', source: '', from: '', to: '' };
+// Default window: the last week through today. Memory refresh is almost always
+// "recently" — an open-ended range made every first search scan all of history.
+function isoDay(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+const facetState = {
+  q: '',
+  speaker: '',
+  source: '',
+  from: isoDay(new Date(Date.now() - 7 * 86400e3)),
+  to: isoDay(new Date()),
+};
 let lastHits = [];
 
 export function mount(root, ctx) {

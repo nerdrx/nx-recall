@@ -118,11 +118,27 @@ export async function reloadSpeakers() {
  *    status:bool, ops:bool}
  * Unknown event types return null — PROTOCOL "Versioning rules".
  */
-export function applyEvent(evt) {
+// A freshly MINTED voice reaches clients only inside the segment that minted
+// it — there is no relabel broadcast for coming into existence — so an unknown
+// speaker id on a segment is the cue to re-pull the list. Debounced: a burst
+// of segments from a new voice costs one query.
+let speakerRefresh = null;
+function noteUnknownSpeaker(id, onDone) {
+  if (id == null || store.speakers.has(id) || speakerRefresh) return;
+  speakerRefresh = setTimeout(() => {
+    speakerRefresh = null;
+    reloadSpeakers()
+      .then(() => onDone?.())
+      .catch(() => {});
+  }, 250);
+}
+
+export function applyEvent(evt, opts = {}) {
   const d = evt?.data;
   switch (evt?.ev) {
     case 'segment': {
       if (!d || d.id == null) return null;
+      noteUnknownSpeaker(d.speaker, opts.onSpeakersChanged);
       const known = store.segById.get(d.id);
       if (known) {
         Object.assign(known, d);

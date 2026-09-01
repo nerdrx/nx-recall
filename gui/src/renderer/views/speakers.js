@@ -281,6 +281,11 @@ export function mount(root, ctx) {
 
   function update(change) {
     if (!change) return;
+    if (change.speakers) {
+      // The store just re-pulled speakers.list (a voice was minted mid-view).
+      renderList();
+      renderBanner();
+    }
     if (change.relabel || change.merged) {
       renderBanner();
       renderList();

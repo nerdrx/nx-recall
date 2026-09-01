@@ -10,6 +10,7 @@
 
 import { app, BrowserWindow, Tray, Menu, nativeImage } from 'electron';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { RecallClient, defaultSocketPath } from './client.js';
 import { registerIpc, broadcast } from './ipc.js';
@@ -309,6 +310,15 @@ async function bootstrap() {
 // One GUI per machine: a second copy would open a second socket connection and
 // a second tray icon, and the person double-clicking the icon wants the window
 // they already have.
+//
+// Exception: a test-driven instance (NX_RECALL_E2E is set, even to 0). The lock
+// lives in userData, so pointing userData at a scratch dir both frees the lock
+// and keeps test state out of the real profile — without it, the headless suite
+// silently exits whenever the installed app is running, which is exactly when a
+// developer is most likely to run it.
+if (process.env.NX_RECALL_E2E !== undefined) {
+  app.setPath('userData', join(tmpdir(), `nx-recall-e2e-${process.pid}`));
+}
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {

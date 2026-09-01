@@ -183,7 +183,12 @@ window.recall.onState((st) => {
 
 window.recall.onEvent((evt) => {
   if (typeof evt?.seq === 'number') store.conn.seq = evt.seq;
-  const change = applyEvent(evt);
+  const change = applyEvent(evt, {
+    onSpeakersChanged() {
+      renderBadges();
+      current?.update?.({ speakers: true });
+    },
+  });
   if (!change) {
     renderFooter();
     return;

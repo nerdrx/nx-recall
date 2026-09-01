@@ -198,12 +198,21 @@ export function startMock({ sockPath = defaultMockSocket(), feedMs = 2000, seqSt
     if (state.paused) return;
     const [sp, text, overlap, score] = CANNED_LINES[state.feedIdx % CANNED_LINES.length];
     state.feedIdx += 1;
+    // A voice the client has never seen gets minted mid-session: there is no
+    // relabel broadcast for coming into existence, only this segment. The GUI
+    // shipped a bug (speakers view frozen at connect-time state) because the
+    // mock never exercised this — now it always does, early in the feed.
+    let mintedSpeaker = null;
+    if (state.feedIdx === 4 && !state.speakers.some((s) => s.id === 77)) {
+      mintedSpeaker = { id: 77, name: null, auto: 'Speaker_77', segments: 0, total_ms: 0 };
+      state.speakers.push(mintedSpeaker);
+    }
     const now = Date.now();
     const seg = {
       id: state.nextSegId++,
       session: SESSIONS[2].id,
       source: state.feedIdx % 6 === 5 ? 'Discord' : 'VRChat.exe',
-      speaker: overlap > 0.1 ? null : sp,
+      speaker: mintedSpeaker ? 77 : overlap > 0.1 ? null : sp,
       text,
       t_ms: now,
       t_ns: String(now) + '000000',

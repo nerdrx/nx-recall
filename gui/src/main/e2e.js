@@ -149,6 +149,21 @@ export function runE2E(deps) {
       return { rows, headline };
     });
 
+    // A voice minted after connect must appear without a view remount — the
+    // mock mints Speaker_77 on its 4th feed tick, which has fired by now.
+    await step('minted-voice-appears', async () => {
+      const found = await waitFor(
+        'the minted voice in the list',
+        async () =>
+          js(
+            '[...document.querySelectorAll("#speaker-list .sp-row")].some(r => r.textContent.includes("Speaker_77"))'
+          ),
+        { timeout: 15000 }
+      );
+      assert(found, 'Speaker_77 was minted mid-feed but never appeared in the speakers view');
+      return { found };
+    });
+
     await step('shot-speakers', async () => ({ file: await shot('speakers') }));
 
     // 7 — inline rename through the real UI, then the retroactive broadcast
