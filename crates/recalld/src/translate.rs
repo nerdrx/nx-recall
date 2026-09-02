@@ -171,6 +171,11 @@ struct Live {
     to: String,
     read: Vec<String>,
     display: String,
+    /// 0.11.0. Here rather than read from the worker's `AssistConfig` snapshot
+    /// for the same reason the other three are: `pipeline::write_segment` has
+    /// no `AssistConfig` in scope at all, and threading one down the capture
+    /// path to spell one integer would be a worse trade than this static.
+    min_words: usize,
 }
 
 impl Live {
@@ -179,6 +184,7 @@ impl Live {
             to: String::new(),
             read: Vec::new(),
             display: String::new(),
+            min_words: 3,
         }
     }
 }
@@ -189,7 +195,20 @@ fn live() -> Live {
 
 /// Point the daemon at a target language. `""` switches translation off.
 pub fn set_target(tag: &str) {
-    LIVE.write().unwrap_or_else(|p| p.into_inner()).to = tag.trim().to_ascii_lowercase();
+    let tag = tag.trim().to_ascii_lowercase();
+    let changed = {
+        let mut live = LIVE.write().unwrap_or_else(|p| p.into_inner());
+        let changed = live.to != tag;
+        live.to = tag;
+        changed
+    };
+    if changed {
+        // 0.11.0: turns queued for the old target are not turns anybody asked
+        // to see in the new one, and translating them would put a line in a
+        // language nobody chose under a transcript row. They keep their NULL
+        // `translation_via`, so the ordinary pass re-offers them.
+        clear_live();
+    }
 }
 
 /// The configured target, or `""` when translation is off.
@@ -251,6 +270,7 @@ pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     adopt(&AssistConfig::default());
+    clear_live();
     guard
 }
 
@@ -259,7 +279,260 @@ pub fn adopt(cfg: &AssistConfig) {
     set_target(&cfg.translate_to);
     set_read_languages(&cfg.read_languages);
     set_display(&cfg.translation_display);
+    LIVE.write().unwrap_or_else(|p| p.into_inner()).min_words = cfg.translate_min_words.max(1);
 }
+
+/// `[assist] translate_min_words`, live like the other three.
+pub fn min_words() -> usize {
+    live().min_words.max(1)
+}
+
+// ---- 0.11.0, the line that is on screen now --------------------------------
+//
+// Until 0.11.0 a foreign turn waited for the assistant's fair-share pass, and
+// that pass yields to the enrichment queue for `assist::SHARE_EVERY_S` — five
+// minutes — every time it runs. So the honest description of 0.10.2's
+// translation was "some time in the next five minutes, if nothing else is
+// queued". The user watched a French line sit untranslated for exactly that
+// reason, which is half of why this version exists.
+//
+// The fix is not a shorter share. A digest is for tomorrow morning and a
+// translation is for the sentence somebody is reading *now*: they are not the
+// same kind of work and they should not queue behind one another. So a turn
+// committed in a language the reader does not have goes onto a small queue of
+// its own, the worker is woken, and that queue is drained **before** the gate's
+// fair-share arithmetic is even consulted. The gates that are about the machine
+// rather than about fairness — paused, and a capture backlog — still apply
+// unchanged: a paused daemon writes nothing, including this.
+
+/// How many turns may be waiting for a live translation at once.
+///
+/// Small on purpose. This queue is "what is on screen", and a lobby that
+/// produced more than sixty-four untranslated turns while the model was busy is
+/// a lobby whose oldest entry is scrollback, not a caption. Past the cap the
+/// **oldest** is dropped — the newest line is the one somebody is reading — and
+/// nothing is lost for good: the row keeps its NULL `translation_via`, so the
+/// ordinary fair-share pass still picks it up.
+pub const LIVE_CAP: usize = 64;
+
+/// The word floor for a line the detector was **confident** about.
+///
+/// Three words is the ordinary floor, and it is right for the fair-share pass:
+/// "ja klar" translated is "yeah sure". It is wrong for a live caption, because
+/// a two-word French line is still a line the reader cannot read. Two, and only
+/// when the language was named confidently — "Ja." style one-worders stay out
+/// at any confidence, and an unconfident two-word guess is exactly the shape
+/// that turns out to be a name.
+pub const LIVE_MIN_WORDS_CONFIDENT: usize = 2;
+
+static LIVE_QUEUE: std::sync::LazyLock<std::sync::Mutex<std::collections::VecDeque<i64>>> =
+    std::sync::LazyLock::new(Default::default);
+static LIVE_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn live_queue() -> std::sync::MutexGuard<'static, std::collections::VecDeque<i64>> {
+    LIVE_QUEUE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Turns dropped from the front of the queue because it was full.
+pub fn live_dropped() -> u64 {
+    LIVE_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many turns are waiting. For `status` and for the tests.
+pub fn live_queued() -> usize {
+    live_queue().len()
+}
+
+/// Put a turn at the back of the live queue and wake the worker.
+///
+/// Idempotent against itself: a segment already waiting is not queued twice,
+/// which matters because `write_segment` publishes a segment more than once in
+/// some paths and each publish would otherwise cost a model call.
+pub fn push_live(segment_id: i64) {
+    {
+        let mut q = live_queue();
+        if q.contains(&segment_id) {
+            return;
+        }
+        while q.len() >= LIVE_CAP {
+            q.pop_front();
+            LIVE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        q.push_back(segment_id);
+    }
+    crate::assist::wake();
+}
+
+/// Take the oldest waiting turn, if there is one.
+pub fn take_live() -> Option<i64> {
+    live_queue().pop_front()
+}
+
+/// Empty the queue. Tests, and `set_target("")` — a target that changed while
+/// turns were waiting would translate them into the language nobody asked for.
+pub fn clear_live() {
+    live_queue().clear();
+}
+
+/// Should this committed turn be translated **now**? If so, queue it.
+///
+/// Called from `pipeline::write_segment` with the store lock already held, once
+/// per committed segment. Everything it does is either a read or the one write
+/// 0.10.2 already made from the fair-share pass — a confident guess stamped
+/// onto `segments.lang` with `lang_via = "guessed"` — so a client that queries
+/// the row a millisecond later sees the same language the queue decided on.
+///
+/// Returns the tag it queued the turn under, for the tests and the log.
+pub fn queue_live(store: &Store, segment_id: i64) -> Option<&'static str> {
+    if !enabled() {
+        return None;
+    }
+    let row = match store.segment_row(segment_id) {
+        Ok(Some(row)) => row,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!(
+                segment_id,
+                "could not read a segment back to translate it: {e:#}"
+            );
+            return None;
+        }
+    };
+    if row.translation_via.is_some() {
+        return None; // already looked at
+    }
+    let text = row.text.as_deref().unwrap_or_default();
+    let n_words = crate::asr::normalise_words(text).len();
+    if n_words == 0 {
+        return None;
+    }
+
+    // What language it is in, and how sure. A stamped row is taken at its word
+    // — the model, the classifier or the conversational prior put it there and
+    // all three know more than a guess does. Only an unstamped row is guessed
+    // at, which is the same asymmetry the fair-share pass uses: a mumbled
+    // German line and a French line are the same NULL, and the guesser naming
+    // one of them is the only thing that separates them.
+    let (tag, confident) = match row.lang.as_deref() {
+        Some(stamped) => {
+            // A tag outside the guessable set — `de`, `en`, or something a
+            // client wrote. If it is not one the reader has, the ordinary pass
+            // will still take it; the live queue only carries what this daemon
+            // can name for itself.
+            let tag = crate::lang::GUESSABLE.iter().find(|t| **t == stamped)?;
+            (*tag, true)
+        }
+        None => {
+            let g = crate::lang::guess_other(text)?;
+            if g.confident
+                && let Err(e) =
+                    store.set_segment_language(segment_id, g.tag, crate::store::lang_via::GUESSED)
+            {
+                warn!(segment_id, "could not stamp a guessed language: {e:#}");
+            }
+            (g.tag, g.confident)
+        }
+    };
+
+    let floor = if confident {
+        min_words().min(LIVE_MIN_WORDS_CONFIDENT)
+    } else {
+        min_words()
+    };
+    if n_words < floor {
+        return None;
+    }
+
+    // A language the reader already has — `read_languages` plus the target,
+    // plus whatever their own voice is declared to speak — is not a language to
+    // translate out of, whatever the target is.
+    if read_languages().iter().any(|s| s == tag) {
+        return None;
+    }
+    match store.your_languages() {
+        Ok(mine) => {
+            if mine.iter().any(|s| s == tag) {
+                return None;
+            }
+        }
+        Err(e) => warn!(segment_id, "could not read your own languages: {e:#}"),
+    }
+
+    debug!(segment_id, lang = tag, "queued for a live translation");
+    push_live(segment_id);
+    Some(tag)
+}
+
+/// Drain the live queue. `Ok(true)` means there was work.
+///
+/// One model call per line, and the same lock discipline as [`batch`]: read
+/// under the lock, ask without it, commit under it, publish. The gate is
+/// re-checked between lines so a pause lands within one translation rather than
+/// within one batch.
+pub fn drain_live(
+    store: &Arc<std::sync::Mutex<Store>>,
+    control: &Arc<Control>,
+    bus: &Bus,
+    llm: &Llm,
+    stop: &dyn Fn() -> bool,
+) -> Result<bool> {
+    let to = target();
+    if to.is_empty() {
+        clear_live();
+        return Ok(false);
+    }
+    let mut worked = false;
+    while let Some(id) = take_live() {
+        if stop() || crate::enrich::gate(control, &control.graph()).is_some() {
+            // Put it back: the daemon paused, it did not decide.
+            live_queue().push_front(id);
+            break;
+        }
+        let text = {
+            let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+            match guard.segment_row(id)? {
+                Some(row) if row.translation_via.is_none() => row.text.unwrap_or_default(),
+                // Translated, declined or deleted while it waited.
+                _ => continue,
+            }
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        worked = true;
+
+        // ---- ask (no lock) ----
+        let tuned = llm.with_threads(control.graph().llm_threads);
+        let verdict = match ask(&tuned, &text, &to) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(segment = id, "a live translation failed: {e:#}");
+                continue;
+            }
+        };
+
+        // ---- commit (lock held, no model) ----
+        {
+            let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+            match &verdict {
+                Verdict::Translated(text) => {
+                    guard.set_segment_translation(id, text, tuned.model_id())?
+                }
+                other => {
+                    debug!(segment = id, ?other, "no live translation for this turn");
+                    guard.mark_translation_declined(id, tuned.model_id())?;
+                }
+            }
+        }
+        if matches!(verdict, Verdict::Translated(_)) {
+            let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+            crate::pipeline::publish_segment(bus, &guard, id);
+        }
+    }
+    Ok(worked)
+}
+
+// ---- end 0.11.0 ------------------------------------------------------------
 
 /// What the pass concluded about one turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -883,7 +1156,222 @@ mod tests {
         );
     }
 
+    // ---- 0.11.0, the live queue --------------------------------------------
+
+    #[test]
+    fn a_turn_the_reader_cannot_read_is_queued_the_moment_it_is_committed() {
+        let _live = test_guard();
+        set_target("en");
+        set_read_languages(&["de".to_string(), "en".to_string()]);
+        let (store, ids) = store_with(&[
+            // The line the user watched sit there. No stamp, no French function
+            // word, three words — 0.10.2 could not even name it.
+            ("Tu arrêtes appartement.", None),
+            // German and English: never queued, whatever else is true.
+            ("das ist der einzige weg das zu machen", Some("de")),
+            ("i think that is the only way to do it", Some("en")),
+            // A mumble nothing can name.
+            ("mhm ne warte kurz", None),
+        ]);
+        assert_eq!(queue_live(&store, ids[0]), Some("fr"));
+        assert_eq!(queue_live(&store, ids[1]), None);
+        assert_eq!(queue_live(&store, ids[2]), None);
+        assert_eq!(queue_live(&store, ids[3]), None);
+        assert_eq!(live_queued(), 1);
+        assert_eq!(take_live(), Some(ids[0]));
+
+        // …and the guess was written onto the row, so the transcript event the
+        // hook is about to publish already says `fr`.
+        let row = store.segment_row(ids[0]).unwrap().unwrap();
+        assert_eq!(row.lang.as_deref(), Some("fr"));
+        assert_eq!(
+            row.lang_via.as_deref(),
+            Some(crate::store::lang_via::GUESSED)
+        );
+    }
+
+    #[test]
+    fn a_two_word_line_is_live_only_when_the_language_was_named_confidently() {
+        let _live = test_guard();
+        set_target("en");
+        // Two words, and the detector is sure: a Polish character no other
+        // language in the set writes. The reader cannot read it, so it goes —
+        // the fair-share pass's three-word floor is about not spending a model
+        // call on "ja klar", not about hiding short lines from the reader.
+        let (store, ids) = store_with(&[
+            ("Dziękuję bardzo", None),
+            // Two words and nothing names them at all.
+            ("okay cool", None),
+        ]);
+        assert_eq!(queue_live(&store, ids[0]), Some("pl"));
+        assert_eq!(queue_live(&store, ids[1]), None);
+        assert_eq!(live_queued(), 1);
+        clear_live();
+
+        // One word stays out at any confidence: `LIVE_MIN_WORDS_CONFIDENT` is
+        // two, not one, and "Ja." is not a caption.
+        let (store, ids) = store_with(&[("Dziękuję", None)]);
+        assert_eq!(queue_live(&store, ids[0]), None);
+        assert_eq!(live_queued(), 0);
+    }
+
+    #[test]
+    fn the_queue_is_bounded_and_drops_the_oldest_line_not_the_newest() {
+        let _live = test_guard();
+        clear_live();
+        let before = live_dropped();
+        for id in 1..=(LIVE_CAP as i64 + 5) {
+            push_live(id);
+        }
+        assert_eq!(live_queued(), LIVE_CAP, "the cap holds");
+        assert_eq!(live_dropped() - before, 5, "and the drops are counted");
+        // The oldest five went, so the front is now the sixth.
+        assert_eq!(take_live(), Some(6));
+        // A turn already waiting is not queued twice — `write_segment` can
+        // publish one segment more than once, and each would be a model call.
+        clear_live();
+        push_live(7);
+        push_live(7);
+        assert_eq!(live_queued(), 1);
+    }
+
+    #[test]
+    fn turns_queued_for_one_target_are_not_translated_into_another() {
+        let _live = test_guard();
+        set_target("en");
+        push_live(1);
+        push_live(2);
+        assert_eq!(live_queued(), 2);
+        set_target("de");
+        assert_eq!(live_queued(), 0, "a changed target empties the queue");
+        // Setting the same target again is not a change and does not clear.
+        push_live(3);
+        set_target("de");
+        assert_eq!(live_queued(), 1);
+        // Switching translation off clears it too.
+        set_target("");
+        assert_eq!(live_queued(), 0);
+    }
+
+    #[test]
+    fn a_turn_already_looked_at_is_never_queued_again() {
+        let _live = test_guard();
+        set_target("en");
+        let (store, ids) = store_with(&[("Tu arrêtes appartement.", None)]);
+        assert_eq!(queue_live(&store, ids[0]), Some("fr"));
+        clear_live();
+        store.mark_translation_declined(ids[0], "q@1").unwrap();
+        assert_eq!(
+            queue_live(&store, ids[0]),
+            None,
+            "declined is a decision, not a gap"
+        );
+        assert_eq!(live_queued(), 0);
+    }
+
+    #[test]
+    fn translation_switched_off_queues_nothing_at_all() {
+        let _live = test_guard();
+        assert!(!enabled(), "the shipped value");
+        let (store, ids) = store_with(&[("Tu arrêtes appartement.", None)]);
+        assert_eq!(queue_live(&store, ids[0]), None);
+        // …and the row is left completely alone: no language stamped by a
+        // feature that is switched off.
+        assert_eq!(store.segment_row(ids[0]).unwrap().unwrap().lang, None);
+    }
+
     // ---- against the real model --------------------------------------------
+
+    #[test]
+    fn a_live_translation_reaches_the_transcript_in_seconds() {
+        // The measurement behind FINDINGS §21 and PROTOCOL 0.11.0: the wall
+        // clock from the hook `pipeline::write_segment` calls to the `segment`
+        // event that carries the translation. Everything between those two
+        // points is this feature; the model call inside it is the cost.
+        let Some(root) = std::env::var("NXR_GRAPH_MODELS")
+            .ok()
+            .filter(|s| !s.is_empty())
+        else {
+            eprintln!("skipping the live-translation latency: set NXR_GRAPH_MODELS=<models dir>");
+            return;
+        };
+        let Some(llm) = Llm::resolve(
+            std::path::Path::new(&root),
+            &crate::config::GraphConfig::default(),
+            &crate::config::RuntimeConfig::default(),
+        ) else {
+            panic!("NXR_GRAPH_MODELS has no qwen gguf and llama/llama-cli");
+        };
+
+        let _live = test_guard();
+        set_target("en");
+        set_read_languages(&["de".to_string(), "en".to_string()]);
+        let lines: &[(&str, Option<&str>)] = &[
+            ("Tu arrêtes appartement.", None),
+            (
+                "je ne sais pas ce que c'est mais il est dans la boîte",
+                None,
+            ),
+            ("Dziękuję bardzo za wszystko", None),
+            ("mesto ma mnoho obyvatel", None),
+            ("staden har många invånare", None),
+        ];
+        let (store, ids) = store_with(lines);
+        let control = Control::new(
+            std::path::PathBuf::from("/nonexistent"),
+            None,
+            &crate::allowlist::Allowlist::from_rules([("VRChat.exe", true)]),
+        );
+        control.set_graph_enabled(true);
+        let bus = Bus::new(64, 64);
+        let (client, rx) = bus.attach(None);
+        client.subscribe(&crate::bus::Topic::ALL);
+        let store = Arc::new(std::sync::Mutex::new(store));
+
+        let mut waits = Vec::new();
+        for id in &ids {
+            let queued = {
+                let guard = store.lock().unwrap();
+                queue_live(&guard, *id)
+            };
+            let Some(tag) = queued else {
+                panic!("segment {id} was not recognised as foreign");
+            };
+            let started = std::time::Instant::now();
+            drain_live(&store, &control, &bus, &llm, &|| false).unwrap();
+            // The event, not the row: the number that matters is when a client
+            // could have drawn the caption.
+            let mut seen = false;
+            while let Ok(bytes) = rx.try_recv() {
+                let v: Value = serde_json::from_slice(&bytes).unwrap();
+                if v["data"]["id"] == serde_json::json!(id)
+                    && v["data"]["translation"]["text"].is_string()
+                {
+                    seen = true;
+                }
+            }
+            let took = started.elapsed();
+            eprintln!(
+                "  {tag} -> en in {:.2}s{}",
+                took.as_secs_f64(),
+                if seen { "" } else { " (declined)" }
+            );
+            if seen {
+                waits.push(took);
+            }
+        }
+        assert!(
+            !waits.is_empty(),
+            "the model translated none of five foreign lines"
+        );
+        waits.sort();
+        let median = waits[waits.len() / 2];
+        eprintln!(
+            "live translation latency: median {:.2}s over {} lines",
+            median.as_secs_f64(),
+            waits.len()
+        );
+    }
 
     #[test]
     fn the_real_model_translates_a_line_and_does_not_answer_it() {

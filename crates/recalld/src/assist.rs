@@ -22,9 +22,22 @@
 //!
 //! ## Order within the tick
 //!
-//! Digests first, then translations. A digest is one call per *conversation*
-//! and a translation is one per *turn*, so a backlog of translations would
-//! otherwise starve the digest of the model for as long as the backlog lasted.
+//! **Live translations, then digests, then the fair-share translation batch.**
+//!
+//! The middle two are 0.9.0's order and its reason stands: a digest is one call
+//! per *conversation* and a translation is one per *turn*, so a backlog of
+//! translations would otherwise starve the digest for as long as the backlog
+//! lasted.
+//!
+//! The first is 0.11.0. A turn committed in a language the reader cannot read
+//! goes onto `translate`'s live queue and rings [`wake`], and that queue is
+//! drained before [`gate`] is consulted at all — because `gate` contains the
+//! fair-share rule, and the fair-share rule can withhold the model for five
+//! minutes. Five minutes is nothing for a paragraph about last night and it is
+//! the difference between a caption and a footnote for the line on screen. The
+//! gates that are about the *machine* rather than about fairness — the model
+//! switched off, capture paused, a transcription backlog — are re-checked in
+//! full before the live pass runs, and between every line inside it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,6 +85,13 @@ impl AssistStats {
             "translated": self.translated.load(Ordering::Relaxed),
             "translation_declined": self.translation_declined.load(Ordering::Relaxed),
             "reminders_fired": self.reminders_fired.load(Ordering::Relaxed),
+            // 0.11.0. Not a stored fact like the others, so it is read from the
+            // queue rather than from the rows: how many turns are waiting for a
+            // live translation, and how many were dropped because more arrived
+            // than `translate::LIVE_CAP`. A number that climbs means the model
+            // is slower than the lobby is talking.
+            "live_queued": crate::translate::live_queued(),
+            "live_dropped": crate::translate::live_dropped(),
         })
     }
 }
@@ -116,6 +136,51 @@ pub fn gate(store: &Arc<std::sync::Mutex<Store>>, control: &Arc<Control>) -> Opt
 /// passes while it has work of its own.
 pub const SHARE_EVERY_S: i64 = 300;
 
+// ---- 0.11.0, waking on demand ----------------------------------------------
+//
+// The worker used to sleep `batch_pause_s` between looks, which is fine for
+// work that is for tomorrow morning and useless for a caption. A committed turn
+// in a language the reader cannot read now *rings this bell* — see
+// `translate::push_live` — and the sleep below ends the moment it does.
+//
+// A condvar rather than a channel because the thing being signalled is "look
+// again", not "here is an item": the item is in `translate`'s queue, and two
+// turns arriving during one model call must be one wake-up, not two.
+
+static WAKE: std::sync::LazyLock<(std::sync::Mutex<bool>, std::sync::Condvar)> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Tell the worker to look now rather than at the end of its sleep.
+///
+/// Sticky: a wake that arrives while the worker is busy is remembered, so the
+/// turn it was rung for cannot sit through a whole `batch_pause_s` because it
+/// arrived a microsecond before the worker went back to sleep.
+pub fn wake() {
+    let (lock, cv) = &*WAKE;
+    *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+    cv.notify_all();
+}
+
+/// Sleep until woken, stopped, or `pause` has passed. `true` if it was woken.
+fn wait_for_work(pause: Duration, stop: &AssistStop) -> bool {
+    let (lock, cv) = &*WAKE;
+    let mut rung = lock.lock().unwrap_or_else(|p| p.into_inner());
+    let deadline = std::time::Instant::now() + pause;
+    while !*rung && !stop.stopped() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        // Capped so a `stop` that arrives without a wake is still noticed
+        // promptly — the same 200 ms the old sleep loop checked at.
+        let (guard, _) = cv
+            .wait_timeout(rung, left.min(Duration::from_millis(200)))
+            .unwrap_or_else(|p| p.into_inner());
+        rung = guard;
+    }
+    std::mem::replace(&mut *rung, false)
+}
+
 /// The background thread. Started whether or not anything here is enabled: all
 /// three switches are live, so something has to be watching them.
 #[allow(clippy::too_many_arguments)]
@@ -150,17 +215,47 @@ pub fn run(
         }
         let graph = control.graph();
         let mut worked = false;
+        let resolve = |llm: &mut Option<Llm>, resolved_for: &mut Option<(String, String)>| {
+            let key = (graph.llm_model.clone(), graph.llama_dir.clone());
+            if resolved_for.as_ref() != Some(&key) || llm.is_none() {
+                *llm = models_root
+                    .as_deref()
+                    .and_then(|root| Llm::resolve(root, &graph, &runtime));
+                *resolved_for = Some(key);
+            }
+        };
+
+        // ---- 0.11.0: the live queue, before anything else ------------------
+        //
+        // Ahead of `gate` on purpose, and it is the one ordering decision in
+        // this file worth arguing about. `gate` is two different things wearing
+        // one name: the machine's rules (the model is off, capture is paused,
+        // the transcription queue is backed up) and the *fairness* rule that
+        // hands the enrichment queue five minutes at a time. A translation of
+        // the line on screen must obey the first and must not wait on the
+        // second — a caption that arrives after the conversation has moved on
+        // is not a caption. So the machine's rules are re-checked here in full,
+        // via `enrich::gate` and the same `graph.enabled` switch `gate` reads,
+        // and only the fair share is skipped.
+        if graph.enabled
+            && crate::translate::enabled()
+            && crate::translate::live_queued() > 0
+            && crate::enrich::gate(&control, &graph).is_none()
+        {
+            resolve(&mut llm, &mut resolved_for);
+            if let Some(llm) = llm.as_ref() {
+                match crate::translate::drain_live(&store, &control, &bus, llm, &stopped) {
+                    Ok(did) => worked |= did,
+                    Err(e) => warn!("a live translation pass failed: {e:#}"),
+                }
+                refresh(&store, &cfg, &stats);
+            }
+        }
 
         if let Some(reason) = gate(&store, &control) {
             debug!("the assistant worker is standing down: {reason}");
         } else {
-            let key = (graph.llm_model.clone(), graph.llama_dir.clone());
-            if resolved_for.as_ref() != Some(&key) || llm.is_none() {
-                llm = models_root
-                    .as_deref()
-                    .and_then(|root| Llm::resolve(root, &graph, &runtime));
-                resolved_for = Some(key);
-            }
+            resolve(&mut llm, &mut resolved_for);
             match llm.as_ref() {
                 None => {
                     if !said_unavailable {
@@ -199,18 +294,11 @@ pub fn run(
         }
 
         let pause = Duration::from_secs(cfg.batch_pause_s.max(1));
-        let step = Duration::from_millis(200);
-        let mut slept = Duration::ZERO;
         // A worker that did something looks again sooner: a backlog should
         // drain at the pace of the model, not at the pace of the sleep.
         let pause = if worked { pause / 2 } else { pause };
-        while slept < pause {
-            if stop.stopped() {
-                break;
-            }
-            std::thread::sleep(step);
-            slept += step;
-        }
+        // …and a turn that needs translating now does not wait for either.
+        wait_for_work(pause, &stop);
     }
 }
 
@@ -351,6 +439,83 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_that_needs_translating_now_does_not_wait_out_the_sleep() {
+        let stop = AssistStop::default();
+        // Nothing rang: the sleep runs its course and says so.
+        let t = std::time::Instant::now();
+        assert!(!wait_for_work(Duration::from_millis(120), &stop));
+        assert!(t.elapsed() >= Duration::from_millis(100), "it did sleep");
+
+        // A wake that arrives *before* the wait is remembered rather than
+        // missed — which is the whole race: the turn is committed on the
+        // capture thread while this one is still finishing a model call.
+        wake();
+        let t = std::time::Instant::now();
+        assert!(wait_for_work(Duration::from_secs(30), &stop));
+        assert!(t.elapsed() < Duration::from_secs(1), "it woke at once");
+
+        // And the bell is cleared by the wake it caused, not left ringing.
+        assert!(!wait_for_work(Duration::from_millis(50), &stop));
+
+        // A stopping worker does not sleep out its pause either.
+        stop.stop();
+        let t = std::time::Instant::now();
+        wait_for_work(Duration::from_secs(30), &stop);
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_live_queue_answers_to_the_machines_gates_and_not_to_the_fair_share() {
+        let (store, control) = rig();
+        control.set_graph_enabled(true);
+        let graph = control.graph();
+        // Nothing wrong with the machine: the live pass may run.
+        assert_eq!(crate::enrich::gate(&control, &graph), None);
+        // Now make the fair-share rule bite by pretending the assistant just
+        // had its turn while conversations wait. `gate` refuses…
+        {
+            let guard = store.lock().unwrap();
+            let src = guard.upsert_source("VRChat.exe", "VRChat", 0).unwrap();
+            let sess = guard.begin_session(src, 0).unwrap();
+            let a = guard.mint_speaker(0).unwrap();
+            for i in 0..4i64 {
+                let t = i * 5 * SEC;
+                let id = guard
+                    .insert_segment(sess, t, t + 3 * SEC, "x.wav", t)
+                    .unwrap();
+                guard
+                    .set_segment_analysis(
+                        id,
+                        &SegmentAnalysis {
+                            text: Some(format!("das ist der einzige weg {i}")),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                guard.set_segment_speaker(id, Some(a), Some(0.8)).unwrap();
+                crate::threads::assign(&guard, &GraphConfig::default(), id).unwrap();
+            }
+        }
+        control
+            .assist_stats
+            .last_pass_ns
+            .store(crate::clock::utc_now_ns(), Ordering::Relaxed);
+        assert!(
+            gate(&store, &control).is_some_and(|r| r.contains("commitments")),
+            "the fair share is in force"
+        );
+        // …and the live pass, which reads `enrich::gate` rather than `gate`,
+        // still runs. A digest is for tomorrow morning; a caption is not.
+        assert_eq!(crate::enrich::gate(&control, &control.graph()), None);
+
+        // Pause, though, stops both. There is no such thing as work a paused
+        // daemon may do.
+        control.pause();
+        assert!(crate::enrich::gate(&control, &control.graph()).is_some());
+        assert!(gate(&store, &control).is_some());
+    }
+
+    #[test]
     fn the_counters_are_read_back_from_the_rows() {
         let stats = AssistStats::default();
         let v = stats.to_json();
@@ -360,6 +525,8 @@ mod tests {
             "translated",
             "translation_declined",
             "reminders_fired",
+            "live_queued",
+            "live_dropped",
         ] {
             assert_eq!(v[key], json!(0), "{key}");
         }

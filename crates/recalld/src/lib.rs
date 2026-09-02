@@ -44,6 +44,10 @@ pub mod identity;
 pub mod identity_prior;
 pub mod ingest;
 pub mod lang;
+/// Generated character-trigram tables for [`lang::guess_by_trigram`] (0.11.0).
+/// Written by `spike/short_lang_bench.py --emit`; never edited by hand.
+#[rustfmt::skip]
+pub mod lang_ngrams;
 pub mod langctx;
 pub mod llm;
 pub mod models;

@@ -30,6 +30,23 @@
 //! Danish and a confident wrong stamp is worse than no stamp. The numbers
 //! behind both halves of that sentence are in `spike/guess_other_bench.py` and
 //! quoted on [`GUESSABLE`].
+//!
+//! ## The short line (0.11.0)
+//!
+//! That rule needs three function words, and it was measured on whole FLEURS
+//! sentences. A lobby turn is three to eight words and mostly content:
+//! "Tu arrêtes appartement." is French, has no French function word in it, and
+//! sat on the user's screen untranslated. `spike/short_lang_bench.py` re-measures
+//! the rule on 2-, 3-, 4- and 6-word fragments — the real distribution — and it
+//! recalls 33.8% of them.
+//!
+//! Two stages are added below the script check and above nothing:
+//! [`guess_by_diacritic`], a character only one shippable language writes, and
+//! [`guess_by_trigram`], a character-trigram model in `crate::lang_ngrams`.
+//! Together they take that 33.8% to 74.7% while the thing that must not happen
+//! — a German or English line handed to a translator — stays at 0.00–0.12% per
+//! fragment length against a gate of 0.5%. FINDINGS §21 has the per-language
+//! table and says which languages were refused which stage.
 
 /// What a transcript reads as. Deliberately four answers, not two: "I cannot
 /// tell" and "there are no words" are different facts, and neither is a
@@ -248,6 +265,28 @@ pub fn guess_other(text: &str) -> Option<OtherLang> {
             confident: true,
         });
     }
+    // 0.11.0, and the two stages are in this order for a reason. A character
+    // only one language writes is *evidence*, not a model: it cannot be beaten
+    // by a coincidence of frequencies, and it costs one pass over the string.
+    // The trigram model is last because it is the only stage that can be
+    // confidently wrong, and everything above it is cheaper and surer.
+    if let Some(tag) = guess_by_diacritic(text) {
+        return Some(OtherLang {
+            tag,
+            confident: true,
+        });
+    }
+    if let Some(g) = guess_by_stopwords(text) {
+        return Some(g);
+    }
+    guess_by_trigram(text).map(|tag| OtherLang {
+        tag,
+        confident: true,
+    })
+}
+
+/// The 0.10.2 vote, unchanged — three function words and an outright win.
+fn guess_by_stopwords(text: &str) -> Option<OtherLang> {
     let ws = words(text);
     if ws.is_empty() {
         return None;
@@ -284,6 +323,176 @@ pub fn guess_other(text: &str) -> Option<OtherLang> {
         confident: best >= CONFIDENT_VOTES,
     })
 }
+
+// ---- 0.11.0, the short line ------------------------------------------------
+//
+// The 0.10.2 rule above needs three function words. A VRChat turn is three to
+// eight words and mostly *content* — "Tu arrêtes appartement." has none at all —
+// so on the length a lobby actually speaks in, the shipped rule answers "I
+// cannot tell" more often than it answers. `spike/short_lang_bench.py` cuts
+// FLEURS test sentences into 2-, 3-, 4- and 6-word fragments and measures it:
+// 33.8% recall over every shippable language and length. The two stages below
+// take that to 74.7% with de/en false positives at 0.00–0.12% per length, under
+// a gate of 95% precision at *every* length — see FINDINGS §21.
+
+/// A character exactly one shippable language writes, when the line has one.
+///
+/// The whole stage is `crate::lang_ngrams::EXCLUSIVE`, and that table is
+/// generated from the corpus rather than written down, because the intuition is
+/// wrong about it in both directions. `ç` looks like the French stage's best
+/// evidence and is Turkish's commonest accent and Portuguese's second; `ø` looks
+/// Danish and is Norwegian too; `å` is three languages at once. Every one of
+/// those was in the first draft, and each cost its language the gate — Danish
+/// fell to 64.6% precision at two words, Swedish to 69.2%, French to 85.9%.
+/// What survives is `ãõ` `ýčěřůž` `ąćęłńśż` `ğış` and `ñ`.
+///
+/// Two guards on top of the table: the win must be **outright** — a line
+/// carrying one language's character and another's is answered "I cannot tell",
+/// never split — and the line must have two words, because one word with an
+/// accent in it is as likely to be a name as a sentence.
+pub fn guess_by_diacritic(text: &str) -> Option<&'static str> {
+    let low: String = text.chars().flat_map(char::to_lowercase).collect();
+    let mut hit: Option<&'static str> = None;
+    for (tag, chars) in crate::lang_ngrams::EXCLUSIVE {
+        if chars.chars().any(|c| low.contains(c)) {
+            if hit.is_some() {
+                return None; // two languages arguing
+            }
+            hit = Some(tag);
+        }
+    }
+    let tag = hit?;
+    if !crate::lang_ngrams::DIACRITIC_SHIP.contains(&tag) {
+        return None;
+    }
+    if words(text).len() < crate::lang_ngrams::MIN_WORDS {
+        return None;
+    }
+    Some(tag)
+}
+
+/// Lowercased letters and single spaces, padded with one space each end.
+///
+/// The padding is what makes the model see word *edges*: ` th` and `nt ` are
+/// most of what separates one language from another at this length, and without
+/// the pad a two-word fragment contributes none of them.
+fn ngram_text(text: &str) -> String {
+    let mut inner = String::new();
+    let mut prev_space = true;
+    for ch in text.chars().flat_map(char::to_lowercase) {
+        if ch.is_alphabetic() {
+            inner.push(ch);
+            prev_space = false;
+        } else if !prev_space {
+            inner.push(' ');
+            prev_space = true;
+        }
+    }
+    while inner.ends_with(' ') {
+        inner.pop();
+    }
+    if inner.is_empty() {
+        return String::new();
+    }
+    format!(" {inner} ")
+}
+
+/// A character's slot in [`crate::lang_ngrams::ALPHABET`], or 0 for one the
+/// tables never saw. A linear scan over ~75 characters, on strings of at most a
+/// few dozen: cheaper than the hash map that would replace it.
+fn ngram_index(ch: char) -> u32 {
+    crate::lang_ngrams::ALPHABET
+        .chars()
+        .position(|c| c == ch)
+        .map_or(0, |i| i as u32 + 1)
+}
+
+/// The line's trigrams, packed the way the generated tables are keyed.
+fn packed_trigrams(text: &str) -> Vec<u32> {
+    let norm = ngram_text(text);
+    let idx: Vec<u32> = norm.chars().map(ngram_index).collect();
+    let radix = crate::lang_ngrams::RADIX;
+    idx.windows(3)
+        .map(|w| (w[0] * radix + w[1]) * radix + w[2])
+        .collect()
+}
+
+/// Mean log-probability per trigram, per language.
+fn ngram_scores(packed: &[u32]) -> Vec<(&'static str, f32)> {
+    let scale = crate::lang_ngrams::LOG_SCALE;
+    crate::lang_ngrams::TABLES
+        .iter()
+        .map(|(tag, table)| {
+            let floor = crate::lang_ngrams::FLOORS
+                .iter()
+                .find(|(t, _)| t == tag)
+                .map_or(-10.0, |(_, f)| *f as f32 / scale);
+            let sum: f32 = packed
+                .iter()
+                .map(|k| match table.binary_search_by_key(k, |(key, _)| *key) {
+                    Ok(i) => table[i].1 as f32 / scale,
+                    Err(_) => floor,
+                })
+                .sum();
+            (*tag, sum / packed.len() as f32)
+        })
+        .collect()
+}
+
+/// The character-trigram model (FINDINGS §21). `None` unless one language wins
+/// by a margin, and the margin is what makes this safe.
+///
+/// The score is a *mean* over the line's trigrams, so its noise falls off as
+/// `1/sqrt(n)`: a margin loose enough to name a six-word line names German
+/// fragments at two words. Measured — a flat margin leaked 2.88% of the German
+/// and English two-word fragments to a translator, nearly six times the gate.
+/// So the margin is `A + B / sqrt(trigrams)`, which is that standard error with
+/// a price on it, and it is required **twice**: over the runner-up, and again
+/// over the better of German and English. The second one is not implied by the
+/// first — the languages this daemon must never mistake are not usually the
+/// runner-up, they are the two the reader already has.
+///
+/// German, English and Norwegian are in the tables and cannot win. The first
+/// two are the negatives; Norwegian is the 0.10.2 blocker doing the same job it
+/// does in the stopword vote — it has to be *able* to win so that its win can
+/// be refused, or every Norwegian line is answered "Danish".
+pub fn guess_by_trigram(text: &str) -> Option<&'static str> {
+    if words(text).len() < crate::lang_ngrams::MIN_WORDS {
+        return None;
+    }
+    let packed = packed_trigrams(text);
+    if packed.is_empty() {
+        return None;
+    }
+    let se = 1.0 / (packed.len() as f32).sqrt();
+    let mut best: (&'static str, f32) = ("", f32::NEG_INFINITY);
+    let mut runner = f32::NEG_INFINITY;
+    let mut deen = f32::NEG_INFINITY;
+    for (tag, score) in ngram_scores(&packed) {
+        if tag == "de" || tag == "en" {
+            deen = deen.max(score);
+        }
+        if score > best.1 {
+            runner = best.1;
+            best = (tag, score);
+        } else if score > runner {
+            runner = score;
+        }
+    }
+    if best.1 - runner < crate::lang_ngrams::MARGIN_A + crate::lang_ngrams::MARGIN_B * se {
+        return None;
+    }
+    if best.1 - deen < crate::lang_ngrams::MARGIN_DEEN_A + crate::lang_ngrams::MARGIN_DEEN_B * se {
+        return None;
+    }
+    if !crate::lang_ngrams::TRIGRAM_SHIP.contains(&best.0) {
+        // de, en, or the Norwegian blocker.
+        return None;
+    }
+    Some(best.0)
+}
+
+// ---- end 0.11.0 ------------------------------------------------------------
 
 /// The writing system, when there is one that settles the question.
 fn guess_by_script(text: &str) -> Option<&'static str> {
@@ -714,6 +923,200 @@ mod tests {
         assert!(GUESSABLE.contains(&"ar") && !offered("ar"));
         for tag in ["fr", "es", "ja", "ru"] {
             assert!(offered(tag) && GUESSABLE.contains(&tag), "{tag}");
+        }
+    }
+
+    // ---- 0.11.0, the short line -------------------------------------------
+
+    #[test]
+    fn the_line_that_started_this_is_french() {
+        // "Tu arrêtes appartement." — three words, not one of them a French
+        // function word, and 0.10.2 answered `None`. The trigram stage names
+        // it, and names it confidently enough to stamp the row.
+        let g = guess_other("Tu arrêtes appartement.").expect("a language");
+        assert_eq!(g.tag, "fr");
+        assert!(g.confident);
+    }
+
+    #[test]
+    fn the_two_languages_the_reader_has_are_still_never_guessed_at() {
+        // The gate the whole feature is priced on: 0.00–0.12% of German and
+        // English fragments per length. These are the two the user watched.
+        for text in [
+            "Ich hab das gestern gemacht",
+            "I did that yesterday",
+            // …and the shapes the new stages could plausibly break on: German
+            // with umlauts (NOT exclusive characters), English with a Romance
+            // loanword, and a two-word fragment of each.
+            "das wär schön gewesen",
+            "the cafe menu",
+            "ich glaube",
+            "not really",
+        ] {
+            assert_eq!(guess_other(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_character_only_one_language_writes_settles_a_short_line() {
+        // Two words each, and not a function word between them.
+        for (text, want) in [
+            ("Dziękuję bardzo", "pl"),  // ł ę ą ż ć ń ś
+            ("Teşekkür ederim", "tr"),  // ş ğ ı
+            ("Děkuji mnohokrát", "cs"), // ř ě ů č ž ý
+            ("Não posso", "pt"),        // ã õ
+            ("mañana temprano", "es"),  // ñ
+        ] {
+            assert_eq!(guess_by_diacritic(text), Some(want), "{text:?}");
+            assert_eq!(guess_other(text).map(|g| g.tag), Some(want), "{text:?}");
+        }
+        // One word is a name, not a sentence.
+        assert_eq!(guess_by_diacritic("Dziękuję"), None);
+    }
+
+    #[test]
+    fn two_languages_characters_in_one_line_is_answered_i_cannot_tell() {
+        // The conflict rule. A Polish character and a Spanish one in the same
+        // line is not half of each — the stage declines and says nothing.
+        assert_eq!(guess_by_diacritic("mañana słońce"), None);
+        assert_eq!(guess_by_diacritic("não teşekkür"), None);
+    }
+
+    #[test]
+    fn the_characters_the_eye_calls_exclusive_and_the_corpus_does_not() {
+        // These four were in the hand-written first draft of the table and the
+        // bench threw every one of them out. `ç` is Turkish and Portuguese as
+        // much as French; `ê` is Portuguese; `ø` is Norwegian as well as
+        // Danish; `å` is all three Scandinavian languages. Each cost its
+        // language the 95% gate, so none of them is in the shipped table —
+        // which is a fact about `lang_ngrams::EXCLUSIVE`, so assert it there.
+        let table: String = crate::lang_ngrams::EXCLUSIVE
+            .iter()
+            .map(|(_, chars)| *chars)
+            .collect();
+        for ch in ['ç', 'ê', 'ø', 'å', 'ä', 'ö', 'ü', 'ß', 'é'] {
+            assert!(!table.contains(ch), "{ch:?} is not exclusive to anything");
+        }
+        // Danish and Swedish therefore have no diacritic stage at all.
+        for tag in ["da", "sv", "fr", "nl", "it", "fi"] {
+            assert!(
+                !crate::lang_ngrams::DIACRITIC_SHIP.contains(&tag),
+                "{tag} has no exclusive character"
+            );
+        }
+    }
+
+    #[test]
+    fn the_trigram_model_reads_a_known_sentence_in_each_language_it_ships() {
+        for (text, want) in [
+            ("je voudrais te montrer quelque chose", "fr"),
+            ("la ciudad tiene muchos habitantes", "es"),
+            ("voglio farti vedere una cosa", "it"),
+            ("quero te mostrar uma coisa", "pt"),
+            ("ik wil je iets laten zien", "nl"),
+            ("chcę ci coś pokazać teraz", "pl"),
+            ("sana bir şey göstermek istiyorum", "tr"),
+            ("staden har många invånare", "sv"),
+            ("haluan näyttää sinulle jotain", "fi"),
+            ("mesto ma mnoho obyvatel", "cs"),
+        ] {
+            assert_eq!(guess_by_trigram(text), Some(want), "{text:?}");
+        }
+        // The two it must never answer with, and the blocker.
+        for text in [
+            "ich möchte dir etwas zeigen",
+            "i want to show you something",
+            "jeg vil vise deg noe",
+        ] {
+            let got = guess_by_trigram(text);
+            assert!(
+                !matches!(got, Some("de") | Some("en") | Some("no")),
+                "{text:?} -> {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_trigram_stage_declines_when_nothing_wins_by_a_margin() {
+        // No letters at all, and one word: below the two-word floor.
+        assert_eq!(guess_by_trigram("2019"), None);
+        assert_eq!(guess_by_trigram("bonjour"), None);
+        // A name is not a sentence in the language it comes from.
+        assert_eq!(guess_by_trigram("Marseille Rotterdam"), None);
+        // And a real Spanish sentence that simply does not clear the margin:
+        // Portuguese is 0.25 behind it and the margin at five words is 0.31.
+        // Declining here is the rule working — the alternative to "I cannot
+        // tell" is Portuguese, not Spanish. `spike/short_lang_bench.py` reads
+        // this line the same way, which is what "the same rule" means.
+        assert_eq!(
+            guess_by_trigram("quiero mostrarte algo muy interesante"),
+            None
+        );
+    }
+
+    #[test]
+    fn every_tag_the_new_stages_may_answer_with_is_one_the_daemon_ships() {
+        // `GUESSABLE` is the promise; the two generated ship lists must be
+        // inside it, or a stage could stamp a row with a tag 0.10.2 refused.
+        for tag in crate::lang_ngrams::DIACRITIC_SHIP {
+            assert!(GUESSABLE.contains(tag), "{tag} is not guessable");
+        }
+        for tag in crate::lang_ngrams::TRIGRAM_SHIP {
+            assert!(GUESSABLE.contains(tag), "{tag} is not guessable");
+        }
+        // Norwegian is in the tables so that it can lose. It is in neither
+        // ship list, exactly as in the stopword vote.
+        assert!(
+            crate::lang_ngrams::TABLES.iter().any(|(t, _)| *t == "no"),
+            "the blocker must be able to win"
+        );
+        assert!(!crate::lang_ngrams::TRIGRAM_SHIP.contains(&"no"));
+        for tag in ["de", "en"] {
+            assert!(crate::lang_ngrams::TABLES.iter().any(|(t, _)| *t == tag));
+            assert!(!crate::lang_ngrams::TRIGRAM_SHIP.contains(&tag));
+        }
+    }
+
+    #[test]
+    fn the_generated_tables_are_the_ones_the_bench_measured() {
+        // The same discipline as the 0.10.2 test above. The tables themselves
+        // are generated, so they cannot drift; the *constants* the decision is
+        // made with are the ones that could, and every number in FINDINGS §21
+        // is a number about these five.
+        let bench = include_str!("../../../spike/short_lang_bench.py");
+        let value = |name: &str| -> f32 {
+            bench
+                .lines()
+                .find(|l| l.starts_with(&format!("{name} = ")))
+                .and_then(|l| l.split_once(" = "))
+                .and_then(|(_, v)| v.split_whitespace().next())
+                .and_then(|v| v.trim_end_matches('#').trim().parse().ok())
+                .unwrap_or_else(|| panic!("the bench has no {name}"))
+        };
+        assert_eq!(
+            value("TRI_MIN_WORDS") as usize,
+            crate::lang_ngrams::MIN_WORDS
+        );
+        assert_eq!(value("TRI_MARGIN_A"), crate::lang_ngrams::MARGIN_A);
+        assert_eq!(value("TRI_MARGIN_B"), crate::lang_ngrams::MARGIN_B);
+        assert_eq!(
+            value("TRI_MARGIN_DEEN_A"),
+            crate::lang_ngrams::MARGIN_DEEN_A
+        );
+        assert_eq!(
+            value("TRI_MARGIN_DEEN_B"),
+            crate::lang_ngrams::MARGIN_DEEN_B
+        );
+        // …and the packing the tables were keyed with.
+        assert_eq!(
+            crate::lang_ngrams::RADIX as usize,
+            crate::lang_ngrams::ALPHABET.chars().count() + 2
+        );
+        for (_, table) in crate::lang_ngrams::TABLES {
+            assert!(
+                table.windows(2).all(|w| w[0].0 < w[1].0),
+                "a table is not sorted, so the binary search is wrong"
+            );
         }
     }
 
