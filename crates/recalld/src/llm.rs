@@ -313,6 +313,31 @@ impl Llm {
             .map(|s| truncate(s, MAX_TOPIC)))
     }
 
+    // ---- 0.9.0, the assistant ------------------------------------------
+    /// One grammar-constrained call, for a caller that owns its own schema.
+    ///
+    /// [`Self::commitment`] and [`Self::topic`] live here because their prompts
+    /// and grammars are measured artefacts of the bake-off and belong next to
+    /// the note that says so. The assistant round's two — a daily digest and a
+    /// translation — are measured by their own benches
+    /// (`spike/digest_bench`, `spike/translate_bench.py`) and their prompts
+    /// live with the modules those benches are about. What they need from here
+    /// is exactly this: the jail, the timeout, the `--temp 0`, and the scrape.
+    ///
+    /// Returns the child's raw stdout; the caller reads it with
+    /// [`first_json`], which is the same defensive scrape the two methods above
+    /// use for the same reason.
+    pub fn ask(
+        &self,
+        system: &str,
+        prompt: &str,
+        grammar: &str,
+        max_tokens: i32,
+    ) -> Result<String> {
+        self.run(system, prompt, grammar, max_tokens)
+    }
+    // ---- end 0.9.0 ------------------------------------------------------
+
     /// One call. The argument list is `run_bench.py`'s, in the same order, with
     /// the affinity moved from `taskset` into the child itself.
     fn run(&self, system: &str, prompt: &str, grammar: &str, max_tokens: i32) -> Result<String> {

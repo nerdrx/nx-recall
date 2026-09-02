@@ -1261,3 +1261,79 @@ button.sp-num:focus-visible { outline: none; box-shadow: var(--clear-focus); }
   padding: 4px 11px; border-color: var(--clear-line); background: var(--clear-tile);
   color: var(--clear-ink); font-weight: 500;
 }
+
+/* == 0.9.0 — the assistant ================================================= */
+/* Three additions, and each of them is a SECOND thing on a row that already
+   existed: a date on a note, a paragraph above the commitments, and a
+   translation under a transcript line. Nothing here is a new kind of object,
+   which is why none of it gets a colour of its own. */
+
+/* -- reminders ------------------------------------------------------------- */
+/* A note with a date reads as a note. The chip is the only difference, and it
+   is the accent only while the reminder is still ahead — once it has come round
+   it goes quiet, because a reminder that has done its job is not a thing to
+   keep looking at. */
+.note-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.chip.due {
+  font: 600 10.5px/1 var(--mono); text-transform: none; letter-spacing: 0.02em;
+  color: var(--clear-muted);
+}
+.chip.due.soon { color: var(--violet); border-color: var(--clear-line-accent); background: var(--violet-soft); }
+.chip.due.fired { color: var(--clear-faint); }
+.note-row.timed { border-color: var(--clear-line-accent); }
+.note-row.fired { border-color: var(--clear-line); }
+.chip.note-act.snooze { color: var(--clear-muted); }
+/* Where a reminder lands when you click its toast or its notification. A pulse
+   and not a permanent mark: it answers "which row" and then gets out of the
+   way. */
+.note-row.flash { animation: note-flash 1.6s var(--ease-soft); }
+@keyframes note-flash {
+  0%, 100% { background: var(--clear-tile); }
+  15% { background: var(--violet-soft); border-color: var(--clear-line-accent); }
+}
+/* The reminder toast is the one toast in this app that is a thing to press. */
+.toast.clickable { cursor: pointer; }
+.toast.clickable:hover { border-color: var(--clear-line-accent); }
+
+/* -- the digest card ------------------------------------------------------- */
+.digest-list { display: flex; flex-direction: column; gap: var(--sp-1); }
+.digest-row {
+  display: flex; flex-direction: column; gap: 7px; width: 100%;
+  padding: 12px; border-radius: var(--clear-r-control); text-align: left;
+  background: var(--clear-tile); border: 1px solid var(--clear-line);
+  font: inherit; color: var(--clear-ink); cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft);
+}
+.digest-row:hover { background: var(--clear-surface); border-color: var(--clear-line-accent); }
+.digest-row:focus-visible { outline: none; box-shadow: var(--clear-focus); }
+.digest-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.digest-when { font: 500 11px/1 var(--mono); color: var(--clear-muted); }
+.digest-people { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.chip.person { display: inline-flex; align-items: center; gap: 5px; text-transform: none; letter-spacing: 0.02em; }
+.chip.person .dot { width: 7px; height: 7px; }
+.digest-turns { margin-left: auto; font: 500 11px/1 var(--mono); color: var(--clear-faint); }
+.digest-text { font-size: 13.5px; line-height: 1.6; }
+/* What the model thought was left hanging. Deliberately not styled as anything
+   pressable: the commitments card below is where a promise is acted on, and two
+   surfaces offering to close the same thing is one too many. */
+.digest-open { display: flex; flex-direction: column; gap: 3px; margin-top: 2px; }
+.digest-open-item {
+  font-size: 12px; line-height: 1.5; color: var(--clear-muted);
+  padding-left: 14px; position: relative;
+}
+.digest-open-item::before {
+  content: "·"; position: absolute; left: 4px; color: var(--clear-faint);
+}
+
+/* -- a translated turn ----------------------------------------------------- */
+/* Under the words and never instead of them. Indented, quieter, and marked with
+   an arrow, so the eye reads the original first — the transcript is the record
+   and the translation is a reading of it. */
+.seg .txt.has-translation { display: flex; flex-direction: column; gap: 3px; }
+.txt-said { font-size: 13.5px; line-height: 1.55; }
+.txt-translated {
+  display: flex; align-items: baseline; gap: 6px;
+  font-size: 12.5px; line-height: 1.5; color: var(--clear-muted);
+  font-style: italic;
+}
+.tr-mark { font-style: normal; color: var(--clear-faint); flex: none; }

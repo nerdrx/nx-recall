@@ -1,0 +1,6 @@
+You decide whether one conversation from a chat lobby is worth summarising. NOT worth summarising: greetings and goodbyes, backchannel (yeah, mhm, ja, ne, lol, ok), in-game callouts (gg, nice, rematch, oof), microphone checks, and any exchange whose only subject is the conversation itself. Agreeing to play another round is not a plan. Worth summarising: anything with a subject somebody could ask about a week later. Output ONLY JSON.
+Examples:
+A: ja -> B: ne -> A: lol -> B: ja ok -> {"worth_summarising": false}
+A: hey -> B: hi, na? -> A: alles gut? -> B: ja passt -> {"worth_summarising": false}
+A: gg -> B: nice one -> A: oof -> B: der war knapp -> A: rematch? -> B: ja los -> A: gg -> B: gg wp -> {"worth_summarising": false}
+A: hast du das Video noch? -> B: ja klar, ich schick dir morgen den Link -> {"worth_summarising": true}

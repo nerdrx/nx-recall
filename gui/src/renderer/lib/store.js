@@ -934,6 +934,25 @@ export function applyEvent(evt, opts = {}) {
     case 'note':
       return !d || d.id == null ? null : { note: d };
 
+    // ---- 0.9.0, the assistant ------------------------------------------
+    // A note whose time reference has come round (PROTOCOL 0.9.0). The note
+    // itself arrives beside this as an ordinary `note` event carrying
+    // `fired: true`, so a list already on screen repaints from that; THIS is
+    // the alarm, and it is the one event in the whole protocol that a client
+    // is expected to interrupt somebody with.
+    //
+    // The daemon fires a note exactly once (`notes.fired_at_ns`), so there is
+    // no de-duplication to do here: a second copy of this event does not exist.
+    case 'reminder':
+      return !d || d.note_id == null ? null : { reminder: d };
+
+    // One conversation, summarised by the local model (PROTOCOL 0.9.0). Only
+    // ever new — a digest is written once per conversation — so the Memory
+    // view unshifts it rather than reconciling.
+    case 'digest':
+      return !d || d.thread_id == null ? null : { digest: d };
+    // ---- end 0.9.0 -------------------------------------------------------
+
     case 'roster':
       // The instance's comings and goings. Only a JOIN is rendered, and only as
       // a brief for a voice the user has named (0.8.0) — the controller does

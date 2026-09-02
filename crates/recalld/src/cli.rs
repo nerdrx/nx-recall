@@ -299,6 +299,27 @@ Nothing but one of these commands ever moves a note off `open`.")]
     /// and the only real measurement this machine has.
     Accuracy,
 
+    // ---- 0.9.0, the assistant ------------------------------------------
+    /// One paragraph per conversation, for a day.
+    ///
+    /// The local model writes these when it has read everything else it owes
+    /// you; `recalld graph on` is what turns it on, and a machine that has
+    /// never fetched it prints nothing at all.
+    #[command(long_about = "\
+One paragraph per conversation that has settled, for a day.\n\n\
+DAY is a local calendar day (2026-09-02), or one of `today` and `yesterday`.\n\
+With no DAY at all, the most recent conversations come back whichever day they\n\
+happened on.\n\n\
+Conversations the model read and declined to summarise are not listed. That is\n\
+not a failure: eight turns of \"ja / ne / lol\" is a conversation by the\n\
+threading rule and nothing worth a paragraph, and refusing it is what the\n\
+verdict-first grammar is for.")]
+    Digest {
+        /// A local calendar day, `today`, or `yesterday`.
+        #[arg(value_name = "DAY")]
+        day: Option<String>,
+    },
+    // ---- end 0.9.0 -------------------------------------------------------
     /// Chronological transcript dump.
     Transcript {
         /// Restrict to one capture session.

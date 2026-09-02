@@ -31,10 +31,15 @@ contextBridge.exposeInMainWorld("recall", {
   getState: () => ipcRenderer.invoke("recall:getState"),
   show: () => ipcRenderer.invoke("recall:show"),
   relaunch: () => ipcRenderer.invoke("recall:relaunch"),
+  // 0.9.0: a reminder that has come round. Main raises the OS notification —
+  // the renderer never touches the Notification API itself.
+  notify: (payload) => ipcRenderer.invoke("recall:notify", payload),
 
   onState: (fn) => on("recall:state", fn),
   onEvent: (fn) => on("recall:event", fn),
   onResync: (fn) => on("recall:resync", fn),
   onCaughtUp: (fn) => on("recall:caughtup", fn),
   onToast: (fn) => on("recall:toast", fn),
+  // Somebody clicked a reminder notification, outside the window.
+  onOpenNote: (fn) => on("recall:openNote", fn),
 });

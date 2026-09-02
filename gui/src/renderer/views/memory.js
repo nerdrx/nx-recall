@@ -21,7 +21,7 @@
 //      size, the core count, when it runs, that it is off by default, and that
 //      nothing leaves the machine — in plain words, next to the switch.
 
-import { h, clear, fmtDate, speakerColor } from '../lib/dom.js';
+import { h, clear, fmtDate, fmtClock, fmtDayLabel, speakerColor } from '../lib/dom.js';
 import { store, speakerLabel, ask } from '../lib/store.js';
 import { toast } from '../lib/sheets.js';
 
@@ -45,6 +45,19 @@ export const id = 'memory';
  * the vocabulary is what the next transcript is biased toward. Three cards, one
  * sentence, in the order it happens.
  */
+
+/// How long a snooze puts a reminder off for, and what each one is for.
+///
+/// Three, and no free-text field. A snooze is a thing you press while you are
+/// doing something else — most of the time inside a headset, with a controller
+/// — and a minute picker is not pressable in that state. The daemon accepts
+/// anything up to a week (`snooze_min`); these are the three a person actually
+/// wants.
+const SNOOZES = [
+  [10, '10 min', 'Bring this back in ten minutes.'],
+  [60, '1 hour', 'Bring this back in an hour.'],
+  [60 * 12, 'Tonight', 'Bring this back in twelve hours.'],
+];
 
 /// The states a note can be put in, and what each one means. Same shape as the
 /// commitments above: nothing but a click moves one, at either end of the socket.
@@ -105,6 +118,35 @@ function due(c) {
   };
 }
 
+/**
+ * How a reminder's own date reads (0.9.0).
+ *
+ * Deliberately NOT `due()` above. A commitment's date is a claim about
+ * something somebody else said and is rendered as a guess; a note's date is a
+ * thing you said out loud about yourself, so it is rendered as a fact — and the
+ * near ones are rendered in the units a person thinks in ("in 20 min"), because
+ * a reminder twenty minutes away is not a date, it is a countdown.
+ */
+function dueChip(n) {
+  if (n.due_ms == null) return null;
+  const left = n.due_ms - Date.now();
+  const mins = Math.round(left / 60000);
+  if (n.fired && left <= 0) {
+    return { text: 'reminded', cls: 'fired', title: `This came round at ${fmtDate(new Date(n.due_ms).toISOString())}.` };
+  }
+  if (left <= 0) {
+    return { text: 'due now', cls: 'soon', title: 'This is due; the reminder is on its way.' };
+  }
+  if (mins < 60) return { text: `in ${mins} min`, cls: 'soon', title: `Due at ${fmtClock(n.due_ms).slice(0, 5)}.` };
+  const sameDay = new Date(n.due_ms).toDateString() === new Date().toDateString();
+  const day = fmtDayLabel(n.due_ms).split(' · ')[0].toLowerCase();
+  return {
+    text: sameDay ? `today ${fmtClock(n.due_ms).slice(0, 5)}` : `${day} ${fmtClock(n.due_ms).slice(0, 5)}`,
+    cls: '',
+    title: `Due ${fmtDate(new Date(n.due_ms).toISOString())}.`,
+  };
+}
+
 /** What to call a person the daemon described, without needing them in `store`. */
 function who(p) {
   if (!p) return 'somebody';
@@ -120,10 +162,14 @@ export function mount(root, ctx) {
 
   let notes = [];
   let noteBusy = new Set();
+  let digests = [];
+  /// A note somebody asked to be taken to, which may not be on screen yet.
+  let pendingFocus = null;
   let accuracy = null;
   let vocab = store.vocab;
 
   const sub = h('span', { class: 'sub', id: 'memory-sub' });
+  const digestCard = h('div', { class: 'card', id: 'digest-card' });
   const openCard = h('div', { class: 'card', id: 'commitments-card' });
   const notesCard = h('div', { class: 'card', id: 'notes-card' });
   const accuracyCard = h('div', { class: 'card', id: 'accuracy-card' });
@@ -133,6 +179,10 @@ export function mount(root, ctx) {
   const body = h(
     'div',
     { class: 'view-body view-enter' },
+    // 0.9.0. Above the commitments on purpose: what happened is the thing you
+    // came here to be reminded of, and what is still owed is what you do about
+    // it. The card is absent entirely until there is something in it.
+    digestCard,
     openCard,
     notesCard,
     // The correction loop, in the order it happens (see the note at the top).
@@ -151,6 +201,131 @@ export function mount(root, ctx) {
     ),
     body
   );
+
+  // -- yesterday (0.9.0) ----------------------------------------------------
+  //
+  // One paragraph per conversation that has settled, written by the local
+  // model. Two groups and no more: "Yesterday", because that is the question
+  // this card answers, and "Earlier today" for the ones from this morning that
+  // are already over. Anything older is `recalld digest <day>` — a card is a
+  // card, and an archive of every evening is a different surface.
+  //
+  // The card renders NOTHING when there is nothing, rather than an empty state.
+  // An empty state here would be a permanent advertisement for a feature that
+  // is off by default and needs a 1.9 GB download; the enrichment card below
+  // already says all of that, once, where the switch is.
+
+  function renderDigests() {
+    clear(digestCard);
+    if (!digests.length) {
+      digestCard.hidden = true;
+      return;
+    }
+    digestCard.hidden = false;
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const today = digests.filter((d) => (d.started_ms ?? 0) >= start.getTime());
+    const before = digests.filter((d) => (d.started_ms ?? 0) < start.getTime());
+    // "Yesterday" only when it really is. `digest.list` with no day returns the
+    // newest conversations whichever day they happened on, so a machine that
+    // was off for a week would otherwise have a card headed "Yesterday" over
+    // last Tuesday — a small lie, and the kind that makes a person doubt the
+    // paragraph under it.
+    const yesterday = new Date(start.getTime() - 86_400_000);
+    const leadIsYesterday =
+      before.length > 0 && new Date(before[0].started_ms ?? 0) >= yesterday;
+
+    digestCard.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('div', {
+          class: 'card-title',
+          text: before.length ? (leadIsYesterday ? 'Yesterday' : 'Recently') : 'Earlier today',
+        }),
+        h('span', {
+          class: 'sub',
+          id: 'digest-sub',
+          text: `${digests.length} conversation${digests.length === 1 ? '' : 's'} summarised`,
+        })
+      )
+    );
+    // The heading above says which group leads, so a sub-heading is only
+    // written when there are two groups to tell apart.
+    for (const [key, label, group] of [
+      ['before', null, before],
+      ['today', 'Earlier today', today],
+    ]) {
+      if (!group.length) continue;
+      if (label && before.length) {
+        digestCard.append(
+          h('div', { class: 'acc-group-title', dataset: { group: key }, text: label })
+        );
+      }
+      const list = h('div', { class: 'digest-list', dataset: { digests: key } });
+      for (const d of group) list.append(digestRow(d));
+      digestCard.append(list);
+    }
+    digestCard.append(
+      h('p', {
+        class: 'rail-hint',
+        id: 'digest-note',
+        style: 'padding:12px 0 0;max-width:70ch',
+        text: 'Written by the local model on this machine, once per conversation, after it has finished. Conversations it read and found not worth a paragraph are not here — which is most short ones.',
+      })
+    );
+  }
+
+  function digestRow(d) {
+    const people = d.participants ?? [];
+    return h(
+      'button',
+      {
+        class: 'digest-row',
+        dataset: { digest: String(d.thread_id), day: d.day ?? '' },
+        title: 'Read this conversation from its first turn',
+        onclick: () => void openDigest(d),
+      },
+      h(
+        'span',
+        { class: 'digest-head' },
+        h('span', {
+          class: 'digest-when',
+          text: d.started_ms ? fmtDate(new Date(d.started_ms).toISOString()) : '—',
+        }),
+        h(
+          'span',
+          { class: 'digest-people' },
+          ...people.map((p) =>
+            h(
+              'span',
+              { class: 'chip person', dataset: { sp: String(p.speaker_id) } },
+              h('span', { class: 'dot', style: `color:${speakerColor(p.speaker_id)}` }),
+              p.label || speakerLabel(p.speaker_id)
+            )
+          )
+        ),
+        d.turns ? h('span', { class: 'digest-turns', text: `${d.turns} turns` }) : null
+      ),
+      h('span', { class: 'digest-text', text: d.summary ?? '' }),
+      // What the model thought was left hanging. Shown as text and not as
+      // something to tick: a commitment is the row you act on, and this is a
+      // sentence about the conversation.
+      (d.open ?? []).length
+        ? h(
+            'span',
+            { class: 'digest-open' },
+            ...(d.open ?? []).map((o) => h('span', { class: 'digest-open-item', text: o }))
+          )
+        : null
+    );
+  }
+
+  /** A digest → the conversation it is about, in the transcript. */
+  async function openDigest(d) {
+    const landed = await ctx.showThreadInTranscript?.(d.thread_id);
+    if (landed === null) toast('That conversation is no longer in the transcript.', '');
+  }
 
   // -- open commitments -----------------------------------------------------
 
@@ -334,7 +509,11 @@ export function mount(root, ctx) {
         'div',
         { class: 'sheet-head' },
         h('div', { class: 'card-title', text: 'Notes to self' }),
-        h('span', { class: 'sub', id: 'notes-sub', text: notes.length ? `${notes.filter((n) => n.state === 'open').length} open` : '' })
+        h('span', {
+          class: 'sub',
+          id: 'notes-sub',
+          text: notesSub(),
+        })
       )
     );
     if (!notes.length) {
@@ -353,13 +532,36 @@ export function mount(root, ctx) {
     const list = h('div', { class: 'note-list', id: 'note-list' });
     for (const n of notes) list.append(noteRow(n));
     notesCard.append(list);
+    // A reminder may have asked for a row that did not exist yet.
+    applyFocus();
+  }
+
+  /** "3 open · 1 with a reminder" — the second half only when it is true. */
+  function notesSub() {
+    if (!notes.length) return '';
+    const open = notes.filter((n) => n.state === 'open');
+    const timed = open.filter((n) => n.due_ms != null && !n.fired);
+    return timed.length
+      ? `${open.length} open · ${timed.length} will remind you`
+      : `${open.length} open`;
   }
 
   function noteRow(n) {
     const pending = noteBusy.has(n.id);
+    // 0.9.0: a note that carries a time is a reminder, and it says so in the
+    // row. Everything else about the row is unchanged — a reminder is not a
+    // second kind of note, it is a note with a date on it.
+    const d = dueChip(n);
     const row = h('div', {
-      class: `note-row state-${n.state}${pending ? ' pending' : ''}`,
-      dataset: { note: String(n.id), state: n.state, segment: String(n.segment_id) },
+      class: `note-row state-${n.state}${pending ? ' pending' : ''}${d ? ' timed' : ''}${
+        n.fired ? ' fired' : ''
+      }`,
+      dataset: {
+        note: String(n.id),
+        state: n.state,
+        segment: String(n.segment_id),
+        ...(n.due_ms != null ? { due: String(n.due_ms), fired: String(!!n.fired) } : {}),
+      },
     });
     row.append(
       h(
@@ -370,11 +572,33 @@ export function mount(root, ctx) {
           onclick: () => ctx.jumpToSegment?.({ id: n.segment_id, t_ms: n.t_ms ?? Date.now() }),
         },
         h('span', { class: 'note-text', text: n.text || '(nothing after the wake phrase)' }),
-        h('span', { class: 'note-when', text: n.t_ms ? fmtDate(new Date(n.t_ms).toISOString()) : '—' })
+        h(
+          'span',
+          { class: 'note-meta' },
+          d ? h('span', { class: `chip due ${d.cls}`.trim(), dataset: { due: 'chip' }, title: d.title, text: d.text }) : null,
+          h('span', { class: 'note-when', text: n.t_ms ? fmtDate(new Date(n.t_ms).toISOString()) : '—' })
+        )
       ),
       h(
         'span',
         { class: 'note-actions' },
+        // Snooze is offered on an OPEN note only, and it is the one control
+        // here that changes when a note comes back rather than what it is.
+        ...(n.state === 'open'
+          ? SNOOZES.map(([mins, label, title]) =>
+              h(
+                'button',
+                {
+                  class: 'chip note-act snooze',
+                  dataset: { snooze: String(mins), note: String(n.id) },
+                  title,
+                  disabled: pending,
+                  onclick: () => void snoozeNote(n, mins),
+                },
+                label
+              )
+            )
+          : []),
         ...NOTE_ACTIONS.filter(([state]) => state !== n.state).map(([state, label, title]) =>
           h(
             'button',
@@ -392,6 +616,36 @@ export function mount(root, ctx) {
       )
     );
     return row;
+  }
+
+  /**
+   * "Not now" (0.9.0).
+   *
+   * `notes.set_state` with `snooze_min` rather than a method of its own: a
+   * snooze IS a state change — the note goes back to open and its date moves —
+   * and two ways to reach one row is two things a client has to keep in sync.
+   *
+   * On a note with no date at all this GIVES it one, which is the only way to
+   * ask to be reminded of something you said without a time in it.
+   */
+  async function snoozeNote(n, minutes) {
+    noteBusy.add(n.id);
+    renderNotes();
+    try {
+      Object.assign(n, await ask('notes.set_state', { id: n.id, state: 'open', snooze_min: minutes }));
+      const hours = Math.round(minutes / 60);
+      toast(
+        `Back in ${
+          minutes < 60 ? `${minutes} minutes` : `${hours} hour${hours === 1 ? '' : 's'}`
+        }.`,
+        'ok'
+      );
+    } catch (e) {
+      toast(`Could not snooze that — ${e.message}`, 'error');
+    } finally {
+      noteBusy.delete(n.id);
+      renderNotes();
+    }
   }
 
   async function setNoteState(n, state) {
@@ -1002,6 +1256,17 @@ export function mount(root, ctx) {
           vocab = null;
         })
         .then(renderVocab),
+      // 0.9.0. Its own slice for the same reason the three above have theirs:
+      // a daemon older than 0.9.0 answers `unknown_method`, and one missing
+      // method must not blank the cards next to it.
+      ask('digest.list', { limit: 40 })
+        .then((r) => {
+          digests = r.digests ?? [];
+        })
+        .catch(() => {
+          digests = [];
+        })
+        .then(renderDigests),
     ]);
   }
 
@@ -1043,6 +1308,7 @@ export function mount(root, ctx) {
   }
 
   renderSub();
+  renderDigests();
   renderCommitments();
   renderNotes();
   renderAccuracy();
@@ -1061,6 +1327,18 @@ export function mount(root, ctx) {
         else notes.unshift(change.note);
         renderNotes();
       }
+      // 0.9.0: a conversation the model has just read. Only ever new — one
+      // digest per conversation — so this unshifts rather than reconciling.
+      if (change?.digest) {
+        if (!digests.some((d) => d.thread_id === change.digest.thread_id)) {
+          digests.unshift(change.digest);
+        }
+        renderDigests();
+      }
+      // A reminder came round. The note itself arrives beside it as a `note`
+      // event carrying `fired`, so the row repaints from that; this is only
+      // here so the card scrolls to it when the view is already open.
+      if (change?.reminder) focusNote(change.reminder.note_id);
       // The glossary changed somewhere — here, the CLI, another window. It is a
       // broadcast, so this repaints rather than re-queries.
       if (change?.vocab) {
@@ -1093,7 +1371,41 @@ export function mount(root, ctx) {
       if (change?.relabel) renderCommitments();
     },
     reload: load,
+    // 0.9.0: a reminder, from a toast or from an OS notification, lands on its
+    // row. Returns null when the note is not in the list, which is how the
+    // controller knows to say so rather than scrolling to nothing.
+    focusNote,
   };
+
+  /**
+   * Land on one note's row.
+   *
+   * `pendingFocus` is what makes this work when the view has only just been
+   * mounted — a reminder clicked from the transcript switches to Memory, and
+   * the notes are still one query away when this is called. Remembering the id
+   * and applying it after the next paint is the difference between a
+   * notification that lands on the row and one that lands on an empty card.
+   */
+  function focusNote(noteId) {
+    pendingFocus = noteId;
+    return applyFocus();
+  }
+
+  function applyFocus() {
+    if (pendingFocus == null) return null;
+    const row = notesCard.querySelector(`[data-note="${CSS.escape(String(pendingFocus))}"]`);
+    if (!row) return null;
+    const id = pendingFocus;
+    pendingFocus = null;
+    row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    // Restarted rather than merely added: a second reminder for the same row
+    // while the first pulse is still running must be visible.
+    row.classList.remove('flash');
+    void row.offsetWidth;
+    row.classList.add('flash');
+    setTimeout(() => row.classList.remove('flash'), 1600);
+    return id;
+  }
 }
 
 /// GB as the rest of this project says GB — decimal, the unit a download size

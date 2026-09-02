@@ -494,6 +494,90 @@ impl Default for AsrConfig {
     }
 }
 
+// ---- 0.9.0, the assistant -------------------------------------------------
+
+/// The three things the daemon does *for* you rather than *to* the recording
+/// (0.9.0): reminders that fire, one paragraph per conversation, and a
+/// translation on a turn you cannot read.
+///
+/// Everything here is off-by-default in the way that matters. Reminders need a
+/// note with a time in it, which only exists because somebody said one out
+/// loud. The digest and the translation both need `[graph]` — they are the same
+/// 1.9 GB local model, under the same jail — so on a machine that has never run
+/// `models fetch --graph` this whole section is inert, and the two switches
+/// below decide only whether an enabled model spends its budget here.
+///
+/// `translate_to` is empty by default and is the one setting with no sensible
+/// guess: which language you read is not something a daemon can measure, and
+/// translating into the wrong one would be worse than translating into none.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AssistConfig {
+    /// Announce notes whose time reference has come round.
+    pub reminders: bool,
+    /// How often the scheduler looks. Thirty seconds is the resolution of the
+    /// feature, and it is deliberately coarse: a reminder is a note somebody
+    /// dictated in a headset, not an alarm clock.
+    pub reminder_tick_s: u64,
+    /// Reminders one tick may announce. A daemon that was off overnight has a
+    /// backlog, and a tick that can publish two hundred events is a tick that
+    /// can hang up every client's outbox.
+    pub reminder_batch: usize,
+
+    /// Summarise conversations once they have settled.
+    pub digest: bool,
+    /// How long after a conversation's last turn it becomes eligible. A thread
+    /// is only over in retrospect — the threading rule keeps extending it while
+    /// anybody speaks — so this is how long the daemon waits to be sure.
+    pub digest_settle_min: i64,
+    /// Turns with words in them a conversation needs before it is worth a
+    /// paragraph. Eight is the bench's floor and it is the number the trap
+    /// cases are built at: eight turns of "ja" is a conversation by the
+    /// threading rule and nothing at all by content.
+    pub digest_min_turns: i64,
+    /// Turns of a conversation the model is shown. Past this a summary is a
+    /// summary of a summary, and the budget is a model call either way.
+    pub digest_max_turns: usize,
+
+    /// Translate committed turns into this language tag (`"de"`, `"en"`).
+    /// Empty is off, and is the shipped value.
+    pub translate_to: String,
+    /// Turns shorter than this are not translated. Three words, because "ja
+    /// klar" translated is "yeah sure" and nobody needed it — and because a
+    /// two-word turn is where the decoder is least reliable to begin with.
+    pub translate_min_words: usize,
+
+    /// Rows per batch, for both model passes.
+    pub batch: usize,
+    /// Seconds between batches, and between re-checks while a gate is closed.
+    pub batch_pause_s: u64,
+    /// Queue depth, in seconds of audio waiting for the inference thread, above
+    /// which the worker stands down — the same rule, and the same reason, as
+    /// `[graph].max_queue_seconds`.
+    pub max_queue_seconds: i64,
+}
+
+impl Default for AssistConfig {
+    fn default() -> Self {
+        Self {
+            reminders: true,
+            reminder_tick_s: 30,
+            reminder_batch: 20,
+            digest: true,
+            digest_settle_min: 30,
+            digest_min_turns: 8,
+            digest_max_turns: 40,
+            translate_to: String::new(),
+            translate_min_words: 3,
+            batch: 8,
+            batch_pause_s: 10,
+            max_queue_seconds: 5,
+        }
+    }
+}
+
+// ---- end 0.9.0 ------------------------------------------------------------
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -613,6 +697,8 @@ pub struct Config {
     /// The accuracy round's idle worker (0.8.0).
     pub asr: AsrConfig,
     pub graph: GraphConfig,
+    /// The assistant round (0.9.0): reminders, digests, translation.
+    pub assist: AssistConfig,
     pub socket: SocketConfig,
     pub roster: RosterConfig,
     pub retention: RetentionConfig,

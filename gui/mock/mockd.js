@@ -21,13 +21,15 @@
 // window that was already open is now the old client of a new daemon, and that
 // string is the only place it can find that out.
 //
-// SIGUSR2 fires the 0.8.0 events that a canned world cannot produce on its own,
+// SIGUSR2 fires the events that a canned world cannot produce on its own,
 // one per signal, in order:
 //
-//   1st — a `note` event: a MIC turn that began with a wake phrase.
-//   2nd — a `roster` JOIN naming a voice the user has named (Kira), which is
+//   1st — a `note` event: a MIC turn that began with a wake phrase (0.8.0).
+//   2nd — a `reminder` and the `note` it is about, plus a `digest` for a
+//         conversation the local model has just read (0.9.0).
+//   3rd — a `roster` JOIN naming a voice the user has named (Kira), which is
 //         what a client turns into a brief.
-//   3rd — the SAME join again, immediately, so a client's brief debounce is
+//   4th — the SAME join again, immediately, so a client's brief debounce is
 //         testable rather than merely assertable in prose.
 //
 // A signal rather than a timer because both are things a test has to be able to
@@ -40,7 +42,7 @@ import path from 'node:path';
 
 const PROTO = 1;
 const DAEMON = 'recalld-mock/0.5';
-const SCHEMA = 7;
+const SCHEMA = 11;
 const REPLAY_MAX = 200; // deliberately small: overrunning it must be reachable
 // Copied from crates/recalld/src/service.rs::SPLIT_EVENT_CAP. Past it a split
 // stops publishing one `segment` event per moved row and says `resync: true`
@@ -297,6 +299,19 @@ function buildFiller(base) {
         // the real bake-off measured and enough that any page has a few.
         asr_confidence: i % 11 === 5 ? 'shaky' : 'solid',
         text_via: 'live',
+        // 0.9.0: the English turns come with a German reading under them, and
+        // the German ones do not — which is the rule the daemon follows (a
+        // turn already in your language is not a turn to translate). An object
+        // and not a string: a client showing a translation has to be able to
+        // say which language it is in and which model wrote it.
+        translation:
+          speaker === 1
+            ? null
+            : {
+                lang: 'de',
+                text: TRANSLATIONS[i % TRANSLATIONS.length],
+                via: 'qwen2.5-3b-instruct-q4_k_m@1',
+              },
         // Blocks of five, as above, but numbered BELOW the canned threads so
         // "recent conversations" still means the canned ones.
         thread: 100 + block,
@@ -531,6 +546,26 @@ function buildHistory() {
 /// Two of them, in the two languages the daemon classifies, and one already
 /// `done` — a list where every row is in the same state cannot show that the
 /// state chips mean anything.
+/// 0.9.0: German lines to hang under the English filler, so a transcript page
+/// shows the second row under the first and the driver can check that the
+/// original survives above it.
+///
+/// They are stand-ins, not translations of the filler: the index wraps
+/// independently of FILLER_LINES, so a given pair does not correspond. What is
+/// being demonstrated is the SHAPE — two lines, the original on top, the
+/// reading quiet and marked — and a mock that had to keep two lists in step
+/// would break every time either grew.
+const TRANSLATIONS = [
+  'warte, welches Portal war das — das hinter der Bar oder das im Treppenhaus?',
+  'das im Treppenhaus, aber es geht erst auf, wenn das Licht ausgeht',
+  'ich bin schon wieder in der falschen Instanz gelandet, einen Moment',
+  'hast du das Video von dem Bar-World-Abend noch?',
+  'ja klar, ich schick dir morgen den Link',
+  'perfekt, danke dir',
+  'der Shader frisst allerdings Performance',
+  'ich baue sowieso nur für den PC',
+];
+
 const NOTES = [
   {
     id: 700,
@@ -551,6 +586,57 @@ const NOTES = [
     state: 'done',
     t_ms: 0,
     t_ns: '0',
+  },
+  // 0.9.0: two notes with a date in them, which is what makes a note a
+  // reminder. `due_in` is relative to boot so the card looks the same on every
+  // run — one still ahead (the chip is the accent, and the snooze buttons are
+  // live), one already fired (the chip is quiet).
+  {
+    id: 704,
+    segment_id: 1124,
+    lang: 'de',
+    said: 'recall, erinner mich morgen um zehn an den Link',
+    text: 'morgen um zehn an den Link',
+    state: 'open',
+    t_ms: 0,
+    t_ns: '0',
+    due_in: 40 * 60 * 1000,
+    fired: false,
+  },
+  {
+    id: 705,
+    segment_id: 1125,
+    lang: 'en',
+    said: 'recall, remind me at 8 pm to send the recording',
+    text: 'at 8 pm to send the recording',
+    state: 'open',
+    t_ms: 0,
+    t_ns: '0',
+    due_in: -20 * 60 * 1000,
+    fired: true,
+  },
+];
+
+/// 0.9.0: one paragraph per conversation, as the local model writes them.
+/// Two, on two different days, so the card has both of its groups.
+const DIGESTS = [
+  {
+    thread_id: 501,
+    lang: 'de',
+    day_offset: 1,
+    summary:
+      'A hat nach dem Shader von dem Avatar gefragt, den B gestern gezeigt hat. B hat die Datei noch und will den Link morgen schicken; heute kommt er nicht mehr dazu.',
+    open: ['B schickt A morgen den Link'],
+    people: [1, 2],
+  },
+  {
+    thread_id: 503,
+    lang: 'en',
+    day_offset: 0,
+    summary:
+      'A asked whether anybody recorded the meetup. B had OBS running for about two hours and offered to cut it down to the world tour section before sending it over.',
+    open: ['B cuts the recording and sends it to A'],
+    people: [2, 3],
   },
 ];
 
@@ -849,7 +935,16 @@ export function startMock({
     })),
     topics: { ...THREAD_TOPICS },
     // 0.8.0 --------------------------------------------------------------
-    notes: NOTES.map((n) => ({ ...n })),
+    notes: NOTES.map((n) => ({
+      ...n,
+      // 0.9.0. Absolute at boot, so a reminder that is "in forty minutes" is
+      // still in forty minutes however long the mock has been up.
+      due_ms: n.due_in == null ? null : Date.now() + n.due_in,
+      due_ns: n.due_in == null ? null : String(Date.now() + n.due_in) + '000000',
+      fired: !!n.fired,
+      fired_ms: n.fired ? Date.now() + n.due_in : null,
+    })),
+    digests: DIGESTS.map((d) => ({ ...d })),
     vocab: { user: [...VOCAB_USER] },
     /// Every `segments.correct` this daemon has served, which is where
     /// `accuracy.summary` comes from: the pre-correction text lives in the
@@ -1283,6 +1378,41 @@ export function startMock({
       t_ms: n.t_ms,
       t_ns: n.t_ns,
       state: n.state,
+      // 0.9.0: when it asked to come back, and whether it has. `due_ms` is
+      // null on most notes — a sentence with no time in it — and `fired` is
+      // not "done": a reminder that has gone off is still an open note.
+      due_ms: n.due_ms ?? null,
+      due_ns: n.due_ms == null ? null : String(n.due_ms) + '000000',
+      fired: !!n.fired,
+      fired_ms: n.fired_ms ?? null,
+    };
+  }
+
+  /// One digest on the wire, the shape `digest.list` and the `digest` event
+  /// both carry.
+  function digestPayload(d) {
+    const day = new Date(Date.now() - d.day_offset * DAY);
+    const started = day.getTime() - 3 * 3600_000;
+    const iso = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(
+      day.getDate()
+    ).padStart(2, '0')}`;
+    return {
+      thread_id: d.thread_id,
+      day: iso,
+      lang: d.lang,
+      summary: d.summary,
+      open: d.open ?? [],
+      participants: (d.people ?? []).map((id) => ({
+        speaker_id: id,
+        label: state.speakers.find((s) => s.id === id)?.name ?? null,
+      })),
+      started_ms: started,
+      started_ns: String(started) + '000000',
+      ended_ms: started + 40 * 60_000,
+      ended_ns: String(started + 40 * 60_000) + '000000',
+      turns: 12,
+      model_id: 'qwen2.5-3b-instruct-q4_k_m@1',
+      created_ms: Date.now(),
     };
   }
 
@@ -1373,6 +1503,11 @@ export function startMock({
             available: false,
             how: 'semantic search is not installed. `recalld models fetch --semantic` installs multilingual-e5-small-int8 (128.9 MB), then `recalld semantic backfill` indexes what has already been said.',
           },
+      // 0.9.0: what the three assistant features are set to, so a client can
+      // tell "off" from "an older daemon" without guessing. The mock ships
+      // with translation ON and pointed at German, because the whole point of
+      // a mock is to be the state that is worth looking at.
+      assist: { reminders: true, digest: true, translate_to: 'de' },
       segments_total: state.segments.length,
       daemon: daemonId(),
       schema: SCHEMA,
@@ -2040,10 +2175,55 @@ export function startMock({
       if (!NOTE_STATES.includes(next)) {
         throw err('params', `state must be one of ${JSON.stringify(NOTE_STATES)}, not ${JSON.stringify(next)}`);
       }
+      // 0.9.0: "not now, in ten minutes". The same method, because a snooze IS
+      // a state change — the note goes back to open and its date moves.
+      const snooze = params?.snooze_min;
+      if (snooze != null) {
+        if (next !== 'open') {
+          throw err(
+            'params',
+            'snooze_min only makes sense with state "open" — a note that is done or dismissed is not waiting to come back'
+          );
+        }
+        const mins = Number(snooze);
+        if (!Number.isFinite(mins) || mins < 1 || mins > 7 * 24 * 60) {
+          throw err('params', 'snooze_min must be between 1 and 10080 minutes');
+        }
+        const row = state.notes.find((n) => n.id === id);
+        if (!row) throw err('not_found', `no note with id ${params?.id}`);
+        row.state = 'open';
+        // A snooze on a note with no date GIVES it one, which is the only way
+        // to ask to be reminded of something you said without a time in it.
+        row.due_ms = Date.now() + mins * 60_000;
+        row.fired = false;
+        row.fired_ms = null;
+        const out = notePayload(row);
+        emit('segments', 'note', out);
+        return out;
+      }
       const row = state.notes.find((n) => n.id === id);
       if (!row) throw err('not_found', `no note with id ${params?.id}`);
       row.state = next;
       return notePayload(row);
+    },
+
+    // --- 0.9.0: the daily digest -------------------------------------------
+
+    'digest.list'(params) {
+      const day = params?.day;
+      if (day != null && !/^\d{4}-\d{2}-\d{2}$/.test(String(day))) {
+        throw err(
+          'params',
+          `day must be a local calendar day like "2026-09-02", not ${JSON.stringify(day)}`
+        );
+      }
+      const limit = Math.min(500, Math.max(1, Number(params?.limit ?? 50)));
+      const rows = state.digests
+        .map(digestPayload)
+        .filter((d) => day == null || d.day === day)
+        .sort((a, b) => b.started_ms - a.started_ms)
+        .slice(0, limit);
+      return { day: day ?? null, total: rows.length, digests: rows };
     },
 
     // --- 0.8.0: one query box ----------------------------------------------
@@ -2372,12 +2552,50 @@ export function startMock({
       }
       return { sent: 'note', id: LIVE_NOTE.id };
     }
+    if (n === 1) {
+      // 0.9.0: a reminder coming round, and a conversation the model has just
+      // read. Both are things a canned world cannot produce on its own, and
+      // both are the events the assistant round's two surfaces are built on.
+      const note = state.notes.find((x) => x.due_ms != null && !x.fired)
+        ?? state.notes.find((x) => x.state === 'open');
+      if (note) {
+        note.fired = true;
+        note.due_ms = note.due_ms ?? Date.now();
+        note.fired_ms = Date.now();
+        // The alarm, and then the row — in that order, because a client raises
+        // the notification from the first and repaints the list from the
+        // second (PROTOCOL 0.9.0).
+        emit('segments', 'reminder', {
+          note_id: note.id,
+          text: note.text,
+          due_ms: note.due_ms,
+          due_ns: String(note.due_ms) + '000000',
+          segment_id: note.segment_id,
+          t_ms: note.t_ms,
+        });
+        emit('segments', 'note', notePayload(note));
+      }
+      const fresh = {
+        thread_id: 500,
+        lang: 'de',
+        day_offset: 0,
+        summary:
+          'A und B haben über das Portal im Treppenhaus geredet. Es geht erst auf, wenn das Licht ausgeht; das hinter der Bar führt zurück in dieselbe Instanz.',
+        open: [],
+        people: [1, 3],
+      };
+      if (!state.digests.some((d) => d.thread_id === fresh.thread_id)) {
+        state.digests.unshift(fresh);
+        emit('segments', 'digest', digestPayload(fresh));
+      }
+      return { sent: 'reminder', note_id: note?.id ?? null, digest: fresh.thread_id };
+    }
     // A named voice walking into the instance. `who` is the VRChat display
     // name; linking it to a speaker is the client's job and is deliberately
     // case-insensitive on the user-given name (crates/recalld/src/roster.rs).
     const who = state.speakers.find((s) => s.name)?.name ?? 'Kira';
     emit('roster', 'roster', { ev: 'join', who, t: String(Date.now()) + '000000' });
-    return { sent: 'roster.join', who, repeat: n > 1 };
+    return { sent: 'roster.join', who, repeat: n > 2 };
   }
 
   return {

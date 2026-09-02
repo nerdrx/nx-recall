@@ -98,6 +98,13 @@ pub struct Control {
     asr: Mutex<crate::config::AsrConfig>,
     /// What that worker has done since the daemon started.
     pub quality: Arc<crate::quality::QualityStats>,
+    // ---- 0.9.0, the assistant -------------------------------------------
+    /// Reminders, digests and translation. Live like `asr` and `graph` and for
+    /// the same reason: every one of them has a switch.
+    assist: Mutex<crate::config::AssistConfig>,
+    /// What the assistant worker has done, read back from the rows.
+    pub assist_stats: Arc<crate::assist::AssistStats>,
+    // ---- end 0.9.0 -------------------------------------------------------
 }
 
 impl Control {
@@ -126,6 +133,9 @@ impl Control {
             graph_state: Mutex::new(GraphState::default()),
             asr: Mutex::new(crate::config::AsrConfig::default()),
             quality: Arc::new(crate::quality::QualityStats::default()),
+            // 0.9.0.
+            assist: Mutex::new(crate::config::AssistConfig::default()),
+            assist_stats: Arc::new(crate::assist::AssistStats::default()),
         })
     }
 
@@ -358,6 +368,25 @@ impl Control {
         *this.asr.get_mut().unwrap_or_else(|p| p.into_inner()) = cfg;
         self
     }
+
+    // ---- the assistant round (0.9.0) -------------------------------------
+
+    pub fn assist(&self) -> crate::config::AssistConfig {
+        self.assist
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Point the assistant at the running config. Set before the handle is
+    /// shared, like the rest of the wiring.
+    pub fn with_assist(mut self: Arc<Self>, cfg: crate::config::AssistConfig) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
+        *this.assist.get_mut().unwrap_or_else(|p| p.into_inner()) = cfg;
+        self
+    }
+
+    // ---- end 0.9.0 --------------------------------------------------------
 
     // ---- the memory graph (GRAPH.md Tiers 2 and 3) -----------------------
 

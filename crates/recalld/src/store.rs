@@ -44,7 +44,13 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // verdict, see `apply_v10`) and the `notes` table (a mic turn that opened with
 // a wake phrase, see `apply_v10_notes`). Both halves are idempotent and
 // independent; there is no backfill of either.
-pub const SCHEMA_VERSION: i64 = 10;
+// ---- 0.9.0 (schema v11) ---------------------------------------------------
+// v11 is the assistant round, and it is entirely additive: two columns on
+// `notes` (when a reminder is due and when it fired), two on `segments` (a
+// translation and the model that wrote it) and one new table, `digests`. See
+// `apply_v11`. No backfill of any of it — a note captured before v11 had no
+// due date to lose, and a translation nobody has computed is correctly absent.
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -220,6 +226,17 @@ pub struct SegmentRow {
     /// `None` when no cross-check has run — which is not the same as "checked
     /// and fine", and is why the null is on the wire.
     pub asr_confidence: Option<String>,
+    // ---- 0.9.0, the assistant (schema v11) --------------------------------
+    /// This turn, in the language the person reading is expected to have
+    /// (`[assist] translate_to`). `None` on every row until the idle pass has
+    /// looked, and on every row it decided not to translate — a turn already
+    /// in that language, a turn under three words, or one whose translation
+    /// failed a guard.
+    pub translation: Option<String>,
+    /// Which model wrote it, so a translation from one model is never mistaken
+    /// for a translation from another. Always set when `translation` is.
+    pub translation_via: Option<String>,
+    // ---- end 0.9.0 --------------------------------------------------------
 }
 
 /// A turn the idle quality worker may act on: enough to find its audio, place
@@ -781,6 +798,11 @@ impl Store {
         // v10 (0.8.0), second half: notes to self. Standalone like v9 — one
         // table that references `segments` and nothing else, and no backfill.
         self.apply_v10_notes()?;
+        // ---- 0.9.0, the assistant (schema v11) ----------------------------
+        // Standalone like v9 and v10's second half: additive columns and one
+        // table, reading nothing another migration writes.
+        self.apply_v11()?;
+        // ---- end 0.9.0 ----------------------------------------------------
 
         match current {
             None => {
@@ -2681,12 +2703,13 @@ impl Store {
     /// How many columns [`Self::SEGMENT_COLUMNS`] selects. A query that appends
     /// its own — the search's snippet — indexes from here rather than from a
     /// number somebody has to remember to bump.
-    const SEGMENT_COLUMN_COUNT: usize = 17;
+    const SEGMENT_COLUMN_COUNT: usize = 19;
 
     const SEGMENT_COLUMNS: &'static str =
         "g.id, g.session_id, sc.match_key, g.t_start_ns, g.t_end_ns,
          sp.canonical_id, sp.display_name, g.text, g.overlap_frac, g.match_score, g.audio_path,
-         g.lang, g.label_via, g.thread_id, g.lang_via, g.text_via, g.asr_confidence";
+         g.lang, g.label_via, g.thread_id, g.lang_via, g.text_via, g.asr_confidence,
+         g.translation, g.translation_via";
 
     fn segment_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentRow> {
         Ok(SegmentRow {
@@ -2707,6 +2730,9 @@ impl Store {
             lang_via: r.get(14)?,
             text_via: r.get(15)?,
             asr_confidence: r.get(16)?,
+            // 0.9.0 (v11).
+            translation: r.get(17)?,
+            translation_via: r.get(18)?,
         })
     }
 
@@ -4580,6 +4606,15 @@ pub struct NoteRow {
     /// The segment's start: when you actually said it, which is what a client
     /// shows and what the transcript can be scrolled to.
     pub t_start_ns: i64,
+    // ---- 0.9.0, the assistant (schema v11) --------------------------------
+    /// When this note asked to be brought back, resolved by [`crate::timeref`]
+    /// against the moment it was said. `None` for a note with no time
+    /// reference in it, which is most of them.
+    pub due_ns: Option<i64>,
+    /// When the scheduler actually announced it. `None` means it has not yet —
+    /// and a note fires exactly once, which is what this column is for.
+    pub fired_at_ns: Option<i64>,
+    // ---- end 0.9.0 --------------------------------------------------------
 }
 
 /// One conversation label a person took part in, most recent first.
@@ -4615,7 +4650,8 @@ impl Store {
     }
 
     const NOTE_COLUMNS: &'static str =
-        "n.id, n.segment_id, n.text, n.created_utc_ns, n.state, g.t_start_ns
+        "n.id, n.segment_id, n.text, n.created_utc_ns, n.state, g.t_start_ns,
+         n.due_ns, n.fired_at_ns
          FROM notes n
          JOIN segments g ON g.id = n.segment_id AND g.deleted_at IS NULL";
 
@@ -4627,6 +4663,9 @@ impl Store {
             created_utc_ns: r.get(3)?,
             state: r.get(4)?,
             t_start_ns: r.get(5)?,
+            // 0.9.0 (v11).
+            due_ns: r.get(6)?,
+            fired_at_ns: r.get(7)?,
         })
     }
 
@@ -4635,10 +4674,18 @@ impl Store {
     /// Returns `None` when the words have not changed, so a re-decode that
     /// produced the same sentence does not re-announce a note the user has
     /// already seen — and, crucially, does not resurrect one they dismissed.
+    ///
+    /// `due_ns` (0.9.0) travels with the words because it is *derived* from
+    /// them: a re-decode that turns "erinner mich morgen" into "erinner mich
+    /// heute" has moved the reminder, and a due date left over from the
+    /// sentence before is a reminder for something nobody said. It is written
+    /// on the same UPDATE and on nothing else — a snooze
+    /// ([`Self::snooze_note`]) is a person's decision and is not undone here.
     pub fn upsert_note(
         &self,
         segment_id: i64,
         text: &str,
+        due_ns: Option<i64>,
         at_utc_ns: i64,
     ) -> Result<Option<NoteRow>> {
         let existing: Option<(i64, String)> = self
@@ -4652,17 +4699,22 @@ impl Store {
         let id = match existing {
             Some((_, was)) if was == text => return Ok(None),
             Some((id, _)) => {
+                // The words moved, so the date they implied moves with them —
+                // and the row goes back on the scheduler's list, because a
+                // reminder that fired for a sentence that has since been
+                // re-read has not fired for this one.
                 self.conn.execute(
-                    "UPDATE notes SET text = ?2 WHERE id = ?1",
-                    params![id, text],
+                    "UPDATE notes SET text = ?2, due_ns = ?3, fired_at_ns = NULL
+                     WHERE id = ?1",
+                    params![id, text, due_ns],
                 )?;
                 id
             }
             None => {
                 self.conn.execute(
-                    "INSERT INTO notes (segment_id, text, created_utc_ns, state)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![segment_id, text, at_utc_ns, note_state::OPEN],
+                    "INSERT INTO notes (segment_id, text, created_utc_ns, state, due_ns)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![segment_id, text, at_utc_ns, note_state::OPEN, due_ns],
                 )?;
                 self.conn.last_insert_rowid()
             }
@@ -4818,6 +4870,419 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
+
+// ===========================================================================
+// 0.9.0 — the assistant (schema v11). One migration, and the queries the three
+// features need: reminders that fire, one digest per conversation per day, and
+// a translation on a turn.
+//
+// Its own impl block on purpose: three parallel worktrees are editing this
+// file, and a block with a name is a block a merge can see the shape of.
+// ===========================================================================
+
+/// `digests.lang` is a plain tag, but the *day* is a string and the format is
+/// load-bearing — it is the primary key's other half and what `digest.list`
+/// filters on. Local calendar days, `YYYY-MM-DD`, because "yesterday" is a
+/// thing that happens in a timezone and not in UTC.
+pub const DAY_FORMAT: &str = "%Y-%m-%d";
+
+/// One conversation, summarised. `people_json` and `open_json` are JSON arrays
+/// on the row for the same reason `speakers.languages` is: they are read whole,
+/// written whole, and never joined against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestRow {
+    pub thread_id: i64,
+    pub day: String,
+    pub lang: String,
+    pub summary: String,
+    pub people_json: String,
+    pub open_json: String,
+    pub model_id: String,
+    pub created_ns: i64,
+}
+
+/// A conversation the digest worker may look at: ended, long enough, and with
+/// no digest yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestCandidate {
+    pub thread_id: i64,
+    pub started_ns: i64,
+    pub ended_ns: i64,
+    pub turns: i64,
+}
+
+/// A committed turn the translation pass may look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslateCandidate {
+    pub id: i64,
+    pub text: String,
+    pub lang: String,
+}
+
+impl Store {
+    /// The assistant round (0.9.0). Four columns, one table, no backfill.
+    ///
+    /// `notes.due_ns` and `notes.fired_at_ns` are the reminder scheduler's
+    /// whole state, and they are deliberately two columns rather than one
+    /// nullable "next fire": a note that has fired keeps its due date, because
+    /// the date is what the user said and the firing is what the daemon did.
+    ///
+    /// `segments.translation` / `translation_via` sit on the segment rather
+    /// than in a table, like `threads.topic`: one string per turn, dead the
+    /// moment the turn is, and a table would be a second thing that can
+    /// disagree with `segments`.
+    fn apply_v11(&self) -> Result<()> {
+        self.add_column_if_missing("notes", "due_ns", "INTEGER")?;
+        self.add_column_if_missing("notes", "fired_at_ns", "INTEGER")?;
+        self.add_column_if_missing("segments", "translation", "TEXT")?;
+        self.add_column_if_missing("segments", "translation_via", "TEXT")?;
+        self.conn.execute_batch(
+            // The scheduler's query is "open notes with a due date that has
+            // passed and have not fired", every thirty seconds, forever. This
+            // is the covering index for exactly that.
+            "CREATE INDEX IF NOT EXISTS idx_notes_due ON notes(due_ns, fired_at_ns, state);
+
+             -- One digest per conversation, ever: `thread_id` is the key, and
+             -- `day` is on the row rather than in the key because a
+             -- conversation happens on one day and re-summarising it on the
+             -- next would be a second paragraph about the same evening.
+             CREATE TABLE IF NOT EXISTS digests (
+                 thread_id   INTEGER PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+                 day         TEXT    NOT NULL,
+                 lang        TEXT    NOT NULL,
+                 summary     TEXT    NOT NULL,
+                 people_json TEXT    NOT NULL,
+                 open_json   TEXT    NOT NULL,
+                 model_id    TEXT    NOT NULL,
+                 created_ns  INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_digests_day ON digests(day, created_ns);
+
+             -- The translation pass's queue: turns with words, a language, and
+             -- no verdict yet. `translation_via IS NULL` is the queue and
+             -- `translation IS NULL` is not — a turn the pass looked at and
+             -- declined to translate is marked (see `mark_translation_declined`)
+             -- so the worker does not walk it again every ten seconds.
+             CREATE INDEX IF NOT EXISTS idx_segments_translation
+                 ON segments(translation_via, t_start_ns);",
+        )?;
+        Ok(())
+    }
+
+    // ---- reminders ---------------------------------------------------------
+
+    /// Notes that have come due: open, dated, not yet fired, `due_ns <= now`.
+    ///
+    /// Ordered oldest first so a daemon that was off overnight announces a
+    /// backlog in the order the user asked for it, and bounded because a
+    /// scheduler that can publish two hundred events in one tick is a
+    /// scheduler that can hang up every client's outbox.
+    pub fn notes_due(&self, now_utc_ns: i64, limit: usize) -> Result<Vec<NoteRow>> {
+        let sql = format!(
+            "SELECT {} WHERE n.state = ?1 AND n.due_ns IS NOT NULL
+                        AND n.fired_at_ns IS NULL AND n.due_ns <= ?2
+             ORDER BY n.due_ns ASC, n.id ASC LIMIT ?3",
+            Self::NOTE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_map(
+                params![note_state::OPEN, now_utc_ns, limit as i64],
+                Self::note_row_from,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Mark a note as announced. Returns whether this call was the one that did
+    /// it — the guard that makes "fires once and never twice" true even if two
+    /// ticks overlap, because the UPDATE only matches a row that is still
+    /// unfired.
+    pub fn mark_note_fired(&self, id: i64, at_utc_ns: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE notes SET fired_at_ns = ?2 WHERE id = ?1 AND fired_at_ns IS NULL",
+            params![id, at_utc_ns],
+        )? > 0)
+    }
+
+    /// Push a note's due date `minutes` into the future from `from_utc_ns`, and
+    /// put it back on the scheduler's list.
+    ///
+    /// A snooze on a note with no due date **gives** it one, which is the only
+    /// way a person can ask to be reminded of something they said without a
+    /// time in it. Returns the row, or `None` when there is no such note.
+    pub fn snooze_note(&self, id: i64, minutes: i64, from_utc_ns: i64) -> Result<Option<NoteRow>> {
+        let due = from_utc_ns.saturating_add(minutes.max(1).saturating_mul(60_000_000_000));
+        let n = self.conn.execute(
+            "UPDATE notes SET due_ns = ?2, fired_at_ns = NULL, state = ?3 WHERE id = ?1",
+            params![id, due, note_state::OPEN],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        self.note(id)
+    }
+
+    // ---- digests -----------------------------------------------------------
+
+    /// Conversations the digest worker may consider: ended before
+    /// `settled_before_ns`, at least `min_turns` turns with words in them, and
+    /// no digest row.
+    ///
+    /// "Ended" is `threads.ended_ns`, which the threading rule advances with
+    /// every turn — so a conversation still being spoken is simply not in this
+    /// list yet, and a conversation that resumes after a digest was written
+    /// keeps the digest it has. That is the honest failure of one digest per
+    /// thread and it is the one worth having: the alternative is a paragraph
+    /// that changes under a reader.
+    pub fn threads_for_digest(
+        &self,
+        settled_before_ns: i64,
+        min_turns: i64,
+        limit: usize,
+    ) -> Result<Vec<DigestCandidate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id, t.started_ns, t.ended_ns, COUNT(g.id) AS turns
+             FROM threads t
+             JOIN segments g ON g.thread_id = t.id
+                            AND g.deleted_at IS NULL
+                            AND g.text IS NOT NULL AND TRIM(g.text) <> ''
+             LEFT JOIN digests d ON d.thread_id = t.id
+             WHERE d.thread_id IS NULL AND t.ended_ns <= ?1
+             GROUP BY t.id
+             HAVING turns >= ?2
+             ORDER BY t.ended_ns DESC
+             LIMIT ?3",
+        )?;
+        Ok(stmt
+            .query_map(params![settled_before_ns, min_turns, limit as i64], |r| {
+                Ok(DigestCandidate {
+                    thread_id: r.get(0)?,
+                    started_ns: r.get(1)?,
+                    ended_ns: r.get(2)?,
+                    turns: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Write one digest. Replaces rather than fails: a re-run after a model
+    /// change should produce the model's current answer, not an error about a
+    /// row somebody already wrote.
+    pub fn upsert_digest(&self, d: &DigestRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO digests
+                 (thread_id, day, lang, summary, people_json, open_json, model_id, created_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(thread_id) DO UPDATE SET
+                 day = excluded.day, lang = excluded.lang, summary = excluded.summary,
+                 people_json = excluded.people_json, open_json = excluded.open_json,
+                 model_id = excluded.model_id, created_ns = excluded.created_ns",
+            params![
+                d.thread_id,
+                d.day,
+                d.lang,
+                d.summary,
+                d.people_json,
+                d.open_json,
+                d.model_id,
+                d.created_ns
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record that a conversation was read and found not worth summarising.
+    ///
+    /// A refusal is a result and has to be written down, or the worker asks the
+    /// model about the same eight "ja"s every ten seconds for the rest of the
+    /// evening. An empty summary is the marker; `digest_rows` filters them out,
+    /// so a refusal is invisible to a client and permanent to the worker.
+    pub fn mark_thread_not_worth_summarising(
+        &self,
+        thread_id: i64,
+        model_id: &str,
+        at_utc_ns: i64,
+    ) -> Result<()> {
+        self.upsert_digest(&DigestRow {
+            thread_id,
+            day: String::new(),
+            lang: String::new(),
+            summary: String::new(),
+            people_json: "[]".into(),
+            open_json: "[]".into(),
+            model_id: model_id.to_string(),
+            created_ns: at_utc_ns,
+        })
+    }
+
+    /// Digests with something in them, newest conversation first. `day` narrows
+    /// to one local calendar day.
+    pub fn digest_rows(&self, day: Option<&str>, limit: usize) -> Result<Vec<DigestRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.thread_id, d.day, d.lang, d.summary, d.people_json, d.open_json,
+                    d.model_id, d.created_ns
+             FROM digests d
+             JOIN threads t ON t.id = d.thread_id
+             WHERE TRIM(d.summary) <> '' AND (?1 IS NULL OR d.day = ?1)
+             ORDER BY t.ended_ns DESC, d.thread_id DESC
+             LIMIT ?2",
+        )?;
+        Ok(stmt
+            .query_map(params![day, limit as i64], |r| {
+                Ok(DigestRow {
+                    thread_id: r.get(0)?,
+                    day: r.get(1)?,
+                    lang: r.get(2)?,
+                    summary: r.get(3)?,
+                    people_json: r.get(4)?,
+                    open_json: r.get(5)?,
+                    model_id: r.get(6)?,
+                    created_ns: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How many conversations have been read and how many are still waiting —
+    /// `(with a summary, refused, pending)`. Read by `status`.
+    pub fn digest_counts(&self, settled_before_ns: i64, min_turns: i64) -> Result<(i64, i64, i64)> {
+        let written: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM digests WHERE TRIM(summary) <> ''",
+            [],
+            |r| r.get(0),
+        )?;
+        let refused: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM digests WHERE TRIM(summary) = ''",
+            [],
+            |r| r.get(0),
+        )?;
+        let pending = self
+            .threads_for_digest(settled_before_ns, min_turns, usize::MAX >> 32)?
+            .len() as i64;
+        Ok((written, refused, pending))
+    }
+
+    // ---- translation -------------------------------------------------------
+
+    /// Turns waiting for a translation into `to`: stamped with some other
+    /// language, not spoken by one of `mine`, with words, and not yet looked at.
+    ///
+    /// `mine` is the languages the user's own voice speaks — a turn in a
+    /// language you already read is not a turn you need translated, and asking
+    /// the model anyway would be spending a model call to produce a copy.
+    pub fn segments_for_translation(
+        &self,
+        to: &str,
+        mine: &[String],
+        min_words: usize,
+        limit: usize,
+    ) -> Result<Vec<TranslateCandidate>> {
+        // `mine` is a small set of two-letter tags; an IN list built here is
+        // bounded by the number of languages a person can declare.
+        let skip: Vec<String> = std::iter::once(to.to_string())
+            .chain(mine.iter().cloned())
+            .collect();
+        let holes = (0..skip.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT g.id, g.text, g.lang FROM segments g
+             WHERE g.deleted_at IS NULL AND g.translation_via IS NULL
+               AND g.lang IS NOT NULL AND g.lang NOT IN ({holes})
+               AND g.text IS NOT NULL AND TRIM(g.text) <> ''
+             ORDER BY g.t_start_ns DESC LIMIT ?1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(limit as i64), Box::new(min_words as i64)];
+        for s in &skip {
+            args.push(Box::new(s.clone()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt
+            .query_map(refs.as_slice(), |r| {
+                Ok(TranslateCandidate {
+                    id: r.get(0)?,
+                    text: r.get(1)?,
+                    lang: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // The word floor is applied here rather than in SQL: SQLite cannot
+        // count words, and a LIKE-based approximation would be a second,
+        // different definition of "three words" from the one the pass uses.
+        Ok(rows
+            .into_iter()
+            .filter(|c| crate::asr::normalise_words(&c.text).len() >= min_words)
+            .collect())
+    }
+
+    /// Store a translation of one turn.
+    pub fn set_segment_translation(
+        &self,
+        segment_id: i64,
+        translation: &str,
+        model_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET translation = ?2, translation_via = ?3
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![segment_id, translation, model_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record that the pass looked at a turn and decided against translating
+    /// it — the model echoed the input, or answered in the wrong language.
+    ///
+    /// `translation_via` is set and `translation` left NULL, which is what
+    /// keeps the queue finite: NULL/NULL means "nothing has looked", and this
+    /// row has been looked at.
+    pub fn mark_translation_declined(&self, segment_id: i64, model_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET translation = NULL, translation_via = ?2
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![segment_id, model_id],
+        )?;
+        Ok(())
+    }
+
+    /// A turn whose words changed has a translation of words nobody said any
+    /// more. Clearing both columns puts it back at the end of the queue.
+    pub fn clear_segment_translation(&self, segment_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET translation = NULL, translation_via = NULL WHERE id = ?1",
+            params![segment_id],
+        )?;
+        Ok(())
+    }
+
+    /// `(translated, declined)` — the two halves of what the pass has done.
+    pub fn translation_counts(&self) -> Result<(i64, i64)> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(translation),
+                    SUM(CASE WHEN translation_via IS NOT NULL AND translation IS NULL
+                             THEN 1 ELSE 0 END)
+             FROM segments WHERE deleted_at IS NULL",
+            [],
+            |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+        )?)
+    }
+
+    /// The languages the user's own voice is declared to speak, for the
+    /// translation pass's "a turn you can already read" rule. Empty when there
+    /// is no pinned voice or it has no declaration — which is the common state,
+    /// and means only `translate_to` itself is skipped.
+    pub fn your_languages(&self) -> Result<Vec<String>> {
+        let Some(you) = self.you_speaker_id()? else {
+            return Ok(Vec::new());
+        };
+        Ok(self.speaker_languages(you)?.unwrap_or_default())
+    }
+}
+
+// ---- end 0.9.0 ------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -5038,6 +5503,86 @@ mod tests {
     }
 
     // ---- migration -------------------------------------------------------
+
+    /// 0.9.0 (v11). The whole migration is four columns and one table, and the
+    /// thing worth asserting is that it is a **no-op on the rows that exist**:
+    /// a note captured before v11 had no due date to lose, and a turn captured
+    /// before it has no translation nobody computed.
+    #[test]
+    fn a_v10_database_gains_the_assistant_and_loses_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "nx-recall-v11-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A database as 0.8.2 left it: opened by this build, then stamped back
+        // to v10 with the v11 columns dropped, which is as close to a real v10
+        // file as a test can get without checking a binary into the tree.
+        let (note_id, seg) = {
+            let s = Store::open(&dir).unwrap();
+            let src = s.upsert_source("VRChat.exe", "VRChat", 0).unwrap();
+            let sess = s.begin_session(src, 0).unwrap();
+            let seg = s.insert_segment(sess, 100, 200, "x.wav", 0).unwrap();
+            s.set_segment_analysis(
+                seg,
+                &SegmentAnalysis {
+                    text: Some("Recall, merk dir den Shader".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let note = s.upsert_note(seg, "den Shader", None, 7).unwrap().unwrap();
+            s.conn
+                .execute_batch(
+                    // The indexes reference the columns, so they go first —
+                    // which is also what a real v10 database looks like.
+                    "DROP INDEX IF EXISTS idx_notes_due;
+                     DROP INDEX IF EXISTS idx_segments_translation;
+                     ALTER TABLE notes DROP COLUMN due_ns;
+                     ALTER TABLE notes DROP COLUMN fired_at_ns;
+                     ALTER TABLE segments DROP COLUMN translation;
+                     ALTER TABLE segments DROP COLUMN translation_via;
+                     DROP TABLE digests;
+                     UPDATE schema_version SET version = 10;",
+                )
+                .unwrap();
+            (note.id, seg)
+        };
+
+        let s = Store::open(&dir).unwrap();
+        let v: i64 = s
+            .conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(v, 11);
+
+        // The note is still there, and it is not a reminder: nothing invented a
+        // date for a sentence that never had one.
+        let note = s.note(note_id).unwrap().expect("the note survived");
+        assert_eq!(note.text, "den Shader");
+        assert_eq!(note.due_ns, None);
+        assert_eq!(note.fired_at_ns, None);
+        assert!(s.notes_due(i64::MAX, 10).unwrap().is_empty());
+
+        // The turn is still there, and it has no translation — which is not the
+        // same as "needs none", and is why the column is NULL rather than "".
+        let row = s.segment_row(seg).unwrap().expect("the turn survived");
+        assert_eq!(row.text.as_deref(), Some("Recall, merk dir den Shader"));
+        assert_eq!(row.translation, None);
+        assert_eq!(row.translation_via, None);
+        assert_eq!(s.translation_counts().unwrap(), (0, 0));
+
+        // …and the new surface works on the migrated database.
+        assert_eq!(s.digest_rows(None, 10).unwrap(), Vec::new());
+        s.snooze_note(note_id, 5, 0).unwrap().unwrap();
+        assert_eq!(s.notes_due(6 * 60_000_000_000, 10).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_v1_database_migrates_and_keeps_its_rows() {

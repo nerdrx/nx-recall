@@ -263,7 +263,7 @@ mod tests {
             "Recall, merk dir: Aspen den Shader fragen",
         );
         let note = crate::notes::detect("Recall, merk dir: Aspen den Shader fragen").unwrap();
-        s.store.upsert_note(seg, &note, 0).unwrap();
+        s.store.upsert_note(seg, &note, None, 0).unwrap();
         // And one that names somebody else.
         let other = a_turn(
             &s,
@@ -275,6 +275,7 @@ mod tests {
             .upsert_note(
                 other,
                 &crate::notes::detect("Recall, note ask Kira about the world").unwrap(),
+                None,
                 0,
             )
             .unwrap();
