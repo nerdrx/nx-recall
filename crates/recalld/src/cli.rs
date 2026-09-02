@@ -226,6 +226,37 @@ the daemon is capturing, and a run that is interrupted loses nothing.
         action: Option<LangAction>,
     },
 
+    // ---- 0.11.0: source-aware identity ------------------------------------
+    /// Where each voice has been heard, and which labels the source-aware
+    /// prior would have questioned.
+    // Verbatim: clap would reflow the two halves into one paragraph.
+    #[command(long_about = "\
+Where each voice has been heard, and which labels that history argues against.
+
+Some voices are only ever present on Discord, some on Discord and in VRChat,
+some only through your own microphone. A voice heard eight hundred times on
+Discord and never once in VRChat should not win a VRChat turn at 0.36 — and
+until 0.11.0 it could, because the voicebank was asked one question about the
+whole world at once.
+
+`audit` prints three things and changes nothing:
+
+  the matrix     every voice against every source it has been heard on
+  the count      labels that pointed at a voice with no PRIOR history on that
+                 source, judged by replaying the labels in the order they were
+                 made — the only reading of the question that is not circular
+  the tail       the twenty most recent of those, with their scores
+
+`repair --foreign` takes those labels back to unassigned — never to another
+voice, because the finding is an argument against the label a row has and not
+for any other one. It previews by default; `--apply` writes.
+
+The prior itself is off until `[identity].source_prior = true`.")]
+    Identity {
+        #[command(subcommand)]
+        action: Option<IdentityAction>,
+    },
+    // ---- end 0.11.0 -------------------------------------------------------
     /// Give a voice a name. Retroactive by nature: the numeric id is the
     /// identity, so every past and future segment follows.
     Name {
@@ -501,6 +532,26 @@ pub enum NotesAction {
     Reopen {
         #[arg(value_name = "NOTE_ID")]
         id: i64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum IdentityAction {
+    /// The report: the voice × source matrix, the count of labels the rule
+    /// questions, and the most recent of them. Changes nothing. The default.
+    Audit,
+    /// Take questioned labels back to unassigned. Previews unless `--apply`.
+    Repair {
+        /// Required, and the only selector there is. Naming it is the point:
+        /// this command must never grow a mode that rewrites anything else.
+        #[arg(long)]
+        foreign: bool,
+        /// Actually write. Without it the command only lists.
+        #[arg(long)]
+        apply: bool,
+        /// Stop after this many rows.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
     },
 }
 

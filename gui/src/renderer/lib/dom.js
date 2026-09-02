@@ -125,3 +125,49 @@ export function fmtFirstSeen(iso) {
   if (!Number.isFinite(t) || t <= 0) return 'today';
   return fmtDate(iso);
 }
+
+// ---------------------------------------------------------- heard on ------
+// 0.11.0: where a voice has actually been heard.
+//
+// The list rows and the person header ask the same question and must answer it
+// identically, so the chips are built once here rather than twice in two views.
+// The label is the source's DISPLAY name where it has one and its match key
+// where it does not — "VRChat.exe" is what a person recognises, "Chromium" is
+// what a Discord client calls itself to PipeWire, and neither is guessable from
+// the other. The microphone and the room mic get plain words instead: they are
+// not applications and reading "mic" on a row about a person is a puzzle.
+
+const SOURCE_WORD = { mic: 'your mic', room: 'the room' };
+
+/** What one source chip says. */
+export function sourceLabel(s) {
+  return SOURCE_WORD[s?.kind] ?? s?.source ?? '—';
+}
+
+/**
+ * The chips for one voice's `sources` array, most-heard first (the daemon
+ * already sorts them). `withCounts` adds the turn count, which the person page
+ * has room for and a list row does not.
+ *
+ * An empty history renders nothing at all rather than an empty-state chip: a
+ * voice with no live turns is already saying so through its "0 segments".
+ */
+export function heardOnChips(sources, { withCounts = false } = {}) {
+  const rows = Array.isArray(sources) ? sources : [];
+  if (!rows.length) return null;
+  return h(
+    'span',
+    { class: 'heard-on', dataset: { heardOn: String(rows.length) } },
+    ...rows.map((s) =>
+      h(
+        'span',
+        {
+          class: `chip heard kind-${s.kind ?? 'app'}`,
+          dataset: { heardSource: s.source },
+          title: `${s.segments} turn${s.segments === 1 ? '' : 's'} on ${s.name || s.source}`,
+        },
+        withCounts ? `${sourceLabel(s)} · ${s.segments}` : sourceLabel(s)
+      )
+    )
+  );
+}

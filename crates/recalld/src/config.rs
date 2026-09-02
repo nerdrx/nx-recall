@@ -305,6 +305,38 @@ pub struct IdentityConfig {
     /// from. Beyond this the silence is long enough that somebody else may have
     /// started talking.
     pub proximity_gap_s: f32,
+
+    // ---- 0.11.0: the source-aware prior (`crate::identity_prior`) --------
+    /// Whether where the audio came from is allowed to affect who wins a
+    /// segment at all. **Off by default**, and that is a measurement rather
+    /// than caution: on this install's 92 Discord turns with Discord's own
+    /// ground truth, every candidate the ladder was choosing between was
+    /// already native to Discord, so the prior changed nothing and there is no
+    /// evidence yet that it helps (FINDINGS §17). It is a live, tested code
+    /// path with a measured null result, not a guess — turn it on and
+    /// `recalld identity audit` will say what it does.
+    pub source_prior: bool,
+    /// How much extra score a voice needs to win a segment on a source it has
+    /// never been heard on. Added to `label_threshold`, so the default puts a
+    /// foreign voice's bar at 0.45 against a native voice's 0.35.
+    pub foreign_source_margin: f32,
+    /// How many turns a voice must have, in total, before its *absence* from a
+    /// source counts as evidence. Below this the voice is simply new, and
+    /// calling it foreign would freeze the bank at whichever app happened to
+    /// hear each person first.
+    pub foreign_after_segments: i64,
+    /// Whether Discord's speaking events may exclude a candidate outright on a
+    /// Discord-sourced segment. On: this is Discord's own word about its own
+    /// call, and the soft rules are for evidence that is weaker than that.
+    /// Costs nothing when the truth bridge has never run — no data in the
+    /// window means the rule does not fire.
+    pub presence_hard: bool,
+    /// Which capture sources count as VRChat, as lower-case substrings matched
+    /// against a source's match key and display name. The mirror of
+    /// `[truth].sources`, which says the same thing about Discord, and kept
+    /// separate for the same reason: a client under another name should be a
+    /// config edit rather than a rebuild.
+    pub vrchat_sources: Vec<String>,
 }
 
 impl Default for IdentityConfig {
@@ -324,6 +356,12 @@ impl Default for IdentityConfig {
             mint_min_duration_s: 2.0,
             mint_min_words: 2,
             proximity_gap_s: 2.5,
+            // ---- 0.11.0 ----------------------------------------------
+            source_prior: false,
+            foreign_source_margin: 0.10,
+            foreign_after_segments: 20,
+            presence_hard: true,
+            vrchat_sources: vec!["vrchat".into()],
         }
     }
 }
@@ -978,6 +1016,17 @@ impl Config {
              # off by default and it needs `device = \"<pipewire node.name>\"`;\n\
              # `recalld devices` lists them. Its voices are matched and enrolled\n\
              # like anybody else's, so they appear in the voicebank by name.\n\
+             #\n\
+             # `[identity].source_prior` makes WHERE a turn came from evidence\n\
+             # about who is on it: a voice heard thousands of times on Discord\n\
+             # and never in VRChat needs a higher score to win a VRChat turn,\n\
+             # and Discord's own speaking events can rule a linked account out\n\
+             # of a Discord turn entirely. It is OFF because it was measured and\n\
+             # found to change nothing yet on this corpus — 236 candidates\n\
+             # removed across 161 ground-truth turns, 0 labels changed, because\n\
+             # every voice in a Discord call already lives on Discord (spike/\n\
+             # FINDINGS.md §17). `recalld identity audit` says what it would do\n\
+             # to your database without turning it on.\n\
              \n{body}"
         );
         let tmp = path.with_extension("toml.tmp");
@@ -1115,6 +1164,21 @@ mod tests {
         assert_eq!(cfg.identity.split_ambiguous_margin, 0.05);
         assert_eq!(cfg.identity.split_restarts, 8);
         assert_eq!(cfg.vad.turn_merge_gap_ms, 1_500);
+
+        // 0.11.0. The prior ships OFF, and that is a measurement (FINDINGS
+        // §17): on 161 turns with Discord's own ground truth it removed 236
+        // candidates and changed nothing, because every voice in a Discord call
+        // already lives on Discord. Flipping this default is a claim about
+        // accuracy and needs a corpus that crosses sources to back it.
+        assert!(!cfg.identity.source_prior);
+        assert_eq!(cfg.identity.foreign_source_margin, 0.10);
+        assert_eq!(cfg.identity.foreign_after_segments, 20);
+        // The hard rule is on, and costs nothing while the prior is off — and
+        // nothing again on an install whose truth bridge has never run.
+        assert!(cfg.identity.presence_hard);
+        assert_eq!(cfg.identity.vrchat_sources, vec!["vrchat".to_string()]);
+        // Its mirror, which says the same about Discord and is not duplicated.
+        assert_eq!(cfg.truth.sources, vec!["discord", "vesktop"]);
     }
 
     #[test]

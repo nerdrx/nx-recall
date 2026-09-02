@@ -77,6 +77,33 @@ const REPAIR_BATCH: usize = 32;
 const PRUNE_MAX_SEGMENTS: i64 = 1;
 const PRUNE_MAX_SPEECH_NS: i64 = 3_000_000_000;
 
+/// A voice's source history on the wire (0.11.0), most-heard first.
+///
+/// `source` is the match key — an application's executable name, or the literal
+/// `mic` / `room` — because that is what the prior keys on and what stays the
+/// same when a display name changes. `name` is what a person should read.
+/// `None` renders as `[]` rather than `null`: a voice with no live turns has an
+/// empty history, not an unknown one.
+pub fn source_chips(rows: Option<&Vec<crate::store::SpeakerSource>>) -> Value {
+    let Some(rows) = rows else {
+        return json!([]);
+    };
+    Value::Array(
+        rows.iter()
+            .map(|s| {
+                json!({
+                    "source": s.match_key,
+                    "name": s.display_name,
+                    "kind": s.kind,
+                    "segments": s.segments,
+                    "last_ms": ns_to_ms(s.last_ns),
+                    "last_ns": s.last_ns.to_string(),
+                })
+            })
+            .collect(),
+    )
+}
+
 /// One segment on the wire.
 ///
 /// Both time forms, deliberately (PROTOCOL "Field conventions"): `t_ms` is what
@@ -1215,6 +1242,10 @@ impl Service {
         let store = self.store();
         let rows = store.list_speakers().map_err(Error::from)?;
         let you = store.you_speaker_id().map_err(Error::from)?;
+        // Where each voice has been heard (0.11.0). One query for the whole
+        // list rather than one per row: the client renders every voice at once
+        // and an N+1 here would be the only expensive thing on the page.
+        let sources = store.speaker_source_matrix().map_err(Error::from)?;
         drop(store);
         Ok(json!({
             "speakers": rows
@@ -1239,6 +1270,11 @@ impl Service {
                     "segments": r.segments,
                     "total_ms": ns_to_ms(r.speech_ns),
                     "speech_ns": r.speech_ns.to_string(),
+                    // Which capture sources this voice has actually been heard
+                    // on (0.11.0). A voice present only on Discord and a voice
+                    // present everywhere are different facts about a person,
+                    // and until now the list could not tell them apart.
+                    "sources": source_chips(sources.get(&r.id)),
                 }))
                 .collect::<Vec<_>>(),
         }))
@@ -1998,6 +2034,9 @@ impl Service {
         // 0.10.0: where they meet.
         let worlds = crate::worlds::person_worlds(&store, id, crate::worlds::PERSON_WORLDS)
             .map_err(Error::from)?;
+        // 0.11.0: where they are heard. The same shape `speakers.list` carries,
+        // for the header's chips.
+        let sources = store.speaker_sources(id).map_err(Error::from)?;
         // Participant *names*, resolved here rather than in the client: the
         // page lists people who may not be in the client's speaker list at all
         // (a merged-away id, a voice minted since the last query).
@@ -2030,6 +2069,9 @@ impl Service {
             // because the page has a chip for them and should not have to know
             // they live on the speaker row.
             "languages": speaker.languages,
+            // 0.11.0: heard on. Top level for the same reason `languages` is —
+            // the header has a row of chips for it.
+            "sources": source_chips(Some(&sources)),
             "totals": {
                 "segments": totals.segments,
                 "speech_ms": ns_to_ms(totals.speech_ns),
@@ -5063,6 +5105,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["samples"].as_array().unwrap().len(), 0);
+    }
+
+    // ---- 0.11.0: where a voice has been heard ----------------------------
+
+    #[test]
+    fn a_voice_carries_the_sources_it_was_heard_on_to_both_surfaces() {
+        let r = rig("heard-on");
+        let voice = {
+            let store = r.service.store();
+            let discord = store
+                .upsert_source_kind("Discord", "Chromium", crate::store::KIND_APP, 0)
+                .unwrap();
+            let vrchat = store
+                .upsert_source_kind("VRChat.exe", "VRChat", crate::store::KIND_APP, 0)
+                .unwrap();
+            let voice = store.mint_speaker(0).unwrap();
+            let sec = 1_000_000_000i64;
+            let put = |source: i64, n: i64| {
+                let sess = store.begin_session(source, 0).unwrap();
+                for i in 0..n {
+                    let at = i * 10 * sec;
+                    let id = store
+                        .insert_segment(sess, at, at + sec, "x.wav", at)
+                        .unwrap();
+                    store
+                        .set_segment_speaker_via(id, Some(voice), Some(0.9), None)
+                        .unwrap();
+                }
+            };
+            put(discord, 3);
+            put(vrchat, 1);
+            voice
+        };
+
+        // The list. Most-heard first, so a client can render the chips in the
+        // order they matter without sorting.
+        let listed = call(&r, r#"{"id":1,"method":"speakers.list"}"#).unwrap();
+        let row = listed["speakers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == json!(voice))
+            .unwrap()
+            .clone();
+        let srcs = row["sources"].as_array().unwrap();
+        assert_eq!(srcs.len(), 2, "two sources: {srcs:?}");
+        assert_eq!(srcs[0]["source"], json!("Discord"));
+        assert_eq!(srcs[0]["segments"], json!(3));
+        assert_eq!(srcs[0]["kind"], json!("app"));
+        assert!(srcs[0]["last_ms"].as_i64().is_some());
+        assert_eq!(srcs[1]["source"], json!("VRChat.exe"));
+        assert_eq!(srcs[1]["segments"], json!(1));
+
+        // The person page says the same thing in the same shape.
+        let page = call(
+            &r,
+            &format!(r#"{{"id":2,"method":"person.get","params":{{"id":{voice}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(page["sources"], row["sources"]);
+
+        // A voice with no live turns has an empty history, not a null one — a
+        // client must never have to guard the field.
+        let empty = r.service.store().mint_speaker(0).unwrap();
+        let page = call(
+            &r,
+            &format!(r#"{{"id":3,"method":"person.get","params":{{"id":{empty}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(page["sources"], json!([]));
     }
 
     // ---- 0.6.1: per-speaker languages ------------------------------------

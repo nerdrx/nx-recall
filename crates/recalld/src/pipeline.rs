@@ -295,6 +295,17 @@ impl Pipeline {
                 if models.complete() {
                     let mut analyzer = Analyzer::load(&models, &cfg.identity)?;
                     analyzer.set_lang_config(&cfg.lang);
+                    // 0.11.0: which capture sources count as Discord, so the
+                    // source prior's hard presence rule knows where it applies.
+                    analyzer.set_truth_config(&cfg.truth);
+                    if cfg.identity.source_prior {
+                        info!(
+                            foreign_margin = cfg.identity.foreign_source_margin,
+                            after_segments = cfg.identity.foreign_after_segments,
+                            presence_hard = cfg.identity.presence_hard,
+                            "the source-aware identity prior is on"
+                        );
+                    }
                     // Which flips this machine can actually settle. Said once,
                     // because "it was only flagged" otherwise has no visible
                     // cause — the arbiters are optional and both of them are.

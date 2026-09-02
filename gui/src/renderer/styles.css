@@ -525,6 +525,21 @@ select.input option, select.input optgroup {
 .chip.lang:focus-visible { outline: none; box-shadow: var(--clear-focus); }
 .chip.lang.set { color: var(--violet); border-color: var(--clear-line-accent); background: var(--violet-soft); }
 
+/* ------------------------------------------------------------ heard on --- */
+/* 0.11.0: where a voice has actually been heard. Read-only and quiet — this is
+   provenance, not a control, and it sits beside the name where "first heard"
+   already is. The microphone is the one that earns the accent: it is the only
+   source whose label is certain rather than matched (DESIGN §5). */
+
+.heard-on { display: inline-flex; flex-wrap: wrap; gap: 5px; margin-left: 6px; vertical-align: middle; }
+.chip.heard {
+  padding: 2px 8px; font-size: 9px; letter-spacing: 0.09em;
+  background: transparent; border-color: var(--clear-line);
+}
+.chip.heard.kind-mic,
+.chip.heard.kind-room { color: var(--violet); border-color: var(--clear-line-accent); background: var(--violet-soft); }
+.person-tags .heard-on { margin-left: 0; }
+
 /* Four choices, one row: the daemon classifies two languages, so this is a
    closed set and a segmented control is the honest shape for it. Exactly one is
    ever chosen, so the accent lands exactly once. */

@@ -30,7 +30,7 @@
 //! any other migration writes, so it applies to a v6, v7 or v8 database alike.
 //! Existing databases are migrated in place.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -948,6 +948,13 @@ impl Store {
         // IS honest (the VRChat logs still on disk).
         crate::worlds::migrate_v12(&self.conn)?;
         // ---- end 0.10.0 ---------------------------------------------------
+
+        // ---- 0.11.0: source-aware identity --------------------------------
+        // One index and nothing else. No column, no table, no backfill — the
+        // source history is derived from `segments` and `sessions` on demand,
+        // so there is no shape change and no version to bump.
+        self.apply_source_prior_index()?;
+        // ---- end 0.11.0 ---------------------------------------------------
 
         match current {
             None => {
@@ -6286,6 +6293,332 @@ impl Store {
 }
 
 // ---- end 0.10.1 -----------------------------------------------------------
+// ---- 0.11.0: source-aware identity ----------------------------------------
+//
+// Everything below the banner is additive: one index, four read queries and
+// one narrow UPDATE. Nothing above it reads any of this, and deleting the block
+// would leave a working 0.10.0 store behind.
+//
+// **Why a query and not a counter table.** A maintained `speaker_sources`
+// counter would be a fifth thing every relabelling path has to remember —
+// `merge_speakers`, `split`, `set_segment_speaker`, `set_segment_speaker_via`,
+// proximity inheritance, `speakers.prune`, delete-by-speaker, the truth pass's
+// enrolment and the retention sweeper all move or remove rows that would have
+// to be counted — and a counter that drifts is worse than no counter, because
+// the prior would then refuse voices on the strength of a number nobody can
+// see is wrong. The query is a grouped join over `segments.speaker_id`, which
+// is already indexed, and this install's whole `segments` table is under ten
+// thousand rows after two months of daily capture. The covering index below
+// makes the per-speaker case index-only up to the session join.
+
+/// One row of a voice's source history: where it has been heard, how often,
+/// and when last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeakerSource {
+    pub source_id: i64,
+    /// The stable identifier — an application's PE/executable name, or the
+    /// literal `mic` / `room`. This is what the prior keys on and what a client
+    /// should render as the chip's identity.
+    pub match_key: String,
+    pub display_name: String,
+    /// `app`, `mic` or `room` (`crate::store::source_kind`).
+    pub kind: String,
+    pub segments: i64,
+    /// When this voice was last heard on this source.
+    pub last_ns: i64,
+}
+
+/// What the prior needs to know about one voice's standing on one source.
+/// Deliberately not [`SpeakerSource`]: this is two counts, for every voice at
+/// once, and it is asked per segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceStanding {
+    pub speaker_id: i64,
+    pub on_source: i64,
+    pub total: i64,
+}
+
+/// One labelled turn, in the shape the audit's chronological replay needs it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelledSegment {
+    pub id: i64,
+    pub speaker_id: i64,
+    pub source_id: i64,
+    pub match_score: Option<f64>,
+    pub label_via: Option<String>,
+    pub t_start_ns: i64,
+}
+
+/// The source a segment was captured from, with the span the presence rules
+/// look around.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentSource {
+    pub segment_id: i64,
+    pub source_id: i64,
+    pub match_key: String,
+    pub display_name: String,
+    pub kind: String,
+    pub t_start_ns: i64,
+    pub t_end_ns: i64,
+}
+
+impl Store {
+    /// The covering index the source matrix is read through. Idempotent and
+    /// additive, so it needs no schema version of its own — it is an index,
+    /// and an index is not a shape.
+    pub(crate) fn apply_source_prior_index(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_segments_speaker_session
+                 ON segments(speaker_id, session_id);",
+        )?;
+        Ok(())
+    }
+
+    /// Where one voice has been heard, most turns first.
+    ///
+    /// Live rows only: a soft-deleted turn has left every other read path and
+    /// must not keep a chip alive on the Speakers list either.
+    pub fn speaker_sources(&self, speaker_id: i64) -> Result<Vec<SpeakerSource>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sc.id, sc.match_key, sc.display_name, sc.kind,
+                    COUNT(g.id), MAX(g.t_end_ns)
+             FROM segments g
+             JOIN sessions ss ON ss.id = g.session_id
+             JOIN sources  sc ON sc.id = ss.source_id
+             WHERE g.speaker_id = ?1 AND g.deleted_at IS NULL
+             GROUP BY sc.id
+             ORDER BY 5 DESC, sc.id ASC",
+        )?;
+        Ok(stmt
+            .query_map(params![speaker_id], Self::speaker_source_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The whole voice × source matrix in one query, keyed by voice.
+    ///
+    /// One query rather than one per voice: `speakers.list` renders every row
+    /// at once and the audit prints the matrix, so the N+1 shape would be the
+    /// only expensive thing on either path.
+    pub fn speaker_source_matrix(&self) -> Result<HashMap<i64, Vec<SpeakerSource>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.speaker_id, sc.id, sc.match_key, sc.display_name, sc.kind,
+                    COUNT(g.id), MAX(g.t_end_ns)
+             FROM segments g
+             JOIN sessions ss ON ss.id = g.session_id
+             JOIN sources  sc ON sc.id = ss.source_id
+             WHERE g.speaker_id IS NOT NULL AND g.deleted_at IS NULL
+             GROUP BY g.speaker_id, sc.id
+             ORDER BY g.speaker_id ASC, 6 DESC, sc.id ASC",
+        )?;
+        let mut out: HashMap<i64, Vec<SpeakerSource>> = HashMap::new();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    SpeakerSource {
+                        source_id: r.get(1)?,
+                        match_key: r.get(2)?,
+                        display_name: r.get(3)?,
+                        kind: r.get(4)?,
+                        segments: r.get(5)?,
+                        last_ns: r.get(6)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (speaker_id, row) in rows {
+            out.entry(speaker_id).or_default().push(row);
+        }
+        Ok(out)
+    }
+
+    fn speaker_source_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SpeakerSource> {
+        Ok(SpeakerSource {
+            source_id: r.get(0)?,
+            match_key: r.get(1)?,
+            display_name: r.get(2)?,
+            kind: r.get(3)?,
+            segments: r.get(4)?,
+            last_ns: r.get(5)?,
+        })
+    }
+
+    /// Every voice's standing against one source: turns there, turns anywhere.
+    ///
+    /// Asked once per segment analysed, which is why it is a single grouped
+    /// scan rather than a lookup per candidate — a voicebank of thirty voices
+    /// would otherwise be thirty round trips inside the store mutex.
+    pub fn source_standings(&self, source_id: i64) -> Result<Vec<SourceStanding>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.speaker_id,
+                    SUM(CASE WHEN ss.source_id = ?1 THEN 1 ELSE 0 END),
+                    COUNT(g.id)
+             FROM segments g
+             JOIN sessions ss ON ss.id = g.session_id
+             WHERE g.speaker_id IS NOT NULL AND g.deleted_at IS NULL
+             GROUP BY g.speaker_id",
+        )?;
+        Ok(stmt
+            .query_map(params![source_id], |r| {
+                Ok(SourceStanding {
+                    speaker_id: r.get(0)?,
+                    on_source: r.get(1)?,
+                    total: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Which source a segment came from, and the span the presence rules look
+    /// either side of.
+    pub fn segment_source(&self, segment_id: i64) -> Result<Option<SegmentSource>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT sc.id, sc.match_key, sc.display_name, sc.kind,
+                        g.t_start_ns, g.t_end_ns
+                 FROM segments g
+                 JOIN sessions ss ON ss.id = g.session_id
+                 JOIN sources  sc ON sc.id = ss.source_id
+                 WHERE g.id = ?1",
+                params![segment_id],
+                |r| {
+                    Ok(SegmentSource {
+                        segment_id,
+                        source_id: r.get(0)?,
+                        match_key: r.get(1)?,
+                        display_name: r.get(2)?,
+                        kind: r.get(3)?,
+                        t_start_ns: r.get(4)?,
+                        t_end_ns: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// The Discord accounts a voice is linked to. Empty for a voice nothing has
+    /// linked, which is the state the hard presence rule refuses to act on.
+    pub fn discord_user_ids_for_speaker(&self, speaker_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.user_id FROM discord_users d
+             JOIN speaker_resolved sp ON sp.id = d.speaker_id
+             WHERE sp.canonical_id = ?1",
+        )?;
+        Ok(stmt
+            .query_map(params![speaker_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Which Discord accounts spoke at all in `[from_ns, to_ns)`.
+    ///
+    /// The *set*, not the spans: the hard rule asks one yes/no question per
+    /// account and a list of ids answers it without materialising every ring
+    /// Discord drew in ten minutes.
+    pub fn discord_users_speaking_between(
+        &self,
+        from_ns: i64,
+        to_ns: i64,
+    ) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT user_id FROM truth_speaking
+             WHERE t_start_ns < ?2 AND COALESCE(t_end_ns, ?2) > ?1",
+        )?;
+        Ok(stmt
+            .query_map(params![from_ns, to_ns], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?)
+    }
+
+    /// Which display names the VRChat roster had present in `[from_ns, to_ns)`.
+    ///
+    /// An open row (nobody has left) counts as present through the window's
+    /// end, which is the same reading `roster_intervals` takes.
+    pub fn roster_names_between(&self, from_ns: i64, to_ns: i64) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT display_name FROM session_roster
+             WHERE joined_at_utc_ns < ?2 AND COALESCE(left_at_utc_ns, ?2) > ?1",
+        )?;
+        Ok(stmt
+            .query_map(params![from_ns, to_ns], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?)
+    }
+
+    /// The name a voice would be looked up in the roster by, or `None` when it
+    /// has never been named. Resolved through the tombstone view, like
+    /// `roster_intervals`, so a merged-away id answers for the surviving voice.
+    pub fn named_speaker_name(&self, speaker_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT s.display_name FROM speakers s
+                 JOIN speaker_resolved sp ON sp.canonical_id = s.id
+                 WHERE sp.id = ?1 AND s.named_at IS NOT NULL",
+                params![speaker_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// One labelled turn, as the audit's chronological replay reads it.
+    pub fn labelled_segments_in_order(&self) -> Result<Vec<LabelledSegment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.speaker_id, ss.source_id, g.match_score, g.label_via, g.t_start_ns
+             FROM segments g
+             JOIN sessions ss ON ss.id = g.session_id
+             WHERE g.speaker_id IS NOT NULL AND g.deleted_at IS NULL
+             ORDER BY g.t_start_ns ASC, g.id ASC",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(LabelledSegment {
+                    id: r.get(0)?,
+                    speaker_id: r.get(1)?,
+                    source_id: r.get(2)?,
+                    match_score: r.get(3)?,
+                    label_via: r.get(4)?,
+                    t_start_ns: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every capture source, by id — the audit's lookup table.
+    pub fn sources_by_id(&self) -> Result<HashMap<i64, (String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, match_key, display_name, kind FROM sources")?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    (
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    ),
+                ))
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    }
+
+    /// Take one label back to *unassigned*: the only write `identity repair`
+    /// is allowed to make.
+    ///
+    /// It never re-points a row at another voice. The audit's finding is "this
+    /// label is not supported by where the audio came from", which is an
+    /// argument against the label it has and not for any other one — and a
+    /// sweep that guesses again in bulk is how a bad label becomes a hundred.
+    /// The embedding stays, so the row remains evidence for a later reassign.
+    pub fn unassign_segment_speaker(&self, segment_id: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE segments SET speaker_id = NULL, match_score = NULL, label_via = NULL
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![segment_id],
+        )? > 0)
+    }
+}
+
+// ---- end 0.11.0 -----------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -8651,5 +8984,200 @@ mod tests {
         s.set_segment_language(ids[0], "en", lang_via::CLASSIFIED)
             .unwrap();
         assert_eq!(s.language_mismatch_counts().unwrap(), (2, 1));
+    }
+
+    // ---- 0.11.0: source-aware identity -----------------------------------
+
+    /// One store with two voices and three sources, arranged the way the live
+    /// database actually is: one voice heard only through an app, one heard
+    /// only on a second app, and the user's own voice on the microphone.
+    fn a_two_source_store() -> (Store, i64, i64, i64, i64, i64) {
+        let s = store();
+        let discord = s
+            .upsert_source_kind("Discord", "Chromium", KIND_APP, 0)
+            .unwrap();
+        let vesktop = s
+            .upsert_source_kind("vesktop", "Chromium", KIND_APP, 0)
+            .unwrap();
+        let mic = s
+            .upsert_source_kind("mic", "Microphone", KIND_MIC, 0)
+            .unwrap();
+        let sd = s.begin_session(discord, 0).unwrap();
+        let sv = s.begin_session(vesktop, 0).unwrap();
+        let sm = s.begin_session(mic, 0).unwrap();
+
+        let rowan = s.create_speaker("Rowan", 0).unwrap();
+        let albe = s.create_speaker("Albe", 0).unwrap();
+        let you = s.ensure_you_speaker(0).unwrap();
+
+        let sec = 1_000_000_000i64;
+        let mut t = sec;
+        let put = |session: i64, speaker: i64, at: i64| {
+            let id = s
+                .insert_segment(session, at, at + sec, "x.wav", at)
+                .unwrap();
+            s.set_segment_speaker_via(id, Some(speaker), Some(0.9), Some(label_via::MATCH))
+                .unwrap();
+            id
+        };
+        for _ in 0..3 {
+            put(sd, rowan, t);
+            t += 10 * sec;
+        }
+        for _ in 0..2 {
+            put(sv, albe, t);
+            t += 10 * sec;
+        }
+        let mic_seg = put(sm, you, t);
+        (s, rowan, albe, you, discord, mic_seg)
+    }
+
+    #[test]
+    fn a_voice_source_history_counts_only_where_it_was_actually_heard() {
+        let (s, rowan, albe, you, discord, _) = a_two_source_store();
+
+        let h = s.speaker_sources(rowan).unwrap();
+        assert_eq!(h.len(), 1, "Rowan has been heard on one source: {h:?}");
+        assert_eq!(h[0].match_key, "Discord");
+        assert_eq!(h[0].segments, 3);
+        assert_eq!(h[0].source_id, discord);
+        assert_eq!(h[0].kind, KIND_APP);
+
+        assert_eq!(s.speaker_sources(albe).unwrap()[0].match_key, "vesktop");
+        let y = s.speaker_sources(you).unwrap();
+        assert_eq!(y[0].kind, KIND_MIC);
+
+        // The matrix says the same thing for everyone at once.
+        let m = s.speaker_source_matrix().unwrap();
+        assert_eq!(m[&rowan][0].segments, 3);
+        assert_eq!(m[&albe][0].segments, 2);
+        assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn a_deleted_turn_stops_counting_towards_a_source() {
+        let (s, rowan, ..) = a_two_source_store();
+        let first = s
+            .conn
+            .query_row(
+                "SELECT id FROM segments WHERE speaker_id = ?1 ORDER BY id LIMIT 1",
+                params![rowan],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        s.soft_delete_segments(&[first], 1).unwrap();
+        assert_eq!(s.speaker_sources(rowan).unwrap()[0].segments, 2);
+    }
+
+    #[test]
+    fn the_standings_split_turns_here_from_turns_anywhere() {
+        let (s, rowan, albe, _, discord, _) = a_two_source_store();
+        let st = s.source_standings(discord).unwrap();
+        let of = |id: i64| *st.iter().find(|x| x.speaker_id == id).unwrap();
+        assert_eq!((of(rowan).on_source, of(rowan).total), (3, 3));
+        // Albe has history, all of it somewhere else — the whole point.
+        assert_eq!((of(albe).on_source, of(albe).total), (0, 2));
+    }
+
+    #[test]
+    fn a_segment_knows_which_source_it_came_from() {
+        let (s, _, _, _, _, mic_seg) = a_two_source_store();
+        let src = s.segment_source(mic_seg).unwrap().unwrap();
+        assert_eq!(src.match_key, "mic");
+        assert_eq!(src.kind, KIND_MIC);
+        assert!(src.t_end_ns > src.t_start_ns);
+        assert!(s.segment_source(999_999).unwrap().is_none());
+    }
+
+    #[test]
+    fn unassigning_a_label_clears_the_name_and_keeps_the_evidence() {
+        let (s, _, _, _, _, mic_seg) = a_two_source_store();
+        s.store_embedding(mic_seg, &emb("m@1", &[1.0, 0.0]))
+            .unwrap();
+        assert!(s.unassign_segment_speaker(mic_seg).unwrap());
+
+        let row = s.segment_row(mic_seg).unwrap().unwrap();
+        assert_eq!(row.speaker_id, None);
+        assert_eq!(row.match_score, None);
+        // The embedding is the thing a later reassignment argues from, so it
+        // must survive the row losing its name.
+        assert!(s.segment_embedding(mic_seg).unwrap().is_some());
+        // Idempotent, and honest about having done nothing the second time.
+        assert!(!s.unassign_segment_speaker(999_999).unwrap());
+    }
+
+    #[test]
+    fn the_audit_flags_a_cross_source_label_and_only_the_first_of_its_run() {
+        let (s, rowan, _, _, _, _) = a_two_source_store();
+        let cfg = crate::config::IdentityConfig {
+            // Three turns of history is all this fixture has.
+            foreign_after_segments: 3,
+            ..Default::default()
+        };
+        // Nothing yet: every label so far was made on the source that voice
+        // already lived on.
+        assert!(
+            crate::identity_prior::audit(&s, &cfg)
+                .unwrap()
+                .foreign
+                .is_empty()
+        );
+
+        // Now Rowan — three Discord turns and none on vesktop — wins two
+        // vesktop turns in a row, exactly as it did in the live database at
+        // 0.361 (FINDINGS §17).
+        let vesktop = s
+            .upsert_source_kind("vesktop", "Chromium", KIND_APP, 0)
+            .unwrap();
+        let sv = s.begin_session(vesktop, 0).unwrap();
+        let sec = 1_000_000_000i64;
+        for i in 0..2 {
+            let at = 1_000 * sec + i * 10 * sec;
+            let id = s.insert_segment(sv, at, at + sec, "x.wav", at).unwrap();
+            s.set_segment_speaker_via(id, Some(rowan), Some(0.361), Some(label_via::MATCH))
+                .unwrap();
+        }
+
+        let report = crate::identity_prior::audit(&s, &cfg).unwrap();
+        assert_eq!(
+            report.foreign.len(),
+            1,
+            "a run is flagged once, at its head: {:?}",
+            report.foreign
+        );
+        let f = &report.foreign[0];
+        assert_eq!(f.speaker_id, rowan);
+        assert_eq!(f.source, "vesktop");
+        // Written as f32 by the pipeline, read back as f64 by the audit.
+        assert!(f.match_score.is_some_and(|s| (s - 0.361).abs() < 1e-6));
+        assert_eq!(f.followed_by, 1, "and it says how long the run got");
+        assert_eq!(report.considered, 8);
+        // The matrix is the report's other half and carries every voice.
+        assert_eq!(report.matrix.len(), 3);
+    }
+
+    #[test]
+    fn your_own_voice_is_never_flagged_however_many_sources_it_appears_on() {
+        let (s, _, _, you, _, _) = a_two_source_store();
+        let cfg = crate::config::IdentityConfig {
+            foreign_after_segments: 1,
+            ..Default::default()
+        };
+        let vrc = s
+            .upsert_source_kind("VRChat.exe", "VRChat", KIND_APP, 0)
+            .unwrap();
+        let sv = s.begin_session(vrc, 0).unwrap();
+        let sec = 1_000_000_000i64;
+        let id = s
+            .insert_segment(sv, 9_000 * sec, 9_001 * sec, "x.wav", 0)
+            .unwrap();
+        s.set_segment_speaker_via(id, Some(you), None, Some(label_via::MIC))
+            .unwrap();
+        let report = crate::identity_prior::audit(&s, &cfg).unwrap();
+        assert!(
+            report.foreign.iter().all(|f| f.speaker_id != you),
+            "the microphone follows the user everywhere: {:?}",
+            report.foreign
+        );
     }
 }

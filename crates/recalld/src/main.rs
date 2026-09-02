@@ -41,8 +41,8 @@ use recalld::truth::{self, TruthStats, TruthStop};
 use recalld::truthnet;
 
 use crate::cli::{
-    Cli, Command, GraphAction, LangAction, MicAction, ModelsAction, NightBackend, NotesAction,
-    SemanticAction, SpeakersAction, TruthAction,
+    Cli, Command, GraphAction, IdentityAction, LangAction, MicAction, ModelsAction, NightBackend,
+    NotesAction, SemanticAction, SpeakersAction, TruthAction,
 };
 
 fn main() -> Result<()> {
@@ -156,6 +156,9 @@ fn main() -> Result<()> {
                 cmd_lang_repair(&cfg, &data_dir, dir.as_deref(), batch, limit)
             }
         },
+        // ---- 0.11.0, source-aware identity -----------------------------
+        Command::Identity { action } => cmd_identity(&cfg, &data_dir, action),
+        // ---- end 0.11.0 -------------------------------------------------
         Command::Name {
             speaker_id,
             display_name,
@@ -3145,6 +3148,200 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
+
+// ---- 0.11.0: source-aware identity ----------------------------------------
+
+/// `recalld identity …` — the report, and the one narrow repair it justifies.
+///
+/// Reads the database directly, like `recalld speakers` and `recalld lang`: it
+/// says nothing about a running daemon and has to work on a machine where none
+/// is running. The repair writes directly for the same reason the merge does —
+/// it is a bulk correction to history, not a live decision.
+fn cmd_identity(cfg: &Config, data_dir: &Path, action: Option<IdentityAction>) -> Result<()> {
+    match action.unwrap_or(IdentityAction::Audit) {
+        IdentityAction::Audit => cmd_identity_audit(cfg, data_dir),
+        IdentityAction::Repair {
+            foreign,
+            apply,
+            limit,
+        } => {
+            if !foreign {
+                println!(
+                    "`identity repair` needs --foreign. It is the only thing it can repair,\n\
+                     and naming it is what keeps it from quietly growing a second mode."
+                );
+                return Ok(());
+            }
+            cmd_identity_repair(cfg, data_dir, apply, limit)
+        }
+    }
+}
+
+/// How many of the questioned labels the tail prints.
+const AUDIT_TAIL: usize = 20;
+
+fn cmd_identity_audit(cfg: &Config, data_dir: &Path) -> Result<()> {
+    let store = Store::open(data_dir)?;
+    let report = recalld::identity_prior::audit(&store, &cfg.identity)?;
+
+    println!(
+        "{:<20}{}",
+        "prior",
+        if cfg.identity.source_prior {
+            format!(
+                "ON — a voice foreign to a source needs {:.2}, and {:+.2} on the best \
+                 native candidate",
+                cfg.identity.label_threshold + cfg.identity.foreign_source_margin,
+                cfg.identity.enroll_margin
+            )
+        } else {
+            "OFF — `[identity].source_prior = true` turns it on. This report is what \
+             it would see."
+                .to_string()
+        }
+    );
+    println!(
+        "{:<20}a voice is foreign to a source once it has {} turn(s) elsewhere and none there",
+        "foreign after", cfg.identity.foreign_after_segments
+    );
+    println!(
+        "{:<20}{}",
+        "hard presence",
+        if cfg.identity.presence_hard {
+            "on — Discord may exclude a linked account it saw say nothing (live rule only)"
+        } else {
+            "off"
+        }
+    );
+
+    println!("\n=== where each voice has been heard ===");
+    if report.matrix.is_empty() {
+        println!("No voices yet.");
+    }
+    for (id, name, sources) in &report.matrix {
+        if sources.is_empty() {
+            println!("{id:>4}  {name:<24}  —  (no live turns)");
+            continue;
+        }
+        let cells = sources
+            .iter()
+            .map(|s| {
+                format!(
+                    "{} {} (last {})",
+                    s.match_key,
+                    s.segments,
+                    recalld::clock::iso8601(s.last_ns)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("  ·  ");
+        println!("{id:>4}  {name:<24}  {cells}");
+    }
+
+    println!("\n=== labels the rule questions ===");
+    println!("{:<20}{}", "labels considered", report.considered);
+    println!("{:<20}{}", "questioned", report.foreign.len());
+    if report.foreign.is_empty() {
+        println!(
+            "Nothing to look at: no label ever pointed at a voice with no prior history\n\
+             on the source it was heard on."
+        );
+        return Ok(());
+    }
+    println!(
+        "\nJudged by replaying the labels in the order they were made, so each row is\n\
+         the FIRST of its run — `followed` says how many more landed on that voice and\n\
+         source afterwards.\n"
+    );
+    let tail = report
+        .foreign
+        .iter()
+        .rev()
+        .take(AUDIT_TAIL)
+        .collect::<Vec<_>>();
+    println!(
+        "{:>8}  {:>5}  {:<20}  {:<14}  {:>6}  {:<10}  {:>8}  WHEN",
+        "SEGMENT", "VOICE", "NAME", "SOURCE", "SCORE", "VIA", "FOLLOWED"
+    );
+    for f in tail {
+        println!(
+            "{:>8}  {:>5}  {:<20}  {:<14}  {:>6}  {:<10}  {:>8}  {}",
+            f.segment_id,
+            f.speaker_id,
+            f.speaker_name,
+            f.source,
+            f.match_score
+                .map(|s| format!("{s:.3}"))
+                .unwrap_or_else(|| "—".into()),
+            f.label_via.as_deref().unwrap_or("—"),
+            f.followed_by,
+            recalld::clock::iso8601(f.t_start_ns)
+        );
+    }
+    println!(
+        "\n`recalld identity repair --foreign` lists what it would unassign; \
+         add --apply to write."
+    );
+    Ok(())
+}
+
+/// The repair. One verb, one direction: **to unassigned**.
+///
+/// It never re-points a row at another voice, and it is not allowed to grow
+/// that ability. The audit's finding is that a label is not supported by where
+/// the audio came from — which argues against the name the row has and for no
+/// other name at all. A sweep that guessed again in bulk would take one wrong
+/// label and make a hundred, with no human anywhere in it.
+fn cmd_identity_repair(
+    cfg: &Config,
+    data_dir: &Path,
+    apply: bool,
+    limit: Option<usize>,
+) -> Result<()> {
+    let store = Store::open(data_dir)?;
+    let report = recalld::identity_prior::audit(&store, &cfg.identity)?;
+    let rows: Vec<_> = report
+        .foreign
+        .iter()
+        .rev()
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+    if rows.is_empty() {
+        println!("Nothing the rule questions. Nothing to repair.");
+        return Ok(());
+    }
+    println!(
+        "{} label(s){}. Each becomes UNASSIGNED — never another voice — and keeps its\n\
+         transcript, its audio and its embedding, so a later reassignment still has\n\
+         everything to argue from.\n",
+        rows.len(),
+        if apply { "" } else { ", preview only" }
+    );
+    let mut done = 0usize;
+    for f in &rows {
+        println!(
+            "  segment {:>7}  {:<20} on {:<14} at {}",
+            f.segment_id,
+            f.speaker_name,
+            f.source,
+            f.match_score
+                .map(|s| format!("{s:.3}"))
+                .unwrap_or_else(|| "—".into()),
+        );
+        if apply && store.unassign_segment_speaker(f.segment_id)? {
+            done += 1;
+        }
+    }
+    if apply {
+        println!("\n{done} label(s) unassigned.");
+        println!("Restart nothing: the rows are already what every client will read next.");
+    } else {
+        println!("\nNothing written. Add --apply.");
+    }
+    Ok(())
+}
+
+// ---- end 0.11.0 -----------------------------------------------------------
 
 fn format_duration(ns: i64) -> String {
     let secs = ns / 1_000_000_000;

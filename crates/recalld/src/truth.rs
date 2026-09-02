@@ -668,6 +668,24 @@ pub fn summary(store: &Store, identity: &IdentityConfig, cfg: &TruthConfig) -> R
 
     // ---- identity, on `single` segments only ----
     let rows = store.truth_identity_rows(MIN_SCORE_DURATION_S)?;
+    // 0.10.1: a `single` verdict naming the user's OWN account is not ground
+    // truth about audio captured from their own Discord client — that client
+    // never plays your microphone back to you, so yours is the one voice the
+    // stream cannot contain, and scoring the ladder against it charged it 35
+    // wrong labels it could not have got right (FINDINGS §17: 73% → 88%).
+    let you = store.you_speaker_id()?;
+    let mut own_excluded = 0i64;
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|r| {
+            if you.is_some_and(|y| y == r.truth_speaker_id) {
+                own_excluded += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
     let mut correct = 0i64;
     let mut wrong = 0i64;
     let mut unlabelled = 0i64;
@@ -737,6 +755,8 @@ pub fn summary(store: &Store, identity: &IdentityConfig, cfg: &TruthConfig) -> R
             "correct": correct,
             "wrong": wrong,
             "unlabelled": unlabelled,
+            // Rows Discord attributed to your own account: excluded, see above.
+            "own_account_excluded": own_excluded,
             "precision": precision,
             "recall": recall,
             "by_speaker": by

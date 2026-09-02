@@ -325,6 +325,23 @@ const FILLER_LINES = [
 /// discarded exactly this row at exactly the moment it was merged in.
 const OLDEST_LINE = 'the obsidian lighthouse world, before they took it down';
 
+/// 0.11.0 — which capture source each filler voice is heard through.
+///
+/// Pinned per VOICE rather than rotated per row, because that is the fact the
+/// source history exists to show and the rotation hid it: some people you only
+/// ever meet on Discord, some only in VRChat, and some in both. Voices 3 and 6
+/// are Discord-only; voice 1 is the cross-source one (every seventh turn on
+/// Discord, the rest in VRChat); the rest are VRChat-only. The user's own voice
+/// arrives on `mic` from the canned block, so all three kinds of chip render.
+const SPEAKER_SOURCE = { 1: 'both', 3: 'Discord', 6: 'Discord' };
+
+function fillerSource(speaker, i) {
+  const rule = SPEAKER_SOURCE[speaker];
+  if (rule === 'Discord') return 'Discord';
+  if (rule === 'both') return i % 7 === 3 ? 'Discord' : 'VRChat.exe';
+  return 'VRChat.exe';
+}
+
 function buildFiller(base) {
   const out = [];
   for (let d = 0; d < FILLER_DAYS; d += 1) {
@@ -349,7 +366,7 @@ function buildFiller(base) {
         // noticed for the length of a test run.
         id: 10_000 + i,
         session: SESSIONS[i % 2].id,
-        source: i % 7 === 3 ? 'Discord' : 'VRChat.exe',
+        source: fillerSource(speaker, i),
         speaker,
         text: i === 0 ? OLDEST_LINE : FILLER_LINES[i % FILLER_LINES.length],
         t_ms: t,
@@ -410,7 +427,7 @@ function buildHistory() {
     out.push({
       id: 1000 + i,
       session: SESSIONS[i % 3 === 2 ? 2 : i % 2].id,
-      source: mine ? 'mic' : i % 5 === 3 ? 'Discord' : 'VRChat.exe',
+      source: mine ? 'mic' : fillerSource(speaker, i),
       speaker,
       text,
       t_ms: t,
@@ -1311,7 +1328,36 @@ export function startMock({
       first_seen: s.first_seen,
       segments: c.get(s.id)?.segments ?? 0,
       total_ms: c.get(s.id)?.total_ms ?? 0,
+      // 0.11.0: where this voice has actually been heard. Derived from the
+      // segments, exactly as the daemon derives it, so the chips can never
+      // disagree with the transcript the same mock is serving.
+      sources: speakerSources(s.id),
     }));
+  }
+
+  /// A voice's source history, most-heard first.
+  function speakerSources(spId) {
+    const acc = new Map();
+    for (const seg of state.segments) {
+      if (owner(seg) !== spId) continue;
+      const row = acc.get(seg.source) ?? { segments: 0, last: 0 };
+      row.segments += 1;
+      row.last = Math.max(row.last, seg.t_ms + seg.dur_ms);
+      acc.set(seg.source, row);
+    }
+    return [...acc.entries()]
+      .map(([source, row]) => {
+        const meta = state.sources.find((s) => s.match_key === source);
+        return {
+          source,
+          name: meta?.display ?? source,
+          kind: meta?.kind ?? 'app',
+          segments: row.segments,
+          last_ms: row.last,
+          last_ns: String(row.last) + '000000',
+        };
+      })
+      .sort((a, b) => b.segments - a.segments || a.source.localeCompare(b.source));
   }
 
   /// The voices a sweep would take: one segment at most, under three seconds
@@ -1872,7 +1918,10 @@ export function startMock({
     const seg = {
       id: state.nextSegId++,
       session: SESSIONS[2].id,
-      source: state.feedIdx % 6 === 5 ? 'Discord' : 'VRChat.exe',
+      // 0.11.0: a live turn arrives on the source its voice is heard on, like
+      // every other turn. A feed that rotated sources independently would walk
+      // a Discord-only voice into VRChat one tick at a time.
+      source: fillerSource(mintedSpeaker ? 77 : sp, state.feedIdx),
       speaker: mintedSpeaker ? 77 : overlap > 0.1 ? null : sp,
       text,
       t_ms: now,
@@ -2382,6 +2431,8 @@ export function startMock({
           first_seen: sp.first_seen,
         },
         languages: sp.languages ?? null,
+        // 0.11.0: the same shape `speakers.list` carries, for the header chips.
+        sources: speakerSources(sp.id),
         totals,
         edges: [...edges.entries()]
           .map(([id, e]) => ({
