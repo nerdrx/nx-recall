@@ -98,6 +98,11 @@ pub struct FetchOptions {
     /// compiled by `models build-night` rather than downloaded, because
     /// upstream publishes no such binary for this card.
     pub night: bool,
+    /// Also install the Japanese decoder and the spoken-language identifier
+    /// that routes to it (~605 MB, 0.11.0). Off by default: without them a
+    /// Japanese turn is transliterated into Latin letters by the multilingual
+    /// decoder, which is what every release up to 0.10.3 did.
+    pub japanese: bool,
     /// Force the single-stream path. Only the test suite sets this; it is how
     /// the fallback is exercised without finding a server that lacks ranges.
     pub single_stream: bool,
@@ -124,6 +129,9 @@ impl FetchOptions {
         }
         if self.night {
             out.push(Group::Night);
+        }
+        if self.japanese {
+            out.push(Group::Japanese);
         }
         out
     }

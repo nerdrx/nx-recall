@@ -25,6 +25,7 @@ pub mod arbiter;
 pub mod ask;
 // ---- 0.9.0, the assistant ------------------------------------------------
 pub mod asr;
+pub mod asr_ja;
 pub mod assist;
 pub mod b64;
 pub mod brief;
@@ -58,6 +59,7 @@ pub mod lang;
 #[rustfmt::skip]
 pub mod lang_ngrams;
 pub mod langctx;
+pub mod lid;
 pub mod llm;
 pub mod models;
 pub mod night;

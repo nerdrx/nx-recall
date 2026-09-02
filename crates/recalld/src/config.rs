@@ -583,6 +583,43 @@ pub struct AsrConfig {
     pub max_queue_seconds: i64,
     /// Ceiling on the vocabulary's `effective` list.
     pub vocab_max_terms: usize,
+
+    // ---- Japanese (0.11.0, `crate::asr_ja`) ------------------------------
+    /// Listen for Japanese turns and re-decode them with a decoder that speaks
+    /// it.
+    ///
+    /// **On**, and unlike most switches here that costs nothing on a machine
+    /// that has not opted in: both models are optional downloads
+    /// (`recalld models fetch --japanese`), so "on" means "use them if they are
+    /// there". Off is for somebody who has them and wants the live path left
+    /// alone.
+    ///
+    /// The failure it exists for is not a bad transcript, it is an
+    /// *undetectable* one: the multilingual decoder renders Japanese in Latin
+    /// letters ("Sima Sen Okenki Deska."), so no text-based check — not the
+    /// classifier, not the third-language guesser, not a person skimming —
+    /// can ever see it. See `crate::lid`.
+    pub japanese: bool,
+    /// Share of the identifier's windows that must agree before a turn is
+    /// handed to the Japanese decoder.
+    ///
+    /// **Measured** (`spike/lid_bench.py`, 200 FLEURS utterances per
+    /// language): whisper-tiny heard **zero of 400** German and English
+    /// utterances as Japanese, at full length, at 3 s and at 1.5 s. With
+    /// `lid_windows = 1` the confidence is always 1.0, so at the shipped
+    /// defaults this is a "did it say Japanese at all" test — which is what
+    /// the measurement supports and what the operating point was chosen to be.
+    /// Both halves of the knob are here for a machine that hears something
+    /// that corpus did not.
+    pub lid_min_confidence: f32,
+    /// How many windows of a turn the identifier is asked about.
+    ///
+    /// One, and that is the measurement rather than a shrug: at zero false
+    /// positives in 400 negatives there is nothing for a second window to rule
+    /// out, and a three-window vote would triple the only cost this feature
+    /// has — 0.019 RTF at 3 s, which is what makes asking on every unclear
+    /// turn affordable at all.
+    pub lid_windows: usize,
 }
 
 impl Default for AsrConfig {
@@ -598,6 +635,9 @@ impl Default for AsrConfig {
             batch_pause_s: 10,
             max_queue_seconds: 5,
             vocab_max_terms: 500,
+            japanese: true,
+            lid_min_confidence: 1.0,
+            lid_windows: 1,
         }
     }
 }

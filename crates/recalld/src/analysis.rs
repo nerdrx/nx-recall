@@ -76,6 +76,15 @@ pub struct Outcome {
     /// it. The caller publishes them, so a GUI sees the row change without
     /// re-querying.
     pub also_changed: Vec<i64>,
+    /// The spoken-language identifier was run on this turn (0.11.0). The
+    /// number that says what the Japanese feature *costs*: it is the count of
+    /// turns whose transcript nobody could read, which is a fact worth being
+    /// able to watch whether or not any of them turned out to be Japanese.
+    pub lid_checked: bool,
+    /// The turn was re-decoded by the Japanese decoder and the row now says so
+    /// (0.11.0). `None` on every turn that was not Japanese, which is nearly
+    /// all of them.
+    pub routed_ja: Option<crate::asr_ja::Routed>,
 }
 
 /// Everything the microphone leg needs that the matching leg does not: who the
@@ -137,6 +146,15 @@ pub struct Analyzer {
     /// like `lang_cfg` so a caller that does not care — the acceptance rig, the
     /// mic suite — keeps the two-argument constructor it always had.
     truth_cfg: TruthConfig,
+
+    // ---- Japanese (0.11.0, `crate::asr_ja`) ------------------------------
+    /// The Japanese decoder and the spoken-language identifier that routes to
+    /// it, each loaded the first time it is needed and resident from then on.
+    japanese: crate::asr_ja::Japanese,
+    /// The switch and the operating point the router reads. Defaulted like
+    /// `lang_cfg`, and set from the running config by [`Analyzer::
+    /// set_asr_config`].
+    asr_cfg: crate::config::AsrConfig,
 }
 
 impl Analyzer {
@@ -158,6 +176,8 @@ impl Analyzer {
             lang_cfg: LangConfig::default(),
             arbiters: Arbiters::new(models),
             truth_cfg: TruthConfig::default(),
+            japanese: crate::asr_ja::Japanese::new(models, &crate::config::AsrConfig::default()),
+            asr_cfg: crate::config::AsrConfig::default(),
         })
     }
 
@@ -180,6 +200,23 @@ impl Analyzer {
             vrchat: &self.cfg.vrchat_sources,
         }
     }
+
+    // ---- Japanese (0.11.0) -----------------------------------------------
+    /// Point the Japanese router at the running config. Set once, in the same
+    /// place and for the same reason as [`Analyzer::set_lang_config`] —
+    /// **before** the inference thread starts, because it rebuilds the router
+    /// and the router owns two lazily loaded models.
+    pub fn set_asr_config(&mut self, models: &ModelSet, cfg: &crate::config::AsrConfig) {
+        self.japanese = crate::asr_ja::Japanese::new(models, cfg);
+        self.asr_cfg = cfg.clone();
+    }
+
+    /// The line the daemon logs once at start-up about Japanese, `None` when
+    /// there is nothing worth saying.
+    pub fn japanese_note(&self) -> Option<String> {
+        self.japanese.startup_note()
+    }
+    // ---- end Japanese ----------------------------------------------------
 
     /// Which languages this install can actually re-decode into. Logged once at
     /// start-up so "the flip was only flagged" has a visible cause.
@@ -262,6 +299,8 @@ impl Analyzer {
                 );
                 store.set_segment_speaker(segment_id, None, None)?;
                 return Ok(Outcome {
+                    lid_checked: false,
+                    routed_ja: None,
                     overlap_frac,
                     text,
                     decision: Decision::Refused(refusal),
@@ -384,6 +423,8 @@ impl Analyzer {
             language_fix: None,
             prior: Some(prior),
             also_changed: Vec::new(),
+            lid_checked: false,
+            routed_ja: None,
         })
     }
 
@@ -494,6 +535,8 @@ impl Analyzer {
             // candidate list for the prior to have an opinion about.
             prior: None,
             also_changed: Vec::new(),
+            lid_checked: false,
+            routed_ja: None,
         })
     }
 
@@ -510,7 +553,50 @@ impl Analyzer {
         outcome: &mut Outcome,
         samples: &[f32],
     ) {
-        if let Some(speaker_id) = outcome.speaker_id {
+        // ---- Japanese (0.11.0, `crate::asr_ja`) --------------------------
+        //
+        // FIRST, before the declared-language correction, because the two
+        // answer different questions and only one of them can be right about a
+        // Japanese turn. `correct_language` asks "do the words disagree with
+        // what this voice was declared to speak"; a transliterated Japanese
+        // turn's words are `Unclear` and disagree with nothing, so that check
+        // passes it silently — and if it did fire it would hand German audio
+        // to a German arbiter over a Japanese sentence. When the router
+        // settles a row there is nothing left for the declaration check to
+        // decide, so it is skipped.
+        //
+        // Best-effort like every other correction here: a language nobody
+        // could settle never costs a recording.
+        let mut settled_ja = false;
+        match crate::asr_ja::route_segment(
+            &mut self.japanese,
+            store,
+            crate::asr_ja::Turn {
+                segment_id,
+                declared: outcome
+                    .speaker_id
+                    .and_then(|id| store.speaker_languages(id).ok().flatten())
+                    .as_ref(),
+                text: outcome.text.as_deref(),
+                samples,
+                lang_cfg: &self.lang_cfg,
+                asr_cfg: &self.asr_cfg,
+            },
+            crate::clock::utc_now_ns(),
+        ) {
+            Ok(checked) => {
+                outcome.lid_checked = checked.lid_checked;
+                if let Some(routed) = checked.routed {
+                    outcome.text = Some(routed.text.clone());
+                    outcome.routed_ja = Some(routed);
+                    settled_ja = true;
+                }
+            }
+            Err(e) => warn!(segment_id, "the Japanese route failed: {e:#}"),
+        }
+        // ---- end Japanese ------------------------------------------------
+
+        if let Some(speaker_id) = outcome.speaker_id.filter(|_| !settled_ja) {
             match self.correct_language(
                 store,
                 segment_id,
@@ -679,6 +765,19 @@ impl Analyzer {
         segment_id: i64,
         samples: &[f32],
     ) -> Result<Option<ContextFix>> {
+        // ---- Japanese (0.11.0) -------------------------------------------
+        //
+        // A row the Japanese router settled is not the thread prior's
+        // business, and this guard is load-bearing rather than tidy:
+        // `langctx::decide` treats `re-decode` and `mismatch` as settled and
+        // has never heard of `lid`, and `lang::classify` on kana returns
+        // `Unclear` — which is the *inherit* branch. Without this line a
+        // correctly re-decoded Japanese turn would be stamped "de" by the
+        // German conversation around it, seconds after being fixed.
+        if crate::asr_ja::settled_by_lid(store, segment_id)? {
+            return Ok(None);
+        }
+        // ---- end Japanese ------------------------------------------------
         let (intent, _context) = langctx::intent_for(store, &self.lang_cfg, segment_id)?;
         match intent {
             Intent::Nothing => Ok(None),
@@ -829,6 +928,18 @@ pub struct AnalysisStats {
     /// other half of the story, and the one worth watching: if this number is
     /// large the margin is too low.
     pub prior_foreign_kept: std::sync::atomic::AtomicU64,
+
+    // ---- Japanese (0.11.0, `crate::asr_ja`) ------------------------------
+    /// Turns handed to the spoken-language identifier — the ones whose
+    /// transcript nobody could read. This is what the feature COSTS, and the
+    /// two counters are reported side by side on purpose: a `lid_checked` that
+    /// climbs while `routed_ja` stays at zero means the daemon is paying 20 ms
+    /// a turn to be told "German", and the answer is to look at why so many
+    /// transcripts are unreadable rather than to look at Japanese.
+    pub lid_checked: std::sync::atomic::AtomicU64,
+    /// Turns the Japanese decoder re-read, whose words it replaced, and whose
+    /// language is now `ja` via `lid`.
+    pub routed_ja: std::sync::atomic::AtomicU64,
 }
 
 impl AnalysisStats {
@@ -910,6 +1021,13 @@ impl AnalysisStats {
             }
             self.prior_foreign_kept
                 .fetch_add(prior.foreign_kept.len() as u64, Ordering::Relaxed);
+        }
+        // What the Japanese router did to this turn (0.11.0).
+        if outcome.lid_checked {
+            self.lid_checked.fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome.routed_ja.is_some() {
+            self.routed_ja.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
