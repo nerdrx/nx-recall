@@ -2198,13 +2198,14 @@ export function runE2E(deps) {
         s.value = 'en';
         s.dispatchEvent(new Event('change', { bubbles: true }));
       })()`);
-      const en = await waitFor('the new target', async () => {
+      // The badge and the chip repaint from the same `assist` event, but the
+      // probe can land between the two paints — so both are waited for.
+      const en = await waitFor('the new target, badge and chip', async () => {
         const t = await js('window.__recallDebug.translation()');
-        return t.target === 'en' ? t : null;
+        const chip = (t.read || []).find((r) => r.code === 'en');
+        return t.target === 'en' && chip?.on && chip?.locked ? t : null;
       });
       assert(/English/.test(en.sub), `the badge still says "${en.sub}"`);
-      const enChip = en.read.find((r) => r.code === 'en');
-      assert(enChip?.on && enChip?.locked, `the new target is not read by definition: ${JSON.stringify(enChip)}`);
 
       // 3. A language you read is a chip you can turn off. French is not read,
       //    so pressing it says "leave French alone".
