@@ -36,7 +36,7 @@ import {
   HARD_MAX,
 } from '../lib/store.js';
 import { separatorWalker } from '../lib/seams.js';
-import { shakyMark } from '../lib/marks.js';
+import { shakyMark, translationCell } from '../lib/marks.js';
 import { openSheet, toast } from '../lib/sheets.js';
 import { play, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 // Conversation replay (0.9.2). The engine is in lib/replay.js and holds no DOM;
@@ -450,34 +450,15 @@ export function mount(root, ctx) {
       h('span', { class: 'dot', style: `color:${color}` }),
       nm
     );
-    // 0.9.0: a turn in a language you do not read, in one you do. A SECOND
-    // line under the words and never a replacement for them: the transcript is
-    // a record of what was said, and what was said is the original. It is
-    // marked as a translation and carries the model that wrote it, because a
-    // paraphrase presented as a quotation is the failure this feature is
-    // bounded against (`crate::translate`).
-    const tr = seg.translation;
+    // 0.9.0: a turn in a language you do not read, in one you do. Both lines
+    // are always on the row — the transcript is a record and the original never
+    // leaves it — and which of the two LEADS is `[assist] translation_display`
+    // (0.10.2). The cell itself is in lib/marks.js, because a search hit has to
+    // draw the identical thing.
     row.append(
       h('span', { class: 't', text: fmtClock(seg.t_ms) }),
       who,
-      tr?.text
-        ? h(
-            'span',
-            { class: 'txt has-translation' },
-            h('span', { class: 'txt-said', text: seg.text || '…' }),
-            h(
-              'span',
-              {
-                class: 'txt-translated',
-                lang: tr.lang || undefined,
-                dataset: { translation: tr.lang || '', via: tr.via || '' },
-                title: `Translated into ${tr.lang || 'your language'} by ${tr.via || 'the local model'}. The line above is what was actually said.`,
-              },
-              h('span', { class: 'tr-mark', 'aria-hidden': 'true', text: '↳' }),
-              tr.text
-            )
-          )
-        : h('span', { class: 'txt', text: seg.text || '…' }),
+      translationCell(seg),
       h(
         'span',
         { class: 'meta' },
@@ -809,6 +790,10 @@ export function mount(root, ctx) {
       updateCount();
     }
     if (change.merged) repaint(); // ids moved wholesale; a repaint is honest and rare
+    // 0.10.2: `translation_display` decides which of a translated row's two
+    // lines is the main one, so a change to it — from the card, from another
+    // window, from the config file — is a repaint of every row on screen.
+    if (change.assist) repaint();
     if (change.relabel) refreshFilterOptions();
     // The pin arriving (or moving, after a merge) changes which rows are
     // marked as the user's. Guarded on the id itself, because `mic` and

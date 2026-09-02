@@ -7,7 +7,7 @@
 
 import { h, clear, fmtClock, fmtDay, fmtDayLabel, fmtDate, speakerColor } from '../lib/dom.js';
 import { store, speakerLabel, segmentSpeakerLabel, isUncertain, isShaky, ask } from '../lib/store.js';
-import { shakyMark } from '../lib/marks.js';
+import { shakyMark, translationCell } from '../lib/marks.js';
 import { toast } from '../lib/sheets.js';
 import { defaultMode, modeControl, modeById, requestFor, resultSummary, semanticState, viaBadge } from './semantic.js';
 
@@ -515,7 +515,12 @@ export function mount(root, ctx, arg) {
           style: seg.speaker == null ? '' : `color:${color}`,
         })
       ),
-      h('span', { class: 'txt' }, ...highlight(seg.text ?? '', facetState.q)),
+      // 0.10.2: a hit renders its translation exactly as the transcript does,
+      // including which of the two lines leads. A result that looked different
+      // from the row it takes you to is a result you have to re-read on
+      // arrival — and the highlighting still lands on the ORIGINAL, because
+      // the words you searched for are the words that were said.
+      translationCell(seg, (t) => highlight(t, facetState.q)),
       h(
         'span',
         { class: 'meta' },

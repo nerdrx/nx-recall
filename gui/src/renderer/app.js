@@ -1146,7 +1146,30 @@ document.addEventListener('keydown', (e) => {
           })),
         // A row with no translation must render exactly as it always did.
         plain: document.querySelectorAll('#seg-list .txt:not(.has-translation)').length,
+        // 0.10.2: which of the two lines leads. `main` puts the translation
+        // where the words normally are, and the DOM order is the rendering —
+        // there is no second copy of the rule to check against.
+        main: document.querySelectorAll('#seg-list .txt.has-translation.translation-main').length,
+        first: [...document.querySelectorAll('#seg-list .txt.has-translation')]
+          .slice(0, 3)
+          .map((t) => t.firstElementChild?.className ?? ''),
+        saidLangs: [...document.querySelectorAll('#seg-list .txt-said .said-lang')]
+          .slice(0, 3)
+          .map((l) => l.textContent),
       },
+    }),
+    // 0.10.2: the Translation card's three controls, as a person sees them.
+    translation: () => ({
+      sub: document.getElementById('translate-sub')?.textContent ?? '',
+      target: document.getElementById('translate-target')?.value ?? null,
+      targets: [...(document.getElementById('translate-target')?.options ?? [])].map((o) => o.value),
+      read: [...document.querySelectorAll('#translate-read .toggle-chip')].map((c) => ({
+        code: c.dataset.lang,
+        on: c.dataset.on === 'true',
+        locked: c.classList.contains('locked'),
+      })),
+      display: document.querySelector('input[name="translation-display"]:checked')?.value ?? null,
+      modes: [...document.querySelectorAll('input[name="translation-display"]')].map((r) => r.value),
     }),
     ask: () => ({
       pills: [...document.querySelectorAll('#ask-pills .ask-pill')].map((p) => ({

@@ -1101,6 +1101,49 @@ button.sp-num:focus-visible { outline: none; box-shadow: var(--clear-focus); }
   font-variant-numeric: tabular-nums;
 }
 
+/* -- the translation card (0.10.2) ----------------------------------------- */
+/* Same well as `.enrich-tune` above, stacked instead of in a row: a set of
+   nineteen chips and a pair of radios do not fit beside their label. */
+.tune-block {
+  display: flex; flex-direction: column; gap: 10px;
+  margin-top: 14px; padding: 10px 12px; max-width: 70ch;
+  border: 1px solid var(--clear-line); border-radius: var(--clear-r-control);
+  background: var(--clear-tile);
+}
+.tune-block .tune-label { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.tune-block .tune-label b { font-size: 13px; font-weight: 640; }
+.tune-block .tune-label small { font-size: 11.5px; color: var(--clear-muted); }
+#translate-target { max-width: 24ch; }
+
+.lang-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+/* A chip that is a switch. Off is the quiet default and ON is the one that
+   carries the accent, because "I read this" is the state a person is adding. */
+.chip.toggle-chip {
+  cursor: pointer; border: 1px solid var(--clear-line-strong);
+  background: var(--clear-surface); color: var(--clear-muted);
+  transition: background var(--dur-fast) var(--ease-soft), color var(--dur-fast) var(--ease-soft);
+}
+.chip.toggle-chip:hover:not(:disabled) { border-color: var(--clear-line-accent); }
+.chip.toggle-chip.on {
+  background: var(--violet-soft); border-color: var(--clear-line-accent); color: var(--violet);
+}
+/* The target's own chip: on, and not yours to turn off. */
+.chip.toggle-chip.locked { cursor: default; opacity: 0.75; }
+.chip.toggle-chip:disabled:not(.locked) { opacity: 0.5; cursor: default; }
+.lang-chips[data-pending='true'] { opacity: 0.6; }
+
+.radio-set { display: flex; flex-direction: column; gap: 6px; }
+.radio-row {
+  display: flex; align-items: flex-start; gap: 9px; cursor: pointer;
+  padding: 7px 9px; border-radius: var(--clear-r-control);
+  border: 1px solid transparent;
+}
+.radio-row:hover { background: var(--clear-surface); }
+.radio-row.on { background: var(--clear-surface); border-color: var(--clear-line-accent); }
+.radio-row input { margin-top: 2px; accent-color: var(--violet); flex: none; }
+.radio-row b { display: block; font-size: 13px; font-weight: 640; }
+.radio-row small { display: block; font-size: 11.5px; color: var(--clear-muted); }
+
 /* ============================================ the accuracy round (0.8.0) == */
 
 /* -- the brief bar -------------------------------------------------------- */
@@ -1394,6 +1437,24 @@ button.sp-num:focus-visible { outline: none; box-shadow: var(--clear-focus); }
   font-style: italic;
 }
 .tr-mark { font-style: normal; color: var(--clear-faint); flex: none; }
+
+/* 0.10.2 — the same two lines, the other way up. `translation_display: main`
+   promotes the translation to the line and demotes the original to subtext:
+   the weights swap, the italic goes (it is the line you are reading now), and
+   the original picks up a language code so that what it is stays obvious. The
+   record is still on the row — nothing here removes a line, it reorders two. */
+.txt.has-translation.translation-main .txt-translated {
+  font-size: 13.5px; line-height: 1.55; color: var(--clear-ink); font-style: normal;
+}
+.txt.has-translation.translation-main .txt-said {
+  display: flex; align-items: baseline; gap: 6px;
+  font-size: 12.5px; line-height: 1.5; color: var(--clear-muted);
+}
+.said-lang {
+  flex: none; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--clear-faint); border: 1px solid var(--clear-line);
+  border-radius: var(--clear-r-mini); padding: 0 4px; line-height: 1.5;
+}
 
 /* ------------------------------------------- conversation replay (0.9.2) -- */
 /* A thread, played back, with the transcript reading along. Three surfaces:

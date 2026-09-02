@@ -82,59 +82,183 @@ const TRANSLATE_TOKENS: i32 = 400;
 /// Longest translation kept.
 const MAX_TRANSLATION: usize = 1000;
 
+/// How many language-less turns one batch offers the guesser (0.10.2).
+///
+/// A scan window, not a batch: most rows with no language stamp are mumbles
+/// and names that no guess will ever name, and they stay in the window until
+/// something else moves them. Two thousand is roughly a fortnight of a busy
+/// lobby's unreadable turns, and the window is newest-first — the turns a
+/// person is actually reading are the ones at the front of it.
+const GUESS_SCAN: usize = 2000;
+
 /// The system prompt, per target language. **Verbatim from
-/// `spike/translate_bench.py`**, which is what the 0.948 was measured with.
+/// `spike/translate_bench.py`**, which is what the 0.948 was measured with,
+/// except for the target language name and the example — see below.
 ///
 /// Every clause is a refusal. "Do not answer it" is there because a model shown
 /// a question translates it into an answer; "keep names, worlds and usernames
 /// exactly as they are spelled" is there because a VRChat lobby is full of
 /// proper nouns that look like words.
+///
+/// 0.10.2: the few-shot example is **in the target language**. It was German
+/// hard-coded, from the bench, and a prompt that says "translate into English"
+/// under two worked examples that answer in German is a prompt arguing with
+/// itself — the one place a small model reliably takes the demonstration over
+/// the instruction. Only English and German have written examples because those
+/// are the two this project can check; every other target gets the instruction
+/// alone, which is honest about what is known rather than shipping a machine
+/// translation of a demonstration as if it were one.
 pub fn system_for(to: &str) -> String {
     let lang = language_name(to);
+    let examples = match to {
+        "de" => {
+            "Examples:\n\
+             i will send you the link tomorrow -> {\"translation\": \"ich schicke dir \
+             morgen den Link\"}\n\
+             which portal was it -> {\"translation\": \"welches Portal war es\"}"
+        }
+        "en" => {
+            "Examples:\n\
+             ich schicke dir morgen den Link -> {\"translation\": \"i will send you \
+             the link tomorrow\"}\n\
+             welches Portal war es -> {\"translation\": \"which portal was it\"}"
+        }
+        _ => "",
+    };
     format!(
         "You translate one line of overheard conversation into {lang}. Translate \
          only what is written. Do not answer it, do not explain it, do not add or \
          remove anything, and do not comment on it. Keep names, worlds and \
          usernames exactly as they are spelled. If the line is already {lang}, \
-         repeat it unchanged. Output ONLY JSON.\n\
-         Examples:\n\
-         i will send you the link tomorrow -> {{\"translation\": \"ich schicke dir \
-         morgen den Link\"}}\n\
-         which portal was it -> {{\"translation\": \"welches Portal war es\"}}"
+         repeat it unchanged. Output ONLY JSON.\n{examples}"
     )
 }
 
 /// The English name of a language tag, as the prompt says it.
+///
+/// Falls back to English rather than to the raw tag: a prompt that says
+/// "translate into zz" is a prompt with no instruction in it, and English is
+/// the target every other default in this file assumes.
 pub fn language_name(tag: &str) -> &'static str {
-    match tag {
-        "de" => "German",
-        "fr" => "French",
-        "es" => "Spanish",
-        _ => "English",
+    lang::name_of(tag).unwrap_or("English")
+}
+
+/// `translation_display`: the translation is the line, the original is subtext.
+pub const DISPLAY_MAIN: &str = "main";
+/// `translation_display`: 0.9.0's layout — the original leads.
+pub const DISPLAY_UNDER: &str = "under";
+
+/// The three live translation settings.
+///
+/// A static, and it is worth saying why rather than hiding it.
+/// [`crate::service::segment_json`] is a free function called from a dozen
+/// places — a transcript page, a search hit, five different events — precisely
+/// so that all of them describe a segment identically, and threading a config
+/// value through every one of those call sites to spell one field would trade a
+/// global for twelve signatures.
+///
+/// 0.10.2 made it a lock rather than a `OnceLock`. It was written once at
+/// start-up because it was a config file entry; it is now three controls in the
+/// Memory view, and a control that needs a restart is not a control. The
+/// **worker** reads it here too rather than from the `AssistConfig` it was
+/// handed at spawn: that copy is a snapshot from start-up, and a target changed
+/// at 21:00 that the queue only honours after a restart is the same bug in a
+/// quieter place.
+static LIVE: std::sync::RwLock<Live> = std::sync::RwLock::new(Live::new());
+
+#[derive(Debug, Clone)]
+struct Live {
+    to: String,
+    read: Vec<String>,
+    display: String,
+}
+
+impl Live {
+    const fn new() -> Self {
+        Self {
+            to: String::new(),
+            read: Vec::new(),
+            display: String::new(),
+        }
     }
 }
 
-/// The language this daemon is translating into, for the one caller that
-/// cannot be handed it: [`crate::service::segment_json`].
-///
-/// A static, and it is worth saying why rather than hiding it. `segment_json`
-/// is a free function called from a dozen places — a transcript page, a search
-/// hit, five different events — precisely so that all of them describe a
-/// segment identically, and threading a config value through every one of those
-/// call sites to spell one field would trade a global for twelve signatures.
-/// The value is written once, at start-up, from `[assist] translate_to`, and is
-/// a two-letter tag; the row's own `translation_via` carries the part that
-/// actually varies per row.
-static TARGET_LANG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+fn live() -> Live {
+    LIVE.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
 
-/// Set at start-up. A second call is ignored: this is configuration, not state.
+/// Point the daemon at a target language. `""` switches translation off.
 pub fn set_target(tag: &str) {
-    let _ = TARGET_LANG.set(tag.trim().to_string());
+    LIVE.write().unwrap_or_else(|p| p.into_inner()).to = tag.trim().to_ascii_lowercase();
 }
 
 /// The configured target, or `""` when translation is off.
-pub fn target() -> &'static str {
-    TARGET_LANG.get().map(String::as_str).unwrap_or_default()
+pub fn target() -> String {
+    live().to
+}
+
+/// Is there a target at all? The worker's own switch, so that turning
+/// translation on does not need a restart to be noticed.
+pub fn enabled() -> bool {
+    !target().is_empty()
+}
+
+/// The languages the reader already has. See `[assist] read_languages`.
+pub fn set_read_languages(codes: &[String]) {
+    LIVE.write().unwrap_or_else(|p| p.into_inner()).read = codes
+        .iter()
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+}
+
+/// The languages a turn may be in without being translated — `read_languages`
+/// **plus the target**, always. A target you would then translate away from is
+/// not a setting anybody meant.
+pub fn read_languages() -> Vec<String> {
+    let live = live();
+    let mut out = live.read;
+    let to = live.to;
+    if !to.is_empty() && !out.contains(&to) {
+        out.push(to);
+    }
+    out
+}
+
+/// Where a client puts the translation. [`DISPLAY_MAIN`] or [`DISPLAY_UNDER`];
+/// anything else, including unset, reads as [`DISPLAY_MAIN`].
+pub fn set_display(mode: &str) {
+    LIVE.write().unwrap_or_else(|p| p.into_inner()).display = mode.trim().to_ascii_lowercase();
+}
+
+pub fn display() -> &'static str {
+    if live().display == DISPLAY_UNDER {
+        DISPLAY_UNDER
+    } else {
+        DISPLAY_MAIN
+    }
+}
+
+/// Hold the live settings still for the duration of one test.
+///
+/// [`LIVE`] is one value for the whole process, which is right for a daemon and
+/// awkward for a test binary that runs its tests in parallel threads — a test
+/// that sets a target would otherwise be read by a test that asserts there is
+/// none. Every test that touches these three takes this first, and the ones
+/// that do not, do not care.
+#[cfg(test)]
+pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    adopt(&AssistConfig::default());
+    guard
+}
+
+/// Adopt a whole `[assist]` block — start-up, and every `assist.set`.
+pub fn adopt(cfg: &AssistConfig) {
+    set_target(&cfg.translate_to);
+    set_read_languages(&cfg.read_languages);
+    set_display(&cfg.translation_display);
 }
 
 /// What the pass concluded about one turn.
@@ -169,14 +293,41 @@ pub fn judge(source: &str, answer: Option<&str>, to: &str) -> Verdict {
     let want = match to {
         "de" => Some(Lang::De),
         "en" => Some(Lang::En),
-        // The classifier only speaks two languages. For any other target it
-        // has no opinion, and an absent opinion is not evidence.
+        // The two-way classifier has no opinion about any other target, and an
+        // absent opinion is not evidence. 0.10.2 gives those targets a check of
+        // their own below rather than leaving them unguarded.
         _ => None,
     };
-    if let Some(want) = want {
-        let read = lang::classify(answer);
-        if matches!(read, Lang::De | Lang::En) && read != want {
-            return Verdict::WrongLanguage;
+    match want {
+        Some(want) => {
+            let read = lang::classify(answer);
+            if matches!(read, Lang::De | Lang::En) && read != want {
+                return Verdict::WrongLanguage;
+            }
+        }
+        None => {
+            // A third-language target (0.10.2). The guesser is allowed to
+            // reject only what it is *confident* about, and only when it names
+            // a language that is not the one asked for: three Spanish
+            // stopwords in a Portuguese answer must not throw the answer away,
+            // because those two are exactly the pair the guesser is worst at.
+            match lang::guess_other(answer) {
+                Some(g) if g.confident && g.tag == to => {}
+                Some(g) if g.confident => return Verdict::WrongLanguage,
+                _ => {
+                    // The guesser could not name it. The commonest failure it
+                    // cannot see is the one it does not speak: asked for
+                    // Japanese, the model answers in English. `classify` is
+                    // NOT used for this — it settles on German the moment it
+                    // sees an umlaut, and Swedish, Turkish and Finnish are
+                    // full of them. The raw stopword evidence, at the same
+                    // floor the guesser uses, is the honest test.
+                    let (de, en) = lang::stopword_votes(answer);
+                    if de.max(en) >= 3 {
+                        return Verdict::WrongLanguage;
+                    }
+                }
+            }
         }
     }
     Verdict::Translated(truncate(answer, MAX_TRANSLATION))
@@ -224,20 +375,68 @@ pub fn batch(
     cfg: &AssistConfig,
     stop: &dyn Fn() -> bool,
 ) -> Result<bool> {
-    let to = cfg.translate_to.trim().to_string();
+    // The live value, not the snapshot the worker was spawned with: see `LIVE`.
+    let to = target();
     if to.is_empty() {
         return Ok(false);
     }
-    let candidates = {
+    let min_words = cfg.translate_min_words.max(1);
+    let limit = cfg.batch.max(1);
+    let (mut candidates, unstamped) = {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-        let mine = guard.your_languages()?;
-        guard.segments_for_translation(
-            &to,
-            &mine,
-            cfg.translate_min_words.max(1),
-            cfg.batch.max(1),
-        )?
+        // What the reader already has: the configured `read_languages` (which
+        // always contains the target), plus whatever their own voice is
+        // declared to speak. A turn in any of these is not a turn to translate.
+        let mut skip = read_languages();
+        for mine in guard.your_languages()? {
+            if !skip.contains(&mine) {
+                skip.push(mine);
+            }
+        }
+        let stamped = guard.segments_for_translation(&to, &skip, min_words, limit)?;
+        // Only worth the scan when there is room left in the batch.
+        let unstamped = if stamped.len() < limit {
+            guard.segments_without_language(min_words, GUESS_SCAN)?
+        } else {
+            Vec::new()
+        };
+        (stamped, unstamped)
     };
+
+    // ---- the third language (no lock) --------------------------------------
+    //
+    // A turn nothing could read a language out of is a candidate ONLY when the
+    // guesser can name one. That asymmetry is the whole safety argument: a
+    // mumbled German line and a French line are the same NULL in the column,
+    // and the difference between them is the only thing that stops "translate
+    // everything I cannot read" from meaning "translate everything".
+    let skip = read_languages();
+    let mut guessed: Vec<(crate::store::TranslateCandidate, lang::OtherLang)> = Vec::new();
+    for c in unstamped {
+        if candidates.len() + guessed.len() >= limit {
+            break;
+        }
+        let Some(g) = lang::guess_other(&c.text) else {
+            continue;
+        };
+        if skip.iter().any(|s| s == g.tag) {
+            continue;
+        }
+        guessed.push((c, g));
+    }
+    if !guessed.is_empty() {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        for (c, g) in &guessed {
+            // A confident guess is written onto the row, so the transcript can
+            // say what language the line is in and so the next pass finds it
+            // through the ordinary query. An unconfident one is enough to ask
+            // the model and not enough to claim anything in the database.
+            if g.confident {
+                guard.set_segment_language(c.id, g.tag, crate::store::lang_via::GUESSED)?;
+            }
+        }
+    }
+    candidates.extend(guessed.into_iter().map(|(c, _)| c));
     if candidates.is_empty() {
         return Ok(false);
     }
@@ -338,6 +537,55 @@ mod tests {
         assert!(system_for("en").contains("into English"));
         assert!(system_for("zz").contains("into English"), "the fallback");
         assert_eq!(language_name("de"), "German");
+        assert_eq!(language_name("ja"), "Japanese");
+    }
+
+    #[test]
+    fn the_example_answers_in_the_language_the_prompt_asked_for() {
+        // 0.10.2. The German example under an English instruction was the one
+        // place a 3b model reliably takes the demonstration over the sentence
+        // above it — and English is the user's target.
+        let en = system_for("en");
+        assert!(en.contains("i will send you the link tomorrow\"}"), "{en}");
+        assert!(
+            !en.contains("ich schicke dir morgen den Link\"}"),
+            "the English prompt still demonstrates German: {en}"
+        );
+        let de = system_for("de");
+        assert!(de.contains("ich schicke dir morgen den Link\"}"), "{de}");
+        // A target with no checked example gets the instruction and no
+        // demonstration at all, rather than a machine-translated one.
+        let ja = system_for("ja");
+        assert!(
+            ja.contains("into Japanese") && !ja.contains("Examples:"),
+            "{ja}"
+        );
+    }
+
+    #[test]
+    fn the_three_settings_are_live_and_the_target_is_always_read() {
+        let _live = test_guard();
+        assert_eq!(target(), "", "the shipped value is off");
+        assert!(!enabled());
+        assert_eq!(read_languages(), vec!["de".to_string(), "en".to_string()]);
+        assert_eq!(display(), DISPLAY_MAIN);
+
+        set_target("EN");
+        assert_eq!(target(), "en", "case-folded on the way in");
+        assert!(enabled());
+        set_read_languages(&["de".to_string()]);
+        // …and the target comes back with it, because a target you do not read
+        // is a setting that translates a line into a language you cannot read.
+        assert_eq!(read_languages(), vec!["de".to_string(), "en".to_string()]);
+        set_read_languages(&[]);
+        assert_eq!(read_languages(), vec!["en".to_string()]);
+
+        set_display("under");
+        assert_eq!(display(), DISPLAY_UNDER);
+        set_display("sideways");
+        assert_eq!(display(), DISPLAY_MAIN, "an unknown mode is the default");
+        set_target("");
+        assert!(!enabled(), "off is a setting, not an absence");
     }
 
     // ---- the three guards --------------------------------------------------
@@ -372,6 +620,41 @@ mod tests {
                 "welches portal war das denn",
                 Some("ich glaube das war das im treppenhaus"),
                 "en"
+            ),
+            Verdict::WrongLanguage
+        );
+    }
+
+    #[test]
+    fn a_third_language_target_is_guarded_too_and_not_by_the_umlaut_rule() {
+        // 0.10.2. Asked for Japanese, the model answered in English — the
+        // commonest failure, and one the two-way classifier used to be given
+        // no chance to catch because the target was not one of its two.
+        assert_eq!(
+            judge(
+                "welches portal war das denn",
+                Some("i think it was the one behind the bar"),
+                "ja"
+            ),
+            Verdict::WrongLanguage
+        );
+        // A real answer in the target survives.
+        let v = judge("which portal was it", Some("どのポータルでしたか"), "ja");
+        assert!(matches!(v, Verdict::Translated(_)), "{v:?}");
+        // And the trap: `classify` calls anything with an umlaut German, so a
+        // correct Swedish answer must NOT be judged by it.
+        let v = judge(
+            "i will send you the link tomorrow",
+            Some("jag skickar dig länken imorgon"),
+            "sv",
+        );
+        assert!(matches!(v, Verdict::Translated(_)), "{v:?}");
+        // A confident guess of the wrong third language is still a rejection.
+        assert_eq!(
+            judge(
+                "which portal was it, the one behind the bar",
+                Some("je ne sais pas ce que c'est mais il est dans la boîte"),
+                "es"
             ),
             Verdict::WrongLanguage
         );
@@ -477,6 +760,80 @@ mod tests {
                 .is_empty(),
             "a turn in a language you already read is not a turn to translate"
         );
+    }
+
+    #[test]
+    fn a_turn_in_no_language_the_classifier_knows_is_only_a_candidate_when_it_can_be_named() {
+        // The 0.10.2 rule, and the whole reason `lang::guess_other` exists. All
+        // four of these are `lang IS NULL` in the database — the classifier
+        // reads nothing out of any of them — and they must not be treated the
+        // same way.
+        let (store, ids) = store_with(&[
+            (
+                "je ne sais pas ce que c'est mais il est dans la boîte",
+                None,
+            ),
+            ("это единственный способ сделать это", None),
+            // A German mumble. Nothing can read a language out of it either,
+            // and it must NOT go to a translator.
+            ("mhm ne warte kurz", None),
+            // Words in nobody's stopword list at all.
+            ("okay cool nice one", None),
+        ]);
+        let rows = store.segments_without_language(3, 50).unwrap();
+        assert_eq!(rows.len(), 4, "all four have no language stamp");
+        let named: Vec<(i64, &str)> = rows
+            .iter()
+            .filter_map(|c| lang::guess_other(&c.text).map(|g| (c.id, g.tag)))
+            .collect();
+        // Newest first, like every other queue here.
+        assert_eq!(named, vec![(ids[1], "ru"), (ids[0], "fr")]);
+
+        // A confident guess is written onto the row, which is what puts it in
+        // the ordinary queue from then on — and what lets the transcript say
+        // which language the line is in.
+        store
+            .set_segment_language(ids[1], "ru", crate::store::lang_via::GUESSED)
+            .unwrap();
+        let queue: Vec<i64> = store
+            .segments_for_translation("en", &["de".to_string(), "en".to_string()], 3, 50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(queue, vec![ids[1]]);
+        // …and it is gone from the guesser's scan, so it is never asked twice.
+        assert_eq!(store.segments_without_language(3, 50).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_language_you_read_is_never_translated_whatever_the_target_is() {
+        let _live = test_guard();
+        // The user's setting: read German and English, translate into English.
+        set_target("en");
+        set_read_languages(&["de".to_string(), "en".to_string()]);
+        assert_eq!(read_languages(), vec!["de".to_string(), "en".to_string()]);
+        let (store, ids) = store_with(&[
+            ("das ist der einzige weg das zu machen", Some("de")),
+            ("i think that is the only way to do it", Some("en")),
+        ]);
+        assert!(
+            store
+                .segments_for_translation("en", &read_languages(), 3, 50)
+                .unwrap()
+                .is_empty(),
+            "both turns are in a language the reader has"
+        );
+        // Drop German from the list and the German turn is a candidate — the
+        // one setting doing the one thing it says.
+        set_read_languages(&["en".to_string()]);
+        let queue: Vec<i64> = store
+            .segments_for_translation("en", &read_languages(), 3, 50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(queue, vec![ids[0]]);
     }
 
     #[test]

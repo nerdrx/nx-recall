@@ -74,6 +74,15 @@ const ALLOWED = new Set([
   // ride on `notes.list` and `notes.set_state`, both already here — and a
   // translation rides on the segment.
   'digest.list',
+  // The translation controls (0.10.2). Two, and both are reachable from the
+  // Memory view's Translation card — a read, because the card builds its
+  // selector out of the languages the daemon will accept rather than a list of
+  // its own, and a write, because three controls that need a restart are not
+  // controls. A method the UI calls and this set forgets is a card that
+  // renders empty and says nothing about why, which is exactly what happened
+  // the first time this was left out.
+  'assist.get',
+  'assist.set',
   // Worlds and turn-taking (0.10.0). Two reads: the Memory view's Worlds card
   // and the person page's "How you talk". A method the UI calls and this set
   // forgets is a card that never renders and says nothing about why.

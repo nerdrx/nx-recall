@@ -22,7 +22,7 @@
 //      nothing leaves the machine — in plain words, next to the switch.
 
 import { h, clear, fmtDate, fmtClock, fmtDayLabel, fmtDur, speakerColor } from '../lib/dom.js';
-import { store, speakerLabel, ask } from '../lib/store.js';
+import { store, speakerLabel, ask, applyAssist } from '../lib/store.js';
 import { toast } from '../lib/sheets.js';
 
 export const id = 'memory';
@@ -159,6 +159,9 @@ export function mount(root, ctx) {
   let topics = [];
   let busy = new Set();
   let showAll = false;
+  /// 0.10.2: an `assist.set` is in flight, so the three controls are dead until
+  /// it answers — the same visible optimistic window the thread stepper has.
+  let translatePending = false;
 
   let notes = [];
   let noteBusy = new Set();
@@ -181,6 +184,11 @@ export function mount(root, ctx) {
   // the where is the one people remember first.
   const worldsCard = h('div', { class: 'card', id: 'worlds-card' });
   const enrichCard = h('div', { class: 'card', id: 'enrich-card' });
+  // 0.10.2. Directly under the model's own card, because it IS the model's
+  // other job: the same 1.9 GB of weights, the same pinned cores, the same
+  // queue. A person who has just read what the local model costs is the person
+  // deciding whether to give it a second thing to do.
+  const translateCard = h('div', { class: 'card', id: 'translate-card' });
   const body = h(
     'div',
     { class: 'view-body view-enter' },
@@ -195,7 +203,8 @@ export function mount(root, ctx) {
     vocabCard,
     worldsCard,
     topicsCard,
-    enrichCard
+    enrichCard,
+    translateCard
   );
 
   root.append(
@@ -1226,6 +1235,209 @@ export function mount(root, ctx) {
     return h('li', {}, h('span', { class: 'tick', 'aria-hidden': 'true', text: '·' }), text);
   }
 
+  // -- translation (0.10.2) -------------------------------------------------
+  //
+  // Three controls, and they are three because the person asked three separate
+  // questions in one breath: *everything but German and English should be
+  // translated*, *the original should be subtext and the translation the main
+  // thing*, and *translate it to English*. Each is a setting on its own here,
+  // and none of them is inferred from another — a client that guessed "you
+  // read German, so translate into German" would be answering a question
+  // nobody asked.
+  //
+  // What this card deliberately does NOT have is a switch. Translation being
+  // "on" is not a fourth fact: it is what having a target means, and `Off` is
+  // the first option in the selector that sets it. Two controls for one state
+  // is how a switch and a dropdown end up disagreeing.
+
+  function renderTranslation() {
+    clear(translateCard);
+    const a = store.assist;
+    const langs = a.languages.length ? a.languages : null;
+    const live = store.conn.status === 'connected' && !translatePending;
+    // A daemon that has never answered `assist.get` has given us no list, and
+    // a selector built out of a list this file invented would offer languages
+    // the daemon may refuse. Say so instead.
+    const canSet = live && !!langs;
+
+    translateCard.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('div', { class: 'card-title', text: 'Translation' }),
+        h('span', {
+          class: 'sub',
+          id: 'translate-sub',
+          text: a.translate_to
+            ? `into ${nameOf(a.translate_to)} · everything you do not read`
+            : 'off — nothing is translated',
+        })
+      )
+    );
+
+    // 1. the target.
+    const targetSelect = h(
+      'select',
+      {
+        class: 'input',
+        id: 'translate-target',
+        disabled: !canSet,
+        'aria-label': 'Translate turns into',
+        onchange: (e) => void setAssist({ translate_to: e.target.value }),
+      },
+      h('option', { value: '', selected: !a.translate_to || undefined }, 'Off — do not translate'),
+      ...(langs ?? []).map((l) =>
+        h('option', { value: l.code, selected: l.code === a.translate_to || undefined }, l.name)
+      )
+    );
+
+    // 2. the languages you read. Chips, because this is a set and not a
+    //    choice, and a set of nineteen checkboxes is a form.
+    const chips = h('div', { class: 'lang-chips', id: 'translate-read', dataset: { pending: String(translatePending) } });
+    for (const l of langs ?? []) {
+      const on = a.read_languages.includes(l.code);
+      const locked = !!a.translate_to && l.code === a.translate_to;
+      chips.append(
+        h(
+          'button',
+          {
+            class: `chip toggle-chip${on ? ' on' : ''}${locked ? ' locked' : ''}`,
+            dataset: { lang: l.code, on: String(on) },
+            role: 'switch',
+            'aria-checked': String(on),
+            disabled: !canSet || locked,
+            title: locked
+              ? `${l.name} is what you are translating INTO, so you read it by definition.`
+              : on
+                ? `${l.name} is not translated. Press to have it translated.`
+                : `${l.name} is translated. Press to leave it alone.`,
+            onclick: () => void toggleRead(l.code),
+          },
+          l.name
+        )
+      );
+    }
+
+    // 3. where the translation goes.
+    const mode = (value, label, hint) =>
+      h(
+        'label',
+        { class: `radio-row${a.translation_display === value ? ' on' : ''}` },
+        h('input', {
+          type: 'radio',
+          name: 'translation-display',
+          value,
+          id: `translate-display-${value}`,
+          checked: a.translation_display === value || undefined,
+          disabled: !live,
+          onchange: () => void setAssist({ translation_display: value }),
+        }),
+        h('span', {}, h('b', { text: label }), h('small', { text: hint }))
+      );
+
+    translateCard.append(
+      h(
+        'div',
+        { class: 'enrich-tune', id: 'translate-target-row', dataset: { pending: String(translatePending) } },
+        h(
+          'span',
+          { class: 'tune-label' },
+          h('b', { text: 'Translate into' }),
+          h('small', {
+            text: 'The language you want to read. Turns already in it are never sent to the model.',
+          })
+        ),
+        h('span', { class: 'spacer' }),
+        targetSelect
+      ),
+      h(
+        'div',
+        { class: 'tune-block', id: 'translate-read-row' },
+        h(
+          'span',
+          { class: 'tune-label' },
+          h('b', { text: 'Languages you read' }),
+          h('small', {
+            text: 'Anything NOT on this list gets translated. The language you translate into is always on it.',
+          })
+        ),
+        chips
+      ),
+      h(
+        'div',
+        { class: 'tune-block', id: 'translate-display-row' },
+        h(
+          'span',
+          { class: 'tune-label' },
+          h('b', { text: 'On a transcript row' }),
+          h('small', { text: 'Both lines are always there. This is which one leads.' })
+        ),
+        h(
+          'div',
+          { class: 'radio-set', role: 'radiogroup', 'aria-label': 'Where the translation goes' },
+          mode('main', 'Translation first', 'the original underneath, with its language code'),
+          mode('under', 'Original first', 'the translation underneath — how 0.9.0 drew it')
+        )
+      ),
+      h('p', {
+        class: 'rail-hint',
+        id: 'translate-note',
+        style: 'padding:10px 0 0;max-width:70ch',
+        text: 'The same local model that reads your conversations, one call per turn, after the enrichment queue has had its share. A turn it cannot translate honestly — it echoed the input, or answered in the wrong language — is left untranslated rather than guessed at, and the original is never replaced.',
+      })
+    );
+
+    if (!langs) {
+      translateCard.append(
+        h('p', {
+          class: 'mic-warn',
+          id: 'translate-absent',
+          text: 'This daemon is older than 0.10.2 and cannot be told what to translate from here. `translate_to` in config.toml still works.',
+        })
+      );
+    }
+  }
+
+  function nameOf(code) {
+    return store.assist.languages.find((l) => l.code === code)?.name ?? code;
+  }
+
+  /** Add or remove one language from the read set. */
+  function toggleRead(code) {
+    const now = store.assist.read_languages;
+    const next = now.includes(code) ? now.filter((c) => c !== code) : [...now, code];
+    return setAssist({ read_languages: next });
+  }
+
+  /**
+   * The one write. Optimistic with rollback, like every other control here: the
+   * value moves the instant a person presses and goes back if the daemon
+   * refuses, rather than sitting still for a round trip.
+   *
+   * The daemon's reply is applied over the optimistic guess rather than trusted
+   * to match it — `read_languages` comes back with the target folded in, and a
+   * client that kept its own guess would draw a chip the daemon has switched on.
+   */
+  async function setAssist(patch) {
+    const before = { ...store.assist };
+    applyAssist(patch);
+    translatePending = true;
+    renderTranslation();
+    try {
+      applyAssist(await ask('assist.set', patch));
+    } catch (e) {
+      store.assist = before;
+      toast(`Could not change that — ${e.message}`, 'error');
+    } finally {
+      translatePending = false;
+      renderTranslation();
+      // The transcript is not repainted from here. The daemon publishes an
+      // `assist` event for a change made anywhere, this window is subscribed
+      // to it like any other, and that is the one path — a second path would
+      // be a second chance to disagree with the daemon.
+    }
+  }
+
   /// How much of the machine the model may use — the setting that replaced
   /// standing down while you played.
   ///
@@ -1425,6 +1637,18 @@ export function mount(root, ctx) {
           digests = [];
         })
         .then(renderDigests),
+      // 0.10.2. Its own slice for the same reason every one above it has one:
+      // a daemon older than 0.10.2 answers `unknown_method` here, and the card
+      // says so rather than blanking the enrichment card beside it. This is
+      // also what puts the LANGUAGE LIST in the model — the resync fetches it
+      // too, but a view mounted between resyncs would otherwise draw a
+      // selector with nothing in it.
+      ask('assist.get')
+        .then((r) => {
+          applyAssist(r);
+        })
+        .catch(() => {})
+        .then(renderTranslation),
       // 0.10.0. Its own slice for the same reason every one above it has one.
       ask('worlds.list', { limit: 12 })
         .then((r) => {
@@ -1483,6 +1707,7 @@ export function mount(root, ctx) {
   renderWorlds();
   renderTopics();
   renderEnrichment();
+  renderTranslation();
   void load();
 
   return {
@@ -1530,6 +1755,10 @@ export function mount(root, ctx) {
         if (change.graph) summary = { ...(summary ?? {}), enrichment: change.graph };
         renderEnrichment();
       }
+      // The translation settings moved — here, in another window, or in the
+      // config file. `status` carries them too, so a window that missed the
+      // event converges on the next poll (0.10.2).
+      if (change?.assist || change?.status) renderTranslation();
       if (change?.commitment) {
         const row = commitments.find((c) => c.id === change.commitment.id);
         if (row) Object.assign(row, change.commitment);

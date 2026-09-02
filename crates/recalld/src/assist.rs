@@ -180,7 +180,11 @@ pub fn run(
                             Err(e) => warn!("a digest batch failed: {e:#}"),
                         }
                     }
-                    if !cfg.translate_to.trim().is_empty() {
+                    // 0.10.2: the live switch, not `cfg`'s. `cfg` is a snapshot
+                    // taken when this thread was spawned, and translation
+                    // turned on from the Memory view has to start without a
+                    // restart — see `translate::LIVE`.
+                    if crate::translate::enabled() {
                         match crate::translate::batch(&store, &control, &bus, llm, &cfg, &stopped) {
                             Ok(did) => worked |= did,
                             Err(e) => warn!("a translation batch failed: {e:#}"),

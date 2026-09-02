@@ -255,6 +255,35 @@ const CANNED_LINES = [
  * Both are speaker 1, who is declared `de` — which is the case the field
  * exists for. `lang` is the language of the TEXT here, not of the turn.
  */
+/**
+ * Every language the daemon offers as a target or as one you read (0.10.2).
+ *
+ * The real one is `lang::OFFERED` and this is a copy of it, which is the usual
+ * mock bargain: the list is on the wire precisely so a client does not have to
+ * carry one, and the mock has to put something there for the client to read.
+ */
+const LANGUAGES = [
+  { code: 'en', name: 'English' },
+  { code: 'de', name: 'German' },
+  { code: 'fr', name: 'French' },
+  { code: 'es', name: 'Spanish' },
+  { code: 'it', name: 'Italian' },
+  { code: 'pt', name: 'Portuguese' },
+  { code: 'nl', name: 'Dutch' },
+  { code: 'pl', name: 'Polish' },
+  { code: 'ru', name: 'Russian' },
+  { code: 'uk', name: 'Ukrainian' },
+  { code: 'ja', name: 'Japanese' },
+  { code: 'zh', name: 'Chinese' },
+  { code: 'ko', name: 'Korean' },
+  { code: 'tr', name: 'Turkish' },
+  { code: 'sv', name: 'Swedish' },
+  { code: 'da', name: 'Danish' },
+  { code: 'no', name: 'Norwegian' },
+  { code: 'fi', name: 'Finnish' },
+  { code: 'cs', name: 'Czech' },
+];
+
 const TRANSLATED = new Map([
   [0, { lang: 'en', text: 'wait — which portal was it, the one behind the bar or the one in the stairwell?', via: 'nllb-200' }],
   [3, { lang: 'en', text: 'no rush, we are still waiting on two people', via: 'nllb-200' }],
@@ -1039,6 +1068,13 @@ export function startMock({
     })),
     digests: DIGESTS.map((d) => ({ ...d })),
     vocab: { user: [...VOCAB_USER] },
+    /// The translation settings (0.10.2), live and settable like the real
+    /// daemon's. Deliberately NOT the shipped defaults: the mock's job is to
+    /// be the state worth looking at, and `read_languages: ['de']` with a
+    /// German target is the only combination the canned translations above are
+    /// coherent with — the English turns carry a German reading, and the
+    /// German ones carry none.
+    assist: { translate_to: 'de', read_languages: ['de'], translation_display: 'main' },
     /// Every `segments.correct` this daemon has served, which is where
     /// `accuracy.summary` comes from: the pre-correction text lives in the
     /// record, so a WER estimate is arithmetic over real edits rather than a
@@ -1600,6 +1636,28 @@ export function startMock({
     };
   }
 
+  /// The languages a turn may be in without being translated: what was set,
+  /// plus the target, which is read by definition. The daemon folds it in the
+  /// same way and for the same reason — a target you would then translate away
+  /// from is not a setting anybody meant.
+  function effectiveRead() {
+    const out = [...state.assist.read_languages];
+    const to = state.assist.translate_to;
+    if (to && !out.includes(to)) out.push(to);
+    return out;
+  }
+
+  /// `assist.get`'s answer, `assist.set`'s reply, and the `assist` event, from
+  /// one function so the three cannot drift.
+  function assistState() {
+    return {
+      translate_to: state.assist.translate_to,
+      read_languages: effectiveRead(),
+      translation_display: state.assist.translation_display,
+      languages: LANGUAGES.map((l) => ({ ...l })),
+    };
+  }
+
   /// Word-level error rate between what was transcribed and what a person said
   /// it should have been. A real daemon runs a proper alignment; this is the
   /// same NUMBER SHAPE from a cheap one, which is all a client can be written
@@ -1874,7 +1932,16 @@ export function startMock({
       // tell "off" from "an older daemon" without guessing. The mock ships
       // with translation ON and pointed at German, because the whole point of
       // a mock is to be the state that is worth looking at.
-      assist: { reminders: true, digest: true, translate_to: 'de' },
+      assist: {
+        reminders: true,
+        digest: true,
+        // The three values, and NOT the `languages` list: that is
+        // `assist.get`'s, because a selector's options do not change and this
+        // block is polled every three seconds.
+        translate_to: state.assist.translate_to,
+        read_languages: effectiveRead(),
+        translation_display: state.assist.translation_display,
+      },
       segments_total: state.segments.length,
       daemon: daemonId(),
       schema: SCHEMA,
@@ -2753,6 +2820,48 @@ export function startMock({
       // the reason the `mic` event is there: a new topic would make an older
       // client deaf to it and there is nothing here that wants its own stream.
       emit('status', 'vocab', payload);
+      return { ...payload, persisted: true };
+    },
+
+    // --- 0.10.2: the translation controls ----------------------------------
+
+    'assist.get': () => assistState(),
+
+    'assist.set'(params) {
+      const next = { ...state.assist };
+      if (params?.translate_to !== undefined) {
+        const code = String(params.translate_to ?? '').trim().toLowerCase();
+        if (code && !LANGUAGES.some((l) => l.code === code)) {
+          throw err('params', `no language ${JSON.stringify(code)}; translate_to is one of ${LANGUAGES.map((l) => l.code).join(', ')} or "" for off`);
+        }
+        next.translate_to = code;
+      }
+      if (params?.read_languages !== undefined) {
+        if (!Array.isArray(params.read_languages)) throw err('params', 'read_languages must be an array of strings');
+        const out = [];
+        for (const item of params.read_languages) {
+          if (typeof item !== 'string') throw err('params', 'read_languages must be an array of strings');
+          const code = item.trim().toLowerCase();
+          if (!LANGUAGES.some((l) => l.code === code)) {
+            throw err('params', `no language ${JSON.stringify(code)}; read_languages is any of ${LANGUAGES.map((l) => l.code).join(', ')}`);
+          }
+          if (!out.includes(code)) out.push(code);
+        }
+        next.read_languages = out;
+      }
+      if (params?.translation_display !== undefined) {
+        const mode = String(params.translation_display ?? '').trim().toLowerCase();
+        if (mode !== 'main' && mode !== 'under') throw err('params', 'translation_display is "main" or "under"');
+        next.translation_display = mode;
+      }
+      if (params?.translate_to === undefined && params?.read_languages === undefined && params?.translation_display === undefined) {
+        throw err('params', 'assist.set needs at least one of translate_to, read_languages, translation_display');
+      }
+      state.assist = next;
+      const payload = assistState();
+      // On `status`, like `vocab` and `mic`: the display mode changes what a
+      // transcript ROW looks like, so every open window has to be told.
+      emit('status', 'assist', payload);
       return { ...payload, persisted: true };
     },
 
