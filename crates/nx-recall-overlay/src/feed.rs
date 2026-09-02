@@ -46,6 +46,10 @@ pub struct Turn {
     /// wears, because a mark that means one thing in one window and another
     /// thing in the next is not a mark.
     pub shaky: bool,
+    /// What language the turn was SPOKEN in, when the daemon says. Only ever
+    /// shown when the translation is the main line: it is the difference
+    /// between "a quieter second line" and "the original, in Polish".
+    pub lang: Option<String>,
     /// The sibling `translation` track: `{lang, text, via}`, absent on most
     /// rows and meaning exactly nothing when it is.
     pub translation: Option<(Option<String>, String)>,
@@ -54,6 +58,59 @@ pub struct Turn {
     /// no socket, and a "You" row that stops being dimmer because two facts
     /// arrived out of order is a flicker nobody can explain.
     pub mine: bool,
+}
+
+/// `[assist] translation_display` — which of a translated row's two lines
+/// leads (PROTOCOL "[assist], three keys", 0.10.2).
+///
+/// 0.9.0 put the translation under the words and argued the original must lead
+/// because the transcript is a record. 0.10.2 reversed it: somebody who cannot
+/// read the original is not reading a record, they are reading a wall of text
+/// with a hint under each line. Both lines are on the row either way.
+///
+/// The caption bar is not exempt from that argument — it is the surface where
+/// it bites hardest, because a caption is read once, at a glance, over a game.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TranslationDisplay {
+    /// The translation is the line; the original is subtext under it, wearing
+    /// its own language code. The daemon's default.
+    #[default]
+    Main,
+    /// 0.9.0's layout: the original leads and the translation sits under it.
+    Under,
+}
+
+impl TranslationDisplay {
+    /// Read it off the wire — from `status.assist`, from an `assist` event, or
+    /// from `assist.get`, all of which carry the same shape.
+    ///
+    /// Anything that is not exactly `"under"` is `Main`, including absent,
+    /// null, and a value from a build that knows something this one does not.
+    /// That is `translationLeads()` in gui/src/renderer/lib/store.js, verbatim,
+    /// and it matters that the two agree: a daemon too old to have the field at
+    /// all must give both surfaces the SAME layout, and 0.10.2's default is the
+    /// one a person configured when they last had a control for it.
+    pub fn from_wire(v: &Value) -> Self {
+        if v.as_str() == Some("under") {
+            Self::Under
+        } else {
+            Self::Main
+        }
+    }
+
+    /// The same, dug out of whichever envelope carried it: `status` nests it
+    /// under `assist`, the `assist` event has it at the top level.
+    pub fn from_envelope(v: &Value, current: Self) -> Self {
+        for at in [
+            &v["assist"]["translation_display"],
+            &v["translation_display"],
+        ] {
+            if !at.is_null() {
+                return Self::from_wire(at);
+            }
+        }
+        current
+    }
 }
 
 /// The last N turns, and the rule that keeps history out of them.
@@ -216,6 +273,7 @@ impl Captions {
             who: who.to_owned(),
             text: seg["text"].as_str().unwrap_or("…").to_owned(),
             shaky: seg["asr_confidence"].as_str() == Some("shaky"),
+            lang: seg["lang"].as_str().map(str::to_owned),
             translation: seg["translation"]["text"].as_str().map(|text| {
                 (
                     seg["translation"]["lang"].as_str().map(str::to_owned),
@@ -352,7 +410,15 @@ pub fn run(socket: Option<&Path>, turns: usize) -> Result<()> {
     if let Ok(tail) = feed.call("transcript", json!({"limit": 1})) {
         caps.seed_tail(&tail);
     }
-    feed.call("subscribe", json!({"topics": ["segments", "relabel"]}))?;
+    // Which line leads on a translated row, and the topic the change rides.
+    let mut display = feed
+        .call("status", json!({}))
+        .map(|st| TranslationDisplay::from_envelope(&st, Default::default()))
+        .unwrap_or_default();
+    feed.call(
+        "subscribe",
+        json!({"topics": ["segments", "relabel", "status"]}),
+    )?;
 
     loop {
         let msg = feed.read()?;
@@ -362,6 +428,12 @@ pub fn run(socket: Option<&Path>, turns: usize) -> Result<()> {
                 caps.apply_relabel(&msg["data"]);
                 true
             }
+            Some("assist") => {
+                let next = TranslationDisplay::from_envelope(&msg["data"], display);
+                let moved = next != display;
+                display = next;
+                moved
+            }
             _ => false,
         };
         if !changed {
@@ -370,9 +442,24 @@ pub fn run(socket: Option<&Path>, turns: usize) -> Result<()> {
         println!("--");
         for t in caps.turns() {
             let mark = if t.shaky { "≈ " } else { "" };
-            println!("{:<16} {mark}{}  [{}]", t.who, t.text, t.t_ms);
-            if let Some((lang, text)) = &t.translation {
-                println!("{:<16}   [{}] {text}", "", lang.as_deref().unwrap_or("?"));
+            // Same two lines in the same order the bar would draw them, because
+            // `--feed` is how somebody checks what the bar is about to show.
+            match (&t.translation, display) {
+                (Some((lang, text)), TranslationDisplay::Main) => {
+                    println!("{:<16} {mark}{text}  [{}]", t.who, t.t_ms);
+                    println!(
+                        "{:<16}   [{}] {}",
+                        "",
+                        t.lang.as_deref().unwrap_or("?"),
+                        t.text
+                    );
+                    let _ = lang;
+                }
+                (Some((lang, text)), TranslationDisplay::Under) => {
+                    println!("{:<16} {mark}{}  [{}]", t.who, t.text, t.t_ms);
+                    println!("{:<16}   [{}] {text}", "", lang.as_deref().unwrap_or("?"));
+                }
+                (None, _) => println!("{:<16} {mark}{}  [{}]", t.who, t.text, t.t_ms),
             }
         }
     }

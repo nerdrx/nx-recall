@@ -263,6 +263,11 @@ slider moves the live bar.
 - `turns`, `size`, `hold_s`, `opacity`, `showYou` — all live, all clamped to the
   same ranges by a transliteration of `normalizeCaptionSettings` (`settings.rs`).
 - `clickThrough` — live, and the whole of the section above.
+- `output` (0.10.3) — the connector name of the screen the bar is on, e.g.
+  `DP-2`. Not decoration: a layer surface belongs to one `wl_output` for its
+  whole life, so this is the field that says which surface to make. Written by
+  a drag across a seam and by the card's Screen selector; a name that is not
+  plugged in today falls back to choosing one.
 - `bounds` — its **size** is honoured, and its **position** as far as a layer
   surface can honour one. A layer surface is placed by anchor and margin
   relative to *its output*; `bounds` is in the global desktop coordinates the
@@ -281,19 +286,74 @@ the next slider nudge would write the old position back over the new one.
 
 Content rules are the desktop window's, unchanged and shared with `feed.rs`:
 seed from the live tail, only `added` rows newer than that head, shaky rows
-muted with the same "≈", translation under the original, your own turns dimmed
-by the same `YOU_DIM`, and the whole stack fading one second after `hold_s`
-(except in furniture mode, above).
+muted with the same "≈", your own turns dimmed by the same `YOU_DIM`, and the
+whole stack fading one second after `hold_s` (except in furniture mode, above).
 
-**Multi-output:** not "the output under the cursor" — a bar that changed monitor
-when you reached for a menu is a bar you have to chase. The output is now named
-**explicitly** on the request rather than left to the compositor, because
-margins and `bounds` have to describe the same screen and a placement computed
-for one output and honoured on another is a bar on the wrong monitor. In order:
-`--output DP-2`; the output the remembered position is on; the output at the
-desktop's origin; whatever came first. The log says which and why. Moving the
-bar to a *different* monitor by editing `bounds` takes effect on the next
-launch, not live — a layer surface cannot change output without being recreated.
+**Translated rows (0.10.3)** follow `[assist] translation_display` — the setting
+0.10.2 added and this surface ignored until now, drawing the translation under
+the original whatever the transcript was doing. It is read from `status.assist`
+on connect and from the `assist` event, which rides the **`status`** topic
+(PROTOCOL: "No new topic, so no client changes its subscription" — this one did,
+because until 0.10.2 it had no reason to care), so a change made on the Memory
+card repaints the bar with no restart.
+
+| | lead line, full size | subtext, smaller |
+|---|---|---|
+| `main` (default) | the translation | the original, tagged with the segment's own `lang` |
+| `under` | the original | the translation, tagged with its target language |
+
+Both lines are always there and nothing is ever invented: an untranslated turn
+is one line with no tag in either mode. The language tags are on the LINE rather
+than in a tooltip because a caption bar has no hover — the transcript carries
+the same two facts in a `title` and a `.said-lang` chip. The "≈" stays on the
+lead: in the transcript it lives in the row's meta cell, on neither line, and a
+caption bar has no meta cell, so it goes where it cannot be missed.
+
+### Moving between screens
+
+**"I CANT MOVE THE LIVE CAPTION BETWEEN SCREENS."** A layer surface belongs to
+one `wl_output` — `get_layer_surface` takes the output and the protocol offers
+no way to change it — so 0.10.2's drag clamped at the edge of the screen it was
+born on. There is no title bar to drag it back by and no window menu to send it
+elsewhere with, which made one monitor a life sentence.
+
+The way across is to notice the bar's **centre** has entered another output's
+rectangle and re-make the surface there at the same place on the desk. The
+centre, not a corner: dragging by the left edge would otherwise hop the instant
+one pixel crossed the seam, while the thing you are looking at is still entirely
+on the old screen. The geometry comes from `zxdg_output_manager_v1` — logical
+position and size — because `wl_output` alone reports a mode in device pixels
+and no position, and a desk of two differently-scaled monitors cannot be laid
+out from that.
+
+**The drag ends at the hop.** Destroying the surface ends the compositor's
+implicit pointer grab with it, and carrying the grab across would mean knowing
+the button is still down on a surface that has never sent a press — `wl_pointer`
+reports transitions, not state. So the bar lands where the hand left it, the
+position is written down, and picking it up again is one more click. That is the
+behaviour shipped, in preference to a plausible-looking guess about button state.
+
+A centre that lands on **no** screen — the dead region beside a shorter monitor,
+or past the edge of the desk — moves nothing. There is no way back to a bar that
+is nowhere.
+
+**Which screen it starts on**, in order: `--output DP-2`; the `output`
+remembered in `captions.json`; the screen the remembered position is on (for a
+file written before there was an `output` field); the screen at the desk's
+origin; whatever came first. It is always named **explicitly** on the request
+rather than left to the compositor, because margins and `bounds` have to
+describe the same screen. The log says which and why.
+
+**The Screen selector** on the Captions card is the same move without the
+dragging, and it writes the same `output` field — so the two routes cannot
+disagree. It only appears where there is a choice: the layer path, and more than
+one screen. The list comes from `nx-recall-overlay --list-outputs`, one line of
+JSON from a subprocess the main process runs once, because the card is a page in
+a renderer with no Wayland access. The alternative was for the overlay to write
+an `outputs` block into `captions.json` on every start; that was rejected
+because it would rewrite a file both sides watch and both diff, trip both echo
+guards on each launch, and put a cache of hardware state inside the object that
+holds what a person chose.
 
 **Fallback:** if `zwlr_layer_shell_v1` is not offered — or there is no Wayland
 display at all — it prints one line and exits **2**, and
@@ -329,6 +389,18 @@ synthetic input of any kind was used at any point.**
   glyph caches). The budget was one 60 Hz frame.
 - **The fallback code.** With `WAYLAND_DISPLAY` unset it prints the fallback
   line and exits 2, checked directly.
+- **`translation_display` is read and followed** (0.10.3). `--feed` against the
+  mock in `main` printed the translation as the line and `[de] …` — the
+  segment's own language — under it; the log said which layout it had on
+  connect, and `assist.set` mid-run logged `translation_display is now under`
+  with no restart.
+- **The bar crosses screens** (0.10.3). On the two-monitor desk it was created
+  on `DP-2` ("it is the screen captions.json remembers; 2 screens on this
+  desk"), and writing `output: "DP-1"` into `captions.json` — which is exactly
+  what the card's Screen selector does — logged `the bar crossed onto DP-1 —
+  re-making the surface there at 2010,96`, photographed on the lower monitor,
+  and wrote back `bounds {x: 2010, y: 2444}` with `output: "DP-1"`. One reload,
+  no echo loop.
 
 **Still not verified by a real click, in either direction.** Neither "the click
 passes through" nor "the drag moves the bar" was exercised by a synthetic
@@ -340,8 +412,12 @@ desktop. What is checked instead is everything that decides the outcome:
   for a fresh profile, an empty object and a corrupt file;
 - the whole `LayerConfig` — layer, anchor, size, margins, exclusive zone, and
   keyboard interactivity `None` in **both** modes;
-- the drag arithmetic — `layout::drag_margins`, including the vertical sign that
-  is easy to get backwards, and that the bar cannot be dragged off its output;
+- the drag arithmetic — the vertical sign that is easy to get backwards, and the
+  hop: which screen a global point is on, the margin recomputation across
+  stacked and side-by-side desks, the round trip margins → bounds → margins on
+  every screen, a centre on no screen changing nothing, and a one-screen desk
+  never hopping;
+- the layout of a translated row, both ways and for a row with no translation;
 - the round trip a drag makes through the file: margins → `bounds` → margins,
   unchanged, so the bar does not walk a few pixels up the screen on each launch;
 - the echo guard, as a function of two strings;
@@ -369,7 +445,8 @@ Electron window, which is exactly the fallback this path needs to keep working.
 | the caption rasteriser (wrap, ground, speaker hues, translations) | `src/raster.rs` | yes — unit tests, plus `--render` against the mock |
 | the overlay session and the Vulkan upload | `src/xr.rs` | **no. never executed.** |
 | the desktop captions window (Route 2's source, and the fallback) | `gui/src/renderer/captions.*` | yes — `npm run headless`, both grounds |
-| the settings reader and writer (`captions.json`: the ranges, the JS's null asymmetry, the byte-identical text, the atomic write) | `src/settings.rs` | yes — unit tests |
+| the settings reader and writer (`captions.json`: the ranges, the JS's null asymmetry, the byte-identical text, the atomic write, `output`) | `src/settings.rs` | yes — unit tests |
+| which line a translated row leads with (`translation_display`) | `src/raster.rs` (`row_lines`), `src/feed.rs` | yes — unit tests both ways and for a row with no translation, plus `--feed` against the mock |
 | the bar's size, position and fade schedule | `src/layout.rs` | yes — unit tests |
-| the layer surface (config, both input regions, the drag math, the shm conversion) | `src/desktop.rs`, `src/layout.rs` | yes for the parts a compositor is not needed for; the surface itself was run and photographed on KWin in both modes. **Neither the click passing through nor the drag was exercised by synthetic input** — see "Desktop: layer-shell" |
+| the layer surface (config, both input regions, the drag math, the cross-screen hop, the shm conversion) | `src/desktop.rs`, `src/layout.rs` | yes for the parts a compositor is not needed for; the surface itself was run and photographed on KWin in both modes. **Neither the click passing through nor the drag was exercised by synthetic input** — see "Desktop: layer-shell" |
 | which surface a desktop gets, and where the binary is | `gui/src/main/captions.js` | yes — `gui/test/layer_captions.test.js` |

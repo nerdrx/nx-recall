@@ -24,16 +24,100 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use fontdue::{Font, FontSettings};
 
-use crate::feed::Turn;
+use crate::feed::{TranslationDisplay, Turn};
 
 /// The deep-space ground, unpacked. Matches `--cap-ground` in captions.css.
 pub const GROUND: [u8; 3] = [6, 4, 12];
 /// Body ink. Matches `.cap-text`.
 const INK: [u8; 3] = [244, 243, 248];
-/// The muted ink a shaky row and a translation are set in.
+/// The muted ink a shaky row is set in.
 const MUTED: [u8; 3] = [185, 180, 201];
-const TRANSLATION: [u8; 3] = [200, 195, 214];
+/// The second line of a row, whichever of the two it is. Named for its ROLE and
+/// not its content since 0.10.2: `translation_display` decides whether the
+/// subtext is the translation or the original, and a colour called TRANSLATION
+/// sitting under half the rows' originals would be a name that lies.
+const SUBTEXT: [u8; 3] = [200, 195, 214];
 const FAINT: [u8; 3] = [143, 138, 160];
+
+/// The two lines of one row, in the order they are drawn.
+///
+/// The whole of `translation_display` lives here, as a function of a turn and a
+/// setting and nothing else — no font, no surface, no compositor — because it
+/// is the one decision in this file that is a *rule* rather than arithmetic, and
+/// the rule has to match the transcript's (`translationCell` in
+/// gui/src/renderer/lib/marks.js) exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowLines {
+    /// The line at full size: body ink, or the muted ink if the row is shaky.
+    pub lead: String,
+    /// The quieter, smaller line under it. `None` unless the turn was
+    /// translated — nothing here ever invents a second line.
+    pub sub: Option<String>,
+    /// Whether `lead` is the translation. Not used by the drawing (both lines
+    /// are drawn the same way whichever they are) but it is the fact the layout
+    /// turns on, and a test that could not see it would be checking strings.
+    pub lead_is_translation: bool,
+}
+
+/// Lay out one row.
+///
+/// What does NOT change with the setting, matching the transcript in both modes:
+///
+/// - **both lines are always there.** The original never leaves the row.
+/// - **the subtext wears a language code**, and which language it is depends on
+///   which line the subtext is: in `Under` it is the translation's target, so
+///   the reader knows what they are being offered; in `Main` it is the
+///   segment's own `lang`, which is what turns "a quieter second line" into
+///   "the original, in Polish". The transcript carries the same two facts in a
+///   `title` and a `.said-lang` chip; a caption bar has no hover, so both are
+///   spelled on the line.
+/// - **the "≈" stays on the LEAD.** In the transcript the shaky mark sits in
+///   the row's meta cell, on neither line — it is a fact about the row. The
+///   caption bar has no meta cell, so it goes on the line being read, which is
+///   the one place it cannot be missed. A translation of a shaky reading is not
+///   less doubtful than the reading.
+pub fn row_lines(turn: &Turn, display: TranslationDisplay) -> RowLines {
+    let said = if turn.shaky {
+        format!("≈ {}", turn.text)
+    } else {
+        turn.text.clone()
+    };
+    let Some((tr_lang, tr_text)) = turn.translation.as_ref() else {
+        // The ordinary row, and most rows. One line, no code, nothing implied.
+        return RowLines {
+            lead: said,
+            sub: None,
+            lead_is_translation: false,
+        };
+    };
+    match display {
+        TranslationDisplay::Under => RowLines {
+            lead: said,
+            sub: Some(tagged(tr_lang.as_deref(), tr_text)),
+            lead_is_translation: false,
+        },
+        TranslationDisplay::Main => RowLines {
+            // The translation leads, and the "≈" leads with it: it is the row
+            // that is uncertain, not the line.
+            lead: if turn.shaky {
+                format!("≈ {tr_text}")
+            } else {
+                tr_text.clone()
+            },
+            sub: Some(tagged(turn.lang.as_deref(), &turn.text)),
+            lead_is_translation: true,
+        },
+    }
+}
+
+/// A line with its language code in front of it, or just the line. Absent is
+/// the ordinary case for `lang` on an older daemon and means exactly nothing.
+fn tagged(lang: Option<&str>, text: &str) -> String {
+    match lang.map(str::trim).filter(|l| !l.is_empty()) {
+        Some(l) => format!("{}  {text}", l.to_uppercase()),
+        None => text.to_owned(),
+    }
+}
 
 /// An RGBA8 surface, premultiplied by nothing: the alpha is the ground's, and
 /// the compositor is what multiplies it.
@@ -110,6 +194,12 @@ pub struct Style {
     /// How much of the scene behind the bar the ground covers, 0.3–0.9.
     pub opacity: f32,
     pub pad: i64,
+    /// Which of a translated row's two lines leads (`[assist]
+    /// translation_display`, 0.10.2). On the Style rather than an argument to
+    /// `render` so that every caller — the desktop bar, `--render`, the headset
+    /// path — picks it up by setting one field, and none of them can forget to
+    /// pass it.
+    pub translation_display: TranslationDisplay,
 }
 
 impl Default for Style {
@@ -123,6 +213,9 @@ impl Default for Style {
             size: 34.0,
             opacity: 0.6,
             pad: 18,
+            // The daemon's default, so a caption bar that has not been told
+            // anything lays a translated row out the way the transcript does.
+            translation_display: TranslationDisplay::Main,
         }
     }
 }
@@ -186,26 +279,13 @@ impl Renderer {
         for turn in turns.iter().rev() {
             let name = format!("{}  ", turn.who);
             let name_w = self.measure(&name, name_size);
-            let text = if turn.shaky {
-                format!("≈ {}", turn.text)
-            } else {
-                turn.text.clone()
-            };
-            let text_lines = self.wrap(&text, self.style.size, inner - name_w - DOT_COLUMN);
-            let tr_lines = turn
-                .translation
-                .as_ref()
-                .map(|(lang, text)| {
-                    let prefix = lang
-                        .as_deref()
-                        .map(|l| format!("{}  ", l.to_uppercase()))
-                        .unwrap_or_default();
-                    self.wrap(
-                        &format!("{prefix}{text}"),
-                        tr_size,
-                        inner - name_w - DOT_COLUMN,
-                    )
-                })
+            let lines = row_lines(turn, self.style.translation_display);
+            let column = inner - name_w - DOT_COLUMN;
+            let text_lines = self.wrap(&lines.lead, self.style.size, column);
+            let tr_lines = lines
+                .sub
+                .as_deref()
+                .map(|sub| self.wrap(sub, tr_size, column))
                 .unwrap_or_default();
             let height = self.style.pad * 2
                 + text_lines.len() as i64 * line_h
@@ -294,7 +374,7 @@ impl Renderer {
             y += line_h;
         }
         for line in &b.tr_lines {
-            self.draw_text(s, line, text_x, y + 2, tr_size, TRANSLATION, dim);
+            self.draw_text(s, line, text_x, y + 2, tr_size, SUBTEXT, dim);
             y += tr_line_h;
         }
     }
@@ -476,9 +556,156 @@ mod tests {
             who: "Kira".into(),
             text: text.into(),
             shaky: false,
+            lang: None,
             translation: None,
             mine: false,
         }
+    }
+
+    /// A translated turn: said in `lang`, read back in `tr_lang`.
+    fn translated(said: &str, lang: &str, tr_lang: &str, tr: &str) -> Turn {
+        Turn {
+            lang: Some(lang.into()),
+            translation: Some((Some(tr_lang.into()), tr.into())),
+            ..turn(1, said)
+        }
+    }
+
+    /// The layout decision, both ways, and the row it does not apply to.
+    ///
+    /// This is the whole of `translation_display` in the caption bar: everything
+    /// after it is wrapping and pixels. It has to agree with `translationCell`
+    /// in gui/src/renderer/lib/marks.js, because a turn that reads one way in
+    /// the transcript and the other way over the game is two designs.
+    #[test]
+    fn main_puts_the_translation_on_the_line_and_the_original_under_it() {
+        let t = translated(
+            "das gleiche, auf Deutsch",
+            "de",
+            "en",
+            "the same, in English",
+        );
+        let lines = row_lines(&t, TranslationDisplay::Main);
+        assert!(lines.lead_is_translation);
+        assert_eq!(lines.lead, "the same, in English");
+        // The original keeps its own language code — the difference between
+        // "a quieter second line" and "the original, in German".
+        assert_eq!(lines.sub.as_deref(), Some("DE  das gleiche, auf Deutsch"));
+    }
+
+    #[test]
+    fn under_is_0_9_0s_layout_with_the_original_leading() {
+        let t = translated(
+            "das gleiche, auf Deutsch",
+            "de",
+            "en",
+            "the same, in English",
+        );
+        let lines = row_lines(&t, TranslationDisplay::Under);
+        assert!(!lines.lead_is_translation);
+        assert_eq!(lines.lead, "das gleiche, auf Deutsch");
+        // …and here the code on the subtext is the TARGET, because that is the
+        // fact the reader needs about the line they are being offered.
+        assert_eq!(lines.sub.as_deref(), Some("EN  the same, in English"));
+    }
+
+    /// Most rows. Neither setting may invent a second line, and neither may
+    /// hang a language code on a row that was never translated.
+    #[test]
+    fn a_turn_with_no_translation_is_one_line_in_either_mode() {
+        let plain = turn(1, "just the one sentence");
+        for display in [TranslationDisplay::Main, TranslationDisplay::Under] {
+            let lines = row_lines(&plain, display);
+            assert_eq!(lines.lead, "just the one sentence");
+            assert_eq!(lines.sub, None, "a second line appeared from nowhere");
+            assert!(!lines.lead_is_translation);
+        }
+        // Even when the daemon told us what language it was in: `lang` alone is
+        // not a translation and must not put a code on the row.
+        let mut known = plain.clone();
+        known.lang = Some("de".into());
+        assert_eq!(row_lines(&known, TranslationDisplay::Main).sub, None);
+    }
+
+    /// The "≈" is a fact about the ROW, not about one of its lines — the
+    /// transcript puts it in the meta cell, and a caption bar has none. So it
+    /// leads in both modes: a translation of a shaky reading is not less
+    /// doubtful than the reading.
+    #[test]
+    fn the_shaky_mark_stays_on_the_line_being_read() {
+        let mut t = translated("das gleiche", "de", "en", "the same");
+        t.shaky = true;
+        assert_eq!(row_lines(&t, TranslationDisplay::Main).lead, "≈ the same");
+        assert_eq!(
+            row_lines(&t, TranslationDisplay::Under).lead,
+            "≈ das gleiche"
+        );
+        // The subtext never wears it twice.
+        assert_eq!(
+            row_lines(&t, TranslationDisplay::Main).sub.as_deref(),
+            Some("DE  das gleiche")
+        );
+    }
+
+    /// A daemon too old to send `lang`, and one that sends an empty one. The
+    /// original is still the subtext; it just has nothing to be labelled with.
+    #[test]
+    fn a_missing_language_code_is_left_off_rather_than_guessed() {
+        let mut t = translated("das gleiche", "de", "en", "the same");
+        t.lang = None;
+        assert_eq!(
+            row_lines(&t, TranslationDisplay::Main).sub.as_deref(),
+            Some("das gleiche")
+        );
+        t.lang = Some("  ".into());
+        assert_eq!(
+            row_lines(&t, TranslationDisplay::Main).sub.as_deref(),
+            Some("das gleiche")
+        );
+        t.translation = Some((None, "the same".into()));
+        assert_eq!(
+            row_lines(&t, TranslationDisplay::Under).sub.as_deref(),
+            Some("the same")
+        );
+    }
+
+    /// Both modes draw two lines and neither is allowed to lose one, whatever
+    /// the surface is. The regression this guards is a `main` row whose
+    /// original fell off the bottom because the height was measured for the
+    /// other layout.
+    #[test]
+    fn both_layouts_reach_the_surface_and_neither_drops_a_line() {
+        let Some(mut r) = renderer() else { return };
+        let t = translated(
+            "das ist der lange deutsche satz, der umgebrochen werden muss",
+            "de",
+            "en",
+            "this is the long English sentence that has to wrap",
+        );
+        let mut inked = Vec::new();
+        for display in [TranslationDisplay::Under, TranslationDisplay::Main] {
+            r.set_style(Style {
+                translation_display: display,
+                ..Style::default()
+            });
+            let s = r.render(std::slice::from_ref(&t), None);
+            inked.push(
+                s.pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|p| p[3] > 0)
+                    .count(),
+            );
+        }
+        assert!(inked[0] > 0 && inked[1] > 0);
+        // Same two lines, the other way up: near-identical coverage, and very
+        // much not one line's worth.
+        let (a, b) = (inked[0] as f64, inked[1] as f64);
+        assert!(
+            (a - b).abs() / a.max(b) < 0.35,
+            "one layout drew far less than the other: {a} vs {b}"
+        );
     }
 
     fn renderer() -> Option<Renderer> {

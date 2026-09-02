@@ -858,11 +858,30 @@ export function mount(root, ctx) {
   // and a slider that only takes effect when you let go makes that a guessing
   // game. The main process debounces the disk write behind it.
 
-  let caps = normalizeCaptionSettings(null);
+  // Not `withSurface(null)`: that reads `caps` for the fields it is keeping,
+  // and `caps` is still in its temporal dead zone on this line.
+  let caps = { ...normalizeCaptionSettings(null), surface: 'window', outputs: [] };
+
+  /**
+   * The settings, plus the two facts about them that are not settings: which
+   * surface this desktop puts the captions on, and what screens there are.
+   *
+   * `normalizeCaptionSettings` drops what it does not know — which is exactly
+   * what it is for, and exactly why these two have to be put back by hand. A
+   * card that lost them on the first click would silently revert to describing
+   * a caption bar this desktop is not running.
+   */
+  function withSurface(raw) {
+    return {
+      ...normalizeCaptionSettings(raw),
+      surface: raw?.surface ?? caps?.surface ?? 'window',
+      outputs: Array.isArray(raw?.outputs) ? raw.outputs : (caps?.outputs ?? []),
+    };
+  }
   let capsOpen = false;
 
   async function pushCaptions(patch) {
-    caps = normalizeCaptionSettings(await window.recall.captions.set(patch));
+    caps = withSurface(await window.recall.captions.set(patch));
     renderCaptions();
   }
 
@@ -912,6 +931,47 @@ export function mount(root, ctx) {
     );
   }
 
+  /**
+   * Which screen the bar is on. The value is the connector name the compositor
+   * uses (`DP-2`), because that is what survives a reboot — an index into a
+   * list does not.
+   */
+  function capScreen() {
+    const select = h(
+      'select',
+      {
+        // `.input` is this app's select, the one the translation card uses.
+        class: 'input',
+        dataset: { cap: 'output' },
+        'aria-label': 'Which screen the captions are on',
+        onchange: (e) => pushCaptions({ output: e.target.value || null }),
+      },
+      // "Wherever it lands" is not the same as any named screen: it is the
+      // rules the overlay follows when nobody has said (the screen the
+      // remembered position is on, then the one at the desk's origin).
+      h('option', { value: '', text: 'Wherever it lands', selected: !caps.output || undefined }),
+      ...caps.outputs.map((o) =>
+        h('option', {
+          value: o.name,
+          text: `${o.name} — ${o.w}×${o.h}`,
+          selected: caps.output === o.name || undefined,
+        })
+      )
+    );
+    return h(
+      'div',
+      { class: 'cap-row-ctl' },
+      h(
+        'span',
+        { class: 'cap-label' },
+        h('b', { text: 'Screen' }),
+        h('small', { text: 'You can also just drag the bar across — it follows onto whichever screen you carry it to.' })
+      ),
+      h('span', { class: 'spacer' }),
+      select
+    );
+  }
+
   function renderCaptions() {
     clear(captionsCard);
     captionsCard.append(
@@ -944,6 +1004,12 @@ export function mount(root, ctx) {
       capSlider('hold_s', 'Hold', 'How long the bar stays up after the last thing anybody said.', (v) => `${v} s`),
       capSlider('opacity', 'Ground', 'How much of what is underneath the captions cover.', (v) => `${Math.round(v * 100)}%`),
       capToggle('showYou', 'Show your own turns', 'Kept dimmer than everybody else’s, because you already know what you said.'),
+      // 0.10.3. A layer surface belongs to one screen and cannot change it —
+      // dragging the bar across a seam re-makes it on the other side, and this
+      // is the same move without the dragging. Offered only where there is a
+      // choice to make: one screen, or a desktop drawing the bar as a window,
+      // and a selector with one entry is furniture.
+      caps.surface === 'layer' && caps.outputs.length > 1 ? capScreen() : null,
       // Three desktops, three honest sentences. On the layer path the toggle is
       // real and does two different things — it is the difference between
       // scenery and furniture — so it says both. On Wayland WITHOUT layer-shell
@@ -1087,7 +1153,7 @@ export function mount(root, ctx) {
   void (async () => {
     try {
       const st = await window.recall.captions.state();
-      caps = normalizeCaptionSettings(st?.settings);
+      caps = withSurface(st?.settings);
       capsOpen = !!st?.open;
       renderCaptions();
     } catch {
@@ -1139,7 +1205,7 @@ export function mount(root, ctx) {
       // A settings broadcast carries the whole block; the rail button's own
       // click carries only `true`, and then only the open/closed half moved.
       if (change?.captions) {
-        if (typeof change.captions === 'object') caps = normalizeCaptionSettings(change.captions);
+        if (typeof change.captions === 'object') caps = withSurface(change.captions);
         void window.recall.captions
           .state()
           .then((st) => {

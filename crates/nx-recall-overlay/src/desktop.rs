@@ -86,8 +86,8 @@ use wayland_client::{
     protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 
-use crate::feed::{self, Captions, Turn, visible};
-use crate::layout;
+use crate::feed::{self, Captions, TranslationDisplay, Turn, visible};
+use crate::layout::{self, DragStep, Screen};
 use crate::raster;
 use crate::settings::CaptionSettings;
 
@@ -234,6 +234,91 @@ pub struct Options {
     pub seconds: Option<f32>,
 }
 
+/// `--list-outputs`: the desk, as JSON, and nothing else.
+///
+/// The settings card needs a list of screens to offer, and the card has no
+/// Wayland access — it is a page in an Electron renderer. Two ways to get it
+/// there were on the table; this is the one that keeps `captions.json` a
+/// SETTINGS file. The alternative was for the overlay to write an `outputs`
+/// block into it on every start, and that would mean a file the settings card
+/// owns being rewritten with hardware state on each launch, tripping both
+/// sides' echo guards, churning a file people diff, and putting a cache in the
+/// same object as the things a person chose. A one-shot subprocess run when
+/// the card is opened costs a few milliseconds and owns nothing.
+///
+/// Exits with the same code as `--desktop` when there is no layer-shell, so the
+/// caller can tell "this desktop cannot" from "this desk has one screen".
+pub fn list_outputs() -> Result<()> {
+    let Ok(conn) = Connection::connect_to_env() else {
+        eprintln!("[overlay] no Wayland display; there are no outputs to list.");
+        std::process::exit(NO_LAYER_SHELL);
+    };
+    let (globals, mut queue) = registry_queue_init::<App>(&conn)?;
+    let qh = queue.handle();
+    let compositor = CompositorState::bind(&globals, &qh)
+        .map_err(|e| anyhow::anyhow!("this compositor offers no wl_compositor: {e}"))?;
+    let shm = Shm::bind(&globals, &qh)
+        .map_err(|e| anyhow::anyhow!("this compositor offers no wl_shm: {e}"))?;
+    if LayerShell::bind(&globals, &qh).is_err() {
+        eprintln!("[overlay] this compositor does not offer zwlr_layer_shell_v1.");
+        std::process::exit(NO_LAYER_SHELL);
+    }
+    let pool = SlotPool::new(4, &shm).context("could not make an shm pool")?;
+    let mut app = App {
+        registry_state: RegistryState::new(&globals),
+        output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
+        compositor,
+        shm,
+        pool,
+        layer: None,
+        cfg: None,
+        screens: Vec::new(),
+        current: 0,
+        shell: None,
+        out_size: (1920, 1080),
+        out_origin: (0, 0),
+        scale: 1,
+        configured: false,
+        exit: false,
+        dirty: false,
+        renderer: raster::Renderer::new(raster::Style::default(), None)?,
+        settings: CaptionSettings::default(),
+        settings_path: PathBuf::new(),
+        last_written: None,
+        save_at: None,
+        pointer: None,
+        drag: None,
+        turns: Vec::new(),
+        translation_display: TranslationDisplay::default(),
+        last_change: Instant::now(),
+        faded_out: false,
+        want_output: None,
+        margin_override: None,
+        frame_us: 0,
+        frames: 0,
+    };
+    // Two: the first brings the outputs, the second their xdg-output geometry.
+    queue.roundtrip(&mut app)?;
+    queue.roundtrip(&mut app)?;
+    let screens: Vec<serde_json::Value> = app
+        .read_screens()
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "x": s.origin.0,
+                "y": s.origin.1,
+                "w": s.size.0,
+                "h": s.size.1,
+                "scale": s.scale,
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string(&json!({"outputs": screens}))?);
+    Ok(())
+}
+
 pub fn run(opts: Options) -> Result<()> {
     let settings_path = opts
         .settings
@@ -289,6 +374,9 @@ pub fn run(opts: Options) -> Result<()> {
         pool,
         layer: None,
         cfg: None,
+        screens: Vec::new(),
+        current: 0,
+        shell: None,
         out_size: (1920, 1080),
         out_origin: (0, 0),
         scale: 1,
@@ -303,6 +391,7 @@ pub fn run(opts: Options) -> Result<()> {
         pointer: None,
         drag: None,
         turns: Vec::new(),
+        translation_display: TranslationDisplay::default(),
         last_change: Instant::now(),
         faded_out: false,
         want_output: opts.output.clone(),
@@ -316,12 +405,13 @@ pub fn run(opts: Options) -> Result<()> {
     // creation, and guessing it means a bar that resizes itself in front of the
     // person the moment it appears.
     queue.roundtrip(&mut app)?;
-    app.create_layer(&layer_shell, &qh);
+    app.shell = Some(layer_shell);
+    app.create_layer(&qh);
     queue.roundtrip(&mut app)?;
 
     // The feed on its own thread, handing over turn lists. A socket read must
     // never sit between a configure and a commit.
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<Turn>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Update>();
     let wake = Wake::new()?;
     let socket = opts.socket.clone().unwrap_or_else(feed::default_socket);
     {
@@ -407,13 +497,13 @@ pub fn run(opts: Options) -> Result<()> {
         let mut latest = None;
         loop {
             match rx.try_recv() {
-                Ok(turns) => latest = Some(turns),
+                Ok(update) => latest = Some(update),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
         }
-        if let Some(turns) = latest {
-            app.set_turns(turns);
+        if let Some(update) = latest {
+            app.set_turns(update);
         }
         // The fade is a function of the clock, so the frame it asks for has to
         // be asked for by the clock too.
@@ -429,24 +519,46 @@ pub fn run(opts: Options) -> Result<()> {
 /// Same rules as the desktop captions window, enforced in `feed.rs`: seed from
 /// the live tail so the archive rule has a head to measure against, and only
 /// `added` rows newer than that head become captions.
-fn pump(socket: &Path, tx: &Sender<Vec<Turn>>, wake: &Waker) -> Result<()> {
+fn pump(socket: &Path, tx: &Sender<Update>, wake: &Waker) -> Result<()> {
     let mut f = feed::Feed::connect(socket)?;
     let mut caps = Captions::new(KEEP);
+    let mut display = TranslationDisplay::default();
     if let Ok(list) = f.call("speakers.list", json!({})) {
         caps.learn_speakers(&list);
     }
     if let Ok(mic) = f.call("mic.get", json!({})) {
         caps.learn_you(&mic);
     }
+    // Which of a translated row's two lines leads. On `status` rather than
+    // `assist.get` because `status` is the call every client already makes and
+    // carries the three `[assist]` values (PROTOCOL, 0.10.2) — and because a
+    // daemon too old for either answers `unknown_method`, which is not a
+    // failure here, only "the default, then".
+    if let Ok(status) = f.call("status", json!({})) {
+        display = TranslationDisplay::from_envelope(&status, display);
+    }
     if let Ok(tail) = f.call("transcript", json!({"limit": 1})) {
         caps.seed_tail(&tail);
     }
-    f.call("subscribe", json!({"topics": ["segments", "relabel"]}))?;
+    // `status` is on the list for the `assist` event, which rides that topic
+    // rather than getting one of its own (PROTOCOL: "No new topic, so no client
+    // changes its subscription"). This one does change its subscription,
+    // because until 0.10.2 it had no reason to care what the transcript's
+    // layout was.
+    f.call(
+        "subscribe",
+        json!({"topics": ["segments", "relabel", "status"]}),
+    )?;
     eprintln!(
-        "[overlay] subscribed; the bar shows the live feed and nothing else (your voice: {})",
+        "[overlay] subscribed; the bar shows the live feed and nothing else \
+         (your voice: {}, translations {})",
         caps.you()
             .map(|id| id.to_string())
             .unwrap_or_else(|| "not known yet".into()),
+        match display {
+            TranslationDisplay::Main => "lead, with the original underneath",
+            TranslationDisplay::Under => "under the original",
+        },
     );
     loop {
         let msg = f.read()?;
@@ -456,6 +568,25 @@ fn pump(socket: &Path, tx: &Sender<Vec<Turn>>, wake: &Waker) -> Result<()> {
                 caps.apply_relabel(&msg["data"]);
                 true
             }
+            // The layout changed under us — from the Memory card, from another
+            // window, from the config file. Every row on screen is repainted,
+            // which is unusual for a settings event and is the point of it.
+            Some("assist") => {
+                let next = TranslationDisplay::from_envelope(&msg["data"], display);
+                let moved = next != display;
+                if moved {
+                    eprintln!(
+                        "[overlay] translation_display is now {}",
+                        if next == TranslationDisplay::Main {
+                            "main"
+                        } else {
+                            "under"
+                        }
+                    );
+                }
+                display = next;
+                moved
+            }
             _ => false,
         };
         if !changed {
@@ -464,11 +595,26 @@ fn pump(socket: &Path, tx: &Sender<Vec<Turn>>, wake: &Waker) -> Result<()> {
         // The whole ring, cut to size by the DRAW side: `turns` and `showYou`
         // change while this thread is blocked on a socket read, and a stack cut
         // to the old numbers here would not come back until somebody spoke.
-        if tx.send(caps.turns().cloned().collect()).is_err() {
+        // The layout travels WITH the turns rather than beside them, for the
+        // same reason the "you" marker does: the draw side has no socket, and
+        // two facts arriving out of order would be one repaint in the wrong
+        // shape.
+        let update = Update {
+            turns: caps.turns().cloned().collect(),
+            display,
+        };
+        if tx.send(update).is_err() {
             return Ok(());
         }
         wake.wake();
     }
+}
+
+/// What the feed thread hands the draw loop: the stack, and how a translated
+/// row in it is laid out.
+struct Update {
+    turns: Vec<Turn>,
+    display: TranslationDisplay,
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +630,16 @@ struct App {
     pool: SlotPool,
     layer: Option<LayerSurface>,
     cfg: Option<LayerConfig>,
+    /// Every output, in the global desktop coordinates `bounds` is written in.
+    /// Rebuilt whenever the compositor tells us the layout changed, because a
+    /// drag across a seam is arithmetic over ALL of them and not just the one
+    /// the surface is on.
+    screens: Vec<Screen>,
+    /// Which of `screens` the surface currently lives on. A layer surface
+    /// cannot change output, so moving between them means making a new one.
+    current: usize,
+    /// The shell, kept so the surface can be re-made on another output.
+    shell: Option<LayerShell>,
     /// The output the bar is on, as (size, origin) in logical pixels. Cached at
     /// creation: the drag math needs both on every motion event, and asking the
     /// registry per frame for a fact that changes when somebody replugs a
@@ -513,28 +669,14 @@ struct App {
     /// margins at that moment. `None` between drags.
     drag: Option<Drag>,
     turns: Vec<Turn>,
+    /// `[assist] translation_display`, as the feed last heard it.
+    translation_display: TranslationDisplay,
     last_change: Instant,
     faded_out: bool,
     want_output: Option<String>,
     margin_override: Option<i32>,
     frame_us: u128,
     frames: u64,
-}
-
-/// Is this point on that output?
-fn contains(origin: (i32, i32), size: (u32, u32), p: (i32, i32)) -> bool {
-    p.0 >= origin.0
-        && p.1 >= origin.1
-        && p.0 < origin.0 + size.0 as i32
-        && p.1 < origin.1 + size.1 as i32
-}
-
-/// One output, as the placement math needs it.
-#[derive(Debug, Clone, Copy)]
-struct Placement {
-    size: (u32, u32),
-    origin: (i32, i32),
-    scale: i32,
 }
 
 /// A drag in progress. `press` is the ORIGINAL press point and stays put: see
@@ -557,14 +699,18 @@ impl App {
     /// chase. `--output NAME` names one, and with no name the compositor is
     /// asked to place it, which on KWin is the active output at the moment the
     /// surface appears. Documented in docs/OVERLAY.md.
-    fn pick_output(&self) -> (Option<wl_output::WlOutput>, Placement) {
-        let mut named = None;
-        let mut holds_bounds = None;
-        let mut at_origin = None;
-        let mut first = None;
-
-        for out in self.output_state.outputs() {
-            let Some(info) = self.output_state.info(&out) else {
+    /// Every output the compositor is offering, in desk order as it lists them.
+    ///
+    /// The whole list, not just the chosen one: since 0.10.3 a drag can carry
+    /// the bar off one screen and onto another, and deciding whether it has
+    /// needs every screen's rectangle. `zxdg_output_manager_v1` is what makes
+    /// them comparable — `wl_output` alone reports a mode in device pixels and
+    /// no position, and a desk of two differently-scaled monitors cannot be
+    /// laid out from that.
+    fn read_screens(&self) -> Vec<Screen> {
+        let mut out = Vec::new();
+        for wl in self.output_state.outputs() {
+            let Some(info) = self.output_state.info(&wl) else {
                 continue;
             };
             let size = info
@@ -572,83 +718,180 @@ impl App {
                 .or_else(|| info.modes.iter().find(|m| m.current).map(|m| m.dimensions))
                 .map(|(w, h)| (w.max(1) as u32, h.max(1) as u32))
                 .unwrap_or((1920, 1080));
-            // Where this output starts in the global desktop. `bounds` is in
-            // those coordinates and margins are in this output's, and on a
-            // stacked pair of monitors the two are 1440 apart.
-            let origin = info.logical_position.unwrap_or(info.location);
-            let place = Placement {
+            out.push(Screen {
+                name: info
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("output-{}", out.len())),
+                origin: info.logical_position.unwrap_or(info.location),
                 size,
-                origin,
                 scale: info.scale_factor.max(1),
-            };
-            let pick = (out.clone(), place, info.name.clone().unwrap_or_default());
-
-            if self.want_output.as_deref() == info.name.as_deref() && self.want_output.is_some() {
-                named = Some(pick);
-                break;
-            }
-            if let Some(b) = self.settings.bounds
-                && contains(
-                    origin,
-                    size,
-                    (b.x + b.width as i32 / 2, b.y + b.height as i32 / 2),
-                )
-            {
-                holds_bounds.get_or_insert(pick.clone());
-            }
-            if origin == (0, 0) {
-                at_origin.get_or_insert(pick.clone());
-            }
-            first.get_or_insert(pick);
+            });
         }
+        out
+    }
 
-        if self.want_output.is_some() && named.is_none() {
-            eprintln!(
-                "[overlay] no output called {}; choosing one",
-                self.want_output.as_deref().unwrap_or("?")
-            );
+    /// Re-read the desk, keeping `current` pointing at the same screen by NAME.
+    /// Indices are positions in a list the compositor owns and they move when a
+    /// monitor is unplugged; a name does not.
+    fn refresh_screens(&mut self) {
+        let was = self.screens.get(self.current).map(|s| s.name.clone());
+        let next = self.read_screens();
+        if next == self.screens {
+            return;
         }
-        // The output is named EXPLICITLY on the request, never left to the
-        // compositor. Until the bar could be moved, letting the compositor put
-        // it on the active screen was the friendlier answer; now that margins
-        // and `bounds` have to describe the SAME screen, a placement computed
-        // for one output and honoured on another is a bar on the wrong monitor.
-        //
-        // In order: the one you asked for; the one your remembered position is
-        // on; the one at the desktop's origin; whatever came first.
-        let (why, chosen) = match (named, holds_bounds, at_origin, first) {
-            (Some(p), ..) => ("--output", Some(p)),
-            (_, Some(p), ..) => ("the remembered position is on it", Some(p)),
-            (_, _, Some(p), _) => ("it is at the desktop origin", Some(p)),
-            (_, _, _, p) => ("it was the first one offered", p),
-        };
-        match chosen {
-            Some((out, place, name)) => {
-                eprintln!(
-                    "[overlay] output {name} ({}x{} at {},{}) — {why}",
-                    place.size.0, place.size.1, place.origin.0, place.origin.1
-                );
-                (Some(out), place)
-            }
-            None => (
-                None,
-                Placement {
-                    size: (1920, 1080),
-                    origin: (0, 0),
-                    scale: 1,
-                },
-            ),
+        self.screens = next;
+        if let Some(name) = was
+            && let Some(at) = layout::screen_named(&self.screens, &name)
+        {
+            self.current = at;
+        }
+        if let Some(here) = self.screens.get(self.current) {
+            self.out_size = here.size;
+            self.out_origin = here.origin;
         }
     }
 
-    fn create_layer(&mut self, shell: &LayerShell, qh: &QueueHandle<Self>) {
-        let (output, place) = self.pick_output();
+    /// The `wl_output` a screen index names, for `get_layer_surface`.
+    fn wl_output_for(&self, at: usize) -> Option<wl_output::WlOutput> {
+        let name = self.screens.get(at)?.name.as_str();
+        self.output_state.outputs().find(|wl| {
+            self.output_state
+                .info(wl)
+                .and_then(|i| i.name)
+                .is_some_and(|n| n == name)
+        })
+    }
+
+    /// Which screen the bar belongs on, and why.
+    ///
+    /// The output is chosen EXPLICITLY and never left to the compositor:
+    /// margins and `bounds` have to describe the same screen, and a placement
+    /// computed for one output and honoured on another is a bar on the wrong
+    /// monitor.
+    ///
+    /// In order: `--output`; the `output` remembered in captions.json — which
+    /// is where a drag across a seam and the settings card's Screen selector
+    /// both land; the screen the remembered position is on, for a file written
+    /// before there was an `output` field; the screen at the desk's origin;
+    /// whatever came first.
+    fn pick_screen(&self) -> (usize, &'static str) {
+        if self.screens.is_empty() {
+            return (0, "there are no outputs");
+        }
+        if let Some(name) = self.want_output.as_deref() {
+            if let Some(at) = layout::screen_named(&self.screens, name) {
+                return (at, "--output");
+            }
+            eprintln!("[overlay] no output called {name}; choosing one");
+        }
+        if let Some(name) = self.settings.output.as_deref() {
+            if let Some(at) = layout::screen_named(&self.screens, name) {
+                return (at, "it is the screen captions.json remembers");
+            }
+            eprintln!("[overlay] the remembered screen {name} is not plugged in; choosing one");
+        }
+        if let Some(b) = self.settings.bounds {
+            let centre = (b.x + b.width as i32 / 2, b.y + b.height as i32 / 2);
+            if let Some(at) = layout::screen_at(&self.screens, centre) {
+                return (at, "the remembered position is on it");
+            }
+        }
+        if let Some(at) = self.screens.iter().position(|s| s.origin == (0, 0)) {
+            return (at, "it is at the desktop origin");
+        }
+        (0, "it was the first one offered")
+    }
+
+    /// Make the surface, on the screen the rules pick and at the margins the
+    /// settings describe.
+    fn create_layer(&mut self, qh: &QueueHandle<Self>) {
+        self.screens = self.read_screens();
+        let (at, why) = self.pick_screen();
+        self.current = at;
+        let place = self.screens.get(at).cloned().unwrap_or(Screen {
+            name: "?".into(),
+            origin: (0, 0),
+            size: (1920, 1080),
+            scale: 1,
+        });
+        eprintln!(
+            "[overlay] output {} ({}x{} at {},{}) — {why}; {} screen{} on this desk",
+            place.name,
+            place.size.0,
+            place.size.1,
+            place.origin.0,
+            place.origin.1,
+            self.screens.len(),
+            if self.screens.len() == 1 { "" } else { "s" },
+        );
         let cfg = layer_config(
             &self.settings,
             place.size,
             place.origin,
             self.margin_override,
         );
+        self.build_surface(cfg, qh);
+    }
+
+    /// Re-make the surface on another screen, at the margins given.
+    ///
+    /// A layer surface belongs to one `wl_output` for its whole life — the
+    /// protocol takes the output at creation and offers no way to change it —
+    /// so crossing a seam is destroy-and-create, not a request. Which means the
+    /// implicit pointer grab goes with it: **the drag ends at the hop.** The bar
+    /// lands where the hand left it and the position is written down; picking it
+    /// up again is one more click. Carrying the grab across would mean knowing
+    /// the button is still down on a surface that has not sent a press, and
+    /// wl_pointer reports transitions, not state.
+    fn hop_to(&mut self, at: usize, margins: (i32, i32), qh: &QueueHandle<Self>) {
+        let Some(place) = self.screens.get(at).cloned() else {
+            return;
+        };
+        eprintln!(
+            "[overlay] the bar crossed onto {} — re-making the surface there at {},{}",
+            place.name, margins.0, margins.1
+        );
+        self.current = at;
+        self.settings.output = Some(place.name.clone());
+        // Dropping the old LayerSurface destroys the wl_surface with it, which
+        // is what ends the drag; say so here rather than leaving a Drag that
+        // will never see its release.
+        self.drag = None;
+        self.layer = None;
+        self.configured = false;
+        // Only the MARGIN is overridden. The size comes from `layer_config` as
+        // it always does, so a hop that arrives alongside a size change — the
+        // settings card can send both at once — does not carry the old shape
+        // over, and a hop during a drag keeps the shape it had because the
+        // remembered bounds still describe it.
+        let cfg = LayerConfig {
+            margin: (0, 0, margins.1, margins.0),
+            ..layer_config(
+                &self.settings,
+                place.size,
+                place.origin,
+                self.margin_override,
+            )
+        };
+        self.build_surface(cfg, qh);
+        self.remember_position();
+    }
+
+    /// The requests themselves, shared by the first surface and every one after
+    /// a hop, so the two cannot drift into describing different bars.
+    fn build_surface(&mut self, cfg: LayerConfig, qh: &QueueHandle<Self>) {
+        // Taken and put back rather than borrowed: `LayerShell` is a field of
+        // self and everything below needs `&mut self`.
+        let Some(shell) = self.shell.take() else {
+            return;
+        };
+        let place = self.screens.get(self.current).cloned().unwrap_or(Screen {
+            name: "?".into(),
+            origin: (0, 0),
+            size: (1920, 1080),
+            scale: 1,
+        });
         self.scale = place.scale;
         self.out_size = place.size;
         self.out_origin = place.origin;
@@ -659,7 +902,7 @@ impl App {
             surface,
             cfg.layer,
             Some("nx-recall-captions"),
-            output.as_ref(),
+            self.wl_output_for(self.current).as_ref(),
         );
         layer.set_anchor(cfg.anchor);
         layer.set_size(cfg.width, cfg.height);
@@ -672,24 +915,20 @@ impl App {
         layer.commit();
 
         eprintln!(
-            "[overlay] layer surface: {}x{} logical at scale {}, layer OVERLAY, \
-             anchor BOTTOM|LEFT, margin {l}px from the left and {b}px from the bottom of a \
-             {}x{} output at ({},{}), exclusive zone {}, keyboard none",
-            cfg.width,
-            cfg.height,
-            place.scale,
-            place.size.0,
-            place.size.1,
-            place.origin.0,
-            place.origin.1,
-            cfg.exclusive_zone,
+            "[overlay] layer surface on {}: {}x{} logical at scale {}, layer OVERLAY, \
+             anchor BOTTOM|LEFT, margin {l}px from the left and {b}px from the bottom, \
+             exclusive zone {}, keyboard none",
+            place.name, cfg.width, cfg.height, place.scale, cfg.exclusive_zone,
         );
         self.cfg = Some(cfg);
         self.layer = Some(layer);
+        self.shell = Some(shell);
+        self.dirty = true;
     }
 
-    fn set_turns(&mut self, turns: Vec<Turn>) {
-        self.turns = turns;
+    fn set_turns(&mut self, update: Update) {
+        self.turns = update.turns;
+        self.translation_display = update.display;
         self.last_change = Instant::now();
         self.faded_out = false;
         self.dirty = true;
@@ -758,6 +997,24 @@ impl App {
     /// hold, whose turns — is decided again by `draw`.
     fn apply_settings(&mut self, next: CaptionSettings, qh: &QueueHandle<Self>) {
         let before = std::mem::replace(&mut self.settings, next);
+
+        // A different screen is not a property that can be re-sent: the surface
+        // has to be made again over there. This is the settings card's Screen
+        // selector arriving, and it takes the same road a drag across a seam
+        // does — including keeping the bar at the same place ON the new screen
+        // rather than at the same place on the desk, because somebody who
+        // picked a screen from a list meant "put it there", not "shift it 1440
+        // pixels".
+        if self.settings.output != before.output
+            && let Some(name) = self.settings.output.clone()
+            && let Some(at) = layout::screen_named(&self.screens, &name)
+            && at != self.current
+        {
+            let margins = self.margins();
+            self.hop_to(at, margins, qh);
+            return;
+        }
+
         let (Some(layer), Some(cfg)) = (self.layer.as_ref(), self.cfg.as_ref()) else {
             self.dirty = true;
             return;
@@ -885,6 +1142,7 @@ impl App {
                 size: self.settings.size * scale as f32,
                 opacity: self.settings.opacity,
                 pad: PAD * scale as i64,
+                translation_display: self.translation_display,
             });
             let mut shown = visible(&self.turns, self.settings.turns, self.settings.show_you);
             // Furniture you cannot see is furniture you cannot move. Turning
@@ -979,6 +1237,7 @@ fn move_hint() -> Turn {
         text: "drag to move · scroll to resize the text · right-click to let clicks through again"
             .into(),
         shaky: false,
+        lang: None,
         translation: None,
         mine: false,
     }
@@ -1210,18 +1469,32 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Motion { .. } => {
                     let Some(drag) = self.drag else { continue };
-                    let to = layout::drag_margins(
-                        drag.press,
-                        event.position,
-                        drag.from,
-                        self.size(),
-                        self.out_size,
+                    // Unclamped, and deliberately: clamping to the screen the
+                    // surface is on is exactly what stopped the bar ever
+                    // reaching the next one. Where it may go is now a question
+                    // about the whole desk, and `drag_step` answers it.
+                    let want = (
+                        drag.from.0 + (event.position.0 - drag.press.0).round() as i32,
+                        drag.from.1 - (event.position.1 - drag.press.1).round() as i32,
                     );
-                    if to != self.margins() {
-                        if let Some(d) = self.drag.as_mut() {
-                            d.moved = true;
+                    let Some(here) = self.screens.get(self.current) else {
+                        continue;
+                    };
+                    let rect = here.bounds_for(want, self.size());
+                    match layout::drag_step(&self.screens, self.current, rect) {
+                        // Carried into the gap beside a shorter monitor, or off
+                        // the edge of the desk. Nothing moves: there is no title
+                        // bar to drag it back by.
+                        DragStep::Nowhere => {}
+                        DragStep::Stay { margins } => {
+                            if margins != self.margins() {
+                                if let Some(d) = self.drag.as_mut() {
+                                    d.moved = true;
+                                }
+                                self.place(margins);
+                            }
                         }
-                        self.place(to);
+                        DragStep::Hop { screen, margins } => self.hop_to(screen, margins, qh),
                     }
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
@@ -1275,14 +1548,19 @@ impl PointerHandler for App {
 impl App {
     /// Where the bar has ended up, in the coordinates `bounds` is written in.
     fn remember_position(&mut self) {
-        let bounds = layout::bounds_from_margins(
-            self.margins(),
-            self.size(),
-            self.out_size,
-            self.out_origin,
-        );
-        if self.settings.bounds != Some(bounds) {
+        let Some(here) = self.screens.get(self.current) else {
+            return;
+        };
+        let bounds = here.bounds_for(self.margins(), self.size());
+        let name = Some(here.name.clone());
+        // The screen goes down with the rectangle. `bounds` alone would be
+        // enough on this desk, but not on one where a monitor is unplugged and
+        // the coordinates it used to occupy now belong to another — and it is
+        // the field the settings card's Screen selector writes, so both routes
+        // have to mean the same thing.
+        if self.settings.bounds != Some(bounds) || self.settings.output != name {
             self.settings.bounds = Some(bounds);
+            self.settings.output = name;
             self.save_soon();
         }
     }
@@ -1321,9 +1599,20 @@ impl OutputHandler for App {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    // A monitor plugged in, unplugged, moved in the arrangement, or rescaled.
+    // The desk's geometry is what every drag is measured against, so it is
+    // re-read rather than assumed — but the surface is NOT re-made here: the
+    // compositor closes a layer surface whose output has gone, and that arrives
+    // as `closed`, which is a different and much clearer event to act on.
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.refresh_screens();
+    }
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.refresh_screens();
+    }
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.refresh_screens();
+    }
 }
 
 impl ShmHandler for App {

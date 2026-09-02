@@ -37,6 +37,12 @@ pub struct CaptionSettings {
     /// off, the bar is furniture you can drag and scroll over. The DEFAULT is on
     /// and stays on — this is which of two modes, not whether the feature works.
     pub click_through: bool,
+    /// Which screen the bar is on, by connector name (`DP-2`). A layer surface
+    /// belongs to one output and cannot change it, so this is not decoration:
+    /// it is the field that says which surface to make. `None` means "the one
+    /// the rest of the rules pick". A name that is not plugged in today falls
+    /// back the same way.
+    pub output: Option<String>,
     /// The remembered rectangle, in the same global desktop coordinates the
     /// Electron window reports. Its size is honoured, and its position too, as
     /// far as a layer surface can — see `docs/OVERLAY.md`, "Desktop:
@@ -62,6 +68,7 @@ impl Default for CaptionSettings {
             opacity: 0.6,
             show_you: true,
             click_through: true,
+            output: None,
             bounds: None,
         }
     }
@@ -137,6 +144,11 @@ impl CaptionSettings {
             opacity: clamp(get("opacity"), OPACITY, d.opacity as f64) as f32,
             show_you: flag(get("showYou"), d.show_you),
             click_through: flag(get("clickThrough"), d.click_through),
+            output: get("output")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned),
             bounds: bounds_of(get("bounds")),
         }
     }
@@ -201,7 +213,7 @@ impl CaptionSettings {
         };
         format!(
             "{{\n  \"turns\": {},\n  \"size\": {},\n  \"hold_s\": {},\n  \"opacity\": {},\n  \
-             \"showYou\": {},\n  \"clickThrough\": {},\n  \"bounds\": {}\n}}",
+             \"showYou\": {},\n  \"clickThrough\": {},\n  \"bounds\": {},\n  \"output\": {}\n}}",
             self.turns,
             js_number(self.size as f64),
             js_number(self.hold_s as f64),
@@ -209,6 +221,10 @@ impl CaptionSettings {
             self.show_you,
             self.click_through,
             bounds,
+            match &self.output {
+                Some(name) => serde_json::Value::String(name.clone()).to_string(),
+                None => "null".to_owned(),
+            },
         )
     }
 
@@ -395,6 +411,7 @@ mod tests {
                 opacity: 0.85,
                 show_you: false,
                 click_through: false,
+                output: Some("HDMI-A-1".into()),
                 bounds: Some(Bounds {
                     x: -120,
                     y: 640,
@@ -424,7 +441,7 @@ mod tests {
         assert_eq!(
             s.to_pretty_json(),
             "{\n  \"turns\": 5,\n  \"size\": 26,\n  \"hold_s\": 12,\n  \"opacity\": 0.65,\n  \
-             \"showYou\": true,\n  \"clickThrough\": true,\n  \"bounds\": null\n}"
+             \"showYou\": true,\n  \"clickThrough\": true,\n  \"bounds\": null,\n  \"output\": null\n}"
         );
         // With a remembered rectangle in it. Both literals were taken from
         // `node -e 'JSON.stringify(x, null, 2)'` rather than written by hand:
@@ -437,18 +454,43 @@ mod tests {
                 width: 1100,
                 height: 340,
             }),
+            output: Some("DP-2".into()),
             ..CaptionSettings::default()
         };
         assert_eq!(
             placed.to_pretty_json(),
             "{\n  \"turns\": 5,\n  \"size\": 26,\n  \"hold_s\": 12,\n  \"opacity\": 0.65,\n  \
              \"showYou\": true,\n  \"clickThrough\": true,\n  \"bounds\": {\n    \"x\": 12,\n    \
-             \"y\": 34,\n    \"width\": 1100,\n    \"height\": 340\n  }\n}"
+             \"y\": 34,\n    \"width\": 1100,\n    \"height\": 340\n  },\n  \"output\": \"DP-2\"\n}"
         );
         // 26, not 26.0 — and 0.6, not 0.6000000000000001.
         assert_eq!(js_number(26.0), "26");
         assert_eq!(js_number(0.6000000000000001), "0.6");
         assert_eq!(js_number(0.85), "0.85");
+    }
+
+    /// A screen name that is not a screen name is not a screen name.
+    #[test]
+    fn the_output_is_a_name_or_nothing() {
+        assert_eq!(CaptionSettings::normalize(&json!({})).output, None);
+        assert_eq!(
+            CaptionSettings::normalize(&json!({"output": null})).output,
+            None
+        );
+        assert_eq!(
+            CaptionSettings::normalize(&json!({"output": "  "})).output,
+            None
+        );
+        assert_eq!(
+            CaptionSettings::normalize(&json!({"output": 7})).output,
+            None
+        );
+        assert_eq!(
+            CaptionSettings::normalize(&json!({"output": " DP-2 "}))
+                .output
+                .as_deref(),
+            Some("DP-2")
+        );
     }
 
     /// Atomic: the name the card reads never holds a half-written file, and the

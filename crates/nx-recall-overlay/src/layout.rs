@@ -97,57 +97,106 @@ pub fn left_margin(
     local_x as i32
 }
 
-/// Keep the bar on the output. A caption bar dragged three quarters of the way
-/// off the screen is a caption bar with most of the sentence missing, and — on
-/// a layer surface, which has no title bar and no window menu — no way back.
-pub fn clamp_margins(left: i32, bottom: i32, size: (u32, u32), output: (u32, u32)) -> (i32, i32) {
-    let max_left = (output.0 as i64 - size.0 as i64).max(0) as i32;
-    let max_bottom = (output.1 as i64 - size.1 as i64).max(0) as i32;
-    (left.clamp(0, max_left), bottom.clamp(0, max_bottom))
+// ---------------------------------------------------------------------------
+// crossing between screens
+//
+// A layer surface belongs to ONE wl_output. That is not a limitation of this
+// code, it is the protocol: `zwlr_layer_shell_v1.get_layer_surface` takes an
+// output and the surface lives on it until it is destroyed. So a bar dragged
+// to the edge of DP-2 stops there, which is exactly what "I CANT MOVE THE LIVE
+// CAPTION BETWEEN SCREENS" describes.
+//
+// The way across is to notice that the bar's centre has entered a DIFFERENT
+// output's rectangle and re-create the surface there at the same place on the
+// desk. Everything needed to decide that is arithmetic over the outputs'
+// logical geometry, so it lives here where a machine with no compositor can
+// check it.
+// ---------------------------------------------------------------------------
+
+/// One output, as the placement math needs it: a name and a rectangle in the
+/// global desktop coordinates `bounds` is written in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Screen {
+    pub name: String,
+    pub origin: (i32, i32),
+    pub size: (u32, u32),
+    pub scale: i32,
 }
 
-/// Where a drag has got to.
-///
-/// `press` and `now` are surface-local pointer positions, which is all a Wayland
-/// client is given — there are no global pointer coordinates on this protocol.
-/// That sounds like it should not work, and it does: the delta is applied to the
-/// margins, the surface moves under the pointer by exactly that delta, and the
-/// next motion event's surface-local position is back at `press` plus however
-/// far the hand has moved since. The loop is self-correcting rather than
-/// accumulating, which is why `press` is the ORIGINAL press point and not the
-/// previous motion.
-///
-/// Note the sign on the vertical: surface coordinates grow downward and the
-/// bottom margin grows upward.
-pub fn drag_margins(
-    press: (f64, f64),
-    now: (f64, f64),
-    from: (i32, i32),
-    size: (u32, u32),
-    output: (u32, u32),
-) -> (i32, i32) {
-    let dx = (now.0 - press.0).round() as i32;
-    let dy = (now.1 - press.1).round() as i32;
-    clamp_margins(from.0 + dx, from.1 - dy, size, output)
+impl Screen {
+    pub fn contains(&self, p: (i32, i32)) -> bool {
+        p.0 >= self.origin.0
+            && p.1 >= self.origin.1
+            && p.0 < self.origin.0 + self.size.0 as i32
+            && p.1 < self.origin.1 + self.size.1 as i32
+    }
+
+    /// `(left, bottom)` margins that put a global rectangle here.
+    ///
+    /// Not clamped. While a bar is being carried across a seam it genuinely
+    /// hangs off the edge of one screen, and clamping mid-drag is what would
+    /// stop it ever reaching the other one.
+    pub fn margins_for(&self, r: Bounds) -> (i32, i32) {
+        (
+            r.x - self.origin.0,
+            self.origin.1 + self.size.1 as i32 - r.y - r.height as i32,
+        )
+    }
+
+    /// The global rectangle a pair of margins describes here — the inverse.
+    pub fn bounds_for(&self, margins: (i32, i32), size: (u32, u32)) -> Bounds {
+        Bounds {
+            x: self.origin.0 + margins.0,
+            y: self.origin.1 + self.size.1 as i32 - margins.1 - size.1 as i32,
+            width: size.0,
+            height: size.1,
+        }
+    }
 }
 
-/// The rectangle to remember, in the same global desktop coordinates the
-/// Electron window reports — so `bounds` means one thing whichever surface
-/// wrote it, and either side can open the bar where the other left it.
+/// Which screen a global point is on, if any.
+pub fn screen_at(screens: &[Screen], p: (i32, i32)) -> Option<usize> {
+    screens.iter().position(|s| s.contains(p))
+}
+
+/// Which screen a name belongs to.
+pub fn screen_named(screens: &[Screen], name: &str) -> Option<usize> {
+    screens.iter().position(|s| s.name == name)
+}
+
+/// What a drag has just asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DragStep {
+    /// Nowhere valid. The bar keeps the margins it had — a caption bar dropped
+    /// in the gap between two monitors of different heights would be on no
+    /// screen at all, and there is no way back to it.
+    Nowhere,
+    /// Still this screen. Move the margins.
+    Stay { margins: (i32, i32) },
+    /// Another screen. The surface has to be destroyed and made again there,
+    /// because a layer surface cannot change output.
+    Hop { screen: usize, margins: (i32, i32) },
+}
+
+/// Where a dragged bar has got to, across the whole desk.
 ///
-/// The output's own origin is included because a layer surface's margins are
-/// relative to ITS output, and `bounds` is not.
-pub fn bounds_from_margins(
-    margins: (i32, i32),
-    size: (u32, u32),
-    output: (u32, u32),
-    output_origin: (i32, i32),
-) -> Bounds {
-    Bounds {
-        x: output_origin.0 + margins.0,
-        y: output_origin.1 + output.1 as i32 - margins.1 - size.1 as i32,
-        width: size.0,
-        height: size.1,
+/// The bar's CENTRE decides which screen it is on, not its corner: dragging by
+/// the left edge would otherwise hop the moment one pixel crossed the seam,
+/// while the thing you are looking at is still entirely on the old screen.
+pub fn drag_step(screens: &[Screen], current: usize, rect: Bounds) -> DragStep {
+    let centre = (
+        rect.x + rect.width as i32 / 2,
+        rect.y + rect.height as i32 / 2,
+    );
+    match screen_at(screens, centre) {
+        None => DragStep::Nowhere,
+        Some(i) if i == current => DragStep::Stay {
+            margins: screens[i].margins_for(rect),
+        },
+        Some(i) => DragStep::Hop {
+            screen: i,
+            margins: screens[i].margins_for(rect),
+        },
     }
 }
 
@@ -275,67 +324,187 @@ mod tests {
         assert_eq!(bottom_margin(Some(b), 340, out, origin), 96);
         assert_eq!(left_margin(Some(b), 1100, out, origin), 200);
         // …and the round trip back out.
-        assert_eq!(bounds_from_margins((200, 96), (1100, 340), out, origin), b);
+        assert_eq!(
+            Screen {
+                name: "DP-1".into(),
+                origin,
+                size: out,
+                scale: 1
+            }
+            .bounds_for((200, 96), (1100, 340)),
+            b
+        );
     }
 
-    /// Margins in, bounds out, bounds in, the same margins. If this drifts, the
-    /// bar walks up (or down) the screen a few pixels on every launch.
-    #[test]
-    fn a_dragged_position_survives_the_round_trip_through_the_file() {
-        let out = (2560, 1440);
-        for margins in [(0, 0), (730, 96), (1460, 1100), (12, 7)] {
-            let size = (1100, 340);
-            let b = bounds_from_margins(margins, size, out, (0, 0));
-            assert_eq!(
-                (
-                    left_margin(Some(b), size.0, out, (0, 0)),
-                    bottom_margin(Some(b), size.1, out, (0, 0))
-                ),
-                margins,
-                "margins {margins:?} did not survive"
-            );
+    // -- crossing between screens ------------------------------------------
+
+    fn screen(name: &str, x: i32, y: i32, w: u32, h: u32) -> Screen {
+        Screen {
+            name: name.into(),
+            origin: (x, y),
+            size: (w, h),
+            scale: 1,
         }
     }
 
-    /// The drag itself. Surface-local coordinates, a delta from the press point,
-    /// and the vertical sign that is easy to get backwards.
+    /// The user's own desk: two 5120x1440 ultrawides, stacked.
+    fn stacked() -> Vec<Screen> {
+        vec![
+            screen("DP-2", 0, 0, 5120, 1440),
+            screen("DP-1", 0, 1440, 5120, 1440),
+        ]
+    }
+
+    /// The other common shape, and the one where an x offset rather than a y
+    /// offset is what the margin math has to get right.
+    fn side_by_side() -> Vec<Screen> {
+        vec![
+            screen("HDMI-A-1", 0, 0, 1920, 1080),
+            screen("DP-3", 1920, 0, 2560, 1440),
+        ]
+    }
+
     #[test]
-    fn a_drag_moves_the_bar_by_exactly_the_hand() {
-        let (size, out) = ((1100u32, 340u32), (2560u32, 1440u32));
-        let from = (730, 96);
-        // Right and up.
+    fn a_global_point_finds_its_screen_and_the_gaps_find_none() {
+        let s = stacked();
+        assert_eq!(screen_at(&s, (10, 10)), Some(0));
         assert_eq!(
-            drag_margins((50.0, 20.0), (90.0, 5.0), from, size, out),
-            (770, 111)
+            screen_at(&s, (10, 1440)),
+            Some(1),
+            "the seam belongs to the lower screen"
         );
-        // Left and down.
+        assert_eq!(screen_at(&s, (10, 1439)), Some(0));
+        assert_eq!(screen_at(&s, (10, 2879)), Some(1));
         assert_eq!(
-            drag_margins((50.0, 20.0), (30.0, 60.0), from, size, out),
-            (710, 56)
+            screen_at(&s, (10, 2880)),
+            None,
+            "past the bottom of the desk"
         );
-        // Not moved at all.
+        assert_eq!(screen_at(&s, (-1, 10)), None);
+        // Side by side, with a taller screen on the right: the region beside
+        // the short one is desk that belongs to nobody.
+        let t = side_by_side();
+        assert_eq!(screen_at(&t, (100, 100)), Some(0));
+        assert_eq!(screen_at(&t, (2000, 100)), Some(1));
+        assert_eq!(screen_at(&t, (100, 1200)), None, "below the short screen");
+        assert_eq!(screen_named(&t, "DP-3"), Some(1));
+        assert_eq!(screen_named(&t, "DP-9"), None);
+    }
+
+    /// Margins and global rectangles are the same fact said two ways, and the
+    /// conversion has to survive a round trip on every screen — otherwise the
+    /// bar walks a little further off every time it is picked up.
+    #[test]
+    fn margins_and_bounds_round_trip_on_every_screen() {
+        for screens in [stacked(), side_by_side()] {
+            for s in &screens {
+                for margins in [(0, 0), (40, 96), (200, 500)] {
+                    let size = (900, 260);
+                    let r = s.bounds_for(margins, size);
+                    assert_eq!(s.margins_for(r), margins, "{} {margins:?}", s.name);
+                }
+            }
+        }
+    }
+
+    /// The hop itself, on the desk the report came from. A bar near the bottom
+    /// of the upper screen, dragged down, lands on the lower one at the SAME
+    /// place on the desk — which is the whole point: it must not jump.
+    #[test]
+    fn dragging_past_the_seam_moves_the_bar_to_the_other_screen() {
+        let s = stacked();
+        let size = (1100u32, 340u32);
+        // Sitting on DP-2, 96 up from its bottom: global y = 1440-340-96 = 1004.
+        let here = s[0].bounds_for((2010, 96), size);
+        assert_eq!(here.y, 1004);
         assert_eq!(
-            drag_margins((50.0, 20.0), (50.0, 20.0), from, size, out),
-            from
+            drag_step(&s, 0, here),
+            DragStep::Stay {
+                margins: (2010, 96)
+            }
+        );
+
+        // Dragged 300 px down. The centre (y = 1304 + 170 = 1474) is now on
+        // DP-1, so the surface has to be re-made there.
+        let moved = Bounds {
+            y: here.y + 300,
+            ..here
+        };
+        let step = drag_step(&s, 0, moved);
+        let DragStep::Hop { screen, margins } = step else {
+            panic!("no hop: {step:?}");
+        };
+        assert_eq!(screen, 1);
+        // Same place on the desk, expressed against the new screen: it is
+        // 1304 - 1440 = -136 into DP-1, so 1440 - (-136) - 340 = 1236 up from
+        // DP-1's bottom, and it straddles the seam exactly as it looks.
+        assert_eq!(margins, (2010, 1236));
+        assert_eq!(
+            s[1].bounds_for(margins, size),
+            moved,
+            "the bar moved when it hopped"
         );
     }
 
-    /// A layer surface has no title bar and no window menu, so a bar dragged off
-    /// the screen is a bar with no way back. It stops at the edge.
+    /// Side by side, where the x offset is what has to be undone.
     #[test]
-    fn the_bar_cannot_be_dragged_off_the_output() {
-        let (size, out) = ((1100u32, 340u32), (2560u32, 1440u32));
+    fn the_hop_works_sideways_too() {
+        let s = side_by_side();
+        let size = (900u32, 260u32);
+        let here = s[0].bounds_for((100, 96), size);
+        let moved = Bounds {
+            x: here.x + 1600,
+            ..here
+        };
+        let step = drag_step(&s, 0, moved);
+        let DragStep::Hop { screen, margins } = step else {
+            panic!("no hop: {step:?}");
+        };
+        assert_eq!(screen, 1);
+        assert_eq!(margins.0, moved.x - 1920);
+        assert_eq!(s[1].bounds_for(margins, size), moved);
+    }
+
+    /// A centre on no screen at all — the dead region beside a shorter monitor,
+    /// or past the edge of the desk. The bar stays where it was: there is no
+    /// title bar to drag it back by.
+    #[test]
+    fn a_bar_carried_into_nothing_stays_where_it_was() {
+        let s = side_by_side();
+        let size = (900u32, 260u32);
+        let here = s[0].bounds_for((100, 96), size);
+        let into_the_void = Bounds {
+            y: here.y + 900,
+            ..here
+        };
+        assert_eq!(drag_step(&s, 0, into_the_void), DragStep::Nowhere);
+        // …and off the left of the desk entirely.
         assert_eq!(
-            drag_margins((0.0, 0.0), (-99999.0, 99999.0), (730, 96), size, out),
-            (0, 0)
+            drag_step(&s, 0, Bounds { x: -5000, ..here }),
+            DragStep::Nowhere
         );
-        assert_eq!(
-            drag_margins((0.0, 0.0), (99999.0, -99999.0), (730, 96), size, out),
-            (2560 - 1100, 1440 - 340)
-        );
-        // A surface bigger than the output pins to the corner rather than going
-        // negative.
-        assert_eq!(clamp_margins(50, 50, (4000, 2000), (2560, 1440)), (0, 0));
+    }
+
+    /// One screen is the ordinary case and must never produce a hop.
+    #[test]
+    fn a_single_screen_desk_never_hops() {
+        let s = vec![screen("eDP-1", 0, 0, 1920, 1080)];
+        let size = (900u32, 260u32);
+        let here = s[0].bounds_for((100, 96), size);
+        for dx in [-400, 0, 400] {
+            let step = drag_step(
+                &s,
+                0,
+                Bounds {
+                    x: here.x + dx,
+                    ..here
+                },
+            );
+            assert!(
+                matches!(step, DragStep::Stay { .. } | DragStep::Nowhere),
+                "{step:?}"
+            );
+        }
     }
 
     /// The hold is flat, then one second of fading, then gone. Same numbers the
