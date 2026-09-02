@@ -138,6 +138,7 @@ failed are listed further down with their numbers.
 | A source prior ("that voice only lives on Discord") | changed **0 of 161** ground-truth decisions — ships off, with the audit that found the three labels it would have caught |
 | Daily digest refusing banter | 6/6 traps refused, 4/4 real conversations summarised, once the verdict got its own grammar |
 | Translation, FLEURS parallel sentences, e5 cosine | 0.948 against the reference (unrelated pairs: 0.79) |
+| Telling eighteen other languages apart from the two you read, 4 200 FLEURS sentences | **0 of 400** German or English sentences misidentified; Norwegian withheld because its function words are Danish's |
 | Quarterly model refresh, four newer checkpoints vs Parakeet v3 | **keep v3** — nearest 3.6% vs 3.3% lab WER; qwen3-asr ties on real audio and loses on speed |
 | Hotword biasing toward the roster and glossary | +9.1% recall on rare words against a +20% gate; at strength the glossary leaked into unrelated turns (control WER 8% → 29%). Not shipped |
 | Electron's click-through on Linux | sets no X11 input shape, is a no-op on Wayland — so the caption bar is a native layer-shell surface |
@@ -248,8 +249,9 @@ defence is layered, each layer measured:
    output actually reads as the target language, captions stripped.
 4. **`recalld lang repair`** — the backlog heals retroactively while its audio
    is still inside the retention window.
-5. **Translation** for the languages you do not read, under — or over — the
-   original, in the language you choose.
+5. **Translation** for everything outside the languages you read, into the
+   language you choose, with the translation leading and the original as
+   subtext — or the other way round. Three controls on the Memory tab.
 
 ## Getting it right
 
@@ -384,6 +386,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.9.1 | +93h | `models build-night` fetches the Khronos headers a desktop with a working driver still lacks, and the runtime it installs finds its own libraries |
 | 0.10.0 | +98h | replay, world memory, turn-taking statistics, Markdown export, the room microphone, a Discord source card, naming a new voice from the transcript, and captions that really pass clicks through |
 | 0.10.1 | +100h | the captions toggle means two things again (drag, scroll, right-click to give clicks back); the accuracy card stops reporting 113% error; the assistant gets a fair share behind the enrichment queue; heard-on chips and the identity audit; `truth report` stops scoring your own account |
+| 0.10.2 | +101h | translation controls: what to translate into, which languages you read, and whether the translation or the original leads; a detector for eighteen other languages that never once mistook German or English for anything else |
 
 ## Quickstart
 
