@@ -141,6 +141,7 @@ Repair is bounded, resumable and runs at idle priority: it is safe to run while
 the daemon is capturing, and a run that is interrupted loses nothing.
 
 `recalld models fetch --arbiter-de` installs the German arbiter (~208 MB);
+`recalld models fetch --confidence` installs the cross-check decoder (~154 MB);
 `--fallback-asr` installs the English one (~108 MB).")]
     Lang {
         #[command(subcommand)]
@@ -366,6 +367,13 @@ pub enum ModelsAction {
         /// which is what the daemon did before 0.7.7.
         #[arg(long)]
         arbiter_de: bool,
+
+        /// Also install the transcript cross-check decoder (~154 MB): Canary
+        /// 180m, run as a second opinion whose agreement with the primary
+        /// decoder becomes `asr_confidence`. Optional — without it transcripts
+        /// carry no confidence flag at all, which is honest and quiet.
+        #[arg(long)]
+        confidence: bool,
 
         /// Also install the text-embedding model that semantic search needs
         /// (~135 MB). Not part of the default set: keyword search works

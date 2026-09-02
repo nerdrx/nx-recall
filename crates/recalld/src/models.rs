@@ -75,6 +75,10 @@ pub enum Group {
     /// is no German-only transducer to re-decode with, and Whisper's language
     /// token is the one honest way to force the constraint.
     ArbiterDe,
+    /// The transcript cross-check (0.8.0): Canary 180m int8, a *second*
+    /// decoder whose agreement with the first is the confidence flag. Optional,
+    /// and without it `asr_confidence` is null rather than guessed.
+    Confidence,
 }
 
 impl Group {
@@ -98,6 +102,10 @@ impl Group {
             Group::ArbiterDe => {
                 "optional — the German flip arbiter; without it a German-looking \
                  flip is flagged rather than re-read"
+            }
+            Group::Confidence => {
+                "optional — the second decoder behind `asr_confidence`; without \
+                 it turns are unflagged rather than wrongly flagged"
             }
         }
     }
@@ -146,6 +154,14 @@ pub const SEMANTIC_DIR: &str = "multilingual-e5-small-int8";
 /// the semantic roles are named: `models fetch --arbiter-de` and `models status`
 /// both have to pick it out of the catalogue.
 pub const ARBITER_DE_ROLE: &str = "arbiter.de";
+
+/// `RemoteAsset::role` for the transcript cross-check decoder (0.8.0), for the
+/// same reason: `models fetch --confidence` and `models status` both pick it
+/// out of the catalogue by this string.
+pub const CONFIDENCE_ROLE: &str = "confidence";
+
+/// The directory the cross-check decoder installs into, under the models root.
+pub const CONFIDENCE_DIR: &str = "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8";
 
 /// The default model set of DESIGN §4, as published by the sherpa-onnx project.
 ///
@@ -299,6 +315,42 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
                 130_672_026,
             ),
             ("sherpa-onnx-whisper-base/base-tokens.txt", 816_730),
+        ],
+    },
+    // The transcript cross-check (0.8.0). OPTIONAL, and the flag is
+    // `models fetch --confidence`.
+    //
+    // Canary 180m flash int8: four languages, RTF 0.33 on one thread, and a
+    // decoder built differently enough from the Parakeet transducer that its
+    // agreement carries information. `spike/confidence_bench.py` measured what
+    // that information is worth on FLEURS + LibriSpeech through Opus 24k: at
+    // τ = 0.5 the turns where the two decoders disagree carry 76.4% word error
+    // against 18.2% where they agree — a 4.2× split, which is the whole reason
+    // the flag exists. It is never allowed to replace a word (§11: it drops
+    // 11% of real turns outright, which is disqualifying for a transcriber and
+    // irrelevant for a witness).
+    //
+    // int8, and only the two files the recognizer opens plus the token table;
+    // the tarball also carries test WAVs this daemon never reads.
+    RemoteAsset {
+        role: CONFIDENCE_ROLE,
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8.tar.bz2",
+        download_bytes: 153_692_328,
+        install: Install::TarBz2,
+        group: Group::Confidence,
+        files: &[
+            (
+                "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8/encoder.int8.onnx",
+                132_678_643,
+            ),
+            (
+                "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8/decoder.int8.onnx",
+                74_437_848,
+            ),
+            (
+                "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8/tokens.txt",
+                53_555,
+            ),
         ],
     },
     // ---- the memory graph's Tier 3 (GRAPH.md) -----------------------------
@@ -560,6 +612,87 @@ impl ArbiterModel {
             crate::fetch::human(arbiter_download_bytes()),
         )
     }
+}
+
+/// Where the cross-check decoder lives under a models root, and whether it is
+/// there.
+///
+/// Kept apart from [`ModelSet`] like every other optional model: its absence is
+/// a normal state, and what happens without it is that `asr_confidence` stays
+/// null. A null there means "nothing checked these words", which is true, and
+/// is a different thing from "checked and fine".
+#[derive(Debug, Clone)]
+pub struct ConfidenceModel {
+    pub root: PathBuf,
+    pub encoder: PathBuf,
+    pub decoder: PathBuf,
+    pub tokens: PathBuf,
+    /// Threads the recognizer is built with, from `[runtime].asr_threads`.
+    pub threads: i32,
+}
+
+impl ConfidenceModel {
+    pub fn resolve_at(root: PathBuf, threads: i32) -> Self {
+        let dir = root.join(CONFIDENCE_DIR);
+        Self {
+            encoder: dir.join("encoder.int8.onnx"),
+            decoder: dir.join("decoder.int8.onnx"),
+            tokens: dir.join("tokens.txt"),
+            threads,
+            root,
+        }
+    }
+
+    pub fn entries(&self) -> Vec<ModelEntry> {
+        [
+            ("confidence.encoder", &self.encoder),
+            ("confidence.decoder", &self.decoder),
+            ("confidence.tokens", &self.tokens),
+        ]
+        .into_iter()
+        .map(|(role, path)| ModelEntry {
+            role,
+            path: path.clone(),
+            expected: path
+                .strip_prefix(&self.root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .as_deref()
+                .and_then(expected_bytes),
+        })
+        .collect()
+    }
+
+    /// All three files at exactly the catalogued size, the same rule every
+    /// other model here follows: a truncated download is *absent*, not broken.
+    pub fn present(&self) -> bool {
+        self.entries().iter().all(|e| e.ok())
+    }
+
+    /// What produced a confidence flag, with the source language in it: the
+    /// same audio checked in German and in English is two different opinions,
+    /// and a stored provenance that hid the difference would be a lie.
+    pub fn model_id(&self, lang: &str) -> String {
+        format!("{CONFIDENCE_DIR}-{lang}@{ASR_CONTRACT_VERSION}")
+    }
+
+    pub fn how_to_get_it() -> String {
+        format!(
+            "the cross-check decoder is not installed. `recalld models fetch --confidence` \
+             installs {CONFIDENCE_DIR} ({}), and until then transcripts carry no \
+             `asr_confidence`.",
+            crate::fetch::human(confidence_download_bytes()),
+        )
+    }
+}
+
+/// Bytes `models fetch --confidence` has to pull down.
+pub fn confidence_download_bytes() -> u64 {
+    REMOTE_ASSETS
+        .iter()
+        .filter(|a| a.group == Group::Confidence)
+        .map(|a| a.download_bytes)
+        .sum()
 }
 
 /// Bytes `models fetch --arbiter-de` has to pull down.

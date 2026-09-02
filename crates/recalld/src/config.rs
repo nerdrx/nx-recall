@@ -420,6 +420,80 @@ impl Default for GraphConfig {
     }
 }
 
+/// The accuracy round (0.8.0): what the idle quality worker is allowed to do to
+/// a transcript after the fact.
+///
+/// Nothing here touches the live path. Both passes run in one background thread
+/// behind the same gates the enrichment worker uses, and both are measured
+/// rather than assumed — the two `spike/` benches named on the fields are what
+/// set the defaults.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AsrConfig {
+    /// Re-decode short turns with the audio around them and keep the words that
+    /// fall inside the turn.
+    ///
+    /// **Measured** (`spike/context_redecode_bench.py`, FLEURS German +
+    /// LibriSpeech through Opus 24k, 125 turns): 56.7% → 20.4% WER at 1.5 s
+    /// (64% relative) and 34.3% → 17.1% at 2.5 s (50% relative). It is on by
+    /// default because that is the largest accuracy gain in the whole round and
+    /// it costs nothing a person can feel.
+    pub context_redecode: bool,
+    /// Turns shorter than this are re-decoded with their neighbours; longer
+    /// ones already carry their own context and are left alone. 2.5 s is where
+    /// the measured gain is still 50% relative and the median real turn (2.7 s)
+    /// sits just above it.
+    pub context_redecode_below_s: f32,
+    /// How much audio either side of the turn goes into the window.
+    pub context_pad_s: f32,
+    /// A silence longer than this between two stored clips truncates the
+    /// window. There is no continuous recording — the daemon stores one WAV per
+    /// turn — so a window is built by butting clips together with their real
+    /// silences in between, and past a second of silence what is on the other
+    /// side is a different piece of speech, not context.
+    pub context_max_gap_s: f32,
+    /// Cross-check transcripts against a second decoder and flag the ones it
+    /// disagrees with (`crate::canary`). Needs `models fetch --confidence`;
+    /// without it every `asr_confidence` stays null.
+    pub confidence: bool,
+    /// Agreement at or above which the two decoders count as agreeing.
+    ///
+    /// **Measured** (`spike/confidence_bench.py`, 257 items): at 0.5 the
+    /// disagreeing turns carry 76.4% word error against 18.2% for the agreeing
+    /// ones — a 4.2× split. The ratio is flat from 0.4 to 0.8 when the source
+    /// language is known; 0.5 is the highest value that still holds ≥3× when it
+    /// is not and both languages have to be tried.
+    pub confidence_tau: f32,
+    /// Segments per batch, for both passes. The worker re-checks every gate
+    /// between batches, so this is how long it commits to before looking up.
+    pub batch_segments: usize,
+    /// Seconds between batches, and between re-checks while a gate is closed.
+    pub batch_pause_s: u64,
+    /// Queue depth, in seconds of audio waiting for the inference thread, above
+    /// which the worker stands down — the same rule, and the same reason, as
+    /// `[graph].max_queue_seconds`.
+    pub max_queue_seconds: i64,
+    /// Ceiling on the vocabulary's `effective` list.
+    pub vocab_max_terms: usize,
+}
+
+impl Default for AsrConfig {
+    fn default() -> Self {
+        Self {
+            context_redecode: true,
+            context_redecode_below_s: 2.5,
+            context_pad_s: 3.0,
+            context_max_gap_s: 1.0,
+            confidence: true,
+            confidence_tau: 0.5,
+            batch_segments: 40,
+            batch_pause_s: 10,
+            max_queue_seconds: 5,
+            vocab_max_terms: 500,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -536,6 +610,8 @@ pub struct Config {
     pub models: ModelsConfig,
     pub identity: IdentityConfig,
     pub lang: LangConfig,
+    /// The accuracy round's idle worker (0.8.0).
+    pub asr: AsrConfig,
     pub graph: GraphConfig,
     pub socket: SocketConfig,
     pub roster: RosterConfig,

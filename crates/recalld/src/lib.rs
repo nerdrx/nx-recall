@@ -9,12 +9,19 @@
 //! The crate is a library so the acceptance suite in `tests/` can drive the
 //! real pipeline against the golden fixtures; `src/main.rs` is a thin bin.
 
+// `status` is one `json!` literal and it grows by a few keys every release;
+// 0.8.0's counters pushed it past the default 128 levels of macro recursion.
+// Raised rather than split: the whole point of that literal is that a person
+// can read the daemon's whole answer in one place.
+#![recursion_limit = "256"]
+
 pub mod allowlist;
 pub mod analysis;
 pub mod arbiter;
 pub mod asr;
 pub mod b64;
 pub mod bus;
+pub mod canary;
 pub mod capture;
 pub mod client;
 pub mod clock;
@@ -34,6 +41,7 @@ pub mod overlap;
 pub mod pipeline;
 pub mod proto;
 pub mod proximity;
+pub mod quality;
 pub mod queue;
 pub mod resample;
 pub mod retention;
@@ -47,6 +55,7 @@ pub mod threads;
 pub mod timeref;
 pub mod turns;
 pub mod vad;
+pub mod vocab;
 
 /// ~640 KB, bundled so the daemon has no runtime asset lookup. The heavier
 /// analysis models are *not* bundled — they live in `[models].dir`.

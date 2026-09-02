@@ -26,6 +26,7 @@ use recalld::enrich::{self, EnrichStop};
 use recalld::fetch;
 use recalld::models::{self, AsrSelection, EntryState, GraphModels, Group, ModelSet};
 use recalld::pipeline::{self, Pipeline, Stats};
+use recalld::quality::{self, QualityStop};
 use recalld::queue::EventQueue;
 use recalld::retention::{self, SweeperStop};
 use recalld::roster::{self, RosterStop};
@@ -77,6 +78,7 @@ fn main() -> Result<()> {
                 fallback_asr,
                 graph,
                 arbiter_de,
+                confidence,
                 semantic,
                 no_config,
             } => cmd_models_fetch(
@@ -90,6 +92,7 @@ fn main() -> Result<()> {
                     graph,
                     semantic,
                     arbiter_de,
+                    confidence,
                     single_stream: false,
                 },
                 no_config,
@@ -248,7 +251,9 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     .with_lang(cfg.lang.clone())
     .with_mic(cfg.mic.clone())
     // The memory graph's Tier 3 switch is live, like the microphone's.
-    .with_graph(cfg.graph.clone(), models_root.clone());
+    .with_graph(cfg.graph.clone(), models_root.clone())
+    // …and the accuracy round's idle worker reads its switches the same way.
+    .with_asr(cfg.asr.clone());
     // The ids clients see must be the ids that will be written on segments, so
     // resolve the ASR fallback here exactly as the pipeline does.
     if let Some(mut models) = ModelSet::resolve(&cfg.models) {
@@ -375,6 +380,35 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         info!("the memory graph's local model is enabled; it runs only while nothing is captured");
     }
 
+    // The accuracy round's idle worker (0.8.0). Started for the same reason
+    // the enrichment worker is: both its switches are live, and it has to be
+    // there to notice them being turned on.
+    let quality_stop = Arc::new(QualityStop::default());
+    let quality_thread = {
+        let store = Arc::clone(&store);
+        let control = Arc::clone(&control);
+        let bus = Arc::clone(&bus);
+        let root = models_root.clone();
+        let dir = data_dir.to_path_buf();
+        let stats = Arc::clone(&control.quality);
+        let stop = Arc::clone(&quality_stop);
+        let runtime = cfg.runtime.clone();
+        // Resolved exactly as the pipeline resolves it, fallback included, so
+        // the worker never re-decodes with a different export than the one that
+        // wrote the words it is replacing.
+        let models = ModelSet::resolve(&cfg.models).and_then(|mut m| {
+            m.select_asr();
+            m.complete().then_some(m)
+        });
+        std::thread::Builder::new()
+            .name("recalld-quality".into())
+            .spawn(move || {
+                quality::run(store, control, bus, models, root, dir, runtime, stats, stop)
+            })
+            .map_err(|e| warn!("no transcript quality worker: {e}"))
+            .ok()
+    };
+
     let sweeper_stop = Arc::new(SweeperStop::default());
     let sweeper_thread = if cfg.retention.enabled {
         let retention_cfg = cfg.retention.clone();
@@ -415,10 +449,11 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     roster_stop.stop();
     sweeper_stop.stop();
     enrich_stop.stop();
+    quality_stop.stop();
     if let Some(s) = socket {
         s.shutdown();
     }
-    for handle in [roster_thread, sweeper_thread, enrich_thread]
+    for handle in [roster_thread, sweeper_thread, enrich_thread, quality_thread]
         .into_iter()
         .flatten()
     {
@@ -747,6 +782,26 @@ fn cmd_models_status(
     } else {
         println!("german arbiter:     off  (optional)");
         println!("  {}", models::ArbiterModel::how_to_get_it());
+    }
+
+    // The transcript cross-check (0.8.0). Same shape, same reason: without it
+    // every `asr_confidence` is null, which says "nothing has checked these
+    // words" and is a correct, quiet answer.
+    let confidence = models::ConfidenceModel::resolve_at(models.root.clone(), 1);
+    println!();
+    if confidence.present() {
+        println!("cross-check:        on   ({})", confidence.model_id("de"));
+        for e in confidence.entries() {
+            println!(
+                "  {:<14}  {:>10}  {}",
+                e.role,
+                e.bytes().map(fetch::human).unwrap_or_else(|| "-".into()),
+                e.path.display()
+            );
+        }
+    } else {
+        println!("cross-check:        off  (optional)");
+        println!("  {}", models::ConfidenceModel::how_to_get_it());
     }
 
     if selection == AsrSelection::Fallback {

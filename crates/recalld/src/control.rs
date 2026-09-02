@@ -93,6 +93,11 @@ pub struct Control {
     graph: Mutex<GraphConfig>,
     /// What the enrichment worker is doing right now, as it reports it.
     graph_state: Mutex<GraphState>,
+    /// The accuracy round's idle worker (0.8.0), live for the same reason the
+    /// graph's settings are: both its passes have switches.
+    asr: Mutex<crate::config::AsrConfig>,
+    /// What that worker has done since the daemon started.
+    pub quality: Arc<crate::quality::QualityStats>,
 }
 
 impl Control {
@@ -119,6 +124,8 @@ impl Control {
             last_sweep: Mutex::new(None),
             graph: Mutex::new(GraphConfig::default()),
             graph_state: Mutex::new(GraphState::default()),
+            asr: Mutex::new(crate::config::AsrConfig::default()),
+            quality: Arc::new(crate::quality::QualityStats::default()),
         })
     }
 
@@ -336,6 +343,20 @@ impl Control {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
             .unwrap_or(Value::Null)
+    }
+
+    // ---- the accuracy round's idle worker (0.8.0) ------------------------
+
+    pub fn asr(&self) -> crate::config::AsrConfig {
+        self.asr.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Point the worker at the running config. Set before the handle is shared,
+    /// like the rest of the wiring.
+    pub fn with_asr(mut self: Arc<Self>, cfg: crate::config::AsrConfig) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
+        *this.asr.get_mut().unwrap_or_else(|p| p.into_inner()) = cfg;
+        self
     }
 
     // ---- the memory graph (GRAPH.md Tiers 2 and 3) -----------------------

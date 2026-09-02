@@ -440,7 +440,12 @@ fn record(
             .map(|_| ()),
         Event::Leave { who } => guard.roster_leave(who, line.t_utc_ns).map(|_| ()),
         Event::World { .. } => guard.roster_close_all(line.t_utc_ns).map(|_| ()),
-        Event::Room { .. } => Ok(()),
+        // The human-readable world name is the one thing in this log that is
+        // vocabulary rather than presence: "The Great Pug" is a phrase people
+        // say out loud and no ASR model has heard of. Remembered here (0.8.0,
+        // `crate::vocab`) because this is the only place it exists — the
+        // roster table stores world *ids*.
+        Event::Room { name } => crate::vocab::remember_world(&guard, name).map(|_| ()),
     };
     drop(guard);
     if let Err(e) = outcome {

@@ -118,6 +118,17 @@ pub fn segment_json(row: &SegmentRow) -> Value {
         // row older than threading. A client draws a boundary where this
         // changes and renders a null exactly as it always did.
         "thread": row.thread_id,
+        // Schema v10 (0.8.0). `text_via` says which pass produced these words:
+        // `"live"` on the way in, `"context"` after the idle worker re-read the
+        // turn with the audio around it, `"arbiter"` after a language
+        // re-decode. `null` on a row written before the column existed —
+        // provenance nobody recorded, not provenance to guess at.
+        "text_via": row.text_via,
+        // What a second decoder made of them: `"solid"`, `"shaky"`, or `null`
+        // when no cross-check ran. A null is NOT "fine": it means nothing has
+        // looked, which is the state of every row on a machine that has not run
+        // `models fetch --confidence`.
+        "asr_confidence": row.asr_confidence,
     })
 }
 
@@ -242,6 +253,8 @@ impl Service {
             // its own in-process path; this is the same walk for a client that
             // is already holding a socket.
             "lang.repair" => self.lang_repair(req),
+            "vocab.get" => self.vocab_get(),
+            "vocab.set" => self.vocab_set(req),
             "segments.reassign" => self.segments_reassign(req),
             "segments.correct" => self.segments_correct(req),
             "segments.audio" => self.segments_audio(req),
@@ -360,6 +373,37 @@ impl Service {
         }))
     }
 
+    /// The accuracy round's block in `status` (0.8.0): what the idle worker is
+    /// allowed to do and whether the optional decoder it needs is installed.
+    ///
+    /// Always present, always the same shape — a client has to be able to tell
+    /// "the cross-check is not installed" from "an older daemon", and a missing
+    /// key cannot say either.
+    fn asr_quality_json(&self) -> Value {
+        let cfg = self.control.asr();
+        let confidence = self
+            .control
+            .models_root
+            .as_ref()
+            .map(|root| crate::models::ConfidenceModel::resolve_at(root.clone(), 1))
+            .is_some_and(|m| m.present());
+        json!({
+            "context_redecode": cfg.context_redecode,
+            "context_redecode_below_s": cfg.context_redecode_below_s,
+            "confidence": {
+                "enabled": cfg.confidence,
+                "available": confidence,
+                "tau": cfg.confidence_tau,
+                "how": (!confidence).then(crate::models::ConfidenceModel::how_to_get_it),
+            },
+            // The vocabulary is assembled and served; nothing is biased by it.
+            // Said here rather than only in the docs, because a client showing
+            // a glossary screen must not imply an effect the daemon does not
+            // have (`crate::vocab`, `spike/hotwords_bench.py`).
+            "vocab_applied_to_decoder": false,
+        })
+    }
+
     fn status_payload(&self) -> anyhow::Result<Value> {
         let c = &self.control;
         let (depth, capacity, dropped_chunks, dropped_samples) = match &c.queue {
@@ -427,6 +471,8 @@ impl Service {
             // `graph` event when it moves; carried here so a client that missed
             // one still converges on the truth, exactly like the mic block.
             "graph": c.graph_state().to_json(),
+            // The accuracy round's idle worker (0.8.0).
+            "asr": self.asr_quality_json(),
             "segments_total": store.segments_total()?,
             "counters": {
                 "sessions_opened": c.stats.sessions_opened.load(Ordering::Relaxed),
@@ -459,6 +505,15 @@ impl Service {
                 "redecoded_de": c.analysis.redecoded_de.load(Ordering::Relaxed),
                 "redecoded_en": c.analysis.redecoded_en.load(Ordering::Relaxed),
                 "repairs": c.analysis.repairs.load(Ordering::Relaxed),
+                // 0.8.0, the idle quality worker: turns re-decoded with their
+                // session's audio, turns that had none to re-decode with, and
+                // the two verdicts of the cross-check.
+                "redecoded_context":
+                    c.quality.redecoded_context.load(Ordering::Relaxed),
+                "redecode_skipped_no_audio":
+                    c.quality.redecode_skipped_no_audio.load(Ordering::Relaxed),
+                "solid": c.quality.confidence_solid.load(Ordering::Relaxed),
+                "shaky": c.quality.confidence_shaky.load(Ordering::Relaxed),
             },
             "clients": self.bus.client_count(),
             "seq": self.bus.current_seq(),
@@ -2109,6 +2164,53 @@ impl Service {
             None => self.bus.current_seq(),
         };
         Ok(json!({"segment_id": segment_id, "text": text, "seq": seq}))
+    }
+
+    // ---- the vocabulary (0.8.0) ------------------------------------------
+
+    /// The glossary a person curates, the three lists the daemon assembles for
+    /// itself, and their capped union.
+    ///
+    /// The reply carries `applied_to_decoder: false`, which is the honest half
+    /// of this method: the list is real and nothing is currently biased by it.
+    /// `spike/hotwords_bench.py` measured why — +9.1% relative recall on the
+    /// targeted words against a +20% gate, only under a decoder that costs
+    /// 1.6 pp of WER before any hotword is added, with the glossary bleeding
+    /// into unrelated turns (control WER 8.3% → 29.4%) at the strongest
+    /// setting. See `crate::vocab`.
+    fn vocab_get(&self) -> Result<Value, Error> {
+        let cap = self.control.asr().vocab_max_terms;
+        let store = self.store();
+        Ok(crate::vocab::read(&store, cap)
+            .map_err(Error::from)?
+            .to_json())
+    }
+
+    /// Replace the user glossary. Whole-list replacement, because it is the
+    /// only shape that can express a deletion.
+    fn vocab_set(&self, req: &Request) -> Result<Value, Error> {
+        let terms = match req.param("terms") {
+            Some(Value::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item.as_str() {
+                        Some(s) => out.push(s.to_string()),
+                        None => return Err(Error::params("terms must be an array of strings")),
+                    }
+                }
+                out
+            }
+            _ => return Err(Error::params("terms must be an array of strings")),
+        };
+        let cap = self.control.asr().vocab_max_terms;
+        let store = self.store();
+        crate::vocab::set_user_terms(&store, &terms, cap).map_err(Error::from)?;
+        let vocab = crate::vocab::read(&store, cap).map_err(Error::from)?;
+        drop(store);
+        let mut data = vocab.to_json();
+        let seq = self.bus.publish(Topic::Status, "vocab", data.clone());
+        data["seq"] = json!(seq);
+        Ok(data)
     }
 
     // ---- reading ---------------------------------------------------------
@@ -4791,5 +4893,91 @@ mod tests {
         );
         let listed: Vec<i64> = voices.iter().map(|v| v["id"].as_i64().unwrap()).collect();
         assert_eq!(listed, removed);
+    }
+
+    /// `vocab.set` replaces the glossary, `vocab.get` reports it together with
+    /// what the daemon noticed for itself, and the change is announced.
+    ///
+    /// The last assertion is the one that matters: the reply says out loud that
+    /// nothing is biased by the list. `spike/hotwords_bench.py` is why (+9.1%
+    /// relative recall against a +20% gate, and a glossary that bleeds into
+    /// unrelated turns at the strongest setting), and a client showing a
+    /// glossary screen must not imply an effect the daemon does not have.
+    #[test]
+    fn the_glossary_round_trips_and_announces_itself() {
+        let r = rig("vocab");
+        let (segment, _) = a_segment(&r, "we were in the great pug");
+        call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"segments.correct","params":{{"segment_id":{segment},"text":"we were in Kübras Welt"}}}}"#
+            ),
+        )
+        .unwrap();
+        let _ = events(&r);
+
+        let out = call(
+            &r,
+            r#"{"id":2,"method":"vocab.set","params":{"terms":["Vergaberecht","  spaced   term  ",""]}}"#,
+        )
+        .unwrap();
+        assert_eq!(out["user"], json!(["Vergaberecht", "spaced term"]));
+        assert_eq!(
+            out["applied_to_decoder"],
+            json!(false),
+            "the list is assembled and served; nothing is biased by it"
+        );
+        let announced: Vec<Value> = events(&r)
+            .into_iter()
+            .filter(|e| e["ev"] == "vocab")
+            .collect();
+        assert_eq!(announced.len(), 1, "a change is announced exactly once");
+
+        let got = call(&r, r#"{"id":3,"method":"vocab.get"}"#).unwrap();
+        assert_eq!(got["user"], json!(["Vergaberecht", "spaced term"]));
+        let corrections: Vec<&str> = got["auto"]["corrections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            corrections.contains(&"Kübras") && corrections.contains(&"Welt"),
+            "the words a correction ADDED are the vocabulary: {corrections:?}"
+        );
+        let effective: Vec<&str> = got["effective"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            effective.first(),
+            Some(&"Vergaberecht"),
+            "what a person typed outranks what the daemon noticed"
+        );
+        assert!(effective.contains(&"Kübras"));
+    }
+
+    /// A glossary that is not a list of strings is a client bug, and it is
+    /// refused rather than half-applied.
+    #[test]
+    fn a_glossary_of_the_wrong_shape_is_refused() {
+        let r = rig("vocab-shape");
+        assert!(
+            call(
+                &r,
+                r#"{"id":1,"method":"vocab.set","params":{"terms":"Kübra"}}"#
+            )
+            .is_err()
+        );
+        assert!(
+            call(
+                &r,
+                r#"{"id":2,"method":"vocab.set","params":{"terms":[1,2]}}"#
+            )
+            .is_err()
+        );
+        assert!(call(&r, r#"{"id":3,"method":"vocab.set"}"#).is_err());
     }
 }

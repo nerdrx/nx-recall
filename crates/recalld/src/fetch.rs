@@ -88,6 +88,10 @@ pub struct FetchOptions {
     /// without it a German-looking flip is *flagged* rather than re-read, which
     /// is exactly what 0.6.1 did and is a correct, quieter daemon.
     pub arbiter_de: bool,
+    /// Also install the transcript cross-check decoder (~154 MB, 0.8.0). Off by
+    /// default: without it `asr_confidence` is null, which says "nothing has
+    /// checked these words" and is true.
+    pub confidence: bool,
     /// Force the single-stream path. Only the test suite sets this; it is how
     /// the fallback is exercised without finding a server that lacks ranges.
     pub single_stream: bool,
@@ -108,6 +112,9 @@ impl FetchOptions {
         }
         if self.arbiter_de {
             out.push(Group::ArbiterDe);
+        }
+        if self.confidence {
+            out.push(Group::Confidence);
         }
         out
     }
@@ -177,6 +184,11 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
         let arb =
             crate::models::ArbiterModel::resolve_at(root.to_path_buf(), crate::models::ARBITER_DE);
         missing.extend(arb.entries().into_iter().filter(|e| !e.ok()));
+    }
+    // …and for the cross-check decoder.
+    if opts.confidence {
+        let conf = crate::models::ConfidenceModel::resolve_at(root.to_path_buf(), 1);
+        missing.extend(conf.entries().into_iter().filter(|e| !e.ok()));
     }
     if !missing.is_empty() {
         eprintln!();

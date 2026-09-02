@@ -39,7 +39,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::embed::Embedding;
 use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -88,6 +88,29 @@ pub mod lang_via {
     /// (`Store::thread_language_stamps`): a context that fed on its own
     /// inferences would confirm itself.
     pub const CONTEXT: &str = "context";
+}
+
+/// Which pass produced a row's words (v10, on the wire as `text_via`).
+///
+/// A separate axis from [`lang_via`], which says how the row's *language* got
+/// there. The two moved together until 0.8.0 because the only thing that ever
+/// rewrote a transcript was the language arbiter; the context re-decode rewrites
+/// words without touching the language at all, which is exactly why it needed
+/// its own column rather than a sixth value in that one.
+pub mod text_via {
+    /// The first pass, on the way in.
+    pub const LIVE: &str = "live";
+    /// Re-decoded with the session's surrounding audio (`crate::quality`).
+    pub const CONTEXT: &str = "context";
+    /// Re-decoded by a language arbiter (`crate::arbiter`).
+    pub const ARBITER: &str = "arbiter";
+}
+
+/// What a second decoder made of a transcript (v10, on the wire as
+/// `asr_confidence`). Flag only: the cross-check never replaces a word.
+pub mod asr_confidence {
+    pub const SOLID: &str = "solid";
+    pub const SHAKY: &str = "shaky";
 }
 
 /// `settings` key holding the id of the pinned "You" speaker.
@@ -183,6 +206,37 @@ pub struct SegmentRow {
     /// before threading existed and never backfilled, which a client renders
     /// exactly as it always did.
     pub thread_id: Option<i64>,
+    /// Which pass produced these words (v10, `store::text_via`): `"live"` on
+    /// the first pass, `"context"` after the re-decode worker read the turn
+    /// with the audio around it, `"arbiter"` after a constrained re-decode.
+    /// `None` on a row written before the column existed.
+    pub text_via: Option<String>,
+    /// What a second decoder made of them (v10): `"solid"`, `"shaky"`, or
+    /// `None` when no cross-check has run — which is not the same as "checked
+    /// and fine", and is why the null is on the wire.
+    pub asr_confidence: Option<String>,
+}
+
+/// A turn the idle quality worker may act on: enough to find its audio, place
+/// it in its session, and compare what comes back with what is there now.
+#[derive(Debug, Clone)]
+pub struct RedecodeCandidate {
+    pub id: i64,
+    pub session_id: i64,
+    pub t_start_ns: i64,
+    pub t_end_ns: i64,
+    /// Relative to the data dir, and never empty: the query filters those out.
+    pub audio_path: String,
+    pub text: Option<String>,
+}
+
+/// One stored turn's audio, as the window builder sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Clip {
+    pub id: i64,
+    pub t_start_ns: i64,
+    pub t_end_ns: i64,
+    pub audio_path: String,
 }
 
 /// One candidate clip for naming a voice: enough to rank it, label it in a
@@ -718,6 +772,7 @@ impl Store {
         // v9: semantic search. Unconditional and idempotent like every
         // migration above it, and deliberately dependent on none of them.
         crate::semantic::migrate_v9(&self.conn)?;
+        self.apply_v10()?;
 
         match current {
             None => {
@@ -1097,6 +1152,37 @@ impl Store {
         Ok(())
     }
 
+    /// The accuracy round (0.8.0). Four columns on `segments`, no tables.
+    ///
+    /// Two of them are on the wire (`text_via`, `asr_confidence`) and two are
+    /// the idle worker's queue: a NULL `redecode_at_ns` means no context
+    /// re-decode has *considered* this row, and a NULL `confidence_at_ns` means
+    /// no cross-check has. They are separate from the answers on purpose — a
+    /// re-decode that ran and decided to keep the original words has to be
+    /// distinguishable from one that never ran, or the worker walks the same
+    /// segment for ever.
+    ///
+    /// No backfill, deliberately. Every existing row keeps NULLs, which read as
+    /// "nothing has looked at this" — true — and the worker walks the history
+    /// at idle priority from newest to oldest. Writing `"live"` over rows the
+    /// live pass produced before the column existed would be a guess about
+    /// provenance, and provenance is the one thing this column exists to state.
+    fn apply_v10(&self) -> Result<()> {
+        self.add_column_if_missing("segments", "text_via", "TEXT")?;
+        self.add_column_if_missing("segments", "asr_confidence", "TEXT")?;
+        self.add_column_if_missing("segments", "redecode_at_ns", "INTEGER")?;
+        self.add_column_if_missing("segments", "confidence_at_ns", "INTEGER")?;
+        // The two worker queues are "the newest rows with no stamp", so the
+        // index is on the stamp and the clock together.
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_segments_redecode
+                 ON segments(redecode_at_ns, t_start_ns);
+             CREATE INDEX IF NOT EXISTS idx_segments_confidence
+                 ON segments(confidence_at_ns, t_start_ns);",
+        )?;
+        Ok(())
+    }
+
     /// Thread every session's existing segments by replaying the live rule.
     ///
     /// Deliberately not clever: sessions in id order, turns in time order, the
@@ -1348,7 +1434,8 @@ impl Store {
     pub fn set_segment_analysis(&self, segment_id: i64, a: &SegmentAnalysis) -> Result<()> {
         self.conn.execute(
             "UPDATE segments
-             SET text = ?2, lang = ?3, lang_via = ?4, asr_model_id = ?5, overlap_frac = ?6
+             SET text = ?2, lang = ?3, lang_via = ?4, asr_model_id = ?5, overlap_frac = ?6,
+                 text_via = 'live'
              WHERE id = ?1",
             params![
                 segment_id,
@@ -1373,11 +1460,275 @@ impl Store {
         asr_model_id: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE segments SET text = ?2, lang = ?3, lang_via = ?4, asr_model_id = ?5
+            "UPDATE segments SET text = ?2, lang = ?3, lang_via = ?4, asr_model_id = ?5,
+                 text_via = ?6
              WHERE id = ?1",
-            params![segment_id, text, lang, lang_via::REDECODE, asr_model_id],
+            params![
+                segment_id,
+                text,
+                lang,
+                lang_via::REDECODE,
+                asr_model_id,
+                text_via::ARBITER
+            ],
         )?;
         Ok(())
+    }
+
+    // ---- the accuracy round (0.8.0, `crate::quality`) --------------------
+
+    /// Turns short enough to be worth re-decoding with their neighbours, newest
+    /// first, that no re-decode has considered yet.
+    ///
+    /// The filters are the guards, in SQL because they are cheap there and
+    /// because a worker that read rows it must not touch would be one bug away
+    /// from touching them: live rows only, with audio still on disk, shorter
+    /// than `below_s`, and never a row a person has corrected by hand —
+    /// `text_via` is NULL or `live`, so a turn is re-decoded once and an
+    /// arbiter's or a person's words are never overwritten.
+    ///
+    /// **A turn with no transcript at all is in the queue, and is the point.**
+    /// The live pass stores an empty decode as NULL text
+    /// (`crate::analysis::Analyzer::prepare`), and a 1.4 s fragment that the
+    /// decoder made nothing of is exactly the case the context window rescues —
+    /// measured here, not argued: on the middle third of `clean_single_0.wav`
+    /// parakeet v3 returns nothing alone and "and a violin were" in its
+    /// neighbours' company. What the queue does need is evidence that the live
+    /// pass has *been* here, which is `asr_model_id`; a row without one is
+    /// still waiting for the inference thread.
+    pub fn segments_for_context_redecode(
+        &self,
+        below_s: f32,
+        limit: usize,
+    ) -> Result<Vec<RedecodeCandidate>> {
+        let below_ns = (below_s.max(0.0) as f64 * 1e9) as i64;
+        let rows = self
+            .conn
+            .prepare(
+                "SELECT g.id, g.session_id, g.t_start_ns, g.t_end_ns, g.audio_path, g.text
+                 FROM segments g
+                 WHERE g.deleted_at IS NULL
+                   AND g.redecode_at_ns IS NULL
+                   AND g.asr_model_id IS NOT NULL
+                   AND g.audio_path <> ''
+                   AND (g.t_end_ns - g.t_start_ns) < ?1
+                   AND (g.text_via IS NULL OR g.text_via = 'live')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM operations o
+                       WHERE o.op = 'segments.correct'
+                         AND o.target_ids = '[' || g.id || ']')
+                 ORDER BY g.t_start_ns DESC
+                 LIMIT ?2",
+            )?
+            .query_map(params![below_ns, limit as i64], |r| {
+                Ok(RedecodeCandidate {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    t_start_ns: r.get(2)?,
+                    t_end_ns: r.get(3)?,
+                    audio_path: r.get(4)?,
+                    text: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The stored clips of one session that touch `[from_ns, to_ns]`, in time
+    /// order, so the worker can rebuild the audio around a turn.
+    ///
+    /// There is no continuous recording — the daemon stores one WAV per turn —
+    /// so this is the whole of what "surrounding audio" can mean.
+    pub fn session_clips_between(
+        &self,
+        session_id: i64,
+        from_ns: i64,
+        to_ns: i64,
+    ) -> Result<Vec<Clip>> {
+        let rows = self
+            .conn
+            .prepare(
+                "SELECT id, t_start_ns, t_end_ns, audio_path FROM segments
+                 WHERE session_id = ?1 AND deleted_at IS NULL AND audio_path <> ''
+                   AND t_end_ns >= ?2 AND t_start_ns <= ?3
+                 ORDER BY t_start_ns ASC, id ASC",
+            )?
+            .query_map(params![session_id, from_ns, to_ns], |r| {
+                Ok(Clip {
+                    id: r.get(0)?,
+                    t_start_ns: r.get(1)?,
+                    t_end_ns: r.get(2)?,
+                    audio_path: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Replace a transcript with the words a context re-decode read out of the
+    /// turn's own span. The language is untouched: the words moved, and which
+    /// language they are in did not.
+    pub fn set_segment_text_from_context(
+        &self,
+        segment_id: i64,
+        text: &str,
+        asr_model_id: &str,
+        at_utc_ns: i64,
+    ) -> Result<()> {
+        // The cross-check is cleared with the words it was about: a `solid`
+        // flag on a transcript that has since been replaced is a claim nobody
+        // ever checked. The confidence pass picks the row up again on its next
+        // walk, against the new text.
+        self.conn.execute(
+            "UPDATE segments
+             SET text = ?2, asr_model_id = ?3, text_via = ?4, redecode_at_ns = ?5,
+                 asr_confidence = NULL, confidence_at_ns = NULL
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![segment_id, text, asr_model_id, text_via::CONTEXT, at_utc_ns],
+        )?;
+        Ok(())
+    }
+
+    /// Record that the re-decode worker has considered a row and left it alone.
+    /// Without this a rejected re-decode is retried for ever.
+    pub fn mark_redecode_considered(&self, segment_id: i64, at_utc_ns: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET redecode_at_ns = ?2 WHERE id = ?1",
+            params![segment_id, at_utc_ns],
+        )?;
+        Ok(())
+    }
+
+    /// Turns waiting for a cross-check, newest first: transcribed, audio still
+    /// on disk, never checked, and not hand-corrected — a person's own words
+    /// need no second opinion.
+    pub fn segments_for_confidence(&self, limit: usize) -> Result<Vec<RedecodeCandidate>> {
+        let rows = self
+            .conn
+            .prepare(
+                "SELECT g.id, g.session_id, g.t_start_ns, g.t_end_ns, g.audio_path, g.text
+                 FROM segments g
+                 WHERE g.deleted_at IS NULL
+                   AND g.confidence_at_ns IS NULL
+                   AND g.text IS NOT NULL AND LENGTH(TRIM(g.text)) > 0
+                   AND g.audio_path <> ''
+                   AND NOT EXISTS (
+                       SELECT 1 FROM operations o
+                       WHERE o.op = 'segments.correct'
+                         AND o.target_ids = '[' || g.id || ']')
+                 ORDER BY g.t_start_ns DESC
+                 LIMIT ?1",
+            )?
+            .query_map(params![limit as i64], |r| {
+                Ok(RedecodeCandidate {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    t_start_ns: r.get(2)?,
+                    t_end_ns: r.get(3)?,
+                    audio_path: r.get(4)?,
+                    text: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Flag a transcript with what the second decoder made of it. `None` marks
+    /// the row checked without a verdict — the cross-check ran and had nothing
+    /// to say, usually because it returned no words at all (§11: canary is
+    /// empty on 11% of real turns).
+    pub fn set_segment_confidence(
+        &self,
+        segment_id: i64,
+        confidence: Option<&str>,
+        at_utc_ns: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET asr_confidence = ?2, confidence_at_ns = ?3
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![segment_id, confidence, at_utc_ns],
+        )?;
+        Ok(())
+    }
+
+    /// The transcript's language and its thread's, for feeding the cross-check
+    /// a source language. Both may be NULL, which is the caller's cue to decode
+    /// in both and keep the better agreement.
+    pub fn segment_lang_hint(&self, segment_id: i64) -> Result<(Option<String>, Option<i64>)> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT lang, thread_id FROM segments WHERE id = ?1",
+                params![segment_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((None, None)))
+    }
+
+    // ---- the vocabulary (0.8.0, `crate::vocab`) --------------------------
+
+    /// Display names seen in the VRChat roster, most recently joined first.
+    pub fn recent_roster_names(&self, limit: usize) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT display_name, MAX(joined_at_utc_ns) AS seen
+                 FROM session_roster
+                 GROUP BY display_name
+                 ORDER BY seen DESC
+                 LIMIT ?1",
+            )?
+            .query_map(params![limit as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Voices the user has actually named. A generated `Speaker_07` is not
+    /// vocabulary — it is the absence of it.
+    pub fn named_speakers(&self) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT display_name FROM speakers
+                 WHERE named_at IS NOT NULL AND merged_into IS NULL
+                 ORDER BY named_at DESC",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Words the user's corrections *added* to a transcript, newest first.
+    ///
+    /// The pre-correction text is in the operation's `prior_state` and the
+    /// corrected text is on the row, so the difference is exactly "words the
+    /// model did not know" — which is what a glossary is.
+    pub fn correction_terms(&self, limit: usize) -> Result<Vec<String>> {
+        let rows: Vec<(String, Option<String>)> = self
+            .conn
+            .prepare(
+                "SELECT o.prior_state, g.text
+                 FROM operations o
+                 JOIN segments g ON '[' || g.id || ']' = o.target_ids
+                 WHERE o.op = 'segments.correct' AND g.deleted_at IS NULL
+                 ORDER BY o.at_utc_ns DESC
+                 LIMIT ?1",
+            )?
+            .query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut out: Vec<String> = Vec::new();
+        for (prior, after) in rows {
+            let before = serde_json::from_str::<serde_json::Value>(&prior)
+                .ok()
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            let Some(after) = after else { continue };
+            for word in crate::vocab::corrected_words(&before, &after) {
+                if !out.iter().any(|w| w.eq_ignore_ascii_case(&word)) {
+                    out.push(word);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Mark a segment whose transcript disagrees with its speaker's declared
@@ -2292,12 +2643,12 @@ impl Store {
     /// How many columns [`Self::SEGMENT_COLUMNS`] selects. A query that appends
     /// its own — the search's snippet — indexes from here rather than from a
     /// number somebody has to remember to bump.
-    const SEGMENT_COLUMN_COUNT: usize = 15;
+    const SEGMENT_COLUMN_COUNT: usize = 17;
 
     const SEGMENT_COLUMNS: &'static str =
         "g.id, g.session_id, sc.match_key, g.t_start_ns, g.t_end_ns,
          sp.canonical_id, sp.display_name, g.text, g.overlap_frac, g.match_score, g.audio_path,
-         g.lang, g.label_via, g.thread_id, g.lang_via";
+         g.lang, g.label_via, g.thread_id, g.lang_via, g.text_via, g.asr_confidence";
 
     fn segment_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentRow> {
         Ok(SegmentRow {
@@ -2316,6 +2667,8 @@ impl Store {
             label_via: r.get(12)?,
             thread_id: r.get(13)?,
             lang_via: r.get(14)?,
+            text_via: r.get(15)?,
+            asr_confidence: r.get(16)?,
         })
     }
 

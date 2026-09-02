@@ -19,7 +19,7 @@ Daemon replies with its version, the current event sequence number, and the id o
 this **run** of the daemon:
 
 ```json
-{"welcome": {"proto": 1, "daemon": "recalld/0.7", "seq": 41823, "schema": 9, "boot": "18f3c0a1d4b2e900"}}
+{"welcome": {"proto": 1, "daemon": "recalld/0.7", "seq": 41823, "schema": 10, "boot": "18f3c0a1d4b2e900"}}
 ```
 
 If `proto` is unsupported the daemon replies `{"error": {"code": "proto", ...}}` and
@@ -759,6 +759,12 @@ decoder got wrong. Two additive changes on the wire and one new method.
   `redecoded_de`, `redecoded_en` and `repairs`, beside the existing `redecoded`
   (their sum across both directions) and `lang_mismatch`.
 
+  0.8.0 adds four more from the idle quality worker: `redecoded_context` and
+  `redecode_skipped_no_audio` (a short turn with no neighbouring clip inside
+  `[asr].context_max_gap_s` — there is no continuous recording, so a turn alone
+  in a silence has no context to be read with), and `solid` / `shaky` from the
+  cross-check.
+
 ## Paging the transcript
 
 `transcript` pages in both directions with no second method, because **which
@@ -798,10 +804,37 @@ see until a user hits it.
   cross-check. Segments also gain `text_via`: `"live"` (first pass),
   `"context"` (re-decoded with surrounding session audio), `"arbiter"`
   (language arbiter). A re-decode re-publishes the segment event.
+
+  Two clarifications the implementation forced:
+
+  - **`null` is not "fine".** It means nothing has checked those words, which
+    is the state of every row on a machine that has not run
+    `recalld models fetch --confidence` (~154 MB, Canary 180m). `status.asr`
+    carries `{confidence: {enabled, available, tau, how}}` so a client can tell
+    "not installed" from "an older daemon". A context re-decode **clears** the
+    flag it invalidates: a `solid` verdict about words that have since been
+    replaced is a claim nobody ever made.
+  - **A re-decode may fill a transcript that was empty.** The live pass stores
+    a decode with no words as `text: null`, and a short fragment the decoder
+    made nothing of is precisely what the surrounding audio rescues, so
+    `text_via: "context"` can arrive on a row a client is showing as silent.
 - **Vocabulary.** `vocab.get` → `{user: [...], auto: {roster: [...], worlds:
-  [...], corrections: [...]}, effective: [...]}`; `vocab.set {terms: [...]}`
-  replaces the user glossary (persisted). The daemon biases the transducer
-  toward `effective` (hotwords). Event `vocab` on change.
+  [...], corrections: [...], speakers: [...]}, effective: [...],
+  applied_to_decoder: false}`; `vocab.set {terms: [...]}` replaces the user
+  glossary (persisted) and answers with the same object. Event `vocab` on
+  change (topic `status`). `effective` is the union, user glossary first, then
+  named speakers, correction words, roster names and world names, de-duplicated
+  case-insensitively and capped at `[asr].vocab_max_terms` (500).
+
+  **The daemon does not bias the transducer toward `effective`, and the field
+  `applied_to_decoder` says so on every reply.** That is a change to this
+  contract, and it is a measurement, not an omission: `spike/hotwords_bench.py`
+  put contextual biasing at +9.1% relative recall on the targeted words against
+  a +20% gate, only under `modified_beam_search` (which costs 1.6 pp of WER on
+  its own before a single hotword is added), with the glossary bleeding into
+  unrelated utterances at the strongest setting — control WER 8.3% → 29.4%.
+  The list is assembled, stored, served and announced; nothing is fed to the
+  recognizer until something can use it without that trade.
 - **Accuracy.** `accuracy.summary` → `{corrections, estimated_wer,
   by_source: [{source, corrections, estimated_wer}], by_speaker: [{speaker_id,
   corrections, estimated_wer}], since_ns}` computed from `segments.correct`
