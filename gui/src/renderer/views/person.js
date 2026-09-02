@@ -138,6 +138,20 @@ export function mount(root, ctx, arg) {
           hint
         ),
         h('div', { class: 'spacer' }),
+        // The same one-line account the roster raises when this person walks
+        // in (0.8.0), asked for deliberately. It is on the header rather than
+        // in a card because it is a SUMMARY of everything below it: a card
+        // would be the page's contents restated above the page's contents.
+        h(
+          'button',
+          {
+            class: 'btn small',
+            id: 'person-brief',
+            title: `What is open between you and ${name}, in one line`,
+            onclick: () => void ctx.showBrief?.(spId),
+          },
+          'Brief'
+        ),
         previewButton()
       )
     );

@@ -21,6 +21,9 @@ import {
   uncertainReason,
   hasMark,
   languageNote,
+  isShaky,
+  textViaNote,
+  speakerByDisplayName,
   isYou,
   micChip,
   onboardingCandidates,
@@ -121,9 +124,62 @@ test('a purge removes segments and gives their time back', () => {
 test('unknown events and unknown fields are ignored, never fatal', () => {
   reset();
   assert.equal(applyEvent({ seq: 1, ev: 'weather', data: { sunny: true } }), null);
-  assert.equal(applyEvent({ seq: 2, ev: 'roster', data: { ev: 'join', who: 'x' } }), null);
-  applyEvent({ seq: 3, ev: 'segment', data: { ...seg(1), future_field: 'ignored' } });
+  // A roster JOIN is the one shape this client acts on (0.8.0); everything else
+  // on that topic is still nothing to draw.
+  assert.equal(applyEvent({ seq: 2, ev: 'roster', data: { ev: 'leave', who: 'x' } }), null);
+  assert.equal(applyEvent({ seq: 3, ev: 'roster', data: { ev: 'world', world_id: 'wrld_1' } }), null);
+  applyEvent({ seq: 4, ev: 'segment', data: { ...seg(1), future_field: 'ignored' } });
   assert.equal(store.segments.length, 1);
+});
+
+// -- 0.8.0, the accuracy round ----------------------------------------------
+
+test('a roster join is handed to the controller so it can raise a brief', () => {
+  reset();
+  const change = applyEvent({ seq: 1, ev: 'roster', data: { ev: 'join', who: 'Kira', t: '1' } });
+  assert.equal(change.rosterJoin.who, 'Kira');
+});
+
+test('a display name links to a NAMED voice, case-insensitively, and never to auto', () => {
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', auto: 'Speaker_03' });
+  store.speakers.set(2, { id: 2, name: null, auto: 'Speaker_07' });
+  assert.equal(speakerByDisplayName('kira')?.id, 1);
+  assert.equal(speakerByDisplayName('  KIRA  ')?.id, 1);
+  // The generated label is not a name and must never win a brief: a person who
+  // really is called Speaker_07 would otherwise get somebody else's account.
+  assert.equal(speakerByDisplayName('Speaker_07'), null);
+  assert.equal(speakerByDisplayName(''), null);
+  assert.equal(speakerByDisplayName(null), null);
+});
+
+test('the cross-check flag is its own doubt, not the speaker one', () => {
+  reset();
+  const shaky = { ...seg(1), asr_confidence: 'shaky', match_score: 0.9, overlap_frac: 0.01 };
+  assert.equal(isShaky(shaky), true);
+  // A confident name with shaky words is NOT "uncertain" — that mark is about
+  // who spoke, and saying "weak voice match" here would be a lie.
+  assert.equal(isUncertain(shaky), false);
+  assert.equal(isShaky({ ...seg(1), asr_confidence: 'solid' }), false);
+  assert.equal(isShaky(seg(1)), false); // no cross-check ran
+});
+
+test('text provenance is one word, and silent for a first-pass reading', () => {
+  reset();
+  assert.match(textViaNote({ text_via: 'context' }), /surrounding audio/);
+  assert.match(textViaNote({ text_via: 'arbiter' }), /language arbiter/);
+  assert.equal(textViaNote({ text_via: 'live' }), '');
+  assert.equal(textViaNote({}), '');
+});
+
+test('a vocab event replaces the cached glossary; a note event is handed on', () => {
+  reset();
+  const v = { user: ['PhysBones'], auto: { roster: [], worlds: [], corrections: [] }, effective: ['PhysBones'] };
+  assert.deepEqual(applyEvent({ seq: 1, ev: 'vocab', data: v }).vocab, v);
+  assert.deepEqual(store.vocab, v);
+  const note = { id: 7, segment_id: 90, text: 'the link', t_ms: 1, t_ns: '1', state: 'open' };
+  assert.deepEqual(applyEvent({ seq: 2, ev: 'note', data: note }).note, note);
+  assert.equal(applyEvent({ seq: 3, ev: 'note', data: { text: 'no id' } }), null);
 });
 
 test('op progress is tracked and cleared on completion', () => {

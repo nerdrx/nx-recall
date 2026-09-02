@@ -79,6 +79,13 @@ export const store = {
   // Memory view — the rail badge needs "how many are open" wherever you are,
   // and nothing else does. The commitments themselves are that view's own.
   graph: { counts: null, enrichment: { phase: 'off' }, config: null },
+  /**
+   * The vocabulary (0.8.0). Cached here rather than in the Memory view because
+   * a `vocab` event can arrive while that view is not mounted, and the next
+   * mount must not paint a glossary the daemon has already replaced. `null`
+   * means "never asked", which is a different thing from an empty glossary.
+   */
+  vocab: null,
   ops: new Map(), // op id → {kind, frac, done}
 
   /**
@@ -127,6 +134,23 @@ export function isNamed(sp) {
   return !!(sp && sp.name);
 }
 
+/**
+ * The voice behind a VRChat display name, or null (0.8.0).
+ *
+ * Case-insensitive and against the USER-GIVEN name only. The `auto` label is a
+ * generated "Speaker_07" and could never be a display name, and matching it
+ * would mean a person called Speaker_07 got somebody else's brief. Trimmed
+ * because a roster line is scraped out of a log file, not typed.
+ */
+export function speakerByDisplayName(who) {
+  const want = String(who ?? '').trim().toLowerCase();
+  if (!want) return null;
+  for (const sp of store.speakers.values()) {
+    if (sp.name && sp.name.trim().toLowerCase() === want) return sp;
+  }
+  return null;
+}
+
 export function isUncertain(seg) {
   if (!seg) return false;
   if (seg.speaker == null) return true;
@@ -148,6 +172,36 @@ export function languageNote(seg) {
     return 'These words were re-read from the audio by the German/English arbiter, after the conversation around them suggested the first pass had heard the wrong language.';
   if (seg?.lang_via === 'mismatch')
     return 'This turn reads as a different language from the conversation around it, and nothing could settle which is right — so the original words are kept as they are.';
+  return '';
+}
+
+/**
+ * 0.8.0 — what the SECOND decoder made of the same audio.
+ *
+ * A separate doubt from every other one on a row, and the reason it gets its
+ * own mark rather than joining the "?": the "?" is about who said it and which
+ * model wrote it down, and both of those are answers the pipeline is prepared
+ * to defend. `shaky` is the pipeline saying it cannot: two decoders read the
+ * same seconds and did not agree, the text on screen is the first one's, and
+ * nothing chose between them. `solid` is agreement and earns no badge at all —
+ * a mark on every row is not a mark.
+ */
+export function isShaky(seg) {
+  return seg?.asr_confidence === 'shaky';
+}
+
+/** What the shaky mark says when you hover it. One sentence, no jargon. */
+export const SHAKY_NOTE = 'a second decoder disagreed with this reading';
+
+/**
+ * Where the WORDS came from, when it was not simply the first pass. One word in
+ * the sheet, not a badge in the row: it is a fact about how the text was
+ * produced, which is worth having when you are deciding whether to fix it and
+ * is noise everywhere else. `live` is the ordinary answer and says nothing.
+ */
+export function textViaNote(seg) {
+  if (seg?.text_via === 'context') return 're-read with surrounding audio';
+  if (seg?.text_via === 'arbiter') return 're-read by the language arbiter';
   return '';
 }
 
@@ -855,10 +909,28 @@ export function applyEvent(evt, opts = {}) {
       return { ops: true, opFinished: { ...d, failed: evt.ev === 'op.failed' } };
     }
 
+    // The user glossary changed — here, in the CLI, or in another window. It
+    // rides on the `status` topic for the same reason `mic` does: no client has
+    // to change its subscription and an older one ignores it.
+    case 'vocab': {
+      if (!d) return null;
+      store.vocab = d;
+      return { vocab: d };
+    }
+
+    // A MIC turn that began with a wake phrase became a note (0.8.0). The
+    // segment itself arrives separately as an ordinary `segment` event and
+    // stays in the transcript — this is a second reading of that turn, not a
+    // turn that was filed somewhere else.
+    case 'note':
+      return !d || d.id == null ? null : { note: d };
+
     case 'roster':
-      // Stored for the session view that Step 5 adds; nothing renders it yet,
-      // and an unknown event must never be an error.
-      return null;
+      // The instance's comings and goings. Only a JOIN is rendered, and only as
+      // a brief for a voice the user has named (0.8.0) — the controller does
+      // that, because the bar it raises sits above every view rather than
+      // inside one. Everything else here is still nothing to draw.
+      return d?.ev === 'join' ? { rosterJoin: d } : null;
 
     default:
       return null;

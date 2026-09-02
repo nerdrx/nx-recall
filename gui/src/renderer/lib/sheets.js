@@ -21,10 +21,17 @@ export function openSheet(build, { onClose } = {}) {
     if (onClose) onClose(result);
   };
   const onKey = (e) => {
-    if (e.key === 'Escape') {
-      e.stopPropagation();
-      close(null);
-    }
+    if (e.key !== 'Escape') return;
+    // This listener is on `document` in the CAPTURE phase, so it runs before
+    // anything inside the sheet ever sees the key — which is right for a sheet
+    // and wrong for a control inside one that has its own idea of Escape. The
+    // inline transcript fix is the first: Escape there abandons the edit and
+    // keeps the sheet, and a `stopPropagation` in its own handler can never
+    // reach a listener that has already fired. So the opt-out is declared on
+    // the element instead, and the nearer meaning wins.
+    if (e.target?.closest?.('[data-keep-escape]')) return;
+    e.stopPropagation();
+    close(null);
   };
 
   sheet.append(...[build(close)].flat().filter(Boolean));

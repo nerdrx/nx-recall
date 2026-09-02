@@ -51,6 +51,18 @@ const ALLOWED = new Set([
   'commitments.list',
   'commitments.set_state',
   'topics.list',
+  // The accuracy round (0.8.0). Every one of these is reachable from a control
+  // the UI actually offers, which is the only bar this set has: the vocabulary
+  // panel reads and writes the glossary, the dashboard reads the summary, the
+  // notes section reads and moves notes, the query box asks a question in
+  // words, and a roster join asks for one person's brief.
+  'vocab.get',
+  'vocab.set',
+  'accuracy.summary',
+  'notes.list',
+  'notes.set_state',
+  'search.ask',
+  'person.brief',
   'segments.audio',
   'segments.reassign',
   'segments.correct',

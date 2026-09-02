@@ -196,6 +196,37 @@ export function runE2E(deps) {
       return p;
     });
 
+    // 4d — 0.8.0: a second decoder read the same seconds and disagreed. That is
+    // a different doubt from every other one on a row — the "?" is about who
+    // spoke and which model wrote it down, both of which the pipeline will
+    // defend — so it gets its own mark, and the mark has to say the one plain
+    // thing there is to say about it.
+    await step('shaky-rows-carry-the-cross-check-mark', async () => {
+      const a = await waitFor('a shaky row', async () => {
+        const a = await js('window.__recallDebug.accuracy()');
+        return a.shakyRows > 0 ? a : null;
+      });
+      assert(a.shakyMarks === a.shakyRows, `${a.shakyRows} shaky rows wear ${a.shakyMarks} marks`);
+      // A badge on every row is not a badge: rows the cross-check AGREED with
+      // must carry nothing at all.
+      assert(a.solidMarks === 0, `${a.solidMarks} rows the cross-check agreed with are wearing the mark`);
+      assert(
+        /second decoder disagreed/i.test(a.tip),
+        `the mark does not explain itself: "${a.tip}"`
+      );
+      // …and the words themselves read as unsettled, the same way an uncertain
+      // row's do. The class is not enough — the treatment has to be visible.
+      const muted = await js(`(() => {
+        const row = document.querySelector('#seg-list .seg.shaky');
+        const other = document.querySelector('#seg-list .seg:not(.shaky):not(.uncertain)');
+        const ink = (r) => r && getComputedStyle(r.querySelector('.txt')).color;
+        return { shaky: ink(row), plain: ink(other), style: getComputedStyle(row.querySelector('.txt')).fontStyle };
+      })()`);
+      assert(muted.shaky !== muted.plain, `a shaky row's words are painted like a settled one (${muted.shaky})`);
+      assert(muted.style === 'italic', `a shaky row's words are not set apart (font-style: ${muted.style})`);
+      return { rows: a.shakyRows, tip: a.tip, ...muted };
+    });
+
     await step('shot-transcript', async () => ({ file: await shot('transcript') }));
 
     // -----------------------------------------------------------------------
@@ -429,6 +460,77 @@ export function runE2E(deps) {
       await js('document.querySelector(".sheet #segment-save").click()');
       await waitFor('the sheet to close', async () => js('!document.querySelector(".sheet")'));
       return { file };
+    });
+
+    // 5a2 — 0.8.0, "fix this". The correct path has been in this sheet since
+    // 0.4 and almost nobody used it, because it was a textarea below a heading
+    // below a picker. Now the words themselves are the control: click them,
+    // type, Enter. This drives exactly that motion and then proves the three
+    // things that have to be true afterwards — the daemon has it, the row says
+    // so, and Escape puts a change back rather than saving it.
+    await step('fixing-a-transcript-is-one-motion', async () => {
+      const target = await js(`(() => {
+        const rows = [...document.querySelectorAll('#seg-list .seg')];
+        const row = rows[rows.length - 1];
+        row.click();
+        return { id: Number(row.dataset.seg) };
+      })()`);
+      await waitFor('the sheet', async () => js('!!document.querySelector(".sheet #segment-text")'));
+
+      const rest = await js('window.__recallDebug.accuracy()');
+      assert(!rest.sheet.editing, 'the sheet opened already in an editor');
+      assert(/click the words/i.test(rest.sheet.hint), `no invitation to fix: "${rest.sheet.hint}"`);
+
+      // Escape first, so a passing "it saved" can never be a false positive
+      // from an editor that saves whatever it is holding.
+      const fixed = `corrected by the driver ${Date.now()}`;
+      await js(`(() => {
+        document.getElementById('segment-text').click();
+        const ta = document.getElementById('correct-text');
+        ta.value = 'THIS MUST NOT BE SAVED';
+        ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        return true;
+      })()`);
+      const reverted = await js('window.__recallDebug.accuracy()');
+      assert(!reverted.sheet.editing, 'Escape left the editor open');
+      assert(
+        !/MUST NOT BE SAVED/.test(reverted.sheet.reader),
+        `Escape kept the abandoned edit: "${reverted.sheet.reader}"`
+      );
+      // …and the sheet is still open. Escape belongs to the nearer thing.
+      assert(await js('!!document.querySelector(".sheet")'), 'Escape in the editor closed the whole sheet');
+
+      await js(`(() => {
+        document.getElementById('segment-text').click();
+        const ta = document.getElementById('correct-text');
+        ta.value = ${JSON.stringify(fixed)};
+        ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        return true;
+      })()`);
+      const saved = await waitFor('the fix to land', async () => {
+        const a = await js('window.__recallDebug.accuracy()');
+        return a.sheet.reader === fixed && !a.sheet.editing ? a : null;
+      });
+      // The daemon really has it — not just this window.
+      const onWire = await js(`(async () => {
+        const r = await window.recall.request('transcript', { limit: 600 });
+        return (r.data.segments.find(s => s.id === ${target.id}) || {}).text ?? null;
+      })()`);
+      assert(onWire === fixed, `the daemon still says ${JSON.stringify(onWire)}`);
+
+      const file = await shot('segment-fix');
+      await js('document.querySelector(".scrim").dispatchEvent(new MouseEvent("mousedown", {bubbles: true}))');
+      await waitFor('the sheet to close', async () => js('!document.querySelector(".sheet")'));
+
+      // …and the row wears the mark, through the broadcast rather than through
+      // an optimistic write in this window.
+      const marked = await waitFor(
+        'the corrected mark on the row',
+        async () => js(`!!document.querySelector('#seg-list .seg.corrected[data-seg="${target.id}"]')`),
+        { timeout: 10000 }
+      );
+      assert(marked, 'a fixed row does not say it was fixed');
+      return { segment: target.id, hint: rest.sheet.hint, text: saved.sheet.reader.slice(0, 24), file };
     });
 
     // 5b — a segment's own ▶: the same shared player, one clip.
@@ -1134,6 +1236,168 @@ export function runE2E(deps) {
       return { topics: m.topics.map((t) => t.topic), rows };
     });
 
+    // -----------------------------------------------------------------------
+    // 6r2..6r4 — 0.8.0's three cards, and why they are on THIS tab.
+    //
+    // Sources answers "what is this program allowed to hear". Notes, the
+    // vocabulary and the accuracy figures answer "what did it make of what it
+    // heard", which is the question Memory already exists for — and the three
+    // of them are one loop: a fix moves the figures, the figures point at the
+    // vocabulary, and the vocabulary changes what the next turn is heard as.
+    // -----------------------------------------------------------------------
+
+    await step('notes-to-self-render-and-flip-state', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      const a = await waitFor('the notes list', async () => {
+        const a = await js('window.__recallDebug.accuracy()');
+        return a.notes.length ? a : null;
+      });
+      assert(a.notes.length >= 2, `only ${a.notes.length} note(s) rendered`);
+      // The wake phrase is the addressing, not the note: what is shown is what
+      // was said after it.
+      for (const n of a.notes) {
+        assert(n.text.length > 3, `a note rendered no text: ${JSON.stringify(n)}`);
+        assert(!/^recall,/i.test(n.text), `a note still carries its wake phrase: "${n.text}"`);
+        assert(n.segment > 0, `a note has no turn behind it: ${JSON.stringify(n)}`);
+      }
+      // Every state a note can be in has a chip, and the row only offers the
+      // moves it is not already in.
+      const states = [...new Set(a.notes.map((n) => n.state))].sort();
+      assert(states.length >= 2, `every note is in the same state: ${JSON.stringify(states)}`);
+      const open = a.notes.find((n) => n.state === 'open');
+      assert(open, 'no open note to move');
+      assert(!open.acts.includes('open'), 'an open note offers to be reopened');
+
+      await js(`document.querySelector('[data-note-act="done"][data-note="${open.id}"]').click()`);
+      const moved = await waitFor('the note to settle', async () => {
+        const a = await js('window.__recallDebug.accuracy()');
+        const row = a.notes.find((n) => n.id === open.id);
+        return row && row.state === 'done' && !row.pending ? a : null;
+      });
+      // The daemon really has it, not just this window.
+      const onWire = await js(`(async () => {
+        const r = await window.recall.request('notes.list', {});
+        return (r.data.notes.find(n => n.id === ${open.id}) || {}).state ?? null;
+      })()`);
+      assert(onWire === 'done', `the daemon still says ${onWire}`);
+      // Put it back, so the live-note step below still has an open list to
+      // prepend onto and the screenshots are not all one state.
+      await js(`document.querySelector('[data-note-act="open"][data-note="${open.id}"]').click()`);
+      await waitFor('the note to reopen', async () => {
+        const a = await js('window.__recallDebug.accuracy()');
+        return a.notes.find((n) => n.id === open.id)?.state === 'open';
+      });
+      await js('document.getElementById("notes-card").scrollIntoView({ block: "start" })');
+      const file = await shot('memory-notes');
+      return { notes: moved.notes.length, states, flipped: open.id, file };
+    });
+
+    // A note arriving live goes to the TOP of the list — it is the newest thing
+    // you said to yourself, and it is why you are looking. The mock delivers it
+    // on the first SIGUSR2, because a note that turns up at second 19 of a run
+    // lands in whatever step happens to be on screen and proves nothing.
+    if (process.env.NX_RECALL_MOCK_PID) {
+      await step('a-note-arriving-live-goes-to-the-top', async () => {
+        const before = await js('window.__recallDebug.accuracy()');
+        process.kill(Number(process.env.NX_RECALL_MOCK_PID), 'SIGUSR2');
+        const after = await waitFor(
+          'the new note',
+          async () => {
+            const a = await js('window.__recallDebug.accuracy()');
+            return a.notes.length > before.notes.length ? a : null;
+          },
+          { timeout: 12000 }
+        );
+        assert(
+          after.notes[0].id !== before.notes[0]?.id,
+          'the new note did not go to the top of the list'
+        );
+        assert(after.notes[0].state === 'open', `a fresh note arrived as "${after.notes[0].state}"`);
+        // The turn itself is still a transcript row — a note is a second
+        // reading of a turn, not a turn that was filed somewhere else.
+        const seg = after.notes[0].segment;
+        const inModel = await js(`window.__recallDebug.store.segById.has(${seg})`);
+        assert(inModel, `the turn behind the note (${seg}) is not in the transcript`);
+        return { was: before.notes.length, now: after.notes.length, top: after.notes[0].text.slice(0, 40) };
+      });
+    }
+
+    await step('the-accuracy-card-is-honest-arithmetic', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      const a = await waitFor('the accuracy card', async () => {
+        const a = await js('window.__recallDebug.accuracy()');
+        return a.dash.corrections ? a : null;
+      });
+      // The driver fixed one transcript back in step 5a2, on top of the mock's
+      // three seeded ones, so there is a real number here rather than a fixture.
+      assert(Number(a.dash.corrections) >= 4, `only ${a.dash.corrections} corrections counted`);
+      assert(/^\d+\.\d%$/.test(a.dash.wer), `the error estimate does not read as a rate: "${a.dash.wer}"`);
+      assert(a.dash.bySource.length >= 1, 'no by-source breakdown');
+      assert(a.dash.bySpeaker.length >= 1, 'no by-speaker breakdown');
+      // The by-speaker rows are NAMES, not ids: a dashboard that says
+      // "speaker_id 4" is a dashboard nobody reads.
+      assert(
+        !a.dash.bySpeaker.some((s) => /^\d+$/.test(s)),
+        `a by-speaker row is a raw id: ${JSON.stringify(a.dash.bySpeaker)}`
+      );
+      // …and it says what kind of number it is. An estimate that presents
+      // itself as a measurement is the whole failure mode of a card like this.
+      assert(/estimate/i.test(a.dash.note), `the card does not own up to being an estimate: "${a.dash.note}"`);
+      return { corrections: a.dash.corrections, wer: a.dash.wer, sources: a.dash.bySource, speakers: a.dash.bySpeaker };
+    });
+
+    await step('the-vocabulary-is-editable-where-it-is-a-decision', async () => {
+      const a = await waitFor('the vocabulary card', async () => {
+        const a = await js('window.__recallDebug.accuracy()');
+        return a.vocab.user.length ? a : null;
+      });
+      assert(/\d+ terms/.test(a.vocab.effective), `the effective size is not stated: "${a.vocab.effective}"`);
+      for (const key of ['roster', 'worlds', 'corrections']) {
+        assert(a.vocab.counts[key] > 0, `the ${key} group has no count: ${JSON.stringify(a.vocab.counts)}`);
+      }
+      // The rule the card exists to make: one half is a decision and can be
+      // taken back, the other half is an observation and cannot.
+      assert(a.vocab.autoRemovable === 0, `${a.vocab.autoRemovable} derived terms offer a remove button`);
+
+      const term = `driver-term-${Date.now()}`;
+      await js(`(() => {
+        const i = document.getElementById('vocab-add');
+        i.value = ${JSON.stringify(term)};
+        document.getElementById('vocab-add-go').click();
+        return true;
+      })()`);
+      const added = await waitFor('the term to be added', async () => {
+        const a = await js('window.__recallDebug.accuracy()');
+        return a.vocab.user.includes(term) ? a : null;
+      });
+      // The daemon has it, and it reached the EFFECTIVE list — a glossary that
+      // is stored and not used is a text field, not a feature.
+      const onWire = await js(`(async () => {
+        const r = await window.recall.request('vocab.get', {});
+        return { user: r.data.user, effective: r.data.effective.includes(${JSON.stringify(term)}) };
+      })()`);
+      assert(onWire.user.includes(term), `the daemon's glossary is ${JSON.stringify(onWire.user)}`);
+      assert(onWire.effective, 'a user term never reached the effective list');
+      await js('document.getElementById("accuracy-card").scrollIntoView({ block: "start" })');
+      await sleep(400);
+      const file = await shot('memory-accuracy');
+      await js('document.getElementById("vocab-card").scrollIntoView({ block: "start" })');
+      await sleep(400);
+      const vocabFile = await shot('memory-vocabulary');
+
+      await js(`document.querySelector('[data-remove-term="${term}"]').click()`);
+      const removed = await waitFor('the term to go', async () => {
+        const a = await js('window.__recallDebug.accuracy()');
+        return !a.vocab.user.includes(term) ? a : null;
+      });
+      const gone = await js(`(async () => {
+        const r = await window.recall.request('vocab.get', {});
+        return r.data.user.includes(${JSON.stringify(term)});
+      })()`);
+      assert(!gone, 'removing a term did not reach the daemon');
+      return { terms: added.vocab.user.length, after: removed.vocab.user.length, counts: a.vocab.counts, files: [file, vocabFile] };
+    });
+
     // 6s — the enrichment card, in all three states it has copy for, and the
     // copy itself. This is the honest-cost half of the feature: what it runs,
     // what it costs, that it keeps working while you play, that a pause stops
@@ -1561,6 +1825,181 @@ export function runE2E(deps) {
       const keyword = await shot('search-keyword');
       return { hits, vias, pressed, both, keyword };
     });
+
+    // 11c — 0.8.0, the one query box. The Search view used to open with a field
+    // called Query and four dropdowns beside it, which asked a person who
+    // wanted to remember something to decompose their question into facets
+    // first. Now they type the question; the daemon says what it understood;
+    // the pills are where they disagree with it.
+    await step('one-query-box-shows-what-it-understood', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="search"]\').click()');
+      await waitFor('the search box', async () => js('!!document.getElementById("search-q")'));
+
+      // The manual facets did not go away — they went behind something, and
+      // that something has to be reachable.
+      const shut = await js('window.__recallDebug.ask()');
+      assert(shut.facetsHidden, 'the advanced facets are open by default — the box is not the front door');
+      assert(shut.advanced === 'false', `the Advanced control says ${shut.advanced}`);
+      await js('document.getElementById("search-advanced").click()');
+      const open = await waitFor('the facets to open', async () => {
+        const a = await js('window.__recallDebug.ask()');
+        return !a.facetsHidden ? a : null;
+      });
+      assert(open.advanced === 'true', 'the Advanced control did not follow');
+      assert(await js('!!document.getElementById("search-speaker")'), 'the speaker facet is gone entirely');
+      await js('document.getElementById("search-advanced").click()');
+
+      // A real question, typed and Entered — not the button, because Enter is
+      // the motion this feature is about.
+      await js(`(() => {
+        const q = document.getElementById('search-q');
+        q.value = 'what did Kira say yesterday about the portal';
+        q.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        return true;
+      })()`);
+      const asked = await waitFor('the interpretation', async () => {
+        const a = await js('window.__recallDebug.ask()');
+        return a.shown && a.pills.length ? a : null;
+      });
+      const facets = asked.pills.map((p) => p.facet);
+      for (const want of ['query', 'speaker', 'time', 'mode']) {
+        assert(facets.includes(want), `no ${want} pill: ${JSON.stringify(asked.pills)}`);
+      }
+      const by = Object.fromEntries(asked.pills.map((p) => [p.facet, p]));
+      assert(/Kira/.test(by.speaker.text), `the speaker pill reads "${by.speaker.text}"`);
+      assert(/yesterday/i.test(by.time.text), `the time pill reads "${by.time.text}"`);
+      assert(/portal/.test(by.query.text), `the words pill reads "${by.query.text}"`);
+      assert(/both|smart|keyword/i.test(by.mode.text), `the mode pill reads "${by.mode.text}"`);
+      // The words are not a facet you can drop — with them gone there is no
+      // question left, and the box above is where you change them.
+      assert(!by.query.removable, 'the query pill offers to remove itself');
+      assert(by.speaker.removable && by.time.removable, 'a facet pill cannot be taken off');
+      // The mode control must not claim one thing while the results came from
+      // another.
+      const pressed = asked.mode.find(([, on]) => on === 'true');
+      assert(pressed, `no search mode is marked as selected: ${JSON.stringify(asked.mode)}`);
+      const file = await shot('search-ask');
+
+      // Taking a facet off re-runs with it cleared. The mock's history is a few
+      // days old, so "yesterday" is a real constraint and dropping it is what
+      // turns an empty answer into an answer — which is the whole reason the
+      // pills are removable rather than merely informative.
+      const before = asked.hits;
+      await js('document.querySelector(\'#ask-pills [data-drop="time"]\').click()');
+      const wider = await waitFor(
+        'the search to re-run without the date',
+        async () => {
+          const a = await js('window.__recallDebug.ask()');
+          return !a.pills.some((p) => p.facet === 'time') ? a : null;
+        },
+        { timeout: 15000 }
+      );
+      assert(wider.hits > before, `dropping the date changed nothing (${before} → ${wider.hits} hits)`);
+      assert(wider.pills.some((p) => p.facet === 'speaker'), 'dropping the date took the speaker with it');
+      // Every hit really is that speaker — the facet was cleared, not the query.
+      const others = await js(`(() => {
+        const want = document.querySelector('#ask-pills [data-facet="speaker"] .ask-pill-text').textContent;
+        return [...document.querySelectorAll('#search-results .seg .who .nm')]
+          .map(n => n.textContent).filter(t => t !== want).length;
+      })()`);
+      assert(others === 0, `${others} hit(s) are not the speaker the pill still names`);
+
+      // And a shaky hit wears the same mark it wears in the transcript: a
+      // result you are about to trust is entitled to say a second decoder did
+      // not. Its own query, because the row this fixture reserves for it is
+      // the only place these words appear.
+      await js(`(() => {
+        const q = document.getElementById('search-q');
+        q.value = 'flickering';
+        q.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        return true;
+      })()`);
+      const marked = await waitFor(
+        'the shaky search hit',
+        async () => {
+          const a = await js('window.__recallDebug.accuracy()');
+          return a.searchShaky > 0 ? a.searchShaky : null;
+        },
+        { timeout: 15000 }
+      );
+
+      // Put the view back where the later steps expect it: an explicit search
+      // clears the interpretation, which is exactly what it is meant to do.
+      await js(`(() => {
+        document.getElementById('search-q').value = 'portal';
+        document.getElementById('search-go').click();
+        return true;
+      })()`);
+      await waitFor('the pills to clear', async () => js('!window.__recallDebug.ask().shown'));
+      return { facets, hits: `${before} → ${wider.hits}`, shakyHits: marked, file };
+    });
+
+    // 11d — 0.8.0, briefs. A roster join naming a voice the user has named is
+    // the one moment this app shows something unasked: you are about to talk to
+    // somebody, and what is open between you is a thing you want to have
+    // remembered ten seconds ago rather than ten minutes later.
+    if (process.env.NX_RECALL_MOCK_PID) {
+      await step('a-join-raises-a-brief-and-it-can-be-waved-away', async () => {
+        await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+        const quiet = await js('window.__recallDebug.brief()');
+        assert(!quiet.shown, 'a brief was up before anybody joined');
+
+        process.kill(Number(process.env.NX_RECALL_MOCK_PID), 'SIGUSR2');
+        const bar = await waitFor(
+          'the brief bar',
+          async () => {
+            const b = await js('window.__recallDebug.brief()');
+            return b.shown ? b : null;
+          },
+          { timeout: 15000 }
+        );
+        // It names a voice this user has NAMED. Read back from the model rather
+        // than hard-coded: earlier steps merge, split and delete voices, and a
+        // brief that named a fixture by string would be testing the fixture.
+        const named = await js(`window.__recallDebug.store.speakers.get(${bar.speaker})?.name ?? null`);
+        assert(named, `the brief is about speaker ${bar.speaker}, who has no user-given name`);
+        assert(bar.text.startsWith(`${named} joined`), `the brief does not say who arrived: "${bar.text}"`);
+        // The three things a brief is for, in the order somebody wants them.
+        assert(/owes you:/.test(bar.text), `the brief does not say what they owe: "${bar.text}"`);
+        assert(/you owe:/.test(bar.text), `the brief does not say what you owe: "${bar.text}"`);
+        assert(/last talked about:/.test(bar.text), `the brief does not say what about: "${bar.text}"`);
+        assert(bar.open && bar.dismiss, 'the brief offers no way in and no way out');
+        const file = await shot('brief-bar');
+
+        // A flaky instance bounces somebody in and out four times a minute, and
+        // four identical bars is not four pieces of information. The mock sends
+        // the same join again immediately; nothing new may happen.
+        process.kill(Number(process.env.NX_RECALL_MOCK_PID), 'SIGUSR2');
+        await sleep(2500);
+        const again = await js('window.__recallDebug.brief()');
+        assert(again.shown && again.speaker === bar.speaker, 'the repeat join disturbed the bar');
+
+        await js('document.getElementById("brief-dismiss").click()');
+        const gone = await waitFor('the brief to go', async () => js('!window.__recallDebug.brief().shown'));
+        assert(gone, 'the brief could not be dismissed');
+
+        // …and it is reachable on purpose, from the person page, which is where
+        // somebody goes when they wondered about it after the bar had gone.
+        await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
+        await waitFor('the speaker list', async () => js('document.querySelectorAll("#speaker-list .sp-row").length > 0'));
+        await js(`document.querySelector('.sp-row[data-speaker="${bar.speaker}"] [data-stats]').click()`);
+        await waitFor('the person page', async () => js('window.__recallDebug.view() === "person"'));
+        assert(await js('!!document.getElementById("person-brief")'), 'the person page offers no Brief');
+        await js('document.getElementById("person-brief").click()');
+        const asked = await waitFor(
+          'the brief from the person page',
+          async () => {
+            const b = await js('window.__recallDebug.brief()');
+            return b.shown ? b : null;
+          },
+          { timeout: 10000 }
+        );
+        await js('document.getElementById("brief-dismiss").click()');
+        await waitFor('the brief to go again', async () => js('!window.__recallDebug.brief().shown'));
+        await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+        return { text: bar.text.slice(0, 120), fromPage: asked.text.slice(0, 60), file };
+      });
+    }
 
     // 12 — sources: default-deny visuals and a live toggle
     await step('sources-toggle', async () => {

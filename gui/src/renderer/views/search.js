@@ -5,10 +5,11 @@
 // moment and highlights it, because "what did she say about that world?" is
 // answered by the conversation, not by the matching line on its own.
 
-import { h, clear, fmtClock, fmtDay, fmtDate, speakerColor } from '../lib/dom.js';
-import { store, speakerLabel, segmentSpeakerLabel, isUncertain, ask } from '../lib/store.js';
+import { h, clear, fmtClock, fmtDay, fmtDayLabel, fmtDate, speakerColor } from '../lib/dom.js';
+import { store, speakerLabel, segmentSpeakerLabel, isUncertain, isShaky, ask } from '../lib/store.js';
+import { shakyMark } from '../lib/marks.js';
 import { toast } from '../lib/sheets.js';
-import { defaultMode, modeControl, requestFor, resultSummary, semanticState, viaBadge } from './semantic.js';
+import { defaultMode, modeControl, modeById, requestFor, resultSummary, semanticState, viaBadge } from './semantic.js';
 
 export const id = 'search';
 
@@ -30,6 +31,15 @@ const facetState = {
   // `null` until the first mount, then whichever mode the daemon can serve.
   // Sticky like the rest of the facets: a person who chose Keyword meant it.
   mode: null,
+  // 0.8.0. The manual facets did not go away — they went BEHIND something. The
+  // front door is one box you ask a question in; this is whether the drawer of
+  // dropdowns under it is open, and it is sticky because a person who opened it
+  // is working that way for the afternoon.
+  advanced: false,
+  // The last `search.ask` interpretation, or null when the query that produced
+  // the results on screen was an explicit one. It is what the pills are drawn
+  // from, and clearing a pill edits it and re-runs.
+  asked: null,
 };
 let lastHits = [];
 
@@ -50,18 +60,32 @@ export function mount(root, ctx) {
     onSelect: (id) => {
       facetState.mode = id;
       modes.paint(id);
-      if (facetState.q) run();
+      // Whichever path put the results on screen is the one that re-runs: a
+      // mode change must not silently throw away an interpretation.
+      if (!facetState.q) return;
+      if (facetState.asked) {
+        facetState.asked.mode = id === 'both' ? 'hybrid' : id === 'smart' ? 'semantic' : 'keyword';
+        renderPills();
+        void rerunAsked();
+      } else {
+        void run();
+      }
     },
   });
 
+  // The front door (0.8.0). It used to be a field called Query with four
+  // dropdowns beside it, which meant the first thing the app asked a person who
+  // wanted to remember something was to decompose their question into facets.
+  // Now they type the question and press Enter, the daemon says what it
+  // understood, and the pills below are where they disagree with it.
   const qInput = h('input', {
     class: 'input',
     id: 'search-q',
     type: 'search',
-    placeholder: 'e.g. portal world',
+    placeholder: 'ask it — “what did Kira say yesterday about the portal”',
     value: facetState.q,
     onkeydown: (e) => {
-      if (e.key === 'Enter') run();
+      if (e.key === 'Enter') runAsk();
     },
   });
 
@@ -84,18 +108,56 @@ export function mount(root, ctx) {
     sourceSel.value = facetState.source;
   }
 
+  // What the daemon understood, as pills you can take off. It sits between the
+  // box and the results because that is where the answer to "why these
+  // results?" belongs — after the question, before the answer.
+  const pills = h('div', { class: 'ask-pills', id: 'ask-pills', hidden: true });
+
+  const advancedBtn = h(
+    'button',
+    {
+      class: 'btn',
+      id: 'search-advanced',
+      'aria-expanded': String(facetState.advanced),
+      'aria-controls': 'search-facets',
+      title: 'The speaker, source and date facets, set by hand',
+      onclick: () => {
+        facetState.advanced = !facetState.advanced;
+        paintAdvanced();
+      },
+    },
+    'Advanced'
+  );
+
+  // The front door: one box, one button, and a drawer.
+  const askRow = h(
+    'div',
+    { class: 'facets ask-row' },
+    h('div', { class: 'facet grow' }, h('label', { for: 'search-q', text: 'Ask' }), qInput),
+    h('div', { class: 'facet' }, h('label', { text: ' ' }), h('button', { class: 'btn primary', id: 'search-ask', onclick: () => runAsk() }, 'Ask')),
+    h('div', { class: 'facet' }, h('label', { text: ' ' }), advancedBtn)
+  );
+
+  function paintAdvanced() {
+    facets.hidden = !facetState.advanced;
+    advancedBtn.setAttribute('aria-expanded', String(facetState.advanced));
+  }
+
+  // Unchanged, and deliberately: the manual facets are still the whole
+  // vocabulary of the old view, still sticky, still exactly where somebody who
+  // learned them left them. They are merely no longer the first thing anybody
+  // has to read.
   const facets = h(
     'div',
-    { class: 'facets' },
-    h('div', { class: 'facet grow' }, h('label', { for: 'search-q', text: 'Query' }), qInput),
+    { class: 'facets', id: 'search-facets', hidden: !facetState.advanced },
     h('div', { class: 'facet' }, h('label', { for: 'search-speaker', text: 'Speaker' }), speakerSel),
     h('div', { class: 'facet' }, h('label', { for: 'search-source', text: 'Source' }), sourceSel),
     h('div', { class: 'facet' }, h('label', { for: 'search-from', text: 'From' }), fromInput),
     h('div', { class: 'facet' }, h('label', { for: 'search-to', text: 'To' }), toInput),
-    h('div', { class: 'facet' }, h('label', { text: ' ' }), h('button', { class: 'btn primary', id: 'search-go', onclick: () => run() }, 'Search'))
+    h('div', { class: 'facet' }, h('label', { text: ' ' }), h('button', { class: 'btn', id: 'search-go', onclick: () => run() }, 'Search'))
   );
 
-  const body = h('div', { class: 'view-body view-enter' }, h('div', { class: 'card' }, facets, modes.el), resultCard);
+  const body = h('div', { class: 'view-body view-enter' }, h('div', { class: 'card' }, askRow, pills, facets, modes.el), resultCard);
   root.append(
     h('div', { class: 'view-head' }, h('div', {}, h('h1', { text: 'Search' }), sub), h('div', { class: 'spacer' })),
     body
@@ -103,7 +165,180 @@ export function mount(root, ctx) {
 
   // -- run ------------------------------------------------------------------
 
+  /**
+   * The question path (0.8.0). One request: the daemon parses the sentence,
+   * runs the search with what it found, and hands back BOTH — so this never
+   * has to guess at what it understood, and never disagrees with it.
+   *
+   * A daemon too old to know the method is not an error worth a red box: the
+   * words are still a perfectly good keyword query, so it falls through to the
+   * explicit path and says so once.
+   */
+  async function runAsk() {
+    facetState.q = qInput.value;
+    if (!facetState.q.trim()) {
+      facetState.asked = null;
+      renderPills();
+      return run();
+    }
+    try {
+      const res = await ask('search.ask', { q: facetState.q, limit: 100 });
+      facetState.asked = res.interpretation ?? null;
+      // The mode the daemon chose is the mode the toggle now shows: the control
+      // must never claim one thing while the results came from another.
+      if (facetState.asked?.mode) {
+        facetState.mode = modeIdOf(facetState.asked.mode);
+        modes.paint(facetState.mode);
+      }
+      lastHits = res.hits ?? [];
+      renderPills();
+      renderHits(res);
+    } catch (e) {
+      if (e.code === 'unknown_method') {
+        facetState.asked = null;
+        renderPills();
+        toast('This daemon cannot read a question yet — searching for those words instead.', '');
+        return run();
+      }
+      facetState.asked = null;
+      renderPills();
+      clear(results);
+      results.append(
+        h('div', { class: 'empty' }, h('b', { text: 'That question could not be asked' }), h('p', { text: `${e.message}. The daemon may be restarting — try again in a moment.` }))
+      );
+    }
+    return undefined;
+  }
+
+  /**
+   * Re-run with the interpretation as it now stands — what taking a pill off
+   * does. Deliberately the EXPLICIT call rather than `search.ask` again: the
+   * whole point of removing a facet is that the daemon's reading of the
+   * sentence was wrong, so asking it to read the same sentence again would put
+   * the facet straight back.
+   */
+  async function rerunAsked() {
+    const it = facetState.asked;
+    if (!it) return run();
+    const params = { q: it.query ?? '', limit: 100 };
+    if (it.speaker_id != null) params.speaker = it.speaker_id;
+    if (it.from_ns) params.from = new Date(nsToMs(it.from_ns)).toISOString();
+    if (it.to_ns) params.to = new Date(nsToMs(it.to_ns)).toISOString();
+    // An empty query with facets is a browse, and only the keyword leg can
+    // answer one — `search.semantic` has nothing to embed.
+    const modeId = params.q.trim() ? modeIdOf(it.mode) : 'keyword';
+    try {
+      const [method, p] = requestFor(modeId, params);
+      const res = await ask(method, p);
+      lastHits = res.hits ?? [];
+      renderPills();
+      renderHits(res, modeId);
+    } catch (e) {
+      clear(results);
+      results.append(
+        h('div', { class: 'empty' }, h('b', { text: 'Search failed' }), h('p', { text: e.message }))
+      );
+    }
+    return undefined;
+  }
+
+  // -- the interpretation, as pills ------------------------------------------
+
+  function nsToMs(ns) {
+    return Math.round(Number(ns) / 1e6);
+  }
+
+  /** The wire's mode names, in this view's vocabulary. */
+  function modeIdOf(mode) {
+    return mode === 'hybrid' ? 'both' : mode === 'semantic' ? 'smart' : 'keyword';
+  }
+
+  /**
+   * What to call the time facet. The contract carries instants, not the phrase
+   * that produced them (PROTOCOL) — which is the right call, because "yesterday"
+   * stops being true at midnight and an instant does not. So the label is
+   * derived here: a range that is exactly one day gets that day's name, and
+   * anything else says its ends.
+   */
+  function timeLabel(it) {
+    const from = it.from_ns ? nsToMs(it.from_ns) : null;
+    const to = it.to_ns ? nsToMs(it.to_ns) : null;
+    if (from != null && to != null) {
+      const oneDay = Math.abs(to - from - 86_400_000) < 60_000;
+      if (oneDay) return fmtDayLabel(from).split(' · ')[0].toLowerCase();
+      return `${fmtDay(from)} → ${fmtDay(to - 1)}`;
+    }
+    if (from != null) return `since ${fmtDay(from)}`;
+    return `until ${fmtDay(to)}`;
+  }
+
+  function renderPills() {
+    clear(pills);
+    const it = facetState.asked;
+    pills.hidden = !it;
+    if (!it) return;
+
+    const pill = (key, label, title, drop) =>
+      h(
+        'span',
+        { class: 'ask-pill', dataset: { facet: key }, title },
+        h('span', { class: 'ask-pill-text', text: label }),
+        h(
+          'button',
+          {
+            class: 'ask-pill-x',
+            dataset: { drop: key },
+            'aria-label': `Search again without ${label}`,
+            title: `Search again without ${label}`,
+            onclick: () => {
+              drop();
+              void rerunAsked();
+            },
+          },
+          '✕'
+        )
+      );
+
+    pills.append(h('span', { class: 'ask-pills-label', text: 'understood as' }));
+    if (it.query) {
+      // Not removable: with the words gone there is no question left, only
+      // facets — and the box above is where you change the words.
+      pills.append(
+        h('span', { class: 'ask-pill fixed', dataset: { facet: 'query' }, title: 'The words that were searched for' },
+          h('span', { class: 'ask-pill-text', text: `“${it.query}”` }))
+      );
+    }
+    if (it.speaker_id != null) {
+      pills.append(
+        pill('speaker', it.speaker_label || speakerLabel(it.speaker_id), 'Only this voice — press ✕ to search everybody', () => {
+          delete facetState.asked.speaker_id;
+          delete facetState.asked.speaker_label;
+        })
+      );
+    }
+    if (it.from_ns || it.to_ns) {
+      pills.append(
+        pill('time', timeLabel(it), 'Only this stretch of time — press ✕ to search all of it', () => {
+          delete facetState.asked.from_ns;
+          delete facetState.asked.to_ns;
+        })
+      );
+    }
+    pills.append(
+      pill('mode', modeById(modeIdOf(it.mode)).label, 'How it searched — press ✕ to fall back to the words alone', () => {
+        facetState.asked.mode = 'keyword';
+        facetState.mode = 'keyword';
+        modes.paint('keyword');
+      })
+    );
+  }
+
   async function run() {
+    // An explicit search is a different question from the one that was asked,
+    // so the pills go: leaving them up would explain results they did not
+    // produce, which is worse than explaining nothing.
+    facetState.asked = null;
+    renderPills();
     facetState.q = qInput.value;
     facetState.speaker = speakerSel.value;
     facetState.source = sourceSel.value;
@@ -138,9 +373,9 @@ export function mount(root, ctx) {
     }
   }
 
-  function renderHits(res) {
+  function renderHits(res, modeId = facetState.mode) {
     clear(results);
-    sub.textContent = resultSummary(facetState.mode, res, facetState.q);
+    sub.textContent = resultSummary(modeId, res, facetState.asked?.query ?? facetState.q);
     if (!lastHits.length) {
       results.append(
         h(
@@ -152,18 +387,24 @@ export function mount(root, ctx) {
               facetState.mode === 'keyword'
                 ? 'Try fewer words, or Smart search if you cannot remember them — search only covers what has been captured on allowed sources.'
                 : 'Try describing it differently, or widen the speaker and date facets — search only covers what has been captured on allowed sources.',
-          })
+          }),
+          // The pills above are not decoration here: an empty answer to a
+          // question is almost always one facet too many, and this says which
+          // ones are on and where to take them off.
+          facetState.asked
+            ? h('p', { class: 'sub', text: 'Or take one of the pills above off — the daemon may have read more into the question than you meant.' })
+            : null
         )
       );
       return;
     }
-    for (const seg of lastHits) results.append(hitRow(seg));
+    for (const seg of lastHits) results.append(hitRow(seg, modeId));
   }
 
-  function hitRow(seg) {
+  function hitRow(seg, modeId = facetState.mode) {
     const color = speakerColor(seg.speaker);
     const row = h('div', {
-      class: `seg${isUncertain(seg) ? ' uncertain' : ''}`,
+      class: `seg${isUncertain(seg) ? ' uncertain' : ''}${isShaky(seg) ? ' shaky' : ''}`,
       dataset: { hit: String(seg.id) },
       role: 'button',
       tabindex: '0',
@@ -187,9 +428,12 @@ export function mount(root, ctx) {
       h(
         'span',
         { class: 'meta' },
+        // The same mark the transcript uses, for the same reason: a result you
+        // are about to trust is entitled to say a second decoder did not.
+        isShaky(seg) ? shakyMark() : null,
         // Only in Both: in the single-leg modes every row arrived the same way
         // and a badge on all of them says nothing.
-        facetState.mode === 'both' ? viaBadge(seg.via) : null,
+        modeId === 'both' ? viaBadge(seg.via) : null,
         h('span', { class: 'chip', text: seg.source ?? 'unknown' })
       )
     );
@@ -229,6 +473,8 @@ export function mount(root, ctx) {
   }
 
   fillFacets();
+  paintAdvanced();
+  renderPills();
   if (facetState.q || facetState.speaker || facetState.source) run();
   else
     results.append(
