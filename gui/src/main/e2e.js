@@ -1586,20 +1586,31 @@ export function runE2E(deps) {
       // a sheet that offers a name field under the picker; Enter names it and
       // the daemon's relabel broadcast repaints the row. A named voice gets no
       // such offer here — renaming stays on the Speakers page.
-      const target = await js(`(() => {
+      // The live window may hold nothing by an unnamed voice (the mock's tail
+      // is mostly named people talking), so the driver makes one: the newest
+      // row is reassigned to an unnamed voice first and put back at the end.
+      const setup = await js(`(() => {
         const s = window.__recallDebug.store;
         const rows = [...document.querySelectorAll('#seg-list .seg')];
-        const row = rows.reverse().find((r) => {
-          const seg = s.segById.get(Number(r.dataset.seg));
-          const sp = seg && seg.speaker != null ? s.speakers.get(seg.speaker) : null;
-          return sp && !sp.name;
-        });
-        if (!row) return null;
-        row.click();
+        const row = rows[rows.length - 1];
         const seg = s.segById.get(Number(row.dataset.seg));
-        return { id: seg.id, speaker: seg.speaker, label: row.querySelector('.who')?.textContent ?? row.textContent.slice(0, 40) };
+        const unnamed = [...s.speakers.values()].find((sp) => !sp.name && !sp.you);
+        return unnamed && seg ? { id: seg.id, was: seg.speaker ?? null, speaker: unnamed.id } : null;
       })()`);
-      assert(target, 'no row by an unnamed voice in the live window');
+      assert(setup, 'the mock has no unnamed voice to name');
+      await js(`window.recall.request('segments.reassign', { segment_id: ${setup.id}, speaker_id: ${setup.speaker} })`);
+      const target = await waitFor('the reassigned row', async () => {
+        const v = await js(`(() => {
+          const s = window.__recallDebug.store;
+          const seg = s.segById.get(${setup.id});
+          if (!seg || seg.speaker !== ${setup.speaker}) return null;
+          const row = document.querySelector('#seg-list .seg[data-seg="${setup.id}"]');
+          if (!row) return null;
+          row.click();
+          return { id: seg.id, speaker: seg.speaker, was: ${setup.was === null ? 'null' : setup.was} };
+        })()`);
+        return v;
+      });
       await waitFor('the sheet', async () => js('!!document.querySelector(".sheet #segment-text")'));
       const before = await js('window.__recallDebug.accuracy()');
       assert(before.sheet.nameOffered, 'the sheet did not offer to name the voice');
@@ -1621,8 +1632,9 @@ export function runE2E(deps) {
         return v.name === name && v.row.includes(name) ? v : null;
       });
       assert(!named.offered, 'the offer stayed up after the voice was named');
-      // Put the fixture back so later steps meet the voice they expect.
+      // Put the fixture back so later steps meet the voice and the row they expect.
       await js(`window.recall.request('speakers.name', { id: ${target.speaker}, name: '' })`);
+      await js(`window.recall.request('segments.reassign', { segment_id: ${target.id}, speaker_id: ${target.was === null ? 'null' : target.was} })`);
       await js('document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))');
       return { segment: target.id, speaker: target.speaker, named: name };
     });
