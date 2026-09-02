@@ -363,29 +363,28 @@ impl Vk {
                     unsafe extern "system" fn(
                         openxr::sys::platform::VkInstance,
                         *const std::os::raw::c_char,
-                    ) -> Option<unsafe extern "system" fn()>,
+                    )
+                        -> Option<unsafe extern "system" fn()>,
                 >(entry.static_fn().get_instance_proc_addr),
                 &instance_ci as *const _ as *const _,
             )
         }?
         .map_err(|e| anyhow::anyhow!("the runtime could not create a VkInstance: {e}"))?;
         let instance = unsafe {
-            ash::Instance::load(
-                entry.static_fn(),
-                vk::Instance::from_raw(raw_instance as _),
-            )
+            ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(raw_instance as _))
         };
 
         let physical = vk::PhysicalDevice::from_raw(unsafe {
             xr.vulkan_graphics_device(system, instance.handle().as_raw() as _)
         }? as _);
 
-        let queue_family = unsafe { instance.get_physical_device_queue_family_properties(physical) }
-            .iter()
-            .enumerate()
-            .find(|(_, p)| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-            .map(|(i, _)| i as u32)
-            .context("the device OpenXR chose has no graphics queue")?;
+        let queue_family =
+            unsafe { instance.get_physical_device_queue_family_properties(physical) }
+                .iter()
+                .enumerate()
+                .find(|(_, p)| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                .map(|(i, _)| i as u32)
+                .context("the device OpenXR chose has no graphics queue")?;
 
         let priorities = [1.0f32];
         let queue_ci = [vk::DeviceQueueCreateInfo::default()
@@ -400,16 +399,16 @@ impl Vk {
                     unsafe extern "system" fn(
                         openxr::sys::platform::VkInstance,
                         *const std::os::raw::c_char,
-                    ) -> Option<unsafe extern "system" fn()>,
+                    )
+                        -> Option<unsafe extern "system" fn()>,
                 >(entry.static_fn().get_instance_proc_addr),
                 physical.as_raw() as _,
                 &device_ci as *const _ as *const _,
             )
         }?
         .map_err(|e| anyhow::anyhow!("the runtime could not create a VkDevice: {e}"))?;
-        let device = unsafe {
-            ash::Device::load(instance.fp_v1_0(), vk::Device::from_raw(raw_device as _))
-        };
+        let device =
+            unsafe { ash::Device::load(instance.fp_v1_0(), vk::Device::from_raw(raw_device as _)) };
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
 
@@ -490,7 +489,8 @@ impl Upload {
                     .allocation_size(req.size)
                     .memory_type_index(vk.memory_type(
                         req.memory_type_bits,
-                        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
                     )?),
                 None,
             )

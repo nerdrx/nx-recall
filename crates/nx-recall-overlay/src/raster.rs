@@ -193,7 +193,11 @@ impl Renderer {
                         .as_deref()
                         .map(|l| format!("{}  ", l.to_uppercase()))
                         .unwrap_or_default();
-                    self.wrap(&format!("{prefix}{text}"), tr_size, inner - name_w - DOT_COLUMN)
+                    self.wrap(
+                        &format!("{prefix}{text}"),
+                        tr_size,
+                        inner - name_w - DOT_COLUMN,
+                    )
                 })
                 .unwrap_or_default();
             let height = self.style.pad * 2
@@ -270,7 +274,15 @@ impl Renderer {
         }
     }
 
-    fn draw_text(&self, s: &mut Surface, text: &str, x: i64, baseline: i64, size: f32, rgb: [u8; 3]) {
+    fn draw_text(
+        &self,
+        s: &mut Surface,
+        text: &str,
+        x: i64,
+        baseline: i64,
+        size: f32,
+        rgb: [u8; 3],
+    ) {
         let mut pen = x;
         for ch in text.chars() {
             let (metrics, bitmap) = self.font.rasterize(self.glyph(ch), size);
@@ -482,7 +494,11 @@ mod tests {
         let x = r.style.pad + 4;
         let y = s.height as i64 - r.style.pad - 4;
         let at = ((y as usize) * (s.width as usize) + x as usize) * 4;
-        assert_eq!(&s.pixels[at..at + 3], &GROUND, "the ground is not deep space");
+        assert_eq!(
+            &s.pixels[at..at + 3],
+            &GROUND,
+            "the ground is not deep space"
+        );
         assert!(
             s.pixels[at + 3] > 220,
             "0.9 opacity produced alpha {}",

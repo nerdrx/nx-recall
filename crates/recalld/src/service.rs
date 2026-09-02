@@ -129,6 +129,12 @@ pub fn segment_json(row: &SegmentRow) -> Value {
         // looked, which is the state of every row on a machine that has not run
         // `models fetch --confidence`.
         "asr_confidence": row.asr_confidence,
+        // Schema v11 (0.9.0): what the overnight third decoder read, present on
+        // a row the night shift has reached and null everywhere else. It is an
+        // annotation, not a transcript — a client shows it as "the night shift
+        // read:" beside the words, and where the vote did replace them
+        // `text_via` says `"night"` and this carries the same string.
+        "night_text": row.night_text,
     })
 }
 
@@ -429,6 +435,14 @@ impl Service {
             .as_ref()
             .map(|root| crate::models::ConfidenceModel::resolve_at(root.clone(), 1))
             .is_some_and(|m| m.present());
+        let night = self.control.night();
+        let night_available = self
+            .control
+            .models_root
+            .as_ref()
+            .map(|root| crate::models::NightModels::resolve_at(root.clone(), &night))
+            .is_some_and(|m| m.present());
+        let stats = &self.control.night_stats;
         json!({
             "context_redecode": cfg.context_redecode,
             "context_redecode_below_s": cfg.context_redecode_below_s,
@@ -443,6 +457,25 @@ impl Service {
             // a glossary screen must not imply an effect the daemon does not
             // have (`crate::vocab`, `spike/hotwords_bench.py`).
             "vocab_applied_to_decoder": false,
+            // The night shift (0.9.0). Always present and always the same
+            // shape, like the confidence block above it: "the GPU decoder is
+            // not built" and "an older daemon" have to be distinguishable, and
+            // a missing key says neither. `replace` is the measured switch —
+            // false means the night reading is stored as `night_text` and shown
+            // beside the row rather than written over it.
+            "night": {
+                "enabled": night.enabled,
+                "available": night_available,
+                "window": night.window,
+                "gpu_busy_max_pct": night.gpu_busy_max_pct,
+                "replace": night.replace,
+                "how": (!night_available).then(crate::models::NightModels::how_to_get_it),
+                "phase": stats.phase().as_str(),
+                "replaced": stats.replaced.load(Ordering::Relaxed),
+                "annotated": stats.annotated.load(Ordering::Relaxed),
+                "skipped_busy": stats.skipped_busy.load(Ordering::Relaxed),
+                "last_run_ms": stats.last_run_ms.load(Ordering::Relaxed),
+            },
         })
     }
 

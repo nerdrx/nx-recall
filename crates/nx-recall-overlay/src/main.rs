@@ -100,10 +100,7 @@ struct Args {
 
 /// `--render`: one frame, from the real daemon, to a file. No OpenXR.
 fn render_once(args: &Args, out: &std::path::Path) -> Result<()> {
-    let path = args
-        .socket
-        .clone()
-        .unwrap_or_else(feed::default_socket);
+    let path = args.socket.clone().unwrap_or_else(feed::default_socket);
     let mut f = feed::Feed::connect(&path)?;
     let mut caps = feed::Captions::new(args.turns);
     if let Ok(list) = f.call("speakers.list", serde_json::json!({})) {
@@ -226,7 +223,10 @@ fn pump(
     if let Ok(tail) = f.call("transcript", serde_json::json!({"limit": 1})) {
         caps.seed_tail(&tail);
     }
-    f.call("subscribe", serde_json::json!({"topics": ["segments", "relabel"]}))?;
+    f.call(
+        "subscribe",
+        serde_json::json!({"topics": ["segments", "relabel"]}),
+    )?;
     loop {
         let msg = f.read()?;
         let changed = match msg["ev"].as_str() {

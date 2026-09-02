@@ -25,6 +25,7 @@ use recalld::control::Control;
 use recalld::enrich::{self, EnrichStop};
 use recalld::fetch;
 use recalld::models::{self, AsrSelection, EntryState, GraphModels, Group, ModelSet};
+use recalld::night::{self, NightStop};
 use recalld::pipeline::{self, Pipeline, Stats};
 use recalld::quality::{self, QualityStop};
 use recalld::queue::EventQueue;
@@ -37,8 +38,8 @@ use recalld::truth::{self, TruthStats, TruthStop};
 use recalld::truthnet;
 
 use crate::cli::{
-    Cli, Command, GraphAction, LangAction, MicAction, ModelsAction, NotesAction, SemanticAction,
-    SpeakersAction, TruthAction,
+    Cli, Command, GraphAction, LangAction, MicAction, ModelsAction, NightBackend, NotesAction,
+    SemanticAction, SpeakersAction, TruthAction,
 };
 
 fn main() -> Result<()> {
@@ -82,6 +83,7 @@ fn main() -> Result<()> {
                 graph,
                 arbiter_de,
                 confidence,
+                night,
                 semantic,
                 no_config,
             } => cmd_models_fetch(
@@ -96,10 +98,17 @@ fn main() -> Result<()> {
                     semantic,
                     arbiter_de,
                     confidence,
+                    night,
                     single_stream: false,
                 },
                 no_config,
             ),
+            ModelsAction::BuildNight {
+                dir,
+                backend,
+                force,
+                jobs,
+            } => cmd_build_night(&cfg, &data_dir, dir.as_deref(), backend, force, jobs),
         },
         Command::Speakers { action } => match action {
             None => cmd_speakers(&data_dir),
@@ -265,7 +274,8 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     // The memory graph's Tier 3 switch is live, like the microphone's.
     .with_graph(cfg.graph.clone(), models_root.clone())
     // …and the accuracy round's idle worker reads its switches the same way.
-    .with_asr(cfg.asr.clone());
+    .with_asr(cfg.asr.clone())
+    .with_night(cfg.night.clone());
     // The ids clients see must be the ids that will be written on segments, so
     // resolve the ASR fallback here exactly as the pipeline does.
     if let Some(mut models) = ModelSet::resolve(&cfg.models) {
@@ -476,6 +486,24 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         token_path: truth_token_path,
     }));
     // ---- end 0.9.0 --------------------------------------------------------
+    // The night shift (0.9.0). Started like the two workers above it — the
+    // switch is live, and every gate it has is re-read on its own loop.
+    let night_stop = Arc::new(NightStop::default());
+    let night_thread = {
+        let store = Arc::clone(&store);
+        let control = Arc::clone(&control);
+        let bus = Arc::clone(&bus);
+        let root = models_root.clone();
+        let dir = data_dir.to_path_buf();
+        let stats = Arc::clone(&control.night_stats);
+        let stop = Arc::clone(&night_stop);
+        let runtime = cfg.runtime.clone();
+        std::thread::Builder::new()
+            .name("recalld-night".into())
+            .spawn(move || night::run(store, control, bus, root, dir, runtime, stats, stop))
+            .map_err(|e| warn!("no night shift: {e}"))
+            .ok()
+    };
 
     let sweeper_stop = Arc::new(SweeperStop::default());
     let sweeper_thread = if cfg.retention.enabled {
@@ -519,6 +547,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     enrich_stop.stop();
     quality_stop.stop();
     truth_stop.stop();
+    night_stop.stop();
     if let Some(s) = socket {
         s.shutdown();
     }
@@ -531,6 +560,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         enrich_thread,
         quality_thread,
         truth_thread,
+        night_thread,
     ]
     .into_iter()
     .flatten()
@@ -882,6 +912,40 @@ fn cmd_models_status(
         println!("  {}", models::ConfidenceModel::how_to_get_it());
     }
 
+    // The night shift (0.9.0). Reported in two halves because they fail
+    // differently: the model is a byte-verified download, and the runtime is
+    // compiled on this machine — so "not built" is a normal state with a
+    // different remedy from "not downloaded".
+    let night = models::NightModels::resolve_at(models.root.clone(), &cfg.night);
+    println!();
+    if night.present() {
+        println!("night shift:        on   ({})", night.model_id());
+        println!("  {:<14}  {}", "night.runtime", night.cli.display());
+    } else {
+        println!(
+            "night shift:        off  (optional — model {}, runtime {})",
+            if night.model_present() {
+                "here"
+            } else {
+                "missing"
+            },
+            if night.runtime_present() {
+                "built"
+            } else {
+                "not built"
+            }
+        );
+        println!("  {}", models::NightModels::how_to_get_it());
+    }
+    for e in night.entries() {
+        println!(
+            "  {:<14}  {:>10}  {}",
+            e.role,
+            e.bytes().map(fetch::human).unwrap_or_else(|| "-".into()),
+            e.path.display()
+        );
+    }
+
     if selection == AsrSelection::Fallback {
         // The set is complete and analysis will run — but on the English-only
         // model, which is a 103% WER answer to a German lobby. Say so before
@@ -1003,6 +1067,184 @@ fn cmd_models_fetch(
     let mut effective = cfg.clone();
     effective.models.dir = Some(root);
     cmd_models_status(&effective, data_dir, None, true)
+}
+
+/// Build the night shift's decoder (0.9.0).
+///
+/// **This one compiles, and it says so.** Every other asset in this program is
+/// a byte-verified download; whisper.cpp publishes no release binary with a GPU
+/// backend for an AMD card, so a `whisper-cli` that can use the 7900 XTX in
+/// this machine has to be built on it. The recipe is pinned to a tag for the
+/// same reason a download is pinned to a byte count.
+///
+/// Everything happens under the models directory and nothing is installed
+/// system-wide. The build runs at nice 19 on half the machine's cores, because
+/// a build that takes the whole box is a build nobody starts twice.
+fn cmd_build_night(
+    cfg: &Config,
+    data_dir: &Path,
+    dir: Option<&Path>,
+    backend: NightBackend,
+    force: bool,
+    jobs: Option<usize>,
+) -> Result<()> {
+    use std::process::Command as Proc;
+
+    let root = fetch::target_dir(dir, &cfg.models, data_dir);
+    let install = root.join(models::NIGHT_DIR);
+    let cli_path = install.join("whisper-cli");
+    if cli_path.is_file() && !force {
+        println!(
+            "{} is already built. `--force` rebuilds it.",
+            cli_path.display()
+        );
+        return Ok(());
+    }
+    let src = root.join("whisper.cpp-src");
+    let build = src.join(format!("build-{}", backend.as_str()));
+    let jobs = jobs.unwrap_or_else(|| (num_cpus().max(2) / 2).max(1));
+
+    println!("models dir:  {}", root.display());
+    println!(
+        "source:      {} @ {}",
+        src.display(),
+        models::NIGHT_WHISPER_TAG
+    );
+    println!("backend:     {}", backend.as_str());
+    println!("jobs:        {jobs} (nice 19)\n");
+
+    std::fs::create_dir_all(&root)?;
+    if !src.join(".git").is_dir() {
+        run_step(
+            "cloning whisper.cpp",
+            Proc::new("git")
+                .arg("clone")
+                .arg("--depth")
+                .arg("1")
+                .arg("--branch")
+                .arg(models::NIGHT_WHISPER_TAG)
+                .arg("https://github.com/ggml-org/whisper.cpp.git")
+                .arg(&src),
+        )?;
+    } else {
+        run_step(
+            "checking out the pinned tag",
+            Proc::new("git").current_dir(&src).args([
+                "checkout",
+                "--quiet",
+                models::NIGHT_WHISPER_TAG,
+            ]),
+        )?;
+    }
+
+    let mut configure = Proc::new("cmake");
+    configure
+        .arg("-S")
+        .arg(&src)
+        .arg("-B")
+        .arg(&build)
+        .arg("-DCMAKE_BUILD_TYPE=Release")
+        .arg("-DWHISPER_BUILD_TESTS=OFF")
+        .arg("-DWHISPER_BUILD_SERVER=OFF");
+    match backend {
+        NightBackend::Vulkan => {
+            configure.arg("-DGGML_VULKAN=ON");
+        }
+        NightBackend::Hip => {
+            // hipBLAS and rocBLAS, which are a separate and much larger install
+            // than the HIP runtime: a machine with `hipcc` does not necessarily
+            // have them, and cmake's error when it does not is unhelpful enough
+            // to be worth naming here.
+            configure
+                .arg("-DGGML_HIP=ON")
+                .arg("-DAMDGPU_TARGETS=gfx1100")
+                .arg("-DCMAKE_HIP_ARCHITECTURES=gfx1100");
+        }
+        NightBackend::Cpu => {}
+    }
+    run_step("configuring", &mut configure)?;
+    run_step(
+        "building",
+        Proc::new("cmake")
+            .arg("--build")
+            .arg(&build)
+            .arg("-j")
+            .arg(jobs.to_string()),
+    )?;
+
+    // Install exactly what the daemon opens: the binary and the shared objects
+    // it loads. The build tree carries a dozen other programs, and this
+    // directory is on a machine's disk for as long as the feature is on.
+    std::fs::create_dir_all(&install)?;
+    let bin = build.join("bin");
+    let mut installed = 0usize;
+    for entry in std::fs::read_dir(&bin)
+        .with_context(|| format!("reading {}", bin.display()))?
+        .flatten()
+    {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "whisper-cli" || name.starts_with("lib") {
+            std::fs::copy(entry.path(), install.join(name.as_ref()))?;
+            installed += 1;
+        }
+    }
+    if !cli_path.is_file() {
+        anyhow::bail!(
+            "the build finished but {} is not there — look in {}",
+            cli_path.display(),
+            build.display()
+        );
+    }
+    println!("\n{installed} files installed into {}", install.display());
+    if backend == NightBackend::Cpu {
+        println!(
+            "NOTE: this is the CPU build. Large-v3 runs at roughly 17x real time on \
+             four cores (FINDINGS §11), which is why a CPU night shift was not shipped. \
+             Expect it to be too slow to finish a night's backlog."
+        );
+    }
+    let night = models::NightModels::resolve_at(root, &cfg.night);
+    if !night.model_present() {
+        println!(
+            "\nThe model is still missing: {}",
+            models::NightModels::how_to_get_it()
+        );
+    } else {
+        println!("\nBoth halves are here. `[night].enabled = true` turns the night shift on.");
+    }
+    Ok(())
+}
+
+/// One build step, with its output on the terminal: a fifteen-minute compile
+/// that prints nothing looks exactly like a hang.
+fn run_step(what: &str, cmd: &mut std::process::Command) -> Result<()> {
+    println!("== {what}");
+    // Same posture as every other heavy thing this program starts: nice 19, so
+    // a build cannot win a scheduling contest against whatever the person is
+    // actually doing.
+    // SAFETY: between fork and exec in a single-threaded child; one syscall,
+    // no allocation, no locks.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(cmd, || {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+            Ok(())
+        });
+    }
+    let status = cmd
+        .status()
+        .with_context(|| format!("{what} — is the tool installed?"))?;
+    if !status.success() {
+        anyhow::bail!("{what} failed ({})", status);
+    }
+    Ok(())
+}
+
+/// Cores this machine has, for the build's default job count.
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 fn cmd_speakers(data_dir: &Path) -> Result<()> {

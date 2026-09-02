@@ -94,7 +94,9 @@ impl Probe {
         println!();
         if self.overlay {
             println!("XR_EXTX_overlay: PRESENT — an overlay session is possible here.");
-            println!("Run `nx-recall-overlay --overlay` with an OpenXR application already running.");
+            println!(
+                "Run `nx-recall-overlay --overlay` with an OpenXR application already running."
+            );
         } else {
             println!("XR_EXTX_overlay: ABSENT.");
             println!();

@@ -78,7 +78,9 @@ impl Captions {
     /// Seed the speaker names, so the first caption is not "Speaker 12".
     pub fn learn_speakers(&mut self, list: &Value) {
         for sp in list["speakers"].as_array().into_iter().flatten() {
-            let Some(id) = sp["id"].as_i64() else { continue };
+            let Some(id) = sp["id"].as_i64() else {
+                continue;
+            };
             let name = sp["name"]
                 .as_str()
                 .or_else(|| sp["auto"].as_str())
@@ -362,7 +364,10 @@ mod tests {
     fn a_re_published_archive_row_is_not_news() {
         let mut caps = Captions::new(5);
         caps.seed_tail(&json!({"segments": [seg(100, 500_000)]}));
-        assert!(!caps.apply(&seg(1, 1000)), "an archive row became a caption");
+        assert!(
+            !caps.apply(&seg(1, 1000)),
+            "an archive row became a caption"
+        );
         assert_eq!(caps.turns().count(), 0);
         // …and the live turn right after it still lands.
         assert!(caps.apply(&seg(101, 500_100)));
@@ -408,7 +413,8 @@ mod tests {
         caps.apply(&seg(1, 1000));
         assert!(caps.turns().next().unwrap().translation.is_none());
         let mut translated = seg(2, 2000);
-        translated["translation"] = json!({"lang": "en", "text": "the same, in English", "via": "nllb-200"});
+        translated["translation"] =
+            json!({"lang": "en", "text": "the same, in English", "via": "nllb-200"});
         caps.apply(&translated);
         let t = caps.turns().last().unwrap();
         assert_eq!(

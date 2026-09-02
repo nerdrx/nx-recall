@@ -495,6 +495,14 @@ pub enum ModelsAction {
         #[arg(long)]
         confidence: bool,
 
+        /// Also install the night shift's GGML model (~1.03 GB, 0.9.0):
+        /// whisper-large-v3, read over the day's shaky rows on the GPU while
+        /// the machine is nobody's. Optional, and only half of what the night
+        /// shift needs — `recalld models build-night` compiles the runtime,
+        /// because upstream publishes no GPU-capable whisper-cli for this card.
+        #[arg(long)]
+        night: bool,
+
         /// Also install the text-embedding model that semantic search needs
         /// (~135 MB). Not part of the default set: keyword search works
         /// without it, and it is a feature you opt into rather than something
@@ -508,6 +516,61 @@ pub enum ModelsAction {
         #[arg(long)]
         no_config: bool,
     },
+
+    /// Build the night shift's GPU decoder from source (0.9.0).
+    ///
+    /// The one asset in this program that COMPILES rather than downloads, and
+    /// it is honest about why: whisper.cpp publishes no release binary with a
+    /// GPU backend for an AMD card, so a `whisper-cli` that can use one has to
+    /// be built on the machine that will run it. Needs git, cmake, a C++
+    /// compiler and either the Vulkan headers and glslc, or hipBLAS.
+    ///
+    /// Clones whisper.cpp at a pinned tag into the models directory, builds it,
+    /// and installs `whisper-cli` and its shared objects into
+    /// `<models>/whisper`. Safe to re-run: an existing binary is left alone
+    /// unless `--force` is given.
+    BuildNight {
+        /// Build into this directory instead of `[models].dir`.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+
+        /// The GPU backend to build. `vulkan` needs the Vulkan headers and
+        /// `glslc`; `hip` needs hipBLAS and rocBLAS, which are a much larger
+        /// install and are not present on every ROCm machine. `cpu` builds a
+        /// working binary at roughly 17x real time, which is why the night
+        /// shift was parked as a CPU feature in the first place — it exists
+        /// here for a machine with no usable GPU backend, and the daemon warns
+        /// when it is what got built.
+        #[arg(long, value_name = "BACKEND", default_value = "vulkan")]
+        backend: NightBackend,
+
+        /// Build even if `whisper-cli` is already installed.
+        #[arg(long)]
+        force: bool,
+
+        /// Parallel compile jobs. Defaults to half the machine's cores, at nice
+        /// 19: a build that takes the whole box is a build nobody starts twice.
+        #[arg(long, value_name = "N")]
+        jobs: Option<usize>,
+    },
+}
+
+/// Which whisper.cpp backend `models build-night` compiles.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NightBackend {
+    Vulkan,
+    Hip,
+    Cpu,
+}
+
+impl NightBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NightBackend::Vulkan => "vulkan",
+            NightBackend::Hip => "hip",
+            NightBackend::Cpu => "cpu",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]

@@ -494,6 +494,98 @@ impl Default for AsrConfig {
     }
 }
 
+// ---- the night shift (0.9.0) ---------------------------------------------
+
+/// A second reading of the day's shaky rows, on the GPU, while nobody is using
+/// the machine (`crate::night`).
+///
+/// **Off, and off is the default**, for two independent reasons. The model is a
+/// gigabyte that nothing else needs and the runtime has to be *compiled* on
+/// this machine (`recalld models build-night`); and the GPU it wants is the one
+/// drawing the user's frames. Turning it on is a decision about a machine, not
+/// a preference, which is why nothing here guesses.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NightConfig {
+    /// Run the night shift at all.
+    pub enabled: bool,
+    /// `HH:MM-HH:MM`, local time, wrapping over midnight. The hours the machine
+    /// is assumed to be nobody's — outside them the worker does not run even if
+    /// everything else is idle, because "the GPU looks free" and "the person is
+    /// not using their computer" are different claims and only the clock can
+    /// make the second one.
+    pub window: String,
+    /// Minutes of no capture activity after which the worker may also run
+    /// outside the window. Zero switches the idle path off entirely and leaves
+    /// only the clock.
+    pub also_when_idle_min: i64,
+    /// GPU utilisation, in percent, above which a batch does not start. Checked
+    /// before **every** batch, not once at the top of the night: a person who
+    /// sits down at 04:00 and puts a headset on gets the GPU back within one
+    /// batch. 50, not 20: amdgpu's busy counter reads 25–30 on a bare desktop
+    /// (compositing counts) and 90–100 in a VR session, so 50 separates the
+    /// two cases and 20 separated nothing (FINDINGS §13 addendum).
+    pub gpu_busy_max_pct: u32,
+    /// The most rows one night will re-read. A ceiling on a background job that
+    /// would otherwise walk the entire history the first time it is switched
+    /// on.
+    pub max_rows_per_night: usize,
+    /// Clips concatenated into one decode. The model load dominates a
+    /// two-second clip by two orders of magnitude, so the batch is the whole
+    /// reason this is affordable; the clips are butted together with
+    /// `gap_s` of silence and split apart again by offset.
+    pub batch_rows: usize,
+    /// Silence between two clips in a batch. One second: long enough that the
+    /// decoder does not run two turns into one sentence, short enough not to
+    /// invite a caption hallucination about the quiet.
+    pub gap_s: f32,
+    /// Ceiling on one decode, in seconds, after which the child is killed. A
+    /// batch of eight two-second clips takes a few seconds on the GPU; this is
+    /// sized for a cold model load on a spinning disk, and is finite because a
+    /// wedged child holding a GPU is worse than a lost batch.
+    pub timeout_s: u64,
+    /// The whisper.cpp binaries, relative to `[models].dir`. `whisper-cli` and
+    /// the shared objects it loads both live here, and `models build-night`
+    /// puts them there.
+    pub whisper_dir: String,
+    /// The GGML model, relative to `[models].dir`.
+    pub model: String,
+    /// Whether the vote may **replace** words, or only annotate them.
+    ///
+    /// **True, because it was measured** (`spike/night_vote_bench.py`,
+    /// FINDINGS §13): on 35 shaky lab spans with human references, the shipped
+    /// rule — two of three readings agreeing against the row, then the
+    /// arbiter's guards — cuts word error from 91.1% to 46.9% (48.6% relative)
+    /// and makes 1 of the 22 rows it touches worse. The gate was ≥30% relative
+    /// with under 5% of touched rows harmed, and that is the whole argument for
+    /// this default being what it is.
+    ///
+    /// It stays a switch because the other outcome is a real product rather
+    /// than a disabled feature: with it off the night reading is stored as
+    /// `night_text` and shown beside the row ("the night shift read: …"), and
+    /// the transcript is never touched. A person who does not want a machine
+    /// editing their evening's words gets the second opinion anyway.
+    pub replace: bool,
+}
+
+impl Default for NightConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window: "03:00-07:00".into(),
+            also_when_idle_min: 20,
+            gpu_busy_max_pct: 50,
+            max_rows_per_night: 400,
+            batch_rows: 8,
+            gap_s: 1.0,
+            timeout_s: 600,
+            whisper_dir: "whisper".into(),
+            model: "ggml-large-v3-q5_0.bin".into(),
+            replace: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -676,6 +768,8 @@ pub struct Config {
     pub lang: LangConfig,
     /// The accuracy round's idle worker (0.8.0).
     pub asr: AsrConfig,
+    /// The night shift (0.9.0).
+    pub night: NightConfig,
     pub graph: GraphConfig,
     pub socket: SocketConfig,
     pub roster: RosterConfig,
@@ -1014,6 +1108,42 @@ mod tests {
         assert_eq!(cfg.graph.llama_dir, "llama");
         assert_eq!(cfg.graph.min_thread_segments, 3);
         assert_eq!(cfg.graph.max_queue_seconds, 5);
+    }
+
+    /// The night shift's defaults carry two separate facts, and both are
+    /// assertions rather than comments: it does not run at all until somebody
+    /// turns it on, and the rule it would run is the one the bench measured
+    /// (FINDINGS §13) rather than a cautious guess.
+    #[test]
+    fn the_night_shift_is_off_but_its_measured_rule_is_armed() {
+        let cfg = Config::default();
+        assert!(!cfg.night.enabled);
+        assert!(
+            cfg.night.replace,
+            "the measured rule (FINDINGS §13) is allowed to replace; the gate was cleared"
+        );
+        assert_eq!(cfg.night.window, "03:00-07:00");
+        assert_eq!(cfg.night.also_when_idle_min, 20);
+        assert_eq!(cfg.night.gpu_busy_max_pct, 50);
+        assert_eq!(cfg.night.model, "ggml-large-v3-q5_0.bin");
+        assert_eq!(cfg.night.whisper_dir, "whisper");
+        assert_eq!(cfg.night.gap_s, 1.0);
+    }
+
+    #[test]
+    fn the_night_section_parses_and_keeps_the_remaining_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [night]
+            enabled = true
+            window = "02:30-06:15"
+            "#,
+        )
+        .expect("parses");
+        assert!(cfg.night.enabled);
+        assert_eq!(cfg.night.window, "02:30-06:15");
+        assert!(cfg.night.replace, "an unrelated key must not move this one");
+        assert_eq!(cfg.night.gpu_busy_max_pct, 50);
     }
 
     #[test]

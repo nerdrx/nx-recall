@@ -1131,3 +1131,100 @@ above this line changes, and `proto` stays `1`.
   they differ when the port was taken, and a client showing only the second
   would lie about a daemon that failed to bind.
 
+## 0.9.0 — the night shift
+
+A third reading of the day's *shaky* rows, decoded overnight on the GPU and
+applied — if at all — by a vote. Everything in this section is additive: a
+client that ignores it sees exactly the 0.8.x contract.
+
+**Why only shaky rows.** `spike/FINDINGS.md` §11 refused to ship an ensemble
+because three ASR models disagree with each other on about half of real lobby
+sentences and nothing said which to believe. §12 found the exception: on rows
+the cross-check already calls `shaky`, whisper-large-v3 disagrees with the live
+text 76% of the time against 27% on `solid` rows. The night shift is scoped to
+exactly that bucket, and to nothing else.
+
+### Segment rows and events
+
+- **`night_text`** (string or `null`) — what the overnight decoder read.
+  Present on any row the night shift has reached, **whether or not the vote
+  replaced anything**, and `null` everywhere else. It is an annotation, not a
+  transcript: a client shows it beside the words ("the night shift read: …"),
+  never instead of them.
+- **`text_via`** gains a fifth value, **`"night"`**. It appears only where the
+  vote actually replaced the words, and then `night_text` carries the same
+  string. `"live"`, `"context"`, `"arbiter"` and `null` are unchanged.
+
+A replacement re-publishes the segment event and follows the 0.8.1 rules
+without exception: an `operations` row `op: "segments.redecode"` with
+`prior_state: {segment_id, text, asr_model_id, text_via}`, the invalidated
+`asr_confidence` **cleared** (the verdict was about the words that are gone),
+and it is emphatically not a `segments.correct` — machine edits and people's
+edits stay distinguishable.
+
+An annotation changes nothing else at all: `text`, `text_via` and
+`asr_confidence` all stand, and no `operations` row is written. A client can
+therefore treat `night_text != null && text_via != "night"` as "a second
+opinion exists and was not acted on", which is the state most rows are in.
+
+### `status.asr.night`
+
+Always present, always this shape — "the GPU decoder is not built" and "an
+older daemon" have to be tellable apart, and a missing key says neither:
+
+```json
+"night": {
+  "enabled": false, "available": false,
+  "window": "03:00-07:00", "gpu_busy_max_pct": 20, "replace": true,
+  "how": "the night shift is not installed. `recalld models fetch --night` …",
+  "phase": "off", "replaced": 0, "annotated": 0,
+  "skipped_busy": 0, "last_run_ms": 0
+}
+```
+
+- `phase` — `off` (`[night].enabled` is false, the shipped state), `unavailable`
+  (the model, the built runtime or the cross-check decoder is missing),
+  `blocked` (a gate is shut: the clock, a pause, or a busy GPU), `idle` (nothing
+  left to read), `running`.
+- `replaced` / `annotated` — rows this daemon has rewritten and rows it has only
+  annotated, since start-up.
+- `skipped_busy` — batches not started because the GPU was over
+  `gpu_busy_max_pct`. A number that keeps climbing is not a fault; it is the
+  feature standing out of the way.
+- `last_run_ms` — wall time of the last batch.
+- `how` — non-null exactly when `available` is false, and it names both halves
+  of the install, because they are fetched differently (see below).
+
+### Two things a client should say out loud
+
+- **The runtime is compiled, not downloaded.** `recalld models fetch --night`
+  brings the GGML model (~1.03 GB); `recalld models build-night` clones
+  whisper.cpp at a pinned tag into the models directory and **builds** it, which
+  needs git, cmake, a C++ compiler and a GPU backend's headers. No GPU-capable
+  `whisper-cli` is published for an AMD card, so there is nothing to download.
+  This is the only asset in the program that behaves this way and a UI that
+  presents it as a download will be wrong for fifteen minutes.
+- **The night shift is off, and it is off for two independent reasons.** The
+  model is a gigabyte nothing else needs, and the GPU it wants is the one
+  drawing the user's frames. `[night]` carries the hours (`window`), an idle
+  fallback (`also_when_idle_min`), the GPU ceiling (`gpu_busy_max_pct`), a
+  nightly row budget, and `replace` — the switch between "the night shift may
+  rewrite a row" and "it may only annotate one". `replace` ships **true**
+  because the rule below was measured (FINDINGS §13: 91.1% → 46.9% word error
+  on shaky lab spans, 1 of 22 touched rows made worse, against a gate of ≥30%
+  relative and under 5% harmed). Turning it off is a supported choice and
+  leaves every `night_text` in place.
+
+### The vote, stated for clients
+
+The daemon never replaces a transcript on the night decoder's word alone. Two
+of the three readings — live (parakeet v3), cross-check (canary 180m), night
+(whisper-large-v3) — must agree with each other *and* disagree with the stored
+words, and the winner must then clear the arbiter's guards: caption text
+stripped, at least two words, and a language that matches the row's — checked
+by the daemon's own classifier **and** by requiring a function word of that
+language, because "Tack för att ni tittade" is Swedish, has an ö in it, and
+would otherwise classify as German. That last clause is not hypothetical: it is
+a string large-v3 produced on this user's German audio (§12), and a vote that
+replaced a bad German transcript with a good Swedish one would have made the
+row worse in the most convincing possible way.
