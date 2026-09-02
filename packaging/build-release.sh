@@ -51,10 +51,11 @@ echo "==> NX Recall $VERSION"
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
     echo "==> cargo build --release"
-    cargo build --release --bin recalld
+    cargo build --release --bin recalld --bin nx-recall-overlay
 fi
 
 [ -x "$TARGET/recalld" ] || { echo "$TARGET/recalld is missing — build first" >&2; exit 1; }
+[ -x "$TARGET/nx-recall-overlay" ] || { echo "$TARGET/nx-recall-overlay is missing — build first" >&2; exit 1; }
 
 # sherpa-rs's build script drops these beside the binary. If they are not here
 # the tarball would produce a binary that runs on this machine (cargo exports a
@@ -104,13 +105,17 @@ mkdir -p "$U/bin" "$U/lib/nx-recall" "$U/share/applications" \
 
 echo "==> staging the daemon"
 install -m 0755 "$TARGET/recalld" "$U/lib/nx-recall/recalld"
+# The headset captions overlay (docs/OVERLAY.md): OpenXR loader is dlopen'd
+# from the host at run time, nothing of ours is linked in. Ships behind
+# `--overlay` and says so until it has run against a live WiVRn session.
+install -m 0755 "$TARGET/nx-recall-overlay" "$U/lib/nx-recall/nx-recall-overlay"
 for so in "${SO_FILES[@]}"; do
     install -m 0755 "$TARGET/$so" "$U/lib/nx-recall/$so"
 done
 if [ "$STRIP" -eq 1 ] && command -v strip >/dev/null; then
     # --strip-unneeded only, and never on the .so files: stripping a shared
     # library's dynamic symbols would break the very linkage we just checked.
-    strip --strip-unneeded "$U/lib/nx-recall/recalld"
+    strip --strip-unneeded "$U/lib/nx-recall/recalld" "$U/lib/nx-recall/nx-recall-overlay"
     echo "    stripped: $(du -h "$U/lib/nx-recall/recalld" | cut -f1)"
 fi
 
@@ -137,6 +142,7 @@ cp "$ROOT/gui/package.json" "$G/resources/app/package.json"
 echo "==> staging launchers, desktop entry, unit, icons"
 install -m 0755 "$ROOT/packaging/bin/nx-recall" "$U/bin/nx-recall"
 install -m 0755 "$ROOT/packaging/bin/recalld"   "$U/bin/recalld"
+install -m 0755 "$ROOT/packaging/bin/nx-recall-overlay" "$U/bin/nx-recall-overlay"
 install -m 0644 "$ROOT/packaging/nx-recall.desktop" "$U/share/applications/nx-recall.desktop"
 install -m 0644 "$ROOT/packaging/nx-recall.service" "$U/share/systemd/user/nx-recall.service"
 

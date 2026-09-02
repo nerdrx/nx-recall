@@ -1,0 +1,17 @@
+#!/bin/sh
+# NX Recall headset captions overlay launcher (docs/OVERLAY.md).
+#
+# Prefix-relative like the other launchers. The binary needs no library of
+# ours: the OpenXR loader (and through it WiVRn) and Vulkan come from the host.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+prefix=$(CDPATH= cd -- "$here/.." && pwd)
+real="$prefix/lib/nx-recall/nx-recall-overlay"
+
+[ -x "$real" ] || {
+    echo "nx-recall-overlay: $real is missing — the install is incomplete." >&2
+    exit 1
+}
+
+exec "$real" "$@"
