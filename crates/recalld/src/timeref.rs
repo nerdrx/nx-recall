@@ -49,7 +49,11 @@ use crate::clock::{civil_from_days, local_offset_s};
 /// Written on every row, so a later parser's output is never mistaken for this
 /// one's — GRAPH.md's Tier 2 provenance rule (`extractor`, `version`).
 pub const EXTRACTOR: &str = "timeref";
-pub const VERSION: u32 = 1;
+/// 2 since 0.9.0: clock hours spelled as words ("um zehn", "at ten") are read.
+/// Bumped rather than absorbed, because that is what the version is for — a row
+/// written by version 1 genuinely could not contain those hours, and a later
+/// pass has to be able to tell "we did not find one" from "we could not".
+pub const VERSION: u32 = 2;
 
 /// What sort of reference this was, which is really *how precise it is*. A
 /// surface renders a `DAY` as a date and a `CLOCK` as a date and a time; the
@@ -458,6 +462,80 @@ fn clocks(s: &str, out: &mut Vec<Hit>) {
             None,
         );
     }
+
+    worded_clocks(s, out);
+}
+
+/// Hours spelled as words: "um zehn", "gegen halb"— no, not that one — "at ten
+/// o'clock", "zehn Uhr" (0.9.0).
+///
+/// This exists because of one sentence. The reminder contract's own example is
+/// *"Recall, erinner mich morgen um zehn an den Link"*, and a parser that reads
+/// "morgen" and not "um zehn" resolves it to local midnight — a reminder ten
+/// hours early, from a sentence that named the hour out loud. Nobody dictating
+/// into a headset types "10:00".
+///
+/// Same discipline as the bare English hour above: a spelled number is only a
+/// time when something says it is. Either a preposition in front of it
+/// (`um`/`gegen`/`at`/`around`) or a unit behind it (`Uhr`/`o'clock`) — because
+/// "ich hab drei Sachen offen" is three things, and "call me at three" is a
+/// time. Without one of the two markers a number word is a count, and counts
+/// are far commoner than hours in speech.
+fn worded_clocks(s: &str, out: &mut Vec<Hit>) {
+    static BEFORE: OnceLock<Regex> = OnceLock::new();
+    static AFTER: OnceLock<Regex> = OnceLock::new();
+    // Bare `ein` is missing from this list and `eins` is not: "um ein Haar"
+    // and "um einiges besser" are ordinary German and neither is one o'clock.
+    // The unbounded form ("um ein Uhr") is caught by the second pattern, where
+    // the unit says what it is.
+    const AFTER_PREP: &str = "(eins|zwei|drei|vier|fünf|sechs|sieben|acht|neun|zehn|elf|zwölf|\
+                              one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)";
+    const BEFORE_UNIT: &str = "(eins|ein|zwei|drei|vier|fünf|sechs|sieben|acht|neun|zehn|elf|\
+                               zwölf|one|two|three|four|five|six|seven|eight|nine|ten|eleven|\
+                               twelve)";
+
+    let before = re(
+        &BEFORE,
+        &format!(r"\b(?:um|gegen|at|around)\s+{AFTER_PREP}\b(?:\s*(?:uhr|o'clock))?"),
+    );
+    let after = re(
+        &AFTER,
+        &format!(r"\b(?:um\s+|gegen\s+)?{BEFORE_UNIT}\s*(?:uhr|o'clock)\b"),
+    );
+    for rx in [before, after] {
+        for m in rx.captures_iter(s) {
+            let whole = m.get(0).expect("group 0");
+            let hour = hour_word(&m[1]);
+            out.push(Hit {
+                start: whole.start(),
+                end: whole.end(),
+                kind: kind::CLOCK,
+                what: What::Clock {
+                    tod: hour * 3600,
+                    // The same rule, and the same reason, as a bare digit: only
+                    // 1..=11 could equally mean the afternoon.
+                    ambiguous: (1..=11).contains(&hour),
+                },
+            });
+        }
+    }
+}
+
+fn hour_word(w: &str) -> i64 {
+    match w {
+        "eins" | "ein" | "one" => 1,
+        "zwei" | "two" => 2,
+        "drei" | "three" => 3,
+        "vier" | "four" => 4,
+        "fünf" | "five" => 5,
+        "sechs" | "six" => 6,
+        "sieben" | "seven" => 7,
+        "acht" | "eight" => 8,
+        "neun" | "nine" => 9,
+        "zehn" | "ten" => 10,
+        "elf" | "eleven" => 11,
+        _ => 12,
+    }
 }
 
 fn push_clock(
@@ -751,6 +829,70 @@ mod tests {
     #[test]
     fn the_provenance_constants_are_what_rows_will_carry() {
         assert_eq!(EXTRACTOR, "timeref");
-        assert_eq!(VERSION, 1);
+        assert_eq!(VERSION, 2, "0.9.0 taught it hours spelled as words");
+    }
+
+    // ---- 0.9.0: hours spelled as words ------------------------------------
+
+    /// The sentence this exists for: the reminder contract's own example. A
+    /// parser that reads "morgen" and not "um zehn" fires ten hours early.
+    #[test]
+    fn a_spelled_hour_after_a_day_anchors_to_it_like_a_digit_does() {
+        let refs = extract(
+            "erinner mich morgen um zehn an den Link",
+            wednesday_evening(),
+        );
+        assert_eq!(refs.len(), 2, "{refs:?}");
+        assert_eq!(refs[1].kind, kind::CLOCK);
+        assert_eq!(ymd(&refs[1]), (2026, 9, 3));
+        assert_eq!(local_time(refs[1].resolved_utc_ns), (10, 0));
+        assert_eq!(refs[1].raw, "um zehn");
+    }
+
+    #[test]
+    fn spelled_hours_read_in_both_languages_and_both_positions() {
+        let at = wednesday_evening(); // 19:30
+        // After a preposition…
+        let r = one("um acht bin ich wieder da", at);
+        assert_eq!(
+            local_time(r.resolved_utc_ns),
+            (20, 0),
+            "8 has passed, so 20"
+        );
+        assert_eq!(ymd(&r), (2026, 9, 2));
+        let ten = one("at ten, the world tour", at);
+        assert_eq!(local_time(ten.resolved_utc_ns), (22, 0));
+        assert_eq!(ten.raw, "at ten");
+        // …or before a unit.
+        let uhr = one("zehn Uhr ist gut", at);
+        assert_eq!(local_time(uhr.resolved_utc_ns), (22, 0));
+        assert_eq!(uhr.raw, "zehn Uhr");
+        // Both readings of one o'clock are behind us at half past seven in the
+        // evening, so it is tomorrow's — `timeref`'s unchanged rule for a bare
+        // hour, and the same answer a bare `1` gets.
+        let eins = one("um ein Uhr", at);
+        assert_eq!(local_time(eins.resolved_utc_ns), (1, 0));
+        assert_eq!(ymd(&eins), (2026, 9, 3));
+        // Noon and midnight are not ambiguous, so they are not shifted.
+        assert_eq!(local_time(one("um zwölf", at).resolved_utc_ns), (12, 0));
+    }
+
+    /// A number word is a count far more often than it is an hour. Without a
+    /// preposition in front or a unit behind, it is left alone.
+    #[test]
+    fn a_bare_number_word_is_a_count_and_not_a_time() {
+        for text in [
+            "ich hab drei Sachen offen",
+            "there were ten people in there",
+            "die zwei da drüben",
+            // The reason bare `ein` is not after a preposition.
+            "das war um ein Haar schiefgegangen",
+            "das ist um einiges besser",
+        ] {
+            assert!(
+                extract(text, wednesday_evening()).is_empty(),
+                "{text:?} produced a time reference"
+            );
+        }
     }
 }

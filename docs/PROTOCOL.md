@@ -913,7 +913,7 @@ see until a user hits it.
   `notes.list` return. Clients may show it when a `roster` join event names a
   linked speaker (the join itself is unchanged).
 
-## 0.8.3 — `translation` on a segment (contract for two parallel builds)
+## 0.9.0 — `translation` on a segment (contract for two parallel builds)
 
 A sibling track adds a translation to turns in languages the user does not read.
 It is a purely additive field on a segment row and on the `segment` event, and
@@ -1228,3 +1228,208 @@ would otherwise classify as German. That last clause is not hypothetical: it is
 a string large-v3 produced on this user's German audio (§12), and a vote that
 replaced a bad German transcript with a good Swedish one would have made the
 row worse in the most convincing possible way.
+## 0.9.0 — the assistant
+
+Three things the daemon does *for* you rather than *to* the recording, and one
+new method between them. Everything here is additive: a client that ignores all
+of it behaves exactly as it did against 0.8.2.
+
+`status` gains `assist: {reminders, digest, translate_to}` so a client can tell
+"switched off" from "an older daemon", and five counters under `counters`:
+`digests_written`, `digests_refused`, `translated`, `translation_declined`,
+`reminders_fired`. Schema goes to **v11** (two columns on `notes`, two on
+`segments`, one `digests` table; no backfill of any of it).
+
+### Reminders that fire
+
+A note whose words carry a time reference that was **still in the future when
+they were said** gets a due date, resolved by the same Tier 2 parser
+(`crate::timeref`) against the segment's own capture time — the same clock a
+commitment's due date uses. There is no model in this path and no second parser.
+
+Wake phrases gain three markers, because reminders need the verb that means
+them: **`recall, erinner mich`**, **`recall, erinnere mich`**, **`recall, remind
+me`**, alongside 0.8.0's four. `me` is two letters and is matched exactly.
+
+`timeref` goes to **version 2**: clock hours spelled as words are read (`um
+zehn`, `at ten`, `zehn Uhr`, `um ein Uhr`). A number word is only a time with a
+preposition in front of it or a unit behind it — `ich hab drei Sachen offen` is
+three things. The version is bumped rather than absorbed because a row written
+by version 1 genuinely could not carry those hours.
+
+Note objects (`notes.list`, the `note` event) gain four fields:
+
+| field | meaning |
+|---|---|
+| `due_ms` / `due_ns` | when it asked to come back, or `null` — which is most notes |
+| `fired` | whether the reminder has been announced. **Not "done"**: a reminder that has gone off is still an open note |
+| `fired_ms` | when it was announced, or `null` |
+
+New event **`reminder`** (topic `segments`) → `{note_id, text, due_ms, due_ns,
+segment_id, t_ms}`. It is the one event in this protocol a client is expected to
+**interrupt somebody with**. The `note` it is about is published immediately
+after it carrying `fired: true`, so a list already on screen repaints from that
+rather than re-querying — the reminder is the alarm, the note is the row.
+
+A note fires **exactly once**. `notes.fired_at_ns` is the whole state machine and
+the write that sets it only matches a row that is still unfired, so two
+overlapping ticks announce it once between them. Two things put a note back on
+the list, both deliberate: a snooze, and a re-decode that **changed the words** —
+the words are the date, so a reminder that fired for the sentence before has not
+fired for this one.
+
+`notes.set_state` gains an optional **`snooze_min`** (1–10080). It is only valid
+with `state: "open"` and is refused otherwise, because "done, but remind me
+again" is a contradiction rather than something to half-honour. On a note with
+no date at all it **gives** it one, which is the only way to ask to be reminded
+of something you said without a time in it. The reply and the `note` broadcast
+are the same as any other state change.
+
+The scheduler does **not** stand down while capture is paused, and it is the one
+background worker that does not. Pause means nothing new is written down; a
+reminder writes nothing about what is being said, it delivers something you
+already said.
+
+### The daily digest
+
+An idle worker summarises conversations that have settled: ended at least
+`[assist] digest_settle_min` (30) minutes ago, at least `digest_min_turns` (8)
+turns with words in them, and no digest yet. It runs behind `crate::enrich`'s
+gates plus one of its own — **the enrichment queue comes first**, because a
+commitment is what somebody is waiting on and a paragraph about last night is
+not. Same model, same jail, same lock discipline (model time and store-lock time
+never overlap).
+
+**`digest.list {day?, limit?}`** → `{day, total, digests: [...]}`, newest
+conversation first. `day` is a local calendar day, `"YYYY-MM-DD"`; a string that
+is not one is refused rather than silently matching nothing. Each digest is:
+
+```json
+{"thread_id": 12, "day": "2026-09-02", "lang": "de",
+ "summary": "…one paragraph…", "open": ["B schickt A morgen den Link"],
+ "participants": [{"speaker_id": 3, "label": "Aspen"}],
+ "started_ms": …, "started_ns": "…", "ended_ms": …, "ended_ns": "…",
+ "turns": 12, "model_id": "qwen2.5-3b-instruct-q4_k_m@1", "created_ms": …}
+```
+
+New event **`digest`** (topic `segments`) carries the same object. It is only
+ever new — one digest per conversation, ever — so a client unshifts rather than
+reconciling. A conversation that resumes after its digest was written keeps the
+one it has; the alternative is a paragraph that changes under a reader.
+
+**Conversations the model declined are not listed.** A refusal is written down
+(so the worker stops asking) and is invisible to clients, which is why
+`digests_refused` is a counter and not a row. It is not a failure: eight turns of
+"ja / ne / lol" is a conversation by the threading rule and nothing worth a
+paragraph.
+
+CLI: `recalld digest [day]`, where DAY may also be `today` or `yesterday`.
+
+#### The measurement, and what it forced
+
+`spike/digest_bench` — six traps in the shapes a lobby actually produces
+(backchannel in both languages, greetings, round callouts, agreement, a
+microphone check) and four real conversations, on four pinned cores at nice 19.
+
+One model call that decided *and* wrote degraded **monotonically** as the prompt
+grew:
+
+| prompt | traps refused | right language | open list right |
+|---|---:|---:|---:|
+| short, no language steering | **6/6** | 1/4 | 1/4 |
+| + an `open` clause and a language order | 5/6 | 2/4 | 4/4 |
+| + a worked trap example as well | 1/6 | 3/4 | 4/4 |
+
+Every clause that made the summary better made the refusal worse. So the verdict
+gets **its own call**, with a grammar that cannot express a summary at all, and
+the summary — which only runs for a conversation that passed — gets all the
+steering it wants. **Shipped: 6/6 traps refused, 4/4 conversations summarised,
+3/4 in the right language, 3.4 s median.** A trap costs one short call instead of
+one long one, so the split is also cheaper (3.4 s against 11.7 s).
+
+The one language miss is the deliberately bilingual conversation, where the
+daemon asks for the reader's language and the model answers in the dialogue's.
+
+### Translation for turns you cannot read
+
+`[assist] translate_to` (empty by default, and empty is off) names the language
+the reader has. An idle pass translates committed turns whose `lang` is stamped,
+is not `translate_to`, and is not one of the user's own speaker languages —
+those are skipped **without a model call at all**. Turns under
+`translate_min_words` (3) are skipped too.
+
+Segment rows and events gain **`translation`**:
+
+```json
+"translation": {"lang": "de", "text": "…", "via": "qwen2.5-3b-instruct-q4_k_m@1"}
+```
+
+or `null`. An **object** and not a bare string, because a client showing a
+translation has to be able to say which language it is in and which model wrote
+it. `null` is the answer for every row until the pass has looked, for every row
+already in that language, and on every machine where `translate_to` is empty —
+it is *not* "this turn needs no translation".
+
+Three guards, and they are the feature:
+
+- The grammar admits **one field**. The model cannot explain, answer the line,
+  or comment on it.
+- **An echo is dropped.** A model that hands its input back has not translated
+  it, and a row claiming otherwise would tell a reader the sentence was already
+  in their language.
+- **A wrong-language answer is dropped.** The stopword classifier reads what came
+  back; a clear reading of the wrong language is discarded. "I could not tell" is
+  *not* a rejection — a three-word answer often votes for nothing, and dropping
+  those would lose the short turns this is most useful on.
+
+A declined turn is **marked** (`translation_via` set, `translation` NULL) so the
+queue stays finite. A re-decode that changes the words clears both, putting the
+row back at the end of the queue.
+
+Measured (`spike/translate_bench.py`): 20 FLEURS sentence ids present in both
+`en_us` and `de_de` — FLEURS is parallel, so the German reference is a human's.
+Scored by cosine in the multilingual-e5-small space the daemon already uses.
+
+| | cosine |
+|---|---:|
+| two *different* German FLEURS sentences (the floor) | 0.792 |
+| the English input against the German reference (passthrough) | 0.906 |
+| **qwen2.5-3b's German against the German reference** | **0.948** |
+
+Gate was ≥ 0.80 and it passes. Read the floor row before the headline: e5 is
+multilingual and its space is crowded, so 0.80 sits barely above the bottom, and
+the number that actually says the feature works is the **0.906 → 0.948** gap — a
+real translation beats simply showing the untranslated line.
+
+### Correction-driven glossary re-read — measured, NOT shipped
+
+§12 gate 2 rejected biasing the transducer toward the whole vocabulary (+9.1%
+relative recall against a +20% bar). The narrow version was specified and
+measured: when a correction introduces a word W, re-decode **only** the other
+turns whose live text holds a word within edit distance 2 of W, with W as the
+single hotword.
+
+`spike/glossary_reread_bench.py` — LibriSpeech dev-clean through Opus 24k, 2 987
+neighbour utterances surveyed with the shipped decoder, the 40 words it actually
+gets wrong taken as the planted corrections, 70 utterances tripping the
+near-miss filter:
+
+| configuration | target recall | target WER |
+|---|---:|---:|
+| greedy — what ships | 47.1% | 5.1% |
+| `modified_beam_search`, no hotword | 50.0% | 5.0% |
+| + the one corrected word @1.5 | 50.0% | 4.9% |
+
+**+6.1% relative against the live text, and +0.0% against `modified_beam_search`
+alone.** The entire gain is the decoder change; the hotword contributes nothing
+on the candidate set. Gate was +30%. **Not shipped**, and there is no
+`text_via: "glossary"` route.
+
+Two things worth recording, because they are the expensive part to rediscover.
+The first bench built its word list by rarity alone and measured 98.4% recall in
+every configuration — the shipped decoder already got those words right, so the
+gate was a tautology; a glossary is for words a decoder is *wrong* about, and
+selecting on that is a step the bench cannot skip. And this was **not** a binding
+limitation: `crate::asr::TimedAsr` already drives sherpa's C API directly and
+sets `hotwords_file`, `modeling_unit` and `bpe_vocab`, so with §12's synthesised
+`bpe.vocab` the Rust side could have done this safely. It was not worth doing.

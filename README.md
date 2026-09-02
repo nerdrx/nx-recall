@@ -89,7 +89,7 @@ label (0.35, calibrated on real lobbies — the corpus value over-split 3×)
 
 ## Numbers we actually measured
 
-The measurement harness came first — 28 experiment scripts in
+The measurement harness came first — 33 experiment scripts in
 [`spike/`](spike/FINDINGS.md) — and two of the original design's core claims
 died in it before a line of the daemon existed.
 
@@ -108,6 +108,11 @@ died in it before a line of the daemon existed.
 | Full pipeline: VAD, gate, ASR, identity, vectors | under 5% of one CPU core |
 | A 1.5-second turn decoded alone vs. inside 3 s of its neighbours | **56.7% WER → 20.4%** (2.5 s turns: 34.3% → 17.1%) — same model, more audio |
 | A second decoder disagreeing as a warning light | shaky rows carry **4.2×** the word errors of solid ones in the lab, **2.8×** on this user's own lobby audio against whisper-large-v3 |
+| Whisper-large-v3 on the 7900 XTX (Vulkan, q5_0) | **RTF 0.043** — 400× the CPU figure that had parked a third reading |
+| Two-of-three vote on shaky rows, lab, with references | 91% → 44% WER on the touched rows, zero rows made worse; the unguarded rules did better and were refused (they wrote two German rows in Swedish on real audio) |
+| Daily digest refusing banter | 6/6 traps refused, 4/4 real conversations summarised, once the verdict got its own grammar (one prompt that decided *and* wrote fell to 1/6 as it improved) |
+| Translation, FLEURS parallel sentences, e5 cosine | 0.948 against the German original (unrelated pairs: 0.79) |
+| Quarterly model refresh, four newer checkpoints vs Parakeet v3 | **keep v3** — nearest 3.6% vs 3.3% lab WER; qwen3-asr ties on real audio and loses on speed |
 | Hotword biasing toward the roster and glossary | +9.1% recall on rare words against a +20% gate; at strength the glossary leaked into unrelated turns (control WER 8% → 29%). Not shipped |
 
 ## The graveyard of clever ideas
@@ -143,6 +148,14 @@ respectfully re-implements a corpse.
   strength the glossary starts appearing in sentences that never contained it.
   The vocabulary is assembled, stored and served anyway; every reply says
   `applied_to_decoder: false` until something can use it without that trade.
+- **The narrow glossary re-read.** Re-decode only the rows near a word you
+  corrected, with that word as a hotword. Measured: +6% recall over live, and
+  +0.0% over merely switching to beam search — the whole gain was the decoder
+  change that costs 1.6 pp on its own. Gate was +30%. Not shipped.
+- **Stereo azimuth, so far.** Discord's two channels are bit-identical (the
+  negative control behaved); VRChat has not been recorded in stereo yet. The
+  bench passes its own synthetic lobby at silhouette 0.93, so the day a lobby
+  recording exists the question takes ten minutes to answer.
 - **`COUNT(*)+1` as an id.** Delete two rows and the next two mints collide.
   Numbers come from row ids now, like they always should have.
 
@@ -205,6 +218,31 @@ speaker and the day it read as removable pills; **notes to self** — say
 keyboard; and a **brief** when a named friend joins the instance: what they owe
 you, what you owe them, what you last talked about.
 
+## Ground truth, a night shift, and a bar in the headset
+
+Every accuracy number so far was a benchmark or a correction you chose to
+make. **Ground truth from Discord** fixes that: Discord's own client knows who
+is talking, so a Vencord plugin hands the daemon *who spoke when* — speaking
+edges, membership, nicknames, to 127.0.0.1 and nowhere else, no audio, no
+messages. The daemon scores its voicebank against that word: precision,
+recall, per person, plus the overlap gate's hit rate. The "deferred labelling
+pass" the plan carried since day one is now a command, `recalld truth report`.
+
+The **night shift** is the accuracy ceiling made affordable: whisper-large-v3
+re-reads the day's shaky rows on the GPU while the machine idles, and replaces
+words only when the night decoder and the cross-check agree with each other
+against the live reading, in the row's own language, past the same guards
+that stopped the Swedish hallucinations. Every replacement is on the record.
+
+**Captions** float over whatever you are doing: the last few turns, large,
+click-through, dark on both grounds, from the tray or `nx-recall --captions`.
+The headset route is an OpenXR overlay that WiVRn advertises and this code
+has not yet run against — it ships behind a flag that says exactly that.
+
+And the parts that make a memory useful on its own: reminders that fire
+("Recall, erinner mich morgen um zehn …"), one paragraph per conversation the
+next morning, and a translation under any turn in a language you do not read.
+
 ## What never leaves this machine
 
 | Artifact | Lives | Leaves |
@@ -227,11 +265,11 @@ or sharing surface at all** — not a missing feature, the
 
 | | |
 |---|---|
-| Daemon | Rust, 39k lines — PipeWire capture, four ONNX runtimes, one GGUF via llama.cpp, SQLite WAL, NDJSON socket |
+| Daemon | Rust — PipeWire capture, four ONNX runtimes, one GGUF via llama.cpp, whisper.cpp on Vulkan at night, SQLite WAL, NDJSON socket, one loopback ingest for Discord's word |
 | Client | Electron, 12k lines, zero runtime dependencies, NX Clear in both grounds |
-| Tests | **647 Rust + 100 node + 70 headless-compositor steps × 2 themes** |
-| Schema | v10, migrated in place from v1 on a live database, every step idempotent |
-| Models | pyannote gate 6 MB · Parakeet v3 620 MB · ERes2Net 26 MB · e5 135 MB · Qwen 3B 1.9 GB · Canary cross-checker 154 MB · arbiters on demand — all pinned to exact bytes |
+| Tests | **768 Rust + 116 node + 81 headless-compositor steps × 2 themes** |
+| Schema | v11, migrated in place from v1 on a live database, every step idempotent |
+| Models | pyannote gate 6 MB · Parakeet v3 620 MB · ERes2Net 26 MB · e5 135 MB · Qwen 3B 1.9 GB · Canary cross-checker 154 MB · large-v3 q5_0 1.03 GB for the night shift · arbiters on demand — all pinned to exact bytes |
 | Updates | the daemon watches its own binary, drains, restarts; the GUI offers one click; a dozen hands-free updates and counting |
 | Provenance | every derived row carries its model id, confidence, and how the label arrived: `match · mic · proximity · re-decode · context` |
 
@@ -263,6 +301,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.8.0 | +80h | the accuracy round: short turns re-read in context, a second decoder as a warning light, fix-in-place, one query box, notes to self, briefs |
 | 0.8.1 | +83h | the afternoon-after check: one-word rows get no verdict, re-decodes keep the words they replace, the flag re-measured on real audio |
 | 0.8.2 | +84h | yesterday stops landing under now: a re-published archive row is history, not an arrival |
+| 0.9.0 | +92h | ground truth from Discord, the night shift on the GPU, captions, reminders, digests, translation; azimuth and the glossary re-read measured and parked; the quarterly model refresh says keep v3 |
 
 ## Quickstart
 

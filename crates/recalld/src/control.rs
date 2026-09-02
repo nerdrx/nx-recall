@@ -103,6 +103,13 @@ pub struct Control {
     night: Mutex<crate::config::NightConfig>,
     /// What the night shift has done since the daemon started.
     pub night_stats: Arc<crate::night::NightStats>,
+    // ---- 0.9.0, the assistant -------------------------------------------
+    /// Reminders, digests and translation. Live like `asr` and `graph` and for
+    /// the same reason: every one of them has a switch.
+    assist: Mutex<crate::config::AssistConfig>,
+    /// What the assistant worker has done, read back from the rows.
+    pub assist_stats: Arc<crate::assist::AssistStats>,
+    // ---- end 0.9.0 -------------------------------------------------------
 }
 
 impl Control {
@@ -133,6 +140,9 @@ impl Control {
             quality: Arc::new(crate::quality::QualityStats::default()),
             night: Mutex::new(crate::config::NightConfig::default()),
             night_stats: Arc::new(crate::night::NightStats::default()),
+            // 0.9.0.
+            assist: Mutex::new(crate::config::AssistConfig::default()),
+            assist_stats: Arc::new(crate::assist::AssistStats::default()),
         })
     }
 
@@ -397,6 +407,24 @@ impl Control {
         let since = if last > 0 { last } else { self.started_at_ns };
         (crate::clock::utc_now_ns() - since).max(0) / 60_000_000_000
     }
+    // ---- the assistant round (0.9.0) -------------------------------------
+
+    pub fn assist(&self) -> crate::config::AssistConfig {
+        self.assist
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Point the assistant at the running config. Set before the handle is
+    /// shared, like the rest of the wiring.
+    pub fn with_assist(mut self: Arc<Self>, cfg: crate::config::AssistConfig) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
+        *this.assist.get_mut().unwrap_or_else(|p| p.into_inner()) = cfg;
+        self
+    }
+
+    // ---- end 0.9.0 --------------------------------------------------------
 
     // ---- the memory graph (GRAPH.md Tiers 2 and 3) -----------------------
 

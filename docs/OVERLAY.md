@@ -142,7 +142,7 @@ to move a buffer into an image.
 ## Route 2 — mirror the desktop captions window with wlx-overlay-s
 
 This works today and has nothing untested in it. The captions window shipped in
-0.8.3 is an ordinary Wayland window: frameless, transparent, always-on-top, and
+0.9.0 is an ordinary Wayland window: frameless, transparent, always-on-top, and
 sized to be read at arm's length. wlx-overlay-s mirrors Wayland windows into any
 OpenXR runtime, WiVRn included.
 

@@ -47,12 +47,23 @@ const WAKE: &str = "recall";
 /// `merke dir` is not in the contract's list and is here anyway: it is what a
 /// German speaker actually says, and the alternative is a feature that ignores
 /// half the people who use it. It is an alias, not a fifth marker.
+/// `erinner mich` / `erinnere mich` / `remind me` are 0.9.0's and they are
+/// there because reminders are: "Recall, remember to send the link" files a
+/// note, and "Recall, remind me at eight to send the link" is the same sentence
+/// with a time in it. A person who has just learned that a note with a date
+/// comes back will say the verb that means it, and a wake phrase that only
+/// accepts "remember" would answer that with silence.
 const MARKERS: &[&[&str]] = &[
     &["merk", "dir"],
     &["merke", "dir"],
     &["remember"],
     &["notiz"],
     &["note"],
+    // ---- 0.9.0, the assistant ----------------------------------------
+    &["erinner", "mich"],
+    &["erinnere", "mich"],
+    &["remind", "me"],
+    // ---- end 0.9.0 ---------------------------------------------------
 ];
 
 /// Below this many characters a marker is matched exactly. "note" is one edit
@@ -118,10 +129,16 @@ fn capture(store: &Store, segment_id: i64, at_utc_ns: i64) -> Result<Option<Note
     let Some(note) = detect(text) else {
         return Ok(None);
     };
+    // A note with a time reference in it is a reminder (0.9.0). The date is
+    // read from the note's OWN words — the wake phrase is not part of the
+    // sentence — and resolved against `row.t_start_ns`, the moment they were
+    // said, exactly as a commitment's due date is. There is no model in this
+    // path and no second clock: see `crate::reminders`.
+    let due_ns = crate::reminders::due_for(&note, row.t_start_ns);
     // A re-decode or a correction can bring the same turn back through here.
     // One note per turn: the second pass updates the words rather than filing
     // a duplicate the user has to dismiss twice.
-    store.upsert_note(segment_id, &note, at_utc_ns)
+    store.upsert_note(segment_id, &note, due_ns, at_utc_ns)
 }
 
 /// One note on the wire — `notes.list`, and the body of a `note` event, from
@@ -138,6 +155,17 @@ pub fn note_json(note: &NoteRow) -> Value {
         "t_ns": note.t_start_ns.to_string(),
         "state": note.state,
         "created_ms": ns_to_ms(note.created_utc_ns),
+        // ---- 0.9.0, the assistant --------------------------------------
+        // When this note asked to be brought back, and whether it has been.
+        // `due_ms` is null on most notes — a sentence with no time in it —
+        // and a client renders that exactly as it rendered every note before
+        // 0.9.0. `fired` is not "done": a reminder that has gone off is still
+        // an open note until somebody ticks it.
+        "due_ms": note.due_ns.map(ns_to_ms),
+        "due_ns": note.due_ns.map(|v| v.to_string()),
+        "fired": note.fired_at_ns.is_some(),
+        "fired_ms": note.fired_at_ns.map(ns_to_ms),
+        // ---- end 0.9.0 --------------------------------------------------
     })
 }
 
@@ -221,6 +249,22 @@ mod tests {
                 "Recall, note the fountain is broken",
                 Some("the fountain is broken"),
             ),
+            // --- 0.9.0: the reminder verbs ------------------------------
+            (
+                "Recall, erinner mich morgen um zehn an den Link",
+                Some("morgen um zehn an den Link"),
+            ),
+            (
+                "Recall, erinnere mich morgen an den Shader",
+                Some("morgen an den Shader"),
+            ),
+            (
+                "Recall, remind me at 8 pm to send the recording",
+                Some("at 8 pm to send the recording"),
+            ),
+            // "me" is two letters, so it is matched exactly — "remind my"
+            // is not a wake phrase.
+            ("Recall, remind my friend about it", None),
             // --- casing and punctuation ---------------------------------
             ("recall remember the shader", Some("the shader")),
             ("RECALL, REMEMBER THE SHADER", Some("THE SHADER")),

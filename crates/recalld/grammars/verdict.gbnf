@@ -1,0 +1,2 @@
+root ::= "{" ws "\"worth_summarising\":" ws ("false" | "true") ws "}"
+ws ::= [ \t\n]?

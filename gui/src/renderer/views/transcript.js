@@ -326,10 +326,34 @@ export function mount(root, ctx) {
       h('span', { class: 'dot', style: `color:${color}` }),
       nm
     );
+    // 0.9.0: a turn in a language you do not read, in one you do. A SECOND
+    // line under the words and never a replacement for them: the transcript is
+    // a record of what was said, and what was said is the original. It is
+    // marked as a translation and carries the model that wrote it, because a
+    // paraphrase presented as a quotation is the failure this feature is
+    // bounded against (`crate::translate`).
+    const tr = seg.translation;
     row.append(
       h('span', { class: 't', text: fmtClock(seg.t_ms) }),
       who,
-      h('span', { class: 'txt', text: seg.text || '…' }),
+      tr?.text
+        ? h(
+            'span',
+            { class: 'txt has-translation' },
+            h('span', { class: 'txt-said', text: seg.text || '…' }),
+            h(
+              'span',
+              {
+                class: 'txt-translated',
+                lang: tr.lang || undefined,
+                dataset: { translation: tr.lang || '', via: tr.via || '' },
+                title: `Translated into ${tr.lang || 'your language'} by ${tr.via || 'the local model'}. The line above is what was actually said.`,
+              },
+              h('span', { class: 'tr-mark', 'aria-hidden': 'true', text: '↳' }),
+              tr.text
+            )
+          )
+        : h('span', { class: 'txt', text: seg.text || '…' }),
       h(
         'span',
         { class: 'meta' },

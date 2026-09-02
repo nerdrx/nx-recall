@@ -63,6 +63,11 @@ const ALLOWED = new Set([
   'notes.set_state',
   'search.ask',
   'person.brief',
+  // The assistant round (0.9.0). One read: the Memory view's "Yesterday" card.
+  // Reminders need no new method — a reminder is a note with a date, so they
+  // ride on `notes.list` and `notes.set_state`, both already here — and a
+  // translation rides on the segment.
+  'digest.list',
   'segments.audio',
   'segments.reassign',
   'segments.correct',
@@ -83,7 +88,12 @@ export function broadcast(channel, payload) {
   }
 }
 
-export function registerIpc({ request, setPaused, getState, showWindow, relaunch, captions }) {
+/// The longest text a reminder notification may carry. A note is a sentence
+/// somebody dictated; past this it is not a notification, it is a document, and
+/// the renderer's own toast is where the whole thing is readable anyway.
+const MAX_NOTIFY = 220;
+
+export function registerIpc({ request, setPaused, getState, showWindow, relaunch, captions, notify }) {
   ipcMain.handle('recall:request', async (_e, method, params) => {
     if (!ALLOWED.has(method)) return { ok: false, err: { code: 'refused', msg: `method ${method} is not exposed to the UI` } };
     try {
@@ -123,4 +133,22 @@ export function registerIpc({ request, setPaused, getState, showWindow, relaunch
   ipcMain.handle('recall:captions:close', () => captions.close());
   ipcMain.handle('recall:captions:toggle', () => captions.toggle());
   ipcMain.handle('recall:captions:state', () => ({ open: captions.isOpen(), settings: captions.get() }));
+  // ---- 0.9.0, the assistant ----------------------------------------------
+  // An OS notification for a reminder that has come round. Not a protocol
+  // method, so it is not in ALLOWED above — but it IS the only way the
+  // renderer can reach outside the window, so the shape it may send is fixed
+  // here rather than trusted: a note id, and two strings that are truncated.
+  // A page that got compromised can raise a notification about a note; it
+  // cannot raise one about anything else, at any length, with any action on it.
+  ipcMain.handle('recall:notify', (_e, payload) => {
+    const noteId = Number(payload?.noteId);
+    if (!Number.isInteger(noteId)) return false;
+    const clip = (s) => String(s ?? '').slice(0, MAX_NOTIFY);
+    return notify({
+      noteId,
+      title: clip(payload?.title) || 'Reminder',
+      body: clip(payload?.body),
+    });
+  });
+  // ---- end 0.9.0 -----------------------------------------------------------
 }

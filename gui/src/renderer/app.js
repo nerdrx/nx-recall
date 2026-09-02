@@ -71,6 +71,8 @@ const ctx = {
   resync,
   // 0.8.0: the person page's own way of asking for the bar the roster raises.
   showBrief,
+  // 0.9.0: a reminder, from anywhere, lands on its note in Memory.
+  openNote,
 };
 
 /**
@@ -199,6 +201,18 @@ async function jumpToSegment(seg) {
   }
   go('transcript');
   current?.focusSegment?.(seg.id);
+}
+
+/**
+ * A reminder → the note it is about (0.9.0).
+ *
+ * Every route into this ends here: the toast inside the window, the OS
+ * notification outside it, and a click on the row itself. One function, so a
+ * reminder always lands in the same place however it was answered.
+ */
+function openNote(noteId) {
+  go('memory');
+  return current?.focusNote?.(noteId) ?? null;
 }
 
 /** A voice → what they have been saying. Same filter the header already has. */
@@ -574,6 +588,11 @@ window.recall.onEvent((evt) => {
   // Somebody walked in. The bar this raises sits above every view rather than
   // inside one, so it belongs to the controller and not to a view.
   if (change.rosterJoin) void onRosterJoin(change.rosterJoin);
+  // 0.9.0: a note you asked to be brought back. Two surfaces, because the app
+  // is very often not the window you are looking at — an OS notification for
+  // when it is behind a headset, and a toast for when it is not. Both land on
+  // the same row.
+  if (change.reminder) onReminder(change.reminder);
   current?.update?.(change);
   renderFooter();
   if (change.opFinished) {
@@ -585,6 +604,34 @@ window.recall.onEvent((evt) => {
       d.failed ? 'error' : 'ok'
     );
   }
+});
+
+/**
+ * A reminder came round.
+ *
+ * The toast is clickable and stays a little longer than an ordinary one: it is
+ * the only toast in this app that is a thing to act on rather than a report of
+ * something that already happened.
+ */
+function onReminder(r) {
+  const text = r.text || 'a note you left yourself';
+  const el = toast(`Reminder — ${text}`, 'ok');
+  el.classList.add('clickable');
+  el.title = 'Open this note';
+  el.addEventListener('click', () => void openNote(r.note_id));
+  // Outside the window too. `notify` never throws and answers false where the
+  // desktop has no notification service; the toast has already said it either
+  // way, so there is nothing to report.
+  void window.recall.notify?.({
+    noteId: r.note_id,
+    title: 'NX Recall — reminder',
+    body: text,
+  });
+}
+
+// Somebody clicked the notification while the app was behind something else.
+window.recall.onOpenNote?.((d) => {
+  if (d?.noteId != null) void openNote(d.noteId);
 });
 
 window.recall.onResync(async (info) => {
@@ -893,6 +940,13 @@ document.addEventListener('keydown', (e) => {
         pending: r.classList.contains('pending'),
         text: r.querySelector('.note-text')?.textContent ?? '',
         acts: [...r.querySelectorAll('[data-note-act]')].map((b) => b.dataset.noteAct),
+        // 0.9.0: a note with a date is a reminder, and the chip is the whole
+        // difference. Read off the DOM, because a date nobody can see is not a
+        // reminder anybody can act on.
+        due: r.dataset.due ? Number(r.dataset.due) : null,
+        fired: r.dataset.fired === 'true',
+        dueChip: r.querySelector('[data-due="chip"]')?.textContent ?? null,
+        snoozes: [...r.querySelectorAll('[data-snooze]')].map((b) => Number(b.dataset.snooze)),
       })),
       notesEmpty: (document.getElementById('notes-empty') || {}).textContent ?? '',
       dash: {
@@ -912,6 +966,39 @@ document.addEventListener('keydown', (e) => {
         // An auto term must not offer a remove button: you cannot argue with
         // what was heard, and a button that did nothing would say you could.
         autoRemovable: document.querySelectorAll('.vocab-chip.auto .vocab-chip-x').length,
+      },
+    }),
+    // 0.9.0. Everything the driver has to read back about the assistant round:
+    // the Yesterday card, and a translated turn in the transcript.
+    assistant: () => ({
+      digests: {
+        shown: !document.getElementById('digest-card')?.hidden,
+        sub: (document.getElementById('digest-sub') || {}).textContent ?? '',
+        note: (document.getElementById('digest-note') || {}).textContent ?? '',
+        rows: [...document.querySelectorAll('.digest-row')].map((r) => ({
+          thread: Number(r.dataset.digest),
+          day: r.dataset.day,
+          summary: r.querySelector('.digest-text')?.textContent ?? '',
+          people: [...r.querySelectorAll('.chip.person')].map((c) => Number(c.dataset.sp)),
+          open: [...r.querySelectorAll('.digest-open-item')].map((o) => o.textContent),
+        })),
+        groups: [...document.querySelectorAll('[data-digests]')].map((g) => g.dataset.digests),
+      },
+      translated: {
+        // Rows with a second line under the words, and the words themselves,
+        // which must still be the ORIGINAL: a translation is a reading of the
+        // transcript and never a replacement for it.
+        rows: document.querySelectorAll('#seg-list .txt.has-translation').length,
+        pairs: [...document.querySelectorAll('#seg-list .txt.has-translation')]
+          .slice(0, 3)
+          .map((t) => ({
+            said: t.querySelector('.txt-said')?.textContent ?? '',
+            reading: t.querySelector('.txt-translated')?.textContent ?? '',
+            lang: t.querySelector('.txt-translated')?.dataset.translation ?? '',
+            via: t.querySelector('.txt-translated')?.dataset.via ?? '',
+          })),
+        // A row with no translation must render exactly as it always did.
+        plain: document.querySelectorAll('#seg-list .txt:not(.has-translation)').length,
       },
     }),
     ask: () => ({

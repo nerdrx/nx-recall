@@ -135,6 +135,21 @@ pub fn segment_json(row: &SegmentRow) -> Value {
         // read:" beside the words, and where the vote did replace them
         // `text_via` says `"night"` and this carries the same string.
         "night_text": row.night_text,
+        // ---- 0.9.0, the assistant ------------------------------------------
+        // This turn in the language the reader has (`[assist] translate_to`),
+        // or `null`. An OBJECT rather than a bare string, because a client
+        // showing a translation has to be able to say which language it is in
+        // and which model wrote it — a paraphrase presented as a quotation is
+        // the failure mode this whole feature is bounded against
+        // (`crate::translate`). `null` is the answer for every row until the
+        // idle pass has looked, for every row already in that language, and
+        // on every machine where `translate_to` is empty.
+        "translation": crate::translate::translation_json(
+            row.translation.as_deref(),
+            row.translation_via.as_deref(),
+            crate::translate::target(),
+        ),
+        // ---- end 0.9.0 -----------------------------------------------------
     })
 }
 
@@ -308,6 +323,12 @@ impl Service {
             "truth.unlink" => self.truth_unlink(req),
             "truth.summary" => self.truth_summary(),
             // ---- end 0.9.0 -------------------------------------------------
+            // ---- 0.9.0, the assistant --------------------------------------
+            // One read. Reminders ride on `notes.*` (a reminder is a note with
+            // a date, not a new kind of row) and translations ride on the
+            // segment, so the assistant round adds exactly one method.
+            "digest.list" => self.digest_list(req),
+            // ---- end 0.9.0 --------------------------------------------------
             "transcript" => self.transcript(req),
             "roster.now" => self.roster_now(),
             "operations.list" => self.operations_list(req),
@@ -548,6 +569,17 @@ impl Service {
             "graph": c.graph_state().to_json(),
             // The accuracy round's idle worker (0.8.0).
             "asr": self.asr_quality_json(),
+            // ---- 0.9.0, the assistant --------------------------------------
+            // What the three assistant features are set to, so a client can
+            // tell "off" from "an older daemon" without guessing — the same
+            // reason `asr.confidence` carries `{enabled, available}`.
+            "assist": {
+                "reminders": c.assist().reminders,
+                "digest": c.assist().digest,
+                // `""` means translation is off, which is the shipped value.
+                "translate_to": c.assist().translate_to,
+            },
+            // ---- end 0.9.0 --------------------------------------------------
             "segments_total": store.segments_total()?,
             "counters": {
                 "sessions_opened": c.stats.sessions_opened.load(Ordering::Relaxed),
@@ -589,6 +621,21 @@ impl Service {
                     c.quality.redecode_skipped_no_audio.load(Ordering::Relaxed),
                 "solid": c.quality.confidence_solid.load(Ordering::Relaxed),
                 "shaky": c.quality.confidence_shaky.load(Ordering::Relaxed),
+                // ---- 0.9.0, the assistant ---------------------------------
+                // Conversations summarised and conversations the model read
+                // and declined (the second number is not a failure — it is the
+                // trap gate working); turns translated and turns the pass
+                // looked at and would not translate; reminders announced.
+                "digests_written":
+                    c.assist_stats.digests_written.load(Ordering::Relaxed),
+                "digests_refused":
+                    c.assist_stats.digests_refused.load(Ordering::Relaxed),
+                "translated": c.assist_stats.translated.load(Ordering::Relaxed),
+                "translation_declined":
+                    c.assist_stats.translation_declined.load(Ordering::Relaxed),
+                "reminders_fired":
+                    c.assist_stats.reminders_fired.load(Ordering::Relaxed),
+                // ---- end 0.9.0 ---------------------------------------------
             },
             "clients": self.bus.client_count(),
             "seq": self.bus.current_seq(),
@@ -2696,6 +2743,19 @@ const ASK_LIMIT: usize = 50;
 /// Notes one `notes.list` returns when the caller does not say.
 const NOTES_LIMIT: usize = 200;
 
+// ---- 0.9.0, the assistant --------------------------------------------------
+
+/// Digests one `digest.list` returns when the caller does not say. A day is
+/// tens of conversations, not hundreds, and "Yesterday" is a card.
+const DIGEST_LIMIT: usize = 50;
+
+/// The longest snooze. A week: past that a person is not putting a note off,
+/// they are re-scheduling it, and the honest surface for that is dictating a
+/// new one — this method cannot invent a date nobody said.
+const MAX_SNOOZE_MIN: i64 = 7 * 24 * 60;
+
+// ---- end 0.9.0 -------------------------------------------------------------
+
 impl Service {
     /// `search.ask` — one query box.
     ///
@@ -2862,6 +2922,13 @@ impl Service {
 
     /// The note state machine. Like a commitment's, nothing but a person's
     /// click ever moves a row off `open`.
+    ///
+    /// 0.9.0 adds one optional parameter, `snooze_min`, and it is deliberately
+    /// here rather than in a `notes.snooze` of its own: "not now, in ten
+    /// minutes" *is* a state change — the note goes back to `open` and its due
+    /// date moves — and a second method would mean two ways to reach one row
+    /// that a client has to keep in sync. It is only meaningful with
+    /// `state: "open"`, and saying so is better than silently ignoring it.
     fn notes_set_state(&self, req: &Request) -> Result<Value, Error> {
         let id = req.i64("id")?;
         let state = req
@@ -2873,6 +2940,30 @@ impl Service {
                 crate::store::note_state::ALL
             ))
         })?;
+        // ---- 0.9.0: the snooze ------------------------------------------
+        let snooze = req.opt_i64("snooze_min")?;
+        if let Some(minutes) = snooze {
+            if state != crate::store::note_state::OPEN {
+                return Err(Error::params(
+                    "snooze_min only makes sense with state \"open\" — a note that \
+                     is done or dismissed is not waiting to come back",
+                ));
+            }
+            if !(1..=MAX_SNOOZE_MIN).contains(&minutes) {
+                return Err(Error::params(format!(
+                    "snooze_min must be between 1 and {MAX_SNOOZE_MIN} minutes"
+                )));
+            }
+            let row = self
+                .store()
+                .snooze_note(id, minutes, utc_now_ns())
+                .map_err(Error::from)?
+                .ok_or_else(|| Error::not_found(format!("no note with id {id}")))?;
+            let payload = crate::notes::note_json(&row);
+            self.bus.publish(Topic::Segments, "note", payload.clone());
+            return Ok(payload);
+        }
+        // ---- end 0.9.0 ---------------------------------------------------
         let row = self
             .store()
             .set_note_state(id, state)
@@ -2957,6 +3048,42 @@ impl Service {
         }))
     }
 
+    // ---- 0.9.0, the assistant --------------------------------------------
+
+    /// `digest.list` — one paragraph per settled conversation.
+    ///
+    /// `day` is a local calendar day (`YYYY-MM-DD`); without it the newest
+    /// conversations come back whatever day they were. Conversations the model
+    /// declined to summarise are simply absent — a refusal is written down so
+    /// the worker stops asking, and it is not something a person reads.
+    fn digest_list(&self, req: &Request) -> Result<Value, Error> {
+        let day = match req.opt_str("day")? {
+            None => None,
+            Some(d) => {
+                let d = d.trim();
+                if !is_day(d) {
+                    return Err(Error::params(format!(
+                        "day must be a local calendar day like \"2026-09-02\", not {d:?}"
+                    )));
+                }
+                Some(d.to_string())
+            }
+        };
+        let limit = req.usize_or("limit", DIGEST_LIMIT)?.clamp(1, 500);
+        let store = self.store();
+        let rows = store
+            .digest_rows(day.as_deref(), limit)
+            .map_err(Error::from)?;
+        Ok(json!({
+            "day": day,
+            "total": rows.len(),
+            "digests": rows
+                .iter()
+                .map(|r| crate::digest::digest_json(&store, r))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
     /// `truth.link` — say that this Discord account is this voice.
     fn truth_link(&self, req: &Request) -> Result<Value, Error> {
         let user_id = req.str("user_id")?.to_string();
@@ -3014,6 +3141,22 @@ impl Service {
     }
 
     // ---- end 0.9.0 -------------------------------------------------------
+    // ---- end 0.9.0 --------------------------------------------------------
+}
+
+/// `YYYY-MM-DD`, checked rather than parsed: the column is a string and the
+/// comparison is a string comparison, so what matters is the shape.
+fn is_day(s: &str) -> bool {
+    s.len() == 10
+        && s.as_bytes()[4] == b'-'
+        && s.as_bytes()[7] == b'-'
+        && s.bytes().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
 }
 
 #[cfg(test)]
@@ -5721,5 +5864,206 @@ mod tests {
         assert_eq!(a["estimated_wer"], json!(0.2), "one word in five");
         assert_eq!(a["by_source"][0]["source"], json!("VRChat.exe"));
         assert!(a["since_ns"].is_string());
+    }
+
+    // ---- 0.9.0: the assistant ------------------------------------------
+
+    #[test]
+    fn a_snooze_moves_a_notes_date_and_is_broadcast_like_any_other_change() {
+        let r = rig("snooze");
+        let session = a_session(&r);
+        let seg = a_turn_at(
+            &r,
+            session,
+            1_000_000_000,
+            None,
+            "Recall, erinner mich morgen an den Link",
+        );
+        let id = {
+            let store = r.service.store();
+            store
+                .upsert_note(seg, "morgen an den Link", None, 0)
+                .unwrap()
+                .unwrap()
+                .id
+        };
+        let _ = events(&r);
+
+        let out = call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"notes.set_state","params":{{"id":{id},"state":"open","snooze_min":15}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(out["state"], json!("open"));
+        assert!(out["due_ms"].is_number(), "the snooze gave it a date");
+        assert_eq!(out["fired"], json!(false));
+        // Broadcast, like every other retroactive change.
+        let notes: Vec<Value> = events(&r)
+            .into_iter()
+            .filter(|e| e["ev"] == json!("note"))
+            .collect();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["data"]["id"], json!(id));
+
+        // A snooze on a note being marked done is a contradiction, and saying
+        // so beats silently ignoring half of what was asked for.
+        let e = call(
+            &r,
+            &format!(
+                r#"{{"id":2,"method":"notes.set_state","params":{{"id":{id},"state":"done","snooze_min":15}}}}"#
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "params");
+        // …and the ceiling is a week.
+        let e = call(
+            &r,
+            &format!(
+                r#"{{"id":3,"method":"notes.set_state","params":{{"id":{id},"state":"open","snooze_min":99999}}}}"#
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "params");
+    }
+
+    #[test]
+    fn digests_are_listed_by_day_with_the_people_who_were_in_them() {
+        let r = rig("digest");
+        let session = a_session(&r);
+        let aspen = {
+            let store = r.service.store();
+            let id = store.create_speaker("Speaker_01", 0).unwrap();
+            store.rename_speaker(id, "Aspen", 1).unwrap();
+            id
+        };
+        let seg = a_turn_at(&r, session, 5_000_000_000, Some(aspen), "der shader");
+        // …and one the model declined, which must never reach a client.
+        let banter = a_turn_at(&r, session, 900_000_000_000, Some(aspen), "ja");
+        // One guard, taken after every helper that takes its own: the store
+        // mutex is not reentrant, and nesting the two deadlocks the test.
+        let thread = {
+            let store = r.service.store();
+            let graph = crate::config::GraphConfig::default();
+            let thread = crate::threads::assign(&store, &graph, seg)
+                .unwrap()
+                .unwrap();
+            let t2 = crate::threads::assign(&store, &graph, banter)
+                .unwrap()
+                .unwrap();
+            store
+                .upsert_digest(&crate::store::DigestRow {
+                    thread_id: thread,
+                    day: "2026-09-02".into(),
+                    lang: "de".into(),
+                    summary: "Es ging um den Shader.".into(),
+                    people_json: format!("[{aspen}]"),
+                    open_json: "[\"B schickt den Link\"]".into(),
+                    model_id: "qwen2.5-3b@1".into(),
+                    created_ns: 9,
+                })
+                .unwrap();
+            store
+                .mark_thread_not_worth_summarising(t2, "qwen2.5-3b@1", 9)
+                .unwrap();
+            thread
+        };
+
+        let out = call(&r, r#"{"id":1,"method":"digest.list"}"#).unwrap();
+        assert_eq!(out["total"], json!(1), "a refusal is not a digest");
+        let d = &out["digests"][0];
+        assert_eq!(d["thread_id"], json!(thread));
+        assert_eq!(d["day"], json!("2026-09-02"));
+        assert_eq!(d["lang"], json!("de"));
+        assert_eq!(d["summary"], json!("Es ging um den Shader."));
+        assert_eq!(d["open"], json!(["B schickt den Link"]));
+        assert_eq!(d["participants"][0]["speaker_id"], json!(aspen));
+        assert_eq!(d["participants"][0]["label"], json!("Aspen"));
+        // Both time forms, as everywhere else.
+        assert!(d["started_ms"].is_number() && d["started_ns"].is_string());
+
+        // The day filter, and a day with nothing in it.
+        let one = call(
+            &r,
+            r#"{"id":2,"method":"digest.list","params":{"day":"2026-09-02"}}"#,
+        )
+        .unwrap();
+        assert_eq!(one["total"], json!(1));
+        let none = call(
+            &r,
+            r#"{"id":3,"method":"digest.list","params":{"day":"1999-01-01"}}"#,
+        )
+        .unwrap();
+        assert_eq!(none["total"], json!(0));
+        // A day that is not one is refused rather than silently matching none.
+        let e = call(
+            &r,
+            r#"{"id":4,"method":"digest.list","params":{"day":"yesterday"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "params");
+    }
+
+    #[test]
+    fn a_segment_carries_its_translation_as_an_object_or_null() {
+        // The target is read once at start-up (`translate::set_target`), so a
+        // test that wants a translation on the wire has to say what it is
+        // being translated into.
+        crate::translate::set_target("de");
+        let r = rig("translation");
+        let session = a_session(&r);
+        let seg = a_turn_at(
+            &r,
+            session,
+            1_000_000_000,
+            None,
+            "i think that is the only way",
+        );
+        // Nothing has looked yet, and `null` says exactly that.
+        let out = call(&r, r#"{"id":1,"method":"transcript"}"#).unwrap();
+        assert_eq!(out["segments"][0]["translation"], Value::Null);
+
+        r.service
+            .store()
+            .set_segment_translation(seg, "ich glaube das ist der einzige weg", "qwen@1")
+            .unwrap();
+        let out = call(&r, r#"{"id":2,"method":"transcript"}"#).unwrap();
+        let t = &out["segments"][0]["translation"];
+        assert_eq!(t["text"], json!("ich glaube das ist der einzige weg"));
+        assert_eq!(t["via"], json!("qwen@1"));
+        // `lang` is what this daemon is configured to translate INTO.
+        assert_eq!(t["lang"], json!("de"));
+
+        // Declined is not translated: the row is marked so the worker stops
+        // asking, and the wire still says there is nothing to show.
+        let other = a_turn_at(&r, session, 2_000_000_000, None, "no way at all");
+        r.service
+            .store()
+            .mark_translation_declined(other, "qwen@1")
+            .unwrap();
+        let out = call(&r, r#"{"id":3,"method":"transcript"}"#).unwrap();
+        assert_eq!(out["segments"][1]["translation"], Value::Null);
+    }
+
+    #[test]
+    fn status_says_which_assistant_features_are_on() {
+        let r = rig("assist-status");
+        let s = call(&r, r#"{"id":1,"method":"status"}"#).unwrap();
+        assert_eq!(s["schema"], json!(11));
+        // Shipped defaults: reminders and digests on (both need something else
+        // before they do anything), translation off with no guess at a target.
+        assert_eq!(s["assist"]["reminders"], json!(true));
+        assert_eq!(s["assist"]["digest"], json!(true));
+        assert_eq!(s["assist"]["translate_to"], json!(""));
+        for key in [
+            "digests_written",
+            "digests_refused",
+            "translated",
+            "translation_declined",
+            "reminders_fired",
+        ] {
+            assert_eq!(s["counters"][key], json!(0), "{key}");
+        }
     }
 }

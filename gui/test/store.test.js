@@ -965,3 +965,63 @@ test('a re-published row older than the window is not news', () => {
   assert.ok(late.added);
   assert.deepEqual(store.segments.map((s) => s.id), [10, 11, 111, 12]);
 });
+
+// ---- 0.9.0: the assistant --------------------------------------------------
+
+test('a reminder is the alarm and the note beside it is the row', () => {
+  // Two events, and they do different jobs. The `reminder` is the one thing in
+  // this protocol a client is expected to interrupt somebody with; the `note`
+  // that follows carries `fired` so a list already on screen repaints without
+  // re-querying.
+  reset();
+  const r = applyEvent({
+    seq: 1,
+    ev: 'reminder',
+    data: { note_id: 702, text: 'morgen um zehn an den Link', due_ms: 1_700_000_000_000 },
+  });
+  assert.equal(r.reminder.note_id, 702);
+  assert.equal(r.reminder.text, 'morgen um zehn an den Link');
+
+  const n = applyEvent({
+    seq: 2,
+    ev: 'note',
+    data: { id: 702, segment_id: 9, text: 'morgen um zehn an den Link', state: 'open', fired: true },
+  });
+  assert.equal(n.note.fired, true, 'fired is not done — it is still an open note');
+  assert.equal(n.note.state, 'open');
+
+  // A reminder with no note id is not a reminder. An older daemon cannot send
+  // one, but a malformed frame must not become an undefined notification.
+  assert.equal(applyEvent({ seq: 3, ev: 'reminder', data: {} }), null);
+  assert.equal(applyEvent({ seq: 4, ev: 'reminder', data: null }), null);
+});
+
+test('a digest arrives once per conversation and is never an update', () => {
+  reset();
+  const d = applyEvent({
+    seq: 1,
+    ev: 'digest',
+    data: { thread_id: 3, day: '2026-09-02', summary: 'Es ging um den Shader.', open: [] },
+  });
+  assert.equal(d.digest.thread_id, 3);
+  assert.equal(d.digest.summary, 'Es ging um den Shader.');
+  assert.equal(applyEvent({ seq: 2, ev: 'digest', data: { day: 'x' } }), null, 'no thread, no digest');
+});
+
+test('a translation rides on the segment and null is the ordinary answer', () => {
+  // The client stores segment rows as the daemon sends them, so this is really
+  // a check that the field survives the trip — and that a row without one is
+  // not distinguishable from a row from a daemon that never had the column.
+  reset();
+  applyEvent({ seq: 1, ev: 'segment', data: seg(10, { translation: null }) });
+  assert.equal(store.segById.get(10).translation, null);
+
+  const tr = { lang: 'de', text: 'welches Portal war es', via: 'qwen2.5-3b@1' };
+  applyEvent({ seq: 2, ev: 'segment', data: seg(11, { translation: tr }) });
+  assert.deepEqual(store.segById.get(11).translation, tr);
+
+  // A re-decode that replaced the words arrives as an update to the same row,
+  // and the translation it carries replaces the old one rather than merging.
+  applyEvent({ seq: 3, ev: 'segment', data: { ...seg(11), translation: null } });
+  assert.equal(store.segById.get(11).translation, null, 'a cleared translation clears');
+});

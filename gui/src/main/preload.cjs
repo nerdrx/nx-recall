@@ -31,6 +31,9 @@ contextBridge.exposeInMainWorld("recall", {
   getState: () => ipcRenderer.invoke("recall:getState"),
   show: () => ipcRenderer.invoke("recall:show"),
   relaunch: () => ipcRenderer.invoke("recall:relaunch"),
+  // 0.9.0: a reminder that has come round. Main raises the OS notification —
+  // the renderer never touches the Notification API itself.
+  notify: (payload) => ipcRenderer.invoke("recall:notify", payload),
 
   // Live captions (0.8.3). Its own namespace rather than five more top-level
   // keys: the captions window is a second surface with its own lifecycle, and
@@ -54,4 +57,6 @@ contextBridge.exposeInMainWorld("recall", {
   // window's own context menu shows up in it, and the captions window so a
   // slider moved in the settings card is live before it is let go.
   onCaptionSettings: (fn) => on("recall:captions:settings", fn),
+  // Somebody clicked a reminder notification, outside the window.
+  onOpenNote: (fn) => on("recall:openNote", fn),
 });

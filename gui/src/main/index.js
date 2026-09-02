@@ -8,7 +8,7 @@
 // model of the transcript at all: it relays events and lets the renderer
 // rebuild itself on resync.
 
-import { app, BrowserWindow, Tray, Menu, nativeImage, nativeTheme } from 'electron';
+import { app, BrowserWindow, Tray, Menu, Notification, nativeImage, nativeTheme } from 'electron';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -374,6 +374,48 @@ function startClient() {
 }
 
 // ---------------------------------------------------------------------------
+// 0.9.0 — reminders
+// ---------------------------------------------------------------------------
+
+/**
+ * Raise an OS notification for a note that has come due.
+ *
+ * This is the only thing this app does that reaches outside its own window, and
+ * it is deliberately the narrowest thing that could: one notification, for one
+ * note, that the user asked for out loud. There is no notification for a
+ * commitment, for a digest, for a new segment or for anything the daemon
+ * inferred — the Memory view's own copy still says "nothing here reminds you,
+ * notifies you, or acts on its own", and that stays true because a note is not
+ * something the app noticed, it is something you dictated.
+ *
+ * Clicking it brings the window up and hands the renderer the note id, so the
+ * click lands on the row rather than on the app. Returns false when the desktop
+ * has no notification service at all, which is a normal state and not an error:
+ * the renderer's toast has already said the same thing inside the window.
+ */
+function raiseReminder({ noteId, title, body }) {
+  if (!Notification.isSupported()) return false;
+  try {
+    const n = new Notification({
+      title,
+      body,
+      // Quiet. A reminder is not an alarm, and a sound is the thing that makes
+      // people turn a feature off.
+      silent: true,
+    });
+    n.on('click', () => {
+      showWindow();
+      broadcast('recall:openNote', { noteId });
+    });
+    n.show();
+    return true;
+  } catch (e) {
+    console.warn('[recall] could not raise a reminder notification', e);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // lifecycle
 // ---------------------------------------------------------------------------
 
@@ -426,6 +468,8 @@ async function bootstrap() {
       },
       isOpen: captionsAreOpen,
     },
+    // 0.9.0: a reminder that has come round. See `raiseReminder`.
+    notify: raiseReminder,
   });
 
   startClient();

@@ -20,7 +20,9 @@ pub mod allowlist;
 pub mod analysis;
 pub mod arbiter;
 pub mod ask;
+// ---- 0.9.0, the assistant ------------------------------------------------
 pub mod asr;
+pub mod assist;
 pub mod b64;
 pub mod brief;
 pub mod bus;
@@ -31,6 +33,7 @@ pub mod clock;
 pub mod commitment;
 pub mod config;
 pub mod control;
+pub mod digest;
 pub mod embed;
 pub mod enrich;
 pub mod fetch;
@@ -48,6 +51,7 @@ pub mod proto;
 pub mod proximity;
 pub mod quality;
 pub mod queue;
+pub mod reminders;
 pub mod resample;
 pub mod retention;
 pub mod roster;
@@ -58,10 +62,12 @@ pub mod split;
 pub mod store;
 pub mod threads;
 pub mod timeref;
+pub mod translate;
 /// Ground truth from Discord (0.9.0): the labelling pass and the measurement.
 pub mod truth;
 /// The truth ingest's loopback HTTP listener (0.9.0).
 pub mod truthnet;
+// ---- end 0.9.0 -----------------------------------------------------------
 pub mod turns;
 pub mod vad;
 pub mod vocab;

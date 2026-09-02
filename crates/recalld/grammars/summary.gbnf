@@ -1,0 +1,6 @@
+root ::= "{" ws "\"summary\":" ws str "," ws "\"people\":" ws list "," ws "\"open\":" ws list ws "}"
+list ::= "[" ws "]" | "[" ws str (ws "," ws str)* ws "]"
+str ::= "\"" chars "\""
+chars ::= char chars | char
+char ::= [^"\\\x00-\x1f] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])
+ws ::= [ \t\n]?

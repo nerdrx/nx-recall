@@ -1507,6 +1507,167 @@ export function runE2E(deps) {
       });
     }
 
+    // ---- 0.9.0, the assistant --------------------------------------------
+
+    await step('a-note-with-a-date-is-a-reminder-and-says-so', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      const a = await waitFor('the notes card', async () => {
+        const a = await js('window.__recallDebug.accuracy()');
+        return a.notes.length ? a : null;
+      });
+      const timed = a.notes.filter((n) => n.due != null);
+      assert(timed.length >= 2, `only ${timed.length} notes carry a date`);
+      // The chip is the whole difference between a note and a reminder, and it
+      // has to be readable rather than merely present.
+      for (const n of timed) {
+        assert(n.dueChip, `note ${n.id} has a date and no chip`);
+      }
+      // A note with no date wears no chip: a reminder is a note with a date on
+      // it, not a second kind of row.
+      const plain = a.notes.filter((n) => n.due == null);
+      assert(plain.length, 'the fixture has no undated note left to compare against');
+      assert(
+        plain.every((n) => !n.dueChip),
+        'a note with no date is wearing a due chip'
+      );
+      // …and one that has already come round says so quietly rather than
+      // claiming to be due.
+      const fired = timed.find((n) => n.fired);
+      assert(fired, 'no fired reminder in the fixture');
+      assert(
+        /reminded/i.test(fired.dueChip),
+        `a reminder that has gone off reads "${fired.dueChip}"`
+      );
+      // Snooze is offered on open notes only.
+      const open = a.notes.filter((n) => n.state === 'open');
+      assert(open.every((n) => n.snoozes.length === 3), 'an open note is missing its snoozes');
+      assert(
+        a.notes.filter((n) => n.state !== 'open').every((n) => !n.snoozes.length),
+        'a settled note offers a snooze'
+      );
+      await js('document.getElementById("notes-card").scrollIntoView({ block: "start" })');
+      const file = await shot('memory-reminders');
+      return { timed: timed.length, chips: timed.map((n) => n.dueChip), file };
+    });
+
+    await step('a-snooze-moves-the-date-and-the-daemon-agrees', async () => {
+      const before = await js('window.__recallDebug.accuracy()');
+      const target = before.notes.find((n) => n.state === 'open' && n.due != null);
+      assert(target, 'no open reminder to snooze');
+      await js(`document.querySelector('[data-snooze="60"][data-note="${target.id}"]').click()`);
+      const after = await waitFor('the snooze to land', async () => {
+        const a = await js('window.__recallDebug.accuracy()');
+        const row = a.notes.find((n) => n.id === target.id);
+        return row && !row.pending && row.due !== target.due ? row : null;
+      });
+      assert(after.due > target.due, 'the date did not move forward');
+      assert(!after.fired, 'a snooze must un-fire the reminder');
+      // The daemon really has it, not just this window.
+      const onWire = await js(`(async () => {
+        const r = await window.recall.request('notes.list', {});
+        const n = (r.data.notes || []).find(x => x.id === ${target.id});
+        return n ? { due: n.due_ms, fired: n.fired, state: n.state } : null;
+      })()`);
+      assert(onWire, 'the note is gone from the daemon');
+      assert(onWire.state === 'open', `the daemon says ${onWire.state}`);
+      assert(onWire.fired === false, 'the daemon still has it fired');
+      assert(onWire.due === after.due, `the daemon says ${onWire.due}, the window says ${after.due}`);
+      return { was: target.due, now: after.due, chip: after.dueChip };
+    });
+
+    if (process.env.NX_RECALL_MOCK_PID) {
+      await step('a-reminder-coming-round-raises-a-toast-that-opens-the-note', async () => {
+        // The mock's second SIGUSR2 fires a reminder and a digest — both are
+        // things a canned world cannot produce on its own.
+        await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+        process.kill(Number(process.env.NX_RECALL_MOCK_PID), 'SIGUSR2');
+        const toast = await waitFor(
+          'the reminder toast',
+          async () =>
+            js(`(() => {
+              const t = [...document.querySelectorAll('#toasts .toast')]
+                .find((x) => /reminder/i.test(x.textContent));
+              return t ? { text: t.textContent, clickable: t.classList.contains('clickable') } : null;
+            })()`),
+          { timeout: 12000 }
+        );
+        assert(toast.clickable, 'the reminder toast is not pressable');
+        const file = await shot('reminder-toast');
+        // Pressing it goes to Memory and lands on the row, from the transcript.
+        await js(`[...document.querySelectorAll('#toasts .toast')].find((x) => /reminder/i.test(x.textContent)).click()`);
+        const landed = await waitFor('the note to be focused', async () => {
+          const v = await js(`(() => ({
+            view: window.__recallDebug.view(),
+            flashed: document.querySelectorAll('.note-row.flash').length,
+          }))()`);
+          return v.view === 'memory' && v.flashed ? v : null;
+        });
+        return { toast: toast.text.slice(0, 60), view: landed.view, file };
+      });
+
+      await step('a-digest-arriving-live-goes-to-the-top-of-yesterday', async () => {
+        const a = await waitFor(
+          'the digest card',
+          async () => {
+            const v = await js('window.__recallDebug.assistant()');
+            return v.digests.rows.length >= 3 ? v : null;
+          },
+          { timeout: 12000 }
+        );
+        assert(a.digests.shown, 'the Yesterday card is hidden with digests in it');
+        // A digest is written once per conversation, so no thread may appear
+        // twice however many events arrive.
+        const threads = a.digests.rows.map((r) => r.thread);
+        assert(new Set(threads).size === threads.length, `a conversation is summarised twice: ${threads}`);
+        // Every row is a paragraph with the people who were in it.
+        for (const row of a.digests.rows) {
+          assert(row.summary.length > 40, `a digest of ${row.summary.length} characters is not a paragraph`);
+          assert(row.people.length >= 1, `digest ${row.thread} names nobody`);
+        }
+        assert(/summarised/.test(a.digests.sub), `the card's sub reads "${a.digests.sub}"`);
+        await js('document.getElementById("digest-card").scrollIntoView({ block: "start" })');
+        const file = await shot('memory-yesterday');
+        return { rows: a.digests.rows.length, groups: a.digests.groups, file };
+      });
+
+      await step('a-digest-opens-the-conversation-it-is-about', async () => {
+        const before = await js('window.__recallDebug.assistant()');
+        const row = before.digests.rows[0];
+        await js(`document.querySelector('[data-digest="${row.thread}"]').click()`);
+        const landed = await waitFor('the transcript', async () =>
+          js(`(() => {
+            const v = window.__recallDebug.view();
+            return v === 'transcript' ? { view: v, rows: document.querySelectorAll('.seg').length } : null;
+          })()`)
+        );
+        assert(landed.rows > 0, 'the transcript is empty after opening a digest');
+        return { thread: row.thread, ...landed };
+      });
+    }
+
+    await step('a-translated-turn-keeps-the-words-that-were-said', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      const v = await waitFor('translated rows', async () => {
+        const v = await js('window.__recallDebug.assistant()');
+        return v.translated.rows ? v : null;
+      });
+      assert(v.translated.rows > 0, 'no translated rows on screen');
+      // The original is still there, above the reading, and they are not the
+      // same string: a translation that replaced the words would be a
+      // quotation nobody uttered.
+      for (const pair of v.translated.pairs) {
+        assert(pair.said, 'a translated row lost the words that were said');
+        assert(pair.reading, 'a translated row has an empty reading');
+        assert(pair.said !== pair.reading, `the reading is the original: ${pair.said}`);
+        assert(pair.lang === 'de', `the reading claims to be "${pair.lang}"`);
+        assert(pair.via, 'the reading does not say which model wrote it');
+      }
+      // Rows with nothing to translate render exactly as they always did.
+      assert(v.translated.plain > 0, 'every row on screen is translated, which is not the rule');
+      const file = await shot('transcript-translated');
+      return { translated: v.translated.rows, plain: v.translated.plain, file };
+    });
+
     await step('the-accuracy-card-is-honest-arithmetic', async () => {
       await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
       const a = await waitFor('the accuracy card', async () => {

@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use recalld::analysis::AnalysisStats;
+use recalld::assist::{self, AssistStop};
 use recalld::bus::Bus;
 use recalld::capture;
 use recalld::client;
@@ -29,6 +30,7 @@ use recalld::night::{self, NightStop};
 use recalld::pipeline::{self, Pipeline, Stats};
 use recalld::quality::{self, QualityStop};
 use recalld::queue::EventQueue;
+use recalld::reminders::{self, ReminderStop};
 use recalld::retention::{self, SweeperStop};
 use recalld::roster::{self, RosterStop};
 use recalld::server;
@@ -167,6 +169,9 @@ fn main() -> Result<()> {
         // ---- 0.9.0, ground truth from Discord --------------------------
         Command::Truth { action } => cmd_truth(&cfg, &data_dir, &config_path, action),
         // ---- end 0.9.0 -------------------------------------------------
+        // ---- 0.9.0, the assistant ---------------------------------------
+        Command::Digest { day } => cmd_digest(&cfg, &data_dir, day.as_deref()),
+        // ---- end 0.9.0 ---------------------------------------------------
     }
 }
 
@@ -275,7 +280,12 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     .with_graph(cfg.graph.clone(), models_root.clone())
     // …and the accuracy round's idle worker reads its switches the same way.
     .with_asr(cfg.asr.clone())
-    .with_night(cfg.night.clone());
+    .with_night(cfg.night.clone())
+    // 0.9.0: reminders, digests and translation, for the same reason again.
+    .with_assist(cfg.assist.clone());
+    // The target language is read once here rather than threaded through
+    // `segment_json`'s dozen call sites; see `translate::set_target`.
+    recalld::translate::set_target(&cfg.assist.translate_to);
     // The ids clients see must be the ids that will be written on segments, so
     // resolve the ASR fallback here exactly as the pipeline does.
     if let Some(mut models) = ModelSet::resolve(&cfg.models) {
@@ -504,6 +514,48 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
             .map_err(|e| warn!("no night shift: {e}"))
             .ok()
     };
+    // ---- 0.9.0, the assistant ------------------------------------------
+    // Two threads. The scheduler is a query every thirty seconds and no model
+    // at all, so it runs whatever else is switched off; the digest and
+    // translation passes share one worker because they share one model.
+    let reminder_stop = Arc::new(ReminderStop::default());
+    let reminder_thread = {
+        let store = Arc::clone(&store);
+        let bus = Arc::clone(&bus);
+        let assist_cfg = cfg.assist.clone();
+        let stats = Arc::clone(&control.assist_stats);
+        let stop = Arc::clone(&reminder_stop);
+        std::thread::Builder::new()
+            .name("recalld-reminders".into())
+            .spawn(move || reminders::run(store, bus, assist_cfg, stats, stop))
+            .map_err(|e| warn!("no reminder scheduler: {e}"))
+            .ok()
+    };
+    let assist_stop = Arc::new(AssistStop::default());
+    let assist_thread = {
+        let store = Arc::clone(&store);
+        let control2 = Arc::clone(&control);
+        let bus = Arc::clone(&bus);
+        let root = models_root.clone();
+        let runtime = cfg.runtime.clone();
+        let assist_cfg = cfg.assist.clone();
+        let stats = Arc::clone(&control.assist_stats);
+        let stop = Arc::clone(&assist_stop);
+        std::thread::Builder::new()
+            .name("recalld-assist".into())
+            .spawn(move || {
+                assist::run(store, control2, bus, root, runtime, assist_cfg, stats, stop)
+            })
+            .map_err(|e| warn!("no assistant worker: {e}"))
+            .ok()
+    };
+    if !cfg.assist.translate_to.trim().is_empty() {
+        info!(
+            to = %cfg.assist.translate_to,
+            "turns in another language will be translated by the local model"
+        );
+    }
+    // ---- end 0.9.0 -------------------------------------------------------
 
     let sweeper_stop = Arc::new(SweeperStop::default());
     let sweeper_thread = if cfg.retention.enabled {
@@ -548,6 +600,8 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     quality_stop.stop();
     truth_stop.stop();
     night_stop.stop();
+    reminder_stop.stop();
+    assist_stop.stop();
     if let Some(s) = socket {
         s.shutdown();
     }
@@ -561,6 +615,9 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         quality_thread,
         truth_thread,
         night_thread,
+        // 0.9.0.
+        reminder_thread,
+        assist_thread,
     ]
     .into_iter()
     .flatten()
@@ -2506,6 +2563,89 @@ fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
     if let Some(caveat) = a["caveat"].as_str() {
         println!("\n{caveat}");
     }
+    Ok(())
+}
+
+// ---- 0.9.0, the assistant -------------------------------------------------
+
+/// `recalld digest [day]` — one paragraph per conversation.
+fn cmd_digest(cfg: &Config, data_dir: &Path, day: Option<&str>) -> Result<()> {
+    let day = match day.map(str::trim) {
+        None => None,
+        // The two words a person actually types. Resolved here rather than in
+        // the daemon: "today" is a fact about the terminal's clock, and the
+        // socket's `day` parameter is a calendar day so that a client can ask
+        // for one without agreeing with the daemon about what time it is.
+        Some("today") => Some(recalld::digest::local_day(utc_now_ns())),
+        Some("yesterday") => Some(recalld::digest::local_day(
+            utc_now_ns() - 86_400 * 1_000_000_000,
+        )),
+        Some(d) => Some(d.to_string()),
+    };
+    let params = match &day {
+        Some(d) => json!({ "day": d }),
+        None => json!({}),
+    };
+    let out = call(cfg, data_dir, "digest.list", params)?;
+    let rows = out["digests"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!(
+            "Nothing summarised{}.\n\n\
+             Conversations are read once they have settled, by the local model, after\n\
+             everything else it owes you. `recalld graph on` turns it on; `recalld\n\
+             models fetch --graph` installs it. Conversations it read and found not\n\
+             worth a paragraph are not listed, which is most short ones.",
+            day.as_deref()
+                .map(|d| format!(" for {d}"))
+                .unwrap_or_default()
+        );
+        return Ok(());
+    }
+    for (i, d) in rows.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        let people: Vec<String> = d["participants"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|p| {
+                        p["label"]
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("speaker {}", p["speaker_id"]))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        println!(
+            "{}  {}  ({} turns)",
+            format_time(
+                d["started_ns"]
+                    .as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0)
+            ),
+            if people.is_empty() {
+                "nobody the voicebank could name".to_string()
+            } else {
+                people.join(" · ")
+            },
+            d["turns"].as_i64().unwrap_or(0),
+        );
+        println!("  {}", d["summary"].as_str().unwrap_or(""));
+        for open in d["open"].as_array().into_iter().flatten() {
+            if let Some(s) = open.as_str() {
+                println!("  · still open: {s}");
+            }
+        }
+    }
+    println!(
+        "\n{} conversation{} summarised. Written by the local model on this machine;\n\
+         nothing left it.",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
     Ok(())
 }
 
