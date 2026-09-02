@@ -321,6 +321,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.9.0 | +92h | ground truth from Discord, the night shift on the GPU, captions, reminders, digests, translation; azimuth and the glossary re-read measured and parked; the quarterly model refresh says keep v3 |
 | 0.9.1 | +93h | `models build-night` fetches the Khronos headers a desktop with a working driver still lacks, and the runtime it installs finds its own libraries |
 | 0.10.0 | +98h | replay, world memory, turn-taking statistics, Markdown export, the room microphone, a Discord source card, naming a new voice from the transcript, and captions that really pass clicks through |
+| 0.10.1 | +100h | the captions toggle means two things again (drag, scroll, right-click to give clicks back); the accuracy card stops reporting 113% error; the assistant gets a fair share behind the enrichment queue; heard-on chips and the identity audit; `truth report` stops scoring your own account |
 
 ## Quickstart
 
