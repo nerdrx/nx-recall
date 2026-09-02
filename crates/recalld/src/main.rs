@@ -3175,8 +3175,225 @@ fn cmd_identity(cfg: &Config, data_dir: &Path, action: Option<IdentityAction>) -
             }
             cmd_identity_repair(cfg, data_dir, apply, limit)
         }
+        // ---- 0.11.0: learned identity ---------------------------------
+        IdentityAction::Calibrate { apply, reset } => {
+            cmd_identity_calibrate(cfg, data_dir, apply, reset)
+        } // ---- end 0.11.0 -----------------------------------------------
     }
 }
+
+// ---- 0.11.0: learned identity ----------------------------------------------
+
+/// `recalld identity calibrate` — the fit, the held-out table, and the one
+/// write it justifies.
+///
+/// Reads the database directly, like the audit beside it: it says nothing
+/// about a running daemon and has to work where none is running. Everything
+/// the pass would install is printed before it is installed, because a learned
+/// number nobody can see is indistinguishable from a magic one.
+fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: bool) -> Result<()> {
+    let store = Store::open(data_dir)?;
+    let now = recalld::clock::utc_now_ns();
+    if reset {
+        let (cleared, dropped) = recalld::identity_learn::reset(&store, now)?;
+        println!(
+            "{cleared} voice(s) back on the global operating point{}.",
+            if dropped {
+                ", and the learned space dropped"
+            } else {
+                ""
+            }
+        );
+        return Ok(());
+    }
+
+    let name_of = |id: i64| -> String { store.speaker_name(id).ok().flatten().unwrap_or_default() };
+    let report = recalld::identity_learn::calibrate(&store, &cfg.identity, apply, now)?;
+
+    println!(
+        "{:<22}{}",
+        "learning",
+        if cfg.identity.learn {
+            "ON — the nightly pass may install what clears the gate"
+        } else {
+            "OFF — `[identity].learn = true` turns the nightly refit on. This \
+             report is what it would see."
+        }
+    );
+    println!(
+        "{:<22}{} truth rows, {} fit / {} held out (chronological, 60/40)",
+        "ground truth", report.rows, report.fit_rows, report.eval_rows
+    );
+    for (id, fit, held) in &report.per_voice {
+        println!(
+            "  {:<20}fit {fit:<6} held out {held}",
+            format!("{id} {}", name_of(*id))
+        );
+    }
+    if let Some(note) = &report.note {
+        println!("\n{note}.");
+        return Ok(());
+    }
+
+    println!("\ninstalled now");
+    if report.installed.is_empty() {
+        println!(
+            "  nothing — every voice is on the global {:.2}.",
+            cfg.identity.label_threshold
+        );
+    }
+    for (id, t, m, n) in &report.installed {
+        println!(
+            "  {:<20}threshold {t:.2}  margin {m:.2}  (calibrated on {n} turns)",
+            format!("{id} {}", name_of(*id))
+        );
+    }
+    println!(
+        "  learned space        {}",
+        if report.projection_installed {
+            "installed"
+        } else {
+            "none — cosine runs in the extractor's own space"
+        }
+    );
+
+    println!("\nthe fit proposes");
+    if report.proposed.is_empty() {
+        println!(
+            "  nothing. A voice needs {} truth rows in the fit split and a point that \
+             beats\n  the global on them.",
+            recalld::calib::MIN_ROWS_PER_VOICE
+        );
+    }
+    for v in &report.proposed {
+        println!(
+            "  {:<20}threshold {:.2}  margin {:.2}  on {} turns  (F-0.5 {:.3} vs {:.3} global)",
+            format!("{} {}", v.speaker_id, name_of(v.speaker_id)),
+            v.threshold,
+            v.margin,
+            v.n,
+            v.f_beta,
+            v.f_beta_global
+        );
+    }
+
+    let row = |what: &str, s: &recalld::calib::Score| {
+        let pct = |v: f64| {
+            if v.is_nan() {
+                "—".to_string()
+            } else {
+                format!("{:.1}%", v * 100.0)
+            }
+        };
+        println!(
+            "  {:<28}{:>5}{:>9}{:>7}{:>10}{:>11}{:>9}{:>8.3}",
+            what,
+            s.n,
+            s.correct,
+            s.wrong,
+            s.declined,
+            pct(s.precision()),
+            pct(s.recall()),
+            s.f_beta(recalld::calib::BETA)
+        );
+    };
+    println!("\nheld out — the only rows any verdict reads");
+    println!(
+        "  {:<28}{:>5}{:>9}{:>7}{:>10}{:>11}{:>9}{:>8}",
+        "arm", "n", "correct", "wrong", "declined", "precision", "recall", "F-0.5"
+    );
+    row("the globals", &report.baseline);
+    row("+ per-voice thresholds", &report.candidate);
+    if let Some((w, s)) = &report.projection {
+        row(
+            &format!("+ learned space (p{:.2}/s{:.2})", w.power, w.shrinkage),
+            s,
+        );
+    }
+    println!(
+        "\n  thresholds: {}",
+        verdict_line(report.thresholds_swap, &report.proposed.is_empty())
+    );
+    println!(
+        "  space:      {}",
+        match &report.projection {
+            None => "no whitening beat the raw space on the inner split; none offered".into(),
+            Some(_) => verdict_line(report.projection_swap, &false),
+        }
+    );
+
+    println!("\nthe overlap gate, held out");
+    println!(
+        "  {:<8}{:>10}{:>10}{:>10}{:>12}{:>10}{:>9}",
+        "thr", "caught", "missed", "false", "precision", "recall", "F-0.5"
+    );
+    for p in &report.gate_curve {
+        let here = (p.threshold - cfg.identity.max_overlap).abs() < 1e-6;
+        println!(
+            "  {:<8}{:>10}{:>10}{:>10}{:>12}{:>10}{:>9.3}{}",
+            format!("{:.2}", p.threshold),
+            p.caught,
+            p.missed,
+            p.false_refusals,
+            if p.precision().is_nan() {
+                "—".into()
+            } else {
+                format!("{:.1}%", p.precision() * 100.0)
+            },
+            if p.recall().is_nan() {
+                "—".into()
+            } else {
+                format!("{:.1}%", p.recall() * 100.0)
+            },
+            p.f_beta(),
+            if here { "   <- shipping" } else { "" }
+        );
+    }
+    if let (Some(best), Some(cur)) = (report.gate_best, report.gate_shipping) {
+        println!(
+            "  best on the fit split was {:.2}; held out it scores {:.3} against the \
+             shipping {:.2}'s {:.3} -> {}",
+            best.threshold,
+            best.f_beta(),
+            cfg.identity.max_overlap,
+            cur.f_beta(),
+            if best.f_beta() > cur.f_beta() + 1e-9 {
+                "the curve argues for a change"
+            } else {
+                "keep what ships"
+            }
+        );
+    }
+
+    if apply {
+        println!(
+            "\nwrote {} threshold(s), cleared {}.",
+            report.written, report.cleared
+        );
+    } else {
+        println!(
+            "\nNothing was written. `recalld identity calibrate --apply` installs what cleared the gate."
+        );
+    }
+    Ok(())
+}
+
+/// One line saying whether an arm may ship, in the language of the rule that
+/// decided it.
+fn verdict_line(swap: bool, nothing_proposed: &bool) -> String {
+    if *nothing_proposed {
+        "nothing proposed, so nothing to gate".into()
+    } else if swap {
+        "PASS — precision held, and the gain is big enough to be worth the change".into()
+    } else {
+        "REFUSED — it cost held-out precision, or it bought too little to be worth \
+         moving the operating point for (two points of recall, or a fifth of the \
+         wrong labels)"
+            .into()
+    }
+}
+
+// ---- end 0.11.0 -----------------------------------------------------------
 
 /// How many of the questioned labels the tail prints.
 const AUDIT_TAIL: usize = 20;

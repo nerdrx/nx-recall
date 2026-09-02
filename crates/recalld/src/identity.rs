@@ -134,6 +134,40 @@ pub fn decide(
     words: usize,
     ranked: &[Candidate],
 ) -> Decision {
+    decide_with(
+        cfg,
+        &crate::calib::Thresholds::global(cfg.label_threshold, 0.0),
+        overlap_frac,
+        duration_s,
+        words,
+        ranked,
+    )
+}
+
+// ---- 0.11.0: learned identity ---------------------------------------------
+
+/// [`decide`], with the label bar looked up per voice instead of read off the
+/// config (0.11.0).
+///
+/// Two rules keep this from being a second ladder:
+///
+/// * only the **label** decision consults `thresholds`. Enrolment keeps every
+///   global bar it had, because a wrong prototype is permanent and nothing has
+///   measured a per-voice enrol point;
+/// * the lookup applies to the **top** candidate only, and a top candidate
+///   that fails its own bar does not hand the turn to the runner-up. The
+///   ladder's shape is unchanged; one number in it moved.
+///
+/// `decide` is exactly this function with an empty table, so the 0.10.2
+/// behaviour is not a separate code path that could drift.
+pub fn decide_with(
+    cfg: &IdentityConfig,
+    thresholds: &crate::calib::Thresholds,
+    overlap_frac: f32,
+    duration_s: f32,
+    words: usize,
+    ranked: &[Candidate],
+) -> Decision {
     if let Some(refusal) = gate(cfg, overlap_frac, duration_s) {
         return Decision::Refused(refusal);
     }
@@ -153,12 +187,13 @@ pub fn decide(
     let Some(top) = ranked.first() else {
         return mint(None);
     };
-    if top.score < cfg.label_threshold {
+    let (label_threshold, label_margin) = thresholds.for_speaker(top.speaker_id);
+    let runner_up = ranked.get(1).map(|c| c.score).unwrap_or(f32::NEG_INFINITY);
+    let margin = top.score - runner_up;
+    if top.score < label_threshold || margin < label_margin {
         return mint(Some(top.score));
     }
 
-    let runner_up = ranked.get(1).map(|c| c.score).unwrap_or(f32::NEG_INFINITY);
-    let margin = top.score - runner_up;
     let enroll = top.score >= cfg.enroll_threshold
         && margin >= cfg.enroll_margin
         && overlap_frac <= cfg.enroll_max_overlap
@@ -170,6 +205,8 @@ pub fn decide(
         enroll,
     }
 }
+
+// ---- end 0.11.0 -----------------------------------------------------------
 
 /// Which prototype to evict to make room for `incoming`, once a speaker is at
 /// its cap.
@@ -475,6 +512,79 @@ mod tests {
             (11, e(&[0.0, 1.0]), false),
         ];
         assert_eq!(prototype_to_evict(&incoming, &existing).unwrap(), Some(11));
+    }
+
+    // ---- 0.11.0: per-voice thresholds ------------------------------------
+
+    #[test]
+    fn a_learned_threshold_raises_the_bar_for_one_voice_only() {
+        let t = crate::calib::Thresholds::global(cfg().label_threshold, 0.0).with(1, 0.55, 0.0);
+        // Voice 1 at 0.40 used to be a match and is now a mint.
+        assert_eq!(
+            decide_with(&cfg(), &t, 0.0, 5.0, 5, &[c(1, 0.40)]),
+            Decision::Mint {
+                best_score: Some(0.40)
+            }
+        );
+        // Voice 2, at the same score, is untouched.
+        assert!(matches!(
+            decide_with(&cfg(), &t, 0.0, 5.0, 5, &[c(2, 0.40)]),
+            Decision::Matched { speaker_id: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn a_learned_threshold_can_also_lower_the_bar() {
+        let t = crate::calib::Thresholds::global(cfg().label_threshold, 0.0).with(1, 0.31, 0.0);
+        assert!(matches!(
+            decide_with(&cfg(), &t, 0.0, 5.0, 5, &[c(1, 0.32)]),
+            Decision::Matched { speaker_id: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn a_learned_margin_declines_rather_than_promoting_the_runner_up() {
+        // The point of the shape: a top candidate that fails its own margin
+        // does NOT hand the turn to whoever was second.
+        let t = crate::calib::Thresholds::global(cfg().label_threshold, 0.0).with(1, 0.35, 0.10);
+        assert_eq!(
+            decide_with(&cfg(), &t, 0.0, 5.0, 5, &[c(1, 0.60), c(2, 0.58)]),
+            Decision::Mint {
+                best_score: Some(0.60)
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_learned_table_is_exactly_the_old_ladder() {
+        let t = crate::calib::Thresholds::global(cfg().label_threshold, 0.0);
+        for score in [0.10, 0.34, 0.35, 0.54, 0.55, 0.99] {
+            for overlap in [0.0, 0.06, 0.2] {
+                for duration in [0.5, 2.5, 5.0] {
+                    let ranked = [c(1, score), c(2, score - 0.03)];
+                    assert_eq!(
+                        decide(&cfg(), overlap, duration, 5, &ranked),
+                        decide_with(&cfg(), &t, overlap, duration, 5, &ranked),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_learned_threshold_never_relaxes_the_enrol_bar() {
+        // Voice 1's label bar is learned down to 0.31, but enrolment still
+        // wants 0.55: a wrong prototype is permanent and nothing here measured
+        // that decision.
+        let t = crate::calib::Thresholds::global(cfg().label_threshold, 0.0).with(1, 0.31, 0.0);
+        assert_eq!(
+            decide_with(&cfg(), &t, 0.0, 5.0, 5, &[c(1, 0.40)]),
+            Decision::Matched {
+                speaker_id: 1,
+                score: 0.40,
+                enroll: false
+            }
+        );
     }
 
     #[test]

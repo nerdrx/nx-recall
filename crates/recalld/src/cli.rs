@@ -553,6 +553,44 @@ pub enum IdentityAction {
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
     },
+    // ---- 0.11.0: learned identity -----------------------------------------
+    /// Fit the operating point to this install's own ground truth, and show
+    /// what that would change. Prints and changes nothing unless `--apply`.
+    #[command(long_about = "\
+Fit the operating point to the turns Discord itself labelled, and print what
+that would change.
+
+Two things can be learned, and each has to earn its place on rows the fit never
+saw. The truth rows are split by TIME — the first 60% may be fitted on, the
+last 40% is the only thing any verdict reads — and no row is ever scored
+against a prototype it produced itself.
+
+  thresholds   a label bar per voice, bounded to [0.30, 0.60], for voices with
+               at least thirty truth rows. Others keep the global.
+  the space    a within-class whitening applied before cosine, so the
+               directions one person's own turns wander along count for less.
+
+Nothing is installed that does not beat what is already there on the held-out
+rows, and a candidate that lowers held-out PRECISION is refused whatever it
+does to recall: a wrong name corrupts what you later read back as memory, a
+missed one costs a shrug.
+
+  (no flag)    measure and print. Writes nothing.
+  --apply      install whatever cleared the gate, and log the before/after
+               table to `operations` as `identity.calibrate`.
+  --reset      put every voice back on the globals and drop the learned space.
+
+`[identity].learn = false` turns the nightly refit off; this command still
+reports.")]
+    Calibrate {
+        /// Install what cleared the gate. Without it the command only reports.
+        #[arg(long)]
+        apply: bool,
+        /// Forget every learned value and go back to the globals.
+        #[arg(long, conflicts_with = "apply")]
+        reset: bool,
+    },
+    // ---- end 0.11.0 -------------------------------------------------------
 }
 
 #[derive(Subcommand, Debug)]

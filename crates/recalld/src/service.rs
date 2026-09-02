@@ -369,6 +369,9 @@ impl Service {
             "truth.unlink" => self.truth_unlink(req),
             "truth.summary" => self.truth_summary(),
             // ---- end 0.9.0 -------------------------------------------------
+            // ---- 0.11.0, learned identity ----------------------------------
+            "identity.calibrate" => self.identity_calibrate(req),
+            // ---- end 0.11.0 ------------------------------------------------
             // ---- 0.9.0, the assistant --------------------------------------
             // One read. Reminders ride on `notes.*` (a reminder is a note with
             // a date, not a new kind of row) and translations ride on the
@@ -3886,6 +3889,29 @@ impl Service {
     }
 
     // ---- end 0.9.0 -------------------------------------------------------
+
+    // ---- 0.11.0: learned identity -----------------------------------------
+
+    /// `identity.calibrate` — the fit, the held-out table, and optionally the
+    /// write.
+    ///
+    /// Read-only by default, exactly like the CLI: `apply` is what turns the
+    /// measurement into an installation, and even then the held-out gate
+    /// inside the pass has the last word. `reset` puts every voice back on the
+    /// globals.
+    fn identity_calibrate(&self, req: &Request) -> Result<Value, Error> {
+        let apply = req.params["apply"].as_bool().unwrap_or(false);
+        let reset = req.params["reset"].as_bool().unwrap_or(false);
+        let now = crate::clock::utc_now_ns();
+        let store = self.store();
+        if reset {
+            let (cleared, dropped) = crate::identity_learn::reset(&store, now)?;
+            return Ok(json!({ "reset": true, "cleared": cleared, "projection": dropped }));
+        }
+        Ok(crate::identity_learn::calibrate(&store, &self.control.identity, apply, now)?.to_json())
+    }
+
+    // ---- end 0.11.0 -------------------------------------------------------
     // ---- end 0.9.0 --------------------------------------------------------
 }
 

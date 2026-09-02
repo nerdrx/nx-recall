@@ -26,6 +26,9 @@ pub mod assist;
 pub mod b64;
 pub mod brief;
 pub mod bus;
+// ---- 0.11.0: learned identity ---------------------------------------------
+pub mod calib;
+// ---- end 0.11.0 -----------------------------------------------------------
 pub mod canary;
 pub mod capture;
 pub mod client;
@@ -42,6 +45,9 @@ pub mod fetch;
 pub mod identity;
 /// Where the audio came from, as evidence about who is on it (0.11.0).
 pub mod identity_prior;
+// ---- 0.11.0: learned identity ---------------------------------------------
+pub mod identity_learn;
+// ---- end 0.11.0 -----------------------------------------------------------
 pub mod ingest;
 pub mod lang;
 pub mod langctx;

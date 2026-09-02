@@ -278,7 +278,25 @@ impl Analyzer {
 
         store.store_embedding(segment_id, &embedding)?;
         let bank = store.prototypes(&embedding.model_id)?;
-        let ranked = identity::rank(&embedding, &bank)?;
+        // ---- 0.11.0: learned identity ---------------------------------
+        // The learned space, if one is installed, goes in front of the
+        // cosine — both sides of it, which is why the probe and the bank are
+        // mapped together and never separately. A failure costs the learned
+        // space and never the label: the ladder then sees exactly what 0.10.2
+        // would have shown it. Nothing is installed until a nightly
+        // calibration has beaten the raw space on held-out ground truth, so on
+        // a fresh install this is a NULL lookup and a branch.
+        let (probe, bank) = match learned_space(store, &self.cfg, &embedding, &bank) {
+            Ok(Some(mapped)) => mapped,
+            Ok(None) => (embedding.clone(), bank),
+            Err(e) => {
+                warn!(segment_id, "the learned space could not be applied: {e:#}");
+                (embedding.clone(), bank)
+            }
+        };
+        let thresholds = learned_thresholds(store, &self.cfg);
+        // ---- end 0.11.0 -----------------------------------------------
+        let ranked = identity::rank(&probe, &bank)?;
         // The source-aware prior (0.11.0), between ranking and deciding —
         // which is the only place it can be: it needs the scores to weigh a
         // foreign candidate against a native one, and it has to be able to
@@ -305,7 +323,14 @@ impl Analyzer {
         // The word count is the mint bar's second half (0.6.1): a new identity
         // needs seconds *and* words. Matching an existing one never asks.
         let words = text.as_deref().map(lang::word_count).unwrap_or(0);
-        let decision = identity::decide(&self.cfg, overlap_frac, duration_s, words, &ranked);
+        let decision = identity::decide_with(
+            &self.cfg,
+            &thresholds,
+            overlap_frac,
+            duration_s,
+            words,
+            &ranked,
+        );
 
         let (speaker_id, match_score, enrolled) = match &decision {
             // `gate` already ran, so this arm is unreachable in practice; it
@@ -995,3 +1020,62 @@ pub fn analyse_mic_or_log(
         }
     }
 }
+
+// ---- 0.11.0: learned identity ----------------------------------------------
+
+/// A probe and the bank it will be compared against, in the same space.
+///
+/// Named rather than written out because the pairing is the invariant: a
+/// projected probe against raw prototypes is not a worse score, it is a
+/// meaningless one.
+type SameSpace = (Embedding, Vec<(i64, Embedding)>);
+
+/// The learned space, if one is installed and `[identity].learn` is on.
+///
+/// Returns the probe and the bank **both** mapped, or `None` when nothing is
+/// installed. Returning them as a pair is the point: a projected probe
+/// compared against raw prototypes is not a worse score, it is a meaningless
+/// one, and the type is what makes forgetting one half impossible.
+fn learned_space(
+    store: &Store,
+    cfg: &IdentityConfig,
+    probe: &Embedding,
+    bank: &[(i64, Embedding)],
+) -> Result<Option<SameSpace>> {
+    if !cfg.learn {
+        return Ok(None);
+    }
+    let Some((projection, _, _)) = store.installed_projection()? else {
+        return Ok(None);
+    };
+    if projection.model_id != probe.model_id {
+        // A projection is as model-specific as an embedding. A new extractor
+        // invalidates the old map rather than reinterpreting it.
+        return Ok(None);
+    }
+    Ok(Some((
+        projection.apply(probe)?,
+        crate::calib::project_bank(&projection, bank)?,
+    )))
+}
+
+/// The per-voice label thresholds, or the globals.
+///
+/// A read failure is not a reason to stop labelling: the table is an
+/// improvement on the globals, not a prerequisite for them, so the fallback is
+/// the operating point 0.10.2 shipped with.
+fn learned_thresholds(store: &Store, cfg: &IdentityConfig) -> crate::calib::Thresholds {
+    let globals = crate::calib::Thresholds::global(cfg.label_threshold, 0.0);
+    if !cfg.learn {
+        return globals;
+    }
+    match store.threshold_table((cfg.label_threshold, 0.0)) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("the learned thresholds could not be read: {e:#}");
+            globals
+        }
+    }
+}
+
+// ---- end 0.11.0 -----------------------------------------------------------

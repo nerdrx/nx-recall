@@ -521,7 +521,23 @@ pub fn enrol_batch(
             match guard.segment_embedding(c.id)? {
                 Some(embedding) => {
                     let bank = guard.prototypes(&embedding.model_id)?;
-                    Some((embedding, bank))
+                    // ---- 0.11.0: learned identity ----------------------
+                    // The label half of the enrol decision asks the same
+                    // question the live ladder does, so it has to ask it at
+                    // the same operating point. The enrol half keeps its
+                    // globals — nothing has measured a per-voice enrol bar,
+                    // and a wrong prototype is permanent.
+                    let thresholds = if identity.learn {
+                        guard
+                            .threshold_table((identity.label_threshold, 0.0))
+                            .unwrap_or_else(|_| {
+                                crate::calib::Thresholds::global(identity.label_threshold, 0.0)
+                            })
+                    } else {
+                        crate::calib::Thresholds::global(identity.label_threshold, 0.0)
+                    };
+                    // ---- end 0.11.0 ------------------------------------
+                    Some((embedding, bank, thresholds))
                 }
                 // Nothing was ever embedded — refused at the identity gate, or
                 // recorded before the models were installed. Stamped so it is
@@ -529,7 +545,7 @@ pub fn enrol_batch(
                 None => None,
             }
         };
-        let Some((embedding, bank)) = gathered else {
+        let Some((embedding, bank, thresholds)) = gathered else {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
             guard.mark_truth_enrol_considered(c.id, at)?;
             continue;
@@ -537,8 +553,9 @@ pub fn enrol_batch(
 
         // ---- judge (no lock) ----
         let ranked = crate::identity::rank(&embedding, &bank)?;
-        let decision = crate::identity::decide(
+        let decision = crate::identity::decide_with(
             identity,
+            &thresholds,
             c.overlap_frac.unwrap_or(0.0),
             duration_s,
             words,
@@ -575,6 +592,61 @@ pub fn enrol_batch(
     Ok(true)
 }
 
+// ---- 0.11.0: learned identity ---------------------------------------------
+
+/// How long the calibration pass waits before it will look again.
+///
+/// Six hours rather than a wall-clock time of night: the fit costs a few
+/// hundred cosine comparisons over rows already in memory, so there is nothing
+/// to schedule around, and the thing it is really rate-limiting is writing to
+/// `operations` once per evening instead of once per batch.
+pub const CALIBRATE_INTERVAL_NS: i64 = 6 * 3600 * 1_000_000_000;
+
+/// How much more ground truth there has to be before a refit is worth the
+/// walk. Twenty per cent, the same bar the projection's own refit rule uses:
+/// under that, the fit would be re-deriving the same table off the same
+/// evening.
+pub const CALIBRATE_GROWTH: f64 = 1.2;
+
+/// Refit the operating point, at most every [`CALIBRATE_INTERVAL_NS`] and only
+/// when the truth corpus has actually grown.
+///
+/// `--apply` is implied here and nowhere else: this is the nightly pass, and
+/// the thing that makes it safe is not a flag but the held-out gate inside
+/// [`crate::identity_learn::calibrate`], which refuses any candidate that does
+/// not beat what is installed on rows the fit never saw.
+fn calibrate_pass(
+    store: &Arc<std::sync::Mutex<Store>>,
+    identity: &IdentityConfig,
+    last: &mut Option<(i64, usize)>,
+) -> Result<()> {
+    let now = utc_now_ns();
+    let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+    let rows = guard
+        .truth_calibration_rows(crate::identity_learn::MIN_DURATION_S)?
+        .len();
+    if let Some((at, seen)) = *last
+        && (now - at < CALIBRATE_INTERVAL_NS || (rows as f64) < (seen as f64) * CALIBRATE_GROWTH)
+    {
+        return Ok(());
+    }
+    let report = crate::identity_learn::calibrate(&guard, identity, true, now)?;
+    *last = Some((now, rows));
+    info!(
+        rows = report.rows,
+        held_out = report.eval_rows,
+        proposed = report.proposed.len(),
+        written = report.written,
+        cleared = report.cleared,
+        thresholds_swap = report.thresholds_swap,
+        projection_swap = report.projection_swap,
+        "identity calibration"
+    );
+    Ok(())
+}
+
+// ---- end 0.11.0 -----------------------------------------------------------
+
 /// The background thread. Started whether or not the passes are on, like
 /// [`crate::quality::run`]: the switches are live and something has to be
 /// watching them.
@@ -591,6 +663,12 @@ pub fn run(
 ) {
     crate::pipeline::deprioritise_current_thread(runtime.inference_nice, &runtime.inference_cpus);
     let timeout_ns = (cfg.open_span_timeout_s.max(1) as i64) * 1_000_000_000;
+    // ---- 0.11.0: learned identity -----------------------------------------
+    // When the calibration pass last ran, and on how many rows. Held here
+    // rather than in the database because it is a rate limit, not a fact: a
+    // restart may re-run the fit and the only cost is a few hundred cosines.
+    let mut last_calibrated: Option<(i64, usize)> = None;
+    // ---- end 0.11.0 -------------------------------------------------------
 
     loop {
         if stop.stopped() {
@@ -628,6 +706,13 @@ pub fn run(
                 {
                     warn!("a ground-truth enrolment batch failed: {e:#}");
                 }
+                // ---- 0.11.0: learned identity --------------------------
+                if identity.learn
+                    && let Err(e) = calibrate_pass(&store, &identity, &mut last_calibrated)
+                {
+                    warn!("the identity calibration pass failed: {e:#}");
+                }
+                // ---- end 0.11.0 ----------------------------------------
             }
         }
 

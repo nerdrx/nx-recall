@@ -2103,3 +2103,134 @@ a language that is not the target is a rejection, and where it cannot read one,
 three German or English stopwords are. It deliberately does **not** use
 `lang::classify` for a third-language target — that settles on German the moment
 it sees an umlaut, and Swedish, Turkish and Finnish are full of them.
+
+## 0.11.0 — learned identity
+
+Everything in this section is **additive and inert until earned**. A database
+where nothing has been calibrated behaves exactly as 0.10.2 did, byte for byte,
+and a client that ignores the whole section is correct.
+
+### The claim, and what measuring it found
+
+The voicebank has one label threshold for every voice, chosen once on lab audio.
+Now that Discord's ground truth names hundreds of the user's friends' turns, it
+should be possible to do better: a bar per voice, and an embedding space
+rescaled by how much one person's own turns wander.
+
+Both were built and both were measured against held-out ground truth. **Neither
+cleared its gate on the corpus this shipped against** — 239 usable rows over one
+evening and three linked voices — so the shipped operating point is unchanged.
+What ships is the mechanism, the gate and the report. Numbers, per row, in
+`spike/FINDINGS.md` §18.
+
+### The honesty rules
+
+They are in the code, not in a decision somebody made once.
+
+* **Chronological split.** Truth rows are ordered by time; the first 60% may be
+  fitted on, the last 40% is the only thing any verdict reads. The split never
+  cuts through a shared timestamp.
+* **No self-derived prototype.** A row is never scored against a prototype that
+  row produced. Without this, every number is a memory test.
+* **Own account excluded.** A `single` verdict naming the user's own Discord
+  account is not ground truth about audio from the user's own client (0.10.1).
+* **Hyperparameters on an inner split.** The whitening intensity and the
+  per-voice row bar are chosen on a split *of the fit split*.
+* **Two hurdles to install.** `calib::swap_is_safe` vetoes any candidate that
+  lowers held-out precision, whatever it does to recall — a wrong name corrupts
+  what the user reads back as memory, a missed one costs a shrug.
+  `calib::improvement_is_material` then refuses to move the operating point for
+  less than **2 percentage points** of held-out recall or **a fifth** of the
+  wrong labels. Both, or nothing changes.
+
+### What can be learned
+
+**A label threshold per voice.** Bounded to `[0.30, 0.60]`, fitted for voices
+with at least 30 truth rows in the fit split, maximising F-0.5 (β = 0.5:
+precision counts four times as much as recall) with ties broken towards fewer
+wrong labels. A voice under the bar keeps the global. Only the **label**
+decision is learned — enrolment keeps every global bar it had, because a wrong
+prototype is permanent and nothing has measured that decision.
+
+**A linear map before cosine.** Pooled within-class covariance, shrunk towards a
+scaled identity, inverted to a chosen power. Square and full-rank on purpose: a
+rank-reducing LDA would discard the subspace that separates every voice ground
+truth has never named. 192×192 f32.
+
+### Where it lives
+
+`speakers` gains five nullable columns — `label_threshold`, `label_margin`,
+`threshold_via`, `threshold_n`, `threshold_at` — and there is one single-row
+`identity_projection` table. Absence means the global. The database rather than
+the config file, because a fitted threshold is derived data with provenance and
+a config file is the user's opinion; it also means a learned value travels with
+its voice through a merge, a rename and a backup.
+
+A merge tombstone never carries a learned threshold: the table the ladder reads
+resolves through the live-speaker view, so a merged-away id cannot hold a bar
+that applies to nothing while looking like it applies to something.
+
+### `identity.calibrate`
+
+```jsonc
+// request
+{"method": "identity.calibrate", "params": {"apply": false, "reset": false}}
+```
+
+`apply` is permission to install **what cleared the gate**, not permission to
+install. `reset` puts every voice back on the globals and drops the learned
+space. Without either, the call measures and returns; it writes nothing.
+
+The reply is the whole report:
+
+```jsonc
+{
+  "rows": 239, "fit_rows": 143, "eval_rows": 96,
+  "per_voice":  [{"speaker": 25, "fit": 116, "held_out": 62}],
+  "installed":  [{"speaker": 25, "threshold": 0.33, "margin": 0.0, "n": 102}],
+  "proposed":   [{"speaker": 25, "threshold": 0.33, "margin": 0.0,
+                  "n": 102, "f_beta": 1.0, "f_beta_global": 0.998}],
+  "baseline":   {"n": 95, "correct": 80, "wrong": 7, "declined": 8,
+                 "precision": 0.92, "recall": 0.842, "f_beta": 0.903},
+  "candidate":  {"n": 95, "correct": 81, "wrong": 7, "declined": 7, "…": null},
+  "projection": null,             // or {shrinkage, power, centred, score}
+  "projection_installed": false,
+  "thresholds_swap": false,       // did the gate approve?
+  "projection_swap": false,
+  "gate": {"shipping": {…}, "best": {…}, "curve": [{…}]},
+  "written": 0, "cleared": 0,
+  "note": null                    // why nothing could be measured, when nothing could
+}
+```
+
+`precision`, `recall` and `f_beta` are `null` rather than a number when there was
+nothing to divide by — an arm that named nothing is not perfectly precise.
+
+`gate` is the **overlap** gate measured against Discord's `overlap` verdicts:
+`curve` walks 0.05 to 0.30, `shipping` is the point `[identity].max_overlap`
+currently sits on and `best` is the point the fit split preferred, looked up in
+the held-out curve. On this corpus the fit split preferred 0.20 and held out it
+was worse than the shipping 0.10, so 0.10 stands.
+
+### `[identity].learn`
+
+On by default. The truth pass refits at most every six hours, and only when the
+truth corpus has grown by a fifth since the last run. Every write goes to
+`operations` as `identity.calibrate` with the before/after table as its prior
+state. Off means the globals, exactly as 0.10.2 used them; the CLI still
+reports.
+
+### What a client should show
+
+Nothing is required. When it wants to:
+
+* a **"calibrated on N turns"** chip on a voice with a learned threshold, from
+  `installed[].n` — the number is the provenance, and a learned bar nobody can
+  see is indistinguishable from a magic one;
+* the **before/after precision pair** from `baseline` and `candidate`, which is
+  the only honest way to render "is it getting better";
+* the fit/held-out row counts per voice, because "this voice has no ground
+  truth yet" is the answer to most questions about why nothing changed.
+
+A client must not present a *proposed* threshold as an installed one:
+`thresholds_swap` is the difference, and it is false far more often than true.

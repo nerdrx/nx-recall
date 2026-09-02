@@ -337,6 +337,24 @@ pub struct IdentityConfig {
     /// separate for the same reason: a client under another name should be a
     /// config edit rather than a rebuild.
     pub vrchat_sources: Vec<String>,
+    // ---- 0.11.0: learned identity -----------------------------------------
+    /// May the daemon fit its own operating point from ground truth?
+    ///
+    /// On by default, and that is safe rather than optimistic: the nightly
+    /// pass never installs a value it has not first beaten the incumbent with
+    /// on **held-out** truth rows, and precision has a veto
+    /// (`calib::swap_is_safe`). On the corpus this shipped against the answer
+    /// was "change nothing" — 239 usable rows over one evening and three
+    /// linked voices, where the confusions that cost precision come from
+    /// voices with almost no truth rows at all (FINDINGS §18). The switch
+    /// exists so the pass can act the evening the evidence arrives, and so
+    /// somebody who would rather it never did can say so.
+    ///
+    /// Off means the globals, exactly as 0.10.2 used them. Every learned
+    /// value is inspectable with `recalld identity calibrate`, and
+    /// `--reset` puts every voice back on the globals.
+    pub learn: bool,
+    // ---- end 0.11.0 -------------------------------------------------------
 }
 
 impl Default for IdentityConfig {
@@ -362,6 +380,7 @@ impl Default for IdentityConfig {
             foreign_after_segments: 20,
             presence_hard: true,
             vrchat_sources: vec!["vrchat".into()],
+            learn: true,
         }
     }
 }
@@ -1053,6 +1072,16 @@ impl Config {
              # every voice in a Discord call already lives on Discord (spike/\n\
              # FINDINGS.md §17). `recalld identity audit` says what it would do\n\
              # to your database without turning it on.\n\
+             #\n\
+             # `[identity].learn` lets the nightly pass fit its own operating\n\
+             # point — a label threshold per voice, and a learned embedding\n\
+             # space — from the turns Discord itself labelled. It is ON, and it\n\
+             # is still conservative: nothing is installed that has not beaten\n\
+             # what is already there on the last 40%% of truth rows by time,\n\
+             # and a candidate that lowers held-out precision is refused\n\
+             # whatever it does to recall. `recalld identity calibrate` prints\n\
+             # the whole table without writing; `--apply` writes what cleared\n\
+             # the gate; `--reset` puts every voice back on the globals.\n\
              \n{body}"
         );
         let tmp = path.with_extension("toml.tmp");
@@ -1199,6 +1228,8 @@ mod tests {
         assert!(!cfg.identity.source_prior);
         assert_eq!(cfg.identity.foreign_source_margin, 0.10);
         assert_eq!(cfg.identity.foreign_after_segments, 20);
+        // Learning is on, and the gate is what makes that safe.
+        assert!(cfg.identity.learn);
         // The hard rule is on, and costs nothing while the prior is off — and
         // nothing again on an install whose truth bridge has never run.
         assert!(cfg.identity.presence_hard);
