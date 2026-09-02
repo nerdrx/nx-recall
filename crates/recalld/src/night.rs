@@ -43,7 +43,12 @@
 //!
 //! Loading large-v3 costs seconds; decoding a two-second clip costs a fraction
 //! of one. A night shift that spawned one process per row would spend its whole
-//! budget on model loads. So `[night].batch_rows` clips are concatenated with
+//! budget on model loads, and the measurement says so plainly (FINDINGS §13, a
+//! 7900 XTX through the Vulkan build): 30 lobby-sized clips in one invocation
+//! run at RTF 0.154, 167 of them at 0.143, and twenty long utterances — the
+//! same model load spread over four times the audio — at **0.045**. The load is
+//! the cost. On four CPU cores the same weights run at 16.9 (§11), which is why
+//! this was parked as a CPU feature and is shippable as a GPU one. So `[night].batch_rows` clips are concatenated with
 //! `[night].gap_s` of silence between them, decoded in one invocation with
 //! timestamps, and split apart again by offset ([`pack`] / [`split_by_offsets`]).
 //! The gap is one second: long enough that the decoder does not read two turns
@@ -152,6 +157,12 @@ fn local_minute_now() -> u32 {
 ///
 /// **`None` closes the gate.** A night shift that cannot tell whether the card
 /// is busy does not get to assume it is free.
+///
+/// One number to keep in mind when reading `[night].gpu_busy_max_pct`: this
+/// card reports **around 30% with nothing but a desktop on it**, well above the
+/// 20% default. That is deliberate and it is not a mis-set ceiling — on a
+/// machine like this the clock is what lets the night shift start and this
+/// check is what stops it again the moment somebody sits down.
 pub fn gpu_busy_pct() -> Option<u32> {
     gpu_busy_pct_in(Path::new("/sys/class/drm"))
 }
@@ -380,11 +391,15 @@ pub struct Readings<'a> {
 /// `replace_allowed` is `[night].replace`, which ships **true** because this
 /// exact rule — the majority *and* the guards — was measured against human
 /// references (`spike/night_vote_bench.py`, FINDINGS §13): on 35 shaky lab
-/// spans it cuts word error from 91.1% to 46.9%, 48.6% relative, and makes one
-/// of the 22 rows it touches worse. The looser rule that skips the guards
-/// scores better on paper (53.8%) and the looser one still that replaces on
-/// the night decoder's own say-so scores best of all (56.7%) — and that one
-/// fails the gate's second number, which is the one that matters.
+/// spans decoded by the build this daemon ships, it cuts word error from 91.1%
+/// to 44.3%, 51.4% relative, and makes none of the 20 rows it touches worse.
+///
+/// Two looser rules scored better on that set and neither is shipped. Skipping
+/// the guards is worth five points and removes the only thing standing between
+/// this feature and §12's hallucinations. Replacing whenever a row is shaky,
+/// with no second voter, is worth fourteen and is the "no judge" ensemble §11
+/// refused on principle — on the user's own audio it is the rule that rewrote
+/// two German rows in Swedish.
 ///
 /// With `replace_allowed` false the function still runs every guard and still
 /// returns the text, as an annotation. That is a supported choice rather than a

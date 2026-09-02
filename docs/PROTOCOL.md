@@ -1210,10 +1210,10 @@ older daemon" have to be tellable apart, and a missing key says neither:
   fallback (`also_when_idle_min`), the GPU ceiling (`gpu_busy_max_pct`), a
   nightly row budget, and `replace` — the switch between "the night shift may
   rewrite a row" and "it may only annotate one". `replace` ships **true**
-  because the rule below was measured (FINDINGS §13: 91.1% → 46.9% word error
-  on shaky lab spans, 1 of 22 touched rows made worse, against a gate of ≥30%
-  relative and under 5% harmed). Turning it off is a supported choice and
-  leaves every `night_text` in place.
+  because the rule below was measured (FINDINGS §13: 91.1% → 44.3% word error
+  on shaky lab spans, 51.4% relative, none of the 20 touched rows made worse,
+  against a gate of ≥30% relative and under 5% harmed). Turning it off is a
+  supported choice and leaves every `night_text` in place.
 
 ### The vote, stated for clients
 

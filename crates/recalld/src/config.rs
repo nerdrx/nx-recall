@@ -553,12 +553,13 @@ pub struct NightConfig {
     /// Whether the vote may **replace** words, or only annotate them.
     ///
     /// **True, because it was measured** (`spike/night_vote_bench.py`,
-    /// FINDINGS §13): on 35 shaky lab spans with human references, the shipped
-    /// rule — two of three readings agreeing against the row, then the
-    /// arbiter's guards — cuts word error from 91.1% to 46.9% (48.6% relative)
-    /// and makes 1 of the 22 rows it touches worse. The gate was ≥30% relative
-    /// with under 5% of touched rows harmed, and that is the whole argument for
-    /// this default being what it is.
+    /// FINDINGS §13): on 35 shaky lab spans with human references, decoded by
+    /// the build this daemon ships, the shipped rule — two of three readings
+    /// agreeing against the row, then the arbiter's guards — cuts word error
+    /// from 91.1% to 44.3% (51.4% relative) and makes **none** of the 20 rows
+    /// it touches worse. The gate was ≥30% relative with under 5% harmed, and
+    /// that is the whole argument for this default being what it is. Zero out
+    /// of twenty is "no sign of harm", not "harmless".
     ///
     /// It stays a switch because the other outcome is a real product rather
     /// than a disabled feature: with it off the night reading is stored as
