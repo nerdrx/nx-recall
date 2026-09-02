@@ -277,6 +277,64 @@ impl Default for IdentityConfig {
     }
 }
 
+/// The conversational language prior (0.7.7).
+///
+/// The insight this implements, in the user's words: *if something doesn't get
+/// recognised and everything was German before, the undecoded stuff is likely
+/// to be German too.* A conversation has a language, that language is stable
+/// across turns, and a turn that reads as the other one — in a thread where ten
+/// turns running read as German — is far more likely to be a decoder flip than
+/// a genuine switch.
+///
+/// The numbers here are two different kinds of thing and are kept apart on
+/// purpose. `context_*` are **judgement**: how much agreement counts as a
+/// conversation having a language. `arbiter_*` are **measurement**: the points
+/// where `spike/arbiter_de.py` found re-decoding stops being an improvement,
+/// and changing them without re-running that spike is changing what the daemon
+/// claims to know.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LangConfig {
+    /// How many of a thread's most recent *clear* language stamps the context
+    /// is read from. Ten is roughly a minute of lobby back-and-forth: long
+    /// enough that one odd turn cannot move it, short enough that a room which
+    /// really does switch language is followed rather than argued with.
+    ///
+    /// `0` turns the context off entirely — no inheritance, no context-driven
+    /// arbitration, and the 0.6.1 per-speaker correction behaves exactly as it
+    /// always did.
+    pub context_window: usize,
+    /// Clear stamps needed before a thread has a language at all. Below this
+    /// there is no context, and "unclear" stays unclear: two turns are a
+    /// greeting, not a conversation with a language.
+    pub context_min_clear: usize,
+    /// Share of those stamps that must agree. 0.7 means three turns must be
+    /// unanimous (2/3 is 0.67 and does not clear it) while ten turns may carry
+    /// three dissenters — which is the right shape, because a bilingual room
+    /// should not get a context at all.
+    pub context_min_agree: f32,
+    /// **Measured.** Below this many seconds a re-decode may only *flag*, never
+    /// replace: `spike/arbiter_de.py` put the arbiter's word precision at 28%
+    /// on 1.0 s fragments against 54% at 1.5 s. Replacing a wrong transcript
+    /// with a differently wrong one is not a correction.
+    pub arbiter_min_duration_s: f32,
+    /// **Measured.** A one-word arbiter output is not evidence of anything, and
+    /// the empty-output rate is only ~0% above `arbiter_min_duration_s`.
+    pub arbiter_min_words: usize,
+}
+
+impl Default for LangConfig {
+    fn default() -> Self {
+        Self {
+            context_window: 10,
+            context_min_clear: 3,
+            context_min_agree: 0.7,
+            arbiter_min_duration_s: 1.5,
+            arbiter_min_words: 2,
+        }
+    }
+}
+
 /// The memory graph (docs/GRAPH.md).
 ///
 /// Tiers 1 and 2 are deterministic, always on, and have exactly one knob
@@ -477,6 +535,7 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     pub models: ModelsConfig,
     pub identity: IdentityConfig,
+    pub lang: LangConfig,
     pub graph: GraphConfig,
     pub socket: SocketConfig,
     pub roster: RosterConfig,

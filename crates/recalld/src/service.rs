@@ -66,6 +66,14 @@ const TOPIC_THREADS: usize = 12;
 /// segments and under this much speech in total. Both are deliberately far
 /// below anything a person produces in a conversation — a real voice reaches
 /// three seconds in one sentence.
+/// `lang.repair` over the socket, which is synchronous: rows per call by
+/// default, and the hard ceiling on one call. A whole backlog is the CLI's job
+/// — `recalld lang repair` runs in its own process, can be watched and can be
+/// interrupted, and none of those are true of a socket request.
+const REPAIR_LIMIT: usize = 100;
+const REPAIR_MAX: usize = 500;
+const REPAIR_BATCH: usize = 32;
+
 const PRUNE_MAX_SEGMENTS: i64 = 1;
 const PRUNE_MAX_SPEECH_NS: i64 = 3_000_000_000;
 
@@ -98,6 +106,14 @@ pub fn segment_json(row: &SegmentRow) -> Value {
         // turns around it rather than heard, so it is shown as uncertain.
         "lang": row.lang,
         "label_via": row.label_via,
+        // How the *language* got there (0.7.7). `"model"` and `"classified"`
+        // are the ordinary answers and need no UI; `"context"` is a language
+        // inherited from the conversation with the text untouched; and the two
+        // a client should say something about are `"re-decode"` — these words
+        // were produced by an arbiter re-reading the audio, not by the primary
+        // ASR — and `"mismatch"`, where the language is in doubt and `lang` is
+        // therefore null.
+        "lang_via": row.lang_via,
         // Schema v6: which conversation this turn is part of, or `null` on a
         // row older than threading. A client draws a boundary where this
         // changes and renders a null exactly as it always did.
@@ -222,6 +238,10 @@ impl Service {
             "commitments.list" => self.commitments_list(req),
             "commitments.set_state" => self.commitments_set_state(req),
             "topics.list" => self.topics_list(req),
+            // The conversational language prior's backlog (0.7.7). The CLI has
+            // its own in-process path; this is the same walk for a client that
+            // is already holding a socket.
+            "lang.repair" => self.lang_repair(req),
             "segments.reassign" => self.segments_reassign(req),
             "segments.correct" => self.segments_correct(req),
             "segments.audio" => self.segments_audio(req),
@@ -429,6 +449,16 @@ impl Service {
                 "proximity_labelled": c.analysis.proximity_labelled.load(Ordering::Relaxed),
                 "redecoded": c.analysis.redecoded.load(Ordering::Relaxed),
                 "lang_mismatch": c.analysis.lang_mismatch.load(Ordering::Relaxed),
+                // 0.7.7, the conversational language prior: turns that took
+                // their conversation's language rather than staying NULL, turns
+                // that read as the opposite of it and were handed to an
+                // arbiter, the two re-decode directions split out, and rows
+                // `lang.repair` rewrote out of the backlog.
+                "context_stamped": c.analysis.context_stamped.load(Ordering::Relaxed),
+                "flips_suspected": c.analysis.flips_suspected.load(Ordering::Relaxed),
+                "redecoded_de": c.analysis.redecoded_de.load(Ordering::Relaxed),
+                "redecoded_en": c.analysis.redecoded_en.load(Ordering::Relaxed),
+                "repairs": c.analysis.repairs.load(Ordering::Relaxed),
             },
             "clients": self.bus.client_count(),
             "seq": self.bus.current_seq(),
@@ -1927,6 +1957,91 @@ impl Service {
         }))
     }
 
+    /// Walk the language prior's backlog (0.7.7). Bounded and synchronous.
+    ///
+    /// The arbiter is loaded for the call and dropped with it, rather than kept
+    /// resident the way the pipeline's is. That is deliberate: this is a
+    /// maintenance method, the pipeline may already be holding its own copy of
+    /// the same 160 MB, and pinning a second one for the lifetime of a daemon
+    /// because somebody once ran a repair would be the wrong trade in exactly
+    /// the direction this program does not make.
+    ///
+    /// `limit` is clamped rather than optional: the CLI path is the one that
+    /// may run to completion, because it is the one a person is watching.
+    fn lang_repair(&self, req: &Request) -> Result<Value, Error> {
+        let limit = req.usize_or("limit", REPAIR_LIMIT)?.clamp(1, REPAIR_MAX);
+        let Some(root) = self.control.models_root.clone() else {
+            return Err(Error::new(
+                "unavailable",
+                "no [models].dir is configured, so there is no arbiter to re-read with",
+            ));
+        };
+        let cfg = crate::config::ModelsConfig {
+            dir: Some(root.clone()),
+            ..Default::default()
+        };
+        let models = crate::models::ModelSet::resolve_at(root, &cfg);
+        let mut arbiters = crate::arbiter::Arbiters::new(&models);
+        let installed: Vec<String> = arbiters.installed().iter().map(|s| s.to_string()).collect();
+        let store = self.store();
+        if installed.is_empty() {
+            let (flagged, with_audio) = store.language_mismatch_counts().map_err(Error::from)?;
+            return Ok(json!({
+                "arbiters": installed,
+                "flagged": flagged,
+                "repairable": with_audio,
+                "scanned": 0,
+                "repaired": 0,
+                "settled": 0,
+                "note": crate::models::ArbiterModel::how_to_get_it(),
+            }));
+        }
+        let report = crate::langctx::repair(
+            &store,
+            &self.control.data_dir,
+            &mut arbiters,
+            &self.control.lang,
+            REPAIR_BATCH,
+            Some(limit),
+            |_| {},
+        )
+        .map_err(Error::from)?;
+        self.control
+            .analysis
+            .repairs
+            .fetch_add(report.repaired as u64, Ordering::Relaxed);
+        let (flagged, with_audio) = store.language_mismatch_counts().map_err(Error::from)?;
+        // Every rewritten row is a row some client is showing the old words
+        // for, so each one goes out as a `segment` event exactly as a re-decode
+        // in the pipeline does. Read back from the row, never from the report:
+        // the event must not be able to disagree with what a query returns.
+        let payloads: Vec<Value> = report
+            .changed
+            .iter()
+            .filter_map(|id| store.segment_row(*id).ok().flatten())
+            .map(|row| segment_json(&row))
+            .collect();
+        drop(store);
+        for p in payloads {
+            self.bus.publish(Topic::Segments, "segment", p);
+        }
+        Ok(json!({
+            "arbiters": installed,
+            "scanned": report.scanned,
+            "repaired": report.repaired,
+            "repaired_de": report.repaired_de,
+            "repaired_en": report.repaired_en,
+            "settled": report.settled,
+            "kept": report.kept,
+            "too_short": report.too_short,
+            "unavailable": report.unavailable,
+            "undecidable": report.undecidable,
+            "no_audio": report.no_audio,
+            "flagged": flagged,
+            "repairable": with_audio,
+        }))
+    }
+
     fn segments_reassign(&self, req: &Request) -> Result<Value, Error> {
         let segment_id = req.i64("segment_id")?;
         // An explicit null speaker_id means "this was nobody I can name",
@@ -2455,6 +2570,75 @@ mod tests {
             )
             .unwrap();
         (sess, seg)
+    }
+
+    // ---- lang.repair (0.7.7) ---------------------------------------------
+
+    #[test]
+    fn a_repair_with_nowhere_to_load_an_arbiter_from_says_so() {
+        // No `[models].dir` at all. The honest answer is a refusal naming the
+        // reason, never a "success" that scanned nothing.
+        let r = rig("lang-repair-nomodels");
+        let e = call(&r, r#"{"id":1,"method":"lang.repair"}"#).unwrap_err();
+        assert_eq!(e.code, "unavailable");
+        assert!(e.msg.contains("[models].dir"), "{}", e.msg);
+    }
+
+    #[test]
+    fn a_repair_with_no_arbiter_installed_reports_the_backlog_and_changes_nothing() {
+        let r = rig("lang-repair-noarbiter");
+        // A models root that exists and holds nothing.
+        let root = r.dir.join("models");
+        std::fs::create_dir_all(&root).unwrap();
+        // Wired the way the daemon wires it: the models root is set before the
+        // control handle is shared, so this needs its own service rather than
+        // the rig's.
+        let store = Store::open(&r.dir).unwrap();
+        let control = Control::new(r.dir.clone(), None, &Allowlist::from_rules([("x", false)]))
+            .with_graph(crate::config::GraphConfig::default(), Some(root));
+        let bus = Bus::new(64, 32);
+        let service = Service::new(Arc::new(Mutex::new(store)), control, Arc::clone(&bus));
+        let (client, _rx) = bus.attach(None);
+
+        // One flagged row, with no arbiter that could ever settle it.
+        {
+            let store = service.store();
+            let src = store.upsert_source("VRChat.exe", "VRChat.exe", 0).unwrap();
+            let sess = store.begin_session(src, 0).unwrap();
+            let seg = store
+                .insert_segment(sess, 1_000, 2_000, "segments/a.wav", 0)
+                .unwrap();
+            store
+                .set_segment_analysis(
+                    seg,
+                    &SegmentAnalysis {
+                        text: Some("i think that is the only way".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store.mark_segment_language_mismatch(seg).unwrap();
+        }
+
+        let Incoming::Request(req) = parse(r#"{"id":1,"method":"lang.repair"}"#) else {
+            panic!();
+        };
+        let out = service.handle(&client, &req).unwrap();
+        assert_eq!(out["scanned"], 0, "nothing can be re-read, so nothing was");
+        assert_eq!(out["repaired"], 0);
+        assert_eq!(out["flagged"], 1, "and the backlog is reported honestly");
+        assert_eq!(out["arbiters"], json!([]));
+        assert!(
+            out["note"].as_str().unwrap().contains("--arbiter-de"),
+            "the reply names the command that fixes it: {}",
+            out["note"]
+        );
+        // The mark is still there for a later run to come back to.
+        assert_eq!(
+            service.store().language_mismatch_counts().unwrap(),
+            (1, 1),
+            "a repair that could not run must never clear a mark"
+        );
     }
 
     #[test]

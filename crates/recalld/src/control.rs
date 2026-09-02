@@ -71,6 +71,11 @@ pub struct Control {
     /// `speakers.split` re-clusters a voicebank and needs the same thresholds
     /// the pipeline was labelling with.
     pub identity: IdentityConfig,
+    /// The conversational language prior's thresholds and the arbiter's
+    /// measured guards (0.7.7). Here for the same reason `identity` is: the
+    /// socket runs the repair walk, and it has to run it with the daemon's
+    /// numbers rather than with the defaults.
+    pub lang: crate::config::LangConfig,
     models: Mutex<Vec<String>>,
     /// How much disk the program is using, as last measured by the retention
     /// sweeper (and once at start-up). Cached rather than computed on demand
@@ -108,6 +113,7 @@ impl Control {
             stats: Arc::new(Stats::default()),
             analysis: Arc::new(AnalysisStats::default()),
             identity: IdentityConfig::default(),
+            lang: crate::config::LangConfig::default(),
             models: Mutex::new(Vec::new()),
             storage: Mutex::new(None),
             last_sweep: Mutex::new(None),
@@ -135,6 +141,14 @@ impl Control {
     pub fn with_identity(mut self: Arc<Self>, identity: IdentityConfig) -> Arc<Self> {
         let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
         this.identity = identity;
+        self
+    }
+
+    /// The configured language prior. Set before the handle is shared, like the
+    /// rest of the wiring.
+    pub fn with_lang(mut self: Arc<Self>, lang: crate::config::LangConfig) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
+        this.lang = lang;
         self
     }
 

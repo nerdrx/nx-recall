@@ -176,6 +176,89 @@ impl Rig {
             .as_ref()
             .map(|v| v.parse().unwrap())
     }
+
+    // ---- 0.7.7: the conversational language prior ------------------------
+
+    /// Is the German arbiter installed under `NXR_MODELS`? It is optional, so
+    /// its absence skips rather than fails.
+    fn arbiter_installed(&self) -> bool {
+        self.models.arbiter(recalld::models::ARBITER_DE).present()
+    }
+
+    /// One of the three German fixtures the export actually reads as German.
+    ///
+    /// Which one is not fixed: the point of the fixtures is that they are real
+    /// audio through the real model, and asserting *which* of them decodes
+    /// cleanly would be asserting a fact about a model version.
+    fn a_fixture_read_as_german(&mut self) -> Option<String> {
+        for fixture in [
+            "de/de_short_0.wav",
+            "de/de_short_1.wav",
+            "de/de_short_2.wav",
+        ] {
+            for id in self.ingest(fixture) {
+                if let Some(text) = self.store.segment_fields(id).unwrap()["text"].clone()
+                    && recalld::lang::classify(&text) == recalld::lang::Lang::De
+                {
+                    return Some(fixture.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// A conversation to put turns in.
+    ///
+    /// Set directly rather than through `threads::assign`: the rule that
+    /// decides which conversation a turn joins has its own tests, and a
+    /// language test that also depended on it would fail for two reasons.
+    fn new_thread(&self) -> i64 {
+        self.store.create_thread(self.session, 0, 0).unwrap()
+    }
+
+    fn put_in_thread(&self, segment_id: i64, thread_id: i64) {
+        let (_, _, t_end_ns) = self.store.segment_audio(segment_id).unwrap().unwrap();
+        self.store
+            .set_segment_thread(segment_id, thread_id, t_end_ns)
+            .unwrap();
+    }
+
+    /// How many turns in `thread_id` the classifier read as German — the
+    /// evidence the context is built from.
+    fn german_stamps_in(&self, thread_id: i64) -> usize {
+        self.store
+            .thread_language_stamps(thread_id, 0, 64)
+            .unwrap()
+            .iter()
+            .filter(|l| *l == "de")
+            .count()
+    }
+
+    fn samples_of(&self, segment_id: i64) -> Vec<f32> {
+        let rel = self.store.segment_audio(segment_id).unwrap().unwrap().0;
+        read_wav(&self.dir.join(&rel)).unwrap()
+    }
+
+    /// Make a row say something it does not say, leaving its **audio** alone.
+    ///
+    /// This is the injected flip. At 3.5 s the export gets these fixtures
+    /// right, so waiting for a real 12%-at-1 s event would be a test that
+    /// fails most of the time; what is under test is what happens *after* a
+    /// flip, and the audio under it is real German either way.
+    fn flip_to(&self, segment_id: i64, text: &str) {
+        self.store
+            .set_segment_analysis(
+                segment_id,
+                &recalld::store::SegmentAnalysis {
+                    text: Some(text.into()),
+                    lang: recalld::lang::classify(text).tag().map(str::to_string),
+                    lang_via: Some(recalld::store::lang_via::CLASSIFIED.into()),
+                    asr_model_id: Some(self.models.asr_model_id()),
+                    overlap_frac: Some(0.02),
+                },
+            )
+            .unwrap();
+    }
 }
 
 impl Drop for Rig {
@@ -623,8 +706,13 @@ fn an_english_only_voice_gets_its_german_transcript_re_examined() {
     match fix {
         // The English-only model produced English words: they win, and the row
         // says which model wrote them.
-        recalld::analysis::LanguageFix::Redecoded { text, asr_model_id } => {
+        recalld::analysis::LanguageFix::Redecoded {
+            text,
+            asr_model_id,
+            lang,
+        } => {
             eprintln!("  re-decoded: {before:?}\n          -> {text:?}");
+            assert_eq!(lang, "en", "the constraint it was decoded under");
             assert_eq!(after["text"].as_deref(), Some(text.as_str()));
             assert_eq!(
                 recalld::lang::classify(&text),
@@ -660,11 +748,21 @@ fn an_english_only_voice_gets_its_german_transcript_re_examined() {
     assert_eq!(rig.score_of(seg), Some(0.8));
 }
 
-/// The other direction, which is deliberately *not* symmetric: there is no
-/// German-constrained decoder in the catalogue, so a German voice's
-/// English-looking transcript can only be flagged.
+/// The other direction, which was *not* symmetric until 0.7.7 and now is.
+///
+/// Up to 0.7.6 there was no German-constrained decoder in the catalogue, so a
+/// German voice's English-looking transcript could only be flagged. `ARBITER_DE`
+/// closes that gap, and closing it means this direction now carries the same
+/// honest hazard the English one always did: a hard constraint applied to a
+/// wrong declaration produces confident nonsense. The declaration is
+/// load-bearing, it is reversible, and that is why the default is `any`
+/// (docs/PROTOCOL.md).
+///
+/// So the assertion here is not "nothing happens" — it is the invariant that
+/// holds either way: whatever the arbiter says, the row ends up with words and
+/// a provenance that names whoever wrote them, and the *speaker* is untouched.
 #[test]
-fn a_german_only_voice_with_an_english_transcript_is_marked_not_rewritten() {
+fn a_german_only_voice_with_an_english_transcript_is_settled_or_flagged() {
     let mut rig = rig!("lang-mark");
     let ids = rig.ingest("clean_single_0.wav");
     let seg = ids[0];
@@ -686,15 +784,35 @@ fn a_german_only_voice_with_an_english_transcript_is_marked_not_rewritten() {
     let fix = rig
         .analyzer
         .correct_language(&rig.store, seg, speaker, Some(&before), &samples)
-        .unwrap();
-    assert_eq!(
-        fix,
-        Some(recalld::analysis::LanguageFix::Marked { read_as: "en" })
-    );
+        .unwrap()
+        .expect("an English transcript from a German-only voice is a disagreement");
     let after = rig.store.segment_fields(seg).unwrap();
-    assert_eq!(after["text"].as_deref(), Some(before.as_str()));
-    assert_eq!(after["lang"], None);
-    assert_eq!(after["lang_via"].as_deref(), Some("mismatch"));
+    match fix {
+        // The German arbiter is installed and produced German. Confident
+        // nonsense over English audio, and correctly so: the declaration said
+        // this voice speaks German and a hard constraint is a hard constraint.
+        recalld::analysis::LanguageFix::Redecoded {
+            text,
+            asr_model_id,
+            lang,
+        } => {
+            eprintln!("  re-decoded under the German constraint: {before:?}\n       -> {text:?}");
+            assert_eq!(lang, "de");
+            assert_eq!(asr_model_id, recalld::models::ARBITER_DE.model_id());
+            assert_eq!(after["text"].as_deref(), Some(text.as_str()));
+            assert_eq!(after["lang"].as_deref(), Some("de"));
+            assert_eq!(after["lang_via"].as_deref(), Some("re-decode"));
+            assert_eq!(recalld::lang::classify(&text), recalld::lang::Lang::De);
+        }
+        // No arbiter installed, or its answer failed a guard: the 0.6.1
+        // behaviour, unchanged.
+        recalld::analysis::LanguageFix::Marked { read_as } => {
+            assert_eq!(read_as, "en");
+            assert_eq!(after["text"].as_deref(), Some(before.as_str()));
+            assert_eq!(after["lang"], None);
+            assert_eq!(after["lang_via"].as_deref(), Some("mismatch"));
+        }
+    }
     assert_eq!(rig.speaker_of(seg), Some(speaker));
 
     // A voice that speaks both, or none in particular, is never corrected:
@@ -710,6 +828,268 @@ fn a_german_only_voice_with_an_english_transcript_is_marked_not_rewritten() {
             None
         );
     }
+}
+
+// ---- 6. the conversational language prior (0.7.7) ----------------------
+
+/// The German flip, end to end on real German audio.
+///
+/// The measurement this exists for (`spike/lang_flip.py`): the multilingual
+/// export decodes 12% of 1 s German fragments and 5% of 2 s ones **as
+/// English**, and what comes back is 103%-WER nonsense. 0.6.1 could only notice
+/// that when somebody had declared the speaker's language. 0.7.7 notices it
+/// from the conversation — and, now that there is a German-constrained decoder
+/// in the catalogue, can do something about it.
+///
+/// The flip itself is injected rather than waited for: at 3.5 s the export gets
+/// these fixtures right, and a test that needed a 12% event to fire would be a
+/// test that fails 88% of the time. What is NOT injected is the part under
+/// test — the audio is real German, the context is read out of real
+/// transcripts, and the words that replace the flip come out of the real
+/// arbiter reading the real WAV.
+///
+/// Needs the German arbiter under `NXR_MODELS`
+/// (`recalld models fetch --arbiter-de`).
+#[test]
+fn a_german_turn_flipped_to_english_is_re_read_by_the_arbiter() {
+    let mut rig = rig!("lang-arbiter");
+    if !rig.arbiter_installed() {
+        eprintln!(
+            "skipping: needs the German arbiter under NXR_MODELS \
+             (`recalld models fetch --arbiter-de`)"
+        );
+        return;
+    }
+    let Some(fixture) = rig.a_fixture_read_as_german() else {
+        panic!("the multilingual export read none of the German fixtures as German");
+    };
+
+    // A German conversation: four turns of real German audio, each stamped by
+    // the real classifier on the way in. That is the context.
+    let thread = rig.new_thread();
+    for _ in 0..4 {
+        for id in rig.ingest(&fixture) {
+            rig.put_in_thread(id, thread);
+        }
+    }
+    assert!(
+        rig.german_stamps_in(thread) >= 3,
+        "the context bar is three agreeing turns and this thread has {}",
+        rig.german_stamps_in(thread)
+    );
+
+    // …and one more turn of the same German audio, whose transcript came back
+    // English. This is the flip.
+    let subject = *rig.ingest(&fixture).first().expect("a segment");
+    rig.put_in_thread(subject, thread);
+    let samples = rig.samples_of(subject);
+    let flipped = "i think that is the only way to do it";
+    rig.flip_to(subject, flipped);
+
+    let fix = rig
+        .analyzer
+        .apply_language_context(&rig.store, subject, &samples)
+        .unwrap()
+        .expect("an English turn in a German conversation is a suspected flip");
+
+    let after = rig.store.segment_fields(subject).unwrap();
+    match fix {
+        recalld::langctx::ContextFix::Redecoded {
+            text,
+            lang,
+            asr_model_id,
+        } => {
+            eprintln!("  flipped: {flipped:?}\n       -> {text:?}");
+            assert_eq!(lang, "de");
+            assert_eq!(after["text"].as_deref(), Some(text.as_str()));
+            assert_eq!(after["lang"].as_deref(), Some("de"));
+            assert_eq!(after["lang_via"].as_deref(), Some("re-decode"));
+            // The row must name the model that produced the words it holds —
+            // and the forced language is part of that model's contract.
+            assert_eq!(
+                after["asr_model_id"].as_deref(),
+                Some(asr_model_id.as_str())
+            );
+            assert_eq!(asr_model_id, recalld::models::ARBITER_DE.model_id());
+            // Every guard the replacement had to clear, checked on the result
+            // rather than trusted from the code path.
+            assert_eq!(recalld::lang::classify(&text), recalld::lang::Lang::De);
+            assert!(normalise_words(&text).len() >= 2, "{text:?}");
+            assert_eq!(
+                recalld::arbiter::strip_captions(&text),
+                text,
+                "a caption-shaped answer must never have got this far: {text:?}"
+            );
+        }
+        // The arbiter is allowed to disagree — it is an arbiter, not an oracle.
+        // What it is not allowed to do is overwrite good words with bad ones,
+        // so a disagreement leaves the flip standing and flags the row.
+        other => {
+            eprintln!("  the arbiter did not confirm the flip: {other:?}");
+            assert_eq!(after["text"].as_deref(), Some(flipped));
+            assert_eq!(after["lang"], None);
+            assert_eq!(after["lang_via"].as_deref(), Some("mismatch"));
+        }
+    }
+}
+
+/// The two guards that decide when the arbiter is *not* allowed to win.
+///
+/// Both are measured, and both fail in the same direction — keep the words —
+/// because the alternative is replacing one wrong transcript with a differently
+/// wrong one:
+///
+/// * **Under 1.5 s** the arbiter's word precision is 28% (54% at 1.5 s, 66% at
+///   3 s, `spike/arbiter_de.py`). It is not even run.
+/// * **On non-speech** Whisper narrates: `(soft music)`, `[Applause]`. Stripped
+///   before the classifier sees it, that is an empty answer, and an empty
+///   answer replaces nothing.
+#[test]
+fn the_arbiter_may_not_overwrite_words_it_cannot_beat() {
+    let mut rig = rig!("lang-guards");
+    if !rig.arbiter_installed() {
+        eprintln!("skipping: needs the German arbiter under NXR_MODELS");
+        return;
+    }
+    let Some(fixture) = rig.a_fixture_read_as_german() else {
+        panic!("the multilingual export read none of the German fixtures as German");
+    };
+    let flipped = "i think that is the only way to do it";
+
+    let thread = rig.new_thread();
+    for _ in 0..4 {
+        for id in rig.ingest(&fixture) {
+            rig.put_in_thread(id, thread);
+        }
+    }
+    assert!(rig.german_stamps_in(thread) >= 3);
+
+    // -- one second of the same German audio ---------------------------------
+    let short = rig.ingest(&fixture)[0];
+    rig.put_in_thread(short, thread);
+    let one_second: Vec<f32> = rig
+        .samples_of(short)
+        .into_iter()
+        .take(SAMPLE_RATE as usize)
+        .collect();
+    rig.flip_to(short, flipped);
+    let fix = rig
+        .analyzer
+        .apply_language_context(&rig.store, short, &one_second)
+        .unwrap();
+    assert_eq!(
+        fix,
+        Some(recalld::langctx::ContextFix::Marked { read_as: "en" }),
+        "at 1.0 s the arbiter's own words are right 28% of the time: flag, never replace"
+    );
+    let after = rig.store.segment_fields(short).unwrap();
+    assert_eq!(after["text"].as_deref(), Some(flipped), "the words stand");
+    assert_eq!(after["lang"], None, "…and the language is openly in doubt");
+    assert_eq!(after["lang_via"].as_deref(), Some("mismatch"));
+
+    // -- an arbiter answer that is not worth the words it would replace ------
+    // Whisper's measured habit on non-speech is to narrate: "(soft music)",
+    // "[Applaus]". Every such answer is stripped to nothing and rejected, and
+    // the rule that does it (`arbiter::judge`) is exercised directly in its own
+    // module — a caption cannot be *produced* on demand from real audio, and a
+    // test that waited for one would be a test that usually proves nothing.
+    //
+    // What is asserted here is the property that matters at this level: a row
+    // the arbiter did not settle keeps its words. Both branches above already
+    // hold that line, and so does the guard's own table.
+    assert!(
+        recalld::arbiter::judge("(Musik)", recalld::lang::Lang::De, &rig.cfg.lang).is_err(),
+        "a narrated caption never becomes a transcript"
+    );
+}
+
+/// The backlog walk, on the same real audio and through the same guards.
+///
+/// This is what makes the arbiter worth installing on a machine that has been
+/// running since 0.6.1: every flip flagged in that time still has its WAV, and
+/// what could not be settled then can be settled now.
+#[test]
+fn the_repair_walk_settles_a_flagged_row_from_its_audio() {
+    let mut rig = rig!("lang-repair");
+    if !rig.arbiter_installed() {
+        eprintln!("skipping: needs the German arbiter under NXR_MODELS");
+        return;
+    }
+    let Some(fixture) = rig.a_fixture_read_as_german() else {
+        panic!("the multilingual export read none of the German fixtures as German");
+    };
+
+    let thread = rig.new_thread();
+    for _ in 0..4 {
+        for id in rig.ingest(&fixture) {
+            rig.put_in_thread(id, thread);
+        }
+    }
+    // A row flagged exactly as 0.6.1 would have flagged it: English-looking
+    // words over German audio, language NULL, words kept.
+    let flagged = rig.ingest(&fixture)[0];
+    rig.put_in_thread(flagged, thread);
+    rig.flip_to(flagged, "i think that is the only way to do it");
+    rig.store.mark_segment_language_mismatch(flagged).unwrap();
+
+    // …and one whose audio the retention window has taken, which no repair can
+    // ever settle and which must not stop the walk.
+    let gone = rig.ingest(&fixture)[0];
+    rig.put_in_thread(gone, thread);
+    rig.flip_to(gone, "i think that is the only way to do it");
+    rig.store.mark_segment_language_mismatch(gone).unwrap();
+    rig.store.forget_audio(&[gone]).unwrap();
+
+    assert_eq!(rig.store.language_mismatch_counts().unwrap(), (2, 1));
+
+    let mut arbiters = recalld::arbiter::Arbiters::new(&rig.models);
+    let report = recalld::langctx::repair(
+        &rig.store,
+        &rig.dir,
+        &mut arbiters,
+        &rig.cfg.lang,
+        8,
+        None,
+        |_| {},
+    )
+    .unwrap();
+
+    eprintln!("  repair: {report:?}");
+    assert_eq!(
+        report.scanned, 1,
+        "a row with no audio left is never even offered to the walk"
+    );
+    assert_eq!(report.no_audio, 0);
+    let after = rig.store.segment_fields(flagged).unwrap();
+    if report.repaired == 1 {
+        assert_eq!(report.repaired_de, 1);
+        assert_eq!(report.changed, vec![flagged]);
+        assert_eq!(after["lang"].as_deref(), Some("de"));
+        assert_eq!(after["lang_via"].as_deref(), Some("re-decode"));
+        assert_eq!(
+            after["asr_model_id"].as_deref(),
+            Some(recalld::models::ARBITER_DE.model_id().as_str())
+        );
+        assert_eq!(
+            recalld::lang::classify(after["text"].as_deref().unwrap()),
+            recalld::lang::Lang::De
+        );
+    } else {
+        // The arbiter disagreed. The row stays exactly as it was, which is the
+        // point: a repair that could damage a transcript would be worse than no
+        // repair at all.
+        assert_eq!(report.kept, 1);
+        assert_eq!(after["lang_via"].as_deref(), Some("mismatch"));
+        assert_eq!(
+            after["text"].as_deref(),
+            Some("i think that is the only way to do it")
+        );
+    }
+    // The row with no audio is still flagged and still honest about it.
+    assert_eq!(
+        rig.store.segment_fields(gone).unwrap()["lang_via"].as_deref(),
+        Some("mismatch")
+    );
 }
 
 // ---- pure helpers ------------------------------------------------------

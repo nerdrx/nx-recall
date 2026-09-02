@@ -117,6 +117,36 @@ Needs the running daemon: every connected client has to be told.")]
         codes: String,
     },
 
+    /// The conversational language prior: what it has flagged, and re-reading
+    /// the backlog now that there is something to re-read it with.
+    // Verbatim: clap would reflow the example block into one paragraph.
+    #[command(long_about = "\
+The conversational language prior (0.7.7).
+
+A conversation has a language. When ten turns running read as German and the
+eleventh comes back as English, the eleventh is far more likely to be the
+decoder flipping than the room switching — measured at 12% of 1 s fragments and
+5% of 2 s ones, against a median real turn of 2.4 s.
+
+A turn the classifier could not read at all takes the conversation's language.
+A turn that reads as the OPPOSITE is handed to an arbiter: a decoder told which
+language to hear. When there is no arbiter installed, or the turn is under
+1.5 s (below which re-decoding is measurably not an improvement), the words are
+kept and the row is flagged instead.
+
+  recalld lang              how many turns are flagged, and what can settle them
+  recalld lang repair       re-read the flagged ones from their audio
+
+Repair is bounded, resumable and runs at idle priority: it is safe to run while
+the daemon is capturing, and a run that is interrupted loses nothing.
+
+`recalld models fetch --arbiter-de` installs the German arbiter (~208 MB);
+`--fallback-asr` installs the English one (~108 MB).")]
+    Lang {
+        #[command(subcommand)]
+        action: Option<LangAction>,
+    },
+
     /// Give a voice a name. Retroactive by nature: the numeric id is the
     /// identity, so every past and future segment follows.
     Name {
@@ -330,6 +360,13 @@ pub enum ModelsAction {
         #[arg(long)]
         graph: bool,
 
+        /// Also install the German flip arbiter (~208 MB): Whisper base, run
+        /// with its language token forced to German. Optional — without it a
+        /// German turn decoded as English is flagged rather than re-read,
+        /// which is what the daemon did before 0.7.7.
+        #[arg(long)]
+        arbiter_de: bool,
+
         /// Also install the text-embedding model that semantic search needs
         /// (~135 MB). Not part of the default set: keyword search works
         /// without it, and it is a feature you opt into rather than something
@@ -342,6 +379,47 @@ pub enum ModelsAction {
         /// `models status` and the daemon agree with it.
         #[arg(long)]
         no_config: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LangAction {
+    /// How many transcripts are flagged as a language the daemon could not
+    /// settle, and which arbiters are installed to settle them. Changes
+    /// nothing.
+    Status,
+
+    /// Re-read every flagged transcript from its audio, applying exactly the
+    /// guards the live pipeline applies.
+    // Verbatim: the operating model is two paragraphs and clap would fuse them.
+    #[command(long_about = "\
+Re-read every flagged transcript from its audio.
+
+A flagged row is one whose words disagreed with the language expected of them —
+from the speaker's declaration, or from the conversation around it — at a moment
+when nothing could settle the disagreement: no arbiter installed, or an arbiter
+whose own answer failed a guard. The words were kept and the row was marked.
+
+This walks those marks. The target language is re-derived NOW, not read off the
+old mark, because a declaration may have been added since and a conversation may
+have grown a context it did not have. Rows under 1.5 s are left flagged: below
+that the arbiter's word precision is 28% and replacing one wrong transcript with
+another is not a correction. Rows whose audio the retention window has taken are
+skipped — there is nothing left to re-read.
+
+Bounded, resumable and idle-priority: the work list is a query, not a cursor.")]
+    Repair {
+        /// Rows per batch. Progress is reported once per batch.
+        #[arg(long, value_name = "N", default_value_t = 32)]
+        batch: usize,
+
+        /// Stop after this many rows. Without it the walk runs to completion.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+
+        /// Use this models directory instead of `[models].dir`.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
     },
 }
 

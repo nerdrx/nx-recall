@@ -79,6 +79,15 @@ pub mod lang_via {
     /// its text left alone. `lang` stays NULL: the honest answer is that we do
     /// not know which of the two is wrong.
     pub const MISMATCH: &str = "mismatch";
+    /// The conversational language prior (0.7.7): the classifier could not read
+    /// a language out of these words, so the row took the one the rest of its
+    /// **thread** was speaking. An inference, and marked as one — the text was
+    /// not re-decoded and did not change.
+    ///
+    /// Never counted as evidence for another row's context
+    /// (`Store::thread_language_stamps`): a context that fed on its own
+    /// inferences would confirm itself.
+    pub const CONTEXT: &str = "context";
 }
 
 /// `settings` key holding the id of the pinned "You" speaker.
@@ -162,6 +171,11 @@ pub struct SegmentRow {
     pub audio_path: String,
     /// The transcript's language, when one is known (v5).
     pub lang: Option<String>,
+    /// How the *language* got here (`store::lang_via`). On the wire since
+    /// 0.7.7: `"re-decode"` means these words came from an arbiter re-reading
+    /// the audio rather than from the primary ASR, and a client that shows
+    /// provenance for the speaker should be able to show it for the words too.
+    pub lang_via: Option<String>,
     /// How the speaker got here (`store::label_via`), so a client can distrust
     /// an inherited label without distrusting a matched one.
     pub label_via: Option<String>,
@@ -1379,6 +1393,134 @@ impl Store {
         Ok(())
     }
 
+    /// Stamp a language the *conversation* supplied (0.7.7, `crate::langctx`).
+    ///
+    /// Text and `asr_model_id` are untouched, and that is the point: nothing
+    /// was re-decoded, so nothing about what was said has changed. Only the
+    /// answer to "which language was this" moved, from NULL to an inference
+    /// that says out loud that it is one.
+    pub fn set_segment_language_from_context(&self, segment_id: i64, lang: &str) -> Result<()> {
+        self.set_segment_language(segment_id, lang, lang_via::CONTEXT)
+    }
+
+    /// Set a row's language and say where it came from, leaving the transcript
+    /// and its `asr_model_id` alone. The one write that moves `lang` without
+    /// moving the words — used by the context stamp above and by
+    /// `recalld lang repair` when it finds a mark whose disagreement has since
+    /// gone away.
+    pub fn set_segment_language(&self, segment_id: i64, lang: &str, via: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET lang = ?2, lang_via = ?3 WHERE id = ?1",
+            params![segment_id, lang, via],
+        )?;
+        Ok(())
+    }
+
+    /// The last `limit` **clear** language stamps of one conversation, newest
+    /// first, as the raw tags. This is the evidence the thread's language
+    /// context is read from (`crate::langctx`).
+    ///
+    /// Three filters, each load-bearing:
+    ///
+    /// * `lang IS NOT NULL` — only turns something actually read a language
+    ///   out of vote. A NULL is "nobody could tell", not a vote for the other
+    ///   side.
+    /// * `id != exclude` — the turn being decided does not vote on itself. A
+    ///   flip that helped confirm itself would be unfalsifiable.
+    /// * `lang_via != 'context'` — an inherited stamp is an echo of this very
+    ///   query, not new evidence. Counting it would let three real German turns
+    ///   inherit their way to a hundred, and the hundredth would look exactly
+    ///   as certain as the first.
+    pub fn thread_language_stamps(
+        &self,
+        thread_id: i64,
+        exclude: i64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT lang FROM segments
+                 WHERE thread_id = ?1 AND id != ?2 AND lang IS NOT NULL
+                   AND (lang_via IS NULL OR lang_via != ?3) AND deleted_at IS NULL
+                 ORDER BY t_start_ns DESC, id DESC LIMIT ?4",
+            )?
+            .query_map(
+                params![thread_id, exclude, lang_via::CONTEXT, limit as i64],
+                |r| r.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Everything the language prior needs about one row, in one query: which
+    /// conversation it is in, what it says, how its language got there, and —
+    /// reduced here rather than in the caller — whether its speaker is pinned
+    /// to exactly one language.
+    pub fn language_subject(&self, segment_id: i64) -> Result<Option<crate::langctx::Subject>> {
+        // The declaration is read through `speaker_resolved`, exactly as
+        // `speaker_languages` does, so a voice that was merged away still
+        // answers with the surviving voice's declaration rather than its own
+        // stale one.
+        /// `(thread_id, text, lang_via, the speaker's raw languages column)`.
+        type Raw = (Option<i64>, Option<String>, Option<String>, Option<String>);
+        let row: Option<Raw> = self
+            .conn
+            .query_row(
+                "SELECT g.thread_id, g.text, g.lang_via,
+                        (SELECT s.languages FROM speakers s
+                         JOIN speaker_resolved r ON r.canonical_id = s.id
+                         WHERE r.id = g.speaker_id)
+                 FROM segments g
+                 WHERE g.id = ?1 AND g.deleted_at IS NULL",
+                params![segment_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(thread_id, text, lang_via, languages)| {
+            let parsed = crate::lang::parse_languages(languages.as_deref());
+            crate::langctx::Subject {
+                thread_id,
+                text,
+                lang_via,
+                declared: crate::lang::sole_language(parsed.as_ref()).map(str::to_string),
+            }
+        }))
+    }
+
+    /// Rows the arbiter could not settle, oldest first — the backlog
+    /// `recalld lang repair` walks (0.7.7).
+    ///
+    /// Only rows that still have audio: the whole point of a repair is to read
+    /// the *sound* again, and a row whose WAV the retention window took is one
+    /// nothing can be done about. Ordered oldest-first so a bounded run always
+    /// makes progress on the same end of the queue rather than re-visiting
+    /// whatever happened to be recent.
+    pub fn language_mismatch_backlog(&self, limit: usize) -> Result<Vec<(i64, String)>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT id, audio_path FROM segments
+                 WHERE lang_via = ?1 AND deleted_at IS NULL AND audio_path != ''
+                 ORDER BY t_start_ns ASC, id ASC LIMIT ?2",
+            )?
+            .query_map(params![lang_via::MISMATCH, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many rows are still marked as an unsettled language disagreement,
+    /// with and without audio to settle them from. The second number is the one
+    /// a repair can never reduce.
+    pub fn language_mismatch_counts(&self) -> Result<(i64, i64)> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE audio_path != '')
+             FROM segments WHERE lang_via = ?1 AND deleted_at IS NULL",
+            params![lang_via::MISMATCH],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
     /// Label a segment from a voicebank match (or clear its label). The
     /// provenance follows: a row with a speaker was matched, a row without one
     /// has no provenance to record.
@@ -2147,10 +2289,15 @@ impl Store {
     /// The columns every client-facing segment row is built from. Kept in one
     /// place so a transcript page, a search hit and a live event cannot drift
     /// into describing the same segment differently.
+    /// How many columns [`Self::SEGMENT_COLUMNS`] selects. A query that appends
+    /// its own — the search's snippet — indexes from here rather than from a
+    /// number somebody has to remember to bump.
+    const SEGMENT_COLUMN_COUNT: usize = 15;
+
     const SEGMENT_COLUMNS: &'static str =
         "g.id, g.session_id, sc.match_key, g.t_start_ns, g.t_end_ns,
          sp.canonical_id, sp.display_name, g.text, g.overlap_frac, g.match_score, g.audio_path,
-         g.lang, g.label_via, g.thread_id";
+         g.lang, g.label_via, g.thread_id, g.lang_via";
 
     fn segment_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentRow> {
         Ok(SegmentRow {
@@ -2168,6 +2315,7 @@ impl Store {
             lang: r.get(11)?,
             label_via: r.get(12)?,
             thread_id: r.get(13)?,
+            lang_via: r.get(14)?,
         })
     }
 
@@ -2326,7 +2474,9 @@ impl Store {
                 |r| {
                     Ok(SearchHit {
                         row: Self::segment_row_from(r)?,
-                        snippet: r.get(14)?,
+                        // One past SEGMENT_COLUMNS, which is the only place
+                        // in this file that knows how wide that list is.
+                        snippet: r.get(Self::SEGMENT_COLUMN_COUNT)?,
                     })
                 },
             )?
@@ -4025,7 +4175,7 @@ mod tests {
 
         let sec = 1_000_000_000i64;
         let cfg = crate::config::GraphConfig::default();
-        let mut seg = |session: i64, t: i64, speaker: Option<i64>| {
+        let seg = |session: i64, t: i64, speaker: Option<i64>| {
             let id = store
                 .insert_segment(session, t, t + sec, "x.wav", t)
                 .unwrap();
@@ -6081,5 +6231,208 @@ mod tests {
         assert_eq!(thread_of(&s, ids[3]), tid);
         // …and it is not a participant, because nobody knows who it was.
         assert_eq!(s.thread_participants(tid).unwrap(), vec![a, b]);
+    }
+
+    /// The snippet column of a search indexes one past this list, so a column
+    /// added to it and not counted here silently hands every search result the
+    /// wrong field — which is exactly what adding `lang_via` did once.
+    #[test]
+    fn the_segment_column_count_matches_the_column_list() {
+        assert_eq!(
+            Store::SEGMENT_COLUMNS.split(',').count(),
+            Store::SEGMENT_COLUMN_COUNT
+        );
+    }
+
+    // ---- the conversational language prior (0.7.7) -----------------------
+
+    /// Stamp a segment the way the analysis leg would have.
+    fn stamp(s: &Store, id: i64, text: &str, lang: Option<&str>, via: &str) {
+        s.set_segment_analysis(
+            id,
+            &SegmentAnalysis {
+                text: Some(text.into()),
+                lang: lang.map(str::to_string),
+                lang_via: Some(via.into()),
+                asr_model_id: Some("test@1".into()),
+                overlap_frac: Some(0.02),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_threads_language_evidence_is_its_own_and_newest_first() {
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let b = s.create_speaker("B", 1).unwrap();
+        // Two conversations running beside each other, one German and one
+        // English — which is the case the whole feature exists for, and the
+        // case a per-session or per-speaker rule gets wrong.
+        let c = s.create_speaker("C", 1).unwrap();
+        let d = s.create_speaker("D", 1).unwrap();
+        let (_, ids) = a_threaded_session(
+            &s,
+            &[
+                Some(a),
+                Some(b),
+                Some(a),
+                Some(b),
+                Some(c),
+                Some(d),
+                Some(c),
+                Some(d),
+            ],
+        );
+        let de_thread = thread_of(&s, ids[0]);
+        let en_thread = thread_of(&s, ids[4]);
+        assert_ne!(de_thread, en_thread);
+        for id in &ids[..4] {
+            stamp(&s, *id, "das ist so", Some("de"), lang_via::CLASSIFIED);
+        }
+        for id in &ids[4..] {
+            stamp(&s, *id, "that is so", Some("en"), lang_via::CLASSIFIED);
+        }
+
+        // Each conversation sees only its own turns. This is the whole point:
+        // the room is bilingual and neither thread is.
+        assert_eq!(
+            s.thread_language_stamps(de_thread, 0, 10).unwrap(),
+            vec!["de"; 4]
+        );
+        assert_eq!(
+            s.thread_language_stamps(en_thread, 0, 10).unwrap(),
+            vec!["en"; 4]
+        );
+        // Newest first, and capped.
+        stamp(&s, ids[3], "that is so", Some("en"), lang_via::CLASSIFIED);
+        assert_eq!(
+            s.thread_language_stamps(de_thread, 0, 2).unwrap(),
+            vec!["en", "de"],
+            "the most recent two, most recent first"
+        );
+        // The turn being decided never votes on itself.
+        assert_eq!(
+            s.thread_language_stamps(de_thread, ids[3], 10).unwrap(),
+            vec!["de"; 3]
+        );
+    }
+
+    #[test]
+    fn an_inherited_stamp_is_not_evidence_for_the_next_one() {
+        // Otherwise three real German turns would inherit their way to a
+        // hundred and the hundredth would look as certain as the first.
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let (_, ids) = a_threaded_session(&s, &[Some(a), Some(a), Some(a)]);
+        let tid = thread_of(&s, ids[0]);
+        stamp(&s, ids[0], "das ist so", Some("de"), lang_via::CLASSIFIED);
+        stamp(&s, ids[1], "okay", None, lang_via::CLASSIFIED);
+        s.set_segment_language_from_context(ids[1], "de").unwrap();
+        stamp(&s, ids[2], "das ist so", Some("de"), lang_via::CLASSIFIED);
+
+        let f = s.segment_fields(ids[1]).unwrap();
+        assert_eq!(f["lang"].as_deref(), Some("de"));
+        assert_eq!(f["lang_via"].as_deref(), Some(lang_via::CONTEXT));
+        assert_eq!(
+            f["text"].as_deref(),
+            Some("okay"),
+            "an inheritance changes the language and nothing else"
+        );
+        assert_eq!(
+            s.thread_language_stamps(tid, 0, 10).unwrap(),
+            vec!["de", "de"],
+            "the inherited one is an echo, not a vote"
+        );
+    }
+
+    #[test]
+    fn a_soft_deleted_turn_stops_voting() {
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let (_, ids) = a_threaded_session(&s, &[Some(a), Some(a)]);
+        let tid = thread_of(&s, ids[0]);
+        stamp(&s, ids[0], "das ist so", Some("de"), lang_via::CLASSIFIED);
+        stamp(&s, ids[1], "das ist so", Some("de"), lang_via::CLASSIFIED);
+        s.soft_delete_segments(&[ids[1]], 1).unwrap();
+        assert_eq!(s.thread_language_stamps(tid, 0, 10).unwrap(), vec!["de"]);
+    }
+
+    #[test]
+    fn the_language_subject_reduces_a_declaration_to_the_one_that_can_act() {
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let (_, ids) = a_threaded_session(&s, &[Some(a)]);
+        stamp(&s, ids[0], "das ist so", Some("de"), lang_via::CLASSIFIED);
+
+        let subject = s.language_subject(ids[0]).unwrap().unwrap();
+        assert_eq!(subject.thread_id, Some(thread_of(&s, ids[0])));
+        assert_eq!(subject.text.as_deref(), Some("das ist so"));
+        assert_eq!(subject.lang_via.as_deref(), Some(lang_via::CLASSIFIED));
+        assert_eq!(subject.declared, None, "nobody has said anything");
+
+        s.set_speaker_languages(a, Some(&["en".to_string()]))
+            .unwrap();
+        assert_eq!(
+            s.language_subject(ids[0])
+                .unwrap()
+                .unwrap()
+                .declared
+                .as_deref(),
+            Some("en")
+        );
+        // Bilingual is not a declaration anything can act on, so it reduces to
+        // the same "nothing" as no declaration at all.
+        s.set_speaker_languages(a, Some(&["de".to_string(), "en".to_string()]))
+            .unwrap();
+        assert_eq!(s.language_subject(ids[0]).unwrap().unwrap().declared, None);
+
+        // A merged-away voice answers with the surviving voice's declaration.
+        let b = s.create_speaker("B", 1).unwrap();
+        s.set_speaker_languages(b, Some(&["de".to_string()]))
+            .unwrap();
+        s.merge_speakers(a, b).unwrap();
+        assert_eq!(
+            s.language_subject(ids[0])
+                .unwrap()
+                .unwrap()
+                .declared
+                .as_deref(),
+            Some("de")
+        );
+        assert_eq!(s.language_subject(999_999).unwrap(), None);
+    }
+
+    #[test]
+    fn the_mismatch_backlog_is_oldest_first_and_only_what_can_be_re_read() {
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let (_, ids) = a_threaded_session(&s, &[Some(a), Some(a), Some(a), Some(a)]);
+        for id in &ids {
+            stamp(&s, *id, "that is so", Some("en"), lang_via::CLASSIFIED);
+        }
+        // Three flagged, one of them with its audio already aged out.
+        for id in &ids[..3] {
+            s.mark_segment_language_mismatch(*id).unwrap();
+        }
+        s.forget_audio(&[ids[1]]).unwrap();
+
+        assert_eq!(s.language_mismatch_counts().unwrap(), (3, 2));
+        assert_eq!(
+            s.language_mismatch_backlog(10)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![ids[0], ids[2]],
+            "oldest first, and never a row there is nothing left to re-read"
+        );
+        // Bounded, so a repair can walk it a batch at a time.
+        assert_eq!(s.language_mismatch_backlog(1).unwrap().len(), 1);
+
+        // Settling one takes it off the list without touching the others.
+        s.set_segment_language(ids[0], "en", lang_via::CLASSIFIED)
+            .unwrap();
+        assert_eq!(s.language_mismatch_counts().unwrap(), (2, 1));
     }
 }

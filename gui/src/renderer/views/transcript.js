@@ -17,6 +17,10 @@ import {
   segmentSpeakerLabel,
   isUncertain,
   uncertainReason,
+  // 0.7.7: the "?" now also marks a turn whose WORDS came from somewhere other
+  // than the primary model, which is a different doubt from a doubted name.
+  hasMark,
+  languageNote,
   isYou,
   ask,
   setFollowing,
@@ -322,7 +326,9 @@ export function mount(root, ctx) {
         'span',
         { class: 'meta' },
         seg.source === 'Discord' ? h('span', { class: 'chip', text: 'discord' }) : null,
-        uncertain ? h('span', { class: 'qmark', text: '?', title: uncertainReason(seg) }) : null
+        // The "?" is now about two things: a name in doubt, and words that
+        // did not come from the primary model (0.7.7). Either earns the mark.
+        hasMark(seg) ? h('span', { class: 'qmark', text: '?', title: uncertainReason(seg) }) : null
       )
     );
     const open = () => openSegmentSheet(seg, ctx);
@@ -816,14 +822,22 @@ export function openSegmentSheet(seg, ctx) {
       h('h2', { text: 'Reassign or correct' }),
       h('p', {
         class: 'sub',
+        // The name's provenance, then — when there is one — the words'. A
+        // certain speaker whose transcript was re-read still says so here.
         text: isUncertain(seg)
           ? uncertainReason(seg)
-          : isYou(seg.speaker)
-            ? // No score, and there should not be one: nothing was compared.
-              // Saying "matched at 0.00" here would be a lie about a fact the
-              // daemon is more sure of than anything else in the transcript.
-              `Recorded on your own microphone, so the speaker is not a guess. ${Math.round((seg.overlap_frac ?? 0) * 100)}% overlapped.`
-            : `Matched at ${(seg.match_score ?? 0).toFixed(2)} confidence, ${Math.round((seg.overlap_frac ?? 0) * 100)}% overlapped.`,
+          : [
+              isYou(seg.speaker)
+                ? // No score, and there should not be one: nothing was
+                  // compared. Saying "matched at 0.00" here would be a lie
+                  // about a fact the daemon is more sure of than anything else
+                  // in the transcript.
+                  `Recorded on your own microphone, so the speaker is not a guess. ${Math.round((seg.overlap_frac ?? 0) * 100)}% overlapped.`
+                : `Matched at ${(seg.match_score ?? 0).toFixed(2)} confidence, ${Math.round((seg.overlap_frac ?? 0) * 100)}% overlapped.`,
+              languageNote(seg),
+            ]
+              .filter(Boolean)
+              .join(' '),
       }),
       h(
         'div',

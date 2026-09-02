@@ -11,6 +11,7 @@
 
 pub mod allowlist;
 pub mod analysis;
+pub mod arbiter;
 pub mod asr;
 pub mod b64;
 pub mod bus;
@@ -26,6 +27,7 @@ pub mod fetch;
 pub mod identity;
 pub mod ingest;
 pub mod lang;
+pub mod langctx;
 pub mod llm;
 pub mod models;
 pub mod overlap;

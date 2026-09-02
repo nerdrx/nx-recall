@@ -19,6 +19,8 @@ import {
   reloadAll,
   isUncertain,
   uncertainReason,
+  hasMark,
+  languageNote,
   isYou,
   micChip,
   onboardingCandidates,
@@ -286,6 +288,79 @@ test('an inherited label reads as uncertain and says where it came from', () => 
   // is about provenance, not about the missing score.
   const matched = seg(2, { speaker: 1, match_score: 0.82, label_via: 'match', overlap_frac: 0.02 });
   assert.equal(isUncertain(matched), false);
+});
+
+// ---- 0.7.7: the conversational language prior ----------------------------
+
+test('a re-read transcript is marked even when its speaker is certain', () => {
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', total_ms: 1000 });
+
+  // The name is not in doubt — a confident match, no overlap — but the WORDS
+  // on screen came out of the arbiter rather than out of the primary model,
+  // and that is a fact about the transcript the reader is entitled to.
+  const reread = seg(1, {
+    speaker: 1,
+    match_score: 0.81,
+    label_via: 'match',
+    overlap_frac: 0.02,
+    lang: 'de',
+    lang_via: 're-decode',
+  });
+  assert.equal(isUncertain(reread), false, 'the speaker is not what is in doubt');
+  assert.equal(hasMark(reread), true, 'but there is still something to say');
+  const why = uncertainReason(reread);
+  assert.match(why, /re-read/i);
+  assert.match(why, /arbiter/i);
+  // …and it must NOT invent a doubt about the name it was not asked about.
+  assert.doesNotMatch(why, /voice match/i);
+});
+
+test('a flip nothing could settle says the words were kept', () => {
+  reset();
+  const flagged = seg(2, {
+    speaker: 1,
+    match_score: 0.72,
+    label_via: 'match',
+    overlap_frac: 0.02,
+    lang: null,
+    lang_via: 'mismatch',
+  });
+  assert.equal(hasMark(flagged), true);
+  assert.match(uncertainReason(flagged), /kept as they are/i);
+});
+
+test('the ordinary language provenances say nothing at all', () => {
+  // `model`, `classified` and `context` never changed a word, so there is
+  // nothing for the "?" to explain — and a mark on every row is no mark.
+  for (const via of ['model', 'classified', 'context', null, undefined]) {
+    const ordinary = seg(3, {
+      speaker: 1,
+      match_score: 0.9,
+      label_via: 'match',
+      overlap_frac: 0.02,
+      lang: 'de',
+      lang_via: via,
+    });
+    assert.equal(languageNote(ordinary), '', String(via));
+    assert.equal(hasMark(ordinary), false, String(via));
+  }
+});
+
+test('both doubts show together when both are real', () => {
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', total_ms: 1000 });
+  const both = seg(4, {
+    speaker: 1,
+    match_score: null,
+    label_via: 'proximity',
+    overlap_frac: 0.02,
+    lang: 'de',
+    lang_via: 're-decode',
+  });
+  const why = uncertainReason(both);
+  assert.match(why, /surrounding turn/i, 'who');
+  assert.match(why, /arbiter/i, 'and what');
 });
 
 test('a speaker language is a closed set with one label per state', () => {

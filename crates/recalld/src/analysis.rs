@@ -21,12 +21,14 @@ use std::sync::atomic::Ordering;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
+use crate::arbiter::{Arbiters, Arbitration};
 use crate::asr::{Asr, normalise_words};
-use crate::config::{IdentityConfig, SAMPLE_RATE};
+use crate::config::{IdentityConfig, LangConfig, SAMPLE_RATE};
 use crate::embed::{Embedder, Embedding};
 use crate::identity::{self, Decision, Refusal};
 use crate::lang::{self, Lang};
-use crate::models::{FALLBACK_ASR, ModelSet};
+use crate::langctx::{self, ContextFix, Intent};
+use crate::models::ModelSet;
 use crate::overlap::OverlapDetector;
 use crate::store::{SegmentAnalysis, Store, lang_via};
 
@@ -98,8 +100,14 @@ pub fn golden_path(speaker_id: i64, segment_id: i64) -> PathBuf {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LanguageFix {
     /// The audio was decoded again under a hard language constraint and the
-    /// new transcript won. `text` is what the row says now.
-    Redecoded { text: String, asr_model_id: String },
+    /// new transcript won. `text` is what the row says now, and `lang` is the
+    /// constraint it was produced under — which is also the direction the
+    /// counters split on.
+    Redecoded {
+        text: String,
+        asr_model_id: String,
+        lang: String,
+    },
     /// The transcript and the speaker's declared language disagree and nothing
     /// in the catalogue can settle it. The words are kept and the row is
     /// marked; `lang` goes to NULL rather than to a guess.
@@ -111,15 +119,14 @@ pub struct Analyzer {
     asr: Asr,
     embedder: Embedder,
     cfg: IdentityConfig,
-    /// Where the models live, kept so a constrained decoder can be loaded from
-    /// the same root later without re-resolving the config.
-    models: ModelSet,
-    /// The English-only export, loaded the first time a wrong-language decode
-    /// needs it and resident from then on. `None` means "not tried yet";
-    /// `en_unavailable` means "tried, not installed" — the difference is what
-    /// keeps the warning to one line rather than one per segment.
-    en_asr: Option<Asr>,
-    en_unavailable: bool,
+    /// The conversational language prior's thresholds and the arbiter's
+    /// measured guards (0.7.7). Defaulted rather than a `load` parameter so a
+    /// caller that does not care about language — the acceptance rig, the mic
+    /// suite — keeps the two-argument constructor it always had.
+    lang_cfg: LangConfig,
+    /// The two constrained decoders, each loaded the first time a suspected
+    /// flip needs it and resident from then on (`crate::arbiter`).
+    arbiters: Arbiters,
 }
 
 impl Analyzer {
@@ -138,10 +145,21 @@ impl Analyzer {
             asr: Asr::load(models)?,
             embedder: Embedder::load(models)?,
             cfg: cfg.clone(),
-            models: models.clone(),
-            en_asr: None,
-            en_unavailable: false,
+            lang_cfg: LangConfig::default(),
+            arbiters: Arbiters::new(models),
         })
+    }
+
+    /// Point the language prior at the running config. Set once, before the
+    /// inference thread starts.
+    pub fn set_lang_config(&mut self, cfg: &LangConfig) {
+        self.lang_cfg = cfg.clone();
+    }
+
+    /// Which languages this install can actually re-decode into. Logged once at
+    /// start-up so "the flip was only flagged" has a visible cause.
+    pub fn arbiters_installed(&self) -> Vec<&'static str> {
+        self.arbiters.installed()
     }
 
     pub fn embed_model_id(&self) -> &str {
@@ -467,41 +485,6 @@ impl Analyzer {
         Ok(outcome)
     }
 
-    /// The English-only decoder, loaded on demand and kept.
-    ///
-    /// It is not part of the default model set any more (DESIGN §4 — the
-    /// multilingual export beats it at English too), so the honest answer here
-    /// is often "not installed", and that is said once rather than per segment.
-    fn english(&mut self) -> Option<&mut Asr> {
-        if self.en_asr.is_none() && !self.en_unavailable {
-            if !self.models.has_asr_export(&FALLBACK_ASR) {
-                self.en_unavailable = true;
-                warn!(
-                    "a transcript disagrees with its speaker's declared language, but the \
-                     English-only export is not installed under {} — nothing to re-decode with. \
-                     `recalld models fetch --fallback-asr` installs it ({}).",
-                    self.models.root.display(),
-                    FALLBACK_ASR.note
-                );
-            } else {
-                match Asr::load(&self.models.with_asr(&FALLBACK_ASR)) {
-                    Ok(asr) => {
-                        info!(
-                            model = asr.model_id(),
-                            "loaded the English-only decoder for wrong-language correction"
-                        );
-                        self.en_asr = Some(asr);
-                    }
-                    Err(e) => {
-                        self.en_unavailable = true;
-                        warn!("could not load the English-only decoder: {e:#}");
-                    }
-                }
-            }
-        }
-        self.en_asr.as_mut()
-    }
-
     /// Act on a transcript that disagrees with its speaker's declared language.
     ///
     /// This is the correction the 0.6.1 measurement asks for. `spike/lang_flip.py`
@@ -516,21 +499,25 @@ impl Analyzer {
     /// bilingual voice speaking German is not a mistake, and neither is a voice
     /// nobody has said anything about (the default).
     ///
-    /// The two directions are not symmetric, and pretending otherwise would be
-    /// the bug here:
+    /// The two directions used to be asymmetric, because the catalogue was:
     ///
     /// * **English speaker, German-looking transcript** → decode the audio
     ///   again with the English-only export, whose language is a hard property
-    ///   of the model rather than a hint. The result replaces the text *only*
-    ///   if it is non-empty and reads as English; `asr_model_id` moves with it,
-    ///   because the row must say which model produced the words it holds.
-    /// * **German speaker, English-looking transcript** → there is no German
-    ///   constrained decoder in the catalogue, so there is nothing to re-decode
-    ///   *with*. The words are kept (they are the only record of what was said)
-    ///   and the row is marked; `lang` goes to NULL, because the classifier and
-    ///   the declaration cannot both be right and this daemon cannot tell which
-    ///   is wrong. Identity is untouched: the label came from the voice, and a
-    ///   voice does not become less recognisable by switching language.
+    ///   of the model rather than a hint.
+    /// * **German speaker, English-looking transcript** → nothing to re-decode
+    ///   *with*. Flag only.
+    ///
+    /// 0.7.7 closes that gap: `crate::arbiter` adds Whisper forced to German,
+    /// so both directions now go through the same [`Arbiters::arbitrate`] with
+    /// the same measured guards, and the second bullet is only reached when the
+    /// optional arbiter is not installed. What has *not* changed is what the
+    /// failure looks like: the words are kept (they are the only record of what
+    /// was said) and the row is marked, with `lang` NULL, because the
+    /// classifier and the declaration cannot both be right and this daemon
+    /// cannot tell which is wrong.
+    ///
+    /// Identity is untouched either way: the label came from the voice, and a
+    /// voice does not become less recognisable by switching language.
     pub fn correct_language(
         &mut self,
         store: &Store,
@@ -555,47 +542,74 @@ impl Analyzer {
         if got == want {
             return Ok(None);
         }
-
-        if want == "en" {
-            // Already decoding under the English constraint: the text is what
-            // this model says, and running it twice would say it again.
-            let already_english = self.asr.lang() == Some("en");
-            if !already_english && let Some(asr) = self.english() {
-                let model_id = asr.model_id().to_string();
-                let raw = asr.transcribe(samples);
-                let redecoded = lang::classify(&raw);
-                if redecoded == Lang::En && !normalise_words(&raw).is_empty() {
-                    store.set_segment_text_from_redecode(segment_id, &raw, "en", &model_id)?;
-                    info!(
-                        segment_id,
-                        speaker = speaker_id,
-                        model = %model_id,
-                        "re-decoded a transcript that read as German for an English-only voice"
-                    );
-                    return Ok(Some(LanguageFix::Redecoded {
-                        text: raw,
-                        asr_model_id: model_id,
-                    }));
-                }
-                debug!(
-                    segment_id,
-                    speaker = speaker_id,
-                    reads_as = redecoded.as_str(),
-                    "the English re-decode did not come back as English; keeping the original"
-                );
+        let target = match want {
+            "de" => Lang::De,
+            _ => Lang::En,
+        };
+        // Already decoding under that exact constraint: the text is what this
+        // model says, and running it twice would say it again.
+        let already_constrained = self.asr.lang() == Some(want);
+        let outcome = if already_constrained {
+            Arbitration::Rejected {
+                read_as: got,
+                words: 0,
             }
+        } else {
+            self.arbiters.arbitrate(target, samples, &self.lang_cfg)
+        };
+
+        if let Arbitration::Replaced { text, model_id } = outcome {
+            store.set_segment_text_from_redecode(segment_id, &text, want, &model_id)?;
+            info!(
+                segment_id,
+                speaker = speaker_id,
+                model = %model_id,
+                read_as = got,
+                "re-decoded a transcript that disagreed with the voice's declared language"
+            );
+            return Ok(Some(LanguageFix::Redecoded {
+                text,
+                asr_model_id: model_id,
+                lang: want.to_string(),
+            }));
         }
 
-        // Unresolvable in either direction: mark it and keep the words.
+        // Unsettled in either direction: mark it and keep the words.
         store.mark_segment_language_mismatch(segment_id)?;
         debug!(
             segment_id,
             speaker = speaker_id,
             declared = want,
             reads_as = got,
+            outcome = ?outcome,
             "transcript disagrees with the speaker's declared language; marked, not changed"
         );
         Ok(Some(LanguageFix::Marked { read_as: got }))
+    }
+
+    /// The conversational language prior (0.7.7, `crate::langctx`).
+    ///
+    /// Runs **after** threading, because the thread is the thing it reads —
+    /// which is also why it is not part of `after_commit`: at that point the
+    /// turn has a speaker but no conversation yet.
+    ///
+    /// Best-effort like every other correction here. A failure is logged by the
+    /// caller and the row stands as committed.
+    pub fn apply_language_context(
+        &mut self,
+        store: &Store,
+        segment_id: i64,
+        samples: &[f32],
+    ) -> Result<Option<ContextFix>> {
+        let (intent, _context) = langctx::intent_for(store, &self.lang_cfg, segment_id)?;
+        match intent {
+            Intent::Nothing => Ok(None),
+            Intent::Inherit(lang) => langctx::commit_inheritance(store, segment_id, lang),
+            Intent::Arbitrate { want, read_as } => {
+                let outcome = self.arbiters.arbitrate(want, samples, &self.lang_cfg);
+                langctx::commit_arbitration(store, segment_id, want, read_as, outcome)
+            }
+        }
     }
 
     fn enroll(
@@ -704,14 +718,58 @@ pub struct AnalysisStats {
     pub too_slight: std::sync::atomic::AtomicU64,
     /// Turns that took their name from the turns around them.
     pub proximity_labelled: std::sync::atomic::AtomicU64,
-    /// Transcripts re-decoded under a language constraint.
+    /// Transcripts re-decoded under a language constraint, either direction.
     pub redecoded: std::sync::atomic::AtomicU64,
     /// Transcripts that disagree with their speaker's declared language and
     /// could not be corrected.
     pub lang_mismatch: std::sync::atomic::AtomicU64,
+
+    // ---- the conversational language prior (0.7.7) -----------------------
+    /// Turns nothing could be read out of that took their conversation's
+    /// language instead (`lang_via = "context"`). Text unchanged.
+    pub context_stamped: std::sync::atomic::AtomicU64,
+    /// Turns that read as the opposite of a strong thread context and were
+    /// therefore handed to an arbiter — whatever the arbiter then said.
+    pub flips_suspected: std::sync::atomic::AtomicU64,
+    /// The two directions of a successful re-decode, split out because they run
+    /// on different models with different measured behaviour: `de` is Whisper
+    /// forced to German, `en` is the Parakeet 110m.
+    pub redecoded_de: std::sync::atomic::AtomicU64,
+    pub redecoded_en: std::sync::atomic::AtomicU64,
+    /// Rows `recalld lang repair` rewrote out of the mismatch backlog.
+    pub repairs: std::sync::atomic::AtomicU64,
 }
 
 impl AnalysisStats {
+    /// Count what the language prior did to one row (0.7.7). Called from the
+    /// pipeline, after threading — `record` cannot do it, because the prior
+    /// runs later than the outcome it would have to hang off.
+    pub fn record_context(&self, fix: Option<&crate::langctx::ContextFix>) {
+        use crate::langctx::ContextFix;
+        match fix {
+            Some(ContextFix::Inherited { .. }) => {
+                self.context_stamped.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(ContextFix::Redecoded { lang, .. }) => {
+                self.flips_suspected.fetch_add(1, Ordering::Relaxed);
+                self.redecoded.fetch_add(1, Ordering::Relaxed);
+                self.count_direction(lang);
+            }
+            Some(ContextFix::Marked { .. }) => {
+                self.flips_suspected.fetch_add(1, Ordering::Relaxed);
+                self.lang_mismatch.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
+        }
+    }
+
+    fn count_direction(&self, lang: &str) {
+        match lang {
+            "de" => self.redecoded_de.fetch_add(1, Ordering::Relaxed),
+            _ => self.redecoded_en.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
     pub fn record(&self, outcome: &Outcome) {
         self.analysed.fetch_add(1, Ordering::Relaxed);
         match &outcome.decision {
@@ -737,8 +795,9 @@ impl AnalysisStats {
             _ => {}
         }
         match &outcome.language_fix {
-            Some(LanguageFix::Redecoded { .. }) => {
+            Some(LanguageFix::Redecoded { lang, .. }) => {
                 self.redecoded.fetch_add(1, Ordering::Relaxed);
+                self.count_direction(lang);
             }
             Some(LanguageFix::Marked { .. }) => {
                 self.lang_mismatch.fetch_add(1, Ordering::Relaxed);

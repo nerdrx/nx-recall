@@ -308,10 +308,11 @@ only *what*.
   transcripts checked against the text classifier. `en` + a German-looking
   transcript → the segment is decoded again with the English-only export, whose
   language is a property of the model rather than a hint; the new text replaces
-  the old **only** if it is non-empty and reads as English, and `asr_model_id`
-  moves with it. `de` + an English-looking transcript → there is no
-  German-constrained decoder to re-run it with, so the words are kept and the
-  row is marked. Either way the *speaker* is untouched: a voice does not become
+  the old **only** if it clears the guards below, and `asr_model_id` moves with
+  it. `de` + an English-looking transcript → up to 0.7.6 there was no
+  German-constrained decoder to re-run it with, so the words were kept and the
+  row was marked; since 0.7.7 the optional `--arbiter-de` model makes this
+  direction work exactly like the other one. Either way the *speaker* is untouched: a voice does not become
   less recognisable by having been decoded in the wrong language.
 
   The declaration is load-bearing and a wrong one costs transcript quality: if
@@ -323,7 +324,8 @@ only *what*.
 - **Segment rows carry `lang` and `label_via`.** `lang` is the transcript's
   language when one is known — from the model when the model only speaks one,
   otherwise from the text classifier — and `null` when nobody could tell, which
-  is a real answer. `label_via` is how the *speaker* got there:
+  is a real answer. (Since 0.7.7 they also carry `lang_via`, which says *which*
+  of those it was; see below.) `label_via` is how the *speaker* got there:
   `"match"` (the voicebank), `"mic"` (provenance, never a comparison),
   `"manual"` (a person said so), or `"proximity"`. **A client must render
   `proximity` as uncertain**: that label was inherited from the confident turns
@@ -352,7 +354,8 @@ only *what*.
   render it as such; zeroes would be a claim about an empty disk.
 
 - **`status.counters`** gains `too_slight` (turns that matched nobody and were
-  under the mint bar), `proximity_labelled`, `redecoded` and `lang_mismatch`; and,
+  under the mint bar), `proximity_labelled`, `redecoded` and `lang_mismatch`
+  (0.7.7 adds five more — see the language prior below); and,
   in 0.7.5, `gaps_discarded` — turns thrown away because the audio under them had
   a hole in it. `drops` says buffers were lost; this says a *turn* was, which is
   the number that tells a user whether the queue is big enough. A gap is never
@@ -673,6 +676,88 @@ delete brings both back.
   mean "wipe the transcript".
 - `search` returns `total` = all matches (pre-LIMIT); hits are the newest first.
 - A limited unanchored `transcript` returns the NEWEST `limit` rows, ascending.
+
+### The conversational language prior (0.7.7)
+
+A conversation has a language, and that is usable evidence about turns the
+decoder got wrong. Two additive changes on the wire and one new method.
+
+- **Segment rows carry `lang_via`** alongside the `lang` they have carried since
+  schema 5. It says how the *language* got there, and it is the words'
+  provenance the way `label_via` is the speaker's:
+
+  | value | meaning | did the text change? |
+  |---|---|---|
+  | `"model"` | the ASR export only speaks one language | no |
+  | `"classified"` | the text classifier read the words | no |
+  | `"context"` | the classifier could not tell, so the row took the language the rest of its **thread** was speaking | no |
+  | `"re-decode"` | an arbiter re-read the audio under a hard language constraint and its words won | **yes** |
+  | `"mismatch"` | the language is in dispute and nothing could settle it; `lang` is `null` | no |
+  | `null` | no words, so no language | no |
+
+  A client needs to act on exactly two of them. `"re-decode"` means the words on
+  screen came from a *different model* than every other row — `asr_model_id`
+  says which — and a client that shows provenance for a name should show it for
+  the words. `"mismatch"` means the daemon is openly unsure, which is why `lang`
+  is null rather than a guess. `"context"` needs no UI: it is a language, from
+  a weaker source, over unchanged text.
+
+  **The context**, precisely: the majority language over a thread's last
+  `[lang].context_window` (10) clear stamps, requiring at least
+  `context_min_clear` (3) of them and at least `context_min_agree` (0.7)
+  agreement. Below that bar the conversation has no language and nothing
+  happens — which is the right answer for a greeting and for a genuinely
+  bilingual room. Stamps that were themselves inherited never count as evidence:
+  a context that fed on its own inferences would confirm itself.
+
+  **Priority.** An explicit single-language `speakers.set_languages` declaration
+  beats the context, always, and that path behaves exactly as it did in 0.6.1.
+  The context applies to untagged voices, bilingual ones, and turns nobody could
+  put a voice to at all — a decoder flip is a property of the audio, not of
+  whether the voicebank recognised the speaker.
+
+  **What is not symmetric any more.** Up to 0.7.6 a German-looking transcript
+  from an English-only voice was re-decoded and an English-looking one from a
+  German-only voice could only be flagged, because the catalogue had no German
+  decoder. `models fetch --arbiter-de` adds one (Whisper base with its language
+  token forced), so both directions now re-decode. That makes the hazard
+  symmetric too: a wrong declaration now produces confident nonsense in either
+  direction. It is reversible (widen the languages, or `lang repair` once the
+  declaration is right), and it is why the default is `any`.
+
+  **When a re-decode may replace text**, all of it measured
+  (`spike/arbiter_de.py`): the segment is at least
+  `[lang].arbiter_min_duration_s` (1.5 s) long — below that the arbiter's own
+  word precision is 28% against 54% at 1.5 s, and replacing one wrong transcript
+  with a differently wrong one is not a correction; the arbiter's output
+  survives caption-stripping (Whisper narrates non-speech: `(soft music)`,
+  `[Applause]`), has at least `arbiter_min_words` (2) words, and reads as the
+  language it was asked for. Anything less flags the row and keeps the words.
+
+- **`lang.repair {limit?}`** → the backlog walk, bounded and synchronous:
+
+  ```json
+  {"arbiters": ["en", "de"], "scanned": 100, "repaired": 41,
+   "repaired_de": 39, "repaired_en": 2, "settled": 3, "kept": 12,
+   "too_short": 28, "unavailable": 0, "undecidable": 16, "no_audio": 0,
+   "flagged": 214, "repairable": 198}
+  ```
+
+  Every count is a row and they partition `scanned`; `flagged` and `repairable`
+  are the backlog *after* the run, so a client can loop until `flagged` stops
+  falling. `settled` is a row whose disagreement had simply gone away — the
+  declaration changed since it was marked — and whose classifier reading was
+  restored. `limit` defaults to 100 and is clamped to 500: a whole backlog
+  belongs to `recalld lang repair`, which runs in its own process at idle
+  priority and can be interrupted. Every row whose stored words or language
+  moved is announced as an ordinary **`segment`** event, so an open transcript
+  updates without re-querying. With no arbiter installed the method answers
+  honestly — `scanned: 0` and a `note` naming the fetch — rather than clearing
+  marks it cannot justify.
+
+- **`status.counters`** gains `context_stamped`, `flips_suspected`,
+  `redecoded_de`, `redecoded_en` and `repairs`, beside the existing `redecoded`
+  (their sum across both directions) and `lang_mismatch`.
 
 ## Paging the transcript
 

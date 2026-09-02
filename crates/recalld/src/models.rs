@@ -71,6 +71,10 @@ pub enum Group {
     /// Semantic search's sentence-embedding model (DESIGN §6). Optional:
     /// keyword search works without it.
     Semantic,
+    /// The German flip arbiter (0.7.7): Whisper base, forced to German. There
+    /// is no German-only transducer to re-decode with, and Whisper's language
+    /// token is the one honest way to force the constraint.
+    ArbiterDe,
 }
 
 impl Group {
@@ -90,6 +94,10 @@ impl Group {
             Group::Semantic => {
                 "optional — the embedding model behind semantic search; keyword \
                  search works without it"
+            }
+            Group::ArbiterDe => {
+                "optional — the German flip arbiter; without it a German-looking \
+                 flip is flagged rather than re-read"
             }
         }
     }
@@ -133,6 +141,11 @@ pub const SEMANTIC_TOKENIZER_ROLE: &str = "semantic.tokens";
 
 /// The directory the semantic model installs into, under the models root.
 pub const SEMANTIC_DIR: &str = "multilingual-e5-small-int8";
+
+/// `RemoteAsset::role` for the German flip arbiter (0.7.7), for the same reason
+/// the semantic roles are named: `models fetch --arbiter-de` and `models status`
+/// both have to pick it out of the catalogue.
+pub const ARBITER_DE_ROLE: &str = "arbiter.de";
 
 /// The default model set of DESIGN §4, as published by the sherpa-onnx project.
 ///
@@ -252,6 +265,40 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
                 "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8/tokens.txt",
                 9_953,
             ),
+        ],
+    },
+    // The German flip arbiter (0.7.7). OPTIONAL, and the flag is
+    // `models fetch --arbiter-de`.
+    //
+    // Its job is not to beat the multilingual export at German — it is to beat
+    // that export's *flips*, which are 103%-WER garbage. Measured
+    // (spike/arbiter_de.py, the same fragment protocol that found the flips):
+    // Whisper base forced to `language=de` flips German fragments to English
+    // 2-3% of the time against v3's 12% at 1 s, comes back empty ~0% of the
+    // time at 1.5 s and above, and its words are in the reference 54% of the
+    // time at 1.5 s and 66% at 3 s. That is a poor transcript and a strict
+    // improvement on the nonsense it replaces — which is why the replacement is
+    // gated at 1.5 s (`crate::arbiter`) and flag-only below it, where precision
+    // falls to 28%.
+    //
+    // int8, and only the two files the decoder opens plus the token table: the
+    // tarball also carries fp32 exports and test WAVs this daemon never reads.
+    RemoteAsset {
+        role: ARBITER_DE_ROLE,
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.tar.bz2",
+        download_bytes: 207_557_382,
+        install: Install::TarBz2,
+        group: Group::ArbiterDe,
+        files: &[
+            (
+                "sherpa-onnx-whisper-base/base-encoder.int8.onnx",
+                29_120_534,
+            ),
+            (
+                "sherpa-onnx-whisper-base/base-decoder.int8.onnx",
+                130_672_026,
+            ),
+            ("sherpa-onnx-whisper-base/base-tokens.txt", 816_730),
         ],
     },
     // ---- the memory graph's Tier 3 (GRAPH.md) -----------------------------
@@ -403,6 +450,126 @@ pub const FALLBACK_ASR: AsrExport = AsrExport {
 
 /// In preference order: the first export whose files are all on disk wins.
 pub const ASR_EXPORTS: &[AsrExport] = &[DEFAULT_ASR, FALLBACK_ASR];
+
+/// A Whisper export used as a **flip arbiter** (0.7.7): three files, and a
+/// language that is forced on the decoder rather than read off the audio.
+///
+/// Deliberately not an [`AsrExport`]: Whisper has no joiner, its language is a
+/// decoding *parameter* rather than a property of the weights, and it is never
+/// the primary transcriber. Step 0 measured it at 4x the WER of Parakeet and
+/// with a caption-style hallucination habit Parakeet does not have — which is
+/// exactly why it is only ever asked a yes/no question about a fragment
+/// somebody else already got wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WhisperExport {
+    pub dir: &'static str,
+    pub encoder: &'static str,
+    pub decoder: &'static str,
+    pub tokens: &'static str,
+    /// The language token forced on every decode. Part of the model id, so a
+    /// row re-read in German never claims to have been written by the same
+    /// decoder as one re-read in English.
+    pub lang: &'static str,
+    pub note: &'static str,
+}
+
+impl WhisperExport {
+    /// Stable identity of the words this arbiter produces, stored on the rows
+    /// it rewrites. The forced language is in it because it is part of the
+    /// decoding contract, not an observation.
+    pub fn model_id(&self) -> String {
+        format!("{}-{}@{ASR_CONTRACT_VERSION}", self.dir, self.lang)
+    }
+}
+
+/// The German arbiter: Whisper base int8, forced to German. Optional, and the
+/// only decoder in the catalogue that can produce German on demand.
+pub const ARBITER_DE: WhisperExport = WhisperExport {
+    dir: "sherpa-onnx-whisper-base",
+    encoder: "base-encoder.int8.onnx",
+    decoder: "base-decoder.int8.onnx",
+    tokens: "base-tokens.txt",
+    lang: "de",
+    note: "Whisper base forced to German — 2-3% flips, 54-66% word precision at 1.5-3 s",
+};
+
+/// Where the German arbiter lives under a models root, and whether it is there.
+///
+/// Kept apart from [`ModelSet`] for the same reason [`SemanticModel`] is: its
+/// absence is a normal state. Without it a suspected German flip is *flagged*
+/// rather than re-read, which is exactly what 0.6.1 already did.
+#[derive(Debug, Clone)]
+pub struct ArbiterModel {
+    pub root: PathBuf,
+    pub export: WhisperExport,
+    pub encoder: PathBuf,
+    pub decoder: PathBuf,
+    pub tokens: PathBuf,
+}
+
+impl ArbiterModel {
+    pub fn resolve_at(root: PathBuf, export: WhisperExport) -> Self {
+        let dir = root.join(export.dir);
+        Self {
+            encoder: dir.join(export.encoder),
+            decoder: dir.join(export.decoder),
+            tokens: dir.join(export.tokens),
+            export,
+            root,
+        }
+    }
+
+    pub fn entries(&self) -> Vec<ModelEntry> {
+        [
+            ("arbiter.encoder", &self.encoder),
+            ("arbiter.decoder", &self.decoder),
+            ("arbiter.tokens", &self.tokens),
+        ]
+        .into_iter()
+        .map(|(role, path)| ModelEntry {
+            role,
+            path: path.clone(),
+            expected: path
+                .strip_prefix(&self.root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .as_deref()
+                .and_then(expected_bytes),
+        })
+        .collect()
+    }
+
+    /// All three files at exactly the catalogued size. A truncated download is
+    /// *absent*, not broken — the same rule every other model here follows.
+    pub fn present(&self) -> bool {
+        self.entries().iter().all(|e| e.ok())
+    }
+
+    pub fn model_id(&self) -> String {
+        self.export.model_id()
+    }
+
+    /// What every "it is not installed" line says, so the CLI, the daemon's
+    /// warning and `models status` all name the same command.
+    pub fn how_to_get_it() -> String {
+        format!(
+            "the German arbiter is not installed. `recalld models fetch --arbiter-de` \
+             installs {} ({}), and until then a German-looking flip is flagged rather \
+             than re-read.",
+            ARBITER_DE.dir,
+            crate::fetch::human(arbiter_download_bytes()),
+        )
+    }
+}
+
+/// Bytes `models fetch --arbiter-de` has to pull down.
+pub fn arbiter_download_bytes() -> u64 {
+    REMOTE_ASSETS
+        .iter()
+        .filter(|a| a.group == Group::ArbiterDe)
+        .map(|a| a.download_bytes)
+        .sum()
+}
 
 /// Which ASR export the daemon will actually run, once the disk has been
 /// consulted. Returned by [`ModelSet::select_asr`].
@@ -678,6 +845,13 @@ impl ModelSet {
     /// Is every file of `export` on disk at exactly its catalogued size?
     pub fn has_asr_export(&self, export: &AsrExport) -> bool {
         self.asr_export_ok(export)
+    }
+
+    /// The flip arbiter under this set's root (0.7.7). Resolving it here rather
+    /// than from the config is what keeps the arbiter, the primary ASR and the
+    /// English fallback all coming out of one directory.
+    pub fn arbiter(&self, export: WhisperExport) -> ArbiterModel {
+        ArbiterModel::resolve_at(self.root.clone(), export)
     }
 
     /// Is every file of `export` on disk at exactly its catalogued size?

@@ -275,6 +275,7 @@ function buildFiller(base) {
         overlap_frac: 0.02,
         match_score: 0.6 + ((i % 30) / 100),
         label_via: 'match',
+        lang_via: 'classified',
         lang: speaker === 1 ? 'de' : 'en',
         // Blocks of five, as above, but numbered BELOW the canned threads so
         // "recent conversations" still means the canned ones.
@@ -318,6 +319,9 @@ function buildHistory() {
       // changes what a client renders is "proximity" (below).
       label_via: speaker == null ? null : mine ? 'mic' : 'match',
       lang: speaker === 1 ? 'de' : 'en',
+      // 0.7.7: how the LANGUAGE got there. "classified" is the ordinary
+      // answer; the two below are the ones the transcript says something about.
+      lang_via: 'classified',
       // schema v6: which conversation this turn is part of.
       thread: threadFor(i),
     });
@@ -341,6 +345,7 @@ function buildHistory() {
     match_score: null,
     label_via: 'proximity',
     lang: null,
+    lang_via: null,
     thread: threadFor(26),
   });
   out.push({
@@ -357,8 +362,10 @@ function buildHistory() {
     match_score: 0.38,
     label_via: 'match',
     lang: null,
+    lang_via: null,
     thread: threadFor(27),
   });
+
 
   // schema v7, the memory graph's Tiers 2 and 3: three turns that are actually
   // promises, so the Memory view has something real to point at. Appended
@@ -379,8 +386,50 @@ function buildHistory() {
       match_score: 0.66,
       label_via: 'match',
       lang: p.lang,
+      lang_via: 'classified',
       thread: threadFor(28 + i),
     });
+  });
+  // 0.7.7, the conversational language prior. Two rows, because they are the
+  // two states a person can see and they read differently:
+  out.push({
+    // A German turn the multilingual model decoded as English, caught by the
+    // conversation around it and re-read by the German arbiter. The words on
+    // screen came from a different model than every other row here, and the
+    // "?" says so.
+    id: 1110,
+    session: SESSIONS[2].id,
+    source: 'VRChat.exe',
+    speaker: 1,
+    text: 'ich glaube das ist der einzige Weg',
+    t_ms: base2 + 5 * 47_000,
+    t_ns: String(base2 + 5 * 47_000) + '000000',
+    dur_ms: 2400,
+    overlap_frac: 0.02,
+    match_score: 0.31,
+    label_via: 'match',
+    lang: 'de',
+    lang_via: 're-decode',
+    thread: threadFor(31),
+  });
+  out.push({
+    // A suspected flip nothing could settle: too short to re-read. The words
+    // stand and the language is in doubt, which is what `lang: null` with a
+    // "mismatch" provenance means.
+    id: 1111,
+    session: SESSIONS[2].id,
+    source: 'VRChat.exe',
+    speaker: 2,
+    text: 'and then it just works',
+    t_ms: base2 + 6 * 47_000,
+    t_ns: String(base2 + 6 * 47_000) + '000000',
+    dur_ms: 1100,
+    overlap_frac: 0.02,
+    match_score: 0.72,
+    label_via: 'match',
+    lang: null,
+    lang_via: 'mismatch',
+    thread: threadFor(31),
   });
   return out;
 }

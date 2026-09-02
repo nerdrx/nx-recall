@@ -34,7 +34,7 @@ use recalld::service::Service;
 use recalld::store::Store;
 
 use crate::cli::{
-    Cli, Command, GraphAction, MicAction, ModelsAction, SemanticAction, SpeakersAction,
+    Cli, Command, GraphAction, LangAction, MicAction, ModelsAction, SemanticAction, SpeakersAction,
 };
 
 fn main() -> Result<()> {
@@ -76,6 +76,7 @@ fn main() -> Result<()> {
                 force,
                 fallback_asr,
                 graph,
+                arbiter_de,
                 semantic,
                 no_config,
             } => cmd_models_fetch(
@@ -88,6 +89,7 @@ fn main() -> Result<()> {
                     fallback_asr,
                     graph,
                     semantic,
+                    arbiter_de,
                     single_stream: false,
                 },
                 no_config,
@@ -104,6 +106,16 @@ fn main() -> Result<()> {
         Command::Languages { speaker_id, codes } => {
             cmd_languages(&cfg, &data_dir, speaker_id, &codes)
         }
+        // The conversational language prior (0.7.7). Like the semantic
+        // backfill, the repair runs in THIS process: it is a long batch job
+        // that has to be niceable and Ctrl-C-able, and it loads a model the
+        // daemon may not have resident.
+        Command::Lang { action } => match action.unwrap_or(LangAction::Status) {
+            LangAction::Status => cmd_lang_status(&cfg, &data_dir, None),
+            LangAction::Repair { batch, limit, dir } => {
+                cmd_lang_repair(&cfg, &data_dir, dir.as_deref(), batch, limit)
+            }
+        },
         Command::Name {
             speaker_id,
             display_name,
@@ -232,6 +244,8 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     // The socket's own identity work (`speakers.split`) must use the same
     // operating point the pipeline labelled with, not the defaults.
     .with_identity(cfg.identity.clone())
+    // …and `lang.repair` must use the same guards the pipeline re-decoded with.
+    .with_lang(cfg.lang.clone())
     .with_mic(cfg.mic.clone())
     // The memory graph's Tier 3 switch is live, like the microphone's.
     .with_graph(cfg.graph.clone(), models_root.clone());
@@ -434,7 +448,13 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         too_slight = analysis_stats.too_slight.load(Ordering::Relaxed),
         proximity = analysis_stats.proximity_labelled.load(Ordering::Relaxed),
         redecoded = analysis_stats.redecoded.load(Ordering::Relaxed),
+        redecoded_de = analysis_stats.redecoded_de.load(Ordering::Relaxed),
+        redecoded_en = analysis_stats.redecoded_en.load(Ordering::Relaxed),
         lang_mismatch = analysis_stats.lang_mismatch.load(Ordering::Relaxed),
+        // The conversational language prior (0.7.7).
+        context_stamped = analysis_stats.context_stamped.load(Ordering::Relaxed),
+        flips_suspected = analysis_stats.flips_suspected.load(Ordering::Relaxed),
+        repairs = analysis_stats.repairs.load(Ordering::Relaxed),
         dropped_buffers = queue.dropped_chunks(),
         dropped_seconds = queue.dropped_samples() as f32 / SAMPLE_RATE as f32,
         gaps_discarded = stats.gaps_discarded.load(Ordering::Relaxed),
@@ -709,6 +729,26 @@ fn cmd_models_status(
         println!("  {}", models::SemanticModel::how_to_get_it());
     }
 
+    // The flip arbiter (0.7.7), listed the same way and for the same reason:
+    // absent is a normal, correct state — the daemon then flags a suspected
+    // flip instead of re-reading it.
+    let arbiter = models::ArbiterModel::resolve_at(models.root.clone(), models::ARBITER_DE);
+    println!();
+    if arbiter.present() {
+        println!("german arbiter:     on   ({})", arbiter.model_id());
+        for e in arbiter.entries() {
+            println!(
+                "  {:<14}  {:>10}  {}",
+                e.role,
+                e.bytes().map(fetch::human).unwrap_or_else(|| "-".into()),
+                e.path.display()
+            );
+        }
+    } else {
+        println!("german arbiter:     off  (optional)");
+        println!("  {}", models::ArbiterModel::how_to_get_it());
+    }
+
     if selection == AsrSelection::Fallback {
         // The set is complete and analysis will run — but on the English-only
         // model, which is a 103% WER answer to a German lobby. Say so before
@@ -893,9 +933,10 @@ fn cmd_languages(cfg: &Config, data_dir: &Path, speaker_id: i64, codes: &str) ->
                 );
             } else if names.len() == 1 {
                 println!(
-                    "A transcript from this voice that reads as English will be flagged.\n\
-                     There is no German-constrained decoder in the catalogue to re-run it with,\n\
-                     so the words are kept as they are and the row is marked."
+                    "A transcript from this voice that reads as English will be decoded again\n\
+                     with the German arbiter — Whisper, with its language token forced to\n\
+                     German. Without it installed (`recalld models fetch --arbiter-de`) the\n\
+                     words are kept as they are and the row is flagged instead."
                 );
             } else {
                 println!("Two languages: nothing is corrected — either one is expected.");
@@ -903,6 +944,152 @@ fn cmd_languages(cfg: &Config, data_dir: &Path, speaker_id: i64, codes: &str) ->
         }
         _ => println!("Speaker {speaker_id} speaks any language; nothing will be corrected."),
     }
+    Ok(())
+}
+
+/// `recalld lang` — what the language prior has flagged, and what could settle
+/// it. Reads the database directly: it says nothing about a running daemon and
+/// has to work on a machine where none is running.
+fn cmd_lang_status(cfg: &Config, data_dir: &Path, dir: Option<&Path>) -> Result<()> {
+    let store = Store::open(data_dir)?;
+    let (flagged, with_audio) = store.language_mismatch_counts()?;
+    let root = fetch::target_dir(dir, &cfg.models, data_dir);
+    let models = ModelSet::resolve_at(root, &cfg.models);
+    let arbiters = recalld::arbiter::Arbiters::new(&models);
+    let installed = arbiters.installed();
+
+    println!(
+        "{:<20}{} of the last {} clear turn(s) in a conversation, {:.0}% agreeing",
+        "context",
+        cfg.lang.context_min_clear,
+        cfg.lang.context_window,
+        cfg.lang.context_min_agree * 100.0
+    );
+    println!(
+        "{:<20}{:.1} s and {} word(s) minimum to replace a transcript",
+        "replacement bar", cfg.lang.arbiter_min_duration_s, cfg.lang.arbiter_min_words
+    );
+    println!(
+        "{:<20}{}",
+        "arbiters",
+        if installed.is_empty() {
+            "none installed — a suspected flip can only be flagged".to_string()
+        } else {
+            installed.join(", ")
+        }
+    );
+    if !installed.contains(&"de") {
+        println!("  {}", models::ArbiterModel::how_to_get_it());
+    }
+    if !installed.contains(&"en") {
+        println!(
+            "  the English arbiter is not installed. \
+             `recalld models fetch --fallback-asr` installs {} ({}).",
+            models::FALLBACK_ASR.dir,
+            models::FALLBACK_ASR.note
+        );
+    }
+    println!("{:<20}{flagged}", "flagged");
+    if flagged == 0 {
+        println!("nothing to repair.");
+        return Ok(());
+    }
+    println!(
+        "{:<20}{with_audio} still have their audio; {} do not and can never be settled",
+        "  repairable",
+        flagged - with_audio
+    );
+    if !installed.is_empty() {
+        println!("`recalld lang repair` re-reads them.");
+    }
+    Ok(())
+}
+
+/// `recalld lang repair` — the retroactive half of 0.7.7.
+fn cmd_lang_repair(
+    cfg: &Config,
+    data_dir: &Path,
+    dir: Option<&Path>,
+    batch: usize,
+    limit: Option<usize>,
+) -> Result<()> {
+    let root = fetch::target_dir(dir, &cfg.models, data_dir);
+    let models = ModelSet::resolve_at(root, &cfg.models);
+    let mut arbiters = recalld::arbiter::Arbiters::new(&models);
+    if arbiters.installed().is_empty() {
+        println!("no arbiter is installed, so nothing can be re-read.");
+        println!("  {}", models::ArbiterModel::how_to_get_it());
+        return Ok(());
+    }
+
+    // Idle priority, no CPU pinning — the same rule the semantic backfill
+    // follows: a batch job competing with a live capture never wins a timeslice
+    // from a frame.
+    pipeline::deprioritise_current_thread(19, &[]);
+
+    let store = Store::open(data_dir)?;
+    let (before, with_audio) = store.language_mismatch_counts()?;
+    println!("{before} flagged transcript(s), {with_audio} with audio to re-read");
+    if with_audio == 0 {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let report = recalld::langctx::repair(
+        &store,
+        data_dir,
+        &mut arbiters,
+        &cfg.lang,
+        batch,
+        limit,
+        |r| {
+            eprint!(
+                "\r  {} scanned, {} repaired, {} settled\x1b[K",
+                r.scanned, r.repaired, r.settled
+            );
+        },
+    )?;
+    eprintln!();
+
+    let (after, _) = store.language_mismatch_counts()?;
+    println!(
+        "scanned {} in {:.1}s: {} repaired ({} de, {} en), {} settled",
+        report.scanned,
+        started.elapsed().as_secs_f64(),
+        report.repaired,
+        report.repaired_de,
+        report.repaired_en,
+        report.settled,
+    );
+    // Everything that stayed flagged, and why — the reasons are actionable and
+    // a bare "12 left" is not.
+    for (n, line) in [
+        (report.kept, "the arbiter's own answer failed a guard"),
+        (
+            report.too_short,
+            "under the replacement bar; flagged, never replaced",
+        ),
+        (
+            report.unavailable,
+            "no arbiter installed for that language — fetch it and run again",
+        ),
+        (
+            report.undecidable,
+            "nothing says which language to expect: no declaration, no conversation context",
+        ),
+        (report.no_audio, "the audio is gone"),
+    ] {
+        if n > 0 {
+            println!("  {n:>6}  {line}");
+        }
+    }
+    println!(
+        "{after} still flagged{}",
+        if report.scanned > 0 && after > 0 && limit.is_some() {
+            " — run it again to continue"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 
@@ -1400,6 +1587,21 @@ fn cmd_status(cfg: &Config, data_dir: &Path) -> Result<()> {
         s["counters"]["analysed"].as_i64().unwrap_or(0),
         s["counters"]["labelled"].as_i64().unwrap_or(0),
         s["counters"]["refused_overlap"].as_i64().unwrap_or(0),
+    );
+    // The language prior (0.7.7), on its own line because it is four numbers
+    // about one thing and folding them into `counters` would bury the only one
+    // that asks for an action — `flagged`, which `recalld lang repair` clears.
+    let n = |key: &str| s["counters"][key].as_i64().unwrap_or(0);
+    println!(
+        "{:<18}{} stamped from context, {} suspected flip(s), {} re-decoded ({} de, {} en), \
+         {} flagged",
+        "language",
+        n("context_stamped"),
+        n("flips_suspected"),
+        n("redecoded"),
+        n("redecoded_de"),
+        n("redecoded_en"),
+        n("lang_mismatch"),
     );
     println!(
         "{:<18}{} connected, seq {}",

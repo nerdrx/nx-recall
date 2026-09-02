@@ -145,16 +145,33 @@ set). Measured selections:
 | ASR (non-EN) | evaluate parakeet-ja / parakeet-v3 **before** Whisper | — | Whisper base: 4× worse WER, hallucinates on all non-speech |
 | Memory graph (optional) | Qwen2.5-3B-Instruct Q4 GGUF, via llama.cpp | 1.9 GB | 9/9 trap rejections, 3.3 s/case on 4 pinned cores ([GRAPH.md](GRAPH.md)) |
 
-- The graph model is the **only optional** entry: `models fetch --graph`, off by
+- The graph model was the **first optional** entry: `models fetch --graph`, off by
   default in `[graph].enabled`, and `models status` lists it under its own
   heading so a machine that never asked for it is not reported as incomplete.
   It is also the only model this daemon does not link — it runs as a child
   `llama-cli`, which keeps a 3B model's failure modes out of the capture process
-  and costs the build no C++ toolchain.
+  and costs the build no C++ toolchain. The semantic embedder and the German
+  flip arbiter followed the same pattern.
+
+- **Whisper is back, as an arbiter and nothing else** (0.7.7, `models fetch
+  --arbiter-de`, and optional). The table above rejected it as a *transcriber*
+  and that stands — 4× the WER and a caption-hallucination habit Parakeet does
+  not have. But the multilingual export flips short German to English 12% of the
+  time at 1 s (§10) and what it produces then is 103%-WER garbage, so the bar an
+  arbiter has to clear is not "beat Parakeet" but "beat a flip". Measured
+  (`spike/arbiter_de.py`): Whisper base forced to `language=de` flips 2-3%, comes
+  back empty ~0% of the time at 1.5 s and above, and its words are in the
+  reference 54% of the time at 1.5 s and 66% at 3 s. It is asked *only* about a
+  fragment something else already got wrong, its answer may only replace text
+  above 1.5 s (28% precision at 1.0 s — below the floor the row is flagged
+  instead), and its output is caption-stripped before anything classifies it.
 
 - ~~Whisper hallucination filtering is mandatory~~ → **Parakeet emits zero ghost
-  words on silence/noise/music (measured); the filter is Whisper-scoped.** If
-  Whisper ships at all it needs `no_speech_prob` + bracket-caption stripping.
+  words on silence/noise/music (measured); the filter is Whisper-scoped.** Which
+  is exactly where it now lives: `arbiter::strip_captions` runs on every arbiter
+  answer and on nothing else. `(Musik)` classifies as perfectly good German, so
+  an unstripped arbiter would "confirm" a flip on a fragment containing no
+  speech at all.
 - Windowing: embed **contiguous detector-approved single-speaker audio**, as long as
   possible — not fixed short windows (10 s beat 3 s by 27 pp coverage when one
   talker dominates). ASR batches to ~30 s only if a Whisper-family model is in use.
@@ -217,10 +234,27 @@ prototypes capped ~20/speaker, diverse. Unchanged in shape; recalibrated in numb
   a voice pinned to exactly one language gets its transcripts checked against a
   text classifier, and an English-only voice's German-looking transcript is
   decoded again with the English-only export — whose language is a property of
-  the model, not a hint. The other direction is only flagged, because the
-  catalogue holds no German-constrained decoder. The asymmetry is the honest
-  shape of the model set, not an oversight, and the declaration is load-bearing:
-  a wrong one costs transcript quality until it is widened.
+  the model, not a hint. Up to 0.7.6 the other direction was only flagged,
+  because the catalogue held no German-constrained decoder; 0.7.7's optional
+  arbiter (§4) closes that, and the declaration stays load-bearing in both
+  directions: a wrong one now costs transcript quality either way, until it is
+  widened.
+- **A conversation is a language prior, and it needs nobody's permission**
+  (added 0.7.7). The declaration above is the right answer and almost nobody
+  gives it; the flip does not wait. What is always there is the thread — so the
+  rolling majority language over a conversation's last ten clear turns becomes
+  the fallback evidence, on exactly the terms the declaration has. A turn the
+  classifier could not read takes the conversation's language (`lang_via =
+  "context"`, text untouched); a turn that reads as the *opposite* of a settled
+  conversation is a suspected flip and goes to the arbiter, **whoever is
+  speaking** — including a voice the bank did not recognise, because a flip is a
+  property of the audio. A declaration always wins over a vote, and an inherited
+  stamp is never evidence for the next one: one guess may not become the ground
+  for another, which is the same rule proximity inheritance obeys. The bar is
+  deliberately high enough that a genuinely bilingual room gets no context at
+  all (three clear turns, 70% agreement), because in that room there is nothing
+  to infer. And because every flip flagged since 0.6.1 still has its audio,
+  `recalld lang repair` walks that backlog through the identical guards.
 - Turn merging (≤ 1.5 s gaps) before embedding: measured free win.
 - Golden samples, model-migration via re-enrollment from goldens,
   `embed_model_id` versioning with cross-model comparison forbidden in code: as v1.
@@ -246,7 +280,8 @@ every row), with these additions:
   which conflated a microphone pin, a hand reassignment and a split's softened
   score; `label_via` says which (`match` | `mic` | `manual` | `proximity`) and
   `lang_via` says where the language came from (`model` | `classified` |
-  `re-decode` | `mismatch`). The backfill reads the old convention as faithfully
+  `re-decode` | `mismatch`, plus `context` since 0.7.7). The backfill reads the
+  old convention as faithfully
   as it can: every labelled row is `match`, except the pinned voice's scoreless
   ones, which were the microphone.
 - v6: `threads(id, session_id, started_ns, ended_ns)` and `segments.thread_id` —

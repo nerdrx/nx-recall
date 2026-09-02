@@ -139,10 +139,37 @@ export function isUncertain(seg) {
   return false;
 }
 
-// What the "?" says. It has to name the actual reason: "we are not sure" is
-// useless, "two people were talking at once so the identity was refused" tells
-// the user why the fix is theirs to make.
+// What the words themselves are worth, appended to the "?" when there is
+// something to say (0.7.7). Only two of the five `lang_via` values are worth a
+// sentence: the ones where the text on screen is not simply what the primary
+// model heard. `model`, `classified` and `context` never changed a word.
+export function languageNote(seg) {
+  if (seg?.lang_via === 're-decode')
+    return 'These words were re-read from the audio by the German/English arbiter, after the conversation around them suggested the first pass had heard the wrong language.';
+  if (seg?.lang_via === 'mismatch')
+    return 'This turn reads as a different language from the conversation around it, and nothing could settle which is right — so the original words are kept as they are.';
+  return '';
+}
+
+// What the "?" says. It has to name the actual reason, and there are now two
+// kinds: who said it, and what was said. A row whose SPEAKER is certain but
+// whose WORDS were re-read gets only the second — "weak voice match (0.82)"
+// would be a lie about a name nothing is doubting.
 export function uncertainReason(seg) {
+  const note = languageNote(seg);
+  if (!isUncertain(seg)) return note;
+  return note ? `${speakerReason(seg)} ${note}` : speakerReason(seg);
+}
+
+/// Is there anything for the "?" to say at all?
+export function hasMark(seg) {
+  return isUncertain(seg) || languageNote(seg) !== '';
+}
+
+// Why the NAME on a row is in doubt. "We are not sure" is useless; "two people
+// were talking at once so the identity was refused" tells the user why the fix
+// is theirs to make.
+function speakerReason(seg) {
   const ov = seg.overlap_frac ?? 0;
   if (ov > OVERLAP_REFUSE && seg.speaker == null)
     return `Several voices overlap here (${Math.round(ov * 100)}% of the segment), so no speaker identity was claimed. Click to assign one.`;

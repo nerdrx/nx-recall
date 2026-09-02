@@ -84,6 +84,10 @@ pub struct FetchOptions {
     /// (135 MB). Off by default: keyword search works without it, and this is
     /// the one asset that buys a *feature* rather than correctness.
     pub semantic: bool,
+    /// Also install the German flip arbiter (~208 MB, 0.7.7). Off by default:
+    /// without it a German-looking flip is *flagged* rather than re-read, which
+    /// is exactly what 0.6.1 did and is a correct, quieter daemon.
+    pub arbiter_de: bool,
     /// Force the single-stream path. Only the test suite sets this; it is how
     /// the fallback is exercised without finding a server that lacks ranges.
     pub single_stream: bool,
@@ -101,6 +105,9 @@ impl FetchOptions {
         }
         if self.semantic {
             out.push(Group::Semantic);
+        }
+        if self.arbiter_de {
+            out.push(Group::ArbiterDe);
         }
         out
     }
@@ -163,6 +170,13 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
     if opts.semantic {
         let sem = SemanticModel::resolve_at(root.to_path_buf(), cfg);
         missing.extend(sem.entries().into_iter().filter(|e| !e.ok()));
+    }
+    // Same rule for the arbiter: verified when it was asked for, invisible
+    // otherwise. A machine that never wanted a German arbiter is not broken.
+    if opts.arbiter_de {
+        let arb =
+            crate::models::ArbiterModel::resolve_at(root.to_path_buf(), crate::models::ARBITER_DE);
+        missing.extend(arb.entries().into_iter().filter(|e| !e.ok()));
     }
     if !missing.is_empty() {
         eprintln!();

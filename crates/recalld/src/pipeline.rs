@@ -273,7 +273,22 @@ impl Pipeline {
                     warn!("{line}");
                 }
                 if models.complete() {
-                    Some(Analyzer::load(&models, &cfg.identity)?)
+                    let mut analyzer = Analyzer::load(&models, &cfg.identity)?;
+                    analyzer.set_lang_config(&cfg.lang);
+                    // Which flips this machine can actually settle. Said once,
+                    // because "it was only flagged" otherwise has no visible
+                    // cause — the arbiters are optional and both of them are.
+                    let installed = analyzer.arbiters_installed();
+                    if installed.is_empty() {
+                        info!(
+                            "no flip arbiter is installed: a wrong-language transcript will be \
+                             flagged, never re-read. `recalld models fetch --arbiter-de \
+                             --fallback-asr` installs both."
+                        );
+                    } else {
+                        info!(arbiters = installed.join(", "), "flip arbiters available");
+                    }
+                    Some(analyzer)
                 } else {
                     warn!(
                         "analysis models incomplete under {} — see `recalld models status`; \
@@ -608,6 +623,22 @@ impl Pipeline {
                 && let Err(e) = crate::threads::assign(&store, &self.cfg.graph, segment_id)
             {
                 warn!(segment_id, "could not thread a segment: {e:#}");
+            }
+            // The conversational language prior (0.7.7, `crate::langctx`).
+            //
+            // AFTER threading and not with the rest of the analysis leg,
+            // because the thing it reads is the thread: "everything was German
+            // before" is a fact about a conversation, and until `assign` has
+            // run this turn is not in one. Before the broadcast, so the event
+            // carries the corrected text rather than the flip.
+            //
+            // Best-effort, like threading and the extractors either side of it:
+            // a language it could not settle never costs a recording.
+            if !paused_mid_write && let Some(analyzer) = self.analyzer.as_mut() {
+                match analyzer.apply_language_context(&store, segment_id, &samples) {
+                    Ok(fix) => self.analysis_stats.record_context(fix.as_ref()),
+                    Err(e) => warn!(segment_id, "the language prior failed: {e:#}"),
+                }
             }
             // Tier 2 (GRAPH.md): the deterministic extractors, always on and
             // never optional. A handful of regex scans over one line of text,
