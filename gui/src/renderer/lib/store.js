@@ -109,6 +109,22 @@ export const store = {
     /** `[{code, name}]`, from the daemon: the selector is built out of what it accepts. */
     languages: [],
   },
+  /**
+   * The one turn somebody is saying RIGHT NOW, or null (0.11.0).
+   *
+   * A partial is not a segment and is deliberately kept out of `segments`,
+   * `segById` and `appended`: it has no id, it is never stored, it never
+   * arrives twice with the same meaning, and counting it would make every
+   * "turns tonight" number in this app wrong for a second at a time. There is
+   * at most one, because a person can only be in the middle of one sentence.
+   *
+   * `at` is when this client received the last update, which is how a
+   * provisional row that nothing ever replaced gets dropped — a pause, a
+   * discarded turn after an audio gap, or a daemon that went away all end a
+   * turn with no event to say so (PROTOCOL 0.11.0).
+   */
+  partial: null,
+
   ops: new Map(), // op id → {kind, frac, done}
 
   /**
@@ -576,6 +592,11 @@ export function applyConnState(st) {
   if (st?.status) store.status = st.status;
   store.statusLive = st?.conn?.status === 'connected' && !!st?.status;
   store.update = st?.update ?? null;
+  // 0.11.0. Paused means nothing is being captured, and offline means nothing
+  // is arriving to replace it: either way the provisional words on screen
+  // describe a sentence that is no longer being said, and no `segment` is
+  // coming to take them away.
+  if (store.paused || store.conn.status !== 'connected') clearPartial();
   return store;
 }
 
@@ -858,16 +879,84 @@ function noteUnknownSpeaker(id, onDone) {
   }, 250);
 }
 
+// ---- 0.11.0, partial turns -------------------------------------------------
+
+/**
+ * How long a provisional row may sit with nothing new said about it.
+ *
+ * The daemon offers a partial every second while a turn is open and follows the
+ * last one with a `segment` — so silence for several seconds means the turn
+ * ended in a way that produces no event at all: capture was paused, an audio
+ * gap discarded the turn in progress (`pipeline::discard_across_gap`), or the
+ * daemon went away. There is nothing to replace the row with, so it goes.
+ *
+ * Six seconds is comfortably past the cadence plus the worst decode this
+ * project has measured, and short enough that a stale half-sentence is not
+ * still on the glass when the next person starts talking.
+ */
+export const PARTIAL_STALE_MS = 6000;
+
+/**
+ * The turn being said right now, or null — with the staleness rule applied.
+ *
+ * Every surface that draws a provisional row asks THIS rather than reading
+ * `store.partial`, so the "it has been too long" rule lives in one place and
+ * the captions bar and the transcript can never disagree about whether
+ * somebody is still talking.
+ */
+export function livePartial(now = Date.now()) {
+  const p = store.partial;
+  if (!p) return null;
+  if (store.paused || store.conn.status !== 'connected') return null;
+  if (now - p.at > PARTIAL_STALE_MS) return null;
+  return p;
+}
+
+/** Drop the provisional row outright — a resync, a pause, a view being torn down. */
+export function clearPartial() {
+  const had = store.partial != null;
+  store.partial = null;
+  return had;
+}
+
+/**
+ * Drop the provisional row if `seg` is the turn it was about.
+ *
+ * The replace key is `(session, t_start_ns)` and nothing else: a partial has no
+ * id, and `t_start_ns` is a STRING on both events precisely so this comparison
+ * is exact rather than a float that lost its last three digits.
+ */
+function clearPartialFor(seg) {
+  const p = store.partial;
+  if (!p || seg?.session == null) return false;
+  // `t_start_ns` is what the contract names. `t_ns` is the same number under
+  // the older field name and is accepted as a fallback so a daemon that
+  // publishes partials but predates the field split cannot strand a row.
+  const start = seg.t_start_ns ?? seg.t_ns;
+  if (start == null) return false;
+  if (p.session !== seg.session) return false;
+  if (p.t_start_ns !== String(start)) return false;
+  store.partial = null;
+  return true;
+}
+
 export function applyEvent(evt, opts = {}) {
   const d = evt?.data;
   switch (evt?.ev) {
     case 'segment': {
       if (!d || d.id == null) return null;
       noteUnknownSpeaker(d.speaker, opts.onSpeakersChanged);
+      // 0.11.0, and FIRST, before any of the branches below can return: this
+      // may be the turn a provisional row has been showing, and the row has to
+      // go whether the segment lands in the window, is filed as history, or
+      // arrives while the reader is off in July. The replace key is
+      // `(session, t_start_ns)` — a partial has no id to match on.
+      const replaced = clearPartialFor(d);
+      const withPartial = (change) => (replaced ? { ...change, partial: true } : change);
       const known = store.segById.get(d.id);
       if (known) {
         Object.assign(known, d);
-        return { updated: [known] };
+        return withPartial({ updated: [known] });
       }
       // An id we do not hold that is OLDER than everything we hold is not
       // news — it is history being re-published: the re-decode and cross-check
@@ -877,13 +966,13 @@ export function applyEvent(evt, opts = {}) {
       // re-published turn against its speaker a second time. Not in view, not
       // ours to show — the tail is one query away if the reader goes there.
       const head = store.segments[0];
-      if (head && typeof d.t_ms === 'number' && d.t_ms < head.t_ms) return { outside: true };
+      if (head && typeof d.t_ms === 'number' && d.t_ms < head.t_ms) return withPartial({ outside: true });
       store.appended += 1;
       bumpCount(d.speaker, +1, d.dur_ms);
       // The window is somewhere else entirely — the date picker rebuilt it on
       // another day. Tonight's rows must not pile up under July's, and the
       // tail is one query away the moment Follow comes back on.
-      if (store.window.detached) return { detached: true };
+      if (store.window.detached) return withPartial({ detached: true });
       store.segById.set(d.id, d);
       // The feed is chronological in practice, but a corrected or late segment
       // must not jump the list out of order.
@@ -897,8 +986,39 @@ export function applyEvent(evt, opts = {}) {
       // reader is up in history: a live row arriving must never be the thing
       // that scrolls the page they are reading out from under them.
       trimWindow();
-      return { added: [d] };
+      return withPartial({ added: [d] });
     }
+
+    // ---- 0.11.0, partial turns -------------------------------------------
+    // Words for a turn that is still being said. Never a row: it goes nowhere
+    // near `segments`, `segById` or `appended` (see `store.partial`).
+    case 'partial': {
+      // `t_start_ns` is the half of the replace key that has to be there. A
+      // partial without one could never be replaced and would sit on the glass
+      // until it aged out.
+      if (!d || d.t_start_ns == null || d.session == null) return null;
+      // Nothing is being captured, so nothing is being said. A partial that
+      // crossed a pause on the wire is stale by definition.
+      if (store.paused) return null;
+      store.partial = {
+        session: d.session,
+        source: d.source ?? null,
+        speaker: d.speaker ?? null,
+        speaker_hint: d.speaker_hint ?? null,
+        t_start_ms: typeof d.t_start_ms === 'number' ? d.t_start_ms : null,
+        t_start_ns: String(d.t_start_ns),
+        elapsed_ms: typeof d.elapsed_ms === 'number' ? d.elapsed_ms : 0,
+        text: typeof d.text === 'string' ? d.text : '',
+        seq_in_turn: typeof d.seq_in_turn === 'number' ? d.seq_in_turn : 0,
+        at: Date.now(),
+      };
+      // A speaker nobody has heard of is the cue to re-pull the list, exactly
+      // as it is on a segment: a proximity hint can name a voice this client
+      // learned about from a turn it never saw.
+      noteUnknownSpeaker(store.partial.speaker, opts.onSpeakersChanged);
+      return { partial: true };
+    }
+    // ---- end 0.11.0 -------------------------------------------------------
 
     case 'purge': {
       const ids = Array.isArray(d?.ids) ? d.ids : [];

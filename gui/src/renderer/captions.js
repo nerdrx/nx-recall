@@ -22,15 +22,17 @@ import {
   applyEvent,
   applyMic,
   ask,
+  clearPartial,
   followTail,
   isShaky,
   isUncertain,
   isYou,
+  livePartial,
   reloadSpeakers,
   segmentSpeakerLabel,
   SHAKY_NOTE,
 } from './lib/store.js';
-import { normalizeCaptionSettings, translationOf, visibleCaptions } from './lib/captions.js';
+import { normalizeCaptionSettings, translationOf, visibleCaptions, YOU_DIM } from './lib/captions.js';
 
 const stack = document.getElementById('cap-stack');
 const idle = document.getElementById('cap-idle');
@@ -101,15 +103,49 @@ function row({ seg, dim }) {
   return el;
 }
 
+/**
+ * The turn somebody is still saying (0.11.0).
+ *
+ * The same row, built by the same function, with two differences a person can
+ * see at a glance: the ink is lighter and there is a trailing "…". That is the
+ * whole design — a provisional row that looked different STRUCTURALLY would
+ * jump when the final replaced it, and the jump is what makes live captions
+ * unreadable. `partial` on the wrapper is what carries the ink.
+ *
+ * The speaker is whatever the daemon could honestly say, which on a partial is
+ * either a proximity guess or nobody at all (PROTOCOL 0.11.0: no embedding is
+ * computed for a partial). `speaker_hint === "proximity"` renders exactly like
+ * a `label_via: "proximity"` segment, because it is the same claim.
+ */
+function provisionalRow(p) {
+  const seg = {
+    id: null,
+    speaker: p.speaker,
+    text: p.text,
+    label_via: p.speaker_hint === 'proximity' ? 'proximity' : null,
+  };
+  const el = row({ seg, dim: isYou(p.speaker) ? YOU_DIM : 1 });
+  el.classList.add('provisional');
+  el.removeAttribute('data-seg');
+  el.dataset.partial = String(p.seq_in_turn);
+  el.querySelector('.cap-text')?.append(h('span', { class: 'cap-ell', text: '…' }));
+  return el;
+}
+
 function render() {
   const view = visibleCaptions(rows, settings, Date.now(), (s) => isYou(s.speaker));
   root.style.setProperty('--cap-fade', String(view.fade));
   clear(stack);
   for (const r of view.rows) stack.append(row(r));
+  // Under the settled rows, always, and outside the last-N window: it is the
+  // turn happening NOW, so it is at the bottom, and it is not one of the five
+  // turns you asked to keep — it is the one that has not happened yet.
+  const p = livePartial();
+  if (p && (settings.showYou || !isYou(p.speaker))) stack.append(provisionalRow(p));
   // The idle label is for a window that has never had anything in it, not for
   // one whose last turn has faded — a bar that says "waiting for speech" every
   // twelve seconds of quiet is a bar nobody keeps open.
-  idle.hidden = rows.length > 0;
+  idle.hidden = rows.length > 0 || stack.childElementCount > 0;
 }
 
 // The fade is a function of the clock, so something has to tick. Four times a
@@ -156,6 +192,7 @@ window.recall.onState((st) => {
 // again so the archive rule has a head to measure against.
 window.recall.onResync(() => {
   rows = [];
+  clearPartial();
   seeded = false;
   render();
   void seed();
@@ -217,6 +254,22 @@ window.recall.onCaptionSettings(applySettings);
           ground: getComputedStyle(el).backgroundColor,
         };
       }),
+    // The provisional row, read off the DOM like everything else here: the
+    // driver has to prove what a person would have seen, not what the model
+    // believes it published.
+    partial: () => {
+      const el = document.querySelector('.cap-row.provisional');
+      if (!el) return null;
+      return {
+        seq: Number(el.dataset.partial),
+        text: el.querySelector('.cap-text')?.textContent ?? '',
+        who: el.querySelector('.cap-who')?.textContent ?? '',
+        ellipsis: !!el.querySelector('.cap-ell'),
+        dim: getComputedStyle(el.querySelector('.cap-text')).color,
+      };
+    },
+    /** What the MODEL holds, so "no partial afterwards" can be asserted. */
+    partialModel: () => (store.partial ? { ...store.partial } : null),
     // Everything the feed has handed this window, whether or not the last-N
     // window is currently showing it.
     fed: () => rows.map((r) => ({ id: r.seg.id, t_ms: r.seg.t_ms, at: r.at })),

@@ -191,6 +191,20 @@ impl Analyzer {
         self.embedder.model_id()
     }
 
+    // ---- 0.11.0, partial turns: begin --------------------------------------
+    /// Decode an OPEN turn for a provisional caption (`crate::partial`).
+    ///
+    /// The ASR leg and nothing else: no overlap gate, no embedding, no store.
+    /// That is the whole point — a partial is words on a screen for a second
+    /// and a half, and everything the analysis leg does besides transcribe is
+    /// about writing something down, which a partial never does. It is the same
+    /// recogniser instance the finished turn will go through, on the same
+    /// thread, so the feature adds no model and no scheduling surface.
+    pub fn transcribe_partial(&mut self, samples: &[f32]) -> String {
+        self.asr.transcribe(samples)
+    }
+    // ---- 0.11.0, partial turns: end ----------------------------------------
+
     /// All the inference for one turn. Touches no database.
     pub fn prepare(&mut self, samples: &[f32]) -> Result<Prepared> {
         let duration_s = samples.len() as f32 / SAMPLE_RATE as f32;

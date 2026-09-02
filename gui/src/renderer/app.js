@@ -1244,6 +1244,15 @@ document.addEventListener('keydown', (e) => {
         },
       };
     },
+    // 0.11.0 — the live tail. Both halves in one read, because the claim is
+    // that they agree: what the transcript DREW, and what the model holds.
+    // A partial that survives the segment that replaces it is the failure this
+    // is here to catch.
+    partial: () => ({
+      drawn: current?.partial?.() ?? null,
+      model: store.partial ? { ...store.partial } : null,
+      view: currentName,
+    }),
     // Conversation replay (0.9.2): the engine's state, the bar the transcript
     // drew from it, and the row it lit. One read, because the whole feature is
     // "these three agree".

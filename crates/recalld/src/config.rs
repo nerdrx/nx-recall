@@ -564,6 +564,31 @@ pub struct AsrConfig {
     pub max_queue_seconds: i64,
     /// Ceiling on the vocabulary's `effective` list.
     pub vocab_max_terms: usize,
+
+    // ---- 0.11.0, partial turns (`crate::partial`) --------------------------
+    /// Publish provisional `partial` events while a turn is still open, so a
+    /// caption bar can show words before the person has stopped talking.
+    ///
+    /// Everything about this is measured rather than argued
+    /// (`cargo run -p recalld --example partial_bench`, FINDINGS §20): the
+    /// added CPU against the live pipeline's own cost, and how many of the last
+    /// partial's words survive into the final. The default here is whichever
+    /// answer those two numbers gave.
+    pub partials: bool,
+    /// At most one partial per this many milliseconds. Each one is a full
+    /// decode of the whole open turn, so this is the feature's cost knob.
+    pub partial_every_ms: u64,
+    /// How long a turn must have been going before the first partial. Under
+    /// this the window is too short to read (FINDINGS §12: a 1.5 s slice alone
+    /// carries 57% WER) and provisional words that wrong are worse than none.
+    pub partial_min_ms: u64,
+    /// Seconds of audio waiting for the inference thread, above which partials
+    /// stand down entirely. The same rule and the same reason as
+    /// `[graph].max_queue_seconds`: the queue drops the OLDEST audio when it
+    /// overflows, so a partial that put the thread behind would be paying for a
+    /// caption with a lost recording.
+    pub partial_backlog_max_s: i64,
+    // ---- end 0.11.0 --------------------------------------------------------
 }
 
 impl Default for AsrConfig {
@@ -579,6 +604,23 @@ impl Default for AsrConfig {
             batch_pause_s: 10,
             max_queue_seconds: 5,
             vocab_max_terms: 500,
+            // ---- 0.11.0, partial turns ------------------------------------
+            // OFF, and the reason is measured (FINDINGS §20). Convergence
+            // passed handsomely — 96.4% of the last partial's words survive
+            // into the final, and a word reaches the glass 2.4 s sooner — but
+            // the CPU gate did not come close: a partial every second, each one
+            // re-reading the whole open turn, costs **+550-700%** against the live
+            // pipeline's own 7.6 CPU-seconds per minute of speech, where the
+            // gate was 20%. That arithmetic is inherent, not an implementation
+            // fault: N partials over an N-second turn is O(N²) decoding against
+            // the final's O(N). So the mechanism ships complete and switched
+            // off, for a machine whose owner decides the cores are theirs to
+            // spend. `partial_every_ms` is the knob that moves the number.
+            partials: false,
+            partial_every_ms: 1000,
+            partial_min_ms: 800,
+            partial_backlog_max_s: 5,
+            // ---- end 0.11.0 -----------------------------------------------
         }
     }
 }

@@ -1533,6 +1533,25 @@ impl Store {
             .optional()?)
     }
 
+    /// The session's source match key (`VRChat.exe`) — the same string
+    /// `SegmentRow::source` carries.
+    ///
+    /// Added for 0.11.0's partial turns, which have to name their source before
+    /// any row of that session exists. Read once per session and cached by the
+    /// caller, exactly like [`Self::session_source_kind`] beside it.
+    pub fn session_source_key(&self, session_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT sc.match_key FROM sessions ss
+                 JOIN sources sc ON sc.id = ss.source_id
+                 WHERE ss.id = ?1",
+                params![session_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
     /// Mirror a config rule into the DB so `sources` can show it.
     pub fn set_allowed(&self, match_key: &str, allowed: bool, first_seen: i64) -> Result<()> {
         self.conn.execute(

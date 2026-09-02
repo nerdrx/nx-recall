@@ -103,6 +103,16 @@ struct SessionPipeline {
     /// is otherwise invisible precisely because it is treated like everything
     /// else.
     is_room: bool,
+    // ---- 0.11.0, partial turns: begin --------------------------------------
+    /// Cadence, sequence and the previous turn's identity, for the provisional
+    /// captions published while a turn is still open (`crate::partial`).
+    partial: crate::partial::PartialState,
+    /// The session's source match key, read once and cached — the outer
+    /// `Option` is "have we looked", the inner one is the answer. A partial has
+    /// to name its source before any row of the session exists, so it cannot
+    /// borrow the one `SegmentRow` carries.
+    source_key: Option<Option<String>>,
+    // ---- 0.11.0, partial turns: end ----------------------------------------
 }
 
 impl SessionPipeline {
@@ -127,6 +137,10 @@ impl SessionPipeline {
             segment_seq: 0,
             is_mic,
             is_room,
+            // ---- 0.11.0, partial turns ------------------------------------
+            partial: crate::partial::PartialState::default(),
+            source_key: None,
+            // ---- end 0.11.0 -----------------------------------------------
         }
     }
 
@@ -189,6 +203,13 @@ impl SessionPipeline {
         let _ = self.turns.flush();
         self.ring.clear();
         self.ring_base = self.received;
+        // ---- 0.11.0, partial turns ----------------------------------------
+        // A client may be showing provisional words for the turn that just went
+        // on the floor. There is no `segment` coming to replace them and no
+        // identity to lend the next turn, so the open turn is forgotten here
+        // rather than left to age out on the glass.
+        self.partial.reset();
+        // ---- end 0.11.0 ---------------------------------------------------
     }
 
     fn extract(&self, start: u64, end: u64) -> Vec<f32> {
@@ -467,6 +488,14 @@ impl Pipeline {
         for span in emitted {
             self.write_segment(chunk.session_id, span)?;
         }
+        // ---- 0.11.0, partial turns: begin --------------------------------
+        // After the finished turns and before the ring is trimmed: a partial
+        // reads the audio of the turn that is STILL open, which is exactly the
+        // audio `trim` is about to decide to keep. Never fatal — a provisional
+        // caption is the one thing in this file that is allowed to fail
+        // silently, because the recording does not depend on it.
+        self.maybe_partial(chunk.session_id);
+        // ---- 0.11.0, partial turns: end ----------------------------------
         if let Some(s) = self.sessions.get_mut(&chunk.session_id) {
             s.trim();
         }
@@ -724,9 +753,193 @@ impl Pipeline {
                 publish_segment(&self.bus, &store, id);
             }
         }
+        // ---- 0.11.0, partial turns: begin ------------------------------------
+        // The turn is written and announced, so any provisional row a client is
+        // showing for it is replaced by matching `(session, t_start_ns)`. Here
+        // rather than before the broadcast, so the replacement can never be
+        // published before the thing that replaces it.
+        self.close_partial_turn(session_id, segment_id, t_end_ns);
+        // ---- 0.11.0, partial turns: end --------------------------------------
         Ok(())
     }
 }
+
+// ---- 0.11.0, partial turns: begin -----------------------------------------
+//
+// Everything the feature adds to this file that is longer than a line, kept in
+// its own two blocks rather than threaded through the ones above. The rest of
+// pipeline.rs sees five call sites and one field.
+
+impl SessionPipeline {
+    /// Where the turn currently being spoken begins, or `None` when nobody is
+    /// talking.
+    ///
+    /// Two sources, because a turn is open in two different senses. The
+    /// SEGMENTER is mid-speech from the first voiced frame — that is the whole
+    /// case captions exist for and the merger has not heard of it yet. The
+    /// MERGER holds a closed span for up to `turn_merge_gap` waiting to see
+    /// whether the person carries on. Whichever starts earlier is where the
+    /// turn a client is being shown actually began, so that is the start a
+    /// partial decodes from and the `t_start_ns` it is replaced by.
+    fn open_turn_start(&self) -> Option<u64> {
+        match (self.turns.pending_start(), self.segmenter.speech_open()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
+    }
+}
+
+impl Pipeline {
+    /// Offer a provisional caption for whatever is being said on this session
+    /// right now (docs/PROTOCOL.md "0.11.0 — partial turns").
+    ///
+    /// Returns nothing and raises nothing on purpose. Every branch below is a
+    /// reason to do less work, and the most expensive thing this function is
+    /// ever allowed to cost is one ASR decode that a client may ignore.
+    fn maybe_partial(&mut self, session_id: i64) {
+        if self.analyzer.is_none() {
+            return;
+        }
+        // The switch, the pause and the backlog, in the one place they are
+        // tested (`partial::may_emit`). Pause is the panic path and is checked
+        // here as well as in `on_audio`, for the same reason `write_segment`
+        // re-checks it: this is a place words leave the daemon. The backlog
+        // rule is the other half — a partial that pushed the inference thread
+        // behind would be paying for a caption with dropped audio, and the
+        // queue drops the OLDEST buffers, i.e. speech nobody has read yet.
+        let paused = self.control.is_paused();
+        if !self.may_emit_partial(paused) {
+            if paused && let Some(s) = self.sessions.get_mut(&session_id) {
+                s.partial.reset();
+            }
+            return;
+        }
+
+        let cadence = crate::partial::Cadence::from_config(&self.cfg.asr);
+        let now_ms = crate::clock::monotonic_ns() / 1_000_000;
+        let Some(session) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let Some(start) = session.open_turn_start() else {
+            return;
+        };
+        // The VAD's cursor, not `received`: audio past it has not been looked
+        // at, so decoding it would put words on screen for speech the daemon
+        // has not yet decided is speech.
+        let end = session.segmenter.cursor();
+        let elapsed_ms = ((end.saturating_sub(start)) * 1000) / SAMPLE_RATE.max(1) as u64;
+        let t_start_ns = session.utc_of_sample(start);
+        if !session.partial.due(t_start_ns, elapsed_ms, now_ms, cadence) {
+            return;
+        }
+        // The WHOLE open turn, every time. Not the newest chunk: FINDINGS §12
+        // measured a short slice decoded alone at 56.7% WER against 20.4% for
+        // the same slice with context, so a partial built from the last second
+        // would be noise that never improved. Re-reading from the top is what
+        // makes the text converge on the final.
+        let samples = session.extract(start, end);
+        if samples.is_empty() {
+            return;
+        }
+        let (speaker, hint) = session.partial.hint(t_start_ns);
+        let source = self.session_source_key(session_id);
+
+        let Some(analyzer) = self.analyzer.as_mut() else {
+            return;
+        };
+        let text = analyzer.transcribe_partial(&samples);
+        if crate::asr::normalise_words(&text).is_empty() {
+            // The decoder made nothing of it. Not an error and not an event: a
+            // caption bar that flashed an empty provisional row every second of
+            // a cough is worse than one that waits.
+            return;
+        }
+        // Re-checked after the decode, which is the one place in this function
+        // that takes real time: a pause that lands inside it must not be
+        // followed by words appearing on a screen.
+        if self.control.is_paused() {
+            if let Some(s) = self.sessions.get_mut(&session_id) {
+                s.partial.reset();
+            }
+            return;
+        }
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let seq_in_turn = session.partial.mark(t_start_ns, now_ms);
+        self.bus.publish_ephemeral(
+            Topic::Segments,
+            "partial",
+            crate::partial::partial_json(
+                session_id,
+                source.as_deref(),
+                speaker,
+                hint,
+                t_start_ns,
+                elapsed_ms,
+                &text,
+                seq_in_turn,
+            ),
+        );
+    }
+
+    /// The switch, the pause and the backlog — [`crate::partial::may_emit`]
+    /// with this daemon's own numbers in it.
+    fn may_emit_partial(&self, paused: bool) -> bool {
+        crate::partial::may_emit(
+            self.cfg.asr.partials,
+            paused,
+            self.control
+                .queue
+                .as_ref()
+                .map(|q| q.queued_samples())
+                .unwrap_or(0),
+            SAMPLE_RATE,
+            self.cfg.asr.partial_backlog_max_s,
+        )
+    }
+
+    /// A turn was written and announced: close the provisional row and hand
+    /// this turn's identity to the next one as its proximity hint.
+    ///
+    /// The speaker is read back from the ROW rather than from the analysis
+    /// leg's own variables, for the same reason `publish_segment` reads it
+    /// back: the row is what every client sees, and a hint that disagreed with
+    /// it would make the provisional row and the final one name two people.
+    fn close_partial_turn(&mut self, session_id: i64, segment_id: i64, t_end_ns: i64) {
+        let speaker = match self.store.lock() {
+            Ok(store) => store
+                .segment_row(segment_id)
+                .ok()
+                .flatten()
+                .and_then(|r| r.speaker_id),
+            Err(_) => None,
+        };
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.partial.turn_closed(t_end_ns, speaker);
+        }
+    }
+
+    /// The session's source match key, read once and remembered.
+    fn session_source_key(&mut self, session_id: i64) -> Option<String> {
+        if let Some(session) = self.sessions.get(&session_id)
+            && let Some(cached) = &session.source_key
+        {
+            return cached.clone();
+        }
+        let key = match self.store.lock() {
+            Ok(store) => store.session_source_key(session_id).unwrap_or(None),
+            Err(_) => None,
+        };
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.source_key = Some(key.clone());
+        }
+        key
+    }
+}
+
+// ---- 0.11.0, partial turns: end -------------------------------------------
 
 /// Announce a stored segment on the event stream.
 ///
@@ -976,6 +1189,82 @@ mod tests {
         assert_eq!(fine.turns.pending_start(), Some(1_000));
         assert_eq!(fine.ring.len(), 16_000);
     }
+
+    // ---- 0.11.0, partial turns: begin --------------------------------------
+
+    #[test]
+    fn an_open_turn_is_visible_from_the_first_voiced_frame() {
+        // The whole case captions exist for. The turn merger hears nothing
+        // until the segmenter has CLOSED a span, which needs 500 ms of silence
+        // — so mid-sentence, `pending_start` is None and the segmenter is the
+        // only thing that knows somebody is talking.
+        let cfg = SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE);
+        let mut s = SessionPipeline::new(
+            VadState_stub(),
+            cfg,
+            TurnMerger::new(24_000, 480_000),
+            0,
+            false,
+            false,
+        );
+        assert_eq!(s.open_turn_start(), None, "nobody is talking");
+
+        // Speech opens at sample 16_000; the pad reaches back 200 ms.
+        for i in 0..40u64 {
+            s.segmenter
+                .push_frame(0.9, 16_000 + i * FRAME_SAMPLES as u64, FRAME_SAMPLES as u64);
+        }
+        assert_eq!(
+            s.open_turn_start(),
+            Some(16_000 - 3_200),
+            "a turn is open the moment the VAD says so, not when it ends"
+        );
+
+        // Now with a turn ALSO pending in the merger — the previous span,
+        // waiting to see whether this is a continuation. The earlier of the two
+        // is where the turn a client is being shown actually began.
+        let _ = s.turns.push(crate::vad::SegmentSpan {
+            start: 4_000,
+            end: 12_000,
+            voiced_start: 4_200,
+            voiced_end: 11_800,
+        });
+        assert_eq!(s.open_turn_start(), Some(4_000));
+    }
+
+    #[test]
+    fn a_gap_takes_the_provisional_row_with_the_turn_it_described() {
+        // There is no `segment` coming for a discarded turn, so nothing would
+        // ever replace the words on screen — and the NEXT turn must not inherit
+        // an identity from a turn that never landed.
+        let cfg = SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE);
+        let mut s = SessionPipeline::new(
+            VadState_stub(),
+            cfg,
+            TurnMerger::new(24_000, 480_000),
+            0,
+            false,
+            false,
+        );
+        s.received = 16_000;
+        s.ring = vec![0.25; 16_000];
+        s.partial.turn_closed(500_000_000, Some(7));
+        s.partial.mark(1_000_000_000, 10_000);
+        assert!(s.partial.is_open());
+
+        s.discard_across_gap(VadState_stub());
+        assert!(!s.partial.is_open(), "the open turn is forgotten");
+        // Who spoke BEFORE the discarded turn is still a fact about the session,
+        // so the proximity hint survives — it is the turn that vanished, not the
+        // history.
+        assert_eq!(
+            s.partial.hint(1_100_000_000),
+            (Some(7), Some("proximity")),
+            "the gap discarded a turn, not the session's memory"
+        );
+    }
+
+    // ---- 0.11.0, partial turns: end ----------------------------------------
 
     #[test]
     fn ring_extraction_is_clamped_to_what_is_buffered() {

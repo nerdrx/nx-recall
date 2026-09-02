@@ -50,6 +50,7 @@ pub mod models;
 pub mod night;
 pub mod notes;
 pub mod overlap;
+pub mod partial;
 pub mod pipeline;
 pub mod proto;
 pub mod proximity;

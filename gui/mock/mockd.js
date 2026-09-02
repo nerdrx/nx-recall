@@ -25,13 +25,18 @@
 // one per signal, in order:
 //
 //   1st — a `note` event: a MIC turn that began with a wake phrase (0.8.0).
-//   2nd — a `reminder` and the `note` it is about, plus a `digest` for a
+//   2nd — one whole PARTIAL TURN (0.11.0): three `partial` events a second
+//         apart, each carrying more of the same sentence, then the `segment`
+//         that replaces them. The one thing a canned feed cannot produce by
+//         accident, because the three partials and the segment have to share a
+//         `t_start_ns` or the replace rule is untested.
+//   3rd — a `reminder` and the `note` it is about, plus a `digest` for a
 //         conversation the local model has just read (0.9.0).
-//   3rd — a `roster` JOIN naming a voice the user has named (Kira), which is
+//   4th — a `roster` JOIN naming a voice the user has named (Kira), which is
 //         what a client turns into a brief.
-//   4th — the SAME join again, immediately, so a client's brief debounce is
+//   5th — the SAME join again, immediately, so a client's brief debounce is
 //         testable rather than merely assertable in prose.
-//   5th — a `visit` event (0.10.0): a world entry, with its name. What the
+//   6th — a `visit` event (0.10.0): a world entry, with its name. What the
 //         Worlds card and the "Where you meet" chips are fed by.
 //
 // A signal rather than a timer because both are things a test has to be able to
@@ -120,6 +125,15 @@ const MY_LINES = [
   'give me a second, my headset is doing the thing again',
   'that is the world I was talking about earlier',
 ];
+
+/**
+ * The sentence SIGUSR2's partial turn arrives one piece at a time (0.11.0).
+ *
+ * Long enough that three provisional readings are visibly different from each
+ * other and from the final, which is the only way the "updated in place" and
+ * "replaced without a jump" claims can be tested rather than asserted.
+ */
+const PARTIAL_LINE = 'the door behind the bar goes back into the same instance if you take it twice';
 
 // name: null means "not named yet" — the onboarding case (DESIGN §5).
 // `languages` is schema v5: which languages this voice actually speaks, so a
@@ -1081,7 +1095,7 @@ export function startMock({
     /// number the daemon made up. Seeded with three, so the card has something
     /// honest to show before anybody has corrected anything in this session.
     corrections: [],
-    /// Which of SIGUSR2's three deliveries comes next (see the header).
+    /// Which of SIGUSR2's deliveries comes next (see the header).
     nudges: 0,
     myLineIdx: 0,
     tombstones: new Map(), // merged-away speaker id → surviving id (never chained)
@@ -2014,6 +2028,75 @@ export function startMock({
   /// One turn off the user's own microphone. Note what is NOT here: a
   /// match_score. There was no comparison, so there is no score to report, and
   /// a client that renders one would be inventing it.
+  /**
+   * 0.11.0 — one turn arriving the way a turn really arrives: provisionally,
+   * three times, and then for real.
+   *
+   * The three partials carry a growing prefix of the same sentence and the
+   * SAME `t_start_ns`, because `(session, t_start_ns)` is the whole replace
+   * rule and a mock that varied it would let a client pass while never
+   * implementing it. The final `segment` carries that identical `t_start_ns`.
+   *
+   * Deliberately NOT from the microphone: a partial's speaker is a proximity
+   * guess or nothing (PROTOCOL 0.11.0), and the interesting row to look at is
+   * the one wearing a hedged name rather than the user's own pinned one.
+   */
+  function emitPartialTurn() {
+    const now = Date.now();
+    const tStartNs = String(now) + '000000';
+    const you = youSpeaker();
+    const speaker = state.speakers.find((s) => s.name && s.id !== you)?.id ?? null;
+    const words = PARTIAL_LINE.split(' ');
+    // Where the three provisional readings stop. The first is deliberately
+    // SHORT and the last is deliberately not quite the final text: partials are
+    // wrong at first and a client that renders them as settled is the failure
+    // this feature has to avoid (FINDINGS §12).
+    const cuts = [3, 6, words.length - 1];
+    cuts.forEach((cut, i) => {
+      setTimeout(() => {
+        emit('segments', 'partial', {
+          session: SESSIONS[2].id,
+          source: 'VRChat.exe',
+          speaker,
+          speaker_hint: speaker == null ? null : 'proximity',
+          t_start_ms: now,
+          t_start_ns: tStartNs,
+          elapsed_ms: 900 + i * 1000,
+          text: words.slice(0, cut).join(' '),
+          seq_in_turn: i,
+          final: false,
+        });
+      }, i * 700);
+    });
+    // …and the turn itself, after the last one. Same start, so a client
+    // replaces rather than appends.
+    setTimeout(() => {
+      const seg = {
+        id: state.nextSegId++,
+        session: SESSIONS[2].id,
+        source: 'VRChat.exe',
+        speaker,
+        text: PARTIAL_LINE,
+        t_ms: now,
+        t_ns: tStartNs,
+        t_start_ns: tStartNs,
+        t_end_ns: String(now + 4200) + '000000',
+        dur_ms: 4200,
+        overlap_frac: 0.03,
+        match_score: 0.71,
+        label_via: null,
+        lang: 'en',
+        lang_via: 'classified',
+        asr_confidence: 'solid',
+        text_via: 'live',
+        thread: liveThread(),
+      };
+      state.segments.push(seg);
+      emit('segments', 'segment', seg);
+    }, cuts.length * 700 + 400);
+    return { partials: cuts.length, t_start_ns: tStartNs, speaker };
+  }
+
   function emitMine() {
     const now = Date.now();
     const text = MY_LINES[state.myLineIdx % MY_LINES.length];
@@ -3420,6 +3503,10 @@ export function startMock({
       return { sent: 'note', id: LIVE_NOTE.id };
     }
     if (n === 1) {
+      // 0.11.0: one turn, provisionally three times and then for real.
+      return { sent: 'partial-turn', ...emitPartialTurn() };
+    }
+    if (n === 2) {
       // 0.9.0: a reminder coming round, and a conversation the model has just
       // read. Both are things a canned world cannot produce on its own, and
       // both are the events the assistant round's two surfaces are built on.
@@ -3460,7 +3547,7 @@ export function startMock({
     // A named voice walking into the instance. `who` is the VRChat display
     // name; linking it to a speaker is the client's job and is deliberately
     // case-insensitive on the user-given name (crates/recalld/src/roster.rs).
-    if (n > 4) {
+    if (n > 5) {
       // 0.10.0. A world entry, on the `roster` topic and deliberately not a
       // rename of the `roster` event: `roster` says who is present, `visit`
       // says a place was entered.
