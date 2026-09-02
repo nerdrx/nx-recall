@@ -601,6 +601,21 @@ async function bootstrap() {
 if (process.env.NX_RECALL_E2E !== undefined) {
   app.setPath('userData', join(tmpdir(), `nx-recall-e2e-${process.pid}`));
 }
+// A renderer that dies takes the whole e2e driver with it and, in the field,
+// the transcript you were reading. Electron says why in `details` and nobody
+// was listening: two headless runs tonight ended with "the driver did not
+// finish" and no other trace. Logged on stderr (the harness keeps it) and,
+// under the harness, echoed in the shape the step log uses.
+app.on('render-process-gone', (_event, contents, details) => {
+  const where = contents?.getURL?.() ?? '?';
+  const line = `[renderer gone] reason=${details?.reason} exitCode=${details?.exitCode} at ${where}`;
+  console.error(line);
+  if (process.env.NX_RECALL_E2E === '1') console.log(`[e2e] ${line}`);
+});
+app.on('child-process-gone', (_event, details) => {
+  console.error(`[child gone] type=${details?.type} reason=${details?.reason} exitCode=${details?.exitCode} name=${details?.name ?? ''}`);
+});
+
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
