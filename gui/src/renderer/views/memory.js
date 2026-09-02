@@ -317,7 +317,31 @@ export function mount(root, ctx) {
             { class: 'digest-open' },
             ...(d.open ?? []).map((o) => h('span', { class: 'digest-open-item', text: o }))
           )
-        : null
+        : null,
+      // A digest is the model's paragraph ABOUT an evening; this plays the
+      // evening. The card is itself a button, so this one stops the click.
+      h(
+        'span',
+        {
+          class: 'btn small replay-start digest-replay',
+          role: 'button',
+          tabindex: '0',
+          dataset: { replay: String(d.thread_id) },
+          title: 'Play this conversation back, turn by turn',
+          'aria-label': 'Replay this conversation',
+          onclick: (e) => {
+            e.stopPropagation();
+            void ctx.replayThread?.(d.thread_id);
+          },
+          onkeydown: (e) => {
+            if (e.key !== 'Enter' && e.key !== ' ') return;
+            e.preventDefault();
+            e.stopPropagation();
+            void ctx.replayThread?.(d.thread_id);
+          },
+        },
+        'Replay'
+      )
     );
   }
 

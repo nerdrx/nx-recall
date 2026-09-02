@@ -2010,6 +2010,39 @@ export function startMock({
       return { ...threadPayload(id), segments: rows };
     },
 
+    /**
+     * `replay.get` — the thin query behind conversation replay (0.9.2).
+     *
+     * The point of it is `has_audio`, and the point of `has_audio` is that it
+     * is NOT always true: a conversation is a mix of turns that still sound and
+     * turns retention has taken, and a client that never meets the second kind
+     * never renders it. Here that split falls out of the same rule
+     * `segments.audio` follows — NO_AUDIO_SPEAKER answers `gone` — so the two
+     * can never disagree, and thread 502 (canned rows 10..14) mixes both.
+     */
+    'replay.get'(params) {
+      const id = Number(params?.thread);
+      const rows = state.segments.filter((s) => s.thread === id);
+      if (!rows.length) throw err('not_found', `no conversation with id ${params?.thread}`);
+      return {
+        thread: id,
+        turns: rows.map((s) => {
+          const who = owner(s);
+          const p = who == null ? null : person(who);
+          return {
+            id: s.id,
+            t_ms: s.t_ms,
+            t_ns: s.t_ns,
+            dur_ms: s.dur_ms,
+            speaker: s.speaker,
+            speaker_name: p ? (p.name ?? p.auto) : null,
+            text: s.text,
+            has_audio: who !== NO_AUDIO_SPEAKER,
+          };
+        }),
+      };
+    },
+
     // --- the memory graph, Tiers 2 and 3 (0.7.0) --------------------------
 
     'graph.summary': () => ({

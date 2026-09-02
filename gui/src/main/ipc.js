@@ -39,6 +39,12 @@ const ALLOWED = new Set([
   // transcript can land on it. Both are additive and both are read-only.
   'person.get',
   'thread.get',
+  // Conversation replay (0.9.2). A read, and a deliberately thinner one than
+  // `thread.get`: the turns of a conversation with a per-turn "can this
+  // actually be heard right now", so the player draws its scrubber without
+  // fetching a single WAV. The audio itself still comes through
+  // `segments.audio`, which is already here.
+  'replay.get',
   // The memory graph's Tiers 2 and 3 (0.7.0, docs/GRAPH.md). Everything the
   // Memory view reaches: three reads, one state machine, and the Tier 3
   // switch. `graph.set` is here as well as `graph.enrich` because the card

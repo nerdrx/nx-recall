@@ -52,6 +52,7 @@ pub mod proximity;
 pub mod quality;
 pub mod queue;
 pub mod reminders;
+pub mod replay;
 pub mod resample;
 pub mod retention;
 pub mod roster;
