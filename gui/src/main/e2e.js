@@ -10,7 +10,7 @@
 // never opens a window on the developer's desktop.
 
 import { app } from 'electron';
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -1589,10 +1589,13 @@ export function runE2E(deps) {
       // The live window may hold nothing by an unnamed voice (the mock's tail
       // is mostly named people talking), so the driver makes one: the newest
       // row is reassigned to an unnamed voice first and put back at the end.
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      await waitFor('transcript rows', async () => js('document.querySelectorAll("#seg-list .seg").length > 0'));
       const setup = await js(`(() => {
         const s = window.__recallDebug.store;
         const rows = [...document.querySelectorAll('#seg-list .seg')];
         const row = rows[rows.length - 1];
+        if (!row) return null;
         const seg = s.segById.get(Number(row.dataset.seg));
         const unnamed = [...s.speakers.values()].find((sp) => !sp.name && !sp.you);
         return unnamed && seg ? { id: seg.id, was: seg.speaker ?? null, speaker: unnamed.id } : null;
@@ -3159,6 +3162,9 @@ export function runE2E(deps) {
     // nothing else — and it refuses to touch a file it did not write.
     await step('export-previews-then-writes-markdown-to-a-folder', async () => {
       const dir = join(OUT, `export${SUFFIX}`);
+      // A previous run's files would make the preview look as if it had
+      // written something; the folder starts empty every time.
+      rmSync(dir, { recursive: true, force: true });
       mkdirSync(dir, { recursive: true });
       // The driver cannot click an OS folder dialog, so it supplies the answer
       // the dialog would have given. Everything after that is the real path.
