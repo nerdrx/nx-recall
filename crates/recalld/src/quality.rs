@@ -489,6 +489,15 @@ pub fn confidence_batch(
 
         // ---- decode (no lock) ----
         let current = candidate.text.clone().unwrap_or_default();
+        if !worth_cross_checking(&current) {
+            // A one-word row cannot disagree by degrees: "H" against "Hm" is a
+            // verdict about a grunt, not a transcript. Same floor as the mint
+            // bar (≥2 words), for the same reason — below it the signal is a
+            // coin toss and marks half the short rows shaky on real audio.
+            let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+            guard.set_segment_confidence(candidate.id, None, at)?;
+            continue;
+        }
         let checked = cross_check(
             canaries,
             &samples,
@@ -519,6 +528,19 @@ pub fn confidence_batch(
         crate::pipeline::publish_segment(bus, &guard, candidate.id);
     }
     Ok(true)
+}
+
+/// Whether a transcript has enough words for a second decoder's disagreement
+/// to mean anything. The floor is two words — the mint bar's floor, chosen
+/// there because the decoder's honest blank on non-speech is the signal and a
+/// one-word row is where that signal lives. Below it, agreement is 0 or 1 and
+/// the verdict describes a grunt: on the first day of real use, "H", "Yeah."
+/// and "Mm-hmm" were a third of the shaky rows.
+pub fn worth_cross_checking(text: &str) -> bool {
+    text.split_whitespace()
+        .filter(|w| w.chars().any(char::is_alphanumeric))
+        .count()
+        >= 2
 }
 
 /// Read one stored clip, or `None` if retention has already taken it.

@@ -89,7 +89,7 @@ label (0.35, calibrated on real lobbies — the corpus value over-split 3×)
 
 ## Numbers we actually measured
 
-The measurement harness came first — 27 experiment scripts in
+The measurement harness came first — 28 experiment scripts in
 [`spike/`](spike/FINDINGS.md) — and two of the original design's core claims
 died in it before a line of the daemon existed.
 
@@ -107,7 +107,7 @@ died in it before a line of the daemon existed.
 | Cross-language search, German query → English memory | mean rank 2.7 after the language-hub correction (raw model: rank-32 tail disasters) |
 | Full pipeline: VAD, gate, ASR, identity, vectors | under 5% of one CPU core |
 | A 1.5-second turn decoded alone vs. inside 3 s of its neighbours | **56.7% WER → 20.4%** (2.5 s turns: 34.3% → 17.1%) — same model, more audio |
-| A second decoder disagreeing as a warning light | shaky rows carry **4.2×** the word errors of solid ones |
+| A second decoder disagreeing as a warning light | shaky rows carry **4.2×** the word errors of solid ones in the lab, **2.8×** on this user's own lobby audio against whisper-large-v3 |
 | Hotword biasing toward the roster and glossary | +9.1% recall on rare words against a +20% gate; at strength the glossary leaked into unrelated turns (control WER 8% → 29%). Not shipped |
 
 ## The graveyard of clever ideas
@@ -261,6 +261,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.7.6 | +65h | the night shift's three bugs — the lock, the split conversations |
 | 0.7.7 | +67h | the conversational language prior + the German arbiter |
 | 0.8.0 | +80h | the accuracy round: short turns re-read in context, a second decoder as a warning light, fix-in-place, one query box, notes to self, briefs |
+| 0.8.1 | +83h | the afternoon-after check: one-word rows get no verdict, re-decodes keep the words they replace, the flag re-measured on real audio |
 
 ## Quickstart
 

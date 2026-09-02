@@ -1583,6 +1583,24 @@ impl Store {
         asr_model_id: &str,
         at_utc_ns: i64,
     ) -> Result<()> {
+        // The words being replaced are kept, the same way `segments.correct`
+        // keeps them: a re-decode is a machine's edit of the transcript, and an
+        // edit nobody can see or undo is not a provenance story, it is a
+        // rewrite. The row goes to `operations` as `segments.redecode` with the
+        // prior text, model and route, so a person can compare, revert, and
+        // the real-audio benefit of the pass can be measured after the fact.
+        let prior: Option<(Option<String>, Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT text, asr_model_id, text_via FROM segments
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                params![segment_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((prior_text, prior_model, prior_via)) = prior else {
+            return Ok(());
+        };
         // The cross-check is cleared with the words it was about: a `solid`
         // flag on a transcript that has since been replaced is a claim nobody
         // ever checked. The confidence pass picks the row up again on its next
@@ -1593,6 +1611,18 @@ impl Store {
                  asr_confidence = NULL, confidence_at_ns = NULL
              WHERE id = ?1 AND deleted_at IS NULL",
             params![segment_id, text, asr_model_id, text_via::CONTEXT, at_utc_ns],
+        )?;
+        self.log_operation(
+            "segments.redecode",
+            &format!("[{segment_id}]"),
+            &serde_json::json!({
+                "segment_id": segment_id,
+                "text": prior_text,
+                "asr_model_id": prior_model,
+                "text_via": prior_via,
+            })
+            .to_string(),
+            at_utc_ns,
         )?;
         Ok(())
     }

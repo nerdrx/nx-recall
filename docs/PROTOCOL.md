@@ -818,6 +818,17 @@ see until a user hits it.
     a decode with no words as `text: null`, and a short fragment the decoder
     made nothing of is precisely what the surrounding audio rescues, so
     `text_via: "context"` can arrive on a row a client is showing as silent.
+  - **A re-decode is on the record (0.8.1).** Every replacement writes an
+    `operations` row `op: "segments.redecode"` with `prior_state:
+    {segment_id, text, asr_model_id, text_via}` — the words, model and route
+    *before* the pass, exactly as `segments.correct` keeps a person's. It is
+    not a correction: `accuracy.summary` and the "hand-corrected, needs no
+    second opinion" rule key on `segments.correct` alone.
+  - **One word gets no verdict (0.8.1).** Rows with fewer than two words are
+    marked checked with `asr_confidence: null`, never `shaky`: a one-word
+    transcript cannot disagree by degrees, and on the first day of real use
+    "H", "Yeah." and "Mm-hmm" were a third of the shaky rows. Same floor as
+    the mint bar.
 - **Vocabulary.** `vocab.get` → `{user: [...], auto: {roster: [...], worlds:
   [...], corrections: [...], speakers: [...]}, effective: [...],
   applied_to_decoder: false}`; `vocab.set {terms: [...]}` replaces the user

@@ -215,6 +215,48 @@ fn a_hand_corrected_turn_is_left_alone_by_both_passes() {
     let row = store.segment_row(plain).expect("row").expect("live");
     assert_eq!(row.text.as_deref(), Some("das war sehr gut"));
     assert_eq!(row.text_via.as_deref(), Some("context"));
+
+    // The words that were replaced are on the record, the way a person's
+    // correction is: a machine's edit nobody can see or undo is a rewrite.
+    let ops = store
+        .operations_of("segments.redecode", 10)
+        .expect("operations");
+    assert_eq!(ops.len(), 1, "one re-decode, one operations row");
+    assert_eq!(ops[0].target_ids, format!("[{plain}]"));
+    let prior: serde_json::Value = serde_json::from_str(&ops[0].prior_state).expect("json");
+    assert_eq!(prior["segment_id"], serde_json::json!(plain));
+    assert_ne!(
+        prior["text"].as_str(),
+        Some("das war sehr gut"),
+        "prior_state holds the words BEFORE the re-decode"
+    );
+    assert!(
+        prior["text"].is_string(),
+        "the prior text is kept, not nulled"
+    );
+    assert_eq!(prior["text_via"], serde_json::json!("live"));
+    // A machine's edit is not a person's: the accuracy figures and the "hand
+    // corrected, needs no second opinion" rule both key on `segments.correct`.
+    assert!(
+        store
+            .operations_of("segments.correct", 10)
+            .expect("operations")
+            .iter()
+            .all(|o| o.target_ids != format!("[{plain}]")),
+        "a re-decode must not masquerade as a correction"
+    );
+}
+
+/// The cross-check floor: one word cannot disagree by degrees.
+#[test]
+fn a_one_word_row_gets_no_verdict() {
+    use recalld::quality::worth_cross_checking;
+    for grunt in ["H", "Yeah.", "Mm-hmm", "…", "", "   ", "Ja"] {
+        assert!(!worth_cross_checking(grunt), "{grunt:?} is below the floor");
+    }
+    for words in ["Ja genau.", "Was ist Queen Size?", "ok ok", "Mm-hmm, ja"] {
+        assert!(worth_cross_checking(words), "{words:?} is checkable");
+    }
 }
 
 /// Long turns are not in the queue at all: they already carry their own
