@@ -746,6 +746,13 @@ pub struct AssistConfig {
     /// Turns shorter than this are not translated. Three words, because "ja
     /// klar" translated is "yeah sure" and nobody needed it — and because a
     /// two-word turn is where the decoder is least reliable to begin with.
+    ///
+    /// 0.11.0 makes one exception, and only on the **live** path
+    /// (`translate::LIVE_MIN_WORDS_CONFIDENT`): a two-word line whose language
+    /// the detector named *confidently* is still translated, because a two-word
+    /// French line is a line the reader cannot read and this floor was about
+    /// not spending a model call on filler, not about hiding short turns. One
+    /// word stays out at any confidence.
     pub translate_min_words: usize,
 
     // ---- 0.10.2, the translation controls ---------------------------------

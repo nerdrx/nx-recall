@@ -719,6 +719,17 @@ impl Pipeline {
                 is_mic && !paused_mid_write,
                 utc_now_ns(),
             );
+            // ---- 0.11.0: the live translation hook ----
+            //
+            // BEFORE the broadcast, so a language this turn was only guessed at
+            // is already stamped on the row the event is read back from — a
+            // client must not see the same segment twice with two different
+            // language codes. One call, everything inside it: the switch, the
+            // word floor, the guess, the reader's own languages. It queues an
+            // id and rings a bell; the model call happens on the assistant's
+            // thread, never on this one.
+            crate::translate::queue_live(&store, segment_id);
+            // ---- end hook ----
             publish_segment(&self.bus, &store, segment_id);
             for id in also_changed {
                 publish_segment(&self.bus, &store, id);

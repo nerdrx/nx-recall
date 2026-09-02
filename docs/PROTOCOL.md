@@ -2234,3 +2234,82 @@ Nothing is required. When it wants to:
 
 A client must not present a *proposed* threshold as an installed one:
 `thresholds_swap` is the difference, and it is false far more often than true.
+## 0.11.0 — live translation and short-line detection
+
+Two changes, one complaint behind both: a French line — "Tu arrêtes
+appartement." — sat in the transcript untranslated, and would have sat there for
+up to five minutes even if the daemon had recognised it.
+
+**No new methods, no new fields on the wire.** A `segment` event is published a
+second time when its translation lands, exactly as 0.9.0 already did from the
+idle pass; what changed is *when*.
+
+### The language of a short line
+
+`lang::guess_other` needed three function words. A lobby turn is three to eight
+words and mostly content, so on real turns it answered "I cannot tell" more
+often than it answered — `spike/short_lang_bench.py` measures 33.8% recall over
+FLEURS test fragments of 2, 3, 4 and 6 words. Two stages are added below the
+script check:
+
+* **an exclusive character** — one that exactly one shippable Latin-script
+  language of the set writes and neither German nor English does. The table is
+  generated from the corpus, not written by hand: `ç` is Turkish and Portuguese
+  before it is French, `ø` is Norwegian as well as Danish, and shipping those
+  cost three languages the gate. What is left is `ñ` (es), `ãõ` (pt), `ąćęłńśż`
+  (pl), `ğış` (tr), `ýčěřšůž` (cs). A line carrying two languages' characters is
+  answered "I cannot tell", never split.
+* **a character-trigram model** — `crate::lang_ngrams`, generated from the
+  FLEURS dev text, 14 languages × 2 000 trigrams. A language wins by argmax with
+  a margin over the runner-up *and* a margin over the better of German and
+  English, both scaling as `1/sqrt(trigrams)` because the score is a mean.
+  German, English and Norwegian are in the tables and cannot win: the first two
+  are what a guess must beat, and Norwegian is 0.10.2's blocker, present so that
+  its win can be refused rather than handed to Danish.
+
+Recall over every shippable language and fragment length goes from 33.8% to
+74.7%; German and English false positives stay at 0.00–0.25% per length against
+a gate of 0.5%. Danish ships stopword-only — it has no exclusive character and
+cannot be told from Norwegian at two words. FINDINGS §21 has the per-language
+table, the gate verdict and the two pre-existing weaknesses it exposed.
+
+A guess from either new stage is **confident**, so it is written to
+`segments.lang` with `lang_via = "guessed"` exactly as 0.10.2's confident
+stopword guess is. Clients need no change: `lang` and `lang_via` mean what they
+already meant.
+
+### A translation while the line is still on screen
+
+Until now every translation came from the assistant's idle pass, and that pass
+yields the model to the enrichment queue for five minutes at a time
+(`assist::SHARE_EVERY_S`). For a paragraph about last night that is fine. For
+the sentence somebody is reading it is not a caption at all.
+
+When `write_segment` commits a turn whose language — stamped, or guessed at
+commit time — is outside `read_languages ∪ {translate_to}` and outside the
+languages the user's own voice is declared to speak, and translation is on, the
+segment id goes onto a bounded queue and the assistant thread is woken. The
+worker drains that queue **first**: before digests, before the fair-share
+arithmetic, one model call per line.
+
+* The queue holds 64 ids. Past that the **oldest** is dropped and counted — the
+  newest line is the one being read, and a dropped id loses nothing permanently
+  because the row still has a NULL `translation_via` and the ordinary pass will
+  offer it again.
+* `status`'s `assist` block gains two counters: `live_queued` and
+  `live_dropped`. Both are read from the queue rather than from the rows, so
+  they are zero on a fresh daemon and say nothing about history.
+* The gates that are about the machine still apply in full and are re-checked
+  between every line: **paused writes nothing, including this**, and a
+  transcription backlog stands the pass down. Only the fair share is skipped.
+* Changing `translate_to`, including switching translation off, empties the
+  queue. A line queued for one target is not a line anybody asked to read in
+  another.
+* The three-word floor becomes **two words** for a line whose language was named
+  confidently — a two-word French line is still a line the reader cannot read.
+  One word stays out at any confidence.
+
+Measured end to end on the fixture path, from the `write_segment` hook to the
+`segment` event carrying the translation: **median 3.94 s** over five foreign
+lines with qwen2.5-3b at `-t 4`, which is the model call and almost nothing
+else.
