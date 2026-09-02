@@ -330,6 +330,43 @@ verdict-first grammar is for.")]
         day: Option<String>,
     },
     // ---- end 0.9.0 -------------------------------------------------------
+
+    // ---- 0.10.0, worlds and turn-taking ----------------------------------
+    /// How one person talks: their share, their turns, who interrupts whom.
+    ///
+    /// Every number is a query over turns that already exist — nothing is
+    /// stored and nothing is guessed by a model. Two of them are
+    /// approximations with named failure modes, and the command prints the
+    /// definition under the number rather than making you look it up.
+    #[command(
+        long_about = "How one person talks, over every conversation they have taken part in.
+
+`--days N` restricts it to the last N days.
+
+INTERRUPTIONS and LATENCY are approximations and the output says how. An
+interruption is a turn that starts while somebody else is still talking AND
+whose own audio holds overlapped speech; the overlap proves two people were
+audible, not which two, and it cannot tell a genuine interruption from a
+back-channel \"mhm\". Latency is the median gap from the previous speaker's
+turn ending to theirs starting, over gaps of at most five seconds — longer
+ones are dropped rather than clamped, because past that it is a lull and not
+a reply."
+    )]
+    Stats {
+        #[arg(value_name = "SPEAKER_ID")]
+        speaker_id: i64,
+        /// Only the last N days.
+        #[arg(long, value_name = "N")]
+        days: Option<i64>,
+    },
+
+    /// Every world a conversation has happened in.
+    Worlds {
+        /// How many to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    // ---- end 0.10.0 ------------------------------------------------------
     /// Chronological transcript dump.
     Transcript {
         /// Restrict to one capture session.

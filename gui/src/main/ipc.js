@@ -68,6 +68,11 @@ const ALLOWED = new Set([
   // ride on `notes.list` and `notes.set_state`, both already here — and a
   // translation rides on the segment.
   'digest.list',
+  // Worlds and turn-taking (0.10.0). Two reads: the Memory view's Worlds card
+  // and the person page's "How you talk". A method the UI calls and this set
+  // forgets is a card that never renders and says nothing about why.
+  'worlds.list',
+  'person.stats',
   'segments.audio',
   'segments.reassign',
   'segments.correct',

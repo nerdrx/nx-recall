@@ -31,6 +31,8 @@
 //         what a client turns into a brief.
 //   4th — the SAME join again, immediately, so a client's brief debounce is
 //         testable rather than merely assertable in prose.
+//   5th — a `visit` event (0.10.0): a world entry, with its name. What the
+//         Worlds card and the "Where you meet" chips are fed by.
 //
 // A signal rather than a timer because both are things a test has to be able to
 // place: a note that arrives at second 19 of a two-minute run lands in whatever
@@ -42,7 +44,7 @@ import path from 'node:path';
 
 const PROTO = 1;
 const DAEMON = 'recalld-mock/0.5';
-const SCHEMA = 11;
+const SCHEMA = 12;
 const REPLAY_MAX = 200; // deliberately small: overrunning it must be reachable
 // Copied from crates/recalld/src/service.rs::SPLIT_EVENT_CAP. Past it a split
 // stops publishing one `segment` event per moved row and says `resync: true`
@@ -238,6 +240,23 @@ const TRANSLATED = new Map([
 /// with" both need more than one to say anything.
 const THREAD_BLOCK = 5;
 const threadFor = (i) => 500 + Math.floor(i / THREAD_BLOCK);
+
+// ---------------------------------------------------------------------------
+// worlds (0.10.0)
+// ---------------------------------------------------------------------------
+//
+// Two, because one proves nothing: a person page's "Where you meet" is a LIST
+// and a world facet has to be able to exclude something. Threads alternate
+// between them so both have people in them and neither has all of them.
+const WORLDS = [
+  { world_id: 'wrld_4432ea9b-729c-46e3-8eaf-846aa0a37fdd', name: 'The Great Pug' },
+  { world_id: 'wrld_9c1f0a2b-11d4-4f7a-9c33-0b7e5a6d8e10', name: 'Ghost Club' },
+];
+/// Which world a conversation happened in. Deterministic and deliberately not
+/// random: an e2e step that clicks "The Great Pug" must find the same rows on
+/// every run.
+const worldOfThread = (thread) =>
+  thread == null ? null : WORLDS[thread % WORLDS.length].world_id;
 
 // ---------------------------------------------------------------------------
 // the back catalogue (0.7.4)
@@ -1061,6 +1080,172 @@ export function startMock({
         .sort((a, b) => b[1] - a[1])
         .map(([id]) => ({ speaker_id: id, ...person(id) })),
       preview: rows.find((s) => s.speaker != null && s.text)?.text ?? null,
+      // 0.10.0: where it happened, and who did the talking.
+      world: worldPayload(worldOfThread(id)),
+      stats: { shares: sharesOf(rows) },
+    };
+  }
+
+  // ---- 0.10.0: worlds and turn-taking ------------------------------------
+
+  /// Resolve a `world` facet the way the daemon does: an id matches exactly, a
+  /// name matches as a case-insensitive substring, and a facet nobody has a
+  /// world for selects NOTHING rather than everything.
+  function resolveWorld(facet) {
+    const f = String(facet ?? '').trim();
+    if (!f) return null;
+    if (f.startsWith('wrld_')) return [f];
+    const hit = WORLDS.filter((w) => w.name.toLowerCase().includes(f.toLowerCase()));
+    return hit.length ? hit.map((w) => w.world_id) : ['\u0000no-such-world'];
+  }
+
+  function withinWorld(rows, facet) {
+    const ids = resolveWorld(facet);
+    if (!ids) return rows;
+    return rows.filter((s) => ids.includes(worldOfThread(s.thread)));
+  }
+
+  function worldPayload(worldId) {
+    if (!worldId) return null;
+    const w = WORLDS.find((x) => x.world_id === worldId);
+    return { world_id: worldId, name: w?.name ?? null };
+  }
+
+  /// Every identified voice's share of a set of rows, most talkative first.
+  /// The same definition the daemon uses: speech time, not turn count.
+  function sharesOf(rows) {
+    const acc = new Map();
+    let total = 0;
+    for (const seg of rows) {
+      const who = owner(seg);
+      if (who == null) continue;
+      const c = acc.get(who) ?? { turns: 0, ms: 0 };
+      c.turns += 1;
+      c.ms += seg.dur_ms;
+      acc.set(who, c);
+      total += seg.dur_ms;
+    }
+    return [...acc.entries()]
+      .map(([speaker_id, c]) => ({
+        speaker_id,
+        turns: c.turns,
+        speech_ms: c.ms,
+        share: total ? c.ms / total : 0,
+      }))
+      .sort((a, b) => b.speech_ms - a.speech_ms || a.speaker_id - b.speaker_id);
+  }
+
+  /// The turns of every conversation this voice took part in — the whole
+  /// conversation, because a share is a fraction of somebody else's speech too.
+  function turnsWith(speakerId, days) {
+    const threads = new Set(
+      state.segments.filter((s) => owner(s) === speakerId).map((s) => s.thread).filter((t) => t != null)
+    );
+    const from = days == null ? null : Date.now() - days * DAY;
+    return state.segments
+      .filter((s) => s.thread != null && threads.has(s.thread) && (from == null || s.t_ms >= from))
+      .sort((a, b) => a.thread - b.thread || a.t_ms - b.t_ms || a.id - b.id);
+  }
+
+  /// The stats block, to the same definitions the daemon documents. The mock
+  /// is not a second implementation of the rules — it is a fixture that has to
+  /// be the right SHAPE — but the arithmetic is the real arithmetic so the
+  /// GUI's bars and captions are exercised against numbers that add up.
+  function statsOf(speakerId, days) {
+    const turns = turnsWith(speakerId, days);
+    const byThread = new Map();
+    for (const t of turns) {
+      if (!byThread.has(t.thread)) byThread.set(t.thread, []);
+      byThread.get(t.thread).push(t);
+    }
+    let mine = 0;
+    let total = 0;
+    let myTurns = 0;
+    let longest = 0;
+    let span = 0;
+    let given = 0;
+    let received = 0;
+    const latencies = [];
+    const by = [];
+
+    for (const [thread, rows] of byThread) {
+      const start = Math.min(...rows.map((r) => r.t_ms));
+      const end = Math.max(...rows.map((r) => r.t_ms + r.dur_ms));
+      span += end - start;
+      let runStart = null;
+      let runEnd = 0;
+      let threadMine = 0;
+      let threadTotal = 0;
+      let threadTurns = 0;
+      rows.forEach((r, i) => {
+        const who = owner(r);
+        if (who == null) return;
+        total += r.dur_ms;
+        threadTotal += r.dur_ms;
+        if (who === speakerId) {
+          mine += r.dur_ms;
+          myTurns += 1;
+          threadMine += r.dur_ms;
+          threadTurns += 1;
+          if (runStart == null) {
+            runStart = r.t_ms;
+            runEnd = r.t_ms + r.dur_ms;
+          } else {
+            runEnd = Math.max(runEnd, r.t_ms + r.dur_ms);
+          }
+          longest = Math.max(longest, runEnd - runStart);
+        } else if (runStart != null) {
+          runStart = null;
+        }
+        // An interruption: it starts inside somebody else's turn AND its own
+        // audio holds overlapped speech. The mock has no overlap column, so it
+        // stands in the one thing it does have — a turn that begins before the
+        // one before it has ended.
+        for (const a of rows.slice(0, i)) {
+          const other = owner(a);
+          if (other == null || other === who) continue;
+          if (a.t_ms < r.t_ms && r.t_ms < a.t_ms + a.dur_ms) {
+            if (who === speakerId) given += 1;
+            if (other === speakerId) received += 1;
+          }
+        }
+        if (who === speakerId) {
+          const prev = rows.slice(0, i).reverse().find((p) => owner(p) != null);
+          if (prev && owner(prev) !== speakerId) {
+            const gap = r.t_ms - (prev.t_ms + prev.dur_ms);
+            if (gap >= 0 && gap <= 5000) latencies.push(gap);
+          }
+        }
+      });
+      if (threadTurns) {
+        by.push({
+          thread_id: thread,
+          turns: threadTurns,
+          share: threadTotal ? threadMine / threadTotal : 0,
+          last_ms: end,
+        });
+      }
+    }
+    latencies.sort((a, b) => a - b);
+    const median = latencies.length
+      ? latencies.length % 2
+        ? latencies[(latencies.length - 1) / 2]
+        : Math.trunc((latencies[latencies.length / 2 - 1] + latencies[latencies.length / 2]) / 2)
+      : null;
+    by.sort((a, b) => b.last_ms - a.last_ms || b.thread_id - a.thread_id);
+    return {
+      turns: myTurns,
+      speech_ms: mine,
+      conversation_speech_ms: total,
+      share: total ? mine / total : 0,
+      mean_turn_ms: myTurns ? Math.trunc(mine / myTurns) : 0,
+      longest_monologue_ms: longest,
+      interruptions_given: given,
+      interruptions_received: received,
+      median_latency_ms: median,
+      span_ms: span,
+      turns_per_minute: span ? myTurns / (span / 60000) : 0,
+      by_conversation: by.slice(0, 10),
     };
   }
 
@@ -1425,15 +1610,27 @@ export function startMock({
       lang: d.lang,
       summary: d.summary,
       open: d.open ?? [],
-      participants: (d.people ?? []).map((id) => ({
-        speaker_id: id,
-        label: state.speakers.find((s) => s.id === id)?.name ?? null,
-      })),
+      // 0.10.0: the share travels ON the participant, not as a parallel list
+      // — a client that has to join two arrays to draw one bar will
+      // eventually join them wrong.
+      participants: (() => {
+        const shares = sharesOf(state.segments.filter((s) => s.thread === d.thread_id));
+        return (d.people ?? []).map((id) => {
+          const sh = shares.find((x) => x.speaker_id === id);
+          return {
+            speaker_id: id,
+            label: state.speakers.find((s) => s.id === id)?.name ?? null,
+            share: sh?.share ?? null,
+            turns: sh?.turns ?? null,
+          };
+        });
+      })(),
       started_ms: started,
       started_ns: String(started) + '000000',
       ended_ms: started + 40 * 60_000,
       ended_ns: String(started + 40 * 60_000) + '000000',
       turns: 12,
+      world: worldOfThread(d.thread_id),
       model_id: 'qwen2.5-3b-instruct-q4_k_m@1',
       created_ms: Date.now(),
     };
@@ -1450,6 +1647,8 @@ export function startMock({
     [/\b(last week|letzte woche|this week|diese woche)\b/i, 7, 0],
   ];
 
+  const escapeRe = (t) => String(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
   function interpret(q) {
     let rest = String(q ?? '');
     const out = { query: '', mode: state.semantic ? 'hybrid' : 'keyword' };
@@ -1463,6 +1662,20 @@ export function startMock({
       if (!re.test(rest)) continue;
       out.speaker_id = sp.id;
       out.speaker_label = name;
+      rest = rest.replace(re, ' ');
+      break;
+    }
+
+    // 0.10.0 — "in <world>", "in the <world> world", "in der <world> Welt".
+    // The preposition is mandatory: a world name is free text and "who
+    // mentioned the Great Pug" is a search, not a filter. Longest name first.
+    for (const w of [...WORLDS].sort((a, b) => b.name.length - a.name.length)) {
+      const bare = w.name.replace(/^(the|a)\s+/i, '');
+      const alt = `(?:${escapeRe(w.name)}|${escapeRe(bare)})`;
+      const re = new RegExp(`\\bin\\s+(?:der|die|das|dem|den|the|a)?\\s*${alt}(?:\\s+(?:welt|world))?\\b`, 'i');
+      if (!re.test(rest)) continue;
+      out.world_id = w.world_id;
+      out.world_label = w.name;
       rest = rest.replace(re, ' ');
       break;
     }
@@ -1996,10 +2209,102 @@ export function startMock({
             roster_seconds: person(id).name && sp.name ? Math.round(e.ms / 100) / 10 : null,
           }))
           .sort((a, b) => b.threads - a.threads || b.speech_ms - a.speech_ms),
+        // 0.10.0 — where you meet. Grouped by world, most time first, and a
+        // world with no name would render as its id (both fixtures have one).
+        worlds: (() => {
+          const acc = new Map();
+          for (const t of threads) {
+            const world = worldOfThread(t);
+            if (!world) continue;
+            const rows = state.segments.filter((x) => x.thread === t);
+            if (!rows.length) continue;
+            const start = Math.min(...rows.map((x) => x.t_ms));
+            const end = Math.max(...rows.map((x) => x.t_ms + x.dur_ms));
+            const w = acc.get(world) ?? { days: new Set(), ms: 0, last: 0 };
+            w.days.add(new Date(start).toDateString());
+            w.ms += end - start;
+            w.last = Math.max(w.last, end);
+            acc.set(world, w);
+          }
+          return [...acc.entries()]
+            .map(([world_id, w]) => ({
+              world_id,
+              name: WORLDS.find((x) => x.world_id === world_id)?.name ?? null,
+              visits: w.days.size,
+              last_ms: w.last,
+              last_ns: String(w.last) + '000000',
+              minutes_together: w.ms / 60000,
+              together_ms: w.ms,
+            }))
+            .sort((a, b) => b.together_ms - a.together_ms || b.last_ms - a.last_ms)
+            .slice(0, 8);
+        })(),
         recent_threads: [...threads]
           .sort((a, b) => b - a)
           .slice(0, 12)
           .map((t) => threadPayload(t)),
+      };
+    },
+
+    // --- 0.10.0: worlds and turn-taking ------------------------------------
+
+    'worlds.list'(params) {
+      const limit = Math.min(500, Math.max(1, Number(params?.limit ?? 20)));
+      const rows = WORLDS.map((w) => {
+        const threads = [...new Set(state.segments.map((s) => s.thread).filter((t) => t != null))]
+          .filter((t) => worldOfThread(t) === w.world_id);
+        const segs = state.segments.filter((s) => threads.includes(s.thread));
+        const spoke = new Map();
+        for (const seg of segs) {
+          const who = owner(seg);
+          if (who == null) continue;
+          spoke.set(who, (spoke.get(who) ?? 0) + seg.dur_ms);
+        }
+        const last = segs.length ? Math.max(...segs.map((s) => s.t_ms + s.dur_ms)) : 0;
+        // A visit is an EVENING, not a conversation: several threads happen in
+        // one instance, and a world claiming 151 visits from 151 threads would
+        // be counting the wrong thing.
+        const days = new Set(segs.map((x) => new Date(x.t_ms).toDateString()));
+        return {
+          world_id: w.world_id,
+          name: w.name,
+          visits: days.size,
+          last_ms: last,
+          last_ns: String(last) + '000000',
+          people: [...spoke.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 6)
+            .map(([id]) => ({ speaker_id: id, label: person(id).name ?? person(id).auto })),
+          // Tier 2 output: whatever enrichment happened to label these
+          // conversations, and an empty list when it labelled none.
+          topics: [...new Set(threads.map((t) => state.topics[t]).filter(Boolean))].slice(0, 5),
+        };
+      }).sort((a, b) => b.last_ms - a.last_ms);
+      return { total: rows.length, worlds: rows.slice(0, limit) };
+    },
+
+    'person.stats'(params) {
+      const sp = speakerById(Number(params?.id));
+      if (!sp) throw err('not_found', `no speaker ${params?.id}`);
+      const days = params?.days == null ? null : Number(params.days);
+      if (days != null && !(days > 0)) throw err('params', 'days must be positive');
+      const s = statsOf(sp.id, days);
+      return {
+        id: sp.id,
+        days,
+        from_ms: days == null ? null : Date.now() - days * DAY,
+        ...s,
+        // The caveats travel with the numbers, exactly as the daemon sends
+        // them: a client that renders an approximation without its definition
+        // is making a claim the daemon did not.
+        definitions: {
+          interruption:
+            'a turn of theirs that starts while somebody else is still talking AND whose own audio holds at least 10% overlapped speech — the same line above which the daemon refuses to name a voice. The overlap says two people were audible, not which two; the clock supplies the name. It cannot tell an interruption from a back-channel.',
+          latency:
+            "the median gap from the previous speaker's turn ending to theirs starting, over gaps of 0 to 5000 ms. Longer gaps are dropped rather than clamped: past that it is a lull, not a reply.",
+          share:
+            'their speech time over the speech time of every identified voice in the same conversations',
+        },
       };
     },
 
@@ -2268,6 +2573,7 @@ export function startMock({
       if (interpretation.speaker_id != null) facets.speaker = interpretation.speaker_id;
       if (interpretation.from_ns) facets.from = Number(interpretation.from_ns) / 1e6;
       if (interpretation.to_ns) facets.to = Number(interpretation.to_ns) / 1e6;
+      if (interpretation.world_id) facets.world = interpretation.world_id;
 
       // A question with no words left in it is a browse, not a search: the
       // facets are the whole query and the keyword leg has nothing to match on.
@@ -2322,6 +2628,7 @@ export function startMock({
       if (q) rows = rows.filter((s) => s.text.toLowerCase().includes(q));
       if (params?.speaker != null) rows = rows.filter((s) => s.speaker === Number(params.speaker));
       if (params?.source) rows = rows.filter((s) => s.source === params.source);
+      rows = withinWorld(rows, params?.world);
       // Inclusive `from`, exclusive `to`, ISO or number — the same time
       // semantics every filtered method on this socket uses.
       const from = mockTimeParam(params?.from);
@@ -2357,6 +2664,7 @@ export function startMock({
       let rows = state.segments;
       if (params?.speaker != null) rows = rows.filter((s) => s.speaker === Number(params.speaker));
       if (params?.source) rows = rows.filter((s) => s.source === params.source);
+      rows = withinWorld(rows, params?.world);
       if (params?.from) rows = rows.filter((s) => s.t_ms >= Date.parse(params.from));
       if (params?.to) rows = rows.filter((s) => s.t_ms <= Date.parse(params.to));
 
@@ -2396,7 +2704,13 @@ export function startMock({
     },
 
     transcript(params) {
-      return { segments: transcriptPage(state.segments, params), sessions: SESSIONS };
+      // 0.10.0: the world facet works here too, which is what makes "show me
+      // everything said in The Great Pug" a browse rather than a search for
+      // no words.
+      return {
+        segments: transcriptPage(withinWorld(state.segments, params?.world), params),
+        sessions: SESSIONS,
+      };
     },
 
     'delete.preview'(params) {
@@ -2623,6 +2937,19 @@ export function startMock({
     // A named voice walking into the instance. `who` is the VRChat display
     // name; linking it to a speaker is the client's job and is deliberately
     // case-insensitive on the user-given name (crates/recalld/src/roster.rs).
+    if (n > 4) {
+      // 0.10.0. A world entry, on the `roster` topic and deliberately not a
+      // rename of the `roster` event: `roster` says who is present, `visit`
+      // says a place was entered.
+      const w = WORLDS[0];
+      emit('roster', 'visit', {
+        world_id: w.world_id,
+        instance: '12345',
+        name: w.name,
+        t: String(Date.now()) + '000000',
+      });
+      return { sent: 'visit', world: w.name };
+    }
     const who = state.speakers.find((s) => s.name)?.name ?? 'Kira';
     emit('roster', 'roster', { ev: 'join', who, t: String(Date.now()) + '000000' });
     return { sent: 'roster.join', who, repeat: n > 2 };

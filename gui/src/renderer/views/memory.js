@@ -21,7 +21,7 @@
 //      size, the core count, when it runs, that it is off by default, and that
 //      nothing leaves the machine — in plain words, next to the switch.
 
-import { h, clear, fmtDate, fmtClock, fmtDayLabel, speakerColor } from '../lib/dom.js';
+import { h, clear, fmtDate, fmtClock, fmtDayLabel, fmtDur, speakerColor } from '../lib/dom.js';
 import { store, speakerLabel, ask } from '../lib/store.js';
 import { toast } from '../lib/sheets.js';
 
@@ -167,6 +167,8 @@ export function mount(root, ctx) {
   let pendingFocus = null;
   let accuracy = null;
   let vocab = store.vocab;
+  /// 0.10.0 — every place a conversation has happened.
+  let worlds = [];
 
   const sub = h('span', { class: 'sub', id: 'memory-sub' });
   const digestCard = h('div', { class: 'card', id: 'digest-card' });
@@ -175,6 +177,9 @@ export function mount(root, ctx) {
   const accuracyCard = h('div', { class: 'card', id: 'accuracy-card' });
   const vocabCard = h('div', { class: 'card', id: 'vocab-card' });
   const topicsCard = h('div', { class: 'card', id: 'topics-card' });
+  // 0.10.0. Above Topics, below Notes: a world is WHERE, a topic is WHAT, and
+  // the where is the one people remember first.
+  const worldsCard = h('div', { class: 'card', id: 'worlds-card' });
   const enrichCard = h('div', { class: 'card', id: 'enrich-card' });
   const body = h(
     'div',
@@ -188,6 +193,7 @@ export function mount(root, ctx) {
     // The correction loop, in the order it happens (see the note at the top).
     accuracyCard,
     vocabCard,
+    worldsCard,
     topicsCard,
     enrichCard
   );
@@ -299,9 +305,37 @@ export function mount(root, ctx) {
           ...people.map((p) =>
             h(
               'span',
-              { class: 'chip person', dataset: { sp: String(p.speaker_id) } },
+              {
+                class: 'chip person',
+                dataset: {
+                  sp: String(p.speaker_id),
+                  ...(p.share == null ? {} : { share: p.share.toFixed(3) }),
+                },
+                // 0.10.0: the bar is speech TIME, not turn count — two people
+                // take the same number of turns and one of them talks four
+                // times as long. The tooltip says which, because a bar with no
+                // units is a bar that gets read as the other thing.
+                title:
+                  p.share == null
+                    ? ''
+                    : `${Math.round(p.share * 100)}% of the speech in this conversation, over ${
+                        p.turns ?? 0
+                      } turn${p.turns === 1 ? '' : 's'}`,
+              },
               h('span', { class: 'dot', style: `color:${speakerColor(p.speaker_id)}` }),
-              p.label || speakerLabel(p.speaker_id)
+              p.label || speakerLabel(p.speaker_id),
+              p.share == null
+                ? null
+                : h(
+                    'span',
+                    { class: 'share-bar' },
+                    h('span', {
+                      class: 'share-bar-fill',
+                      style: `width:${Math.min(100, Math.max(0, p.share * 100))}%;background:${speakerColor(
+                        p.speaker_id
+                      )}`,
+                    })
+                  )
             )
           )
         ),
@@ -883,6 +917,88 @@ export function mount(root, ctx) {
 
   // -- topics ---------------------------------------------------------------
 
+  // -- worlds (0.10.0) ------------------------------------------------------
+  //
+  // Every place a conversation has happened, newest visit first. It renders
+  // NOTHING when there is nothing — a machine with no VRChat on it has no
+  // worlds and never will, and an empty state would be a permanent
+  // advertisement for a game.
+  //
+  // A row leads to Search, filtered to that world. There is deliberately no
+  // world page: what a person wants from "The Great Pug" is what was said
+  // there, which is a search — a surface that already exists and can be
+  // narrowed further.
+
+  function renderWorlds() {
+    clear(worldsCard);
+    worldsCard.hidden = !worlds.length;
+    if (!worlds.length) return;
+    worldsCard.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('div', { class: 'card-title', text: 'Worlds' }),
+        h('span', {
+          class: 'sub',
+          id: 'worlds-sub',
+          text: `${worlds.length} place${worlds.length === 1 ? '' : 's'} · from VRChat’s own log`,
+        })
+      )
+    );
+    const list = h('div', { class: 'world-list', id: 'world-list' });
+    for (const w of worlds) {
+      const named = !!w.name;
+      const people = w.people ?? [];
+      list.append(
+        h(
+          'button',
+          {
+            class: 'world-row',
+            dataset: { world: w.world_id },
+            title: named ? `${w.world_id} — search what was said here` : 'Search what was said here',
+            onclick: () => ctx.searchWorld?.(w.world_id, w.name),
+          },
+          h(
+            'span',
+            { class: 'world-row-main' },
+            h('span', { class: `world-name${named ? '' : ' unnamed'}`, text: named ? w.name : w.world_id }),
+            h(
+              'span',
+              { class: 'world-people' },
+              ...people.map((p) =>
+                h(
+                  'span',
+                  { class: 'chip person', dataset: { sp: String(p.speaker_id) } },
+                  h('span', { class: 'dot', style: `color:${speakerColor(p.speaker_id)}` }),
+                  p.label || speakerLabel(p.speaker_id)
+                )
+              ),
+              people.length ? null : h('span', { class: 'sub', text: 'nobody identified here yet' })
+            ),
+            // Tier 2 output, and absent on a machine that has never run
+            // enrichment — which is most of them, and is not an error.
+            (w.topics ?? []).length
+              ? h('span', { class: 'world-topics', text: (w.topics ?? []).join(' · ') })
+              : null
+          ),
+          h(
+            'span',
+            { class: 'world-num' },
+            String(w.visits ?? 0),
+            h('small', { text: w.visits === 1 ? 'visit' : 'visits' })
+          ),
+          h(
+            'span',
+            { class: 'world-num' },
+            w.last_ms ? fmtDate(new Date(w.last_ms).toISOString()) : '—',
+            h('small', { text: 'last there' })
+          )
+        )
+      );
+    }
+    worldsCard.append(list);
+  }
+
   function renderTopics() {
     clear(topicsCard);
     topicsCard.append(h('div', { class: 'card-title', text: 'Topics' }));
@@ -1267,6 +1383,15 @@ export function mount(root, ctx) {
           digests = [];
         })
         .then(renderDigests),
+      // 0.10.0. Its own slice for the same reason every one above it has one.
+      ask('worlds.list', { limit: 12 })
+        .then((r) => {
+          worlds = r.worlds ?? [];
+        })
+        .catch(() => {
+          worlds = [];
+        })
+        .then(renderWorlds),
     ]);
   }
 
@@ -1313,6 +1438,7 @@ export function mount(root, ctx) {
   renderNotes();
   renderAccuracy();
   renderVocab();
+  renderWorlds();
   renderTopics();
   renderEnrichment();
   void load();

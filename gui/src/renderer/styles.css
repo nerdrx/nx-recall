@@ -1376,3 +1376,71 @@ button.sp-num:focus-visible { outline: none; box-shadow: var(--clear-focus); }
   font-style: italic;
 }
 .tr-mark { font-style: normal; color: var(--clear-faint); flex: none; }
+
+/* ---- 0.10.0: worlds and turn-taking ------------------------------------ */
+
+/* A world is a NAME and two numbers. Chips on the person page, because five of
+   them read at a glance where five table rows do not; rows in Memory, because
+   that card also carries who is there and what gets talked about. */
+.world-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.world-chip {
+  display: flex; flex-direction: column; gap: 4px; align-items: flex-start;
+  padding: 9px 12px; border-radius: var(--clear-r-control); text-align: left;
+  background: var(--clear-tile); border: 1px solid var(--clear-line);
+  color: var(--clear-ink); font: inherit; cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft);
+}
+.world-chip:hover { background: var(--clear-surface); border-color: var(--clear-line-accent); }
+.world-chip:focus-visible { outline: none; box-shadow: var(--clear-focus); }
+.world-name { font-size: 13.5px; font-weight: 640; }
+/* A world with no name renders as its id, and an id is not a name: it reads in
+   the same quieter monospace an unnamed voice does. */
+.world-name.unnamed, .world-chip.unnamed .world-name {
+  font: 500 11.5px/1.3 var(--mono); color: var(--clear-muted);
+  overflow: hidden; text-overflow: ellipsis; max-width: 34ch; white-space: nowrap;
+}
+.world-meta { font: 600 10px/1 var(--font); letter-spacing: 0.06em; color: var(--clear-muted); }
+
+.world-list { display: flex; flex-direction: column; gap: 6px; }
+.world-row {
+  display: grid; align-items: center; gap: var(--sp-2); width: 100%;
+  grid-template-columns: minmax(0, 1fr) 76px 116px;
+  padding: 11px 12px; border-radius: var(--clear-r-control); text-align: left;
+  background: var(--clear-tile); border: 1px solid var(--clear-line);
+  color: var(--clear-ink); font: inherit; cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft);
+}
+.world-row:hover { background: var(--clear-surface); border-color: var(--clear-line-accent); }
+.world-row:focus-visible { outline: none; box-shadow: var(--clear-focus); }
+.world-row-main { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.world-people { display: flex; flex-wrap: wrap; gap: 4px; }
+.world-topics { font-size: 11.5px; color: var(--clear-muted); }
+.world-num { font: 600 13px/1 var(--mono); text-align: right; color: var(--clear-ink); }
+.world-num small {
+  display: block; margin-top: 5px; font: 600 9.5px/1 var(--font);
+  letter-spacing: 0.11em; text-transform: uppercase; color: var(--clear-muted);
+}
+
+/* The share bar. A number is a fact; the bar is what makes it a comparison. */
+.talk-share { margin-bottom: var(--sp-2); }
+.talk-share-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 7px; }
+.talk-share-head b { font: 640 22px/1 var(--mono); color: var(--clear-ink); }
+.talk-share-head small { font-size: 12px; color: var(--clear-muted); }
+.talk-bar {
+  height: 8px; border-radius: 999px; overflow: hidden;
+  background: var(--clear-tile); border: 1px solid var(--clear-line);
+}
+.talk-bar-fill { display: block; height: 100%; background: var(--violet); }
+/* An approximation says so where it is rendered. The cell carries the daemon's
+   own definition as its title; this is the hint that there is one to read. */
+.talk-why { color: var(--clear-muted); font-size: 10px; }
+.person-stat[data-talk] { cursor: help; }
+
+/* A participant chip that also carries how much of the conversation was
+   theirs. Under the name rather than beside it, so the chip stays a chip. */
+.chip.person .share-bar {
+  display: block; width: 100%; height: 3px; margin-top: 4px;
+  border-radius: 999px; background: var(--clear-line); overflow: hidden;
+}
+.chip.person .share-bar-fill { display: block; height: 100%; }
+.chip.person[data-share] { flex-direction: column; align-items: flex-start; }

@@ -50,6 +50,14 @@ pub mod mode {
     pub const FACETS: &str = "facets";
 }
 
+/// A world a question may name (0.10.0). The id is what a facet resolves to;
+/// the label is what the pill says, spelled as VRChat spells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct World {
+    pub id: String,
+    pub label: String,
+}
+
 /// A voice a question may name. Only *named* speakers are offered: an
 /// auto-label (`Speaker_07`) is not something anybody types into a question,
 /// and matching one fuzzily would turn every stray number into a facet.
@@ -74,10 +82,28 @@ pub struct Interpretation {
     pub from_ns: Option<i64>,
     /// Exclusive upper bound, UTC nanoseconds.
     pub to_ns: Option<i64>,
+    /// 0.10.0 — the world the question was about, if it named one.
+    pub world_id: Option<String>,
+    /// Spelled as the log spells it, for the same reason `speaker_label` is.
+    pub world_label: Option<String>,
 }
 
 /// Read a question apart, relative to `now_ns`.
+///
+/// The world-less form, kept because most callers have no world list and
+/// because every test written before 0.10.0 is a statement about this
+/// behaviour that must not quietly change.
 pub fn parse(question: &str, now_ns: i64, named: &[Named]) -> Interpretation {
+    parse_with_worlds(question, now_ns, named, &[])
+}
+
+/// Read a question apart, worlds included (0.10.0).
+pub fn parse_with_worlds(
+    question: &str,
+    now_ns: i64,
+    named: &[Named],
+    worlds: &[World],
+) -> Interpretation {
     let mut tokens = tokenize(question);
     let mut out = Interpretation::default();
 
@@ -87,6 +113,20 @@ pub fn parse(question: &str, now_ns: i64, named: &[Named]) -> Interpretation {
     if let Some((from, to, span)) = match_time(&tokens, now_ns) {
         out.from_ns = Some(from);
         out.to_ns = Some(to);
+        for t in &mut tokens[span.0..span.1] {
+            t.taken = true;
+        }
+    }
+
+    // Then the world, which is matched BEFORE the speaker and only ever
+    // behind an "in": a world name is free text and can contain anything —
+    // including somebody's name — so the preposition is what stops it from
+    // eating the question. "in der Great Pug Welt" and "in The Great Pug" both
+    // work; "The Great Pug" on its own is words to search for, which is the
+    // right reading of a question that did not say where.
+    if let Some((world, span)) = match_world(&tokens, worlds) {
+        out.world_id = Some(world.id.clone());
+        out.world_label = Some(world.label.clone());
         for t in &mut tokens[span.0..span.1] {
             t.taken = true;
         }
@@ -456,6 +496,79 @@ fn match_speaker<'a>(tokens: &[Token], named: &'a [Named]) -> Option<(&'a Named,
     None
 }
 
+/// The world a question names, as `(world, token span)`.
+///
+/// The shape is `in [der|die|das|the|a] <name> [welt|world]`, and the leading
+/// preposition is mandatory. Longest name first, so a world called "Pug" cannot
+/// steal a question about "The Great Pug".
+fn match_world<'a>(tokens: &[Token], worlds: &'a [World]) -> Option<(&'a World, (usize, usize))> {
+    /// Articles that may sit between "in" and the name. German needs them
+    /// ("in der … Welt"); English tolerates them.
+    const ARTICLES: &[&str] = &["der", "die", "das", "dem", "den", "the", "a"];
+    /// The word that may close the phrase, and is swallowed with it.
+    const TRAILERS: &[&str] = &["welt", "world"];
+
+    let mut candidates: Vec<(&World, Vec<String>)> = Vec::new();
+    for w in worlds {
+        let words: Vec<String> = w
+            .label
+            .split_whitespace()
+            .map(fold)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if words.is_empty() {
+            continue;
+        }
+        // "in der Great Pug Welt" is how a German sentence says "The Great
+        // Pug": the world's own article has been replaced by a German one.
+        // So a label that STARTS with an article is also offered without it.
+        if words.len() > 1 && ARTICLES.contains(&words[0].as_str()) {
+            candidates.push((w, words[1..].to_vec()));
+        }
+        candidates.push((w, words));
+    }
+    candidates.sort_by_key(|(_, words)| std::cmp::Reverse(words.len()));
+
+    for i in 0..tokens.len() {
+        if tokens[i].taken || tokens[i].folded != "in" {
+            continue;
+        }
+        // With and without an article, in that order — "in der Welt" must not
+        // read "der" as the first word of a world called "der …".
+        for lead in [2usize, 1] {
+            let first = i + lead;
+            if lead == 2
+                && !tokens
+                    .get(i + 1)
+                    .is_some_and(|t| ARTICLES.contains(&t.folded.as_str()))
+            {
+                continue;
+            }
+            for (world, words) in &candidates {
+                let end = first + words.len();
+                if end > tokens.len() || tokens[first..end].iter().any(|t| t.taken) {
+                    continue;
+                }
+                if !tokens[first..end]
+                    .iter()
+                    .zip(words)
+                    .all(|(t, w)| &t.folded == w)
+                {
+                    continue;
+                }
+                // Swallow a closing "Welt"/"world" so it does not survive into
+                // the search terms as a word nobody said.
+                let end = match tokens.get(end) {
+                    Some(t) if TRAILERS.contains(&t.folded.as_str()) => end + 1,
+                    _ => end,
+                };
+                return Some((world, (i, end)));
+            }
+        }
+    }
+    None
+}
+
 /// Does one token name one word of a display name?
 ///
 /// Possessives on both sides of the language: "Aspens" (German genitive),
@@ -744,6 +857,91 @@ mod tests {
         let offset = local_offset_s(now());
         let today = (now().div_euclid(SEC) + offset).div_euclid(DAY_S);
         ((today + delta) * DAY_S - offset) * SEC
+    }
+
+    // ---- 0.10.0: "in <world>" ------------------------------------------
+
+    fn worlds() -> Vec<World> {
+        vec![
+            World {
+                id: "wrld_pug".into(),
+                label: "The Great Pug".into(),
+            },
+            World {
+                id: "wrld_club".into(),
+                label: "Ghost Club".into(),
+            },
+            World {
+                id: "wrld_pug2".into(),
+                label: "Pug".into(),
+            },
+        ]
+    }
+
+    fn asked(q: &str) -> Interpretation {
+        parse_with_worlds(q, now(), &roster(), &worlds())
+    }
+
+    #[test]
+    fn a_world_is_read_out_of_a_question_in_de_and_en() {
+        for q in [
+            "was wurde in der Great Pug Welt über den shader gesagt",
+            "was wurde in The Great Pug über den shader gesagt",
+            "what was said in the Great Pug about the shader",
+            "what was said in The Great Pug world about the shader",
+        ] {
+            let it = asked(q);
+            assert_eq!(it.world_id.as_deref(), Some("wrld_pug"), "{q}");
+            // The label is the world's own spelling, not the question's.
+            assert_eq!(it.world_label.as_deref(), Some("The Great Pug"), "{q}");
+            // Neither the name nor its trailer survives into the search terms.
+            let left = it.query.to_lowercase();
+            assert!(
+                !left.contains("pug"),
+                "{q} left the world in the query: {left:?}"
+            );
+            assert!(
+                !left.contains("welt") && !left.contains("world"),
+                "{q}: {left:?}"
+            );
+            assert!(left.contains("shader"), "{q} lost the subject: {left:?}");
+        }
+    }
+
+    #[test]
+    fn the_longest_world_name_wins() {
+        // Both "Pug" and "The Great Pug" are worlds. The question names the
+        // longer one and must not be read as the shorter one plus a stray word.
+        let it = asked("in the Great Pug");
+        assert_eq!(it.world_id.as_deref(), Some("wrld_pug"));
+    }
+
+    #[test]
+    fn a_world_name_without_in_is_words_to_search_for() {
+        // The preposition is what makes it a facet. Without it, a world name
+        // is a phrase somebody may well have SAID, and swallowing it would
+        // silently turn a search into a filter.
+        let it = asked("who mentioned the Great Pug");
+        assert_eq!(it.world_id, None);
+        assert!(it.query.to_lowercase().contains("pug"), "{:?}", it.query);
+    }
+
+    #[test]
+    fn a_world_facet_does_not_steal_the_speaker() {
+        let it = asked("was hat Aspen gestern in der Ghost Club Welt gesagt");
+        assert_eq!(it.world_id.as_deref(), Some("wrld_club"));
+        assert_eq!(it.speaker_id, Some(7));
+        assert!(it.from_ns.is_some(), "and the day survived too");
+    }
+
+    #[test]
+    fn a_question_with_no_worlds_to_offer_parses_exactly_as_before() {
+        let q = "was hat Aspen gestern über den shader gesagt";
+        assert_eq!(
+            parse(q, now(), &roster()),
+            parse_with_worlds(q, now(), &roster(), &[])
+        );
+        assert_eq!(parse(q, now(), &roster()).world_id, None);
     }
 
     fn roster() -> Vec<Named> {
