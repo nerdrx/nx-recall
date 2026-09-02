@@ -138,6 +138,9 @@ failed are listed further down with their numbers.
 | A source prior ("that voice only lives on Discord") | changed **0 of 161** ground-truth decisions — ships off, with the audit that found the three labels it would have caught |
 | Daily digest refusing banter | 6/6 traps refused, 4/4 real conversations summarised, once the verdict got its own grammar |
 | Translation, FLEURS parallel sentences, e5 cosine | 0.948 against the reference (unrelated pairs: 0.79) |
+| Hearing Japanese in the audio (whisper-tiny), 200 utterances per language | **96.5% recall at 3 s, 0 of 400** German or English utterances heard as Japanese — the larger model was more accurate and failed the false-alarm gate |
+| Reading Japanese, character error rate on 3 s turns | Japanese Parakeet 11.3% on the CPU vs whisper-large-v3 11.5% on the GPU at twelve times the cost — the big model's lead exists only on long sentences a lobby never produces |
+| Partial captions while a turn is still open | words 2.4 s sooner and 96% of them survive into the final — at seven times the pipeline's CPU. Shipped off; the number an incremental decoder has to beat is written down |
 | Telling eighteen other languages apart from the two you read, 4 200 FLEURS sentences | **0 of 400** German or English sentences misidentified; Norwegian withheld because its function words are Danish's |
 | Quarterly model refresh, four newer checkpoints vs Parakeet v3 | **keep v3** — nearest 3.6% vs 3.3% lab WER; qwen3-asr ties on real audio and loses on speed |
 | Hotword biasing toward the roster and glossary | +9.1% recall on rare words against a +20% gate; at strength the glossary leaked into unrelated turns (control WER 8% → 29%). Not shipped |
@@ -388,7 +391,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.10.1 | +100h | the captions toggle means two things again (drag, scroll, right-click to give clicks back); the accuracy card stops reporting 113% error; the assistant gets a fair share behind the enrichment queue; heard-on chips and the identity audit; `truth report` stops scoring your own account |
 | 0.10.2 | +101h | translation controls: what to translate into, which languages you read, and whether the translation or the original leads; a detector for eighteen other languages that never once mistook German or English for anything else |
 | 0.10.3 | +102h | the caption bar honours the translation display and crosses screens: drag it past the edge and it re-makes itself on the next monitor; a Screen selector on the card |
-| 0.11.0 | +106h | grounded answers with citations that refuse 12 of 12 traps; live translation within seconds and short-line language detection for eighteen languages; learned identity ships its mechanism and gate with nothing installed yet, honestly |
+| 0.11.0 | +106h | Japanese: the audio identifier hears it with zero false alarms and a Japanese decoder reads it; grounded answers with citations that refuse 12 of 12 traps; live translation within seconds and short-line detection for eighteen languages; learned identity ships its mechanism with nothing installed yet, honestly; streaming captions measured at seven times the CPU and shipped off |
 
 ## Quickstart
 
