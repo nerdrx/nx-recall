@@ -436,13 +436,15 @@ test('a speaker language is a closed set with one label per state', () => {
   assert.equal(languageLabel({ languages: ['de'] }), 'German');
   assert.equal(languageLabel({ languages: ['en'] }), 'English');
   assert.equal(languageLabel({ languages: ['en', 'de'] }), 'German + English');
+  // 0.11.0: Japanese is routed by the audio identifier, not the text classifier.
+  assert.equal(languageLabel({ languages: ['ja'] }), 'Japanese');
   // Every choice the control offers has a value the daemon accepts and a line
   // saying what it does — "German" alone does not explain a changed transcript.
-  assert.equal(LANGUAGE_CHOICES.length, 4);
+  assert.equal(LANGUAGE_CHOICES.length, 5);
   for (const c of LANGUAGE_CHOICES) {
     assert.ok(c.title.length > 20, `${c.label} does not explain itself`);
     for (const code of c.value ? c.value.split(',') : []) {
-      assert.ok(['de', 'en'].includes(code), `${code} is not a language the daemon classifies`);
+      assert.ok(['de', 'en', 'ja'].includes(code), `${code} is not a language the daemon knows`);
     }
   }
 });

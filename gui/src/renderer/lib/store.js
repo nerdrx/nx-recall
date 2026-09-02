@@ -292,6 +292,9 @@ export const LANGUAGE_CHOICES = [
   { value: 'de', label: 'German', title: 'A transcript that reads as English is flagged — there is no German-constrained decoder to re-run it with.' },
   { value: 'en', label: 'English', title: 'A transcript that reads as German is decoded again with the English-only model.' },
   { value: 'de,en', label: 'German + English', title: 'Two languages: nothing is corrected, because either one is expected.' },
+  // 0.11.0: routed by the audio identifier and the Japanese decoder, not by
+  // the text classifier — a voice tagged Japanese skips the European model.
+  { value: 'ja', label: 'Japanese', title: 'Every turn of this voice goes straight to the Japanese decoder; the European model never sees it.' },
 ];
 
 export function languageValue(sp) {

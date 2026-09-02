@@ -2373,8 +2373,8 @@ export function startMock({
         if (typeof item !== 'string') throw err('bad_params', 'languages must be an array of strings');
         const code = item.trim().toLowerCase();
         if (!code || code === 'any') continue;
-        if (code !== 'de' && code !== 'en') {
-          throw err('bad_params', `unknown language ${JSON.stringify(code)}; this daemon classifies de and en only`);
+        if (code !== 'de' && code !== 'en' && code !== 'ja') {
+          throw err('bad_params', `unknown language ${JSON.stringify(code)}; this daemon knows de, en, ja only`);
         }
         if (!out.includes(code)) out.push(code);
       }
