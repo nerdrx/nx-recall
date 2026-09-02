@@ -36,6 +36,8 @@ pub mod control;
 pub mod digest;
 pub mod embed;
 pub mod enrich;
+/// Local Markdown export (0.10.0). DESIGN §12: files on this disk, nothing else.
+pub mod export;
 pub mod fetch;
 pub mod identity;
 pub mod ingest;
@@ -54,6 +56,8 @@ pub mod queue;
 pub mod reminders;
 pub mod resample;
 pub mod retention;
+/// The room microphone (0.10.0): a second, physical input.
+pub mod room;
 pub mod roster;
 pub mod semantic;
 pub mod server;

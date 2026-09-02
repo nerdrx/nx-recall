@@ -79,6 +79,26 @@ const ALLOWED = new Set([
   'transcript',
   'delete.preview',
   'delete.run',
+  // ---- 0.10.0 -------------------------------------------------------------
+  // The room microphone's own switch and the device list it needs. Same
+  // argument as `mic.set`: the daemon refuses the `room` key on `sources.set`,
+  // so the UI must be able to reach the method that works.
+  'room.get',
+  'room.set',
+  'devices.list',
+  // The local Markdown export. Both are reachable from the Export card, and
+  // neither can reach anywhere but the folder the user picked in the dialog
+  // below — the daemon refuses a path that is not an absolute local one.
+  'export.preview',
+  'export.run',
+  // The Discord ground-truth bridge (0.9.0), surfaced in the Sources view.
+  // Four reads and two writes, all of them behind controls the card offers.
+  'truth.status',
+  'truth.users',
+  'truth.summary',
+  'truth.link',
+  'truth.unlink',
+  // ---- end 0.10.0 ---------------------------------------------------------
   'status',
 ]);
 
@@ -93,7 +113,7 @@ export function broadcast(channel, payload) {
 /// the renderer's own toast is where the whole thing is readable anyway.
 const MAX_NOTIFY = 220;
 
-export function registerIpc({ request, setPaused, getState, showWindow, relaunch, captions, notify }) {
+export function registerIpc({ request, setPaused, getState, showWindow, relaunch, captions, notify, chooseFolder, openFolder }) {
   ipcMain.handle('recall:request', async (_e, method, params) => {
     if (!ALLOWED.has(method)) return { ok: false, err: { code: 'refused', msg: `method ${method} is not exposed to the UI` } };
     try {
@@ -151,4 +171,19 @@ export function registerIpc({ request, setPaused, getState, showWindow, relaunch
     });
   });
   // ---- end 0.9.0 -----------------------------------------------------------
+
+  // ---- 0.10.0, the local Markdown export -----------------------------------
+  //
+  // Two acts on this process, not on the daemon, which is why neither is a
+  // protocol request: opening the OS folder chooser, and revealing a folder in
+  // the file manager afterwards.
+  //
+  // The renderer cannot name a directory itself. It asks for the dialog, the
+  // person picks a folder, and the path comes back — so the only directory the
+  // export can ever be pointed at is one somebody chose in a native dialog.
+  // `openFolder` then only accepts a path the user picked in THIS session, so a
+  // compromised page cannot use it as a general "open anything" primitive.
+  ipcMain.handle('recall:export:chooseFolder', () => chooseFolder());
+  ipcMain.handle('recall:export:openFolder', (_e, dir) => openFolder(String(dir ?? '')));
+  // ---- end 0.10.0 ----------------------------------------------------------
 }

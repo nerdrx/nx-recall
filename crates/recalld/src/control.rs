@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use crate::allowlist::Allowlist;
 use crate::analysis::AnalysisStats;
 use crate::clock::utc_now_ns;
-use crate::config::{GraphConfig, IdentityConfig, MicConfig, MicMode};
+use crate::config::{GraphConfig, IdentityConfig, MicConfig, MicMode, RoomConfig};
 use crate::enrich::GraphState;
 use crate::pipeline::Stats;
 use crate::queue::EventQueue;
@@ -56,6 +56,13 @@ pub struct Control {
     /// — "enabled" and "recording right now" are different facts and follow
     /// mode is the whole reason they differ.
     mic_active: AtomicBool,
+    /// The room microphone (0.10.0). A third live switch, kept apart from the
+    /// headset's for the same reason the headset's is kept apart from the
+    /// allowlist: it is a different consent decision about a different device,
+    /// and a client must never be able to move one by moving the other.
+    room: Mutex<RoomConfig>,
+    room_gen: AtomicU64,
+    room_active: AtomicBool,
     started_at_ns: i64,
     /// Where `sources.set` persists a rule, so a toggle survives a restart.
     pub config_path: Option<PathBuf>,
@@ -122,6 +129,9 @@ impl Control {
             mic: Mutex::new(MicConfig::default()),
             mic_gen: AtomicU64::new(0),
             mic_active: AtomicBool::new(false),
+            room: Mutex::new(RoomConfig::default()),
+            room_gen: AtomicU64::new(0),
+            room_active: AtomicBool::new(false),
             started_at_ns: utc_now_ns(),
             config_path,
             data_dir,
@@ -323,6 +333,70 @@ impl Control {
             "state": self.mic_state(),
             "device": cfg.device_override(),
         })
+    }
+
+    // ---- the room microphone (0.10.0) ------------------------------------
+
+    pub fn room(&self) -> RoomConfig {
+        self.room.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The configured room switch. Set before the handle is shared, like the
+    /// rest of the wiring.
+    pub fn with_room(mut self: Arc<Self>, room: RoomConfig) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
+        *this.room.get_mut().unwrap_or_else(|p| p.into_inner()) = room;
+        self
+    }
+
+    /// Flip the switch, the mode, or the device — each independently, so a
+    /// client can pick a device without also deciding to turn the thing on.
+    ///
+    /// `device` is `Some(None)` to clear the pin and `None` to leave it alone.
+    /// Two levels of option because "no device" is a real value here and
+    /// collapsing them would make clearing the pin unexpressible.
+    pub fn set_room(
+        &self,
+        enabled: Option<bool>,
+        mode: Option<MicMode>,
+        device: Option<Option<String>>,
+    ) -> RoomConfig {
+        let mut guard = self.room.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = enabled {
+            guard.enabled = e;
+        }
+        if let Some(m) = mode {
+            guard.mode = m;
+        }
+        if let Some(d) = device {
+            guard.device = d;
+        }
+        let out = guard.clone();
+        drop(guard);
+        self.room_gen.fetch_add(1, Ordering::SeqCst);
+        out
+    }
+
+    pub fn room_generation(&self) -> u64 {
+        self.room_gen.load(Ordering::SeqCst)
+    }
+
+    pub fn set_room_active(&self, active: bool) {
+        self.room_active.store(active, Ordering::SeqCst);
+    }
+
+    pub fn room_active(&self) -> bool {
+        self.room_active.load(Ordering::SeqCst)
+    }
+
+    /// Six states, one string — the headset's five plus `needs-device`. See
+    /// `crate::room::state`.
+    pub fn room_state(&self) -> &'static str {
+        crate::room::state(&self.room(), self.room_active())
+    }
+
+    pub fn room_json(&self) -> Value {
+        crate::room::payload(&self.room(), self.room_active())
     }
 
     // ---- storage ---------------------------------------------------------

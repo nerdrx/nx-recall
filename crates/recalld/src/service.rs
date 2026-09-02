@@ -280,6 +280,11 @@ impl Service {
             "sources.set" => self.sources_set(req),
             "mic.get" => self.mic_get(),
             "mic.set" => self.mic_set(req),
+            // ---- 0.10.0, the room microphone -----------------------------
+            "room.get" => self.room_get(),
+            "room.set" => self.room_set(req),
+            "devices.list" => self.devices_list(),
+            // ---- end 0.10.0 ----------------------------------------------
             "speakers.list" => self.speakers_list(),
             "speakers.name" => self.speakers_name(req),
             "speakers.set_languages" => self.speakers_set_languages(req),
@@ -334,6 +339,10 @@ impl Service {
             "operations.list" => self.operations_list(req),
             "delete.preview" => self.delete_preview(req),
             "delete.run" => self.delete_run(req),
+            // ---- 0.10.0, the local Markdown export -----------------------
+            "export.preview" => self.export_preview(req),
+            "export.run" => self.export_run(req),
+            // ---- end 0.10.0 ----------------------------------------------
             other => Err(Error::new(
                 "unknown_method",
                 format!("no method named {other:?}"),
@@ -554,6 +563,21 @@ impl Service {
             // for anything that only wants to print a word (PROTOCOL).
             "mic": c.mic_json(),
             "mic_state": c.mic_state(),
+            // The Discord ground-truth ingest (0.9.0), as the Sources view
+            // renders it. Four facts, chosen because they are the four a card
+            // has to draw and because none of them costs a walk: `enabled` is
+            // the intention, `listening` is the address actually bound (they
+            // differ when the port was taken), `last_event_ms` is when the
+            // plugin last said anything — which is the difference between
+            // "waiting for Discord" and "receiving" — and `users` is how many
+            // accounts it has heard. Everything else stays on `truth.status`,
+            // which is the method for the whole picture.
+            "truth": self.truth_brief(&store),
+            // The room microphone (0.10.0), on the same two keys and for the
+            // same reason: one block a client renders, one flat string it can
+            // print. A client that has never heard of it ignores both.
+            "room": c.room_json(),
+            "room_state": c.room_state(),
             // Measured by the retention sweeper, never here: this method is
             // polled every three seconds by every open client and the answer
             // costs a walk of the data directory (0.6.1).
@@ -593,6 +617,10 @@ impl Service {
                 "labelled": c.analysis.labelled.load(Ordering::Relaxed),
                 "refused_overlap": c.analysis.refused_overlap.load(Ordering::Relaxed),
                 "mic_segments": c.analysis.mic_segments.load(Ordering::Relaxed),
+                // 0.10.0. Turns that came off the room microphone — ordinary
+                // turns in every other respect, which is exactly why they need
+                // their own counter to be visible at all.
+                "room_segments": c.stats.room_segments.load(Ordering::Relaxed),
                 "mic_enrolled": c.analysis.mic_enrolled.load(Ordering::Relaxed),
                 "mic_goldens": c.analysis.mic_goldens.load(Ordering::Relaxed),
                 // 0.6.1: turns that matched nobody and were too slight to mint
@@ -682,6 +710,7 @@ impl Service {
         let rows = self.store().list_sources().map_err(Error::from)?;
         let live = self.control.allowlist();
         let mic = self.control.mic();
+        let room = self.control.room();
         Ok(json!({
             "sources": rows
                 .iter()
@@ -691,6 +720,9 @@ impl Service {
                     // microphone's switch is `[mic].enabled`, never a rule.
                     let allowed = if r.kind == crate::store::KIND_MIC {
                         mic.enabled
+                    } else if r.kind == crate::store::KIND_ROOM {
+                        // 0.10.0: `[room].enabled`, never a rule.
+                        room.enabled
                     } else {
                         live.decide(&r.match_key).captures()
                     };
@@ -719,6 +751,16 @@ impl Service {
                 "the microphone is not an application rule — use mic.set \
                  {enabled, mode}; it hears the room rather than one program, so \
                  it has its own switch and its own default (off)",
+            ));
+        }
+        // 0.10.0, and for exactly the same reason: `[room]` is a second half of
+        // the config that `[rules]` must never be able to contradict.
+        if match_key == crate::room::ROOM_MATCH_KEY {
+            return Err(Error::new(
+                "refused",
+                "the room microphone is not an application rule — use room.set \
+                 {enabled, mode, device}; it hears everyone sitting in the room, \
+                 so it has its own switch, its own device and its own default (off)",
             ));
         }
         let allowed = req
@@ -854,6 +896,293 @@ impl Service {
         self.announce_status();
         Ok(payload)
     }
+
+    // ---- the room microphone (0.10.0) ------------------------------------
+
+    /// The room block, as `status` and the `room` event carry it.
+    ///
+    /// No `you_speaker` counterpart, and its absence is the feature: there is
+    /// no pinned identity on this device, because the people it hears are not
+    /// the user. They are matched, minted and enrolled like every other voice.
+    fn room_get(&self) -> Result<Value, Error> {
+        Ok(self.control.room_json())
+    }
+
+    /// The switch, the mode and the device, each optional and applied
+    /// independently.
+    ///
+    /// Unlike `mic.set`, `device` is here rather than config-file-only: the
+    /// headset's pin is a rarely-touched machine setup decision with a sensible
+    /// default behind it, and this one has no default at all — a user who
+    /// cannot choose the device from the UI cannot use the feature.
+    ///
+    /// Turning it on with no device is refused rather than accepted into a
+    /// state that can never become active.
+    fn room_set(&self, req: &Request) -> Result<Value, Error> {
+        let enabled = req.opt_bool("enabled")?;
+        let mode = match req.opt_str("mode")? {
+            None => None,
+            Some(s) => Some(crate::config::MicMode::parse(s).ok_or_else(|| {
+                Error::params(format!("mode must be \"follow\" or \"always\", not {s:?}"))
+            })?),
+        };
+        // Three-valued on purpose: absent leaves the pin, `null` clears it, a
+        // string sets it. See `Control::set_room`.
+        // `req.param` folds a null into "absent", which is right everywhere
+        // else and wrong here — clearing the pin has to be expressible — so
+        // this reads the raw params object.
+        let device = match req.params.get("device") {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(Value::String(s)) => Some(crate::room::normalise_device(Some(s))),
+            Some(other) => {
+                return Err(Error::params(format!(
+                    "device must be a PipeWire node.name or null, not {other}"
+                )));
+            }
+        };
+        if enabled.is_none() && mode.is_none() && device.is_none() {
+            return Err(Error::params(
+                "room.set needs at least one of enabled, mode, device",
+            ));
+        }
+
+        // What the config would become, checked before anything is moved: a
+        // refusal must leave the switch exactly where it was.
+        let mut after = self.control.room();
+        if let Some(e) = enabled {
+            after.enabled = e;
+        }
+        if let Some(m) = mode {
+            after.mode = m;
+        }
+        if let Some(d) = device.clone() {
+            after.device = d;
+        }
+        if crate::room::would_be_deviceless(&after) {
+            return Err(Error::params(
+                "the room microphone needs a device: there is no sensible default for a \
+                 second input, and following the system default would open the headset \
+                 the microphone switch is already on. Call devices.list and pass one of \
+                 its node_name values",
+            ));
+        }
+
+        let cfg = self.control.set_room(enabled, mode, device);
+
+        // Mirror the switch onto the source row, so `sources.list` and
+        // `room.get` agree — exactly as `mic.set` does.
+        if let Err(e) = self.store().upsert_source_kind(
+            crate::room::ROOM_MATCH_KEY,
+            crate::room::ROOM_DISPLAY_NAME,
+            crate::store::KIND_ROOM,
+            utc_now_ns(),
+        ) {
+            warn!("could not record the room microphone source row: {e:#}");
+        }
+        if let Err(e) =
+            self.store()
+                .set_allowed(crate::room::ROOM_MATCH_KEY, cfg.enabled, utc_now_ns())
+        {
+            warn!("could not mirror the room switch onto its source row: {e:#}");
+        }
+
+        let mut persisted = false;
+        if let Some(path) = &self.control.config_path {
+            match Config::load(path) {
+                Ok(mut file) => {
+                    file.room.enabled = cfg.enabled;
+                    file.room.mode = cfg.mode;
+                    file.room.device = cfg.device.clone();
+                    match file.save(path) {
+                        Ok(()) => persisted = true,
+                        Err(e) => warn!("could not persist the room switch: {e:#}"),
+                    }
+                }
+                Err(e) => warn!("could not re-read the config to persist the room mic: {e:#}"),
+            }
+        }
+        info!(
+            enabled = cfg.enabled,
+            mode = cfg.mode.as_str(),
+            device = ?cfg.device_override(),
+            persisted,
+            "room microphone switch changed"
+        );
+
+        let mut payload = self.control.room_json();
+        payload["persisted"] = json!(persisted);
+        self.bus.publish(Topic::Status, "room", payload.clone());
+        self.announce_status();
+        Ok(payload)
+    }
+
+    /// Every capture device on the graph, so a client can offer the room
+    /// microphone a device instead of asking for a `node.name` from memory.
+    ///
+    /// A read that opens nothing. The `is_default` flag is on the wire so a UI
+    /// can warn about the one choice that is almost always wrong: the default
+    /// input is the headset, and pointing the room mic at it would record the
+    /// user twice under two identities.
+    fn devices_list(&self) -> Result<Value, Error> {
+        let rows = crate::capture::list_devices()
+            .map_err(|e| Error::internal(format!("could not list capture devices: {e:#}")))?;
+        Ok(json!({
+            "devices": rows.iter().map(crate::capture::DeviceRow::to_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    // ---- the local Markdown export (0.10.0) ------------------------------
+
+    /// Read an export request off the wire.
+    ///
+    /// The directory is the only required field and every guard on it lives in
+    /// `export::check_dir`, which both the preview and the run call — so a
+    /// preview can never approve a path the run would refuse.
+    fn export_request(&self, req: &Request) -> Result<crate::export::ExportRequest, Error> {
+        let dir = req.str("dir")?.trim().to_string();
+        if dir.is_empty() {
+            return Err(Error::params("dir must not be empty"));
+        }
+        Ok(crate::export::ExportRequest {
+            dir: std::path::PathBuf::from(dir),
+            from: time_param(req, "from")?,
+            to: time_param(req, "to")?,
+            speaker: req.opt_i64("speaker")?,
+            thread: req.opt_i64("thread")?,
+            include_translations: req.opt_bool("include_translations")?.unwrap_or(false),
+        })
+    }
+
+    fn export_error(e: crate::export::ExportError) -> Error {
+        match e {
+            crate::export::ExportError::Refused(m) => Error::new("refused", m),
+            crate::export::ExportError::Failed(e) => Error::internal(format!("{e:#}")),
+        }
+    }
+
+    /// What an export would write, before it writes anything: the file list,
+    /// the counts, the exact byte total, and which existing files it is not
+    /// allowed to touch.
+    fn export_preview(&self, req: &Request) -> Result<Value, Error> {
+        let request = self.export_request(req)?;
+        let plan = crate::export::plan(&self.store(), &request).map_err(Self::export_error)?;
+        Ok(json!({
+            "dir": request.dir.to_string_lossy(),
+            "days": plan.days(),
+            "conversations": plan.conversations(),
+            "turns": plan.turns(),
+            "bytes": plan.bytes(),
+            "files": plan.files.iter().map(|f| json!({
+                "name": f.name,
+                "bytes": f.bytes(),
+                "turns": f.turns,
+                "conversations": f.conversations,
+                "exists": f.exists,
+                // True means: this file is already there and NX Recall did not
+                // write it, so `export.run` will refuse rather than eat it.
+                "blocked": f.blocked,
+            })).collect::<Vec<_>>(),
+            "blocked": plan.blocked(),
+        }))
+    }
+
+    /// Write the export, as an operation handle with progress — the same shape
+    /// as `delete.run`, because it is the same kind of thing: bounded work over
+    /// many rows that a client should be able to watch.
+    ///
+    /// DESIGN §12: the output is files in the directory named here, on a local
+    /// filesystem, and there is no other destination anywhere in this path.
+    fn export_run(self: &Arc<Self>, req: &Request) -> Result<Value, Error> {
+        let request = self.export_request(req)?;
+        // Planning happens on the calling thread so a bad path or a blocked
+        // file is an ERROR on this request rather than a failed op the client
+        // has to go and read off the event stream.
+        let plan = crate::export::plan(&self.store(), &request).map_err(Self::export_error)?;
+        if let Some(name) = plan.blocked().first() {
+            return Err(Error::new(
+                "refused",
+                format!(
+                    "{name} already exists in {} and was not written by NX Recall — it \
+                     carries no \"{}\" header, so overwriting it would destroy somebody's \
+                     file. Move it, or export into an empty folder",
+                    request.dir.display(),
+                    crate::export::MARKER
+                ),
+            ));
+        }
+
+        let op = format!("op_{}", self.next_op.fetch_add(1, Ordering::SeqCst));
+        self.ops
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(op.clone(), OpState::Running);
+
+        let this = Arc::clone(self);
+        let op_id = op.clone();
+        let files = plan.files.len();
+        let dir = request.dir.clone();
+        let spawned = std::thread::Builder::new()
+            .name("recalld-export".into())
+            .spawn(move || this.run_export(op_id, plan, dir));
+        if let Err(e) = spawned {
+            self.finish_op(&op, OpState::Failed);
+            self.bus.publish(
+                Topic::Ops,
+                "op.failed",
+                json!({"op": op, "kind": "export.run", "msg": e.to_string()}),
+            );
+            return Err(Error::internal(format!("could not start the export: {e}")));
+        }
+        Ok(json!({"op": op, "files": files, "dir": request.dir.to_string_lossy()}))
+    }
+
+    fn run_export(self: Arc<Self>, op: String, plan: crate::export::Plan, dir: std::path::PathBuf) {
+        let total = plan.files.len();
+        let bus = Arc::clone(&self.bus);
+        let op_for_progress = op.clone();
+        let outcome = crate::export::write(&plan, &dir, |done, total| {
+            bus.publish(
+                Topic::Ops,
+                "op.progress",
+                json!({
+                    "op": op_for_progress,
+                    "kind": "export.run",
+                    "done": done,
+                    "total": total,
+                    "frac": if total == 0 { 1.0 } else { done as f64 / total as f64 },
+                }),
+            );
+        });
+        match outcome {
+            Ok(bytes) => {
+                self.finish_op(&op, OpState::Done);
+                info!(%op, files = total, bytes, dir = %dir.display(), "exported to Markdown");
+                self.bus.publish(
+                    Topic::Ops,
+                    "op.done",
+                    json!({
+                        "op": op,
+                        "kind": "export.run",
+                        "files": total,
+                        "bytes": bytes,
+                        "dir": dir.to_string_lossy(),
+                    }),
+                );
+            }
+            Err(e) => {
+                warn!(%op, "export failed: {e}");
+                self.finish_op(&op, OpState::Failed);
+                self.bus.publish(
+                    Topic::Ops,
+                    "op.failed",
+                    json!({"op": op, "kind": "export.run", "msg": e.to_string()}),
+                );
+            }
+        }
+    }
+
+    // ---- end 0.10.0 -------------------------------------------------------
 
     // ---- speakers --------------------------------------------------------
 
@@ -3004,6 +3333,27 @@ impl Service {
     /// The first thing anybody looks at when the plugin does not seem to be
     /// working, so it answers the three questions in that order: is the
     /// listener up, has anything ever come in, and when was the last thing.
+    /// The four truth facts `status` carries (0.9.0's ingest, surfaced for
+    /// 0.10.0's Sources card). Deliberately not the whole of `truth.status`:
+    /// this is polled every few seconds by every open client, so it costs one
+    /// indexed MAX and one small table read and nothing else.
+    ///
+    /// Every field is present whether or not the ingest is on — a client has
+    /// to be able to tell "off" from "an older daemon", and a missing key
+    /// cannot.
+    fn truth_brief(&self, store: &Store) -> Value {
+        let cfg = self.truth_cfg();
+        let wiring = self.truth.get();
+        json!({
+            "enabled": cfg.enabled,
+            "listening": wiring.and_then(|w| w.listening).map(|a| a.to_string()),
+            // When the plugin last sent anything at all. `null` means it never
+            // has, which is what "waiting for Discord" is drawn from.
+            "last_event_ms": store.truth_last_span_ns().ok().flatten().map(ns_to_ms),
+            "users": store.discord_users().map(|u| u.len()).unwrap_or(0),
+        })
+    }
+
     fn truth_status(&self) -> Result<Value, Error> {
         let wiring = self.truth.get();
         let cfg = self.truth_cfg();
@@ -3237,6 +3587,291 @@ mod tests {
             .unwrap();
         (sess, seg)
     }
+
+    // ---- 0.10.0: the room microphone and the Markdown export -------------
+
+    /// A throwaway directory to export into. `/tmp` is a local filesystem, so
+    /// the path guard is satisfied by the same rule a user's home would be.
+    fn export_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("nx-recall-export-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Wait for an op to reach a terminal state, collecting its events.
+    fn drain_op(rig: &Rig, op: &str) -> Vec<Value> {
+        for _ in 0..200 {
+            let done = matches!(
+                rig.service
+                    .ops
+                    .lock()
+                    .unwrap()
+                    .get(op)
+                    .cloned()
+                    .unwrap_or(OpState::Running),
+                OpState::Done | OpState::Failed
+            );
+            if done {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The writer thread publishes before it flips the state on the last
+        // file, so give the bus a moment to hand the frames over.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        events(rig)
+            .into_iter()
+            .filter(|e| e["data"]["op"] == json!(op))
+            .collect()
+    }
+
+    #[test]
+    fn the_room_switch_is_its_own_switch_and_refuses_to_run_deviceless() {
+        let r = rig("room-switch");
+        let out = call(&r, r#"{"id":1,"method":"room.get"}"#).unwrap();
+        assert_eq!(out["enabled"], json!(false));
+        assert_eq!(out["state"], json!("off"));
+        assert_eq!(out["device"], Value::Null);
+
+        // On with no device is refused, and the switch does not move.
+        let e = call(
+            &r,
+            r#"{"id":2,"method":"room.set","params":{"enabled":true}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "params");
+        assert!(e.msg.contains("devices.list"), "{}", e.msg);
+        assert!(!r.service.control.room().enabled, "the refusal moved it");
+
+        // With a device, both at once.
+        let out = call(
+            &r,
+            r#"{"id":3,"method":"room.set","params":{"enabled":true,"mode":"always","device":"alsa_input.desk"}}"#,
+        )
+        .unwrap();
+        assert_eq!(out["enabled"], json!(true));
+        assert_eq!(out["mode"], json!("always"));
+        assert_eq!(out["device"], json!("alsa_input.desk"));
+        // No stream can have opened in a test, and the state says exactly that
+        // rather than claiming to record.
+        assert_eq!(out["state"], json!("always:idle"));
+
+        // Clearing the device while it is on is refused for the same reason
+        // turning it on without one is.
+        let e = call(
+            &r,
+            r#"{"id":4,"method":"room.set","params":{"device":null}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "params");
+        assert_eq!(
+            r.service.control.room().device_override(),
+            Some("alsa_input.desk"),
+            "a refused call must leave the pin alone"
+        );
+
+        // Empty call, and a nonsense mode.
+        assert_eq!(
+            call(&r, r#"{"id":5,"method":"room.set","params":{}}"#)
+                .unwrap_err()
+                .code,
+            "params"
+        );
+        assert_eq!(
+            call(
+                &r,
+                r#"{"id":6,"method":"room.set","params":{"mode":"sometimes"}}"#
+            )
+            .unwrap_err()
+            .code,
+            "params"
+        );
+
+        // It is a `room` event on the status topic, and `status` carries it.
+        let evs = events(&r);
+        assert!(
+            evs.iter().any(|e| e["ev"] == "room"),
+            "no room event: {evs:?}"
+        );
+        let status = call(&r, r#"{"id":7,"method":"status"}"#).unwrap();
+        assert_eq!(status["room"]["device"], json!("alsa_input.desk"));
+        assert_eq!(status["room_state"], json!("always:idle"));
+        // And it is NOT an allowlist rule.
+        assert!(!r.service.control.allowlist().as_map().contains_key("room"));
+    }
+
+    #[test]
+    fn the_room_microphone_is_not_an_application_rule() {
+        let r = rig("room-rule");
+        let e = call(
+            &r,
+            r#"{"id":1,"method":"sources.set","params":{"match_key":"room","allowed":true}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "refused");
+        assert!(e.msg.contains("room.set"), "{}", e.msg);
+        assert!(
+            e.msg.contains("everyone sitting in the room"),
+            "the refusal must say what the device hears: {}",
+            e.msg
+        );
+    }
+
+    #[test]
+    fn an_export_previews_the_exact_files_it_would_write() {
+        let r = rig("export-preview");
+        let dir = export_dir("preview");
+        let (_, seg) = a_segment(&r, "meet me at the fountain");
+        {
+            let store = r.service.store();
+            let spk = store.mint_speaker(0).unwrap();
+            store.rename_speaker(spk, "Kira", 0).unwrap();
+            store
+                .set_segment_speaker(seg, Some(spk), Some(0.7))
+                .unwrap();
+        }
+
+        let out = call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"export.preview","params":{{"dir":"{}"}}}}"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(out["turns"], json!(1));
+        assert_eq!(out["days"], json!(1));
+        assert_eq!(out["files"].as_array().unwrap().len(), 2);
+        assert_eq!(out["files"][1]["name"], json!("people.md"));
+        assert!(out["bytes"].as_u64().unwrap() > 0);
+        assert!(out["blocked"].as_array().unwrap().is_empty());
+        // A preview writes NOTHING.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_export_writes_the_files_and_reports_progress() {
+        let r = rig("export-run");
+        let dir = export_dir("run");
+        let (_, seg) = a_segment(&r, "meet me at the fountain");
+        {
+            let store = r.service.store();
+            let spk = store.mint_speaker(0).unwrap();
+            store.rename_speaker(spk, "Kira", 0).unwrap();
+            store
+                .set_segment_speaker(seg, Some(spk), Some(0.7))
+                .unwrap();
+        }
+
+        let out = call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"export.run","params":{{"dir":"{}"}}}}"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let op = out["op"].as_str().unwrap().to_string();
+        assert_eq!(out["files"], json!(2));
+
+        let evs = drain_op(&r, &op);
+        let kinds: Vec<&str> = evs.iter().filter_map(|e| e["ev"].as_str()).collect();
+        assert!(
+            kinds.contains(&"op.progress"),
+            "no progress was reported: {kinds:?}"
+        );
+        assert_eq!(kinds.last(), Some(&"op.done"), "{kinds:?}");
+        let done = evs.last().unwrap();
+        assert_eq!(done["data"]["kind"], json!("export.run"));
+        assert_eq!(done["data"]["files"], json!(2));
+
+        let names: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains("people.md"), "{names:?}");
+        let day = names
+            .iter()
+            .find(|n| n.ends_with(".md") && *n != "people.md")
+            .unwrap();
+        let body = std::fs::read_to_string(dir.join(day)).unwrap();
+        assert!(body.starts_with(crate::export::MARKER), "{body}");
+        assert!(body.contains("Kira: meet me at the fountain"), "{body}");
+        let people = std::fs::read_to_string(dir.join("people.md")).unwrap();
+        assert!(people.contains("**Kira**"), "{people}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_export_refuses_a_bad_path_and_a_file_it_did_not_write() {
+        let r = rig("export-guards");
+        let dir = export_dir("guards");
+        a_segment(&r, "one line is enough");
+
+        // Relative, and a volatile runtime directory.
+        for bad in ["notes", "/run/user/1000/notes"] {
+            let e = call(
+                &r,
+                &format!(r#"{{"id":1,"method":"export.preview","params":{{"dir":"{bad}"}}}}"#),
+            )
+            .unwrap_err();
+            assert_eq!(e.code, "refused", "{bad} was not refused: {}", e.msg);
+        }
+
+        // Somebody's own file, standing where a day file would go. The preview
+        // names it, and the run refuses without writing anything at all.
+        let plan = call(
+            &r,
+            &format!(
+                r#"{{"id":2,"method":"export.preview","params":{{"dir":"{}"}}}}"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let day = plan["files"][0]["name"].as_str().unwrap().to_string();
+        std::fs::write(dir.join(&day), "# my own notes\n").unwrap();
+
+        let plan = call(
+            &r,
+            &format!(
+                r#"{{"id":3,"method":"export.preview","params":{{"dir":"{}"}}}}"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(plan["files"][0]["blocked"], json!(true));
+        assert_eq!(plan["blocked"][0], json!(day));
+
+        let e = call(
+            &r,
+            &format!(
+                r#"{{"id":4,"method":"export.run","params":{{"dir":"{}"}}}}"#,
+                dir.display()
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "refused");
+        assert!(
+            e.msg.contains(&day),
+            "the refusal must name the file: {}",
+            e.msg
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(&day)).unwrap(),
+            "# my own notes\n",
+            "the refused export wrote over somebody's file"
+        );
+        assert!(
+            !dir.join("people.md").exists(),
+            "a refused export wrote its other files anyway"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- end 0.10.0 -------------------------------------------------------
 
     // ---- lang.repair (0.7.7) ---------------------------------------------
 

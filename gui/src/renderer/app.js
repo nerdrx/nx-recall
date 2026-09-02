@@ -780,6 +780,53 @@ document.addEventListener('keydown', (e) => {
         otherRows: document.querySelectorAll('#seg-list .seg:not(.you)').length,
       };
     },
+    // ---- 0.10.0 ----------------------------------------------------------
+    // The room microphone: the model's view of the second switch, and what the
+    // DOM shows for it — including the device picker, which is the control the
+    // headset's card does not have and the one this feature turns on.
+    room: () => {
+      const chip = document.getElementById('room-chip');
+      const toggle = document.getElementById('room-toggle');
+      const picker = document.getElementById('room-device');
+      return {
+        ...store.room,
+        chip: chip ? chip.textContent : null,
+        pressed: toggle ? toggle.getAttribute('aria-pressed') : null,
+        toggleDisabled: toggle ? toggle.disabled : null,
+        warning: (document.getElementById('room-warning') || {}).textContent ?? '',
+        devices: picker ? [...picker.options].map((o) => o.value).filter(Boolean) : [],
+        selected: picker ? picker.value : null,
+        modePressed: [...document.querySelectorAll('#room-modes .mode-opt')].map((b) => [
+          b.dataset.roomMode,
+          b.getAttribute('aria-pressed'),
+        ]),
+      };
+    },
+    // The Markdown export card: the folder, the counts, the file list, and
+    // whatever the last run said.
+    exportCard: () => ({
+      dir: (document.getElementById('export-dir') || {}).textContent ?? '',
+      note: (document.getElementById('export-note') || {}).textContent ?? '',
+      counts: (document.getElementById('export-counts') || {}).textContent ?? '',
+      files: [...document.querySelectorAll('#export-files .storage-row')].map((r) => r.dataset.exportFile),
+      done: (document.getElementById('export-done') || {}).textContent ?? '',
+      error: (document.getElementById('export-error') || {}).textContent ?? '',
+      runDisabled: (document.getElementById('export-run') || {}).disabled ?? null,
+      openable: !!document.getElementById('export-open'),
+    }),
+    // The Discord bridge card.
+    truth: () => ({
+      chip: (document.getElementById('truth-chip') || {}).textContent ?? null,
+      hint: (document.getElementById('truth-hint') || {}).textContent ?? '',
+      score: (document.getElementById('truth-score') || {}).textContent ?? '',
+      off: !!document.getElementById('truth-off'),
+      users: [...document.querySelectorAll('#truth-users .src-row')].map((r) => ({
+        id: r.dataset.truthUser,
+        name: r.querySelector('.name')?.textContent ?? '',
+        linked: r.querySelector('select')?.value ?? '',
+      })),
+    }),
+    // ---- end 0.10.0 ------------------------------------------------------
     // 0.6.1. Three facts the driver has to be able to read back: what a voice
     // is declared to speak, how many voices a sweep would take, and what the
     // storage card is actually rendering.

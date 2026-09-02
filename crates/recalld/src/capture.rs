@@ -48,12 +48,13 @@ use tracing::{debug, error, info, warn};
 use crate::allowlist::{Allowlist, Decision, SourceIdent};
 use crate::bus::{Bus, Topic};
 use crate::clock::{monotonic_ns, utc_now_ns};
-use crate::config::{Config, MicConfig, MicMode, SAMPLE_RATE};
+use crate::config::{Config, MicConfig, MicMode, RoomConfig, SAMPLE_RATE};
 use crate::control::Control;
 use crate::pipeline::Stats;
 use crate::queue::{AudioChunk, CaptureEvent, EventQueue};
 use crate::resample::{LinearResampler, downmix};
-use crate::store::{KIND_MIC, Store};
+use crate::room::{ROOM_DISPLAY_NAME, ROOM_MATCH_KEY};
+use crate::store::{KIND_MIC, KIND_ROOM, Store};
 
 const PLAYBACK_STREAM_CLASS: &str = "Stream/Output/Audio";
 /// A capture device — a microphone, a line in, a sink's monitor. The mic tap
@@ -376,6 +377,19 @@ struct MicCapture {
     _listener: pw::stream::StreamListener<StreamData>,
 }
 
+/// The live room tap (0.10.0). Deliberately thinner than [`Mic`]: it has no
+/// default to follow and no device inventory of its own — the graph's capture
+/// devices are enumerated once, in `mic.nodes`, and both taps read them.
+struct Room {
+    cfg: RoomConfig,
+    /// The `sources` row, created at start-up whether or not the room mic is
+    /// on, so a client has something to render its switch against.
+    source_id: i64,
+    capture: Option<MicCapture>,
+    retry_after: Option<Instant>,
+    announced: Option<&'static str>,
+}
+
 /// Everything the registry callbacks need to mutate.
 struct Shared {
     allowlist: Allowlist,
@@ -390,6 +404,8 @@ struct Shared {
     /// skip, which means remembering the ones we skipped.
     nodes: HashMap<u32, NodeInfo>,
     mic: Mic,
+    /// The second, physical microphone (0.10.0).
+    room: Room,
     format_param: Vec<u8>,
     quantum: u32,
 }
@@ -429,6 +445,10 @@ impl Shared {
         };
         let allowed = if row.kind == KIND_MIC {
             self.control.mic().enabled
+        } else if row.kind == KIND_ROOM {
+            // 0.10.0: the room mic's switch is `[room].enabled`, never a rule,
+            // for the same reason the headset's is not one.
+            self.control.room().enabled
         } else {
             self.allowlist.decide(&row.match_key).captures()
         };
@@ -496,7 +516,7 @@ impl Shared {
             error!("attaching to {match_key} (node {}): {e:#}", node.node_id);
         }
         // An allowed application starting is what opens a `follow`-mode mic.
-        self.sync_mic(core);
+        self.sync_taps(core);
     }
 
     /// Open the session row, then wire up the stream. If the stream fails to
@@ -659,7 +679,7 @@ impl Shared {
             }
         }
         // Allowing or denying the last app is a `follow`-mode transition too.
-        self.sync_mic(core);
+        self.sync_taps(core);
     }
 
     /// Drop a live capture and close its session. Dropping the `Capture`
@@ -682,7 +702,7 @@ impl Shared {
         // the mic tap re-resolves and either reopens on the new default or
         // waits, but never brings the daemon down with it.
         if self.mic.nodes.remove(&node_id).is_some() {
-            self.sync_mic(core);
+            self.sync_taps(core);
         }
         let Some(capture) = self.captures.remove(&node_id) else {
             // Not captured, but still worth announcing: the application quit,
@@ -691,7 +711,7 @@ impl Shared {
                 self.publish_source(&node.ident.match_key(), SOURCE_GONE);
             }
             // An app session closing is what ends a `follow`-mode mic session.
-            self.sync_mic(core);
+            self.sync_taps(core);
             return;
         };
         info!(
@@ -707,7 +727,7 @@ impl Shared {
             mono_ns: monotonic_ns(),
         });
         self.publish_source(&capture.match_key, SOURCE_GONE);
-        self.sync_mic(core);
+        self.sync_taps(core);
     }
 
     // ---- microphone ------------------------------------------------------
@@ -719,7 +739,7 @@ impl Shared {
         }
         debug!(node = node.node_id, name = ?node.name, "capture device on the graph");
         self.mic.nodes.insert(node.node_id, node);
-        self.sync_mic(core);
+        self.sync_taps(core);
     }
 
     fn on_default_source(&mut self, core: &pw::core::CoreRc, name: Option<String>) {
@@ -728,7 +748,7 @@ impl Shared {
         }
         info!(default_source = ?name, "the default audio source changed");
         self.mic.default_source = name;
-        self.sync_mic(core);
+        self.sync_taps(core);
     }
 
     /// The `node.name` the tap should be on: an explicit pin, else the default
@@ -978,6 +998,247 @@ impl Shared {
         self.bus
             .publish(Topic::Status, "mic", self.control.mic_json());
     }
+
+    // ---- the room microphone (0.10.0) ------------------------------------
+    //
+    // A second tap on the same graph, with the same state machine (`mic_plan`)
+    // and the same stream callbacks (`register_stream`), and exactly two
+    // differences: it will not open without an explicit device, and its turns
+    // are ordinary turns — no pin, no `label_via: "mic"`, no You. See room.rs
+    // for why those two differences are the whole feature.
+
+    /// Bring both microphone taps in line with the graph. Every call site that
+    /// used to sync the headset syncs the room as well: `follow` means the same
+    /// thing for both, so an application starting or stopping moves both.
+    fn sync_taps(&mut self, core: &pw::core::CoreRc) {
+        self.sync_mic(core);
+        self.sync_room(core);
+    }
+
+    /// The room tap's device, which is required. `None` means the switch is on
+    /// and there is nothing to open — reported as `needs-device`, never as
+    /// "waiting for a device that might turn up".
+    fn room_target(&self) -> Option<String> {
+        self.room.cfg.device_override().map(str::to_string)
+    }
+
+    fn room_pin_on_graph(&self) -> bool {
+        let Some(pin) = self.room.cfg.device_override() else {
+            return false;
+        };
+        self.mic
+            .nodes
+            .values()
+            .any(|n| n.name.as_deref() == Some(pin))
+    }
+
+    fn sync_room(&mut self, core: &pw::core::CoreRc) {
+        let target = self.room_target();
+        // No device pinned: close anything open and say so. This is the branch
+        // `mic_plan` cannot express, because for the headset "no target" is a
+        // legitimate state (the session manager routes it) and here it is not.
+        if self.room.cfg.enabled && target.is_none() {
+            if self.room.capture.is_some() {
+                info!("room microphone: no device is pinned; closing the session");
+                self.stop_room();
+            }
+            self.room.retry_after = None;
+            self.announce_room();
+            return;
+        }
+
+        let target_on_graph = self.room_pin_on_graph();
+        let open_failed = self
+            .room
+            .capture
+            .as_ref()
+            .is_some_and(|c| c.failed.load(Ordering::SeqCst));
+        let plan = mic_plan(&MicSituation {
+            enabled: self.room.cfg.enabled,
+            mode: self.room.cfg.mode,
+            app_captures: self.captures.len(),
+            open_on: self.room.capture.as_ref().map(|c| c.target.as_deref()),
+            target: target.as_deref(),
+            target_on_graph,
+            open_failed,
+        });
+
+        match plan {
+            MicPlan::Hold => return,
+            MicPlan::Close => {
+                let why = if !self.room.cfg.enabled {
+                    "the room microphone was switched off"
+                } else if open_failed {
+                    "the capture stream failed"
+                } else if !target_on_graph {
+                    "the pinned device left the graph"
+                } else {
+                    "no allowed application is capturing"
+                };
+                info!("room microphone: {why}; closing the session");
+                self.stop_room();
+                self.room.retry_after = None;
+                self.announce_room();
+                return;
+            }
+            MicPlan::Reopen => {
+                info!(to = ?target, "room microphone: the input device changed; reopening");
+                self.stop_room();
+            }
+            MicPlan::Open => {}
+        }
+
+        if let Some(at) = self.room.retry_after
+            && Instant::now() < at
+        {
+            self.announce_room();
+            return;
+        }
+        if let Err(e) = self.attach_room(core, target) {
+            warn!("room microphone: not capturing — {e:#}");
+            self.room.retry_after = Some(Instant::now() + MIC_RETRY);
+        } else {
+            self.room.retry_after = None;
+        }
+        self.announce_room();
+    }
+
+    fn attach_room(&mut self, core: &pw::core::CoreRc, target: Option<String>) -> Result<()> {
+        let name = target
+            .as_deref()
+            .ok_or_else(|| anyhow!("[room].device names no input device"))?;
+        // Unlike the headset, an unresolvable name is fatal to the attempt:
+        // there is no "let the session manager decide" for a second mic, and
+        // deciding for it would open the headset and record the user twice.
+        let resolved = self
+            .mic
+            .nodes
+            .values()
+            .find(|n| n.name.as_deref() == Some(name))
+            .and_then(SourceNode::target)
+            .ok_or_else(|| {
+                anyhow!("[room].device = {name:?} is not an Audio/Source on the graph")
+            })?;
+
+        let session_id = {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| anyhow!("store mutex poisoned"))?;
+            store.begin_session(self.room.source_id, utc_now_ns())?
+        };
+        let result = self.attach_room_stream(core, session_id, target, resolved);
+        if result.is_err()
+            && let Ok(store) = self.store.lock()
+            && let Err(e) = store.end_session(session_id, utc_now_ns())
+        {
+            error!("could not close the failed room session {session_id}: {e:#}");
+        }
+        result
+    }
+
+    fn attach_room_stream(
+        &mut self,
+        core: &pw::core::CoreRc,
+        session_id: i64,
+        target: Option<String>,
+        resolved: String,
+    ) -> Result<()> {
+        let mut props = properties! {
+            *pw::keys::MEDIA_TYPE => "Audio",
+            *pw::keys::MEDIA_CATEGORY => "Capture",
+            *pw::keys::MEDIA_ROLE => "Communication",
+            *pw::keys::APP_NAME => "nx-recall",
+            *pw::keys::NODE_NAME => "nx-recall-room",
+        };
+        props.insert(
+            *pw::keys::NODE_LATENCY,
+            format!("{}/{}", self.quantum, SAMPLE_RATE),
+        );
+        props.insert(*pw::keys::TARGET_OBJECT, resolved.clone());
+        // `stream.dont-reconnect`, unlike the headset tap. The headset may
+        // follow the graph because the user's voice is the user's voice on any
+        // device; a room mic that silently reconnected somewhere else would
+        // record a different room, and the provenance on those turns would be
+        // a lie.
+        props.insert("stream.dont-reconnect", "true");
+
+        let stream = pw::stream::StreamRc::new(core.clone(), "nx-recall-room", props)
+            .context("creating the room microphone stream")?;
+
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let data = StreamData {
+            session_id,
+            label: ROOM_MATCH_KEY.to_string(),
+            queue: Arc::clone(&self.queue),
+            rate: SAMPLE_RATE,
+            channels: 1,
+            resampler: LinearResampler::new(),
+            warned_about_format: false,
+            failed: Arc::clone(&failed),
+        };
+        let listener = register_stream(&stream, data)?;
+
+        let mut params = [Pod::from_bytes(&self.format_param)
+            .ok_or_else(|| anyhow!("malformed audio format pod"))?];
+        stream
+            .connect(
+                spa::utils::Direction::Input,
+                None,
+                pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+                &mut params,
+            )
+            .context("connecting the room microphone stream")?;
+
+        info!(
+            session = session_id,
+            mode = self.room.cfg.mode.as_str(),
+            device = ?target,
+            pw_target = %resolved,
+            "capturing the room microphone — every voice in the room, matched like any other"
+        );
+        self.stats.sessions_opened.fetch_add(1, Ordering::Relaxed);
+        self.room.capture = Some(MicCapture {
+            session_id,
+            target,
+            failed,
+            _stream: stream,
+            _listener: listener,
+        });
+        Ok(())
+    }
+
+    fn stop_room(&mut self) {
+        let Some(capture) = self.room.capture.take() else {
+            return;
+        };
+        self.queue.push(CaptureEvent::SessionEnd {
+            session_id: capture.session_id,
+            mono_ns: monotonic_ns(),
+        });
+    }
+
+    /// A `room` event on the existing `status` topic, published only when the
+    /// state actually moved — the same discipline, and the same topic, as the
+    /// headset's `mic` event, so no client changes its subscription.
+    fn announce_room(&mut self) {
+        self.control.set_room_active(self.room.capture.is_some());
+        let state = self.control.room_state();
+        if self.room.announced == Some(state) {
+            return;
+        }
+        self.room.announced = Some(state);
+        self.bus
+            .publish(Topic::Status, "room", self.control.room_json());
+        self.publish_source(
+            ROOM_MATCH_KEY,
+            if self.room.capture.is_some() {
+                SOURCE_CAPTURING
+            } else {
+                SOURCE_SEEN
+            },
+        );
+    }
 }
 
 /// The stream callbacks every capture shares: format negotiation, and the
@@ -1109,6 +1370,161 @@ impl Probe {
             .find(|n| n.name.as_deref() == Some(name))
     }
 }
+
+// ---- device enumeration (0.10.0) ------------------------------------------
+//
+// The room microphone needs a device *name*, and a person cannot be asked to
+// type a PipeWire `node.name` from memory. `devices.list` is the answer, and it
+// is a read: nothing here opens a stream, and neither path can record anything.
+
+/// One capture device, as a client picks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRow {
+    /// `node.name` — the stable id `[room].device` is written with.
+    pub node_name: String,
+    /// `node.description`, the human label. `None` on a node that publishes
+    /// none, in which case a client shows the name.
+    pub description: Option<String>,
+    /// This is `default.audio.source` — almost always the headset the `[mic]`
+    /// tap is on, and therefore the one device a room mic should NOT be.
+    pub is_default: bool,
+}
+
+impl DeviceRow {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "node_name": self.node_name,
+            "description": self.description,
+            "is_default": self.is_default,
+        })
+    }
+}
+
+fn devices_from(sources: &[SourceNode], default_source: Option<&str>) -> Vec<DeviceRow> {
+    let mut rows: Vec<DeviceRow> = sources
+        .iter()
+        .filter_map(|n| {
+            // A node with no `node.name` cannot be pinned, so it cannot be
+            // offered: listing it would produce a device nobody can select.
+            let node_name = n.name.clone()?;
+            Some(DeviceRow {
+                is_default: default_source == Some(node_name.as_str()),
+                node_name,
+                description: n.description.clone(),
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.is_default
+            .cmp(&a.is_default)
+            .then_with(|| a.node_name.cmp(&b.node_name))
+    });
+    rows.dedup_by(|a, b| a.node_name == b.node_name);
+    rows
+}
+
+/// Every `Audio/Source` on the graph right now.
+///
+/// The live registry first, because that is the daemon's own view and needs no
+/// external program. `pw-dump` is the fallback for the case where a second
+/// connection cannot be made from this process — the answer is the same graph
+/// read the same way, which is why [`devices_from_pw_dump`] exists as a
+/// separate, testable parser rather than as a second opinion.
+pub fn list_devices() -> Result<Vec<DeviceRow>> {
+    match probe(&Allowlist::default()) {
+        Ok(p) => Ok(devices_from(&p.sources, p.default_source.as_deref())),
+        Err(live) => match pw_dump() {
+            Ok(text) => devices_from_pw_dump(&text),
+            Err(dump) => Err(live.context(format!("and `pw-dump` did not work either: {dump:#}"))),
+        },
+    }
+}
+
+fn pw_dump() -> Result<String> {
+    let out = std::process::Command::new("pw-dump")
+        .output()
+        .context("running pw-dump")?;
+    if !out.status.success() {
+        return Err(anyhow!("pw-dump exited with {}", out.status));
+    }
+    String::from_utf8(out.stdout).context("pw-dump did not print UTF-8")
+}
+
+/// Parse `pw-dump`'s JSON into the same rows the live registry produces.
+///
+/// `pw-dump` prints an array of objects. Two kinds matter: `Node`s whose props
+/// carry `media.class = "Audio/Source"`, and the `default` `Metadata` object,
+/// whose `default.audio.source` entry names the current input. Everything else
+/// — devices, ports, links, clients, the sinks — is skipped by shape rather
+/// than by position, so a version of PipeWire that reorders the dump does not
+/// change the answer.
+pub fn devices_from_pw_dump(text: &str) -> Result<Vec<DeviceRow>> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).context("parsing pw-dump output as JSON")?;
+    let objects = parsed
+        .as_array()
+        .ok_or_else(|| anyhow!("pw-dump did not print a JSON array"))?;
+
+    let mut sources = Vec::new();
+    let mut default_source = None;
+    for obj in objects {
+        // The default input, as the session manager publishes it. Its `value`
+        // is either the `{"name": ...}` object the metadata carries or, in
+        // some dumps, the raw string.
+        if obj.get("type").and_then(|t| t.as_str()) == Some("PipeWire:Interface:Metadata") {
+            let named_default = obj
+                .get("props")
+                .and_then(|p| p.get("metadata.name"))
+                .and_then(|n| n.as_str())
+                == Some(DEFAULT_METADATA);
+            if named_default {
+                for entry in obj
+                    .get("metadata")
+                    .and_then(|m| m.as_array())
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                {
+                    if entry.get("key").and_then(|k| k.as_str()) != Some(DEFAULT_SOURCE_KEY) {
+                        continue;
+                    }
+                    default_source = match entry.get("value") {
+                        Some(serde_json::Value::String(s)) => default_source_name(s)
+                            .or_else(|| (!s.trim().is_empty()).then(|| s.trim().to_string())),
+                        Some(v) => v
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()),
+                        None => None,
+                    };
+                }
+            }
+            continue;
+        }
+        let props = obj.get("info").and_then(|i| i.get("props"));
+        let Some(props) = props else { continue };
+        if props.get("media.class").and_then(|c| c.as_str()) != Some(AUDIO_SOURCE_CLASS) {
+            continue;
+        }
+        sources.push(SourceNode {
+            node_id: obj.get("id").and_then(|i| i.as_u64()).unwrap_or(0) as u32,
+            serial: props
+                .get("object.serial")
+                .map(|v| v.to_string().trim_matches('"').to_string()),
+            name: props
+                .get("node.name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            description: props
+                .get("node.description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        });
+    }
+    Ok(devices_from(&sources, default_source.as_deref()))
+}
+
+// ---- end 0.10.0 -----------------------------------------------------------
 
 /// One-shot enumeration of current playback streams and capture devices.
 /// Never opens a capture.
@@ -1317,6 +1733,12 @@ pub fn run(
         let guard = store.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
         guard.upsert_source_kind(MIC_MATCH_KEY, MIC_DISPLAY_NAME, KIND_MIC, utc_now_ns())?
     };
+    // Same for the room microphone (0.10.0): the row exists so the switch can
+    // be rendered on a machine that has never turned it on.
+    let room_source_id = {
+        let guard = store.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+        guard.upsert_source_kind(ROOM_MATCH_KEY, ROOM_DISPLAY_NAME, KIND_ROOM, utc_now_ns())?
+    };
 
     let shared = Rc::new(RefCell::new(Shared {
         allowlist: control.allowlist(),
@@ -1333,6 +1755,13 @@ pub fn run(
             capture: None,
             default_source: None,
             nodes: HashMap::new(),
+            retry_after: None,
+            announced: None,
+        },
+        room: Room {
+            cfg: control.room(),
+            source_id: room_source_id,
+            capture: None,
             retry_after: None,
             announced: None,
         },
@@ -1478,6 +1907,7 @@ pub fn run(
     let core_timer = core.clone();
     let applied_rules = std::cell::Cell::new(control.rules_generation());
     let applied_mic = std::cell::Cell::new(control.mic_generation());
+    let applied_room = std::cell::Cell::new(control.room_generation());
     let timer = main_loop.loop_().add_timer(move |_| {
         let rules_gen = control_timer.rules_generation();
         if rules_gen != applied_rules.get() {
@@ -1491,7 +1921,12 @@ pub fn run(
             applied_mic.set(mic_gen);
             shared_timer.borrow_mut().mic.cfg = control_timer.mic();
         }
-        shared_timer.borrow_mut().sync_mic(&core_timer);
+        let room_gen = control_timer.room_generation();
+        if room_gen != applied_room.get() {
+            applied_room.set(room_gen);
+            shared_timer.borrow_mut().room.cfg = control_timer.room();
+        }
+        shared_timer.borrow_mut().sync_taps(&core_timer);
     });
     let tick = std::time::Duration::from_millis(250);
     if let Err(e) = timer.update_timer(Some(tick), Some(tick)).into_result() {
@@ -1505,6 +1940,7 @@ pub fn run(
         rules = control.allowlist().len(),
         queue_seconds = cfg.capture.queue_seconds,
         mic = control.mic_state(),
+        room = control.room_state(),
         "watching for application audio streams"
     );
     main_loop.run();
@@ -1513,6 +1949,8 @@ pub fn run(
     // shutdown does not leave a dangling session for the next start-up to sweep.
     shared_end.borrow_mut().stop_mic();
     control.set_mic_active(false);
+    shared_end.borrow_mut().stop_room();
+    control.set_room_active(false);
     Ok(())
 }
 
@@ -1790,6 +2228,9 @@ mod tests {
         let mic_source_id = store
             .upsert_source_kind(MIC_MATCH_KEY, MIC_DISPLAY_NAME, KIND_MIC, 0)
             .unwrap();
+        let room_source_id = store
+            .upsert_source_kind(ROOM_MATCH_KEY, ROOM_DISPLAY_NAME, KIND_ROOM, 0)
+            .unwrap();
         let bus = Bus::new(64, 32);
         let allowlist = Allowlist::from_rules(rules.iter().copied());
         let control = Control::new(dir.to_path_buf(), None, &allowlist);
@@ -1809,6 +2250,13 @@ mod tests {
                     capture: None,
                     default_source: None,
                     nodes: HashMap::new(),
+                    retry_after: None,
+                    announced: None,
+                },
+                room: Room {
+                    cfg: RoomConfig::default(),
+                    source_id: room_source_id,
+                    capture: None,
                     retry_after: None,
                     announced: None,
                 },
@@ -1974,5 +2422,126 @@ mod tests {
             mic_plan(&situation(true, MicMode::Always, 0, Some(None), None)),
             MicPlan::Hold
         );
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    /// A cut-down `pw-dump`, in the shape PipeWire really prints: an array of
+    /// heterogeneous objects, the interesting ones identified by `media.class`
+    /// and by `metadata.name`, in no useful order.
+    const DUMP: &str = r#"[
+      { "id": 30, "type": "PipeWire:Interface:Device",
+        "info": { "props": { "device.name": "alsa_card.usb-Yeti" } } },
+      { "id": 31, "type": "PipeWire:Interface:Node",
+        "info": { "props": {
+          "media.class": "Audio/Sink",
+          "node.name": "alsa_output.pci-0000_0c_00.4.analog-stereo",
+          "node.description": "Starship/Matisse Analog Stereo" } } },
+      { "id": 45, "type": "PipeWire:Interface:Node",
+        "info": { "props": {
+          "media.class": "Audio/Source",
+          "object.serial": 812,
+          "node.name": "alsa_input.usb-Blue_Yeti-00.analog-stereo",
+          "node.description": "Yeti Stereo Microphone" } } },
+      { "id": 46, "type": "PipeWire:Interface:Node",
+        "info": { "props": {
+          "media.class": "Audio/Source",
+          "object.serial": 813,
+          "node.name": "alsa_input.pci-0000_0c_00.4.analog-stereo",
+          "node.description": "Built-in Audio Analog Stereo" } } },
+      { "id": 47, "type": "PipeWire:Interface:Node",
+        "info": { "props": {
+          "media.class": "Stream/Output/Audio",
+          "node.name": "VRChat.exe",
+          "application.process.binary": "wine64-preloader" } } },
+      { "id": 52, "type": "PipeWire:Interface:Metadata",
+        "props": { "metadata.name": "default" },
+        "metadata": [
+          { "key": "default.audio.sink", "type": "Spa:String:JSON",
+            "value": { "name": "alsa_output.pci-0000_0c_00.4.analog-stereo" } },
+          { "key": "default.audio.source", "type": "Spa:String:JSON",
+            "value": { "name": "alsa_input.usb-Blue_Yeti-00.analog-stereo" } }
+        ] }
+    ]"#;
+
+    #[test]
+    fn the_pw_dump_parser_finds_the_capture_devices_and_the_default() {
+        let rows = devices_from_pw_dump(DUMP).expect("the canned dump parses");
+        assert_eq!(
+            rows.len(),
+            2,
+            "sinks, playback streams and devices are not capture devices: {rows:?}"
+        );
+        // Default first — a client renders it as the one to avoid, because it
+        // is the headset the `[mic]` tap is already on.
+        assert_eq!(
+            rows[0].node_name,
+            "alsa_input.usb-Blue_Yeti-00.analog-stereo"
+        );
+        assert_eq!(
+            rows[0].description.as_deref(),
+            Some("Yeti Stereo Microphone")
+        );
+        assert!(rows[0].is_default);
+        assert_eq!(
+            rows[1].node_name,
+            "alsa_input.pci-0000_0c_00.4.analog-stereo"
+        );
+        assert!(!rows[1].is_default);
+    }
+
+    #[test]
+    fn a_dump_with_no_default_metadata_still_lists_devices() {
+        // What a bare PipeWire with no session manager looks like. Every row
+        // is offerable; none is the default, and none claims to be.
+        let stripped: String = DUMP
+            .lines()
+            .filter(|l| !l.contains("Metadata") && !l.contains("default.audio"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace("\"metadata\": [\n", "")
+            .replace("        ] }\n", "");
+        // The filtered text is no longer valid JSON; build the case directly
+        // instead of hand-editing a literal, which is what the parser's own
+        // contract is about.
+        let no_meta = DUMP.replace("default.audio.source", "default.audio.source.disabled");
+        let rows = devices_from_pw_dump(&no_meta).expect("parses");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|r| !r.is_default),
+            "nothing may claim to be the default when nothing says so"
+        );
+        // Sorted by name when there is no default to hoist.
+        assert!(rows[0].node_name < rows[1].node_name);
+        let _ = stripped;
+    }
+
+    #[test]
+    fn junk_is_refused_rather_than_guessed_at() {
+        assert!(devices_from_pw_dump("not json at all").is_err());
+        assert!(
+            devices_from_pw_dump("{\"id\": 1}").is_err(),
+            "pw-dump prints an array; an object is not one"
+        );
+        assert!(devices_from_pw_dump("[]").unwrap().is_empty());
+        // A source with no `node.name` cannot be pinned, so it is not offered.
+        let nameless = r#"[{ "id": 1, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Audio/Source" } } }]"#;
+        assert!(devices_from_pw_dump(nameless).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_string_valued_default_is_read_too() {
+        // Some dumps print the metadata value as a JSON *string* containing
+        // the object. Both shapes mean the same device.
+        let dump = DUMP.replace(
+            "{ \"name\": \"alsa_input.usb-Blue_Yeti-00.analog-stereo\" }",
+            "\"{\\\"name\\\":\\\"alsa_input.usb-Blue_Yeti-00.analog-stereo\\\"}\"",
+        );
+        let rows = devices_from_pw_dump(&dump).expect("parses");
+        assert!(rows[0].is_default, "{rows:?}");
     }
 }

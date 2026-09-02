@@ -8,7 +8,18 @@
 // it ever makes a sound (DESIGN §3).
 
 import { h, svg, clear, fmtDate, fmtBytes, speakerHue } from '../lib/dom.js';
-import { store, ask, applyMic, micChip, appSources, allowedAppCount } from '../lib/store.js';
+import {
+  store,
+  ask,
+  applyMic,
+  micChip,
+  appSources,
+  allowedAppCount,
+  // 0.10.0: the second microphone's switch, folded in exactly like the first.
+  applyRoom,
+  roomChip,
+  isNamed,
+} from '../lib/store.js';
 import { toast } from '../lib/sheets.js';
 import { CAPTION_RANGES, normalizeCaptionSettings } from '../lib/captions.js';
 
@@ -18,6 +29,11 @@ export function mount(root, ctx) {
   const list = h('div', { id: 'source-list' });
   const sub = h('span', { class: 'sub', id: 'sources-sub' });
   const micCard = h('div', { class: 'card mic-card', id: 'mic-card' });
+  // 0.10.0. Three more cards, all of them on this page because this page is
+  // where what the program listens to and what it does with it is decided.
+  const roomCard = h('div', { class: 'card mic-card', id: 'room-card' });
+  const truthCard = h('div', { class: 'card', id: 'truth-card' });
+  const exportCard = h('div', { class: 'card', id: 'export-card' });
   const storageCard = h('div', { class: 'card', id: 'storage-card' });
   const captionsCard = h('div', { class: 'card', id: 'captions-card' });
   const body = h(
@@ -27,6 +43,10 @@ export function mount(root, ctx) {
     // whose consent question is different in kind: an app rule is about a
     // program's output, this is about the room.
     micCard,
+    // The room mic sits directly beside the headset's: they are the two
+    // devices in the flat, and the difference between them is the thing a
+    // person has to be able to see at a glance.
+    roomCard,
     h(
       'div',
       { class: 'card' },
@@ -43,6 +63,14 @@ export function mount(root, ctx) {
     // it listens to, what it keeps — and a second window that floats over
     // everything is the same kind of decision.
     captionsCard,
+    // The Discord bridge (0.9.0's ground truth), which is a source of
+    // *labels* rather than of audio — and belongs here because the question it
+    // answers is the same one every other card on this page answers: what is
+    // coming in, and from where.
+    truthCard,
+    // Writing it back out (0.10.0). Under everything that produces the
+    // transcript, because it is the last thing you do with one.
+    exportCard,
     // What all of that costs on disk. It belongs on this page because this is
     // where the decisions that grow it are made.
     storageCard
@@ -147,6 +175,616 @@ export function mount(root, ctx) {
     } finally {
       micPending = false;
       renderMic();
+    }
+  }
+
+  // -- the room microphone (0.10.0) -----------------------------------------
+  //
+  // A second card beside the first, deliberately alike: the same head, the same
+  // chip, the same two modes. Three things differ, and each is a fact about the
+  // device rather than a UI choice — it needs a device chosen before it can do
+  // anything, its warning is about other people rather than about the room
+  // around you, and it says out loud that these voices are NOT you.
+
+  let roomPending = false;
+  let devices = [];
+  let devicesError = null;
+
+  async function loadDevices() {
+    try {
+      devices = (await ask('devices.list'))?.devices ?? [];
+      devicesError = null;
+    } catch (e) {
+      devices = [];
+      // An older daemon has no `devices.list`. Say so rather than rendering an
+      // empty picker that looks like "you own no microphones".
+      devicesError = e.message;
+    }
+    renderRoom();
+  }
+
+  function renderRoom() {
+    const room = store.room;
+    const chip = roomChip(room.state);
+    clear(roomCard);
+
+    const known = devices.some((d) => d.node_name === room.device);
+    const toggle = h('button', {
+      class: 'toggle',
+      role: 'switch',
+      id: 'room-toggle',
+      'aria-pressed': String(!!room.enabled),
+      'aria-label': room.enabled ? 'Turn the room microphone off' : 'Turn the room microphone on',
+      // The one disabled state that is not a connection problem: there is
+      // nothing for the switch to open, and the daemon would refuse it.
+      disabled: roomPending || store.conn.status !== 'connected' || (!room.enabled && !room.device),
+      onclick: () => setRoom({ enabled: !room.enabled }),
+    });
+
+    const picker = h(
+      'select',
+      {
+        class: 'cap-select',
+        id: 'room-device',
+        'aria-label': 'Which microphone hears the room',
+        disabled: roomPending || store.conn.status !== 'connected',
+        onchange: (e) => setRoom({ device: e.target.value || null }),
+      },
+      h('option', { value: '', text: room.device ? 'No device (turns it off)' : 'Choose a device…' }),
+      ...devices.map((d) =>
+        h('option', {
+          value: d.node_name,
+          selected: d.node_name === room.device,
+          // The default input is almost always the headset the card above is
+          // already on, and pointing this one at it would record the user
+          // twice under two identities. Say which one it is.
+          text: `${d.description || d.node_name}${d.is_default ? ' — system default (your headset)' : ''}`,
+        })
+      ),
+      // A pinned device that is not on the graph right now must still show as
+      // the chosen one: unplugging a mic is not un-choosing it.
+      ...(room.device && !known ? [h('option', { value: room.device, selected: true, text: `${room.device} — not connected` })] : [])
+    );
+
+    const mode = (value, label, hint) =>
+      h(
+        'button',
+        {
+          class: 'mode-opt',
+          dataset: { roomMode: value },
+          'aria-pressed': String(room.mode === value),
+          disabled: roomPending || !room.enabled,
+          onclick: () => setRoom({ mode: value }),
+        },
+        h('b', { text: label }),
+        h('small', { text: hint })
+      );
+
+    roomCard.append(
+      h(
+        'div',
+        { class: 'mic-head' },
+        h(
+          'span',
+          { class: 'mic-ico', 'aria-hidden': 'true' },
+          svg('M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3M5 11a7 7 0 0 0 14 0M12 18v3', 18)
+        ),
+        h(
+          'span',
+          { class: 'mic-title' },
+          h('span', { class: 'name', text: 'Room microphone' }),
+          h('span', { class: 'key', text: room.device ?? 'no device chosen' })
+        ),
+        h('span', { class: 'spacer' }),
+        h('span', { class: chip.cls, id: 'room-chip' }, h('span', { class: `dot${chip.live ? ' pulse' : ''}` }), chip.text),
+        toggle
+      ),
+      // As blunt as the microphone's, and about somebody else. This is the one
+      // card in the program where the people affected are not in the room's
+      // conversation by choice and are not in the instance at all.
+      h('p', {
+        class: 'mic-warn',
+        id: 'room-warning',
+        text: 'A second microphone for the people physically in the room with you. Everyone it hears is recorded and transcribed — a partner, a flatmate, a friend on the sofa — whether or not they are in the instance. Their voices are matched, named and remembered like anybody else’s; nothing on this device is marked as you.',
+      }),
+      h(
+        'div',
+        { class: 'cap-row-ctl' },
+        h(
+          'span',
+          { class: 'cap-label' },
+          h('b', { text: 'Device' }),
+          h('small', {
+            text: devicesError
+              ? `Could not list the capture devices — ${devicesError}`
+              : 'There is no default: pick the microphone that is in the room, not the one on your head.',
+          })
+        ),
+        picker,
+        h('button', {
+          class: 'btn small',
+          id: 'room-refresh',
+          text: 'Refresh',
+          onclick: () => void loadDevices(),
+        })
+      ),
+      h(
+        'div',
+        { class: 'mic-modes', id: 'room-modes', role: 'group', 'aria-label': 'When the room microphone records' },
+        mode('follow', 'Follow allowed apps', 'Only while something in the list below is being captured.'),
+        mode('always', 'Always', 'Whenever NX Recall is running.')
+      )
+    );
+  }
+
+  async function setRoom(change) {
+    const before = { ...store.room };
+    applyRoom(change);
+    roomPending = true;
+    renderRoom();
+    try {
+      applyRoom(await ask('room.set', change));
+      toast(
+        store.room.enabled
+          ? `Room microphone on — ${store.room.mode === 'always' ? 'recording whenever NX Recall runs' : 'recording only while an allowed app is captured'}.`
+          : 'Room microphone off. Nothing from the room is recorded.',
+        'ok'
+      );
+    } catch (e) {
+      store.room = before;
+      toast(`Could not change the room microphone — ${e.message}`, 'error');
+    } finally {
+      roomPending = false;
+      renderRoom();
+    }
+  }
+
+  // -- the Discord bridge (0.9.0's ground truth) ----------------------------
+  //
+  // Not a source of audio: a source of LABELS. Discord knows who was speaking
+  // and when, which is the only yardstick this program has ever had for
+  // speaker identity — and the card's job is to say what is arriving, from
+  // whom, and how well the voicebank is doing against it.
+
+  let truth = null;
+  let truthUsers = [];
+  let truthSummary = null;
+  let truthPending = null;
+
+  async function loadTruth() {
+    try {
+      const [status, users, summary] = await Promise.all([
+        ask('truth.status').catch(() => null),
+        ask('truth.users').catch(() => null),
+        ask('truth.summary').catch(() => null),
+      ]);
+      truth = status;
+      truthUsers = users?.users ?? [];
+      truthSummary = summary;
+    } catch {
+      /* an older daemon has none of these; the card says "off" */
+    }
+    renderTruth();
+  }
+
+  /**
+   * Has the plugin sent anything in the last minute?
+   *
+   * The newest of the two answers, not the first: `truth.status` was asked once
+   * on mount and the status push keeps arriving, so preferring either one on
+   * its own would leave a live bridge reading as silent within a minute.
+   */
+  function truthLive() {
+    const last = Math.max(truth?.last_span_ms ?? 0, store.status?.truth?.last_event_ms ?? 0);
+    return last > 0 && Date.now() - last < 60_000;
+  }
+
+  function truthChip() {
+    if (!(truth?.enabled ?? store.status?.truth?.enabled)) return { text: 'off', cls: 'chip' };
+    if (truthLive()) return { text: 'receiving', cls: 'chip live', live: true };
+    return { text: 'waiting for Discord', cls: 'chip' };
+  }
+
+  /** `precision · recall · n`, or an honest sentence when there is nothing. */
+  function scorecard() {
+    const id = truthSummary?.identity;
+    if (!id || !id.n) return { text: 'no clean turns scored yet', empty: true };
+    const pct = (v) => (v == null ? '—' : `${Math.round(v * 100)}%`);
+    return {
+      text: `precision ${pct(id.precision)} · recall ${pct(id.recall)} · n ${id.n}`,
+      empty: false,
+    };
+  }
+
+  function renderTruth() {
+    clear(truthCard);
+    const brief = store.status?.truth ?? null;
+    const enabled = truth?.enabled ?? brief?.enabled ?? false;
+    const chip = truthChip();
+
+    truthCard.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('span', { class: 'card-title', text: 'Discord' }),
+        h('span', { class: 'spacer' }),
+        h('span', { class: chip.cls, id: 'truth-chip' }, h('span', { class: `dot${chip.live ? ' pulse' : ''}` }), chip.text)
+      ),
+      h('p', {
+        class: 'rail-hint',
+        id: 'truth-hint',
+        style: 'padding:0 0 12px;max-width:64ch',
+        text: 'Discord already knows who was speaking and when. The RecallBridge plugin sends that here — speaking edges, who is in the channel, and their nicknames. No audio, no messages, no text of any kind, and none of it leaves this machine: it is the only yardstick this program has for whether it is naming voices correctly.',
+      })
+    );
+
+    if (!enabled) {
+      truthCard.append(
+        h(
+          'div',
+          { class: 'empty', id: 'truth-off' },
+          h('b', { text: 'The bridge is off' }),
+          h('p', {
+            text: 'Run `recalld truth on`, restart the daemon, then paste the token from `recalld truth token` into Vencord → RecallBridge.',
+          })
+        )
+      );
+      return;
+    }
+
+    const score = scorecard();
+    truthCard.append(
+      h(
+        'p',
+        { class: 'rail-hint', id: 'truth-score', style: 'padding:0 0 10px;max-width:64ch' },
+        score.empty
+          ? 'Identity score: no clean turns scored yet — a turn counts only when Discord says one person spoke for most of it, it is at least a second long, and that account is linked to a voice.'
+          : `Identity score: ${score.text}. Precision is how often it is right when it answers; recall is how often it answers at all.`
+      )
+    );
+
+    if (!truthUsers.length) {
+      truthCard.append(
+        h(
+          'div',
+          { class: 'empty', id: 'truth-empty' },
+          h('b', { text: 'Nobody heard yet' }),
+          h('p', { text: 'Accounts appear here the first time the plugin reports them speaking.' })
+        )
+      );
+      return;
+    }
+
+    const named = [...store.speakers.values()].filter(isNamed);
+    const list = h('div', { id: 'truth-users' });
+    for (const u of truthUsers) {
+      list.append(truthRow(u, named));
+    }
+    truthCard.append(list);
+  }
+
+  function truthRow(u, named) {
+    const row = h('div', { class: 'src-row', dataset: { truthUser: u.user_id } });
+    const select = h(
+      'select',
+      {
+        class: 'cap-select',
+        dataset: { truthLink: u.user_id },
+        disabled: truthPending === u.user_id,
+        onchange: (e) => setTruthLink(u, e.target.value),
+      },
+      h('option', { value: '', selected: u.speaker == null, text: 'Link…' }),
+      ...named.map((sp) =>
+        h('option', { value: String(sp.id), selected: sp.id === u.speaker, text: sp.name ?? sp.auto })
+      ),
+      // A voice linked automatically may not be named yet, and the select must
+      // still be able to show what it is linked TO.
+      ...(u.speaker != null && !named.some((sp) => sp.id === u.speaker)
+        ? [h('option', { value: String(u.speaker), selected: true, text: u.speaker_name ?? `voice ${u.speaker}` })]
+        : [])
+    );
+
+    row.append(
+      h('span', {
+        class: 'src-mono',
+        text: String(u.name ?? u.user_id).slice(0, 2).toUpperCase(),
+        style: `--sp-h:${speakerHue(hash(u.user_id))}`,
+      }),
+      h(
+        'span',
+        {},
+        // The Discord nickname, shown and never applied: it is per-guild and
+        // somebody picked it for a joke last Tuesday. Naming a voice stays a
+        // decision a person makes on the Speakers page.
+        h('span', { class: 'name', text: u.name ?? u.user_id }),
+        h('span', { class: 'key', text: ` ${u.segments ?? 0} turn${u.segments === 1 ? '' : 's'}${u.via === 'truth' ? ' · linked automatically' : u.via === 'manual' ? ' · linked by you' : ''}` })
+      ),
+      h('span', { class: 'spacer' }),
+      h('span', { class: 'sp-actions' }, select)
+    );
+    return row;
+  }
+
+  async function setTruthLink(u, value) {
+    const before = { ...u };
+    const speaker = value ? Number(value) : null;
+    u.speaker = speaker;
+    u.via = speaker == null ? null : 'manual';
+    truthPending = u.user_id;
+    renderTruth();
+    try {
+      const out = speaker == null ? await ask('truth.unlink', { user_id: u.user_id }) : await ask('truth.link', { user_id: u.user_id, speaker_id: speaker });
+      Object.assign(u, out ?? {});
+      toast(speaker == null ? `${before.name ?? before.user_id} unlinked.` : `${before.name ?? before.user_id} is ${out?.speaker_name ?? 'that voice'}.`, 'ok');
+    } catch (e) {
+      Object.assign(u, before);
+      toast(`Could not link ${before.name ?? before.user_id} — ${e.message}`, 'error');
+    } finally {
+      truthPending = null;
+      renderTruth();
+      // The score moves when a link does: a linked user's turns are the only
+      // ones identity is scored on.
+      void ask('truth.summary')
+        .then((s) => {
+          truthSummary = s;
+          renderTruth();
+        })
+        .catch(() => {});
+    }
+  }
+
+  // -- the Markdown export (0.10.0) -----------------------------------------
+  //
+  // DESIGN §12: this writes files to your disk and nothing else. The card says
+  // that sentence, and the shape of the card is the same claim — a folder you
+  // pick in a native dialog, a preview of exactly which files, and one button.
+  // There is nowhere else for the output to go, and no control that suggests
+  // there might be.
+
+  let exportDir = null;
+  let exportPlan = null;
+  let exportBusy = false;
+  let exportOp = null;
+  let exportProgress = null;
+  let exportDone = null;
+  let exportError = null;
+  const exportRange = { from: '', to: '', translations: false };
+
+  function renderExport() {
+    // A status poll arrives every few seconds and repaints this page. Repainting
+    // a card somebody is typing a date into would take the cursor away from
+    // them, so a focused card is left exactly as it is — everything it shows is
+    // already in the closure and nothing has changed underneath it.
+    if (exportCard.contains(document.activeElement) && !exportBusy) return;
+    clear(exportCard);
+    const canRun = !!exportDir && !exportBusy && store.conn.status === 'connected';
+
+    exportCard.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('span', { class: 'card-title', text: 'Export to Markdown' }),
+        h('span', { class: 'spacer' }),
+        h('button', {
+          class: 'btn small',
+          id: 'export-choose',
+          text: exportDir ? 'Change folder…' : 'Choose folder…',
+          disabled: exportBusy,
+          onclick: () => void chooseFolder(),
+        })
+      ),
+      // The sentence, verbatim, and unmissable.
+      h('p', {
+        class: 'mic-warn',
+        id: 'export-note',
+        text: 'This writes files to your disk and nothing else. One Markdown file per day, plus people.md, in the folder you pick — there is no upload, no sharing and no link. Moving them anywhere afterwards is your own doing.',
+      }),
+      h('p', {
+        class: 'rail-hint',
+        id: 'export-dir',
+        style: 'padding:0 0 10px;max-width:64ch',
+        text: exportDir ? exportDir : 'No folder chosen yet.',
+      })
+    );
+
+    const dateInput = (key, label) =>
+      h(
+        'div',
+        { class: 'cap-row-ctl' },
+        h('span', { class: 'cap-label' }, h('b', { text: label })),
+        h('input', {
+          class: 'cap-range',
+          type: 'date',
+          id: `export-${key}`,
+          value: exportRange[key],
+          'aria-label': label,
+          oninput: (e) => {
+            exportRange[key] = e.target.value;
+            // The plan is about a range; changing the range invalidates it
+            // rather than silently describing a different export.
+            exportPlan = null;
+            renderExport();
+          },
+        })
+      );
+
+    exportCard.append(
+      dateInput('from', 'From'),
+      dateInput('to', 'To (up to, not including)'),
+      h(
+        'div',
+        { class: 'cap-row-ctl' },
+        h(
+          'span',
+          { class: 'cap-label' },
+          h('b', { text: 'Include translations' }),
+          h('small', { text: 'Written under each turn that has one, as a quote.' })
+        ),
+        h('span', { class: 'spacer' }),
+        h('button', {
+          class: 'toggle',
+          role: 'switch',
+          id: 'export-translations',
+          'aria-pressed': String(exportRange.translations),
+          'aria-label': 'Include translations',
+          onclick: () => {
+            exportRange.translations = !exportRange.translations;
+            exportPlan = null;
+            renderExport();
+          },
+        })
+      ),
+      h(
+        'div',
+        { class: 'sheet-head', style: 'padding-top:10px' },
+        h('button', {
+          class: 'btn small',
+          id: 'export-preview',
+          text: 'Preview',
+          disabled: !canRun,
+          onclick: () => void preview(),
+        }),
+        h('button', {
+          class: 'btn small primary',
+          id: 'export-run',
+          text: exportBusy ? 'Exporting…' : 'Export',
+          disabled: !canRun || !exportPlan || !!exportPlan.blocked?.length || !exportPlan.files?.length,
+          onclick: () => void run(),
+        }),
+        h('span', { class: 'spacer' }),
+        exportDone
+          ? h('button', {
+              class: 'btn small',
+              id: 'export-open',
+              text: 'Open folder',
+              onclick: () => void window.recall.exportFolder.open(exportDone.dir),
+            })
+          : h('span', {})
+      )
+    );
+
+    if (exportError) {
+      exportCard.append(h('p', { class: 'mic-warn', id: 'export-error', text: exportError }));
+    }
+    if (exportProgress) {
+      exportCard.append(
+        h('p', {
+          class: 'rail-hint',
+          id: 'export-progress',
+          style: 'padding:8px 0 0',
+          text: `Writing ${exportProgress.done} of ${exportProgress.total}…`,
+        })
+      );
+    }
+    if (exportDone) {
+      exportCard.append(
+        h('p', {
+          class: 'rail-hint',
+          id: 'export-done',
+          style: 'padding:8px 0 0',
+          text: `Wrote ${exportDone.files} file${exportDone.files === 1 ? '' : 's'} (${fmtBytes(exportDone.bytes ?? 0)}) to ${exportDone.dir}.`,
+        })
+      );
+    }
+    if (exportPlan) {
+      exportCard.append(
+        h('p', {
+          class: 'rail-hint',
+          id: 'export-counts',
+          style: 'padding:8px 0 4px;max-width:64ch',
+          text: exportPlan.files.length
+            ? `${exportPlan.days} day${exportPlan.days === 1 ? '' : 's'} · ${exportPlan.conversations} conversation${exportPlan.conversations === 1 ? '' : 's'} · ${exportPlan.turns} turn${exportPlan.turns === 1 ? '' : 's'} · ${fmtBytes(exportPlan.bytes)} over ${exportPlan.files.length} file${exportPlan.files.length === 1 ? '' : 's'}`
+            : 'Nothing to export in that range.',
+        })
+      );
+      const files = h('div', { class: 'storage-rows', id: 'export-files' });
+      for (const f of exportPlan.files) {
+        files.append(
+          h(
+            'div',
+            { class: 'storage-row', dataset: { exportFile: f.name } },
+            h(
+              'span',
+              { class: 'storage-name' },
+              h('b', { text: f.name }),
+              h('small', {
+                text: f.blocked
+                  ? 'Already there and not written by NX Recall — this file will not be touched, and the export refuses while it is in the way.'
+                  : f.exists
+                    ? 'Replaces an earlier export of the same day.'
+                    : 'New file.',
+              })
+            ),
+            h('span', { class: 'storage-bytes', text: fmtBytes(f.bytes) })
+          )
+        );
+      }
+      if (exportPlan.files.length) exportCard.append(files);
+    }
+  }
+
+  /** ISO date (`2026-09-01`) → the instant the daemon reads as that local day. */
+  function dayStart(value) {
+    if (!value) return undefined;
+    const d = new Date(`${value}T00:00:00`);
+    return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
+  }
+
+  function exportParams() {
+    const params = { dir: exportDir, include_translations: exportRange.translations };
+    const from = dayStart(exportRange.from);
+    const to = dayStart(exportRange.to);
+    if (from) params.from = from;
+    if (to) params.to = to;
+    return params;
+  }
+
+  async function chooseFolder() {
+    const dir = await window.recall.exportFolder.choose();
+    if (!dir) return;
+    exportDir = dir;
+    exportPlan = null;
+    exportDone = null;
+    exportError = null;
+    renderExport();
+    void preview();
+  }
+
+  async function preview() {
+    exportBusy = true;
+    exportError = null;
+    renderExport();
+    try {
+      exportPlan = await ask('export.preview', exportParams());
+      if (exportPlan.blocked?.length) {
+        exportError = `${exportPlan.blocked.join(', ')} ${exportPlan.blocked.length === 1 ? 'is' : 'are'} already in that folder and ${exportPlan.blocked.length === 1 ? 'was' : 'were'} not written by NX Recall. Move ${exportPlan.blocked.length === 1 ? 'it' : 'them'}, or pick an empty folder — the export will not overwrite a file it did not write.`;
+      }
+    } catch (e) {
+      exportPlan = null;
+      exportError = e.message;
+    } finally {
+      exportBusy = false;
+      renderExport();
+    }
+  }
+
+  async function run() {
+    exportBusy = true;
+    exportError = null;
+    exportDone = null;
+    exportProgress = { done: 0, total: exportPlan?.files?.length ?? 0 };
+    renderExport();
+    try {
+      const out = await ask('export.run', exportParams());
+      exportOp = out.op;
+      // The op finishes on the event stream; `update` below picks it up.
+    } catch (e) {
+      exportBusy = false;
+      exportOp = null;
+      exportProgress = null;
+      exportError = e.message;
+      toast(`Export refused — ${e.message}`, 'error');
+      renderExport();
     }
   }
 
@@ -314,6 +952,9 @@ export function mount(root, ctx) {
 
   function render() {
     renderMic();
+    renderRoom();
+    renderTruth();
+    renderExport();
     renderStorage();
     renderCaptions();
     clear(list);
@@ -412,6 +1053,22 @@ export function mount(root, ctx) {
   // The captions card's truth lives in the main process — the window can be
   // opened from the tray or from a command line while this view is not
   // mounted — so a mount ASKS rather than assuming the defaults it just drew.
+  // 0.10.0. Three things this view owns that the boot queries do not fetch,
+  // because nothing outside this page needs them: the room switch, the capture
+  // devices it picks from, and the Discord bridge's state. Asked on mount, so
+  // an older daemon that has none of them leaves the cards in their off state
+  // rather than breaking the page.
+  void (async () => {
+    try {
+      applyRoom(await ask('room.get'));
+    } catch {
+      /* a daemon older than the room microphone: the card stays off */
+    }
+    renderRoom();
+    await loadDevices();
+  })();
+  void loadTruth();
+
   void (async () => {
     try {
       const st = await window.recall.captions.state();
@@ -427,7 +1084,42 @@ export function mount(root, ctx) {
   return {
     update(change) {
       if (change?.mic || change?.conn) renderMic();
+      if (change?.room || change?.conn) renderRoom();
       if (change?.status) renderStorage();
+      // ---- 0.10.0 --------------------------------------------------------
+      // The export's op finishes on the event stream, like every other op.
+      if (change?.ops && exportOp) {
+        const live = store.ops.get(exportOp);
+        if (live) {
+          exportProgress = {
+            done: Math.round((live.frac ?? 0) * (exportProgress?.total ?? 1)),
+            total: exportProgress?.total ?? 1,
+          };
+          renderExport();
+        }
+      }
+      if (change?.opFinished?.kind === 'export.run' && change.opFinished.op === exportOp) {
+        const d = change.opFinished;
+        exportBusy = false;
+        exportOp = null;
+        exportProgress = null;
+        if (d.failed) {
+          exportError = d.msg ?? 'the export failed';
+          toast(`Export failed — ${exportError}`, 'error');
+        } else {
+          exportDone = { files: d.files, bytes: d.bytes, dir: d.dir };
+          // The files are on disk now, so the plan describes what IS there.
+          void preview();
+          toast(`Exported ${d.files} file${d.files === 1 ? '' : 's'} to your disk.`, 'ok');
+        }
+        renderExport();
+      }
+      // A link made here or anywhere else, and the periodic status poll that
+      // carries whether the plugin is still sending.
+      if (change?.truth) void loadTruth();
+      if (change?.status) renderTruth();
+      if (change?.speakers || change?.relabel) renderTruth();
+      // ---- end 0.10.0 ----------------------------------------------------
       if (change?.sources || change?.status) render();
       // A settings broadcast carries the whole block; the rail button's own
       // click carries only `true`, and then only the open/closed half moved.

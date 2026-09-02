@@ -30,7 +30,7 @@
 //! any other migration writes, so it applies to a v6, v7 or v8 database alike.
 //! Existing databases are migrated in place.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -69,6 +69,26 @@ pub const SCHEMA_VERSION: i64 = 11;
 pub const KIND_APP: &str = "app";
 /// `sources.kind` for the user's own microphone.
 pub const KIND_MIC: &str = "mic";
+/// `sources.kind` for the room microphone (0.10.0): a second, physical input
+/// that hears the people sitting in the room rather than the user.
+///
+/// No migration comes with it. `kind` has been a free-text column since v4 and
+/// a row is written with this value the first time the room tap exists; a
+/// client that has never heard of it renders the row by its `kind` string,
+/// which is exactly what the versioning rule asks of it.
+pub const KIND_ROOM: &str = "room";
+
+/// The source kinds whose turns may join a conversation from ANOTHER session.
+///
+/// The microphone bridges because the user is one voice across every session
+/// (2026-09-02: pinning them to their own session made every thread a
+/// monologue). The room bridges for the same reason and it is the same reason
+/// literally: the room and the headset are one physical evening, and a person
+/// sitting next to the user answering somebody in the instance is in that
+/// conversation whatever device carried their voice.
+pub fn kind_bridges_threads(kind: &str) -> bool {
+    kind == KIND_MIC || kind == KIND_ROOM
+}
 
 /// `segments.label_via` — how this row's *speaker* came to be what it is (v5).
 /// Before v5 the same distinction was carried implicitly by `match_score`
@@ -3445,25 +3465,31 @@ impl Store {
     }
 
     /// The threading rule's view of one stored segment: its session, whether
-    /// that session is the user's microphone, and the turn itself.
+    /// that session's turns may bridge into another session's conversation,
+    /// and the turn itself.
     ///
-    /// The mic flag exists because a conversation SPANS sessions: the user's
+    /// The bridge flag exists because a conversation SPANS sessions: the user's
     /// half lives in the mic session while everyone else's lives in an app
     /// session, and threading them apart made every thread single-voiced —
     /// which starved the person graph of edges and the commitment extractor
     /// of counterparties (found live, 2026-09-02: 465 threads, roster of one
     /// in every window, found=0 forever).
+    ///
+    /// 0.10.0: the room microphone bridges too ([`kind_bridges_threads`]). The
+    /// people physically in the room are in the same conversation as the people
+    /// in the instance, and the only thing separating them is which device
+    /// carried the sound.
     pub fn segment_turn(&self, segment_id: i64) -> Result<Option<(i64, bool, Turn)>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT g.session_id, (sc.kind = 'mic') AS is_mic,
+                "SELECT g.session_id, (sc.kind IN (?2, ?3)) AS bridges,
                         g.t_start_ns, g.t_end_ns, g.speaker_id
                  FROM segments g
                  JOIN sessions ss ON ss.id = g.session_id
                  JOIN sources sc ON sc.id = ss.source_id
                  WHERE g.id = ?1 AND g.deleted_at IS NULL",
-                params![segment_id],
+                params![segment_id, KIND_MIC, KIND_ROOM],
                 |r| {
                     Ok((
                         r.get(0)?,
@@ -3478,6 +3504,70 @@ impl Store {
             )
             .optional()?)
     }
+
+    // ---- 0.10.0, the Markdown export ------------------------------------
+
+    /// Every live turn in a window, oldest first — what `export.run` writes.
+    ///
+    /// Deliberately one query returning whole [`SegmentRow`]s rather than the
+    /// paged `transcript` shape: the export is the one reader that wants the
+    /// *whole* range at once and every column of it (the translation, the
+    /// shaky flag, the thread), and paging it would mean deciding what a page
+    /// boundary does to a conversation heading.
+    ///
+    /// `from` is inclusive, `to` exclusive, both in UTC nanoseconds; `None` is
+    /// unbounded on that side. `speaker` matches the *canonical* id, so a merged
+    /// voice exports under the voice it was merged into, exactly as every other
+    /// read path resolves it.
+    pub fn export_segments(
+        &self,
+        from: Option<i64>,
+        to: Option<i64>,
+        speaker: Option<i64>,
+        thread: Option<i64>,
+    ) -> Result<Vec<SegmentRow>> {
+        let sql = format!(
+            "SELECT {}
+             FROM segments g
+             JOIN sessions ss ON ss.id = g.session_id
+             JOIN sources sc ON sc.id = ss.source_id
+             LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             WHERE g.deleted_at IS NULL
+               AND (?1 IS NULL OR g.t_start_ns >= ?1)
+               AND (?2 IS NULL OR g.t_start_ns < ?2)
+               AND (?3 IS NULL OR sp.canonical_id = ?3)
+               AND (?4 IS NULL OR g.thread_id = ?4)
+             ORDER BY g.t_start_ns ASC, g.id ASC",
+            Self::SEGMENT_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![from, to, speaker, thread], Self::segment_row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// When each voice was last heard at all, as `(canonical id, t_end_ns)`.
+    ///
+    /// One query rather than a `person_totals` call per voice: `people.md` is
+    /// written for every named voice in the bank, and the roster of a long-lived
+    /// install is not two rows.
+    pub fn export_last_heard(&self) -> Result<BTreeMap<i64, i64>> {
+        let rows = self
+            .conn
+            .prepare(
+                "SELECT sp.canonical_id, MAX(g.t_end_ns)
+                 FROM segments g
+                 JOIN speaker_resolved sp ON sp.id = g.speaker_id
+                 WHERE g.deleted_at IS NULL
+                 GROUP BY sp.canonical_id",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<BTreeMap<i64, i64>>>()?;
+        Ok(rows)
+    }
+
+    // ---- end 0.10.0 -------------------------------------------------------
 
     /// One conversation, in order — what `thread.get` returns.
     pub fn thread_rows(&self, thread_id: i64) -> Result<Vec<SegmentRow>> {
