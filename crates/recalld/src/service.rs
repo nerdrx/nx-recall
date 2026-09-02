@@ -247,6 +247,13 @@ impl Service {
             "segments.audio" => self.segments_audio(req),
             "search" => self.search(req),
             "search.semantic" => self.search_semantic(req),
+            // ---- 0.8.0, the product round (PROTOCOL "the accuracy round") --
+            "search.ask" => self.search_ask(req),
+            "notes.list" => self.notes_list(req),
+            "notes.set_state" => self.notes_set_state(req),
+            "person.brief" => self.person_brief(req),
+            "accuracy.summary" => self.accuracy_summary(),
+            // ---- end 0.8.0 -------------------------------------------------
             "transcript" => self.transcript(req),
             "roster.now" => self.roster_now(),
             "operations.list" => self.operations_list(req),
@@ -1616,7 +1623,15 @@ impl Service {
     /// acted on: `candidate` means the daemon noticed something, and only a
     /// human click moves it.
     fn commitment_json(&self, c: &crate::store::CommitmentRow) -> Value {
-        json!({
+        commitment_json(c)
+    }
+}
+
+/// One commitment on the wire. A free function since 0.8.0 so `person.brief`
+/// ([`crate::brief`]) can render the same shape without going through the
+/// service — two spellings of a commitment is one spelling too many.
+pub fn commitment_json(c: &crate::store::CommitmentRow) -> Value {
+    json!({
             "id": c.id,
             "segment": c.segment_id,
             "thread": c.thread_id,
@@ -1644,9 +1659,10 @@ impl Service {
             "t_ns": c.t_start_ns.to_string(),
             "created_ms": ns_to_ms(c.created_at),
             "updated_ms": ns_to_ms(c.updated_at),
-        })
-    }
+    })
+}
 
+impl Service {
     /// Everything the Memory view needs to paint itself once, in one round trip
     /// — the same argument the person page makes.
     fn graph_summary(&self) -> Result<Value, Error> {
@@ -2491,6 +2507,227 @@ fn wav_span(bytes: &[u8], row_ms: i64) -> (u32, i64) {
     let frames = reader.duration() as i64;
     let rate = spec.sample_rate.max(1);
     (rate, frames * 1000 / rate as i64)
+}
+
+// ===========================================================================
+// 0.8.0 — the product round: search.ask, notes.*, person.brief,
+// accuracy.summary (PROTOCOL "the accuracy round").
+//
+// Kept in one impl block on purpose. The logic lives in `ask`, `notes`,
+// `brief` and `accuracy`; what is here is the socket's share of it — reading
+// parameters, holding the store lock for as short as possible, and
+// broadcasting.
+// ===========================================================================
+
+/// Hits one `search.ask` returns when the caller does not say. A question is
+/// answered on a screen, and a screen holds twenty answers.
+const ASK_LIMIT: usize = 50;
+
+/// Notes one `notes.list` returns when the caller does not say.
+const NOTES_LIMIT: usize = 200;
+
+impl Service {
+    /// `search.ask` — one query box.
+    ///
+    /// The parse is pure and testable ([`crate::ask`]); this is the part that
+    /// needs a database: the voicebank the parser matches names against, and
+    /// the search it runs with what came out.
+    fn search_ask(self: &Arc<Self>, req: &Request) -> Result<Value, Error> {
+        let q = req.str("q")?.trim().to_string();
+        if q.is_empty() {
+            return Err(Error::params("q must not be empty"));
+        }
+        let limit = req.usize_or("limit", ASK_LIMIT)?.clamp(1, 1000);
+
+        // Only NAMED voices are offered to the parser: nobody types
+        // "Speaker_07" into a question, and fuzzy-matching an auto-label would
+        // turn a stray number into a facet.
+        let named: Vec<crate::ask::Named> = self
+            .store()
+            .list_speakers()
+            .map_err(Error::from)?
+            .into_iter()
+            .filter_map(|s| {
+                s.name().map(|n| crate::ask::Named {
+                    id: s.id,
+                    label: n.to_string(),
+                })
+            })
+            .collect();
+        let interpretation = crate::ask::parse(&q, utc_now_ns(), &named);
+
+        let filter = SegmentFilter {
+            speaker: interpretation.speaker_id,
+            session: None,
+            source: None,
+            from: interpretation.from_ns,
+            to: interpretation.to_ns,
+        };
+        let expression = crate::ask::fts_expression(&interpretation.query);
+        let (hits, mode) = self.ask_hits(&interpretation.query, &expression, &filter, limit)?;
+
+        Ok(json!({
+            "q": q,
+            // What the daemon understood, handed back so the GUI can show it
+            // and let the user drop a facet it got wrong. A parser that
+            // guesses silently is a parser nobody can correct.
+            "interpretation": {
+                "query": interpretation.query,
+                "speaker_id": interpretation.speaker_id,
+                // Spelled as the voicebank spells it, not as it was typed.
+                "speaker_label": interpretation.speaker_label,
+                // Both forms, as everywhere else: `_ns` is a string because
+                // 1.8e18 does not survive a JSON number in a browser.
+                "from_ns": interpretation.from_ns.map(|v| v.to_string()),
+                "to_ns": interpretation.to_ns.map(|v| v.to_string()),
+                "from_ms": interpretation.from_ns.map(ns_to_ms),
+                "to_ms": interpretation.to_ns.map(ns_to_ms),
+                "mode": mode,
+            },
+            "total": hits.len(),
+            "hits": hits,
+        }))
+    }
+
+    /// The search half of `search.ask`: hybrid when the semantic model is
+    /// installed, keyword when it is not, and a slice of transcript when the
+    /// question was nothing but facets.
+    ///
+    /// A missing semantic model is NOT an error here, unlike in
+    /// `search.semantic`: the caller asked a question, not for a particular
+    /// engine, and keyword search is a real answer. `mode` says which ran.
+    fn ask_hits(
+        &self,
+        query: &str,
+        expression: &str,
+        filter: &SegmentFilter,
+        limit: usize,
+    ) -> Result<(Vec<Value>, &'static str), Error> {
+        use crate::ask::mode;
+
+        if expression.is_empty() {
+            // "was hat Aspen gestern gesagt" — every word was a facet. The
+            // honest answer is the transcript those facets select, newest
+            // first, rather than an empty result set.
+            let mut rows = self
+                .store()
+                .segment_rows(filter, limit)
+                .map_err(Error::from)?;
+            rows.reverse();
+            return Ok((rows.iter().map(segment_json).collect(), mode::FACETS));
+        }
+
+        let Some(leg) = self.semantic() else {
+            let store = self.store();
+            let hits = store
+                .search_filtered(expression, filter, limit)
+                .map_err(|e| Error::new("params", format!("{e:#}")))?;
+            return Ok((
+                hits.into_iter()
+                    .map(|h| {
+                        let mut row = segment_json(&h.row);
+                        row["snippet"] = json!(h.snippet);
+                        row
+                    })
+                    .collect(),
+                mode::FTS,
+            ));
+        };
+
+        // The same fusion `search.semantic` performs, over the parsed facets.
+        // The vector leg is given the residual words as a PHRASE — it embeds
+        // meaning, and quoting each word for FTS would be noise to it.
+        let store = self.store();
+        let within = crate::semantic::candidates(&store, filter).map_err(Error::from)?;
+        let scored = leg
+            .search(&store, query, limit, &within)
+            .map_err(|e| Error::new("failed", format!("{e:#}")))?;
+        let semantic_ids: Vec<i64> = scored.iter().map(|s| s.segment_id).collect();
+        let scores: HashMap<i64, f32> = scored.iter().map(|s| (s.segment_id, s.score)).collect();
+        let keyword_ids: Vec<i64> = match store.search_filtered(expression, filter, limit) {
+            Ok(hits) => hits.iter().map(|h| h.segment_id()).collect(),
+            Err(e) => {
+                warn!("the keyword leg of a question failed: {e:#}");
+                Vec::new()
+            }
+        };
+        let fused = crate::semantic::fuse(&keyword_ids, &semantic_ids, crate::semantic::RRF_K);
+        let mut hits = Vec::with_capacity(fused.len().min(limit));
+        for f in fused.iter().take(limit) {
+            let Some(row) = store.segment_row(f.segment_id).map_err(Error::from)? else {
+                continue;
+            };
+            let mut item = segment_json(&row);
+            item["via"] = json!(f.via.as_str());
+            item["rrf"] = json!(f.score);
+            if let Some(s) = scores.get(&f.segment_id) {
+                item["score"] = json!(*s);
+            }
+            if f.via != crate::semantic::Via::Semantic {
+                item["snippet"] = json!(row.text.clone().unwrap_or_default());
+            }
+            hits.push(item);
+        }
+        Ok((hits, mode::HYBRID))
+    }
+
+    /// `notes.list` — what you told yourself to remember.
+    fn notes_list(&self, req: &Request) -> Result<Value, Error> {
+        let state = match req.opt_str("state")? {
+            None => None,
+            Some(s) => Some(crate::store::note_state::parse(s).ok_or_else(|| {
+                Error::params(format!(
+                    "state must be one of {:?}, not {s:?}",
+                    crate::store::note_state::ALL
+                ))
+            })?),
+        };
+        let limit = req.usize_or("limit", NOTES_LIMIT)?.clamp(1, 1000);
+        let rows = self.store().notes(state, limit).map_err(Error::from)?;
+        Ok(json!({
+            "state": state,
+            "notes": rows.iter().map(crate::notes::note_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// The note state machine. Like a commitment's, nothing but a person's
+    /// click ever moves a row off `open`.
+    fn notes_set_state(&self, req: &Request) -> Result<Value, Error> {
+        let id = req.i64("id")?;
+        let state = req
+            .opt_str("state")?
+            .ok_or_else(|| Error::params("state is required"))?;
+        let state = crate::store::note_state::parse(state).ok_or_else(|| {
+            Error::params(format!(
+                "state must be one of {:?}, not {state:?}",
+                crate::store::note_state::ALL
+            ))
+        })?;
+        let row = self
+            .store()
+            .set_note_state(id, state)
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::not_found(format!("no note with id {id}")))?;
+        let payload = crate::notes::note_json(&row);
+        // Broadcast, like every other retroactive change: a note ticked off in
+        // the CLI has to disappear from the GUI without a re-query.
+        self.bus.publish(Topic::Segments, "note", payload.clone());
+        Ok(payload)
+    }
+
+    /// `person.brief` — what is outstanding with one person.
+    fn person_brief(&self, req: &Request) -> Result<Value, Error> {
+        let id = req.i64("id")?;
+        crate::brief::brief(&self.store(), id)
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::not_found(format!("no speaker with id {id}")))
+    }
+
+    /// `accuracy.summary` — how wrong the transcripts were, measured from the
+    /// corrections somebody made to them.
+    fn accuracy_summary(&self) -> Result<Value, Error> {
+        crate::accuracy::summary(&self.store()).map_err(Error::from)
+    }
 }
 
 #[cfg(test)]
@@ -4791,5 +5028,326 @@ mod tests {
         );
         let listed: Vec<i64> = voices.iter().map(|v| v["id"].as_i64().unwrap()).collect();
         assert_eq!(listed, removed);
+    }
+
+    // ---- 0.8.0: search.ask, notes.*, person.brief, accuracy.summary ------
+
+    /// A turn at a chosen instant, so a question with a time facet has
+    /// something inside its window and something outside it.
+    fn a_turn_at(rig: &Rig, session: i64, t_ns: i64, speaker: Option<i64>, text: &str) -> i64 {
+        let store = rig.service.store();
+        let seg = store
+            .insert_segment(session, t_ns, t_ns + 1_000_000_000, "segments/a.wav", 0)
+            .unwrap();
+        store
+            .set_segment_analysis(
+                seg,
+                &SegmentAnalysis {
+                    text: Some(text.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        if let Some(spk) = speaker {
+            store
+                .set_segment_speaker(seg, Some(spk), Some(0.9))
+                .unwrap();
+        }
+        seg
+    }
+
+    /// Local noon, `delta` days from today — the same calendar `ask` resolves
+    /// against, so "gestern" in a question and this instant agree.
+    fn local_noon(delta: i64) -> i64 {
+        let now = utc_now_ns();
+        let offset = crate::clock::local_offset_s(now);
+        let today = (now.div_euclid(1_000_000_000) + offset).div_euclid(86_400);
+        (((today + delta) * 86_400 + 12 * 3600) - offset) * 1_000_000_000
+    }
+
+    #[test]
+    fn ask_says_what_it_understood_and_searches_with_it() {
+        let r = rig("ask");
+        let session = a_session(&r);
+        let aspen = {
+            let store = r.service.store();
+            let id = store.create_speaker("Speaker_01", 0).unwrap();
+            store.rename_speaker(id, "Aspen", 1).unwrap();
+            id
+        };
+        let other = r.service.store().mint_speaker(0).unwrap();
+
+        let wanted = a_turn_at(
+            &r,
+            session,
+            local_noon(-1),
+            Some(aspen),
+            "the shader compiles now",
+        );
+        // Right words, right voice, wrong day.
+        a_turn_at(
+            &r,
+            session,
+            local_noon(-5),
+            Some(aspen),
+            "the shader was broken",
+        );
+        // Right words, right day, wrong voice.
+        a_turn_at(
+            &r,
+            session,
+            local_noon(-1),
+            Some(other),
+            "the shader is fine by me",
+        );
+
+        let out = call(
+            &r,
+            r#"{"id":1,"method":"search.ask","params":{"q":"was hat Aspen gestern über den shader gesagt?"}}"#,
+        )
+        .unwrap();
+        let i = &out["interpretation"];
+        assert_eq!(i["speaker_id"], json!(aspen));
+        assert_eq!(i["speaker_label"], json!("Aspen"));
+        assert_eq!(i["query"], json!("shader"), "the residual is the query");
+        // Nanoseconds are strings on the wire, milliseconds are for rendering.
+        assert!(i["from_ns"].is_string() && i["to_ns"].is_string());
+        assert!(i["from_ms"].is_number());
+        // No semantic model in a test rig, and that is not an error: the
+        // question still gets a keyword answer, and the mode says so.
+        assert_eq!(i["mode"], json!("fts"));
+
+        let hits = out["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "both facets narrowed: {hits:?}");
+        assert_eq!(hits[0]["id"], json!(wanted));
+        assert!(hits[0]["snippet"].as_str().unwrap().contains("shader"));
+    }
+
+    #[test]
+    fn a_question_that_is_all_facets_answers_with_the_transcript_it_selects() {
+        let r = rig("ask-facets");
+        let session = a_session(&r);
+        let aspen = {
+            let store = r.service.store();
+            let id = store.create_speaker("Speaker_01", 0).unwrap();
+            store.rename_speaker(id, "Aspen", 1).unwrap();
+            id
+        };
+        a_turn_at(&r, session, local_noon(-1), Some(aspen), "one");
+        a_turn_at(&r, session, local_noon(-1), Some(aspen), "two");
+        a_turn_at(&r, session, local_noon(-4), Some(aspen), "long ago");
+
+        let out = call(
+            &r,
+            r#"{"id":1,"method":"search.ask","params":{"q":"what did Aspen say yesterday"}}"#,
+        )
+        .unwrap();
+        assert_eq!(out["interpretation"]["query"], json!(""));
+        assert_eq!(out["interpretation"]["mode"], json!("facets"));
+        let texts: Vec<&str> = out["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["two", "one"],
+            "newest first, and only yesterday"
+        );
+    }
+
+    #[test]
+    fn ask_refuses_an_empty_question_rather_than_returning_everything() {
+        let r = rig("ask-empty");
+        let e = call(&r, r#"{"id":1,"method":"search.ask","params":{"q":"   "}}"#).unwrap_err();
+        assert_eq!(e.code, "params");
+    }
+
+    #[test]
+    fn notes_are_listed_moved_and_broadcast() {
+        let r = rig("notes");
+        let session = a_session(&r);
+        let seg = a_turn_at(
+            &r,
+            session,
+            local_noon(0),
+            None,
+            "Recall, merk dir: den Shader von Aspen fragen",
+        );
+        // What the pipeline's one call does, with the same guards.
+        crate::notes::maybe_capture(&r.service.store(), &r.service.bus, seg, true, 4_2);
+        let evs = events(&r);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0]["ev"], "note");
+        assert_eq!(evs[0]["data"]["text"], json!("den Shader von Aspen fragen"));
+
+        let out = call(&r, r#"{"id":1,"method":"notes.list"}"#).unwrap();
+        let notes = out["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["state"], json!("open"));
+        assert_eq!(notes[0]["segment_id"], json!(seg));
+        // The moment it was SAID, not the moment the row was written.
+        assert_eq!(notes[0]["t_ns"], json!(local_noon(0).to_string()));
+        let id = notes[0]["id"].as_i64().unwrap();
+
+        let moved = call(
+            &r,
+            &format!(
+                r#"{{"id":2,"method":"notes.set_state","params":{{"id":{id},"state":"done"}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(moved["state"], json!("done"));
+        let evs = events(&r);
+        assert_eq!(
+            evs[0]["ev"], "note",
+            "a decision is broadcast like any other"
+        );
+        assert_eq!(evs[0]["data"]["state"], json!("done"));
+
+        // And the list filters by state.
+        let open = call(
+            &r,
+            r#"{"id":3,"method":"notes.list","params":{"state":"open"}}"#,
+        )
+        .unwrap();
+        assert!(open["notes"].as_array().unwrap().is_empty());
+        let done = call(
+            &r,
+            r#"{"id":4,"method":"notes.list","params":{"state":"done"}}"#,
+        )
+        .unwrap();
+        assert_eq!(done["notes"].as_array().unwrap().len(), 1);
+
+        // The turn itself is still in the transcript. A note annotates; it
+        // never rewrites.
+        let t = call(&r, r#"{"id":5,"method":"transcript"}"#).unwrap();
+        assert_eq!(
+            t["segments"][0]["text"],
+            json!("Recall, merk dir: den Shader von Aspen fragen")
+        );
+    }
+
+    #[test]
+    fn a_note_that_is_not_there_and_a_state_that_is_not_real_are_both_refused() {
+        let r = rig("notes-bad");
+        let e = call(
+            &r,
+            r#"{"id":1,"method":"notes.set_state","params":{"id":1,"state":"done"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "not_found");
+        let e = call(
+            &r,
+            r#"{"id":2,"method":"notes.set_state","params":{"id":1,"state":"maybe"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "params");
+        let e = call(
+            &r,
+            r#"{"id":3,"method":"notes.list","params":{"state":"maybe"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "params");
+        assert!(events(&r).is_empty(), "a refusal broadcasts nothing");
+    }
+
+    #[test]
+    fn a_brief_answers_the_card_in_one_round_trip() {
+        let r = rig("brief");
+        let session = a_session(&r);
+        let (you, them) = {
+            let store = r.service.store();
+            let you = store.ensure_you_speaker(0).unwrap();
+            let them = store.create_speaker("Speaker_02", 0).unwrap();
+            store.rename_speaker(them, "Aspen", 1).unwrap();
+            (you, them)
+        };
+        let theirs = a_turn_at(
+            &r,
+            session,
+            local_noon(-1),
+            Some(them),
+            "i will send you the shader tomorrow",
+        );
+        {
+            let store = r.service.store();
+            store
+                .upsert_commitment(
+                    &crate::store::NewCommitment {
+                        segment_id: theirs,
+                        thread_id: None,
+                        who_speaker_id: Some(them),
+                        to_speaker_id: Some(you),
+                        what: "send the shader".into(),
+                        due_utc_ns: None,
+                        due_raw: None,
+                        due_kind: None,
+                        source: crate::store::commitment_source::RULES,
+                        model_id: None,
+                        confidence: 0.5,
+                    },
+                    0,
+                )
+                .unwrap();
+        }
+        let mine = a_turn_at(
+            &r,
+            session,
+            local_noon(0),
+            Some(you),
+            "Recall, note ask Aspen about the portal",
+        );
+        crate::notes::maybe_capture(&r.service.store(), &r.service.bus, mine, true, 0);
+
+        let b = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"person.brief","params":{{"id":{them}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(b["speaker"]["name"], json!("Aspen"));
+        assert_eq!(b["speaker"]["you"], json!(false));
+        assert!(b["last_heard_ms"].is_number());
+        assert_eq!(
+            b["open_to_you"].as_array().unwrap().len(),
+            1,
+            "what they promised is on the card: {b}"
+        );
+        assert_eq!(
+            b["notes_mentioning"][0]["text"],
+            json!("ask Aspen about the portal")
+        );
+
+        let e = call(
+            &r,
+            r#"{"id":2,"method":"person.brief","params":{"id":9999}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "not_found");
+    }
+
+    #[test]
+    fn accuracy_is_measured_from_the_corrections_and_from_nothing_else() {
+        let r = rig("accuracy");
+        let (_, seg) = a_segment(&r, "the belt holds the line");
+
+        let empty = call(&r, r#"{"id":1,"method":"accuracy.summary"}"#).unwrap();
+        assert_eq!(empty["corrections"], json!(0));
+        assert_eq!(empty["estimated_wer"], Value::Null, "not zero");
+
+        call(
+            &r,
+            &format!(
+                r#"{{"id":2,"method":"segments.correct","params":{{"segment_id":{seg},"text":"the bell holds the line"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let a = call(&r, r#"{"id":3,"method":"accuracy.summary"}"#).unwrap();
+        assert_eq!(a["corrections"], json!(1));
+        assert_eq!(a["estimated_wer"], json!(0.2), "one word in five");
+        assert_eq!(a["by_source"][0]["source"], json!("VRChat.exe"));
+        assert!(a["since_ns"].is_string());
     }
 }

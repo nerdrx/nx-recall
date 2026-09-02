@@ -19,7 +19,7 @@ Daemon replies with its version, the current event sequence number, and the id o
 this **run** of the daemon:
 
 ```json
-{"welcome": {"proto": 1, "daemon": "recalld/0.7", "seq": 41823, "schema": 9, "boot": "18f3c0a1d4b2e900"}}
+{"welcome": {"proto": 1, "daemon": "recalld/0.7", "seq": 41823, "schema": 10, "boot": "18f3c0a1d4b2e900"}}
 ```
 
 If `proto` is unsupported the daemon replies `{"error": {"code": "proto", ...}}` and
@@ -802,27 +802,72 @@ see until a user hits it.
   [...], corrections: [...]}, effective: [...]}`; `vocab.set {terms: [...]}`
   replaces the user glossary (persisted). The daemon biases the transducer
   toward `effective` (hotwords). Event `vocab` on change.
-- **Accuracy.** `accuracy.summary` → `{corrections, estimated_wer,
-  by_source: [{source, corrections, estimated_wer}], by_speaker: [{speaker_id,
-  corrections, estimated_wer}], since_ns}` computed from `segments.correct`
-  operations (the pre-correction text lives in `prior_state`).
-- **One query box.** `search.ask {q, limit?}` → `{interpretation: {query,
-  speaker_id?, speaker_label?, from_ns?, to_ns?, mode}, hits: [...]}`. The
-  daemon parses a natural-language question — speaker mentions, time
-  references in de/en (the Tier-2 parser), the remaining words as the query —
-  and runs the hybrid search with those facets. The interpretation is returned
-  so the GUI can show what it understood and let the user correct a facet.
+- **Accuracy.** `accuracy.summary` → `{corrections, estimated_wer, by_source:
+  [{source, corrections, estimated_wer}], by_speaker: [{speaker_id,
+  corrections, estimated_wer}], since_ns, since_ms}`, computed from
+  `segments.correct` operations. `prior_state` is
+  `{"segment_id": N, "text": "<the transcript before the edit>"}` — verified,
+  already written by `segments.correct`, and nothing had to be extended. The
+  *corrected* text is recovered by reading one segment's corrections in order:
+  each one's result is the next one's `prior_state.text`, and the last one's is
+  the row as it now stands, so a turn corrected twice contributes two
+  measurements. `estimated_wer` is the **mean of the per-correction word error
+  rates** (word-level Levenshtein over the corrected word count), not a corpus
+  ratio; it is `null` — never `0` — when nothing has been corrected, and a
+  correction of a turn that had no transcript at all is skipped. `since_ns` is
+  the oldest correction counted (a string; `since_ms` renders), `null` when
+  there are none. Every row is bucketed by the segment's source and speaker **as
+  they are now**, so a reassignment moves past corrections with it.
+- **One query box.** `search.ask {q, limit?}` → `{q, total, interpretation:
+  {query, speaker_id, speaker_label, from_ns, to_ns, from_ms, to_ms, mode},
+  hits: [...]}`. The daemon parses a natural-language question — a named
+  speaker (case-insensitive, de/en possessives: `Aspens`, `von Aspen`,
+  `Aspen's`; a one-edit slip is forgiven on names of five characters or more,
+  and only *named* voices are matched), a de/en time reference, and the
+  remaining words as the query — then runs the search with those facets.
+  `from_ns`/`to_ns` are strings and the window is `[from, to)`.
+  - **Time is read backwards here.** A question is about what has already been
+    said, so `am Montag` / `on Monday` is the most recent such day (today
+    included) and not `timeref`'s next one, and `gestern` / `last week` /
+    `letzten Monat` have no forward reading at all. This is a second,
+    deliberately retrospective table (`crate::ask`), not a flag on `timeref`.
+  - **Language words are not a facet.** There is no `lang` in `interpretation`;
+    `auf Deutsch` in a question is dropped with the rest of the question's
+    grammar (interrogatives, auxiliaries, articles, the verbs of saying), since
+    it is neither something to filter by nor a word any turn contains.
+  - `mode` says which engine answered: `"hybrid"` (FTS fused with the vector
+    leg — the semantic model is installed), `"fts"` (keyword only; a missing
+    semantic model is **not** an error here, unlike `search.semantic`), or
+    `"facets"` — the whole question was facets, so `query` is empty and `hits`
+    is the slice of transcript those facets select, newest first.
 - **Notes to self.** A MIC segment whose text starts with a wake phrase
   (`recall, merk dir`, `recall, remember`, `recall, notiz`, `recall, note`;
-  case/punctuation-insensitive) becomes a note. `notes.list {limit?, state?}`
-  → `{notes: [{id, segment_id, text, t_ms, t_ns, state}]}`,
-  `notes.set_state {id, state: "open"|"done"|"dismissed"}`. Event `note`
-  (topic `segments`) when one is created. The segment itself stays in the
-  transcript.
-- **Briefs.** `person.brief {id}` → `{speaker, last_heard_ms, open_to_you:
-  [commitment], open_from_you: [commitment], recent_topics: [...],
-  notes_mentioning: [...]}`. Clients may show it when a `roster` join event
-  names a linked speaker (the join itself is unchanged).
+  case/punctuation-insensitive, and `merke dir` as a German alias) becomes a
+  note. The wake word tolerates one edit, because the decoder hands back
+  "Ricall" and "Recoll" on short turns; markers of five characters or more do
+  too, `note` does not. `notes.list {limit?, state?}` → `{state, notes: [{id,
+  segment_id, text, t_ms, t_ns, state, created_ms}]}` — `t_ms`/`t_ns` are the
+  segment's start, i.e. when it was *said*. `notes.set_state {id, state:
+  "open"|"done"|"dismissed"}` returns the note and broadcasts it. Event `note`
+  (topic `segments`) when one is created, when a re-decode changes its words,
+  and on every state change. One note per segment: a turn coming back through
+  the pipeline updates its note rather than filing a second, and a note whose
+  words have not changed is not re-announced — so a dismissal is never undone
+  by a re-decode. A note with no text after the wake phrase is not a note. The
+  segment itself stays in the transcript, and purging it purges the note.
+- **Briefs.** `person.brief {id}` → `{speaker, last_heard_ms, last_heard_ns,
+  open_to_you: [commitment], open_from_you: [commitment], recent_topics:
+  [{topic, thread_id, last_ms, last_ns}], notes_mentioning: [note]}`. Open means
+  `candidate` or `confirmed`; `done` and `dismissed` are decisions and are not
+  re-raised. `open_to_you` is what **they** promised (`who` is this person,
+  including rows with no counterparty); `open_from_you` is what **you** promised
+  them (`who` is your pinned voice, `to` is this person). `recent_topics` is
+  `threads.topic` for their recent conversations, each label once, newest first
+  — empty until the Tier 3 pass has run, which is off by default.
+  `notes_mentioning` matches the speaker's **name**, so an unnamed voice has
+  none. `commitment` and `note` are the shapes `commitments.list` and
+  `notes.list` return. Clients may show it when a `roster` join event names a
+  linked speaker (the join itself is unchanged).
 
 ## Versioning rules
 

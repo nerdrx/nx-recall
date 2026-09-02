@@ -654,6 +654,17 @@ impl Pipeline {
             {
                 warn!(segment_id, "tier-2 extraction failed: {e:#}");
             }
+            // Notes to self (0.8.0). One call, and every guard is inside it:
+            // microphone only, wake phrase at the head of the turn, and a
+            // failure that is logged rather than raised — a note is an
+            // annotation and an annotation never costs a recording.
+            crate::notes::maybe_capture(
+                &store,
+                &self.bus,
+                segment_id,
+                is_mic && !paused_mid_write,
+                utc_now_ns(),
+            );
             publish_segment(&self.bus, &store, segment_id);
             for id in also_changed {
                 publish_segment(&self.bus, &store, id);

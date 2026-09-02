@@ -9,11 +9,14 @@
 //! The crate is a library so the acceptance suite in `tests/` can drive the
 //! real pipeline against the golden fixtures; `src/main.rs` is a thin bin.
 
+pub mod accuracy;
 pub mod allowlist;
 pub mod analysis;
 pub mod arbiter;
+pub mod ask;
 pub mod asr;
 pub mod b64;
+pub mod brief;
 pub mod bus;
 pub mod capture;
 pub mod client;
@@ -30,6 +33,7 @@ pub mod lang;
 pub mod langctx;
 pub mod llm;
 pub mod models;
+pub mod notes;
 pub mod overlap;
 pub mod pipeline;
 pub mod proto;
