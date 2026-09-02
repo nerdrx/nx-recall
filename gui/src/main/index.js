@@ -8,7 +8,7 @@
 // model of the transcript at all: it relays events and lets the renderer
 // rebuild itself on resync.
 
-import { app, BrowserWindow, Tray, Menu, Notification, nativeImage, nativeTheme } from 'electron';
+import { app, BrowserWindow, Tray, Menu, Notification, dialog, shell, nativeImage, nativeTheme } from 'electron';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -435,6 +435,53 @@ function raiseReminder({ noteId, title, body }) {
 // ---------------------------------------------------------------------------
 // lifecycle
 // ---------------------------------------------------------------------------
+// The Markdown export's folder (0.10.0)
+//
+// The renderer never names a directory. It asks for the native chooser, a
+// person picks a folder, and only that path goes to the daemon — which then
+// checks it again (absolute, existing, local, not a runtime directory) before
+// writing a byte. Two gates, because this is the one feature that puts
+// transcripts somewhere a person could later copy them from.
+
+/** Folders the user picked in THIS session, and therefore may reopen. */
+const chosenExportFolders = new Set();
+
+async function chooseExportFolder() {
+  // The headless driver cannot click a native dialog — it is an OS window, not
+  // a page — so under the e2e flag it supplies the answer the dialog would have
+  // given and everything after this line is the real path: the same IPC, the
+  // same daemon call, the same guards, the same files on disk.
+  if (process.env.NX_RECALL_E2E === '1' && process.env.NX_RECALL_E2E_EXPORT_DIR) {
+    const dir = process.env.NX_RECALL_E2E_EXPORT_DIR;
+    chosenExportFolders.add(dir);
+    return dir;
+  }
+  const parent = win && !win.isDestroyed() ? win : undefined;
+  const res = await dialog.showOpenDialog(parent, {
+    title: 'Export transcripts to…',
+    // `createDirectory` because "a folder for this" is the normal answer and
+    // making the person leave to create one is not.
+    properties: ['openDirectory', 'createDirectory'],
+    buttonLabel: 'Export here',
+  });
+  if (res.canceled || !res.filePaths?.length) return null;
+  const dir = res.filePaths[0];
+  chosenExportFolders.add(dir);
+  return dir;
+}
+
+/**
+ * Reveal a folder in the file manager. Only one the user picked here: this is
+ * an "open anything on the disk" primitive otherwise, and the renderer is the
+ * side of the bridge that is allowed to be wrong.
+ */
+function openExportFolder(dir) {
+  if (!chosenExportFolders.has(dir)) return false;
+  void shell.openPath(dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 
 async function bootstrap() {
   // Before the first window: themeSource is what makes the renderer's
@@ -487,6 +534,9 @@ async function bootstrap() {
     },
     // 0.9.0: a reminder that has come round. See `raiseReminder`.
     notify: raiseReminder,
+    // 0.10.0: the export's folder chooser. See `chooseExportFolder`.
+    chooseFolder: chooseExportFolder,
+    openFolder: openExportFolder,
   });
 
   startClient();

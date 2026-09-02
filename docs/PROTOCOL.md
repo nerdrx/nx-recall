@@ -1677,3 +1677,177 @@ nobody experienced.
   who is there and what gets talked about.
 - `recalld stats <speaker_id> [--days N]` — the numbers above, with the
   interruption and latency definitions printed underneath them.
+## 0.10.0 — export and the room microphone
+
+Two additive features and nothing else: no method, event, field or behaviour
+described above this line changes, and `proto` stays `1`. Both put a second
+thing on a page that already had one of its kind, and both are shaped by the
+same rule — a client that has never heard of either goes on working, because
+every new key is *present* rather than merely absent-when-off (a missing key
+cannot tell "off" from "an older daemon").
+
+### The local Markdown export
+
+`export.run` writes files into **one directory on a local filesystem that the
+user chose**, and that is its entire output surface. There is no upload, no
+share, no clipboard, no link, no network target — see DESIGN §12, whose
+amendment this section implements. The copy in every client must say the
+sentence the daemon's own CLI says: *this writes files to your disk and nothing
+else.*
+
+- **`export.preview {dir, from?, to?, speaker?, thread?, include_translations?}`**
+  → `{dir, days, conversations, turns, bytes, files: [{name, bytes, turns,
+  conversations, exists, blocked}], blocked: [name]}`.
+
+  The plan is **rendered**, not estimated: `bytes` is the exact length of the
+  file that would be written, because the preview and the run are one code path
+  and the preview is its first half. A preview writes nothing.
+
+  `from` is inclusive and `to` exclusive, in any form the daemon reads a time in
+  (ISO-8601, epoch ms, epoch ns — "Field conventions"). `speaker` is a canonical
+  voice id, so a merged voice exports under the voice it was merged into.
+
+- **`export.run {…same params}`** → `{op, files, dir}`, then `op.progress` /
+  `op.done` / `op.failed` on the `ops` topic with `kind: "export.run"`, exactly
+  like `delete.run`. `op.done` carries `{files, bytes, dir}`.
+
+- **What is written.** One file per **local calendar day that has turns**,
+  named `YYYY-MM-DD.md`, plus `people.md`. A day with nothing in it produces no
+  file. Every file begins with the line `<!-- nx-recall export -->`.
+
+  ```markdown
+  <!-- nx-recall export -->
+  # 2026-09-01
+
+  ## 19:04 — Kira, You — in wrld_abc123
+  - **19:04** Kira: hey, did you get the thing?
+  - **19:05** You: yeah, it is on the desk
+  - **19:06** Kira: _nice_[^shaky]
+
+  [^shaky]: A second decoder read this turn differently, so the words are uncertain. The speaker is not in doubt; the transcript is.
+  ```
+
+  One `##` per conversation (`segments.thread_id`), ordered by when it started,
+  with its participants and — when the roster covers that moment — the world.
+  Turns with no thread become one final section marked as such. A turn whose
+  `asr_confidence` is `"shaky"` is written in italics with a footnote reference;
+  the footnote itself is defined **once** per file. With
+  `include_translations: true` a turn's `translation` follows it as an indented
+  quote (`  > …`). A turn with no text is written as `_(not transcribed)_`
+  rather than dropped: hiding it would claim a silence that did not happen.
+
+  `people.md` lists the **named** voices only — name, declared languages (or
+  "any language"), and when each was last heard.
+
+- **The overwrite guard.** A file this feature wrote is rewritten. A file it did
+  not write is **never touched**: `export.run` fails with `err:refused` naming
+  the file, before writing anything at all — not the blocked file, and not the
+  files that would have preceded it. The test is the `<!-- nx-recall export -->`
+  header in the first kilobyte; a file that cannot be read counts as not ours.
+  `export.preview` reports the same decision per file (`blocked`) and in
+  `blocked`, so a client can warn before the button is pressed.
+
+- **The path guard**, all of it `err:refused` with a reason a person can act on:
+
+  | refused | why |
+  |---|---|
+  | a relative path | it means a different folder depending on who expands it |
+  | a path reached through `..` | a confirmation dialog has to be readable |
+  | under `/run/user`, `/proc`, `/sys`, `/dev` | files there do not survive the session |
+  | a path that does not exist | the export writes into a folder you already have |
+  | not a directory | — |
+  | a network mount | copying a transcript onto a share is the one thing the design does not do |
+
+  Network mounts are identified by `statfs(2)`'s `f_type` against a list of
+  magics: NFS `0x6969`, CIFS/SMB1 `0xff534d42`, SMB2 `0xfe534d42`, smbfs
+  `0x517b`, 9P `0x01021997`, CephFS `0x00c36400`, AFS `0x5346414f` / `0x6b414653`,
+  Coda `0x73757245`, OCFS2 `0x7461636f`, GFS2 `0x01161970`. FUSE (`0x65735546`)
+  is deliberately **not** on the list — most FUSE mounts are local and the kernel
+  cannot say which are not — and a `statfs` that fails lets the path through,
+  because refusing every unknown would refuse ordinary disks.
+
+- **CLI.** `recalld export <dir> [--from --to --speaker --thread] [--translations]
+  [--dry-run]`. It runs in its own process against the database directly, so it
+  works whether or not the daemon is running.
+
+### The room microphone
+
+A **second, physical** microphone: the desk mic that hears the people sitting in
+the room, who never joined the instance. It is not `[mic]` with another device,
+because the two devices mean opposite things. The headset mic is *provenance* —
+whatever it hears is the user, pinned to "You" with no comparison made. A room
+mic hears strangers to the voicebank, so its turns take the **ordinary** route:
+VAD, the overlap gate, ASR, and identity as unknown voices that are matched,
+minted and enrolled exactly like voices coming out of an application. **Nothing
+on this device is ever labelled You.**
+
+- **`sources.list` rows carry `kind: "room"`** (schema: `sources.kind` is
+  free-text and has been since v4; no migration, no backfill). A client that
+  does not know the kind must not render it as an application, and must not
+  count it among allowed applications.
+- **`sources.set` refuses `match_key: "room"`** with `err:refused` naming
+  `room.set`, for the same reason it refuses `mic`: `[rules]` and `[room]` would
+  otherwise disagree about a consent decision.
+- **`room.get`** → `{enabled, mode, active, state, device}`. There is
+  deliberately no `you_speaker` counterpart, and its absence is the feature.
+- **`room.set {enabled?, mode?, device?}`** → the same block plus `persisted`.
+  Each field applies independently. `mode` is `"follow"` or `"always"` and
+  anything else is `err:params`; a call with no fields at all is `err:params`.
+  `device` is a PipeWire `node.name`, or `null` to clear the pin — and unlike
+  `mic`, it is settable over the wire, because a device with no default cannot
+  be a config-file-only decision without making the feature unreachable.
+  The change is live *and* written to `config.toml`.
+- **The device is required, and the refusal says so.** A call that would leave
+  the switch on with no device is `err:params` naming `devices.list`; the switch
+  does not move. There is no sensible default for a second input — following
+  `default.audio.source` would open the headset `[mic]` is already on and record
+  the user twice under two identities.
+- **`state`** is the microphone's five plus one:
+
+  | state | meaning |
+  |---|---|
+  | `off` | not recording, and not listening for a reason to |
+  | `needs-device` | on, and no device is pinned — nothing can open |
+  | `following:idle` | on, waiting for an allowed application |
+  | `following:active` | recording the room, because an allowed app is captured |
+  | `always:active` | recording the room, whatever is running |
+  | `always:idle` | on, but the pinned device is not on the graph |
+
+  `needs-device` exists because `always:idle` would be a lie of the kind the
+  microphone's own contract forbids: it says "waiting for a device", when the
+  truth is "no device was ever chosen".
+- **`room` event**, on the existing **`status`** topic, same block, published
+  when the switch moves and when the tap opens or closes — the only way a client
+  sees a `follow`-mode transition. No new topic, so no client changes its
+  subscription and an older one ignores it under the versioning rule.
+- **`status`** carries `room` (the same block) and the flat `room_state`, plus
+  `counters.room_segments`.
+- **Provenance.** Segments from this device carry `source: "room"` — the source's
+  match key, on the wire since v1, needing no new field. `label_via` is whatever
+  the identity ladder decided, never `"mic"`.
+- **Threading.** Room turns bridge across sessions exactly as microphone turns
+  do: a room turn may join a conversation that is live in **any** session, not
+  only its own. The room and the headset are one physical evening, and somebody
+  on the sofa answering somebody in the instance is in that conversation — which
+  device carried the sound is a fact about cabling. Two *applications* speaking
+  at once are still two conversations.
+- **`devices.list`** → `{devices: [{node_name, description, is_default}]}`.
+  Every `Audio/Source` on the graph, default first then by name; a node with no
+  `node.name` is omitted because it cannot be pinned. `is_default` is on the
+  wire so a client can warn about the one choice that is almost always wrong —
+  the default input is the headset. It opens no stream. The daemon reads its own
+  PipeWire registry and falls back to parsing `pw-dump` if a second connection
+  cannot be made.
+- **CLI.** `recalld devices`, and `recalld room [status|on|off|follow|always]
+  [--device NODE_NAME]`.
+
+### One addition to `status` for a 0.9.0 feature
+
+`status` now also carries **`truth`**: `{enabled, listening, last_event_ms,
+users}` — the Discord ground-truth ingest's four facts, so a client can draw its
+state without polling `truth.status` every few seconds. `enabled` is the
+intention and `listening` the address actually bound (they differ when the port
+was taken); `last_event_ms` is when the plugin last sent anything, which is the
+difference between "receiving" and "waiting for Discord"; `users` is how many
+accounts it has heard. Everything else stays on `truth.status`, which remains
+the method for the whole picture.

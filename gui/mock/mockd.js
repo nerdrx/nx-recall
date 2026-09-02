@@ -77,12 +77,38 @@ const SOURCES = [
   { match_key: 'spotify', kind: 'app', binary: 'spotify', display: 'Spotify', allowed: false, first_seen: '2026-07-05T22:10:00Z', last_seen: '2026-08-30T23:58:00Z', streams: 0 },
   { match_key: 'mpv', kind: 'app', binary: 'mpv', display: 'mpv', allowed: false, first_seen: '2026-08-14T20:44:00Z', last_seen: '2026-08-14T22:02:00Z', streams: 0 },
   { match_key: 'mic', kind: 'mic', binary: 'mic', display: 'Microphone', allowed: false, first_seen: '2026-07-02T18:22:00Z', last_seen: '2026-08-31T18:05:00Z', streams: 0 },
+  // 0.10.0: the room microphone. A source row like the headset's, governed by
+  // its own switch, and off — a second physical mic is nobody's default.
+  { match_key: 'room', kind: 'room', binary: 'room', display: 'Room microphone', allowed: false, first_seen: '2026-08-14T20:44:00Z', last_seen: '2026-08-31T18:05:00Z', streams: 0 },
+];
+
+/// The capture devices `devices.list` offers (0.10.0). Three, because the
+/// interesting case needs all three: the headset that is already the system
+/// default and must NOT be picked, a desk mic that should be, and a webcam
+/// whose microphone is the thing people pick by accident.
+const DEVICES = [
+  { node_name: 'alsa_input.usb-Index_HMD-00.mono-fallback', description: 'Index HMD Microphone', is_default: true },
+  { node_name: 'alsa_input.usb-Blue_Yeti-00.analog-stereo', description: 'Yeti Stereo Microphone', is_default: false },
+  { node_name: 'alsa_input.usb-046d_HD_Pro_Webcam_C920-02.analog-stereo', description: 'HD Pro Webcam C920 Analog Stereo', is_default: false },
+];
+
+/// The Discord bridge's accounts (0.9.0's ground truth). Three, one of them
+/// already linked — the state the card actually has to render is "some are
+/// linked and some are not", not either extreme.
+const DISCORD_USERS = [
+  { user_id: '184920348293', name: 'kira', speaker: 3, speaker_name: 'Kira', via: 'truth', linked_ms: Date.parse('2026-08-30T21:52:00Z'), first_seen_ms: Date.parse('2026-08-29T20:14:00Z'), last_seen_ms: Date.parse('2026-08-31T18:41:00Z'), agreement: 0.96, segments: 148 },
+  { user_id: '229481003922', name: 'mara.exe', speaker: null, speaker_name: null, via: null, linked_ms: null, first_seen_ms: Date.parse('2026-08-29T20:19:00Z'), last_seen_ms: Date.parse('2026-08-31T18:38:00Z'), agreement: null, segments: 92 },
+  { user_id: '773310028471', name: 'toaster', speaker: null, speaker_name: null, via: null, linked_ms: null, first_seen_ms: Date.parse('2026-08-30T21:44:00Z'), last_seen_ms: Date.parse('2026-08-30T23:10:00Z'), agreement: null, segments: 17 },
 ];
 
 /// The pinned "You" speaker. It exists in the mock's voicebank from the start
 /// (a previous session's microphone minted it) so the transcript's distinct
 /// treatment is reachable without waiting for a live enrolment.
 const YOU_SPEAKER = 8;
+
+/// The header every exported file carries, and the permission slip for
+/// overwriting one (0.10.0). Verbatim from `crate::export::MARKER`.
+const EXPORT_MARKER = '<!-- nx-recall export -->';
 
 // What the user says into their own microphone. Lines rather than tones: the
 // point of the mic feed is that these rows render differently, and a reviewer
@@ -940,6 +966,14 @@ export function startMock({
     sources: SOURCES.map((s) => ({ ...s })),
     // Off by default, exactly as the real daemon ships it.
     mic: { enabled: false, mode: 'follow', active: false, device: null },
+    // 0.10.0: the second, physical microphone. Off, and with no device — the
+    // state a fresh install is in, and the one the card has to be usable from.
+    room: { enabled: false, mode: 'follow', device: null },
+    devices: DEVICES.map((d) => ({ ...d })),
+    // 0.9.0's Discord bridge, on and having heard from the plugin a moment
+    // ago, so the "receiving" light is reachable in a screenshot.
+    truth: { enabled: true, listening: '127.0.0.1:7797', last_event_ms: Date.now() - 4_000 },
+    truthUsers: DISCORD_USERS.map((u) => ({ ...u })),
     // The memory graph (schema v7). Tier 3 is off, like the real daemon, and
     // the model IS installed — so the view's "turn it on" path is reachable
     // rather than blocked behind a 1.9 GB download nobody can do in a test.
@@ -1329,6 +1363,31 @@ export function startMock({
     };
   }
 
+  /// The room tap's state machine (0.10.0). The mic's, plus the one state the
+  /// headset cannot be in: on with no device chosen, which is not "waiting".
+  function roomActive() {
+    if (!state.room.enabled || !state.room.device) return false;
+    if (state.room.mode === 'always') return true;
+    return state.sources.some((s) => s.kind === 'app' && s.allowed && s.streams > 0);
+  }
+
+  function roomState() {
+    if (!state.room.enabled) return 'off';
+    if (!state.room.device) return 'needs-device';
+    const active = roomActive();
+    return state.room.mode === 'always' ? (active ? 'always:active' : 'always:idle') : active ? 'following:active' : 'following:idle';
+  }
+
+  function roomPayload() {
+    return {
+      enabled: state.room.enabled,
+      mode: state.room.mode,
+      active: roomActive(),
+      state: roomState(),
+      device: state.room.device,
+    };
+  }
+
   /// Disk usage, in the four parts that behave differently. Derived from the
   /// canned world rather than invented: audio is ~32 KB per second of segment,
   /// which is what 16 kHz 16-bit mono actually weighs.
@@ -1713,6 +1772,16 @@ export function startMock({
       sources_allowed: state.sources.filter((s) => s.allowed).length,
       mic: micPayload(),
       mic_state: micState(),
+      // 0.10.0: the room microphone, on the same two keys as the headset.
+      room: roomPayload(),
+      room_state: roomState(),
+      // 0.9.0's Discord ingest, in the four facts the Sources card draws.
+      truth: {
+        enabled: state.truth.enabled,
+        listening: state.truth.enabled ? state.truth.listening : null,
+        last_event_ms: state.truth.enabled ? state.truth.last_event_ms : null,
+        users: state.truthUsers.length,
+      },
       // 0.6.1: measured by the retention sweeper, not by this call. The audio
       // figure moves as the feed runs, so the footer and the Sources card have
       // something that actually changes to render.
@@ -1758,6 +1827,11 @@ export function startMock({
   let feedTimer = null;
   function tick() {
     if (state.paused) return;
+    // The Discord bridge is a live stream too: a plugin that is running sends
+    // speaking edges continuously, and the card's "receiving" light is drawn
+    // from when the last one arrived. Without this the mock would drift into
+    // "waiting for Discord" a minute after it started and stay there.
+    if (state.truth.enabled) state.truth.last_event_ms = Date.now();
     // Interleaved, not separate: the user's own voice arrives in the same
     // stream as everybody else's, and the only thing that marks it is where it
     // came from. Every third tick, while the mic is actually capturing.
@@ -1937,6 +2011,104 @@ export function startMock({
       emit('status', 'mic', micPayload());
       emit('status', 'status', statusPayload());
       return { ...micPayload(), persisted: true };
+    },
+
+    // ---- 0.10.0: the room microphone -------------------------------------
+
+    'room.get': () => roomPayload(),
+
+    'room.set'(params) {
+      const { enabled, mode } = params ?? {};
+      const hasDevice = params && Object.prototype.hasOwnProperty.call(params, 'device');
+      if (enabled === undefined && mode === undefined && !hasDevice) {
+        throw err('bad_params', 'room.set needs at least one of enabled, mode, device');
+      }
+      if (mode !== undefined && mode !== 'follow' && mode !== 'always') {
+        throw err('bad_params', `mode must be "follow" or "always", not ${JSON.stringify(mode)}`);
+      }
+      const after = {
+        enabled: enabled === undefined ? state.room.enabled : !!enabled,
+        mode: mode === undefined ? state.room.mode : mode,
+        device: hasDevice ? (params.device ? String(params.device).trim() || null : null) : state.room.device,
+      };
+      // The refusal that is the whole shape of the feature: there is no
+      // sensible default second input, and following the system default would
+      // open the headset the microphone switch is already on.
+      if (after.enabled && !after.device) {
+        throw err(
+          'bad_params',
+          'the room microphone needs a device: there is no sensible default for a second input, and following the system default would open the headset the microphone switch is already on. Call devices.list and pass one of its node_name values'
+        );
+      }
+      state.room = after;
+      const row = state.sources.find((s) => s.kind === 'room');
+      if (row) {
+        row.allowed = state.room.enabled;
+        row.streams = roomActive() ? 1 : 0;
+      }
+      emit('status', 'room', roomPayload());
+      emit('status', 'status', statusPayload());
+      return { ...roomPayload(), persisted: true };
+    },
+
+    'devices.list': () => ({ devices: state.devices }),
+
+    // ---- 0.9.0's Discord bridge, as the Sources card reads it -------------
+
+    'truth.status': () => ({
+      enabled: state.truth.enabled,
+      listening: state.truth.enabled ? state.truth.listening : null,
+      port: 7797,
+      label: 'nx-recall',
+      enrol: false,
+      sources: ['discord', 'vesktop'],
+      token_path: '/home/you/.config/nx-recall/truth.token',
+      spans: 4821,
+      open_spans: 1,
+      last_span_ms: state.truth.enabled ? state.truth.last_event_ms : null,
+      users: state.truthUsers.length,
+      linked: state.truthUsers.filter((u) => u.speaker != null).length,
+      counters: { speaking: 4821, voice: 96, rejected: 0 },
+    }),
+
+    'truth.users': () => ({ users: state.truthUsers.map((u) => ({ ...u })) }),
+
+    'truth.summary': () => ({
+      segments_labelled: 612,
+      single: 391,
+      overlap: 74,
+      partial: 88,
+      nobody: 41,
+      unknown: 18,
+      min_duration_ms: 1000,
+      identity: { n: 214, correct: 187, wrong: 9, unlabelled: 18, precision: 187 / 196, recall: 187 / 214, by_speaker: [] },
+      overlap_gate: { threshold: 0.25, flagged_when_overlap: 61, flagged_when_single: 12, precision: 61 / 73, recall: 61 / 74 },
+      caveat: 'Identity is scored on single-speaker turns of at least 1 s belonging to a linked account, and on nothing else.',
+    }),
+
+    'truth.link'(params) {
+      const u = state.truthUsers.find((x) => x.user_id === String(params?.user_id));
+      if (!u) throw err('not_found', `no Discord user ${params?.user_id}`);
+      const sp = speakerById(Number(params?.speaker_id));
+      if (!sp) throw err('not_found', `no speaker ${params?.speaker_id}`);
+      u.speaker = sp.id;
+      u.speaker_name = sp.name ?? sp.auto;
+      u.via = 'manual';
+      u.linked_ms = Date.now();
+      // The same row shape the method returns, on the relabel topic.
+      emit('relabel', 'truth', { ...u });
+      return { ...u };
+    },
+
+    'truth.unlink'(params) {
+      const u = state.truthUsers.find((x) => x.user_id === String(params?.user_id));
+      if (!u) throw err('not_found', `no Discord user ${params?.user_id}`);
+      u.speaker = null;
+      u.speaker_name = null;
+      u.via = null;
+      u.linked_ms = null;
+      emit('relabel', 'truth', { ...u });
+      return { ...u };
     },
 
     'speakers.list': () => ({ speakers: speakerList() }),
@@ -2746,6 +2918,34 @@ export function startMock({
       };
     },
 
+    // ---- 0.10.0: the local Markdown export --------------------------------
+    //
+    // This mock really writes the files. A card that says "this writes files to
+    // your disk and nothing else" is only testable if the files turn up, and a
+    // preview that agreed with a run that wrote nothing would prove neither.
+
+    'export.preview': (params) => exportPlan(params),
+
+    'export.run'(params) {
+      const plan = exportPlan(params);
+      const blocked = plan.files.filter((f) => f.blocked);
+      if (blocked.length) {
+        throw err(
+          'refused',
+          `${blocked[0].name} already exists in ${plan.dir} and was not written by NX Recall — it carries no "${EXPORT_MARKER}" header, so overwriting it would destroy somebody's file. Move it, or export into an empty folder`
+        );
+      }
+      let bytes = 0;
+      const op = runOp('export.run', Math.max(2, plan.files.length), () => {
+        for (const file of plan.files) {
+          fs.writeFileSync(path.join(plan.dir, file.name), file.body);
+          bytes += file.bytes;
+        }
+        return { files: plan.files.length, bytes, dir: plan.dir };
+      });
+      return { op, files: plan.files.length, dir: plan.dir };
+    },
+
     'delete.preview'(params) {
       const rows = matchDelete(params);
       return {
@@ -2782,6 +2982,120 @@ export function startMock({
 
     status: () => statusPayload(),
   };
+
+  /// The export's plan, rendered the way `crate::export` renders it: the same
+  /// header, the same H2 per conversation, the same `- **HH:MM** Name: text`.
+  /// Close enough that a golden read off this mock is a golden of the shape,
+  /// which is the half the GUI is responsible for.
+  function exportPlan(params) {
+    const dir = String(params?.dir ?? '').trim();
+    if (!dir) throw err('bad_params', 'dir is required');
+    if (!path.isAbsolute(dir)) throw err('refused', `the export directory must be an absolute path; ${dir} is relative`);
+    if (dir === '/run/user' || dir.startsWith('/run/user/') || dir.startsWith('/proc') || dir.startsWith('/sys')) {
+      throw err('refused', `${dir} is not a place files survive — pick a folder in your home directory`);
+    }
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+      throw err('refused', `${dir} does not exist. The export writes into a folder you already have`);
+    }
+    const from = params?.from ? Date.parse(params.from) : null;
+    const to = params?.to ? Date.parse(params.to) : null;
+    const rows = state.segments
+      .filter((s) => (from == null || s.t_ms >= from) && (to == null || s.t_ms < to))
+      .filter((s) => params?.speaker == null || s.speaker === Number(params.speaker))
+      .filter((s) => params?.thread == null || s.thread === Number(params.thread))
+      .slice()
+      .sort((a, b) => a.t_ms - b.t_ms);
+
+    const days = new Map();
+    for (const row of rows) {
+      const d = new Date(row.t_ms);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      if (!days.has(key)) days.set(key, []);
+      days.get(key).push(row);
+    }
+
+    const files = [];
+    for (const [day, turns] of days) {
+      files.push(describeFile(dir, `${day}.md`, renderDay(day, turns, !!params?.include_translations), turns.length, new Set(turns.map((t) => t.thread ?? 0)).size));
+    }
+    if (files.length) {
+      files.push(describeFile(dir, 'people.md', renderPeople(), 0, 0));
+    }
+    return {
+      dir,
+      days: files.filter((f) => f.name !== 'people.md').length,
+      conversations: files.reduce((n, f) => n + f.conversations, 0),
+      turns: files.reduce((n, f) => n + f.turns, 0),
+      bytes: files.reduce((n, f) => n + f.bytes, 0),
+      files,
+      blocked: files.filter((f) => f.blocked).map((f) => f.name),
+    };
+  }
+
+  function describeFile(dir, name, body, turns, conversations) {
+    const full = path.join(dir, name);
+    const exists = fs.existsSync(full);
+    let blocked = false;
+    if (exists) {
+      try {
+        blocked = !fs.readFileSync(full, 'utf8').slice(0, 1024).includes(EXPORT_MARKER);
+      } catch {
+        blocked = true;
+      }
+    }
+    return { name, body, bytes: Buffer.byteLength(body), turns, conversations, exists, blocked };
+  }
+
+  function hhmm(ms) {
+    const d = new Date(ms);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+
+  function renderDay(day, turns, translations) {
+    let out = `${EXPORT_MARKER}\n# ${day}\n`;
+    const groups = new Map();
+    for (const t of turns) {
+      const key = t.thread ?? null;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(t);
+    }
+    let shaky = false;
+    for (const [, rows] of groups) {
+      const names = [...new Set(rows.map((r) => speakerLabelFor(r)))];
+      out += `\n## ${hhmm(rows[0].t_ms)} — ${names.join(', ')}\n`;
+      for (const r of rows) {
+        const isShaky = r.asr_confidence === 'shaky';
+        shaky ||= isShaky;
+        const words = String(r.text ?? '').replace(/\s+/g, ' ').trim();
+        const body = isShaky ? `_${words}_[^shaky]` : words;
+        out += `- **${hhmm(r.t_ms)}** ${speakerLabelFor(r)}: ${body}\n`;
+        if (translations && r.translation) out += `  > ${r.translation}\n`;
+      }
+    }
+    if (shaky) {
+      out += `\n[^shaky]: A second decoder read this turn differently, so the words are uncertain. The speaker is not in doubt; the transcript is.\n`;
+    }
+    return out;
+  }
+
+  function speakerLabelFor(row) {
+    const sp = row.speaker == null ? null : speakerById(row.speaker);
+    return sp ? (sp.name ?? sp.auto) : 'Unknown voice';
+  }
+
+  function renderPeople() {
+    let out = `${EXPORT_MARKER}\n# People\n\nThe voices you have named. Anyone still unnamed is in the transcript but not here.\n\n`;
+    for (const sp of state.speakers.filter((s) => s.name).sort((a, b) => a.name.localeCompare(b.name))) {
+      const last = state.segments.filter((s) => s.speaker === sp.id).reduce((n, s) => Math.max(n, s.t_ms), 0);
+      const languages = sp.languages?.length ? sp.languages.join(', ') : 'any language';
+      const d = last ? new Date(last) : null;
+      const heard = d
+        ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${hhmm(last)}`
+        : 'never (every turn deleted)';
+      out += `- **${sp.name}** — ${languages} — last heard ${heard}\n`;
+    }
+    return out;
+  }
 
   function matchDelete(params) {
     let rows = state.segments;

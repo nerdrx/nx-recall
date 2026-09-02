@@ -24,6 +24,7 @@ use recalld::clock::utc_now_ns;
 use recalld::config::{self, Config, SAMPLE_RATE};
 use recalld::control::Control;
 use recalld::enrich::{self, EnrichStop};
+use recalld::export;
 use recalld::fetch;
 use recalld::models::{self, AsrSelection, EntryState, GraphModels, Group, ModelSet};
 use recalld::night::{self, NightStop};
@@ -74,6 +75,28 @@ fn main() -> Result<()> {
         Command::Allow { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, true),
         Command::Deny { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, false),
         Command::Mic { action } => cmd_mic(&cfg, &data_dir, action),
+        // ---- 0.10.0 -------------------------------------------------------
+        Command::Room { action, device } => cmd_room(&cfg, &data_dir, action, device.as_deref()),
+        Command::Devices => cmd_devices(),
+        Command::Export {
+            dir,
+            from,
+            to,
+            speaker,
+            thread,
+            translations,
+            dry_run,
+        } => cmd_export(
+            &data_dir,
+            &dir,
+            from.as_deref(),
+            to.as_deref(),
+            speaker,
+            thread,
+            translations,
+            dry_run,
+        ),
+        // ---- end 0.10.0 ---------------------------------------------------
         Command::Models { action } => match action {
             ModelsAction::Status { dir } => {
                 cmd_models_status(&cfg, &data_dir, dir.as_deref(), false)
@@ -280,6 +303,8 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     // …and `lang.repair` must use the same guards the pipeline re-decoded with.
     .with_lang(cfg.lang.clone())
     .with_mic(cfg.mic.clone())
+    // 0.10.0: the second microphone's switch, live like the first.
+    .with_room(cfg.room.clone())
     // The memory graph's Tier 3 switch is live, like the microphone's.
     .with_graph(cfg.graph.clone(), models_root.clone())
     // …and the accuracy round's idle worker reads its switches the same way.
@@ -809,6 +834,181 @@ fn cmd_mic(cfg: &Config, data_dir: &Path, action: MicAction) -> Result<()> {
     }
     Ok(())
 }
+
+// ---- 0.10.0, the room microphone and the export ---------------------------
+
+fn cmd_room(cfg: &Config, data_dir: &Path, action: MicAction, device: Option<&str>) -> Result<()> {
+    // A device change is its own request, applied first, so `recalld room
+    // --device x on` reads left to right and cannot be refused for having no
+    // device while naming one.
+    if let Some(device) = device {
+        let out = call(cfg, data_dir, "room.set", json!({"device": device}))?;
+        println!(
+            "{:<18}{}",
+            "device",
+            out["device"].as_str().unwrap_or("(cleared)")
+        );
+    }
+    let out = match action {
+        MicAction::Status => call(cfg, data_dir, "room.get", json!({}))?,
+        MicAction::On => call(cfg, data_dir, "room.set", json!({"enabled": true}))?,
+        MicAction::Off => call(cfg, data_dir, "room.set", json!({"enabled": false}))?,
+        MicAction::Follow => call(
+            cfg,
+            data_dir,
+            "room.set",
+            json!({"enabled": true, "mode": "follow"}),
+        )?,
+        MicAction::Always => call(
+            cfg,
+            data_dir,
+            "room.set",
+            json!({"enabled": true, "mode": "always"}),
+        )?,
+    };
+
+    let state = out["state"].as_str().unwrap_or("?");
+    println!("{:<18}{state}", "room microphone");
+    println!(
+        "{:<18}{}",
+        "meaning",
+        match state {
+            "off" => "not recording, and not listening for a reason to",
+            "needs-device" =>
+                "on, but no device is pinned — run `recalld devices` and pass --device",
+            "following:idle" =>
+                "on, waiting — it records only while an allowed application is captured",
+            "following:active" =>
+                "recording the room right now, because an allowed app is captured",
+            "always:active" => "recording the room right now, regardless of what is running",
+            "always:idle" => "on, but the pinned device is not on the graph",
+            other => other,
+        }
+    );
+    if let Some(device) = out["device"].as_str() {
+        println!("{:<18}{device}", "device");
+    }
+    if out["persisted"] == json!(false) {
+        println!(
+            "\nThe change is live but was NOT written to config.toml; it will not survive a restart."
+        );
+    }
+    if state != "off" {
+        println!(
+            "\nThis microphone hears everyone in the ROOM. Their voices are matched and\n\
+             enrolled like anybody else's — they are named in the voicebank, not marked\n\
+             as you."
+        );
+    }
+    Ok(())
+}
+
+fn cmd_devices() -> Result<()> {
+    let rows = capture::list_devices()?;
+    if rows.is_empty() {
+        println!("No capture devices on the PipeWire graph.");
+        return Ok(());
+    }
+    println!("{:<44}{:<34}", "NODE.NAME", "DESCRIPTION");
+    for row in &rows {
+        println!(
+            "{:<44}{:<34}{}",
+            row.node_name,
+            row.description.as_deref().unwrap_or(""),
+            if row.is_default { "system default" } else { "" }
+        );
+    }
+    println!(
+        "\nPass one of these to `recalld room --device`. The system default is almost\n\
+         always your headset — the microphone switch is already on that one."
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_export(
+    data_dir: &Path,
+    dir: &Path,
+    from: Option<&str>,
+    to: Option<&str>,
+    speaker: Option<i64>,
+    thread: Option<i64>,
+    translations: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let when = |what: Option<&str>, label: &str| -> Result<Option<i64>> {
+        match what {
+            None => Ok(None),
+            Some(text) => recalld::clock::parse_iso8601(text)
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("--{label} {text:?} is not an ISO-8601 date")),
+        }
+    };
+    let req = export::ExportRequest {
+        dir: dir.to_path_buf(),
+        from: when(from, "from")?,
+        to: when(to, "to")?,
+        speaker,
+        thread,
+        include_translations: translations,
+    };
+
+    let store = Store::open(data_dir)?;
+    let plan = match export::plan(&store, &req) {
+        Ok(p) => p,
+        // A refusal is a decision with a reason, not a crash: print it as the
+        // sentence it is.
+        Err(e) => anyhow::bail!("{e}"),
+    };
+    if plan.files.is_empty() {
+        println!("Nothing to export in that range.");
+        return Ok(());
+    }
+
+    println!(
+        "{} day{}, {} conversation{}, {} turn{} — {} bytes over {} file{}:",
+        plan.days(),
+        if plan.days() == 1 { "" } else { "s" },
+        plan.conversations(),
+        if plan.conversations() == 1 { "" } else { "s" },
+        plan.turns(),
+        if plan.turns() == 1 { "" } else { "s" },
+        plan.bytes(),
+        plan.files.len(),
+        if plan.files.len() == 1 { "" } else { "s" },
+    );
+    for file in &plan.files {
+        println!(
+            "  {:<16}{:>9} bytes{}",
+            file.name,
+            file.bytes(),
+            match (file.exists, file.blocked) {
+                (_, true) => "  REFUSED: not written by NX Recall",
+                (true, false) => "  (rewrites an earlier export)",
+                (false, false) => "",
+            }
+        );
+    }
+    if dry_run {
+        println!("\n--dry-run: nothing was written.");
+        return Ok(());
+    }
+
+    let bytes = match export::write(&plan, dir, |done, total| {
+        println!("  wrote {done}/{total}");
+    }) {
+        Ok(b) => b,
+        Err(e) => anyhow::bail!("{e}"),
+    };
+    println!(
+        "\nWrote {bytes} bytes to {}.\nThese are files on your disk and nothing else — nothing \
+         was sent anywhere.",
+        dir.display()
+    );
+    Ok(())
+}
+
+// ---- end 0.10.0 -----------------------------------------------------------
 
 fn cmd_sources(data_dir: &Path) -> Result<()> {
     let store = Store::open(data_dir)?;

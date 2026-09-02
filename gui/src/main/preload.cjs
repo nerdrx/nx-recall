@@ -48,6 +48,15 @@ contextBridge.exposeInMainWorld("recall", {
     state: () => ipcRenderer.invoke("recall:captions:state"),
   },
 
+  // 0.10.0: the local Markdown export. Not protocol requests — one opens the
+  // OS folder chooser, the other reveals a folder that was chosen with it —
+  // and between them they are the whole of the export's contact with the world
+  // outside this window (DESIGN §12: files on this disk, nothing else).
+  exportFolder: {
+    choose: () => ipcRenderer.invoke("recall:export:chooseFolder"),
+    open: (dir) => ipcRenderer.invoke("recall:export:openFolder", dir),
+  },
+
   onState: (fn) => on("recall:state", fn),
   onEvent: (fn) => on("recall:event", fn),
   onResync: (fn) => on("recall:resync", fn),

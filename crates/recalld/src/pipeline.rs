@@ -95,6 +95,14 @@ struct SessionPipeline {
     /// says so rather than a flag the capture side hoped would survive a queue
     /// that is allowed to drop things.
     is_mic: bool,
+    /// Whether this session belongs to the ROOM microphone (0.10.0,
+    /// `sources.kind = "room"`). Read the same way and for a much smaller
+    /// reason: a room turn takes the ORDINARY route in every respect — VAD,
+    /// the overlap gate, ASR, the voicebank — so nothing branches on it. It is
+    /// carried only so the daemon can count what came off that device, which
+    /// is otherwise invisible precisely because it is treated like everything
+    /// else.
+    is_room: bool,
 }
 
 impl SessionPipeline {
@@ -104,6 +112,7 @@ impl SessionPipeline {
         turns: TurnMerger,
         first_chunk_mono_ns: u64,
         is_mic: bool,
+        is_room: bool,
     ) -> Self {
         Self {
             vad_state,
@@ -117,6 +126,7 @@ impl SessionPipeline {
             anchor_sample: 0,
             segment_seq: 0,
             is_mic,
+            is_room,
         }
     }
 
@@ -226,6 +236,11 @@ pub struct Stats {
     /// activity for N minutes" is a statement about turns landing, and this is
     /// the one place that knows when the last one did.
     pub last_segment_ns: AtomicI64,
+    /// Turns that came off the room microphone (0.10.0). They are ordinary
+    /// turns everywhere else in this file, which is exactly why the count is
+    /// worth keeping: without it there is no way to tell a room mic that is
+    /// recording from one that is merely switched on.
+    pub room_segments: AtomicU64,
 }
 
 pub struct Pipeline {
@@ -376,14 +391,25 @@ impl Pipeline {
         // as "an application", which is the safe answer: the worst case is a
         // mic turn going through the voicebank like any other voice, never an
         // app turn being labelled as the user.
-        let is_mic = if self.sessions.contains_key(&chunk.session_id) {
-            false // unused; the entry already exists
+        let (is_mic, is_room) = if self.sessions.contains_key(&chunk.session_id) {
+            (false, false) // unused; the entry already exists
         } else {
-            self.session_is_mic(chunk.session_id)
+            let kind = self.session_kind(chunk.session_id);
+            (
+                kind.as_deref() == Some(KIND_MIC),
+                kind.as_deref() == Some(crate::store::KIND_ROOM),
+            )
         };
         let fresh_state = self.vad.new_state();
         let entry = self.sessions.entry(chunk.session_id).or_insert_with(|| {
-            SessionPipeline::new(new_state, seg_cfg, merger, chunk.capture_mono_ns, is_mic)
+            SessionPipeline::new(
+                new_state,
+                seg_cfg,
+                merger,
+                chunk.capture_mono_ns,
+                is_mic,
+                is_room,
+            )
         });
 
         // A gap is not only a clock problem. Re-anchoring keeps later segments
@@ -436,22 +462,27 @@ impl Pipeline {
         Ok(())
     }
 
-    fn session_is_mic(&self, session_id: i64) -> bool {
+    /// The session's `sources.kind`, read once when the session starts.
+    ///
+    /// `None` reads as "an application", which is the safe answer: the worst
+    /// case is a mic turn going through the voicebank like any other voice,
+    /// never an app turn being labelled as the user.
+    fn session_kind(&self, session_id: i64) -> Option<String> {
         let Ok(store) = self.store.lock() else {
             warn!(
                 session_id,
                 "store mutex poisoned; treating the session as an application"
             );
-            return false;
+            return None;
         };
         match store.session_source_kind(session_id) {
-            Ok(kind) => kind.as_deref() == Some(KIND_MIC),
+            Ok(kind) => kind,
             Err(e) => {
                 warn!(
                     session_id,
                     "could not read the session's source kind: {e:#}"
                 );
-                false
+                None
             }
         }
     }
@@ -498,6 +529,7 @@ impl Pipeline {
         let t_end_ns = session.utc_of_sample(span.end);
         session.segment_seq += 1;
         let is_mic = session.is_mic;
+        let is_room = session.is_room;
         let rel = segment_path(session_id, session.segment_seq, t_start_ns);
         let abs = self.data_dir.join(&rel);
 
@@ -512,6 +544,9 @@ impl Pipeline {
             store.insert_segment(session_id, t_start_ns, t_end_ns, &rel_str, utc_now_ns())?
         };
         self.stats.segments_written.fetch_add(1, Ordering::Relaxed);
+        if is_room {
+            self.stats.room_segments.fetch_add(1, Ordering::Relaxed);
+        }
         self.stats
             .last_segment_ns
             .store(utc_now_ns(), Ordering::Relaxed);
@@ -781,6 +816,7 @@ mod tests {
             TurnMerger::new(24_000, 480_000),
             0,
             false,
+            false,
         );
         s.anchor = Anchor {
             mono_ns: 0,
@@ -807,6 +843,7 @@ mod tests {
             TurnMerger::new(24_000, 480_000),
             0,
             false,
+            false,
         );
         s.anchor = Anchor {
             mono_ns: 0,
@@ -830,6 +867,7 @@ mod tests {
             SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE),
             TurnMerger::new(24_000, 480_000),
             0,
+            false,
             false,
         );
         s.anchor = Anchor {
@@ -856,6 +894,7 @@ mod tests {
             cfg,
             TurnMerger::new(24_000, 480_000),
             0,
+            false,
             false,
         );
         s.anchor = Anchor {
@@ -912,6 +951,7 @@ mod tests {
             TurnMerger::new(24_000, 480_000),
             0,
             false,
+            false,
         );
         fine.received = 16_000;
         fine.ring = vec![0.25; 16_000];
@@ -933,6 +973,7 @@ mod tests {
             SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE),
             TurnMerger::new(24_000, 480_000),
             0,
+            false,
             false,
         );
         s.ring = (0..100).map(|i| i as f32).collect();

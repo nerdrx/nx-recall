@@ -74,6 +74,11 @@ export const store = {
   // hears the room rather than one program, so it has its own method, its own
   // card, and its own default (off).
   mic: { enabled: false, mode: 'follow', active: false, state: 'off', device: null, you_speaker: null },
+  // 0.10.0: the SECOND, physical microphone — the desk mic that hears the
+  // people in the room. Its own switch for the same reason the headset's is
+  // its own: a different device, a different consent decision. Unlike the
+  // headset it has no default device, so `needs-device` is a state.
+  room: { enabled: false, mode: 'follow', active: false, state: 'off', device: null },
   // The memory graph (docs/GRAPH.md, schema 7). Only the counts and the
   // worker's state live here, because only those two are wanted OUTSIDE the
   // Memory view — the rail badge needs "how many are open" wherever you are,
@@ -406,6 +411,39 @@ export function applyMic(d) {
   return store.mic;
 }
 
+/**
+ * Fold a room block (from `room.get`, `room.set`, or a `room` event) into the
+ * model (0.10.0). Same shape as the mic's, minus `you_speaker` — and the
+ * absence of that field IS the feature: nothing on this device is you.
+ */
+export function applyRoom(d) {
+  if (!d) return store.room;
+  store.room = { ...store.room, ...d };
+  return store.room;
+}
+
+/**
+ * What the room card's chip says. The headset's three plus the one it cannot
+ * have: a room mic with no device is not "waiting", it is unconfigured, and
+ * saying so is the difference between a switch that looks broken and one that
+ * tells you what it needs.
+ */
+export function roomChip(state = store.room.state) {
+  switch (state) {
+    case 'following:active':
+    case 'always:active':
+      return { text: 'capturing', cls: 'chip live', live: true };
+    case 'following:idle':
+      return { text: 'waiting for an allowed app', cls: 'chip' };
+    case 'needs-device':
+      return { text: 'no device chosen', cls: 'chip warn' };
+    case 'always:idle':
+      return { text: 'device not connected', cls: 'chip warn' };
+    default:
+      return { text: 'off', cls: 'chip' };
+  }
+}
+
 /** Is this the user's own voice — the one the microphone pins? */
 export function isYou(speakerId) {
   if (speakerId == null) return false;
@@ -446,7 +484,9 @@ export function micChip(state = store.mic.state) {
  * which of the two happened to paint last. One rule, one place, both callers.
  */
 export function appSources() {
-  return store.sources.filter((s) => s.kind !== 'mic');
+  // 0.10.0 adds a second one: the room microphone is a source row too, and it
+  // is no more an application than the headset is.
+  return store.sources.filter((s) => s.kind !== 'mic' && s.kind !== 'room');
 }
 
 /** What the rail badge counts: allowed applications. */
@@ -873,9 +913,20 @@ export function applyEvent(evt, opts = {}) {
       // The daemon's status block carries the mic too, so a client that missed
       // a `mic` event still converges on the truth.
       if (d?.mic) applyMic(d.mic);
+      // …and the room microphone's, for the same reason again (0.10.0).
+      if (d?.room) applyRoom(d.room);
       // …and the graph worker's state, for exactly the same reason (0.7.0).
       if (d?.graph) store.graph = { ...store.graph, enrichment: d.graph };
-      return { status: true, mic: true, graph: d?.graph ?? null };
+      return { status: true, mic: true, room: true, graph: d?.graph ?? null };
+    }
+
+    // The room microphone's switch moving, or its stream opening or closing
+    // (0.10.0). On the status topic, like the headset's `mic` event, so no
+    // client changes its subscription to see it.
+    case 'room': {
+      if (!d) return null;
+      applyRoom(d);
+      return { room: true };
     }
 
     // The memory graph's Tier 3 worker, on the status topic. It arrives when
@@ -905,6 +956,14 @@ export function applyEvent(evt, opts = {}) {
       applyMic(d);
       return { mic: true };
     }
+
+    // A Discord account was linked to a voice, or unlinked — here, in the CLI,
+    // or in another window (0.9.0's ground truth, surfaced on the Sources page
+    // in 0.10.0). The row shape is `truth.users`'s, but the card re-asks
+    // rather than folding it in: the score moves with the link, and the score
+    // is the daemon's arithmetic.
+    case 'truth':
+      return !d ? null : { truth: d };
 
     case 'op.progress': {
       if (!d?.op) return null;

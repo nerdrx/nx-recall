@@ -416,3 +416,27 @@ hand-labeled friend-group recording (tooling ready: `spike/label_server.py`,
 User is in Germany and has decided to proceed; §201 StGB and Art. 9 GDPR
 considerations recorded in v1. Repo private; no export or sharing features anywhere
 in the design — distribution remains the axis that changes the calculus.
+
+**0.10.0 amendment — the local Markdown export.** The sentence above is about
+*distribution*, and it stands. What 0.10.0 adds is not a distribution feature and
+is defined by that: `export.run` writes Markdown files into **one directory on a
+local filesystem that the user chose in a native folder dialog**, and there is no
+other destination anywhere in the code path — no upload, no share sheet, no
+clipboard, no link, no network target of any kind. The daemon refuses a path that
+is not absolute, that does not already exist, that is a volatile runtime directory
+(`/run/user`, `/proc`, `/sys`, `/dev`), or that `statfs` identifies as a network
+mount, because a network mount is a share whatever the file manager calls it. It
+overwrites only files carrying its own `<!-- nx-recall export -->` header and
+refuses by name otherwise: the folder belongs to the user, not to this program.
+
+The copy on the card and in the CLI is one sentence, and it is the sentence this
+paragraph exists to license: **this writes files to your disk and nothing else.**
+Moving those files anywhere afterwards is a person's own act, made deliberately,
+with the file manager — which is exactly where that decision belongs, and is a
+different thing from a program offering to do it.
+
+**0.10.0 — the room microphone.** A second physical input (`[room]`, source kind
+`room`), off by default, requiring an explicit device. It hears the people
+physically present, who never consented to an instance because they never joined
+one — so its consent surface is deliberately the bluntest in the program, and its
+voices are matched and enrolled like any other voice rather than pinned to "You".

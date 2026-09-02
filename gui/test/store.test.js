@@ -41,6 +41,8 @@ import {
   LANGUAGE_CHOICES,
   languageValue,
   languageLabel,
+  applyRoom,
+  roomChip,
 } from '../src/renderer/lib/store.js';
 import { splitOutcome } from '../src/renderer/views/speakers.js';
 
@@ -897,6 +899,57 @@ test('the sources badge counts applications, never the microphone', () => {
   ];
   assert.equal(allowedAppCount(), 2);
   assert.deepEqual(appSources().map((s) => s.match_key), ['VRChat.exe', 'Discord', 'firefox']);
+});
+
+// ---------------------------------------------------------------------------
+// the room microphone (0.10.0)
+// ---------------------------------------------------------------------------
+
+test('the room microphone is not an application either', () => {
+  reset();
+  store.sources = [
+    { match_key: 'VRChat.exe', kind: 'app', allowed: true },
+    { match_key: 'mic', kind: 'mic', allowed: true },
+    // A second device with its own switch, its own card and its own default.
+    // Counting it as an allowed application would put the rail badge back into
+    // exactly the disagreement finding #25 was about.
+    { match_key: 'room', kind: 'room', allowed: true },
+  ];
+  assert.equal(allowedAppCount(), 1);
+  assert.deepEqual(appSources().map((s) => s.match_key), ['VRChat.exe']);
+});
+
+test('a room block folds in from the method, the event and the status push', () => {
+  reset();
+  assert.equal(store.room.enabled, false);
+  assert.equal(store.room.state, 'off');
+
+  applyRoom({ enabled: true, mode: 'always', device: 'alsa_input.desk', state: 'always:idle', active: false });
+  assert.equal(store.room.device, 'alsa_input.desk');
+  assert.equal(store.room.state, 'always:idle');
+
+  // The `room` event, on the status topic like the mic's.
+  const change = applyEvent({ seq: 1, ev: 'room', data: { state: 'always:active', active: true } });
+  assert.deepEqual(change, { room: true });
+  assert.equal(store.room.state, 'always:active');
+  // A partial block must not erase the device it did not mention.
+  assert.equal(store.room.device, 'alsa_input.desk');
+
+  // And a status push converges a client that missed the event.
+  applyEvent({ seq: 2, ev: 'status', data: { room: { state: 'off', enabled: false } } });
+  assert.equal(store.room.state, 'off');
+});
+
+test('the room chip separates "no device" from "waiting" from "unplugged"', () => {
+  // The state the headset cannot be in is the one worth having a word for: a
+  // room mic with nothing chosen is unconfigured, not waiting.
+  assert.equal(roomChip('off').text, 'off');
+  assert.equal(roomChip('needs-device').text, 'no device chosen');
+  assert.equal(roomChip('needs-device').cls, 'chip warn');
+  assert.equal(roomChip('following:idle').text, 'waiting for an allowed app');
+  assert.equal(roomChip('always:idle').text, 'device not connected');
+  assert.equal(roomChip('always:active').live, true);
+  assert.equal(roomChip('following:active').live, true);
 });
 
 test('a disconnect stops the footer quoting the daemon it lost', () => {

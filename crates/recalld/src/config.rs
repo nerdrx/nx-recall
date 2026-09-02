@@ -126,6 +126,57 @@ impl MicConfig {
     }
 }
 
+// ---- 0.10.0, the room microphone ------------------------------------------
+
+/// A second, physical microphone: the desk or room mic that hears the people
+/// who are *in the room* and not in the instance.
+///
+/// It is deliberately not `[mic]` with a second device. The headset mic is
+/// provenance — whatever it hears is the user, and its turns are pinned to the
+/// "You" speaker with no comparison made. A room mic is the opposite: the
+/// voices on it are strangers to the voicebank and have to be matched, minted
+/// and enrolled like any voice coming out of an application. Two different
+/// identity routes are two different switches.
+///
+/// `device` is **required**. There is no sensible default for a second input:
+/// following `default.audio.source` would open the same headset the `[mic]` tap
+/// is already on and record the user twice, under two identities.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoomConfig {
+    pub enabled: bool,
+    /// `follow` / `always`, exactly as `[mic]` means them — the two switches
+    /// answer the same question ("when is a microphone open?") and answering it
+    /// differently in two places would be a second thing to learn.
+    pub mode: MicMode,
+    /// PipeWire `node.name` of the room input. No default: see above.
+    pub device: Option<String>,
+}
+
+impl Default for RoomConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: MicMode::Follow,
+            device: None,
+        }
+    }
+}
+
+impl RoomConfig {
+    /// The `node.name` the room tap must open, or `None` when none is pinned —
+    /// which, unlike `[mic]`, means "cannot open" rather than "follow the
+    /// default".
+    pub fn device_override(&self) -> Option<&str> {
+        self.device
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+// ---- end 0.10.0 -----------------------------------------------------------
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VadConfig {
@@ -846,6 +897,9 @@ impl Default for TruthConfig {
 pub struct Config {
     pub capture: CaptureConfig,
     pub mic: MicConfig,
+    /// The second, physical microphone (0.10.0). Off by default, and unlike
+    /// `[mic]` it cannot open at all until `device` names one.
+    pub room: RoomConfig,
     pub vad: VadConfig,
     pub runtime: RuntimeConfig,
     pub models: ModelsConfig,
@@ -918,6 +972,12 @@ impl Config {
              # and it is off until you turn it on with `recalld mic on`. In the\n\
              # default \"follow\" mode it only records while an allowed program is\n\
              # itself being captured.\n\
+             #\n\
+             # `[room]` is a SECOND, physical microphone — a desk mic that hears\n\
+             # the people sitting with you, who never joined the instance. It is\n\
+             # off by default and it needs `device = \"<pipewire node.name>\"`;\n\
+             # `recalld devices` lists them. Its voices are matched and enrolled\n\
+             # like anybody else's, so they appear in the voicebank by name.\n\
              \n{body}"
         );
         let tmp = path.with_extension("toml.tmp");
@@ -1179,6 +1239,59 @@ mod tests {
         assert_eq!(back.mic.mode, MicMode::Always);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- 0.10.0, the room microphone -------------------------------------
+
+    #[test]
+    fn the_room_microphone_is_off_and_has_no_device_until_it_is_given_one() {
+        let cfg = Config::default();
+        assert!(!cfg.room.enabled);
+        assert_eq!(cfg.room.mode, MicMode::Follow);
+        // The difference from `[mic]` that matters: no default device, and no
+        // fallback to the system default either. See room.rs.
+        assert_eq!(cfg.room.device_override(), None);
+    }
+
+    #[test]
+    fn the_room_switch_round_trips_through_the_file() {
+        let dir = std::env::temp_dir().join(format!("nx-recall-room-cfg-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut cfg = Config::default();
+        cfg.room.enabled = true;
+        cfg.room.mode = MicMode::Always;
+        cfg.room.device = Some("alsa_input.usb-Desk_Mic".to_string());
+        cfg.save(&path).unwrap();
+
+        let back = Config::load(&path).unwrap();
+        assert!(back.room.enabled);
+        assert_eq!(back.room.mode, MicMode::Always);
+        assert_eq!(
+            back.room.device_override(),
+            Some("alsa_input.usb-Desk_Mic"),
+            "the device pin is the one field that cannot be re-derived"
+        );
+        // And the headset's own switch is untouched by any of it: two devices,
+        // two decisions.
+        assert!(!back.mic.enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_room_section_parses_like_the_mic_section_and_refuses_nonsense() {
+        let cfg: Config =
+            toml::from_str("[room]\nenabled = true\nmode = \"follow\"\ndevice = \"  desk  \"\n")
+                .unwrap();
+        assert!(cfg.room.enabled);
+        assert_eq!(cfg.room.device_override(), Some("desk"));
+        assert!(toml::from_str::<Config>("[room]\nmode = \"sometimes\"\n").is_err());
+        // A blank device is "none pinned", not a node named "".
+        let blank: Config = toml::from_str("[room]\ndevice = \"\"\n").unwrap();
+        assert_eq!(blank.room.device_override(), None);
+    }
+
+    // ---- end 0.10.0 -------------------------------------------------------
 
     /// The default that carries the whole privacy argument for Tier 3: the
     /// local model is **off**, and nothing about a fresh install runs it.

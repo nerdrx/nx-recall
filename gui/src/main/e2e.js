@@ -10,7 +10,7 @@
 // never opens a window on the developer's desktop.
 
 import { app } from 'electron';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -2997,6 +2997,224 @@ export function runE2E(deps) {
       assert(after === stopped, `the microphone kept producing rows while off (${stopped} → ${after})`);
       return { stopped, after };
     });
+
+    // ---- 0.10.0 ------------------------------------------------------------
+
+    // 12e — the room microphone. A SECOND physical device, off, with no device
+    // chosen and therefore nothing its switch can do until one is: the state a
+    // fresh install is in, and the one the card has to be usable from.
+    await step('room-card-needs-a-device-before-it-can-do-anything', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await waitFor('the room card', async () => js('!!document.getElementById("room-card")'));
+
+      // It sits beside the microphone's card, not in the application list.
+      const order = await js(`(() => {
+        const cards = [...document.querySelector('.view-body').querySelectorAll('.card')];
+        return [cards.indexOf(document.getElementById('mic-card')), cards.indexOf(document.getElementById('room-card'))];
+      })()`);
+      assert(order[1] === order[0] + 1, `the room card is not beside the microphone's (${JSON.stringify(order)})`);
+      const inList = await js(`[...document.querySelectorAll('#source-list .src-row')].some(r => r.dataset.source === 'room')`);
+      assert(!inList, 'the room microphone is listed as an application — it is not one');
+
+      // The device list is fetched on mount, so wait for the picker to be
+      // populated rather than reading it mid-flight.
+      const room = await waitFor('the device picker', async () => {
+        const r = await js('window.__recallDebug.room()');
+        return r.devices.length ? r : null;
+      });
+      assert(room.enabled === false, 'the room microphone is not off by default');
+      assert(room.state === 'off', `the state reads "${room.state}"`);
+      assert(room.device == null, 'a second microphone shipped with a device already chosen');
+      assert(room.toggleDisabled === true, 'the switch is usable with no device — the daemon would refuse it');
+      // The copy has to be as blunt as the microphone's, and about the people
+      // it hears rather than about the user.
+      assert(/room/i.test(room.warning), `the warning does not say what it hears: ${room.warning}`);
+      assert(
+        /nothing on this device is marked as you/i.test(room.warning),
+        `the warning does not say whose voices these are: ${room.warning}`
+      );
+      // And the picker offers real devices, with the system default named as
+      // the one that is almost always wrong.
+      assert(room.devices.length >= 2, `the device picker offered ${room.devices.length} devices`);
+      const labels = await js(`[...document.getElementById('room-device').options].map(o => o.textContent)`);
+      assert(labels.some((l) => /system default/i.test(l)), `no device is marked as the system default: ${JSON.stringify(labels)}`);
+      return { devices: room.devices.length, warning: room.warning.slice(0, 70) };
+    });
+
+    await step('room-mic-turns-on-once-a-device-is-picked', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await waitFor('the room card', async () => js('!!document.getElementById("room-card")'));
+      await waitFor('the device picker', async () => (await js('window.__recallDebug.room()')).devices.length > 0);
+      // Pick the desk mic — the second option, i.e. NOT the system default.
+      const picked = await js(`(() => {
+        const sel = document.getElementById('room-device');
+        const opt = [...sel.options].find(o => o.value && !/system default/i.test(o.textContent));
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event('change'));
+        return opt.value;
+      })()`);
+      // Wait for the round trip to land, not merely for the optimistic paint:
+      // the switch is deliberately disabled while a change is in flight, so
+      // reading it mid-flight would assert on the pending state.
+      const chosen = await waitFor(
+        'the device to be pinned and the switch to arm',
+        async () => {
+          const r = await js('window.__recallDebug.room()');
+          return r.device === picked && r.toggleDisabled === false ? r : null;
+        },
+        { timeout: 10000, every: 150 }
+      );
+      assert(chosen.state === 'off', `pinning a device turned it on by itself (${chosen.state})`);
+
+      await js('document.getElementById("room-toggle").click()');
+      const on = await waitFor(
+        'the room microphone to come on',
+        async () => {
+          const r = await js('window.__recallDebug.room()');
+          return r.enabled && r.state !== 'off' ? r : null;
+        },
+        { timeout: 10000, every: 150 }
+      );
+      assert(on.state !== 'needs-device', 'it came on and still says it has no device');
+      assert(on.chip !== 'off', `the chip did not follow the switch: "${on.chip}"`);
+
+      // Both modes are reachable, and `always` is the one that does not wait.
+      await js('document.querySelector(\'#room-modes [data-room-mode="always"]\').click()');
+      const always = await waitFor(
+        'always mode',
+        async () => {
+          const r = await js('window.__recallDebug.room()');
+          return r.mode === 'always' ? r : null;
+        },
+        { timeout: 8000, every: 150 }
+      );
+      const file = await shot('sources-room');
+
+      // Put it back where the rest of the suite expects it.
+      await js('document.getElementById("room-toggle").click()');
+      await waitFor('the room microphone to go off', async () => {
+        const r = await js('window.__recallDebug.room()');
+        return r.state === 'off';
+      });
+      return { device: picked, state: always.state, chip: always.chip, file };
+    });
+
+    // 12f — the Discord bridge (0.9.0's ground truth), as a card on this page:
+    // what is arriving, from whom, and how the voicebank is doing against it.
+    await step('discord-card-links-a-user-and-scores-the-voicebank', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await waitFor('the Discord card', async () => js('!!document.getElementById("truth-card")'));
+      const before = await waitFor('the Discord users', async () => {
+        const t = await js('window.__recallDebug.truth()');
+        return t.users.length ? t : null;
+      });
+      assert(!before.off, 'the card says the bridge is off; the mock has it on');
+      assert(/receiving|waiting/i.test(before.chip), `the state chip reads "${before.chip}"`);
+      // The privacy posture: what is received, and where it goes.
+      assert(/no audio/i.test(before.hint), `the copy does not say what is NOT received: ${before.hint}`);
+      assert(/leaves this machine/i.test(before.hint), `the copy does not say where it goes: ${before.hint}`);
+      // The scorecard, with real numbers rather than a placeholder.
+      assert(/precision \d+%/.test(before.score), `no precision in the scorecard: ${before.score}`);
+      assert(/recall \d+%/.test(before.score), `no recall in the scorecard: ${before.score}`);
+      assert(/n \d+/.test(before.score), `no sample size in the scorecard: ${before.score}`);
+
+      // Link an unlinked account to a named voice.
+      const target = before.users.find((u) => !u.linked);
+      assert(target, 'every account was already linked; the link path is untestable');
+      const linked = await js(`(() => {
+        const sel = document.querySelector('[data-truth-link="${target.id}"]');
+        const opt = [...sel.options].find(o => o.value);
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event('change'));
+        return opt.value;
+      })()`);
+      const after = await waitFor(
+        'the link to stick',
+        async () => {
+          const t = await js('window.__recallDebug.truth()');
+          const row = t.users.find((u) => u.id === target.id);
+          return row && row.linked === linked ? t : null;
+        },
+        { timeout: 10000, every: 150 }
+      );
+      await js('document.getElementById("truth-card").scrollIntoView({block: "start"})');
+      const file = await shot('sources-discord');
+      return { users: after.users.length, linked, score: before.score, file };
+    });
+
+    // 12g — the Markdown export. DESIGN §12 is the whole shape of this step:
+    // the card writes FILES, into a folder chosen in a native dialog, and
+    // nothing else — and it refuses to touch a file it did not write.
+    await step('export-previews-then-writes-markdown-to-a-folder', async () => {
+      const dir = join(OUT, `export${SUFFIX}`);
+      mkdirSync(dir, { recursive: true });
+      // The driver cannot click an OS folder dialog, so it supplies the answer
+      // the dialog would have given. Everything after that is the real path.
+      process.env.NX_RECALL_E2E_EXPORT_DIR = dir;
+
+      await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await waitFor('the export card', async () => js('!!document.getElementById("export-card")'));
+      const card = await js('window.__recallDebug.exportCard()');
+      // The sentence that licenses the feature at all.
+      assert(/writes files to your disk and nothing else/i.test(card.note), `the card does not say what it does: ${card.note}`);
+
+      await js('document.getElementById("export-choose").click()');
+      const planned = await waitFor(
+        'the preview',
+        async () => {
+          const c = await js('window.__recallDebug.exportCard()');
+          return c.files.length ? c : null;
+        },
+        { timeout: 15000, every: 200 }
+      );
+      assert(planned.dir.includes(dir), `the card does not show the chosen folder: ${planned.dir}`);
+      assert(planned.files.includes('people.md'), `no people.md in the plan: ${JSON.stringify(planned.files)}`);
+      assert(/turn/.test(planned.counts), `the counts say nothing about turns: ${planned.counts}`);
+      // A preview writes NOTHING.
+      assert(readdirSync(dir).length === 0, 'the preview wrote files');
+
+      await js('document.getElementById("export-run").click()');
+      const done = await waitFor(
+        'the export to finish',
+        async () => {
+          const c = await js('window.__recallDebug.exportCard()');
+          return c.done ? c : null;
+        },
+        { timeout: 20000, every: 200 }
+      );
+      const written = readdirSync(dir);
+      assert(written.includes('people.md'), `people.md was not written: ${JSON.stringify(written)}`);
+      const day = written.find((n) => n !== 'people.md' && n.endsWith('.md'));
+      assert(day, `no day file was written: ${JSON.stringify(written)}`);
+      const body = readFileSync(join(dir, day), 'utf8');
+      assert(body.startsWith('<!-- nx-recall export -->'), `the file carries no export header:\n${body.slice(0, 120)}`);
+      assert(/^## \d\d:\d\d — /m.test(body), `no conversation heading in the export:\n${body.slice(0, 400)}`);
+      assert(/^- \*\*\d\d:\d\d\*\* .+: /m.test(body), `no turn lines in the export:\n${body.slice(0, 400)}`);
+      assert(done.openable, 'no way to open the folder after an export');
+
+      // And the guard: a file NX Recall did not write is never overwritten.
+      writeFileSync(join(dir, day), '# my own notes about that evening\n');
+      await js('document.getElementById("export-preview").click()');
+      const blocked = await waitFor(
+        'the overwrite guard',
+        async () => {
+          const c = await js('window.__recallDebug.exportCard()');
+          return c.error ? c : null;
+        },
+        { timeout: 15000, every: 200 }
+      );
+      assert(blocked.error.includes(day), `the refusal does not name the file: ${blocked.error}`);
+      assert(blocked.runDisabled === true, 'the Export button is still armed over somebody else’s file');
+      assert(
+        readFileSync(join(dir, day), 'utf8') === '# my own notes about that evening\n',
+        'the export wrote over a file it did not write'
+      );
+      await js('document.getElementById("export-card").scrollIntoView({block: "start"})');
+      const file = await shot('sources-export');
+      return { files: written, day, error: blocked.error.slice(0, 80), file };
+    });
+
+    // ---- end 0.10.0 --------------------------------------------------------
 
     // 12d — native widgets Chromium draws outside the page (a <select> option
     // popup above all) take their colours from `color-scheme` and from nothing

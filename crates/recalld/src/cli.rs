@@ -74,6 +74,84 @@ be told.")]
         action: MicAction,
     },
 
+    // ---- 0.10.0, the room microphone -------------------------------------
+    /// Turn the room microphone on or off, or point it at a device.
+    #[command(long_about = "\
+Turn the room microphone on or off, or point it at a device.
+
+This is a SECOND, physical microphone: the desk mic that hears the people
+sitting in the room with you, who never joined the instance. Unlike the headset
+microphone, its voices are matched against the voicebank and enrolled like
+anybody else's — nothing on this device is labelled as you.
+
+It is off by default and it needs a device: there is no sensible default for a
+second input, and following the system default would open the headset the
+`recalld mic` switch is already on.
+
+  recalld devices                     the capture devices you can pick from
+  recalld room --device alsa_input.x  pin the device, changing nothing else
+  recalld room on                     enable it (needs a device first)
+  recalld room follow                 enable it, only while an allowed app runs
+  recalld room always                 enable it, whenever the daemon runs
+  recalld room off                    disable it
+
+Needs the running daemon: the switch is live, and every connected client has to
+be told.")]
+    Room {
+        #[arg(value_enum, default_value_t = MicAction::Status)]
+        action: MicAction,
+        /// The PipeWire `node.name` to capture, from `recalld devices`.
+        #[arg(long, value_name = "NODE_NAME")]
+        device: Option<String>,
+    },
+
+    /// List the capture devices on the PipeWire graph, with the `node.name`
+    /// the room microphone is pinned by. Captures nothing.
+    Devices,
+
+    /// Write the transcript to Markdown files in a folder on this disk.
+    #[command(long_about = "\
+Write the transcript to Markdown files in a folder on this disk.
+
+One file per day (2026-09-01.md) plus people.md, in the directory you name. That
+directory is the whole output: this writes files to your disk and nothing else —
+there is no upload, no share, no link, and the path is refused if it is not an
+absolute local one (a network mount is a share, whatever the file manager calls
+it).
+
+Files NX Recall wrote are rewritten; a file it did not write is never touched —
+it refuses and names the file, because the folder is yours.
+
+  recalld export ~/notes/recall
+  recalld export ~/notes/recall --from 2026-08-01 --to 2026-09-01
+  recalld export ~/notes/recall --speaker 7
+
+Runs in this process against the database directly, so it works whether or not
+the daemon is running.")]
+    Export {
+        /// An absolute path to an existing directory on a local filesystem.
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+        /// ISO-8601 instant or date, inclusive.
+        #[arg(long, value_name = "WHEN")]
+        from: Option<String>,
+        /// ISO-8601 instant or date, exclusive.
+        #[arg(long, value_name = "WHEN")]
+        to: Option<String>,
+        /// Only this voice's turns.
+        #[arg(long, value_name = "SPEAKER_ID")]
+        speaker: Option<i64>,
+        /// Only this conversation.
+        #[arg(long, value_name = "THREAD_ID")]
+        thread: Option<i64>,
+        /// Write the assistant's translations under the turns that have one.
+        #[arg(long)]
+        translations: bool,
+        /// Say what would be written, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    // ---- end 0.10.0 -------------------------------------------------------
     /// Inspect the analysis models.
     Models {
         #[command(subcommand)]
