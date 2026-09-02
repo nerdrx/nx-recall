@@ -159,6 +159,13 @@ impl Renderer {
         Ok(Self { font, style })
     }
 
+    /// A new size, opacity or surface, without re-reading the font off disk.
+    /// The desktop path rebuilds its style every time captions.json is written,
+    /// and a settings slider must not turn into a file read per frame.
+    pub fn set_style(&mut self, style: Style) {
+        self.style = style;
+    }
+
     /// Draw the caption stack, newest at the bottom, and return the surface.
     ///
     /// Rows are laid out from the BOTTOM up, so the newest turn is always in
@@ -211,7 +218,10 @@ impl Renderer {
                 name,
                 name_w,
                 hue: speaker_hue(turn.speaker),
-                mine: turn.speaker.is_some() && turn.speaker == you,
+                // Either the feed already stamped it (the desktop path, where
+                // the roster is known before a caption exists) or the caller
+                // named the voice (the headset path, which has no feed).
+                mine: turn.mine || (turn.speaker.is_some() && turn.speaker == you),
                 shaky: turn.shaky,
                 text_lines,
                 tr_lines,
@@ -242,6 +252,13 @@ impl Renderer {
         let w = self.style.width as i64 - self.style.pad * 2;
         s.fill(x0, top, w, b.height, GROUND, self.style.opacity);
 
+        // Your own turns are dimmer, at the same YOU_DIM the desktop window uses
+        // (gui/src/renderer/lib/captions.js): you already know what you said, and
+        // the reason to keep the row at all is rhythm. The GROUND above is not
+        // dimmed with it — a hole in the bar under one row would read as a
+        // rendering fault rather than as "this one is yours".
+        let dim = if b.mine { YOU_DIM } else { 1.0 };
+
         // The dot's own width plus its gap, then the name, then the words.
         let text_x = x0 + self.style.pad + DOT_COLUMN + b.name_w;
         let mut y = top + self.style.pad + (self.style.size * 0.9) as i64;
@@ -251,9 +268,16 @@ impl Renderer {
         // place violet is spent is the ring on your own dot.
         let dot_y = top + self.style.pad + (name_size * 0.4) as i64;
         if b.mine {
-            s.fill(x0 + self.style.pad - 3, dot_y - 3, 11, 11, VIOLET, 0.9);
+            s.fill(
+                x0 + self.style.pad - 3,
+                dot_y - 3,
+                11,
+                11,
+                VIOLET,
+                0.9 * dim,
+            );
         }
-        s.fill(x0 + self.style.pad, dot_y, 5, 5, b.hue, 1.0);
+        s.fill(x0 + self.style.pad, dot_y, 5, 5, b.hue, dim);
         self.draw_text(
             s,
             &b.name,
@@ -261,19 +285,21 @@ impl Renderer {
             top + self.style.pad + (name_size * 0.9) as i64,
             name_size,
             b.hue,
+            dim,
         );
 
         let ink = if b.shaky { MUTED } else { INK };
         for line in &b.text_lines {
-            self.draw_text(s, line, text_x, y, self.style.size, ink);
+            self.draw_text(s, line, text_x, y, self.style.size, ink, dim);
             y += line_h;
         }
         for line in &b.tr_lines {
-            self.draw_text(s, line, text_x, y + 2, tr_size, TRANSLATION);
+            self.draw_text(s, line, text_x, y + 2, tr_size, TRANSLATION, dim);
             y += tr_line_h;
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_text(
         &self,
         s: &mut Surface,
@@ -282,6 +308,7 @@ impl Renderer {
         baseline: i64,
         size: f32,
         rgb: [u8; 3],
+        dim: f32,
     ) {
         let mut pen = x;
         for ch in text.chars() {
@@ -293,7 +320,7 @@ impl Renderer {
                     pen + metrics.xmin as i64 + gx,
                     baseline - metrics.height as i64 - metrics.ymin as i64 + gy,
                     rgb,
-                    *coverage as f32 / 255.0,
+                    (*coverage as f32 / 255.0) * dim,
                 );
             }
             pen += metrics.advance_width.round() as i64;
@@ -390,6 +417,11 @@ const DOT_COLUMN: i64 = 14;
 /// surface is always dark (gui/src/renderer/captions.html says why).
 const VIOLET: [u8; 3] = [165, 102, 255];
 
+/// How much dimmer a row of yours is. The same number as `YOU_DIM` in
+/// gui/src/renderer/lib/captions.js — one constant, two languages, because a
+/// "You" row that is dimmer in one surface and not in the other is two designs.
+pub const YOU_DIM: f32 = 0.55;
+
 const DEFAULT_FONTS: &[&str] = &[
     "/usr/share/fonts/noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
@@ -445,6 +477,7 @@ mod tests {
             text: text.into(),
             shaky: false,
             translation: None,
+            mine: false,
         }
     }
 
@@ -511,6 +544,32 @@ mod tests {
         let Some(r) = renderer() else { return };
         let s = r.render(&[turn(1, &"a very long sentence ".repeat(40))], None);
         assert_eq!(s.pixels.len(), (s.width as usize) * (s.height as usize) * 4);
+    }
+
+    /// Your own row is dimmer, and the bar under it is not: a hole in the
+    /// ground under one row would read as a rendering fault.
+    #[test]
+    fn your_own_row_is_dimmer_and_its_ground_is_not() {
+        let Some(r) = renderer() else { return };
+        let ink = |s: &Surface| -> u64 {
+            s.pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| p[3] as u64)
+                .sum()
+        };
+        let theirs = r.render(&[turn(1, "the same words, twice")], None);
+        let mine = r.render(&[turn(1, "the same words, twice")], Some(1));
+        assert!(
+            ink(&mine) < ink(&theirs),
+            "a row of yours was not dimmer than one of theirs"
+        );
+        // The ground, well clear of any glyph, is identical in both.
+        let x = r.style.pad + 4;
+        let y = theirs.height as i64 - r.style.pad - 4;
+        let at = ((y as usize) * (theirs.width as usize) + x as usize) * 4;
+        assert_eq!(&mine.pixels[at..at + 4], &theirs.pixels[at..at + 4]);
     }
 
     /// The same voice must be the same colour here and on the desktop — the

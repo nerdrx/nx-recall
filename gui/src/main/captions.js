@@ -12,7 +12,9 @@
 // window: no second socket, no second model. What arrives there arrives here.
 
 import { BrowserWindow, screen } from 'electron';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { accessSync, constants, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { normalizeCaptionSettings } from '../renderer/lib/captions.js';
@@ -34,6 +36,16 @@ let settings = null;
 let settingsFile = null;
 let saveTimer = null;
 let onChange = null;
+/** The `nx-recall-overlay --desktop` child, when the layer path is the one in use. */
+let layer = null;
+/** One restart, not a loop. Reset every time the user asks for captions afresh. */
+let layerRestarted = false;
+/**
+ * This desktop cannot host a layer surface — the child said so with exit 2 — so
+ * every later "Captions" opens the BrowserWindow without trying again. Learned
+ * once per run, because a compositor does not change under a running app.
+ */
+let layerRefused = false;
 
 // ---------------------------------------------------------------------------
 // the settings file
@@ -59,9 +71,47 @@ export function initCaptionSettings(dir, notify = null) {
   return settings;
 }
 
+/**
+ * Which surface this desktop will actually put the captions on, and therefore
+ * what the settings card is allowed to claim:
+ *
+ *   'layer'          — a wlr-layer-shell surface with an empty input region.
+ *                      Click-through is not a setting here, it is the surface.
+ *   'window-wayland' — the BrowserWindow, on Wayland, where Electron's
+ *                      `setIgnoreMouseEvents` is measurably a no-op. The toggle
+ *                      exists and does nothing, and the card says so.
+ *   'window'         — the BrowserWindow on X11 or Windows, where the toggle is
+ *                      real.
+ *
+ * Derived rather than remembered: a compositor does not change under a running
+ * app, but which binaries are installed can, and the honest answer is the one
+ * taken when somebody looks.
+ */
+function captionSurface() {
+  if (!wantsLayerCaptions()) return 'window';
+  if (layerRefused || !overlayBinary()) return 'window-wayland';
+  return 'layer';
+}
+
+// Looked up once. `getCaptionSettings` is called on every frame of a slider
+// drag, and a filesystem probe per frame for a fact that changes when somebody
+// installs a package is a stat storm for nothing.
+let overlayBinaryCache;
+function overlayBinary() {
+  if (overlayBinaryCache === undefined) overlayBinaryCache = findOverlayBinary();
+  return overlayBinaryCache;
+}
+
+/**
+ * The settings, plus the one fact about them that is not a setting.
+ *
+ * `surface` is deliberately outside the normalized block: `save()` writes the
+ * normalized block, and `normalizeCaptionSettings` drops what it does not know,
+ * so this can be read by the card and can never reach captions.json.
+ */
 export function getCaptionSettings() {
   if (!settings) settings = normalizeCaptionSettings(null);
-  return { ...settings };
+  return { ...settings, surface: captionSurface() };
 }
 
 /**
@@ -94,6 +144,160 @@ function save() {
     }
   }, 400);
   if (saveTimer.unref) saveTimer.unref();
+}
+
+// ---------------------------------------------------------------------------
+// the layer surface
+//
+// The captions have always claimed to be click-through, and on X11 they were:
+// `setIgnoreMouseEvents(true)` sets an empty X11 input shape and the pointer
+// falls through. MEASURED on this machine (Electron 44, KDE Wayland): under
+// Wayland it sets no region and does nothing. Chromium has no way to say "this
+// surface is scenery" — a `wl_surface`'s input region is not reachable from
+// Electron's API — so on a Wayland desktop the toggle was a lie in the UI, and
+// a caption bar that eats a click into the game is the exact bug it exists to
+// prevent.
+//
+// So on Wayland the "Captions" surface is not this process's window at all: it
+// is `nx-recall-overlay --desktop`, a wlr-layer-shell client that sets that
+// empty input region itself. It reads the SAME captions.json this file writes,
+// so the settings card stays the one control surface, and it subscribes to the
+// same daemon socket — no second model, no second set of rules.
+//
+// Everything below is about keeping that child indistinguishable from a window:
+// the tray item, the rail button, `--captions` and the settings card must all
+// behave the same whichever surface is up.
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether this run should use the layer surface at all.
+ *
+ * Wayland, Linux, and NOT the e2e harness. The harness is the exception on
+ * purpose: it runs Electron inside a headless gamescope that does not implement
+ * wlr-layer-shell, but it INHERITS the developer's own `WAYLAND_DISPLAY` — so
+ * without this the driven app would put a caption bar on the real desktop
+ * instead of in the compositor under test. The e2e path drives the window, which
+ * is also the fallback path this file must keep working.
+ */
+export function wantsLayerCaptions() {
+  if (process.platform !== 'linux') return false;
+  if (process.env.NX_RECALL_E2E !== undefined) return false;
+  if (process.env.NX_RECALL_NO_LAYER === '1') return false;
+  return process.env.XDG_SESSION_TYPE === 'wayland' || !!process.env.WAYLAND_DISPLAY;
+}
+
+/**
+ * Where `nx-recall-overlay` is, or null.
+ *
+ * Three places, in the order they are true:
+ *   1. beside the app in the install layout — packaging/build-release.sh puts
+ *      the gui in `lib/nx-recall/gui/` and the binary in `lib/nx-recall/`;
+ *   2. the cargo target directory, for a checkout;
+ *   3. PATH, which is where `~/.local/bin/nx-recall-overlay` lives.
+ *
+ * Resolved rather than shelled out to, so a missing binary is a fallback to the
+ * window and not a spawn error the user has to read.
+ */
+export function findOverlayBinary(env = process.env, root = ROOT) {
+  const exe = 'nx-recall-overlay';
+  const candidates = [
+    join(root, '..', exe), // lib/nx-recall/gui → lib/nx-recall/
+    join(root, '..', 'target', 'release', exe),
+    join(root, '..', 'target', 'debug', exe),
+    ...String(env.PATH ?? '')
+      .split(delimiter)
+      .filter(Boolean)
+      .map((dir) => join(dir, exe)),
+  ];
+  for (const path of candidates) {
+    try {
+      accessSync(path, constants.X_OK);
+      return path;
+    } catch {
+      // Not there, or not runnable. The next candidate is the answer.
+    }
+  }
+  return null;
+}
+
+/**
+ * Start the layer surface. Returns false if it could not even be launched, in
+ * which case the caller opens the window instead.
+ */
+function startLayer() {
+  if (layer) return true;
+  const bin = overlayBinary();
+  if (!bin) {
+    console.warn('[recall] nx-recall-overlay is not installed; captions fall back to the window');
+    layerRefused = true;
+    return false;
+  }
+  const args = ['--desktop', '--settings', settingsFile];
+  // The same socket this process is already talking to. Passed rather than
+  // re-derived, so a mock or a second daemon reaches both halves or neither.
+  if (process.env.NX_RECALL_SOCK) args.push('--socket', process.env.NX_RECALL_SOCK);
+
+  let child;
+  try {
+    child = spawn(bin, args, { stdio: ['ignore', 'inherit', 'inherit'] });
+  } catch (e) {
+    console.warn('[recall] could not start the captions overlay:', e.message);
+    layerRefused = true;
+    return false;
+  }
+  layer = child;
+  child.on('error', (e) => {
+    console.warn('[recall] the captions overlay could not run:', e.message);
+    if (layer === child) layer = null;
+  });
+  child.on('exit', (code, signal) => {
+    if (layer !== child) return; // already replaced or deliberately stopped
+    layer = null;
+    if (signal) return; // we killed it, or the session did
+    if (code === 2) {
+      // The compositor does not offer zwlr_layer_shell_v1. Not a failure — an
+      // answer. The window is the surface on this desktop, and asking again on
+      // every toggle would just print the same line forever.
+      console.log('[recall] no layer-shell here; captions fall back to the window');
+      layerRefused = true;
+      createCaptionsWindow({ show: true });
+      onChange?.(getCaptionSettings());
+      return;
+    }
+    if (code === 0) return; // it was asked to stop
+    // Once. A crash loop behind a tray item is a crash loop nobody can see.
+    if (layerRestarted) {
+      console.warn(`[recall] the captions overlay exited ${code} twice; using the window`);
+      layerRefused = true;
+      createCaptionsWindow({ show: true });
+      onChange?.(getCaptionSettings());
+      return;
+    }
+    layerRestarted = true;
+    console.warn(`[recall] the captions overlay exited ${code}; restarting it once`);
+    startLayer();
+  });
+  return true;
+}
+
+function stopLayer() {
+  const child = layer;
+  layer = null;
+  if (child) child.kill('SIGTERM');
+}
+
+export function layerCaptionsRunning() {
+  return !!layer;
+}
+
+/**
+ * On the way out. A layer surface is a separate process, and a separate process
+ * outlives its parent unless somebody says otherwise — a caption bar still on
+ * the screen after the app has quit is furniture with nothing behind it.
+ */
+export function shutdownCaptions() {
+  layerRefused = true; // nothing is to be restarted during a quit
+  stopLayer();
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +399,16 @@ export function getCaptionsWindow() {
   return win && !win.isDestroyed() ? win : null;
 }
 
+/**
+ * Captions on. One entry point for the tray item, the rail button, `--captions`
+ * and the settings card, so all four get whichever surface this desktop can
+ * actually host — and the same one as each other.
+ */
 export function showCaptions() {
+  if (wantsLayerCaptions() && !layerRefused) {
+    layerRestarted = false;
+    if (startLayer()) return true;
+  }
   createCaptionsWindow({ show: true });
   const w = getCaptionsWindow();
   // showInactive, never show: taking focus would pull the user out of the game
@@ -205,6 +418,7 @@ export function showCaptions() {
 }
 
 export function hideCaptions() {
+  stopLayer();
   const w = getCaptionsWindow();
   if (w) w.destroy();
   win = null;
@@ -213,8 +427,7 @@ export function hideCaptions() {
 
 /** What the tray item and the rail button both call. */
 export function toggleCaptions() {
-  const w = getCaptionsWindow();
-  if (w && w.isVisible()) {
+  if (captionsAreOpen()) {
     hideCaptions();
     return false;
   }
@@ -223,6 +436,7 @@ export function toggleCaptions() {
 }
 
 export function captionsAreOpen() {
+  if (layer) return true;
   const w = getCaptionsWindow();
   return !!w && w.isVisible();
 }

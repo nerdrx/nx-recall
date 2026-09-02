@@ -12,6 +12,12 @@ Two questions, and only one of them has a tested answer.
 
 If you want captions in your headset this evening, read Route 2.
 
+A third question, added later and answered on the desktop rather than in the
+headset: **do the captions actually let a click through to the game underneath?**
+On X11 they always did. On Wayland they never did, and now they do — as a
+wlr-layer-shell surface rather than an Electron window. See
+"Desktop: layer-shell".
+
 ---
 
 ## Why not an OpenVR overlay
@@ -172,6 +178,120 @@ The window remembers its position and size, so this is a once-only setup.
 
 ---
 
+## Desktop: layer-shell
+
+### The thing that was wrong
+
+The captions window has said "Ignore the mouse" since 0.8.3, and on X11 it was
+true: `BrowserWindow.setIgnoreMouseEvents(true)` sets an empty X11 input shape
+and the pointer falls through to the game underneath.
+
+**Measured 2026-09-02, Electron 44 on this machine's KDE Wayland session: it
+sets no input region and does nothing.** Chromium has no Wayland path for "this
+surface is scenery" — a `wl_surface`'s input region is compositor-side state
+that Electron's API does not reach — so on Wayland the setting was a lie in the
+UI, and the bug it exists to prevent (a caption bar eating a click into the
+game) was live the whole time.
+
+A Wayland *client* can set that region. So on Wayland, "Captions" is no longer
+an Electron window at all:
+
+```
+nx-recall-overlay --desktop [--settings FILE] [--socket PATH]
+                            [--output NAME] [--margin PX] [--seconds N]
+```
+
+### What it asks the compositor for
+
+| request | value | why |
+|---|---|---|
+| `zwlr_layer_shell_v1.get_layer_surface` | layer `OVERLAY` | `TOP` loses to a fullscreen window, which is the thing captions are for |
+| `set_anchor` | `BOTTOM` only | bottom alone centres a fixed-width surface; adding a side would stretch it |
+| `set_size` | from `captions.json`, else the Electron window's own default shape | one bar, whichever surface draws it |
+| `set_margin` | `(0, 0, bottom, 0)` | `--margin`, else derived from the remembered position, else 96 |
+| `set_exclusive_zone` | `-1` | scenery must never shove a maximised window up |
+| `set_keyboard_interactivity` | `none` | it is read, never typed into |
+| **`wl_surface.set_input_region`** | **an empty `wl_region`** | **the load-bearing one: the compositor delivers no pointer and no touch here, and no setting can change that** |
+| `wl_shm` buffer | `Argb8888`, premultiplied, at the output's scale | no GPU: see "frame time" |
+
+### What it honours from `captions.json`
+
+The **same file** the settings card writes (Electron's userData —
+`~/.config/NX Recall/captions.json`; the main process passes the path with
+`--settings`, and this binary only ever *reads* it). An inotify watch on the
+directory picks up every write, so the Sources card stays the single control
+surface and a slider moves the live bar.
+
+- `turns`, `size`, `hold_s`, `opacity`, `showYou` — all live, all clamped to the
+  same ranges by a transliteration of `normalizeCaptionSettings` (`settings.rs`).
+- `bounds` — its **size** is honoured. Its **position** becomes a bottom margin
+  when the remembered `y` can be read as an offset from the bottom of this
+  output, which is the single-monitor case; otherwise it falls back to 96 px. A
+  layer surface is placed by anchor and margin, not by a global desktop
+  coordinate, so there is no honest way to honour a `y` that belongs to a
+  monitor that is not there today.
+- `clickThrough` — read, kept, and **ignored**. It cannot be anything but on
+  here. The settings card hides the toggle on this path and says so in one
+  line; on the Electron fallback the toggle stays, and where it is known not to
+  work (a Wayland desktop with no layer-shell) it says *that*.
+
+Content rules are the desktop window's, unchanged and shared with `feed.rs`:
+seed from the live tail, only `added` rows newer than that head, shaky rows
+muted with the same "≈", translation under the original, your own turns dimmed
+by the same `YOU_DIM`, and the whole stack fading one second after `hold_s`.
+
+**Multi-output:** not "the output under the cursor" — a bar that changed monitor
+when you reached for a menu is a bar you have to chase. `--output DP-2` names
+one by connector; with no name the compositor places it, which on KWin is the
+active output when the surface appears.
+
+**Fallback:** if `zwlr_layer_shell_v1` is not offered — or there is no Wayland
+display at all — it prints one line and exits **2**, and
+`gui/src/main/captions.js` opens the BrowserWindow instead. Any other non-zero
+exit is restarted **once**, then the window takes over.
+
+### What was verified, and how
+
+Measured on this machine, KDE Wayland (KWin), 2026-09-02, against
+`gui/mock/mockd.js` on a private socket — never the real daemon's, and no
+synthetic input of any kind was used at any point.
+
+- **The compositor offers it.** `wayland-info` lists `zwlr_layer_shell_v1`
+  **version 5** among 60-odd globals, alongside `wl_shm` v2 and `wl_compositor`
+  v6.
+- **The surface really appears.** `nx-recall-overlay --desktop --seconds N`
+  against the mock, photographed with `spectacle -b -n`: the bar is at the
+  bottom of DP-2, over the panel, with speaker names in their hues, the mock's
+  live turns in it, and the ground at the 0.75 the file asked for.
+- **Settings are live.** Rewriting `captions.json` mid-run produced
+  `captions.json changed — turns 5, size 34, hold 4s, ground 0.85, showYou
+  false` in the log, from the inotify watch.
+- **Frame time.** 0.29–0.48 ms to rasterise 1100×340 and convert it to
+  premultiplied ARGB8888, release build. The budget was one 60 Hz frame; it is
+  under 3% of it, so the CPU rasteriser stays and no wgpu is pulled in.
+- **The fallback code.** With `WAYLAND_DISPLAY` unset it prints the fallback
+  line and exits 2, checked directly.
+
+**Not verified: that a click actually passes through.** Doing so would mean
+injecting a synthetic pointer event, which is not something this work is
+permitted to do on somebody's live desktop. What *is* checked is the request
+that makes it true — `wl_surface.set_input_region` with an empty region — in
+three ways: a unit test asserting that no settings file and no value of
+`clickThrough` can produce anything but `InputRegion::Empty`; a unit test on the
+whole `LayerConfig` (layer, anchor, exclusive zone, keyboard interactivity); and
+the request being logged on every run, which is the line quoted above. The
+guarantee is the compositor's, not the client's: a surface with an empty input
+region is one KWin has nowhere to deliver a pointer or touch to.
+
+The e2e harness cannot exercise this path at all — it runs Electron inside a
+headless gamescope over XWayland — so `wantsLayerCaptions()` refuses whenever
+`NX_RECALL_E2E` is set. Without that the driven app would inherit the
+developer's own `WAYLAND_DISPLAY` and put a caption bar on the real desktop
+instead of in the compositor under test. The suite therefore keeps covering the
+Electron window, which is exactly the fallback this path needs to keep working.
+
+---
+
 ## The pieces, and which of them are tested
 
 | what | where | tested? |
@@ -180,4 +300,8 @@ The window remembers its position and size, so this is a once-only setup.
 | the daemon feed (handshake, subscribe, last-N, archive rule) | `src/feed.rs` | yes — unit tests, plus `--feed` against `gui/mock/mockd.js` |
 | the caption rasteriser (wrap, ground, speaker hues, translations) | `src/raster.rs` | yes — unit tests, plus `--render` against the mock |
 | the overlay session and the Vulkan upload | `src/xr.rs` | **no. never executed.** |
-| the desktop captions window (Route 2's source) | `gui/src/renderer/captions.*` | yes — `npm run headless`, both grounds |
+| the desktop captions window (Route 2's source, and the fallback) | `gui/src/renderer/captions.*` | yes — `npm run headless`, both grounds |
+| the settings reader (`captions.json`, the ranges, the JS's null asymmetry) | `src/settings.rs` | yes — unit tests |
+| the bar's size, position and fade schedule | `src/layout.rs` | yes — unit tests |
+| the layer surface (config, empty input region, the shm conversion) | `src/desktop.rs` | yes for the parts a compositor is not needed for; the surface itself was run and photographed on KWin. **The click passing through was NOT exercised by a synthetic click** — see "Desktop: layer-shell" |
+| which surface a desktop gets, and where the binary is | `gui/src/main/captions.js` | yes — `gui/test/layer_captions.test.js` |

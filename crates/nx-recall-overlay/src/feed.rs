@@ -49,6 +49,11 @@ pub struct Turn {
     /// The sibling `translation` track: `{lang, text, via}`, absent on most
     /// rows and meaning exactly nothing when it is.
     pub translation: Option<(Option<String>, String)>,
+    /// This voice is yours. Stamped where the roster is known — on the feed —
+    /// rather than asked for at draw time, because the surface that draws has
+    /// no socket, and a "You" row that stops being dimmer because two facts
+    /// arrived out of order is a flicker nobody can explain.
+    pub mine: bool,
 }
 
 /// The last N turns, and the rule that keeps history out of them.
@@ -59,6 +64,11 @@ pub struct Captions {
     /// already hold is the archive being re-published, not somebody talking.
     newest_ms: i64,
     names: std::collections::HashMap<i64, String>,
+    /// Which voice is the person wearing the microphone, if the daemon has said.
+    /// `isYou` in gui/src/renderer/lib/store.js: `mic.get`'s `you_speaker`
+    /// first, and `speakers.list`'s own `you` flag as the answer that survives a
+    /// daemon too old to have the first.
+    you: Option<i64>,
 }
 
 impl Captions {
@@ -68,11 +78,24 @@ impl Captions {
             keep: keep.max(1),
             newest_ms: 0,
             names: std::collections::HashMap::new(),
+            you: None,
         }
     }
 
     pub fn turns(&self) -> impl Iterator<Item = &Turn> {
         self.turns.iter()
+    }
+
+    /// Which voice is yours, or none if the daemon has not said.
+    pub fn you(&self) -> Option<i64> {
+        self.you
+    }
+
+    /// `mic.get`'s answer, which outranks the roster's flag.
+    pub fn learn_you(&mut self, mic: &Value) {
+        if let Some(id) = mic["you_speaker"].as_i64() {
+            self.you = Some(id);
+        }
     }
 
     /// Seed the speaker names, so the first caption is not "Speaker 12".
@@ -81,6 +104,9 @@ impl Captions {
             let Some(id) = sp["id"].as_i64() else {
                 continue;
             };
+            if sp["you"] == Value::Bool(true) && self.you.is_none() {
+                self.you = Some(id);
+            }
             let name = sp["name"]
                 .as_str()
                 .or_else(|| sp["auto"].as_str())
@@ -196,24 +222,39 @@ impl Captions {
                     text.to_owned(),
                 )
             }),
+            mine: self.you.is_some() && seg["speaker"].as_i64() == self.you,
         }
     }
+}
+
+/// The last `n` turns that are actually to be shown.
+///
+/// `show_you: false` drops your own turns BEFORE the last-N window is taken,
+/// exactly as `visibleCaptions` does — so turning it off gives you five of THEIR
+/// turns rather than five turns of which three are yours.
+///
+/// It takes a slice rather than a `Captions` because the two live on different
+/// threads: the ring is filled by a socket read and cut to size by whatever is
+/// drawing, and `turns` and `showYou` can both change while the socket thread is
+/// blocked. A stack cut to the old numbers on the way out would not come back
+/// until somebody spoke again.
+pub fn visible(turns: &[Turn], n: usize, show_you: bool) -> Vec<Turn> {
+    let kept: Vec<Turn> = turns
+        .iter()
+        .filter(|t| show_you || !t.mine)
+        .cloned()
+        .collect();
+    kept[kept.len().saturating_sub(n.max(1))..].to_vec()
 }
 
 /// Where the daemon listens, unless told otherwise.
 pub fn default_socket() -> PathBuf {
     let run = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
         // Same fallback every other client in this repo uses.
-        format!("/run/user/{}", unsafe { libc_getuid() })
+        // Safety: getuid cannot fail and touches nothing.
+        format!("/run/user/{}", unsafe { libc::getuid() })
     });
     PathBuf::from(run).join("nx-recall.sock")
-}
-
-// One libc call, declared rather than depended on: adding a crate for getuid
-// would double this binary's dependency list.
-unsafe extern "C" {
-    #[link_name = "getuid"]
-    fn libc_getuid() -> u32;
 }
 
 /// A connected, subscribed client.
@@ -403,6 +444,56 @@ mod tests {
         caps.apply(&unmatched);
         let who: Vec<String> = caps.turns().map(|t| t.who.clone()).collect();
         assert_eq!(who, vec!["several voices", "unknown voice"]);
+    }
+
+    /// `showYou: false` drops your own turns BEFORE the last-N window, so it
+    /// gives you N of THEIR turns rather than N turns of which most are yours.
+    #[test]
+    fn hiding_your_own_turns_gives_you_n_of_theirs() {
+        let mut caps = Captions::new(40);
+        caps.learn_you(&json!({"you_speaker": 1}));
+        for i in 1..=8 {
+            let mut s = seg(i, 1000 * i);
+            // Odd ids are yours, even ids are somebody else's.
+            s["speaker"] = json!(if i % 2 == 1 { 1 } else { 2 });
+            caps.apply(&s);
+        }
+        let all: Vec<Turn> = caps.turns().cloned().collect();
+        let mine: Vec<i64> = visible(&all, 3, true).iter().map(|t| t.id).collect();
+        assert_eq!(mine, vec![6, 7, 8]);
+        let theirs: Vec<i64> = visible(&all, 3, false).iter().map(|t| t.id).collect();
+        assert_eq!(
+            theirs,
+            vec![4, 6, 8],
+            "your own turns were counted against the window"
+        );
+    }
+
+    /// The ring is deeper than the window, so raising the `turns` slider mid-run
+    /// shows the turns that already happened rather than an empty bar.
+    #[test]
+    fn a_deeper_ring_lets_the_turns_slider_look_backwards() {
+        let mut caps = Captions::new(40);
+        for i in 1..=10 {
+            caps.apply(&seg(i, 1000 * i));
+        }
+        let all: Vec<Turn> = caps.turns().cloned().collect();
+        assert_eq!(visible(&all, 3, true).len(), 3);
+        let widened: Vec<i64> = visible(&all, 8, true).iter().map(|t| t.id).collect();
+        assert_eq!(widened, vec![3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    /// Two ways for the daemon to say which voice is yours, and `mic.get` wins.
+    #[test]
+    fn which_voice_is_yours_comes_from_the_mic_first_and_the_roster_second() {
+        let mut caps = Captions::new(5);
+        caps.learn_speakers(&json!({"speakers": [{"id": 4, "name": "me", "you": true}]}));
+        assert_eq!(caps.you(), Some(4));
+        caps.learn_you(&json!({"you_speaker": 9}));
+        assert_eq!(caps.you(), Some(9));
+        // A daemon too old to answer `mic.get` says nothing and changes nothing.
+        caps.learn_you(&json!({}));
+        assert_eq!(caps.you(), Some(9));
     }
 
     /// The sibling track's contract: `{lang, text, via}`, absent on most rows
