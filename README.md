@@ -4,19 +4,21 @@
 
 <br>
 
-**The always-on conversation memory for VR. Local transcription in 25
-languages, persistent speaker identity, search by meaning — on your silicon,
-nowhere else.**
+**The always-on conversation memory for VR and voice chat. Transcription in
+25 languages, persistent speaker identity, a memory graph, search by meaning,
+captions in front of your eyes, and a night shift that re-reads the day on
+your own GPU. Every byte of it on your silicon. Nothing, ever, anywhere else.**
 
 <br>
 
 ![local](https://img.shields.io/badge/inference-100%25_local-7700FF?style=for-the-badge)
 ![telemetry](https://img.shields.io/badge/telemetry-none._ever.-0a0714?style=for-the-badge)
 ![languages](https://img.shields.io/badge/languages-25-7700FF?style=for-the-badge)
-![rust](https://img.shields.io/badge/daemon-rust-b7410e?style=for-the-badge)
-![tests](https://img.shields.io/badge/tests-714-2ea44f?style=for-the-badge)
-![releases](https://img.shields.io/badge/releases-19_in_3_days-7700FF?style=for-the-badge)
-![footprint](https://img.shields.io/badge/pipeline-%3C5%25_of_one_core-2ea44f?style=for-the-badge)
+![rust](https://img.shields.io/badge/daemon-rust_·_70k_lines-b7410e?style=for-the-badge)
+![tests](https://img.shields.io/badge/tests-883_rust_·_151_node_·_186_e2e-2ea44f?style=for-the-badge)
+![releases](https://img.shields.io/badge/releases-27_in_4_days-7700FF?style=for-the-badge)
+![footprint](https://img.shields.io/badge/live_pipeline-%3C5%25_of_one_core-2ea44f?style=for-the-badge)
+![experiments](https://img.shields.io/badge/experiments-33_scripts_·_17_findings-0a0714?style=for-the-badge)
 
 <br>
 
@@ -36,62 +38,85 @@ $ recalld probe
   380   firefox      Firefox               6917    unknown (default-deny)
 
 $ recalld allow VRChat.exe
-$ recalld search --smart "her cat spilled a drink on the keyboard"
-semantic 0.510  Kira   She said her cat knocked the coffee over the keyboard…
-semantic 0.454  Jonas  Sie meinte ihre Katze hat den Kaffee über die Tastatur gekippt…
+
+$ recalld ask "was hat Aspen gestern über den Shader gesagt?"
+speaker Aspen · gestern 00:00 → heute 00:00 · query "Shader"
+21:14  Aspen  Der Shader kompiliert nicht, wenn die Textur größer als 4k ist …
 
 $ recalld graph commitments
 open  Rowan → You   "den Link schicken"   due morgen (resolved: Do 03.09)
+
+$ recalld truth report
+identity scored on  126 clean Discord turns Discord itself attributed
+  precision  88.5%     recall  85.8%     wrong  15     declined  4
 ```
 
 Nothing is recorded until you say so. Then everything you allow becomes
-searchable — by word, by meaning, by speaker, by when — and a 1.9 GB model on
-four polite CPU cores quietly writes down who promised what.
+searchable — by word, by meaning, by speaker, by day, by world — and a 1.9 GB
+model on four polite CPU cores quietly writes down who promised what, while a
+1 GB model on your GPU re-reads the hard parts at three in the morning.
 
 ## The problem nobody shipped a fix for
 
 You spend your evenings in lobbies where five conversations run at once through
-one spatialized stereo mix. You meet someone brilliant, talk for an hour, and
-three days later you cannot remember their name, their voice, or the world they
+one spatialized mix. You meet someone brilliant, talk for an hour, and three
+days later you cannot remember their name, their voice, or the world they
 recommended. Every cloud transcription product would happily fix this — by
 uploading your friends' voices to someone else's datacenter.
 
 That is not a fix. That is a breach with a subscription fee.
 
 **NX Recall is the other path**: a Rust daemon that captures audio only from
-apps you explicitly allow (plus, if you switch it on, your own microphone —
-which follows your sessions rather than your room), transcribes everything
-locally, recognizes *who* said it with voice fingerprints that never leave your
-disk, threads the interleaved lobby back into its separate conversations, and
-answers questions you no longer remember the words to. The GPU keeps rendering
-your headset. The network cable stays cold.
+apps you explicitly allow (plus, if you switch them on, your own headset
+microphone and a room microphone), transcribes everything locally, recognizes
+*who* said it with voice fingerprints that never leave your disk, threads the
+interleaved lobby back into its separate conversations, scores its own
+accuracy against the only ground truth that exists, and answers questions you
+no longer remember the words to. The GPU keeps rendering your headset until
+you take it off. The network cable stays cold.
 
 ## The pipeline
 
 <img src="assets/readme/pipeline.svg" width="100%" alt="capture to meaning, one machine, no exits">
 
-The box that earns its keep is the **overlap gate**. Every naive approach
-confidently mislabels overlapping speakers about half the time — and confidence
-scores *cannot see it happening*. NX Recall would rather write *several voices*
-than write the wrong name into your memory. A missed label costs a shrug. A
-false one corrupts the voicebank forever. We chose accordingly — and the same
-philosophy repeats at every layer: the ASR outputs **nothing** on dense babble
-where lesser models invent sentences; the promise extractor was selected for
-refusing all nine trap cases, not for finding the most promises; identity is a
-ladder where *creating* a voice costs more evidence than labeling one, and
-*enrolling* costs more than creating:
+Live, per turn, under five percent of one core: PipeWire tap → Silero VAD →
+turn merge → pyannote **overlap gate** → Parakeet-TDT v3 → ERes2Net
+voiceprint → identity ladder → thread → FTS5 and a 384-dimension vector.
+
+Then the parts that run when nobody is waiting: a **context re-decode** that
+re-reads short turns inside the audio around them, a **cross-check** by a
+second decoder that marks disagreements *shaky*, the **language arbiters**
+for suspected flips, a jailed 3B **language model** for promises, topics,
+digests and translations, the **ground-truth pass** that scores the voicebank
+against Discord's own word, and the **night shift**: whisper-large-v3 on the
+GPU, replacing words only under a two-of-three vote.
+
+The box that earns its keep is the overlap gate. Every naive approach
+confidently mislabels overlapping speakers about half the time — and
+confidence scores *cannot see it happening*. NX Recall would rather write
+*several voices* than write the wrong name into your memory. A missed label
+costs a shrug. A false one corrupts the voicebank forever. The same philosophy
+repeats at every layer: the ASR outputs **nothing** on dense babble where
+lesser models invent sentences; the promise extractor was chosen for refusing
+all nine trap cases, not for finding the most promises; the night shift ships
+the *second-best* vote rule because the best one wrote two German lines in
+Swedish; and identity is a ladder where *creating* a voice costs more evidence
+than labeling one, and *enrolling* costs more than creating:
 
 ```
 label (0.35, calibrated on real lobbies — the corpus value over-split 3×)
   < mint  (2 s of speech AND 2 real words — grunts stop becoming people)
     < enroll (0.55 + margin + overlap-clean + 3 s — the bank cannot poison itself)
+      < truth (Discord says it was them, ≥3 s, ≥95% coverage — the only free lunch)
 ```
 
 ## Numbers we actually measured
 
-The measurement harness came first — 33 experiment scripts in
-[`spike/`](spike/FINDINGS.md) — and two of the original design's core claims
-died in it before a line of the daemon existed.
+The measurement harness came first — **33 experiment scripts and seventeen
+numbered findings** in [`spike/FINDINGS.md`](spike/FINDINGS.md) — and two of
+the original design's core claims died in it before a line of the daemon
+existed. Every feature since has had a gate it had to clear, and the ones that
+failed are listed further down with their numbers.
 
 | Claim | Measured |
 |---|---|
@@ -102,18 +127,21 @@ died in it before a line of the daemon existed.
 | A real 20-minute lobby | **9.8% overlapped speech** — the failure regime is rare in the wild |
 | Two named friends | cover 38% of all lobby speech; ~95% of their later speech auto-matches |
 | Ghost words on silence / noise / music | Zero. |
-| Language flips on 1-second German fragments | 12% read as English — hence the conversational prior below |
+| Language flips on 1-second German fragments | 12% read as English — hence the conversational prior |
 | The promise model's trap-rejection | 9/9 — banter, suggestions, past tense, hypotheticals, absent third parties |
 | Cross-language search, German query → English memory | mean rank 2.7 after the language-hub correction (raw model: rank-32 tail disasters) |
-| Full pipeline: VAD, gate, ASR, identity, vectors | under 5% of one CPU core |
 | A 1.5-second turn decoded alone vs. inside 3 s of its neighbours | **56.7% WER → 20.4%** (2.5 s turns: 34.3% → 17.1%) — same model, more audio |
-| A second decoder disagreeing as a warning light | shaky rows carry **4.2×** the word errors of solid ones in the lab, **2.8×** on this user's own lobby audio against whisper-large-v3 |
-| Whisper-large-v3 on the 7900 XTX (Vulkan, q5_0) | **RTF 0.043** — 400× the CPU figure that had parked a third reading |
-| Two-of-three vote on shaky rows, lab, with references | 91% → 44% WER on the touched rows, zero rows made worse; the unguarded rules did better and were refused (they wrote two German rows in Swedish on real audio) |
-| Daily digest refusing banter | 6/6 traps refused, 4/4 real conversations summarised, once the verdict got its own grammar (one prompt that decided *and* wrote fell to 1/6 as it improved) |
-| Translation, FLEURS parallel sentences, e5 cosine | 0.948 against the German original (unrelated pairs: 0.79) |
+| A second decoder disagreeing as a warning light | shaky rows carry **4.2×** the errors of solid ones in the lab, **2.8×** on the user's own lobby audio against whisper-large-v3 |
+| Whisper-large-v3 on a 7900 XTX (Vulkan, q5_0) | **RTF 0.043** — 400× faster than the CPU figure that had parked a third reading |
+| Two-of-three vote on shaky rows, lab, with references | 91% → 44% WER on the touched rows, zero rows made worse |
+| The voicebank against Discord's word, first evening | **88.5% precision, 85.8% recall** on 126 clean turns — the first unbiased identity number this project ever had |
+| A source prior ("that voice only lives on Discord") | changed **0 of 161** ground-truth decisions — ships off, with the audit that found the three labels it would have caught |
+| Daily digest refusing banter | 6/6 traps refused, 4/4 real conversations summarised, once the verdict got its own grammar |
+| Translation, FLEURS parallel sentences, e5 cosine | 0.948 against the reference (unrelated pairs: 0.79) |
 | Quarterly model refresh, four newer checkpoints vs Parakeet v3 | **keep v3** — nearest 3.6% vs 3.3% lab WER; qwen3-asr ties on real audio and loses on speed |
 | Hotword biasing toward the roster and glossary | +9.1% recall on rare words against a +20% gate; at strength the glossary leaked into unrelated turns (control WER 8% → 29%). Not shipped |
+| Electron's click-through on Linux | sets no X11 input shape, is a no-op on Wayland — so the caption bar is a native layer-shell surface |
+| Full live pipeline: VAD, gate, ASR, identity, vectors | under 5% of one CPU core |
 
 ## The graveyard of clever ideas
 
@@ -142,6 +170,9 @@ respectfully re-implements a corpse.
   every model toward filling the fields that exist — *bigger models
   false-alarmed more* (9/9 traps failed) until the schema forced
   `"is_commitment": true/false` *before* any extractable field existed.
+- **One prompt that decides and writes.** Every clause that made the digest
+  better made it refuse fewer traps (6/6 → 1/6). The verdict got its own call
+  with a grammar that cannot express a paragraph — cheaper, too.
 - **Hotword biasing.** The obvious lever — tell the transducer the names in
   the room. Measured: a few points of recall on rare words, only under a beam
   search that costs 1.6 pp of WER before the first hotword, and at useful
@@ -150,8 +181,20 @@ respectfully re-implements a corpse.
   `applied_to_decoder: false` until something can use it without that trade.
 - **The narrow glossary re-read.** Re-decode only the rows near a word you
   corrected, with that word as a hotword. Measured: +6% recall over live, and
-  +0.0% over merely switching to beam search — the whole gain was the decoder
-  change that costs 1.6 pp on its own. Gate was +30%. Not shipped.
+  +0.0% over merely switching to beam search. Gate was +30%. Not shipped.
+- **The unguarded night-shift votes.** Two rules beat the shipped one on lab
+  WER by five and fourteen points. One of them rewrote *"Yeah okay, dann kein
+  Problem"* as *"Ja, okej, det är en kapadum"*. The guard now asks the decoder
+  which language it read in, and refuses anything the row's own language does
+  not confirm.
+- **Averaged per-line word error rates.** Unbounded (a two-word line retyped
+  as ten is 400%) and averaged over thirteen lines somebody chose to fix, the
+  accuracy card read *112.9% error*. Now a bounded edit share, beside the one
+  number that covers every row: the second decoder's disagreement share.
+- **The source prior.** On Discord audio every candidate voice already lives
+  on Discord; the rule removed 236 candidates from 161 decisions and changed
+  none of them. Ships off. The audit it came with found the three cross-source
+  labels in 9 039 anyway, all within 0.05 of the threshold.
 - **Stereo azimuth, so far.** Discord's two channels are bit-identical (the
   negative control behaved); VRChat has not been recorded in stereo yet. The
   bench passes its own synthetic lobby at silhouette 0.93, so the day a lobby
@@ -161,8 +204,9 @@ respectfully re-implements a corpse.
 
 ## Found by using it
 
-This repo's QA department is **one user with strong opinions** and **an
-adversarial audit told to find what he would have found next**.
+This repo's QA department is **one user with strong opinions**, **an
+adversarial audit told to find what he would have found next**, and **the
+daemon's own telemetry read the morning after**.
 
 - Day one: eight bugs in the first hours of real use — a signature over the
   wrong bytes, a Launch button into a dead socket, a speakers list frozen at
@@ -174,13 +218,18 @@ adversarial audit told to find what he would have found next**.
   fix, every fix shipped with a test confirmed to fail on the old code.
 - The meta-lesson, now enforced: the GUI's mock daemon diverged from the real
   one **seven times, and every divergence was a shipped bug**. The mock is a
-  conformance twin now, held to the daemon's own expectation tables.
-- The morning after enrichment's first full night, the daemon's own telemetry
-  confessed three more: the model holding the database lock (audio gaps), and
-  conversations split down the middle because your voice lived in its own
-  session. Now the mic **bridges** — you are the one voice that exists across
-  sessions — so threads contain both halves and promises have someone they are
-  owed *to*.
+  conformance twin now, held to the daemon's own expectation tables — and the
+  day a new daemon-side re-publisher was not mirrored in it, yesterday's rows
+  landed under today's for an afternoon.
+- The morning after enrichment's first full night, the daemon confessed three
+  more: the model holding the database lock (audio gaps), and conversations
+  split down the middle because your voice lived in its own session. Now the
+  mic **bridges** — you are the one voice that exists across sessions.
+- The evening after the assistant shipped, its counters read zero: "promises
+  before paragraphs" had been an absolute priority behind a queue that never
+  empties. It is a fair share now.
+- Two hub processes downloaded the same update into the same file and one
+  extracted the other's half-written tarball. Every NX app inherited the lock.
 
 ## Sprache, ehrlich
 
@@ -199,96 +248,109 @@ defence is layered, each layer measured:
    output actually reads as the target language, captions stripped.
 4. **`recalld lang repair`** — the backlog heals retroactively while its audio
    is still inside the retention window.
+5. **Translation** for the languages you do not read, under — or over — the
+   original, in the language you choose.
 
-## Getting it right, then getting it useful
+## Getting it right
 
 Four models agreed on only half of a real lobby's sentences, and the biggest
 error was never the model — it was the **window**. A turn cut at 1.5 s loses
-its consonants at both ends, so the daemon now re-reads short turns inside the
+its consonants at both ends, so the daemon re-reads short turns inside the
 audio around them, at idle priority, and keeps only the words inside the turn.
 A second, cheaper decoder reads every turn too; where it disagrees the row is
 marked **shaky** and muted rather than silently trusted. Fix a transcript in
-place and three things move: the row, the **measured error rate** on the
-Memory tab, and the vocabulary the next turn is checked against.
+place and three things move: the row, the **measured** figures on the Memory
+tab, and the vocabulary the next turn is checked against.
 
-Then the parts that make an archive worth having: **one query box** that
-understands *"was hat Aspen gestern über den Shader gesagt?"* and shows the
-speaker and the day it read as removable pills; **notes to self** — say
-*"Recall, merk dir …"* into the microphone and it is filed, in VR, without a
-keyboard; and a **brief** when a named friend joins the instance: what they owe
-you, what you owe them, what you last talked about.
-
-## Ground truth, a night shift, and a bar in the headset
-
-Every accuracy number so far was a benchmark or a correction you chose to
-make. **Ground truth from Discord** fixes that: Discord's own client knows who
-is talking, so a Vencord plugin hands the daemon *who spoke when* — speaking
-edges, membership, nicknames, to 127.0.0.1 and nowhere else, no audio, no
-messages. The daemon scores its voicebank against that word: precision,
-recall, per person, plus the overlap gate's hit rate. The "deferred labelling
-pass" the plan carried since day one is now a command, `recalld truth report`.
+**Ground truth from Discord** closes the loop that every transcription product
+leaves open. Discord's own client knows who is talking, so a Vencord plugin
+hands the daemon *who spoke when* — speaking edges, membership, nicknames, to
+127.0.0.1 and nowhere else, no audio, no messages. The daemon scores its
+voicebank against that word: precision, recall, per person, plus the overlap
+gate's hit rate. The "deferred labelling pass" the plan carried since day one
+is a command now, and it is honest enough to exclude your own account, whose
+voice your own client never plays back.
 
 The **night shift** is the accuracy ceiling made affordable: whisper-large-v3
 re-reads the day's shaky rows on the GPU while the machine idles, and replaces
 words only when the night decoder and the cross-check agree with each other
-against the live reading, in the row's own language, past the same guards
-that stopped the Swedish hallucinations. Every replacement is on the record.
+against the live reading, in the row's own language. Every replacement is on
+the record, next to the words it replaced.
 
-**Captions** float over whatever you are doing: the last few turns, large,
-click-through, dark on both grounds, from the tray or `nx-recall --captions`.
-The headset route is an OpenXR overlay that WiVRn advertises and this code
-has not yet run against — it ships behind a flag that says exactly that.
+## Getting it useful
 
-And the parts that make a memory useful on its own: reminders that fire
-("Recall, erinner mich morgen um zehn …"), one paragraph per conversation the
-next morning, and a translation under any turn in a language you do not read.
-
-## Where you were, how you talk, and the bar that never takes a click
-
-**World memory** reads the VRChat log for the world and instance you were in,
-stamps every conversation with it, and gives the person page "where you
-meet". A question can name a world in either language. **Turn-taking
-statistics** are pure queries over turns you already have: talk share, turn
-length, longest monologue, interruptions given and received (an approximation,
-and the tooltip says exactly which one), response latency. **Replay** plays a
-conversation back with the transcript following, reading through the turns
-whose audio retention already took. **Export** writes Markdown to a folder on
-this disk and refuses network filesystems and files it did not write. A
-**room microphone** hears the people physically beside you and goes through
-the same pipeline as everyone else. And because Electron cannot make a window
-ignore clicks on Linux — measured, not assumed — the caption bar on KDE
-Wayland is a native layer-shell surface with an empty input region, drawn by
-the overlay binary from the daemon socket.
+- **One query box.** *"was hat Aspen gestern über den Shader gesagt?"* becomes
+  a speaker, a day and a query, shown as pills you can take off.
+- **Notes to self.** Say *"Recall, merk dir …"* into the microphone and it is
+  filed, in VR, without a keyboard. Say a time and it fires.
+- **Briefs.** A named friend joins the instance and you see what they owe you,
+  what you owe them, and what you last talked about.
+- **Digests.** One paragraph per conversation the next morning, refused for
+  banter.
+- **Replay.** A conversation played back with the transcript following,
+  reading through the turns whose audio retention already took.
+- **World memory.** Where you meet each person, a world facet in every search,
+  a question that can name a world in either language.
+- **Turn-taking.** Talk share, turn length, longest monologue, interruptions
+  given and received (an approximation, and the tooltip says which), response
+  latency. Pure queries over turns you already have.
+- **Captions.** The last few turns, large, in front of whatever you are doing.
+  On KDE Wayland a native layer-shell surface: click-through by default, and
+  when you switch that off, drag it, scroll it, right-click to give the clicks
+  back. The headset route is an OpenXR overlay that WiVRn advertises and this
+  code has not yet run against — it ships behind a flag that says exactly that.
+- **Export.** Markdown to a folder on this disk. It refuses network filesystems
+  and any file it did not write.
+- **Sources.** Any app you allow, your headset microphone that follows your
+  sessions, a room microphone for the people beside you, and Discord's word.
 
 ## What never leaves this machine
 
 | Artifact | Lives | Leaves |
 |---|---|---|
-| Audio segments (apps, and your mic if you enable it) | your disk, retention-capped (default: days) | never |
-| Transcripts, threads, promises, topics | SQLite on your disk | never |
+| Audio segments (apps, and your mics if you enable them) | your disk, retention-capped (default: days) | never |
+| Transcripts, threads, promises, topics, digests, translations | SQLite on your disk | never |
 | Voice fingerprints | your voicebank | never |
 | Golden enrollment samples | your disk, retention-exempt | never |
 | Search vectors | your disk | never |
+| Discord's who-spoke-when | your disk, from a plugin that posts to 127.0.0.1 | never |
+| Markdown exports | a folder you picked, on a local filesystem | never — the daemon refuses network mounts |
 | Telemetry, analytics, crash reports | nowhere — they do not exist | n/a |
 
 `models fetch` is the only command in the program that opens a network socket:
 setup-time, byte-verified against a pinned catalogue, 12-way parallel because
 consumer uplinks shape per-connection (measured: 50 kB/s single vs 13 MB/s
-ranged). This repo is private by design and the software contains **no export
-or sharing surface at all** — not a missing feature, the
-[legal architecture](docs/DESIGN.md#12-legal-note).
+ranged). The night shift's GPU runtime is *compiled* on your machine from a
+pinned tag, because nobody publishes one for this card. This repo is private
+by design and the software contains **no sharing surface at all** — not a
+missing feature, the [legal architecture](docs/DESIGN.md#12-legal-note).
 
 ## The machine room
 
 | | |
 |---|---|
-| Daemon | Rust — PipeWire capture, four ONNX runtimes, one GGUF via llama.cpp, whisper.cpp on Vulkan at night, SQLite WAL, NDJSON socket, one loopback ingest for Discord's word |
-| Client | Electron, 12k lines, zero runtime dependencies, NX Clear in both grounds |
-| Tests | **883 Rust + 151 node + 93 headless-compositor steps × 2 themes** |
-| Schema | v12, migrated in place from v1 on a live database, every step idempotent |
-| Models | pyannote gate 6 MB · Parakeet v3 620 MB · ERes2Net 26 MB · e5 135 MB · Qwen 3B 1.9 GB · Canary cross-checker 154 MB · large-v3 q5_0 1.03 GB for the night shift · arbiters on demand — all pinned to exact bytes |
-| Updates | the daemon watches its own binary, drains, restarts; the GUI offers one click; a dozen hands-free updates and counting |
-| Provenance | every derived row carries its model id, confidence, and how the label arrived: `match · mic · proximity · re-decode · context` |
+| Daemon | Rust, 70k lines — PipeWire capture, four ONNX runtimes, one GGUF via llama.cpp, whisper.cpp on Vulkan at night, SQLite WAL, NDJSON socket, one loopback ingest for Discord's word |
+| Overlay | Rust — layer-shell captions on Wayland at 0.3–0.5 ms a frame, an OpenXR path behind a flag |
+| Client | Electron, 21k lines, zero runtime dependencies, NX Clear in both grounds |
+| Tests | **883 Rust + 151 node + 93 headless-compositor steps × 2 themes** — every fix ships with a test that failed on the old code |
+| Schema | v12, migrated in place from v1 on a live database, every step idempotent, three independent halves where three tracks landed on one number |
+| Models | pyannote gate 6 MB · Parakeet v3 620 MB · ERes2Net 26 MB · e5 135 MB · Qwen 3B 1.9 GB · Canary cross-checker 154 MB · large-v3 q5_0 1.03 GB · arbiters on demand — all pinned to exact bytes |
+| Scheduling | live pipeline at nice 19 on the cores your game does not use; every background pass gated on pause, backlog, and — for the GPU — the busy counter, checked before every batch |
+| Updates | the daemon watches its own binary, drains, restarts; the GUI offers one click; fourteen hands-free updates and counting |
+| Provenance | every derived row carries its model id, confidence, and how it arrived: `match · mic · proximity · truth · live · context · arbiter · night` |
+| Contract | [`docs/PROTOCOL.md`](docs/PROTOCOL.md), 2 000 lines, additive by rule; [`docs/DESIGN.md`](docs/DESIGN.md); [`docs/GRAPH.md`](docs/GRAPH.md); [`docs/OVERLAY.md`](docs/OVERLAY.md) |
+
+## How it is built
+
+Contract first, then parallel builds isolated by directory, then measurement
+before anything is believed, then one pair of hands on the merge. Each round
+starts by appending the wire contract to the protocol document; independent
+tracks build against it in their own worktrees and their own four-core slice;
+every claim about accuracy runs as a script with a numeric gate before it may
+ship; the merge is done by hand and the merged tree runs the whole suite in
+both themes before a signed tarball leaves the building. Features that fail
+their gate ship as data, or not at all, and their numbers go in the graveyard
+above so the next person does not have to find out twice.
 
 ## Ship log
 
@@ -327,22 +389,25 @@ Installed by its first user on day one; every finding became a release.
 
 ```bash
 cargo build --release
-./target/release/recalld models fetch          # the speech set; --semantic --graph --arbiter-de for the rest
+./target/release/recalld models fetch          # the speech set; --semantic --graph --confidence --night --arbiter-de for the rest
+./target/release/recalld models build-night    # compiles whisper.cpp for your GPU; the only thing here that compiles
 ./target/release/recalld probe                 # see every app making sound — none captured
 ./target/release/recalld allow VRChat.exe
 ./target/release/recalld run                   # first light
 ```
 
 Or install it like a product: it ships through NX Hub as a signed prefix
-tarball — daemon, GUI, tray, systemd unit, delta-updatable, exact-manifest
-uninstall that leaves your data untouched. Pause lives in the tray: instant,
-write-free, and it means it.
+tarball — daemon, overlay, GUI, tray, systemd unit, delta-updatable,
+exact-manifest uninstall that leaves your data untouched. Pause lives in the
+tray: instant, write-free, and it means it.
 
 ## The NX suite
 
-Recall runs alongside nx-hub, nx-orbit, and the rest of the NX family. Orbit
-integration is deliberately one-way and manual: Recall may read Orbit's
-name-picker once; **nothing ever flows back**. Orbit's charter stays clean.
+Recall runs alongside nx-hub, nx-orbit, and the rest of the NX family. Its
+Discord ground truth arrives through the RecallBridge plugin in
+vencord-nx-plugins. Orbit integration is deliberately one-way and manual:
+Recall may read Orbit's name-picker once; **nothing ever flows back**. Orbit's
+charter stays clean.
 
 ---
 
