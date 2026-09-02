@@ -1879,7 +1879,28 @@ export function startMock({
       .replace(/[?¿!.,;:]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
+    // 0.11.0. Was it typed as a question? The daemon says so rather than
+    // leaving every client to keep its own interrogative list.
+    out.is_question = isQuestion(q);
     return out;
+  }
+
+  // --- 0.11.0: is this a question? -----------------------------------------
+
+  const INTERROGATIVES = /^(was|wer|wen|wem|wessen|wann|wo|wohin|woher|wie|warum|wieso|weshalb|welche[rsn]?|what|who|whom|whose|when|where|why|how|which)\b/i;
+
+  // The two questions this fixture can answer, and what it answers with.
+  // `cite` is how many of the hits the sentence came from — the ids themselves
+  // are read off the reply, never hard-coded, so they cannot point at a row the
+  // client was not given.
+  const ANSWERS = [
+    { match: /portal/, lang: 'en', cite: 2, text: 'The portal is the one in the stairwell, and it only opens after the lights go down.' },
+    { match: /shader/, lang: 'en', cite: 1, text: 'Aspen built the shader and put the file on Gumroad.' },
+  ];
+
+  function isQuestion(q) {
+    const s = String(q ?? '').trim();
+    return s.endsWith('?') || INTERROGATIVES.test(s);
   }
 
   function statusPayload() {
@@ -2967,6 +2988,44 @@ export function startMock({
           ? methods['search.semantic']({ ...facets, q: interpretation.query, mode: 'hybrid' })
           : methods.search({ ...facets, q: interpretation.query });
       return { ...res, interpretation, q };
+    },
+
+    // --- 0.11.0: grounded answers -------------------------------------------
+
+    // Two canned answers and one refusal. The mock has no model, so the
+    // "answerable" decision is a lookup — but everything AROUND it is the real
+    // contract: the same interpretation, the same hits, exactly one of `answer`
+    // and `refused`, and citations that are ids the client was actually given.
+    // A question the table does not know is refused, which is also the honest
+    // default for an archive that mostly does not contain what you asked.
+    'search.answer'(params) {
+      const asked = methods['search.ask'](params);
+      const hits = asked.hits ?? [];
+      const q = String(params?.q ?? '').trim().toLowerCase();
+
+      const canned = ANSWERS.find((a) => a.match.test(q));
+      if (!canned || !hits.length) {
+        return {
+          ...asked,
+          answer: null,
+          refused: { reason: hits.length ? 'the transcript does not say' : 'there is nothing in the archive about that' },
+        };
+      }
+      // Cite rows that are really on the page. A chip that points at a turn the
+      // client does not have is a chip that scrolls nowhere, and that bug is
+      // exactly what the mock exists to make impossible to ship.
+      const citations = hits.slice(0, canned.cite).map((h) => h.id);
+      return {
+        ...asked,
+        answer: {
+          text: canned.text,
+          lang: canned.lang,
+          citations,
+          via: 'qwen2.5-3b-instruct-q4_k_m',
+          took_ms: 1180,
+        },
+        refused: null,
+      };
     },
 
     // --- 0.8.0: briefs -----------------------------------------------------

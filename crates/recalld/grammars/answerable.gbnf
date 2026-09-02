@@ -1,0 +1,2 @@
+root ::= "{" ws "\"answerable\":" ws ("false" | "true") ws "}"
+ws ::= [ \t\n]?

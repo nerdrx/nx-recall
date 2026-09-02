@@ -18,6 +18,9 @@
 pub mod accuracy;
 pub mod allowlist;
 pub mod analysis;
+// ---- 0.11.0, grounded answers ----
+pub mod answer;
+// ---- end 0.11.0 ----
 pub mod arbiter;
 pub mod ask;
 // ---- 0.9.0, the assistant ------------------------------------------------

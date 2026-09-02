@@ -68,6 +68,10 @@ const ALLOWED = new Set([
   'notes.list',
   'notes.set_state',
   'search.ask',
+  // Grounded answers (0.11.0). The same box, when what was typed is a
+  // question: it returns everything `search.ask` does plus one sentence, or
+  // one honest refusal. A read — it writes nothing.
+  'search.answer',
   'person.brief',
   // The assistant round (0.9.0). One read: the Memory view's "Yesterday" card.
   // Reminders need no new method — a reminder is a note with a date, so they

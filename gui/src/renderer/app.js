@@ -1183,6 +1183,29 @@ document.addEventListener('keydown', (e) => {
       advanced: (document.getElementById('search-advanced') || {}).getAttribute?.('aria-expanded') ?? null,
       facetsHidden: !!document.getElementById('search-facets')?.hidden,
       mode: [...document.querySelectorAll('.seg-ctl .seg-opt')].map((b) => [b.id, b.getAttribute('aria-pressed')]),
+      // 0.11.0, the answer card. Everything the driver has to read back: the
+      // sentence, the chips and where they point, whether it refused, and
+      // which hit is currently flashing.
+      answer: (() => {
+        const card = document.getElementById('answer-card');
+        if (!card) return null;
+        return {
+          refused: card.classList.contains('refused'),
+          text: (document.getElementById('answer-text') || {}).textContent ?? '',
+          note: (document.getElementById('answer-refused') || {}).textContent ?? '',
+          cites: [...card.querySelectorAll('.cite-chip')].map((c) => ({
+            id: Number(c.dataset.cite),
+            text: c.textContent,
+            // A chip that points at a row this page does not have is the one
+            // bug this whole feature must not ship.
+            lands: !!document.querySelector(`#search-results .seg[data-hit="${c.dataset.cite}"]`),
+          })),
+          // The card is above the hits, always: a claim under its evidence
+          // reads as a footnote.
+          first: document.querySelector('#search-results > *') === card,
+        };
+      })(),
+      cited: [...document.querySelectorAll('#search-results .seg.cited')].map((r) => Number(r.dataset.hit)),
     }),
     brief: () => ({
       shown: !briefBar.hidden,

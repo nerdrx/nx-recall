@@ -838,6 +838,61 @@ fn is_scaffolding(folded: &str) -> bool {
     SCAFFOLDING.contains(&folded)
 }
 
+// ---- 0.11.0, grounded answers ---------------------------------------------
+
+/// Is this folded word one of the ones a question is *built* out of?
+///
+/// [`crate::answer`] needs exactly this list and for a neighbouring reason:
+/// grounding an answer means counting the words it shares with the turn it
+/// cites, and the function words of two languages are shared by every pair of
+/// sentences ever written in them. One list, so "what counts as a content
+/// word" cannot grow two answers.
+pub(crate) fn is_scaffolding_word(folded: &str) -> bool {
+    is_scaffolding(folded)
+}
+
+/// The same list, whole, so `spike/answer_bench` can score grounding the way
+/// the daemon does instead of retyping forty function words into Python.
+#[cfg(test)]
+pub(crate) fn scaffolding_words() -> &'static [&'static str] {
+    SCAFFOLDING
+}
+
+/// Words that make a sentence a question rather than a phrase to search for.
+///
+/// A subset of [`SCAFFOLDING`] — the interrogatives, and only those. The
+/// scaffolding list is much wider (auxiliaries, articles, the verbs of saying)
+/// and "the shader" would be a question if any of it counted.
+const INTERROGATIVES: &[&str] = &[
+    // de
+    "was", "wer", "wen", "wem", "wessen", "wann", "wo", "wohin", "woher", "wie", "warum", "wieso",
+    "weshalb", "worueber", "worum", "wovon", "welche", "welcher", "welches", "welchen",
+    // en
+    "what", "who", "whom", "whose", "when", "where", "why", "how", "which",
+];
+
+/// Was this typed as a question?
+///
+/// Two readings, and a person means either: it **ends in a question mark**, or
+/// it **opens with an interrogative**. Deliberately not "contains one anywhere"
+/// — "the world where we met" is a phrase somebody is searching for, and
+/// answering it with a sentence would be the app talking over the user.
+///
+/// This is a Tier-2 rule like everything else in this module: cheap,
+/// deterministic, wrong sometimes, and reported back to the client as
+/// `interpretation.is_question` rather than acted on behind anybody's back.
+pub fn is_question(question: &str) -> bool {
+    let q = question.trim();
+    if q.ends_with('?') {
+        return true;
+    }
+    tokenize(q)
+        .first()
+        .is_some_and(|t| INTERROGATIVES.contains(&t.folded.as_str()))
+}
+
+// ---- end 0.11.0 ------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1157,6 +1212,34 @@ mod tests {
     fn nothing_is_a_facet_when_nothing_says_so() {
         let i = ask("");
         assert_eq!(i, Interpretation::default());
+    }
+
+    // ---- 0.11.0: is this a question? --------------------------------------
+
+    #[test]
+    fn a_question_is_a_question_mark_or_an_interrogative_at_the_front() {
+        for q in [
+            "was hat Aspen gestern gesagt?",
+            "was hat Aspen gestern gesagt",
+            "wie viel kostet der Shader",
+            "wohin fährt Milo im August",
+            "what time is the meetup",
+            "who built the shader?",
+            "shader?",
+        ] {
+            assert!(is_question(q), "{q:?} is a question");
+        }
+        for q in [
+            "shader compile error",
+            // An interrogative in the middle is not a question: this is a
+            // phrase somebody is searching for, and answering it in a sentence
+            // would be the app talking over them.
+            "the world where we met",
+            "Aspens Meinung zum Portal letzte Woche",
+            "",
+        ] {
+            assert!(!is_question(q), "{q:?} is not a question");
+        }
     }
 
     #[test]

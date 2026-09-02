@@ -2103,3 +2103,80 @@ a language that is not the target is a rejection, and where it cannot read one,
 three German or English stopwords are. It deliberately does **not** use
 `lang::classify` for a third-language target — that settles on German the moment
 it sees an umlaut, and Swedish, Turkish and Finnish are full of them.
+
+## 0.11.0 — grounded answers
+
+`search.answer {q, limit?}` → everything `search.ask` returns, plus **exactly
+one** of `answer` and `refused`:
+
+```json
+{"q": "…", "interpretation": {…, "is_question": true}, "total": 4, "hits": [ … ],
+ "answer": {"text": "The meetup is at eight in the evening.", "lang": "en",
+            "citations": [204], "via": "qwen2.5-3b-instruct-q4_k_m", "took_ms": 11200},
+ "refused": null}
+```
+
+or
+
+```json
+{"…": "…", "answer": null, "refused": {"reason": "the transcript does not say"}}
+```
+
+`interpretation` and `hits` are `search.ask`'s, field for field, because they
+are the same code. **The hits come back either way** — that is the whole design:
+a refusal is not an error page, it is the search results with an honest line
+above them. Nothing is written to the store; `search.answer` is a read, and the
+daemon does not "remember" answers.
+
+`interpretation` gains one field, on **both** methods: `is_question`, true when
+the query ends in `?` or opens with an interrogative. A client uses it to decide
+which method to call, and it is reported rather than re-derived so the daemon's
+reading and the client's cannot differ.
+
+### Two model calls, verdict first
+
+1. `{"answerable": true|false}` over the question and the top **k ≤ 12** hits,
+   each shown as `[id] HH:MM Name: text`, oldest first, clipped to a budget of
+   roughly 1 800 tokens. The grammar has no field in it that could hold an
+   answer. The instruction that matters: a question is answerable **only if the
+   lines state the answer**, not if they merely mention the subject.
+2. Only if that said yes: `{"answer": "…", "citations": [id…]}`, under a grammar
+   whose `id` rule **is the list of ids that were shown**, so citing a row that
+   was not on the page is not something the decoder can emit. At least one
+   citation is required; the answer is one or two sentences, at most 60 words,
+   in the language of the question (`de`/`en`, by the question's own reading).
+
+An empty hit list is refused before either call runs.
+
+### Post-checks, all hard
+
+A grammar can force the shape of an answer, never its honesty. Both of these
+produce `refused` — never a repaired answer — and the hits are still returned:
+
+- every citation must be an id that was shown;
+- the sentence must share **at least two content words** with the rows it cited
+  (normalised, with the de/en function words dropped). A sentence that cites row
+  109 and has no word in common with row 109 was not read off row 109.
+
+`refused.reason` is one of: `there is nothing in the archive about that`, `the
+transcript does not say`, `the model's answer did not come from the cited
+turns`, `the local model is switched off`, `answers need the local model —
+\`recalld models fetch --graph\``.
+
+`answer.via` is the model id, the same string every other Tier 3 row records.
+
+### What it measured
+
+`spike/answer_bench`: 24 questions over a seeded 200-turn German/English
+transcript, run against the real Qwen2.5-3B-Instruct Q4 on four pinned cores at
+nice 19. Gate: ≥11/12 traps refused **and** ≥9/12 answerable answered with every
+citation correct. **Shipped: 12/12 traps refused, 10/12 answered correctly**,
+5.6 s median (a refusal is one short call; an answer is two). The two it loses
+are compound questions whose halves sit in two different rows — the error in the
+safe direction.
+
+The finding worth keeping: the four refusal rules had to be in the **user**
+prompt, immediately after the rows and immediately before generation. In the
+system prompt alone — same words, same examples — the traps sat at 9/12; moved
+to the end of the user turn they went to 12/12. A small model's attention is a
+recency effect, and a system prompt is the least recent thing in the window.

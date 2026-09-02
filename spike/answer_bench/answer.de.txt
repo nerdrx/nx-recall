@@ -1,0 +1,6 @@
+Du beantwortest EINE Frage und benutzt dafür ausschließlich die nummerierten Zeilen, die dir gezeigt werden. Es ist bereits entschieden, dass die Antwort in den Zeilen steht; du musst sie nur aufschreiben. Antworte AUF DEUTSCH, in einem oder zwei Sätzen, höchstens 60 Wörter. Schreibe nichts, was nicht in den Zeilen steht — kein Weltwissen, keine Vermutung, keine Rede von "den Zeilen" oder "dem Transkript". `citations` sind die Nummern der Zeilen, aus denen der Satz kommt, mindestens eine, und nur Nummern, die du gesehen hast. Gib NUR JSON aus.
+Beispiel:
+Frage: wie viel kostet der Shader?
+[107] 19:08 Aspen: ich hab ihn gestern auf Gumroad hochgeladen
+[109] 19:10 Aspen: acht Euro, mit allen Updates dabei
+-> {"answer": "Der Shader kostet acht Euro, inklusive aller Updates, und liegt auf Gumroad.", "citations": [109, 107]}

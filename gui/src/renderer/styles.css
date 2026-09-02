@@ -1323,6 +1323,57 @@ button.sp-num:focus-visible { outline: none; box-shadow: var(--clear-focus); }
   color: var(--clear-ink); font-weight: 500;
 }
 
+/* -- the answer card (0.11.0) --------------------------------------------- */
+
+/* One sentence, above the hits it was read off. It sits INSIDE the results
+   list rather than in a card of its own, because it is not a second thing on
+   the page — it is a reading of the rows underneath it, and the space between
+   a claim and its evidence is where doubt gets in. */
+.answer-card {
+  padding: var(--sp-3) var(--sp-3) var(--sp-2);
+  margin-bottom: var(--sp-2);
+  border: 1px solid var(--clear-line-accent);
+  border-radius: var(--clear-r-card, 10px);
+  background: var(--violet-soft);
+}
+.answer-text {
+  margin: 0;
+  font-size: 14.5px;
+  line-height: 1.5;
+  color: var(--clear-ink);
+}
+.answer-cites {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  margin-top: var(--sp-2);
+}
+.answer-cites .sub {
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--clear-muted);
+}
+/* A citation goes somewhere, so it is a button and looks like one you can
+   press — a chip that reads as a label is a chip nobody clicks. */
+.chip.cite-chip {
+  cursor: pointer;
+  border-color: var(--clear-line-accent);
+  color: var(--violet);
+  font-variant-numeric: tabular-nums;
+}
+.chip.cite-chip:hover { background: var(--clear-surface); }
+.chip.cite-chip:focus-visible { outline: none; box-shadow: var(--clear-focus); }
+
+/* A refusal is not an error. It is a quiet line above results that are still
+   worth reading, so it carries no accent and no border of its own. */
+.answer-card.refused {
+  background: transparent;
+  border-color: var(--clear-line);
+  padding: var(--sp-2) var(--sp-3);
+}
+.answer-refused { margin: 0; color: var(--clear-muted); font-size: 13px; }
+
+/* Where a citation chip lands. The same pulse a reminder uses, and for the
+   same reason: it answers "which row" and then gets out of the way. */
+.seg.cited { animation: note-flash 1.6s var(--ease-soft); }
+
 /* ------------------------------------------------------ live captions (0.8.3) */
 
 /* The rail's one non-navigating button. It is separated from the tablist by a

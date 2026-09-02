@@ -2838,6 +2838,107 @@ export function runE2E(deps) {
       return { facets, hits: `${before} → ${wider.hits}`, shakyHits: marked, file };
     });
 
+    // 11c2 — 0.11.0, grounded answers. A question gets a sentence with the
+    // turns it was read off attached; a question the archive cannot answer
+    // gets one quiet line and the hits anyway; and a plain keyword query gets
+    // neither, because answering one would be the app talking over the user.
+    await step('an-answer-cites-the-turns-it-came-from', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="search"]\').click()');
+      await waitFor('the search box', async () => js('!!document.getElementById("search-q")'));
+
+      const typeQuestion = async (text) =>
+        js(`(() => {
+          const q = document.getElementById('search-q');
+          q.value = ${JSON.stringify(text)};
+          q.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+          return true;
+        })()`);
+
+      // -- a question the archive answers --------------------------------
+      await typeQuestion('which portal was it?');
+      const answered = await waitFor(
+        'the answer card',
+        async () => {
+          const a = await js('window.__recallDebug.ask()');
+          return a.answer && !a.answer.refused ? a : null;
+        },
+        { timeout: 20000 }
+      );
+      const card = answered.answer;
+      assert(card.text.trim().length > 0, 'the answer card is empty');
+      assert(card.first, 'the answer is not above the hits it was read off');
+      // Never a sentence without its evidence. This is the assertion the whole
+      // feature turns on: a claim with no chips is the app asserting something.
+      assert(card.cites.length > 0, 'an answer rendered with no citations');
+      assert(
+        card.cites.every((c) => c.lands),
+        `a citation points at a turn this page does not have: ${JSON.stringify(card.cites)}`
+      );
+      // A chip reads as a moment and a voice, which is what makes it followable.
+      assert(
+        card.cites.every((c) => /^\d{2}:\d{2}\s+\S/.test(c.text)),
+        `a chip does not read as a clock and a name: ${JSON.stringify(card.cites.map((c) => c.text))}`
+      );
+      assert(answered.hits > 0, 'the hits went away when the answer arrived');
+      const file = await shot('search-answer');
+
+      // …and pressing one takes you to the turn.
+      const target = card.cites[0].id;
+      await js(`document.querySelector('#answer-cites [data-cite="${target}"]').click()`);
+      const jumped = await waitFor(
+        'the cited turn to flash',
+        async () => {
+          const a = await js('window.__recallDebug.ask()');
+          return a.cited.includes(target) ? a.cited : null;
+        },
+        { timeout: 8000 }
+      );
+      assert(jumped.includes(target), `the chip flashed ${jumped} instead of ${target}`);
+
+      // -- a question it cannot answer -----------------------------------
+      await typeQuestion('what did anybody say about kryptonite?');
+      const refused = await waitFor(
+        'the refusal note',
+        async () => {
+          const a = await js('window.__recallDebug.ask()');
+          return a.answer?.refused ? a : null;
+        },
+        { timeout: 20000 }
+      );
+      assert(
+        /does not say|nothing in the transcript/i.test(refused.answer.note),
+        `the refusal reads "${refused.answer.note}"`
+      );
+      assert(refused.answer.cites.length === 0, 'a refusal came with citations');
+      // One quiet line, not a red box, and never a sentence.
+      assert(!refused.answer.text, 'a refusal rendered an answer as well');
+
+      // -- a plain keyword query -----------------------------------------
+      // Not a question, so it goes down the search path and gets no card. A
+      // keyword search that grew a sentence would be the app answering
+      // something nobody asked.
+      await typeQuestion('portal');
+      const plain = await waitFor(
+        'the keyword search to land',
+        async () => {
+          const a = await js('window.__recallDebug.ask()');
+          return a.hits > 0 && !a.answer ? a : null;
+        },
+        { timeout: 20000 }
+      );
+      assert(plain.answer === null, 'a keyword query rendered an answer card');
+      assert(plain.shown, 'the interpretation pills went away on a keyword query');
+
+      // Put the view back the way the later steps expect it.
+      await js(`(() => {
+        document.getElementById('search-q').value = 'portal';
+        document.getElementById('search-go').click();
+        return true;
+      })()`);
+      await waitFor('the pills to clear', async () => js('!window.__recallDebug.ask().shown'));
+      return { cites: card.cites.map((c) => c.text).join(', '), file };
+    });
+
     // 11d — 0.8.0, briefs. A roster join naming a voice the user has named is
     // the one moment this app shows something unasked: you are about to talk to
     // somebody, and what is open between you is a thing you want to have
