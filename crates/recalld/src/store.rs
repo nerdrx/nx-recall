@@ -44,7 +44,15 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // verdict, see `apply_v10`) and the `notes` table (a mic turn that opened with
 // a wake phrase, see `apply_v10_notes`). Both halves are idempotent and
 // independent; there is no backfill of either.
-pub const SCHEMA_VERSION: i64 = 10;
+// ---- 0.9.0 (schema v11) ---------------------------------------------------
+// v11 adds ground truth from Discord: `truth_speaking` (who was talking, when,
+// as the Discord client itself saw it), `discord_users` (a Discord account,
+// optionally linked to a voice), four columns on `segments` carrying the
+// verdict that comparison reached, and one on `speaker_prototypes` saying a
+// prototype was enrolled on Discord's word. See `apply_v11`; it is idempotent
+// and there is no backfill — truth only exists from the day the plugin starts
+// sending it.
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -116,6 +124,65 @@ pub mod text_via {
 pub mod asr_confidence {
     pub const SOLID: &str = "solid";
     pub const SHAKY: &str = "shaky";
+}
+
+// ---- 0.9.0: ground truth from Discord -------------------------------------
+
+/// What Discord's own speaking rings said about one segment (v11, on the wire
+/// as `truth_verdict`).
+///
+/// This is **not** a label and never becomes one: the daemon's speaker for a
+/// row is still whatever the voicebank decided. The verdict is the yardstick
+/// that decision gets measured against.
+pub mod truth_verdict {
+    /// One Discord user covered at least [`SINGLE_MIN`] of the segment and
+    /// nobody else reached [`PRESENT_MIN`]. The only verdict identity is
+    /// scored on: it is the only one where "the right answer" is a single
+    /// name.
+    pub const SINGLE: &str = "single";
+    /// Two or more users each reached [`PRESENT_MIN`]. What the overlap gate
+    /// exists to catch, and therefore what it is scored against.
+    pub const OVERLAP: &str = "overlap";
+    /// Exactly one user was heard, but they covered less than [`SINGLE_MIN`]
+    /// of the span.
+    ///
+    /// **The case the four-way verdict list did not name**, and it is common:
+    /// a VAD span whose edges run past the words. Folding it into `single`
+    /// would lower a bar that was set at 0.8 deliberately, and folding it into
+    /// `overlap` would claim a second voice that is not there — so it gets its
+    /// own name and is excluded from both scores.
+    pub const PARTIAL: &str = "partial";
+    /// Truth data covers this moment and says nobody in it was talking. The
+    /// honest reading is usually "the local user, on a mic Discord is not
+    /// carrying" — but the plugin reports the local user too, so a `nobody`
+    /// that is not explained by a muted mic is a real disagreement worth
+    /// looking at.
+    pub const NOBODY: &str = "nobody";
+    /// No truth data anywhere near this segment — the plugin was not running.
+    /// Not a measurement, and never counted as one.
+    pub const UNKNOWN: &str = "unknown";
+
+    pub const ALL: [&str; 5] = [SINGLE, OVERLAP, PARTIAL, NOBODY, UNKNOWN];
+
+    /// A user must cover this much of a segment to own it outright.
+    pub const SINGLE_MIN: f64 = 0.8;
+    /// A user counts as present in a segment at all from here up.
+    pub const PRESENT_MIN: f64 = 0.2;
+
+    pub fn parse(s: &str) -> Option<&'static str> {
+        ALL.into_iter().find(|v| *v == s)
+    }
+}
+
+/// How a Discord user came to be linked to a speaker (v11,
+/// `discord_users.via`), and how a prototype came to be enrolled
+/// (`speaker_prototypes.via`).
+pub mod truth_via {
+    /// The auto-linker: this user's clean turns were labelled as one voice
+    /// often enough, for long enough, that the two are the same person.
+    pub const TRUTH: &str = "truth";
+    /// A person said so.
+    pub const MANUAL: &str = "manual";
 }
 
 /// `settings` key holding the id of the pinned "You" speaker.
@@ -781,6 +848,9 @@ impl Store {
         // v10 (0.8.0), second half: notes to self. Standalone like v9 — one
         // table that references `segments` and nothing else, and no backfill.
         self.apply_v10_notes()?;
+        // v11 (0.9.0): ground truth from Discord. Standalone for the same
+        // reason — two new tables, five new columns, nothing rewritten.
+        self.apply_v11()?;
 
         match current {
             None => {
@@ -4817,6 +4887,602 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    // ---- 0.9.0: ground truth from Discord --------------------------------
+    //
+    // Everything in this block is additive: two tables, five columns and the
+    // accessors over them. Nothing above the banner reads any of it, and
+    // deleting the block would leave a working 0.8.2 store behind.
+
+    fn apply_v11(&self) -> Result<()> {
+        self.conn.execute_batch(
+            // A speaking row is an OBSERVATION, not an annotation: it hangs
+            // off no segment and outlives every one it overlaps. It has to,
+            // because it arrives before the segment it will be compared with
+            // — the plugin reports the ring the instant it lights up, and the
+            // turn is not written down until VAD has heard it end.
+            //
+            // `t_end_ns` is nullable, which is the honest shape: between a
+            // start and its stop the row is genuinely open. `truth_close_open`
+            // shuts the ones a crash left behind.
+            "CREATE TABLE IF NOT EXISTS truth_speaking (
+                 id         INTEGER PRIMARY KEY,
+                 user_id    TEXT    NOT NULL,
+                 name       TEXT    NOT NULL,
+                 channel_id TEXT,
+                 t_start_ns INTEGER NOT NULL,
+                 t_end_ns   INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS idx_truth_speaking_span
+                 ON truth_speaking(t_start_ns, t_end_ns);
+             CREATE INDEX IF NOT EXISTS idx_truth_speaking_open
+                 ON truth_speaking(user_id, t_end_ns);
+
+             -- A Discord account. `speaker_id` is the link to a voice and is
+             -- NULL until something establishes it; `name` is a NICKNAME and
+             -- is never written to `speakers.display_name` by the daemon —
+             -- Discord names are per-guild, people change them for jokes, and
+             -- a voice's name is a decision a person makes.
+             CREATE TABLE IF NOT EXISTS discord_users (
+                 user_id       TEXT PRIMARY KEY,
+                 name          TEXT NOT NULL,
+                 speaker_id    INTEGER REFERENCES speakers(id),
+                 via           TEXT,
+                 linked_at_ns  INTEGER,
+                 first_seen_ns INTEGER NOT NULL,
+                 last_seen_ns  INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_discord_users_speaker
+                 ON discord_users(speaker_id);",
+        )?;
+        // The verdict lives on the segment because that is what it is about,
+        // and because every question worth asking of it ("how often was the
+        // ladder right on clean turns") is a query over segments.
+        self.add_column_if_missing("segments", "truth_user_id", "TEXT")?;
+        self.add_column_if_missing("segments", "truth_verdict", "TEXT")?;
+        self.add_column_if_missing("segments", "truth_coverage", "REAL")?;
+        self.add_column_if_missing("segments", "truth_enrol_ns", "INTEGER")?;
+        // Which prototypes Discord's word put in the bank (`store::truth_via`).
+        // NULL on every row that predates this and on every ordinary
+        // enrolment, which is what it should mean: nothing to say.
+        self.add_column_if_missing("speaker_prototypes", "via", "TEXT")?;
+        self.conn.execute_batch(
+            // The labelling queue is "Discord segments with no verdict", and
+            // the enrolment queue is "single segments with no enrol stamp".
+            "CREATE INDEX IF NOT EXISTS idx_segments_truth
+                 ON segments(truth_verdict, t_start_ns);
+             CREATE INDEX IF NOT EXISTS idx_segments_truth_enrol
+                 ON segments(truth_enrol_ns, t_start_ns);",
+        )?;
+        Ok(())
+    }
+
+    /// Open a speaking row, closing anything this user already had open.
+    ///
+    /// Two starts with no stop between them is a dropped batch, not two
+    /// overlapping utterances by one person — so the earlier row is closed at
+    /// the later one's start rather than left to run.
+    pub fn truth_speaking_start(
+        &self,
+        user_id: &str,
+        name: &str,
+        channel_id: Option<&str>,
+        t_ns: i64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "UPDATE truth_speaking SET t_end_ns = MAX(t_start_ns, ?2)
+             WHERE user_id = ?1 AND t_end_ns IS NULL",
+            params![user_id, t_ns],
+        )?;
+        self.conn.execute(
+            "INSERT INTO truth_speaking (user_id, name, channel_id, t_start_ns, t_end_ns)
+             VALUES (?1, ?2, ?3, ?4, NULL)",
+            params![user_id, name, channel_id, t_ns],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Close this user's open speaking row. A stop with no start is dropped:
+    /// there is no span to invent, and inventing one would put speech on the
+    /// timeline that nobody reported.
+    pub fn truth_speaking_stop(&self, user_id: &str, t_ns: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE truth_speaking SET t_end_ns = MAX(t_start_ns, ?2)
+             WHERE id = (SELECT id FROM truth_speaking
+                         WHERE user_id = ?1 AND t_end_ns IS NULL
+                         ORDER BY t_start_ns DESC LIMIT 1)",
+            params![user_id, t_ns],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Close every row that has been open longer than `timeout_ns`, at the
+    /// timeout rather than at now: the plugin was not running, so the last
+    /// thing we actually know is that they were talking when we lost them.
+    /// Returns how many were closed.
+    pub fn truth_close_open(&self, now_ns: i64, timeout_ns: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE truth_speaking SET t_end_ns = t_start_ns + ?2
+             WHERE t_end_ns IS NULL AND t_start_ns + ?2 <= ?1",
+            params![now_ns, timeout_ns],
+        )?)
+    }
+
+    /// Record that we have seen this Discord account, and what it is calling
+    /// itself. Never touches `speaker_id` — a sighting is not a link.
+    pub fn upsert_discord_user(&self, user_id: &str, name: &str, at_ns: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO discord_users (user_id, name, first_seen_ns, last_seen_ns)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 name          = excluded.name,
+                 last_seen_ns  = MAX(discord_users.last_seen_ns, excluded.last_seen_ns),
+                 first_seen_ns = MIN(discord_users.first_seen_ns, excluded.first_seen_ns)",
+            params![user_id, name, at_ns],
+        )?;
+        Ok(())
+    }
+
+    const DISCORD_USER_COLUMNS: &'static str =
+        "d.user_id, d.name, d.speaker_id, d.via, d.linked_at_ns, d.first_seen_ns, d.last_seen_ns,
+         (SELECT s.display_name FROM speakers s WHERE s.id = d.speaker_id)
+         FROM discord_users d";
+
+    fn discord_user_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<DiscordUserRow> {
+        Ok(DiscordUserRow {
+            user_id: r.get(0)?,
+            name: r.get(1)?,
+            speaker_id: r.get(2)?,
+            via: r.get(3)?,
+            linked_at_ns: r.get(4)?,
+            first_seen_ns: r.get(5)?,
+            last_seen_ns: r.get(6)?,
+            speaker_name: r.get(7)?,
+        })
+    }
+
+    pub fn discord_users(&self) -> Result<Vec<DiscordUserRow>> {
+        let sql = format!(
+            "SELECT {} ORDER BY d.last_seen_ns DESC, d.user_id ASC",
+            Self::DISCORD_USER_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_map([], Self::discord_user_row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn discord_user(&self, user_id: &str) -> Result<Option<DiscordUserRow>> {
+        let sql = format!("SELECT {} WHERE d.user_id = ?1", Self::DISCORD_USER_COLUMNS);
+        Ok(self
+            .conn
+            .query_row(&sql, params![user_id], Self::discord_user_row_from)
+            .optional()?)
+    }
+
+    /// Point a Discord account at a voice, or (with `speaker_id` `None`) stop
+    /// pointing it anywhere. Returns the row as it now stands, or `None` when
+    /// there is no such user.
+    pub fn set_discord_link(
+        &self,
+        user_id: &str,
+        speaker_id: Option<i64>,
+        via: Option<&str>,
+        at_ns: i64,
+    ) -> Result<Option<DiscordUserRow>> {
+        let n = self.conn.execute(
+            "UPDATE discord_users
+                SET speaker_id = ?2, via = ?3, linked_at_ns = ?4
+              WHERE user_id = ?1",
+            params![
+                user_id,
+                speaker_id,
+                speaker_id.and(via),
+                speaker_id.map(|_| at_ns)
+            ],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        self.discord_user(user_id)
+    }
+
+    /// Every speaking span that touches `[from_ns, to_ns)`, oldest first. An
+    /// open span is reported running to `to_ns` — it is still going as far as
+    /// anybody knows, and clipping it there is what keeps coverage ≤ 1.
+    pub fn truth_spans_between(&self, from_ns: i64, to_ns: i64) -> Result<Vec<TruthSpan>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT user_id, name, t_start_ns, COALESCE(t_end_ns, ?2)
+               FROM truth_speaking
+              WHERE t_start_ns < ?2 AND COALESCE(t_end_ns, ?2) > ?1
+              ORDER BY t_start_ns ASC, id ASC",
+        )?;
+        Ok(stmt
+            .query_map(params![from_ns, to_ns], |r| {
+                Ok(TruthSpan {
+                    user_id: r.get(0)?,
+                    name: r.get(1)?,
+                    t_start_ns: r.get(2)?,
+                    t_end_ns: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How many speaking rows there are, and how many are still open. For
+    /// `truth.status`, which is the first thing anybody looks at when the
+    /// plugin does not seem to be arriving.
+    pub fn truth_span_counts(&self) -> Result<(i64, i64)> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(t_end_ns IS NULL), 0) FROM truth_speaking",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
+    /// The most recent speaking row's start, or `None` when there are none.
+    pub fn truth_last_span_ns(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(t_start_ns) FROM truth_speaking", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
+    /// SQL that is true for a session whose source looks like Discord.
+    /// `?N` is bound to a single lower-cased pattern; the caller ORs one copy
+    /// per configured pattern together, because SQLite has no array bind and a
+    /// hand-built `IN` list of user strings is how injections happen.
+    fn discord_source_clause(patterns: usize, first_param: usize) -> String {
+        if patterns == 0 {
+            return "0".to_string();
+        }
+        (0..patterns)
+            .map(|i| {
+                let p = first_param + i;
+                format!(
+                    "(INSTR(LOWER(sc.match_key), ?{p}) > 0 \
+                      OR INSTR(LOWER(sc.display_name), ?{p}) > 0)"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+
+    /// Discord segments waiting for a verdict, newest first.
+    ///
+    /// The queue is "no verdict yet", plus `unknown` rows that truth has since
+    /// caught up with — a segment labelled `unknown` because the plugin was
+    /// not running has to be re-examined if the plugin later backfills that
+    /// moment, and a segment that is still uncovered is left alone forever
+    /// rather than being re-read every twenty seconds.
+    pub fn segments_for_truth(
+        &self,
+        patterns: &[String],
+        limit: usize,
+    ) -> Result<Vec<TruthCandidate>> {
+        if patterns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT g.id, g.t_start_ns, g.t_end_ns, g.speaker_id, g.overlap_frac
+               FROM segments g
+               JOIN sessions ss ON ss.id = g.session_id
+               JOIN sources  sc ON sc.id = ss.source_id
+              WHERE g.deleted_at IS NULL
+                AND ({})
+                AND (g.truth_verdict IS NULL
+                     OR (g.truth_verdict = ?1
+                         AND EXISTS (SELECT 1 FROM truth_speaking t
+                                      WHERE t.t_start_ns < g.t_end_ns
+                                        AND COALESCE(t.t_end_ns, g.t_end_ns) > g.t_start_ns)))
+              ORDER BY g.t_start_ns DESC
+              LIMIT ?2",
+            Self::discord_source_clause(patterns.len(), 3)
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(truth_verdict::UNKNOWN), Box::new(limit as i64)];
+        for p in patterns {
+            binds.push(Box::new(p.to_lowercase()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        Ok(stmt
+            .query_map(refs.as_slice(), |r| {
+                Ok(TruthCandidate {
+                    id: r.get(0)?,
+                    t_start_ns: r.get(1)?,
+                    t_end_ns: r.get(2)?,
+                    speaker_id: r.get(3)?,
+                    overlap_frac: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Stamp a segment with what Discord said about it. Never touches
+    /// `speaker_id`: the verdict is the yardstick, not the answer.
+    pub fn set_segment_truth(
+        &self,
+        segment_id: i64,
+        user_id: Option<&str>,
+        verdict: &str,
+        coverage: Option<f64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments
+                SET truth_user_id = ?2, truth_verdict = ?3, truth_coverage = ?4
+              WHERE id = ?1",
+            params![segment_id, user_id, verdict, coverage],
+        )?;
+        Ok(())
+    }
+
+    /// What was stamped on one segment. `None` when there is no such segment;
+    /// a live segment with no verdict yet answers with an all-`None` row,
+    /// which is a different fact and reads as one.
+    pub fn segment_truth(&self, segment_id: i64) -> Result<Option<SegmentTruth>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT truth_verdict, truth_user_id, truth_coverage FROM segments WHERE id = ?1",
+                params![segment_id],
+                |r| {
+                    Ok(SegmentTruth {
+                        verdict: r.get(0)?,
+                        user_id: r.get(1)?,
+                        coverage: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Clean single-speaker turns belonging to a LINKED user that no
+    /// enrolment pass has looked at yet, newest first.
+    pub fn segments_for_truth_enrol(
+        &self,
+        min_duration_s: f64,
+        min_coverage: f64,
+        limit: usize,
+    ) -> Result<Vec<TruthEnrolCandidate>> {
+        let min_ns = (min_duration_s * 1e9) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.truth_user_id, d.speaker_id, g.t_start_ns, g.t_end_ns,
+                    g.overlap_frac, LENGTH(TRIM(COALESCE(g.text, '')))
+               FROM segments g
+               JOIN discord_users d ON d.user_id = g.truth_user_id
+              WHERE g.deleted_at IS NULL
+                AND g.truth_verdict = ?1
+                AND g.truth_enrol_ns IS NULL
+                AND d.speaker_id IS NOT NULL
+                AND g.truth_coverage >= ?2
+                AND (g.t_end_ns - g.t_start_ns) >= ?3
+              ORDER BY g.t_start_ns DESC
+              LIMIT ?4",
+        )?;
+        Ok(stmt
+            .query_map(
+                params![truth_verdict::SINGLE, min_coverage, min_ns, limit as i64],
+                |r| {
+                    Ok(TruthEnrolCandidate {
+                        id: r.get(0)?,
+                        user_id: r.get(1)?,
+                        speaker_id: r.get(2)?,
+                        t_start_ns: r.get(3)?,
+                        t_end_ns: r.get(4)?,
+                        overlap_frac: r.get(5)?,
+                        text_len: r.get(6)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Mark an enrolment candidate as considered, whether or not it enrolled.
+    /// Without this the pass would re-embed the same refused turn forever.
+    pub fn mark_truth_enrol_considered(&self, segment_id: i64, at_ns: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET truth_enrol_ns = ?2 WHERE id = ?1",
+            params![segment_id, at_ns],
+        )?;
+        Ok(())
+    }
+
+    /// Say a prototype came from Discord's word. Called straight after
+    /// `add_prototype` returned its id, so the provenance and the row are
+    /// written in the same breath.
+    pub fn set_prototype_via(&self, prototype_id: i64, via: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE speaker_prototypes SET via = ?2 WHERE id = ?1",
+            params![prototype_id, via],
+        )?;
+        Ok(())
+    }
+
+    /// How this Discord user's clean turns were labelled by the voicebank:
+    /// `(speaker_id, count)`, commonest first, plus the count of clean turns
+    /// the ladder declined to label at all.
+    ///
+    /// `min_duration_s` excludes the turns too short to be evidence of
+    /// anything — the same floor the identity score uses, for the same reason.
+    pub fn truth_label_histogram(
+        &self,
+        user_id: &str,
+        min_duration_s: f64,
+    ) -> Result<(Vec<(i64, i64)>, i64)> {
+        let min_ns = (min_duration_s * 1e9) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT g.speaker_id, COUNT(*) FROM segments g
+              WHERE g.deleted_at IS NULL
+                AND g.truth_verdict = ?1
+                AND g.truth_user_id = ?2
+                AND (g.t_end_ns - g.t_start_ns) >= ?3
+              GROUP BY g.speaker_id
+              ORDER BY COUNT(*) DESC, g.speaker_id ASC",
+        )?;
+        let rows: Vec<(Option<i64>, i64)> = stmt
+            .query_map(params![truth_verdict::SINGLE, user_id, min_ns], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut labelled = Vec::new();
+        let mut unlabelled = 0i64;
+        for (speaker, n) in rows {
+            match speaker {
+                Some(id) => labelled.push((id, n)),
+                None => unlabelled += n,
+            }
+        }
+        Ok((labelled, unlabelled))
+    }
+
+    /// How many segments carry each verdict.
+    pub fn truth_verdict_counts(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT truth_verdict, COUNT(*) FROM segments
+              WHERE deleted_at IS NULL AND truth_verdict IS NOT NULL
+              GROUP BY truth_verdict",
+        )?;
+        Ok(stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every `single` segment long enough to score, with the voicebank's
+    /// answer beside the truth user's linked one. The identity ladder's whole
+    /// report card comes out of this one query.
+    pub fn truth_identity_rows(&self, min_duration_s: f64) -> Result<Vec<TruthScoreRow>> {
+        let min_ns = (min_duration_s * 1e9) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT g.truth_user_id, d.speaker_id, g.speaker_id
+               FROM segments g
+               JOIN discord_users d ON d.user_id = g.truth_user_id
+              WHERE g.deleted_at IS NULL
+                AND g.truth_verdict = ?1
+                AND d.speaker_id IS NOT NULL
+                AND (g.t_end_ns - g.t_start_ns) >= ?2",
+        )?;
+        Ok(stmt
+            .query_map(params![truth_verdict::SINGLE, min_ns], |r| {
+                Ok(TruthScoreRow {
+                    user_id: r.get(0)?,
+                    truth_speaker_id: r.get(1)?,
+                    heard_speaker_id: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// `(verdict, flagged)` for every segment with a verdict, where flagged
+    /// means the overlap gate refused it. Scored in Rust rather than in SQL
+    /// so the threshold comes from the daemon's live operating point instead
+    /// of being baked into a query.
+    pub fn truth_overlap_rows(&self) -> Result<Vec<(String, Option<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT truth_verdict, overlap_frac FROM segments
+              WHERE deleted_at IS NULL AND truth_verdict IN (?1, ?2)",
+        )?;
+        Ok(stmt
+            .query_map(
+                params![truth_verdict::SINGLE, truth_verdict::OVERLAP],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Discord segments nothing has been able to say anything about: no
+    /// verdict at all. Counted so `unknown` in the report is a real number
+    /// rather than the absence of one.
+    pub fn truth_unverdicted_count(&self, patterns: &[String]) -> Result<i64> {
+        if patterns.is_empty() {
+            return Ok(0);
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM segments g
+               JOIN sessions ss ON ss.id = g.session_id
+               JOIN sources  sc ON sc.id = ss.source_id
+              WHERE g.deleted_at IS NULL AND g.truth_verdict IS NULL AND ({})",
+            Self::discord_source_clause(patterns.len(), 1)
+        );
+        let binds: Vec<String> = patterns.iter().map(|p| p.to_lowercase()).collect();
+        let refs: Vec<&dyn rusqlite::ToSql> =
+            binds.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
+        Ok(self.conn.query_row(&sql, refs.as_slice(), |r| r.get(0))?)
+    }
+
+    // ---- end 0.9.0 -------------------------------------------------------
+}
+
+/// A Discord account we have heard from (v11).
+#[derive(Debug, Clone)]
+pub struct DiscordUserRow {
+    pub user_id: String,
+    /// The nickname the plugin last reported. Never written to a speaker.
+    pub name: String,
+    pub speaker_id: Option<i64>,
+    /// `store::truth_via`, or `None` when unlinked.
+    pub via: Option<String>,
+    pub linked_at_ns: Option<i64>,
+    pub first_seen_ns: i64,
+    pub last_seen_ns: i64,
+    /// The linked voice's name, for a client that wants to show both.
+    pub speaker_name: Option<String>,
+}
+
+/// One stretch of one Discord user talking (v11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruthSpan {
+    pub user_id: String,
+    pub name: String,
+    pub t_start_ns: i64,
+    /// An open span is reported clipped to the window it was asked for.
+    pub t_end_ns: i64,
+}
+
+/// A segment waiting for a verdict.
+#[derive(Debug, Clone)]
+pub struct TruthCandidate {
+    pub id: i64,
+    pub t_start_ns: i64,
+    pub t_end_ns: i64,
+    pub speaker_id: Option<i64>,
+    pub overlap_frac: Option<f32>,
+}
+
+/// A clean turn that might be worth enrolling.
+#[derive(Debug, Clone)]
+pub struct TruthEnrolCandidate {
+    pub id: i64,
+    pub user_id: String,
+    pub speaker_id: i64,
+    pub t_start_ns: i64,
+    pub t_end_ns: i64,
+    pub overlap_frac: Option<f32>,
+    /// Characters of transcript, so the pass can pick a plausible word count
+    /// without loading the text it does not otherwise need.
+    pub text_len: i64,
+}
+
+/// The truth stamp on one segment (v11).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentTruth {
+    /// `store::truth_verdict`, or `None` when nothing has looked yet.
+    pub verdict: Option<String>,
+    /// The Discord account the verdict is about, when it is about one.
+    pub user_id: Option<String>,
+    /// That account's share of the segment.
+    pub coverage: Option<f64>,
+}
+
+/// One scored `single` segment: what Discord said, and what we heard.
+#[derive(Debug, Clone)]
+pub struct TruthScoreRow {
+    pub user_id: String,
+    pub truth_speaker_id: i64,
+    pub heard_speaker_id: Option<i64>,
 }
 
 #[cfg(test)]

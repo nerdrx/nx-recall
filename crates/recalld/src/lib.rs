@@ -57,6 +57,10 @@ pub mod split;
 pub mod store;
 pub mod threads;
 pub mod timeref;
+/// Ground truth from Discord (0.9.0): the labelling pass and the measurement.
+pub mod truth;
+/// The truth ingest's loopback HTTP listener (0.9.0).
+pub mod truthnet;
 pub mod turns;
 pub mod vad;
 pub mod vocab;

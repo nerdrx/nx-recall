@@ -31,12 +31,14 @@ use recalld::queue::EventQueue;
 use recalld::retention::{self, SweeperStop};
 use recalld::roster::{self, RosterStop};
 use recalld::server;
-use recalld::service::Service;
+use recalld::service::{Service, TruthWiring};
 use recalld::store::Store;
+use recalld::truth::{self, TruthStats, TruthStop};
+use recalld::truthnet;
 
 use crate::cli::{
     Cli, Command, GraphAction, LangAction, MicAction, ModelsAction, NotesAction, SemanticAction,
-    SpeakersAction,
+    SpeakersAction, TruthAction,
 };
 
 fn main() -> Result<()> {
@@ -153,6 +155,9 @@ fn main() -> Result<()> {
         Command::Brief { speaker_id } => cmd_brief(&cfg, &data_dir, speaker_id),
         Command::Accuracy => cmd_accuracy(&cfg, &data_dir),
         // ---- end 0.8.0 -------------------------------------------------
+        // ---- 0.9.0, ground truth from Discord --------------------------
+        Command::Truth { action } => cmd_truth(&cfg, &data_dir, &config_path, action),
+        // ---- end 0.9.0 -------------------------------------------------
     }
 }
 
@@ -416,6 +421,62 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
             .ok()
     };
 
+    // ---- 0.9.0: ground truth from Discord ---------------------------------
+    //
+    // Two pieces, deliberately independent. The listener only runs when it has
+    // been asked for; the worker runs always, because truth already collected
+    // is still worth labelling against after the plugin has been switched off.
+    let truth_stats = Arc::new(TruthStats::default());
+    let truth_stop = Arc::new(TruthStop::default());
+    let truth_thread = {
+        let store = Arc::clone(&store);
+        let control = Arc::clone(&control);
+        let bus = Arc::clone(&bus);
+        let truth_cfg = cfg.truth.clone();
+        let identity = cfg.identity.clone();
+        let runtime = cfg.runtime.clone();
+        let stats = Arc::clone(&truth_stats);
+        let stop = Arc::clone(&truth_stop);
+        std::thread::Builder::new()
+            .name("recalld-truth".into())
+            .spawn(move || {
+                truth::run(
+                    store, control, bus, truth_cfg, identity, runtime, stats, stop,
+                )
+            })
+            .map_err(|e| warn!("no ground-truth worker: {e}"))
+            .ok()
+    };
+    let truth_token_path = config::truth_token_path(config_path);
+    let truth_ingest = if cfg.truth.enabled {
+        // A token that cannot be written is a listener that cannot be reached,
+        // so a failure here stops the ingest and not the daemon: capture is
+        // the product and a measurement never costs a recording.
+        match truthnet::token(&truth_token_path).and_then(|token| {
+            truthnet::serve(
+                Arc::clone(&store),
+                Arc::clone(&truth_stats),
+                token,
+                cfg.truth.port,
+            )
+        }) {
+            Ok(ingest) => Some(ingest),
+            Err(e) => {
+                warn!("the truth ingest could not start: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    service.attach_truth(Arc::new(TruthWiring {
+        cfg: cfg.truth.clone(),
+        stats: Arc::clone(&truth_stats),
+        listening: truth_ingest.as_ref().map(|i| i.addr()),
+        token_path: truth_token_path,
+    }));
+    // ---- end 0.9.0 --------------------------------------------------------
+
     let sweeper_stop = Arc::new(SweeperStop::default());
     let sweeper_thread = if cfg.retention.enabled {
         let retention_cfg = cfg.retention.clone();
@@ -457,12 +518,22 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     sweeper_stop.stop();
     enrich_stop.stop();
     quality_stop.stop();
+    truth_stop.stop();
     if let Some(s) = socket {
         s.shutdown();
     }
-    for handle in [roster_thread, sweeper_thread, enrich_thread, quality_thread]
-        .into_iter()
-        .flatten()
+    if let Some(i) = truth_ingest {
+        i.shutdown();
+    }
+    for handle in [
+        roster_thread,
+        sweeper_thread,
+        enrich_thread,
+        quality_thread,
+        truth_thread,
+    ]
+    .into_iter()
+    .flatten()
     {
         let _ = handle.join();
     }
@@ -1979,6 +2050,224 @@ fn cmd_accuracy(cfg: &Config, data_dir: &Path) -> Result<()> {
     );
     Ok(())
 }
+
+// ---- 0.9.0: ground truth from Discord -------------------------------------
+
+/// `recalld truth …` — the ground-truth subsystem's whole CLI surface.
+fn cmd_truth(
+    cfg: &Config,
+    data_dir: &Path,
+    config_path: &Path,
+    action: Option<TruthAction>,
+) -> Result<()> {
+    match action.unwrap_or(TruthAction::Report) {
+        TruthAction::Token => {
+            let path = config::truth_token_path(config_path);
+            let token = recalld::truthnet::token(&path)?;
+            println!("{token}");
+            eprintln!(
+                "  file: {}  (0600)\n  \
+                 Paste it into Vencord → Plugins → RecallBridge → Truth token,\n  \
+                 and make sure the port there matches [truth].port ({}).",
+                path.display(),
+                cfg.truth.port
+            );
+            Ok(())
+        }
+        act @ (TruthAction::On | TruthAction::Off) => {
+            let on = matches!(act, TruthAction::On);
+            let mut edited = Config::load(config_path)?;
+            edited.truth.enabled = on;
+            edited.save(config_path)?;
+            // Generated now rather than at first request, so `truth on` is
+            // followed by `truth token` and not by a puzzle.
+            if on {
+                let path = config::truth_token_path(config_path);
+                recalld::truthnet::token(&path)?;
+                println!(
+                    "Truth ingest ON — 127.0.0.1:{}\n  \
+                     config: {}\n  token:  {}\n  \
+                     restart `recalld run` to apply, then `recalld truth token`.",
+                    edited.truth.port,
+                    config_path.display(),
+                    path.display()
+                );
+            } else {
+                println!(
+                    "Truth ingest OFF\n  config: {}\n  \
+                     restart `recalld run` to apply. Truth already collected is kept, \
+                     and the labelling pass keeps using it.",
+                    config_path.display()
+                );
+            }
+            Ok(())
+        }
+        TruthAction::Users => {
+            let a = call(cfg, data_dir, "truth.users", json!({}))?;
+            let users = a["users"].as_array().cloned().unwrap_or_default();
+            if users.is_empty() {
+                println!(
+                    "Nothing has arrived yet. Turn the ingest on (`recalld truth on`),\n\
+                     restart the daemon, paste `recalld truth token` into the\n\
+                     RecallBridge plugin, and talk in a Discord call."
+                );
+                return Ok(());
+            }
+            println!(
+                "{:<22}{:<24}{:<8}{:<18}linked by",
+                "user id", "discord name", "voice", "name"
+            );
+            for u in users {
+                println!(
+                    "{:<22}{:<24}{:<8}{:<18}{}",
+                    u["user_id"].as_str().unwrap_or("—"),
+                    u["name"].as_str().unwrap_or("—"),
+                    u["speaker"]
+                        .as_i64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                    u["speaker_name"].as_str().unwrap_or("—"),
+                    u["via"].as_str().unwrap_or("—"),
+                );
+            }
+            println!(
+                "\n`discord name` is a Discord NICKNAME and is never applied to a voice —\n\
+                 it is here so you can decide whether to use it. `recalld name <voice> <name>`."
+            );
+            Ok(())
+        }
+        TruthAction::Link {
+            user_id,
+            speaker_id,
+        } => {
+            let a = call(
+                cfg,
+                data_dir,
+                "truth.link",
+                json!({"user_id": user_id, "speaker_id": speaker_id}),
+            )?;
+            println!(
+                "Linked {} ({}) → voice {} ({})",
+                a["user_id"].as_str().unwrap_or("?"),
+                a["name"].as_str().unwrap_or("?"),
+                speaker_id,
+                a["speaker_name"].as_str().unwrap_or("unnamed"),
+            );
+            Ok(())
+        }
+        TruthAction::Unlink { user_id } => {
+            let a = call(cfg, data_dir, "truth.unlink", json!({"user_id": user_id}))?;
+            println!(
+                "Unlinked {} ({}). The verdicts on past turns stay — they are what\n\
+                 Discord said, and that did not change; they simply stop being scored.",
+                a["user_id"].as_str().unwrap_or("?"),
+                a["name"].as_str().unwrap_or("?"),
+            );
+            Ok(())
+        }
+        TruthAction::Report => cmd_truth_report(cfg, data_dir),
+    }
+}
+
+/// `recalld truth report` — the measurement this whole subsystem exists for.
+fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
+    let st = call(cfg, data_dir, "truth.status", json!({}))?;
+    let a = call(cfg, data_dir, "truth.summary", json!({}))?;
+
+    let labelled = a["segments_labelled"].as_i64().unwrap_or(0);
+    if labelled == 0 {
+        println!(
+            "No turn has been compared against Discord yet — which is not a score of\n\
+             zero, it is an empty measurement.\n\n  \
+             ingest:  {}\n  spans:   {}\n\n\
+             Turn it on with `recalld truth on`, restart the daemon, paste\n\
+             `recalld truth token` into the RecallBridge plugin, and have a call.",
+            st["listening"].as_str().unwrap_or("not running"),
+            st["spans"].as_i64().unwrap_or(0),
+        );
+        return Ok(());
+    }
+
+    let pct = |v: &Value| {
+        v.as_f64()
+            .map(|w| format!("{:.1}%", w * 100.0))
+            .unwrap_or_else(|| "—".into())
+    };
+    let n = |k: &str| a[k].as_i64().unwrap_or(0);
+
+    println!("{:<20}{}", "segments compared", labelled);
+    for (label, key) in [
+        ("  single", "single"),
+        ("  overlap", "overlap"),
+        ("  partial", "partial"),
+        ("  nobody", "nobody"),
+        ("  unknown", "unknown"),
+    ] {
+        println!("{label:<20}{}", n(key));
+    }
+
+    let id = &a["identity"];
+    println!(
+        "\n{:<20}{}",
+        "identity scored on",
+        id["n"].as_i64().unwrap_or(0)
+    );
+    println!("{:<20}{}", "  correct", id["correct"].as_i64().unwrap_or(0));
+    println!("{:<20}{}", "  wrong", id["wrong"].as_i64().unwrap_or(0));
+    println!(
+        "{:<20}{}",
+        "  declined",
+        id["unlabelled"].as_i64().unwrap_or(0)
+    );
+    println!("{:<20}{}", "  precision", pct(&id["precision"]));
+    println!("{:<20}{}", "  recall", pct(&id["recall"]));
+    for (i, row) in id["by_speaker"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        println!(
+            "{:<20}{:<8}{:<22}{:>5}  {:>5} ok  {:>5} wrong",
+            if i == 0 { "  by voice" } else { "" },
+            row["speaker_id"].as_i64().unwrap_or(0),
+            row["user_id"].as_str().unwrap_or("—"),
+            row["n"].as_i64().unwrap_or(0),
+            row["correct"].as_i64().unwrap_or(0),
+            row["wrong"].as_i64().unwrap_or(0),
+        );
+    }
+
+    let og = &a["overlap_gate"];
+    println!(
+        "\n{:<20}{}",
+        "overlap gate",
+        og["threshold"]
+            .as_f64()
+            .map(|v| format!("flags above {v:.2}"))
+            .unwrap_or_else(|| "—".into())
+    );
+    println!(
+        "{:<20}{}",
+        "  caught",
+        og["flagged_when_overlap"].as_i64().unwrap_or(0)
+    );
+    println!(
+        "{:<20}{}",
+        "  false alarms",
+        og["flagged_when_single"].as_i64().unwrap_or(0)
+    );
+    println!("{:<20}{}", "  precision", pct(&og["precision"]));
+    println!("{:<20}{}", "  recall", pct(&og["recall"]));
+
+    if let Some(caveat) = a["caveat"].as_str() {
+        println!("\n{caveat}");
+    }
+    Ok(())
+}
+
+// ---- end 0.9.0 ------------------------------------------------------------
 
 fn call(cfg: &Config, data_dir: &Path, method: &str, params: Value) -> Result<Value> {
     let path: PathBuf = config::socket_path(&cfg.socket, data_dir);

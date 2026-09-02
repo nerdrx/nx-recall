@@ -182,6 +182,27 @@ pub struct Service {
     /// the mic tests, the server's own tests — would otherwise have to pass a
     /// `None` it does not care about.
     semantic: std::sync::OnceLock<Arc<crate::semantic::SemanticLeg>>,
+    /// Ground truth from Discord (0.9.0), when `recalld run` wired it up.
+    ///
+    /// A `OnceLock` for the same reason `semantic` is one: only the daemon has
+    /// any business owning a TCP listener and a worker's counters, and every
+    /// other caller of `Service::new` — the socket tests, the mic tests —
+    /// would otherwise have to pass a `None` it does not care about. The
+    /// `truth.*` methods answer honestly without it, saying the ingest is not
+    /// running, which is exactly what is true.
+    truth: std::sync::OnceLock<Arc<TruthWiring>>,
+}
+
+/// What `recalld run` hands the service about the truth subsystem (0.9.0).
+pub struct TruthWiring {
+    pub cfg: crate::config::TruthConfig,
+    pub stats: Arc<crate::truth::TruthStats>,
+    /// Where the ingest actually bound, or `None` when it is switched off or
+    /// failed to bind. The *actual* address, not the configured port: with
+    /// port 0 they differ, and a status that reported the request rather than
+    /// the result would be useless.
+    pub listening: Option<std::net::SocketAddr>,
+    pub token_path: std::path::PathBuf,
 }
 
 impl Service {
@@ -193,7 +214,14 @@ impl Service {
             next_op: AtomicU64::new(1),
             ops: Mutex::new(HashMap::new()),
             semantic: std::sync::OnceLock::new(),
+            truth: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Hand the service the truth subsystem's wiring (0.9.0). Called once, at
+    /// start-up, by `recalld run` and by nobody else.
+    pub fn attach_truth(&self, wiring: Arc<TruthWiring>) {
+        let _ = self.truth.set(wiring);
     }
 
     fn store(&self) -> MutexGuard<'_, Store> {
@@ -267,6 +295,13 @@ impl Service {
             "person.brief" => self.person_brief(req),
             "accuracy.summary" => self.accuracy_summary(),
             // ---- end 0.8.0 -------------------------------------------------
+            // ---- 0.9.0, ground truth (PROTOCOL "ground truth (Discord)") ---
+            "truth.status" => self.truth_status(),
+            "truth.users" => self.truth_users(),
+            "truth.link" => self.truth_link(req),
+            "truth.unlink" => self.truth_unlink(req),
+            "truth.summary" => self.truth_summary(),
+            // ---- end 0.9.0 -------------------------------------------------
             "transcript" => self.transcript(req),
             "roster.now" => self.roster_now(),
             "operations.list" => self.operations_list(req),
@@ -2830,6 +2865,122 @@ impl Service {
     fn accuracy_summary(&self) -> Result<Value, Error> {
         crate::accuracy::summary(&self.store()).map_err(Error::from)
     }
+
+    // ---- 0.9.0: ground truth from Discord --------------------------------
+
+    /// The truth config this daemon is running with, or the defaults when
+    /// nothing was wired up — which is the same thing as "off", and the
+    /// defaults say off.
+    fn truth_cfg(&self) -> crate::config::TruthConfig {
+        self.truth.get().map(|w| w.cfg.clone()).unwrap_or_default()
+    }
+
+    /// `truth.status` — is anything arriving, and where would it arrive.
+    ///
+    /// The first thing anybody looks at when the plugin does not seem to be
+    /// working, so it answers the three questions in that order: is the
+    /// listener up, has anything ever come in, and when was the last thing.
+    fn truth_status(&self) -> Result<Value, Error> {
+        let wiring = self.truth.get();
+        let cfg = self.truth_cfg();
+        let store = self.store();
+        let (spans, open) = store.truth_span_counts().map_err(Error::from)?;
+        let last = store.truth_last_span_ns().map_err(Error::from)?;
+        let users = store.discord_users().map_err(Error::from)?;
+        drop(store);
+        Ok(json!({
+            // `listening` is the fact; `enabled` is the intention. They differ
+            // when the port was taken, and a client showing only the second
+            // would be lying about a daemon that failed to bind.
+            "listening": wiring.and_then(|w| w.listening).map(|a| a.to_string()),
+            "enabled": cfg.enabled,
+            "port": cfg.port,
+            "label": cfg.label,
+            "enrol": cfg.enrol,
+            "sources": cfg.sources,
+            "token_path": wiring.map(|w| w.token_path.display().to_string()),
+            "spans": spans,
+            "open_spans": open,
+            "last_span_ms": last.map(ns_to_ms),
+            "users": users.len(),
+            "linked": users.iter().filter(|u| u.speaker_id.is_some()).count(),
+            "counters": wiring.map(|w| w.stats.to_json()),
+        }))
+    }
+
+    /// `truth.users` — every Discord account we have heard from.
+    ///
+    /// `name` is a Discord **nickname**. A client may offer it as a name for
+    /// the linked voice; the daemon never applies it, because a nickname is
+    /// per-guild, changes for jokes, and naming a voice is a decision a person
+    /// makes once.
+    fn truth_users(&self) -> Result<Value, Error> {
+        let rows = self.store().discord_users().map_err(Error::from)?;
+        Ok(json!({
+            "users": rows
+                .iter()
+                .map(|r| crate::truth::truth_link_json(r, None, None))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// `truth.link` — say that this Discord account is this voice.
+    fn truth_link(&self, req: &Request) -> Result<Value, Error> {
+        let user_id = req.str("user_id")?.to_string();
+        let speaker_id = req.i64("speaker_id")?;
+        let store = self.store();
+        // A merge tombstone holds no rows, so linking to one would point the
+        // measurement at a voice nothing is ever labelled with — the same
+        // argument `speakers.name` makes about renaming one.
+        let summary = store
+            .speaker_summary(speaker_id)
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::not_found(format!("no speaker with id {speaker_id}")))?;
+        let row = store
+            .set_discord_link(
+                &user_id,
+                Some(speaker_id),
+                Some(crate::store::truth_via::MANUAL),
+                utc_now_ns(),
+            )
+            .map_err(Error::from)?
+            .ok_or_else(|| {
+                Error::not_found(format!(
+                    "no Discord user {user_id:?} — the daemon links accounts it has heard \
+                     speak, so start the plugin and talk in a call first"
+                ))
+            })?;
+        drop(store);
+        let _ = summary;
+        let payload = crate::truth::truth_link_json(&row, None, None);
+        self.bus.publish(Topic::Relabel, "truth", payload.clone());
+        info!(user = %user_id, speaker = speaker_id, "linked a Discord user by hand");
+        Ok(payload)
+    }
+
+    /// `truth.unlink` — take the link back. The verdicts already stamped on
+    /// segments stay: they are what Discord said, and that did not change.
+    /// Only the scoring, which needs a link to have an answer to compare
+    /// against, stops counting them.
+    fn truth_unlink(&self, req: &Request) -> Result<Value, Error> {
+        let user_id = req.str("user_id")?.to_string();
+        let row = self
+            .store()
+            .set_discord_link(&user_id, None, None, utc_now_ns())
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::not_found(format!("no Discord user {user_id:?}")))?;
+        let payload = crate::truth::truth_link_json(&row, None, None);
+        self.bus.publish(Topic::Relabel, "truth", payload.clone());
+        Ok(payload)
+    }
+
+    /// `truth.summary` — the identity ladder, scored against Discord's word.
+    fn truth_summary(&self) -> Result<Value, Error> {
+        let cfg = self.truth_cfg();
+        crate::truth::summary(&self.store(), &self.control.identity, &cfg).map_err(Error::from)
+    }
+
+    // ---- end 0.9.0 -------------------------------------------------------
 }
 
 #[cfg(test)]

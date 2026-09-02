@@ -919,3 +919,177 @@ see until a user hits it.
 - Clients MUST ignore unknown fields and unknown event types.
 - The daemon MUST keep serving proto N−1 for one release after N ships (hub updates
   restart the daemon under a possibly-stale GUI — DESIGN §2).
+
+## 0.9.0 — ground truth (Discord)
+
+Every accuracy number this daemon has had is either somebody else's benchmark
+or `accuracy.summary`, which measures the transcripts **you chose to correct**
+— biased high by construction, and silent about speaker identity, which nobody
+corrects one turn at a time. Speaker identity has therefore never been
+measured at all, and "the deferred labelling pass" has been on the plan since
+day one because the honest alternative was a transcript and a pen.
+
+Discord already has the labels. Its client draws a speaking ring per user, and
+a Vencord plugin (`RecallBridge`, in `nerdrx/vencord-nx-plugins`) can read the
+flux event that ring is drawn from. This section is that stream and what is
+done with it. It is additive: no method, event, field or behaviour described
+above this line changes, and `proto` stays `1`.
+
+- **What is reachable, and what is not.** Discord decodes remote voice in the
+  **native engine**, so per-user audio is not reachable from a plugin and this
+  is not speaker separation — the daemon still records one mixed stream off
+  the speakers, exactly as before. What *is* reachable and exact: per-user
+  `SPEAKING` start/stop, voice-channel membership, the current channel, guild
+  nicknames, and whether the local user is muted or deafened. That is
+  who-spoke-when, and who-spoke-when is a yardstick. **A truth verdict is
+  never a label**: `segments.speaker_id` stays whatever the voicebank decided,
+  and nothing in here writes it.
+
+- **The loopback ingest.** `[truth] enabled = false`, `port = 7797`, off until
+  `recalld truth on`. `crate::server`'s first line is "No TCP, ever (DESIGN
+  §8)" and this is the one exception, paid for rather than waived: a Discord
+  renderer cannot open a unix socket, so the listener binds `127.0.0.1` and
+  **only** `127.0.0.1` (there is no config key for the interface — the only
+  correct value is the hard-coded one, and every accepted peer's address is
+  re-checked and hung up on if it is not loopback), and the 0600 unix socket's
+  access control is replaced by a bearer token in a 0600 file at
+  `<config dir>/truth.token`, printed by `recalld truth token` and overridable
+  for tests with `NXR_TRUTH_TOKEN`.
+
+  | route | body | replies |
+  |---|---|---|
+  | `POST /v1/discord/speaking` | NDJSON, `{t_ms, user_id, speaking, name, channel_id}` | `204` |
+  | `POST /v1/discord/voice` | NDJSON, `{t_ms, ev: "join"\|"leave"\|"self", user_id, name, channel_id, self_mute?, self_deaf?}` | `204` |
+  | `GET /v1/health` | — | `200 {ok, service, proto, spans, open}` |
+
+  `401` without a `Bearer` token (health included; the body is never read),
+  `413` over 1 MB, `204` for everything else — a route that does not exist yet
+  is a newer plugin talking to an older daemon, and a fire-and-forget client
+  cannot act on a `404`. `Access-Control-Allow-Origin` is `https://discord.com`
+  and never `*`: the renderer posts from that origin, and `*` would let any
+  page the user happens to have open write into their recordings.
+
+  - **`t_ms` is `Date.now()`, and that is the right clock.** Segments carry
+    UTC epoch nanoseconds (the pipeline derives them from a `clock::Anchor`,
+    monotonic *within* a session but anchored to wall-clock UTC), so both
+    sides of every comparison in this section are wall-clock UTC on one
+    machine and nothing is converted. Comparing against a monotonic clock
+    would have been silently wrong for the life of the feature, which is why
+    it is written down rather than assumed.
+  - **One malformed line does not fail a batch.** It is counted in
+    `rejected` and skipped. Failing the batch would make the plugin retry it
+    forever over one bad line, and the plugin retries on any non-2xx.
+  - **A `leave` closes an open ring.** A client that vanishes mid-word sends
+    no stop, and without this the span would run to the timeout and claim
+    speech that did not happen.
+
+- **Storage (schema v11).** `truth_speaking(id, user_id, name, channel_id,
+  t_start_ns, t_end_ns)` — an **observation**, not an annotation: it hangs off
+  no segment, because it arrives before the turn it will be compared with
+  exists. `t_end_ns` is NULL between a start and its stop; a second start
+  closes the first at its own timestamp (a dropped batch, not two mouths), and
+  a row still open `[truth].open_span_timeout_s` (30 s) after it started is
+  closed **at the timeout**, not at now — the last thing anybody actually
+  knows is that they were talking when we lost them.
+  `discord_users(user_id PRIMARY KEY, name, speaker_id, via, linked_at_ns,
+  first_seen_ns, last_seen_ns)`. Four columns on `segments`
+  (`truth_user_id`, `truth_verdict`, `truth_coverage`, `truth_enrol_ns`) and
+  one on `speaker_prototypes` (`via`). Idempotent like every migration, and
+  with no backfill: truth exists from the day the plugin starts sending it.
+
+- **The verdict.** An idle pass (`crate::truth`, the worker/gating/lock
+  discipline of `crate::quality` — gather under the store lock, judge with
+  none held, commit under it again; never in the capture path) walks segments
+  of a **Discord** session — matched on `[truth].sources`, lower-case
+  substrings against the source's match key and display name, default
+  `["discord", "vesktop"]`; VRChat is not Discord and never matches — and
+  computes, per Discord user, `coverage(u) = overlap_ms / dur_ms`, that user's
+  own overlapping spans merged first so coverage can never exceed 1 however
+  the plugin's batches interleaved.
+
+  | condition | `truth_verdict` | scored against |
+  |---|---|---|
+  | two or more users ≥ 0.2 | `overlap` | the overlap gate |
+  | one user ≥ 0.8, nobody else ≥ 0.2 | `single` | the identity ladder |
+  | one user in [0.2, 0.8), nobody else ≥ 0.2 | `partial` | nothing |
+  | every user < 0.2, truth data within 5 min | `nobody` | nothing |
+  | no truth data within 5 min | `unknown` | nothing |
+
+  - **`partial` is a fifth verdict and it had to exist.** A VAD span whose
+    edges run past the words is common. Folding it into `single` would
+    quietly lower a bar that was set at 0.8 on purpose; folding it into
+    `overlap` would claim a second voice that is not there. It is named,
+    counted, and excluded from both scores.
+  - **`nobody` and `unknown` are different facts.** `nobody` means truth
+    covers this moment and says none of these accounts was talking — usually
+    the local user on a mic Discord is not carrying, and worth reading when
+    it is not, since the plugin reports the local user too. `unknown` means
+    the plugin was not running. An `unknown` is **re-examined** if truth
+    later covers it (a plugin started mid-call, a batch that finally
+    flushed); every other verdict is written once and never re-read.
+  - The local user is a Discord user like any other: their own `SPEAKING`
+    arrives with their own id. The mic is still a separate source with a
+    separate session, and nothing here changes how it is labelled.
+
+- **Linking a user to a voice.** `truth.link {user_id, speaker_id}` /
+  `truth.unlink {user_id}` → the user row; `truth.users` → `{users: [row]}`,
+  where a row is `{user_id, name, speaker, speaker_name, via, linked_ms,
+  first_seen_ms, last_seen_ms, agreement, segments}`. The daemon also links
+  **automatically, and only when there is nothing to decide**: a Discord user
+  whose `single` segments of ≥ 1 s were labelled by the voicebank as one
+  speaker **≥ 90% of the time over ≥ 20 labelled segments** is linked with
+  `via: "truth"`. 89% does not link — at that rate the minority voice is a
+  merge somebody has to look at, not noise. Turns the ladder *declined* are
+  not evidence either way and are in neither half of the fraction; a hand link
+  (`via: "manual"`) is never overwritten. Event **`truth`** on topic `relabel`
+  carries the same row shape on every link and unlink.
+  - **Discord names are never applied to a voice.** `name` is a per-guild
+    nickname somebody picked for a joke last Tuesday. It is recorded on the
+    `discord_users` row and exposed so a client can **offer** it; naming a
+    voice stays `speakers.name`, i.e. a decision a person makes.
+
+- **The measurement, which is the point.** `truth.summary` →
+  `{segments_labelled, single, overlap, partial, nobody, unknown,
+  min_duration_ms, identity: {n, correct, wrong, unlabelled, precision,
+  recall, by_speaker: [{speaker_id, user_id, n, correct, wrong}]},
+  overlap_gate: {threshold, flagged_when_overlap, flagged_when_single,
+  precision, recall}, caveat}`. `recalld truth report` prints it. This is what
+  replaces the deferred labelling pass, so the numbers are built to be honest
+  rather than flattering:
+  - Identity is scored on `single` segments **of at least 1 s** belonging to a
+    **linked** user, and on nothing else. A sub-second turn is a grunt the
+    voicebank refuses anyway; scoring it would measure the floor rather than
+    the model. `min_duration_ms` says so on every reply and `caveat` says it
+    in words.
+  - `correct` is a segment whose speaker is the one linked to its truth user,
+    `wrong` is a different one, `unlabelled` is the ladder declining. So
+    `precision = correct/(correct+wrong)` is over the turns it answered on and
+    `recall = correct/n` is over every turn it was asked about. **Both**,
+    because a ladder that answers rarely and rightly and one that answers
+    always and often wrongly are different failures and one number hides it.
+  - The overlap gate is scored the same way against `overlap` verdicts, with
+    `threshold` the live `[identity].max_overlap` it was scored at.
+  - Every ratio is `null` — never `0` — when there is nothing to divide. An
+    untested gate has no precision, and reporting one as perfectly imprecise
+    is a lie in the same family as reporting an unmeasured error rate as zero.
+  - `unknown` counts the Discord turns no truth covers, verdict-stamped or
+    not, so "the plugin was off for most of this" is visible in the report
+    rather than hidden by a smaller denominator.
+
+- **Enrolment from truth.** Behind `[truth] enrol = true` (off by default —
+  it is the one thing here that changes future behaviour instead of merely
+  measuring it). A `single` segment of ≥ 3 s with `truth_coverage ≥ 0.95`
+  belonging to a **linked** user is enrolled into that voice's bank with
+  `speaker_prototypes.via = "truth"` — **only if it also passes
+  `identity::decide`'s existing four enrol conditions** against the bank as it
+  stands. Ground truth says whose voice it is; it does not say the recording
+  is worth keeping, and `identity.rs` is the only thing that has ever decided
+  that. Every candidate is stamped `truth_enrol_ns` whether it enrolled or
+  not, so a refused turn is not re-examined forever.
+
+- **`truth.status`** → `{listening, enabled, port, label, enrol, sources,
+  token_path, spans, open_spans, last_span_ms, users, linked, counters}`.
+  `listening` is the address actually bound and `enabled` is the intention;
+  they differ when the port was taken, and a client showing only the second
+  would lie about a daemon that failed to bind.
+
