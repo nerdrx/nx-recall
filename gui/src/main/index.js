@@ -22,8 +22,12 @@ import {
   initCaptionSettings,
   setCaptionSettings,
   showCaptions,
+  shutdownCaptions,
   toggleCaptions,
 } from './captions.js';
+
+/** Which surface the captions land on here — 'layer', 'window-wayland' or 'window'. */
+const captionsSurface = () => getCaptionSettings().surface;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..', '..');
@@ -212,13 +216,26 @@ function buildTrayMenu() {
         updateTray();
       },
     },
-    {
-      id: 'captions-click-through',
-      label: 'Captions ignore the mouse',
-      type: 'checkbox',
-      checked: getCaptionSettings().clickThrough,
-      click: (item) => setCaptionSettings({ clickThrough: item.checked }),
-    },
+    // On a Wayland desktop the captions are a layer-shell surface whose input
+    // region is empty, so this is not a setting there — it is what the surface
+    // IS. Shown ticked and greyed rather than hidden: the tray is where you
+    // find out what state you left it in, and "you cannot change this" is a
+    // state. Everywhere else it is the real switch it always was.
+    captionsSurface() === 'layer'
+      ? {
+          id: 'captions-click-through',
+          label: 'Captions ignore the mouse',
+          type: 'checkbox',
+          checked: true,
+          enabled: false,
+        }
+      : {
+          id: 'captions-click-through',
+          label: 'Captions ignore the mouse',
+          type: 'checkbox',
+          checked: getCaptionSettings().clickThrough,
+          click: (item) => setCaptionSettings({ clickThrough: item.checked }),
+        },
     { type: 'separator' },
     { label: 'Open NX Recall', click: () => showWindow() },
     { type: 'separator' },
@@ -557,6 +574,9 @@ app.on('window-all-closed', () => {});
 
 app.on('before-quit', () => {
   quitting = true;
+  // The layer-shell captions are a separate process (see main/captions.js) and
+  // would otherwise still be on the screen after the app that owns them is gone.
+  shutdownCaptions();
 });
 
 app.on('will-quit', () => {

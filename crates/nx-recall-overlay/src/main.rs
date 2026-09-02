@@ -22,9 +22,12 @@
 //! See docs/OVERLAY.md for what the probe found on the machine this was written
 //! on, and for the route that works when the answer is no.
 
+mod desktop;
 mod feed;
+mod layout;
 mod probe;
 mod raster;
+mod settings;
 mod xr;
 
 use std::path::PathBuf;
@@ -42,6 +45,36 @@ struct Args {
     /// that does not advertise XR_EXTX_overlay.
     #[arg(long)]
     overlay: bool,
+
+    /// The captions on the DESKTOP, as a wlr-layer-shell surface that the
+    /// pointer genuinely falls through. This is what "Captions" opens on a
+    /// Wayland desktop; the Electron window is the fallback for one whose
+    /// compositor does not offer the protocol. Exits 2 if it does not.
+    #[arg(long)]
+    desktop: bool,
+
+    /// The captions.json the settings card writes. Defaults to the one in
+    /// Electron's userData directory; the main process passes it explicitly.
+    /// Only ever READ — two writers on one settings file is how a settings file
+    /// ends up disagreeing with the UI that owns it.
+    #[arg(long, value_name = "FILE")]
+    settings: Option<PathBuf>,
+
+    /// Which output the bar goes on, by connector name (`DP-2`, `HDMI-A-1`).
+    /// With no name the compositor places it. Deliberately NOT "the one under
+    /// the cursor" — see docs/OVERLAY.md.
+    #[arg(long, value_name = "NAME")]
+    output: Option<String>,
+
+    /// How far off the bottom of that output, in logical pixels. Overrules the
+    /// position remembered in captions.json.
+    #[arg(long, value_name = "PX")]
+    margin: Option<i32>,
+
+    /// Draw for this many seconds and then leave. The one way to LOOK at the
+    /// layer surface on a real desktop without leaving something on it.
+    #[arg(long, value_name = "SECONDS")]
+    seconds: Option<f32>,
 
     /// Print the captions the daemon is producing, to stdout, and stop there.
     /// This is the half of the feature that does not depend on a headset at
@@ -134,6 +167,17 @@ fn render_once(args: &Args, out: &std::path::Path) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.desktop {
+        return desktop::run(desktop::Options {
+            socket: args.socket.clone(),
+            settings: args.settings.clone(),
+            output: args.output.clone(),
+            margin: args.margin,
+            font: args.font.clone(),
+            seconds: args.seconds,
+        });
+    }
 
     if args.feed {
         return feed::run(args.socket.as_deref(), args.turns);

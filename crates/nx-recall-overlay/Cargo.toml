@@ -16,3 +16,12 @@ serde_json.workspace = true
 openxr = "0.21"
 fontdue = "0.9"
 ash = "0.38"
+# The desktop path (`--desktop`). wlr-layer-shell, wl_shm and an EMPTY input
+# region — the one thing Electron cannot say on Wayland. 0.21 is the version
+# nx-wisp's layer surface is proven against on this KWin, pinned to match.
+smithay-client-toolkit = "0.21"
+wayland-client = "0.31"
+# poll(2), pipe2(2) and inotify, so the draw loop can sleep on three fds at
+# once. Already a workspace dependency; declaring it here also retires the
+# hand-rolled `getuid` in feed.rs.
+libc.workspace = true
