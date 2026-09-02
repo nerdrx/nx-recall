@@ -1,0 +1,18 @@
+[package]
+name = "nx-recall-overlay"
+description = "Live captions as an OpenXR overlay layer — and the probe that says whether this runtime can host one"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+# The OpenXR loader, and the extension set that carries `extx_overlay`. 0.21 is
+# generated against SDK 1.1 and already knows XR_EXTX_overlay's structure chain,
+# which is the whole reason this route is worth probing at all.
+openxr = "0.21"
+fontdue = "0.9"
+ash = "0.38"

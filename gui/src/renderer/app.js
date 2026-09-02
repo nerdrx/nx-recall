@@ -108,7 +108,11 @@ function go(name, arg = null) {
   if (!RAIL_VIEWS.has(name) && RAIL_VIEWS.has(currentName)) returnTo = currentName;
   currentName = name;
   currentArg = arg;
-  for (const btn of document.querySelectorAll('.rail-item')) {
+  // `.rail-item[data-view]` — the rail also carries an ACTION now (Captions),
+  // which opens a second window rather than swapping this one's contents. It
+  // has no view to be selected for, and stamping aria-selected="false" on a
+  // button that is not in the tablist would be a lie to a screen reader.
+  for (const btn of document.querySelectorAll('.rail-item[data-view]')) {
     btn.setAttribute('aria-selected', String(btn.dataset.view === name));
   }
   clear(main);
@@ -148,9 +152,34 @@ async function showThreadInTranscript(threadId) {
   return current?.focusThread?.(threadId) ?? null;
 }
 
-for (const btn of document.querySelectorAll('.rail-item')) {
+for (const btn of document.querySelectorAll('.rail-item[data-view]')) {
   btn.addEventListener('click', () => go(btn.dataset.view));
 }
+
+// ---------------------------------------------------------------------------
+// live captions — the rail's one non-navigating button (0.8.3)
+//
+// The state it reflects belongs to the MAIN process, because the window it
+// describes does: it can be opened from the tray or from a command line while
+// this view is not even mounted. So the button asks, and it is told.
+// ---------------------------------------------------------------------------
+
+const captionsBtn = document.getElementById('captions-btn');
+
+async function paintCaptionsBtn(open = null) {
+  const on = open ?? (await window.recall.captions.state()).open;
+  captionsBtn.setAttribute('aria-pressed', String(!!on));
+  captionsBtn.title = on
+    ? 'Captions are on screen. They float above everything and ignore the mouse until you say otherwise.'
+    : 'Put the last few turns on top of whatever you are doing, in large type.';
+}
+
+captionsBtn.addEventListener('click', async () => {
+  const on = await window.recall.captions.toggle();
+  await paintCaptionsBtn(on);
+  // The card in Sources shows the same fact, and may be mounted right now.
+  current?.update?.({ captions: true });
+});
 
 /** A search hit → the conversation it sits in. */
 async function jumpToSegment(seg) {
@@ -612,6 +641,13 @@ document.addEventListener('keydown', (e) => {
   go('transcript');
   renderFooter();
   renderBadges();
+  await paintCaptionsBtn().catch(() => {});
+  // A setting changed anywhere — this card, the tray's click-through item, the
+  // captions window being dragged. One broadcast, every surface.
+  window.recall.onCaptionSettings((next) => {
+    void paintCaptionsBtn();
+    current?.update?.({ captions: next });
+  });
 
   // Exposed for the headless driver only (scripts/headless_test.sh). It reads
   // and clicks the real DOM; this is just a handle onto the same model the UI
@@ -897,6 +933,28 @@ document.addEventListener('keydown', (e) => {
       text: (document.getElementById('brief-text') || {}).textContent ?? '',
       open: !!document.getElementById('brief-open'),
       dismiss: !!document.getElementById('brief-dismiss'),
+    }),
+    // 0.8.3, live captions. What this window can say about them: the rail
+    // button's state, and every control on the settings card with the value it
+    // is actually rendering — the driver moves the real sliders.
+    captions: () => ({
+      pressed: captionsBtn.getAttribute('aria-pressed'),
+      card: !!document.getElementById('captions-card'),
+      open: !!document.getElementById('captions-open'),
+      values: Object.fromEntries(
+        [...document.querySelectorAll('#captions-card [data-cap]')].map((el) => [
+          el.dataset.cap,
+          el.type === 'checkbox' || el.getAttribute('role') === 'switch'
+            ? el.getAttribute('aria-pressed') ?? String(el.checked)
+            : el.value,
+        ])
+      ),
+      shown: Object.fromEntries(
+        [...document.querySelectorAll('#captions-card [data-cap-value]')].map((el) => [
+          el.dataset.capValue,
+          el.textContent,
+        ])
+      ),
     }),
     // The one line behind the native-widget fix: without `color-scheme: dark`
     // Chromium draws <select> option popups light-on-light over this palette.

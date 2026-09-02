@@ -83,7 +83,7 @@ export function broadcast(channel, payload) {
   }
 }
 
-export function registerIpc({ request, setPaused, getState, showWindow, relaunch }) {
+export function registerIpc({ request, setPaused, getState, showWindow, relaunch, captions }) {
   ipcMain.handle('recall:request', async (_e, method, params) => {
     if (!ALLOWED.has(method)) return { ok: false, err: { code: 'refused', msg: `method ${method} is not exposed to the UI` } };
     try {
@@ -110,4 +110,17 @@ export function registerIpc({ request, setPaused, getState, showWindow, relaunch
     relaunch();
     return true;
   });
+
+  // Live captions (0.8.3). Also not protocol requests, for the same reason
+  // pause is not: every one of them is an act on a WINDOW — opening one,
+  // making it click-through, remembering how big it is — and the daemon has
+  // no opinion about any of it. The tray item, the rail button and
+  // `nx-recall --captions` all land on the same three functions, so the three
+  // surfaces can never disagree about whether the window is up.
+  ipcMain.handle('recall:captions:get', () => captions.get());
+  ipcMain.handle('recall:captions:set', (_e, patch) => captions.set(patch ?? {}));
+  ipcMain.handle('recall:captions:open', () => captions.open());
+  ipcMain.handle('recall:captions:close', () => captions.close());
+  ipcMain.handle('recall:captions:toggle', () => captions.toggle());
+  ipcMain.handle('recall:captions:state', () => ({ open: captions.isOpen(), settings: captions.get() }));
 }

@@ -1,0 +1,30 @@
+<!doctype html>
+<!--
+  Live captions. Stamped dark, unconditionally, and that is not an oversight:
+  every other surface in this app follows the OS because every other surface is
+  a page you look at. This one floats over somebody else's pixels — a game, a
+  call, a desktop — and light captions over a dark screen are a white slab in
+  the middle of it. DESIGN §14's two grounds are about pages; this is furniture.
+-->
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Same policy as the main window, minus the two things this page cannot
+         do: it plays no audio and shows no image, so media-src and img-src are
+         gone with them. connect-src is still 'none' — the only transport in
+         this app is the unix socket the main process owns. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NX Recall captions</title>
+    <link rel="stylesheet" href="./tokens.css" />
+    <link rel="stylesheet" href="./captions.css" />
+  </head>
+  <body class="captions-body">
+    <div class="cap-stack" id="cap-stack" aria-live="polite"></div>
+    <div class="cap-idle" id="cap-idle">waiting for speech…</div>
+    <script type="module" src="./captions.js"></script>
+  </body>
+</html>

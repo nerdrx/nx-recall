@@ -1261,3 +1261,43 @@ button.sp-num:focus-visible { outline: none; box-shadow: var(--clear-focus); }
   padding: 4px 11px; border-color: var(--clear-line); background: var(--clear-tile);
   color: var(--clear-ink); font-weight: 500;
 }
+
+/* ------------------------------------------------------ live captions (0.8.3) */
+
+/* The rail's one non-navigating button. It is separated from the tablist by a
+   hairline rather than by a gap, because a gap alone reads as a layout accident
+   and this really is a different KIND of control: the five above it change what
+   this window shows, and this one puts another window on top of your game. */
+.rail-actions {
+  margin-top: var(--sp-1);
+  padding-top: var(--sp-1);
+  border-top: 1px solid var(--clear-line);
+}
+/* Pressed, not selected. `aria-selected` belongs to the tablist and would make
+   a screen reader announce this as a sixth tab; the look is deliberately the
+   same, because to the eye it IS the same family of control. */
+.rail-item.rail-action[aria-pressed="true"] {
+  color: var(--violet);
+  background: var(--violet-soft);
+  border-color: var(--clear-line-accent);
+  box-shadow: inset 3px 0 0 var(--violet);
+}
+
+/* The settings card. One row per decision, label and hint on the left, the
+   control on the right, and the current value spelled out in mono — a slider
+   with no number on it is a slider you have to guess at. */
+.cap-row-ctl {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 10px 0; border-top: 1px solid var(--clear-line);
+}
+.cap-row-ctl:first-of-type { border-top: none; }
+.cap-row-ctl .spacer { flex: 1; }
+.cap-label { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.cap-label b { font-size: 13px; font-weight: 600; }
+.cap-label small { font-size: 11.5px; color: var(--clear-muted); }
+.cap-value {
+  font: 600 11.5px/1.6 var(--mono); color: var(--clear-muted);
+  min-width: 52px; text-align: right; flex: none;
+}
+.cap-range { flex: none; width: 180px; accent-color: var(--violet); cursor: pointer; }
+.cap-range:focus-visible { outline: none; box-shadow: var(--clear-focus); border-radius: var(--clear-r-chip); }

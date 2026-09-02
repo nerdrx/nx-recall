@@ -34,18 +34,36 @@ export function runE2E(deps) {
   };
   const js = (code) => win().webContents.executeJavaScript(code, true);
 
-  async function shot(name) {
+  /**
+   * The captions window (0.8.3), and JavaScript inside it.
+   *
+   * A second window means a second webContents, and every read the driver makes
+   * about the captions has to go through THIS one — asking the main window what
+   * the captions are showing would be asking the wrong process.
+   */
+  const capWin = () => {
+    const w = deps.captions?.window?.();
+    if (!w || w.isDestroyed()) throw new Error('no captions window');
+    return w;
+  };
+  const capJs = (code) => capWin().webContents.executeJavaScript(code, true);
+
+  async function shotOf(w, name) {
     // Software GL inside headless gamescope presents lazily: without waiting
     // for two real frames, capturePage hands back the PREVIOUS view and the
     // screenshots quietly document the wrong screen.
-    await js('new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))').catch(() => {});
-    win().webContents.invalidate?.();
+    await w.webContents
+      .executeJavaScript('new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))', true)
+      .catch(() => {});
+    w.webContents.invalidate?.();
     await sleep(500);
-    const img = await win().webContents.capturePage();
+    const img = await w.webContents.capturePage();
     const file = join(OUT, `${String(++shots).padStart(2, '0')}-${name}${SUFFIX}.png`);
     writeFileSync(file, img.toPNG());
     return file;
   }
+
+  const shot = (name) => shotOf(win(), name);
 
   async function step(name, fn) {
     const started = Date.now();
@@ -927,9 +945,12 @@ export function runE2E(deps) {
         `a stat rendered no value: ${JSON.stringify(p.strip)}`
       );
       assert(/conversation/.test(p.sub), `the page's subtitle does not summarise it: "${p.sub}"`);
-      // The rail has five items (Memory joined in 0.7.0) and none of them is
+      // The rail has five PLACES (Memory joined in 0.7.0) and none of them is
       // selected here: the person page is pushed state, not a place in the app.
-      const rail = await js('document.querySelectorAll(".rail-item").length');
+      // Counted by `[data-view]`, because 0.8.3 put an action in the rail as
+      // well — Captions opens another window rather than navigating this one,
+      // so it is not a sixth place and must not be counted as one.
+      const rail = await js('document.querySelectorAll(".rail-item[data-view]").length');
       const selected = await js('document.querySelectorAll(\'.rail-item[aria-selected="true"]\').length');
       assert(rail === 5, `the rail has ${rail} items, not the five it should`);
       assert(selected === 0, 'a rail item claims to be selected on the person page');
@@ -1077,7 +1098,7 @@ export function runE2E(deps) {
     // question was "when do the ai thing do thing? i dont see a tab for it?",
     // and this is the answer being there at all.
     await step('memory-is-the-fifth-rail-item', async () => {
-      const rail = await js('[...document.querySelectorAll(".rail-item")].map(b => b.dataset.view)');
+      const rail = await js('[...document.querySelectorAll(".rail-item[data-view]")].map(b => b.dataset.view)');
       assert(rail.length === 5, `the rail has ${rail.length} items: ${JSON.stringify(rail)}`);
       assert(rail.includes('memory'), `no Memory item in the rail: ${JSON.stringify(rail)}`);
       // Between Search and Sources: it is about what was said, not about what
@@ -1292,13 +1313,99 @@ export function runE2E(deps) {
       return { notes: moved.notes.length, states, flipped: open.id, file };
     });
 
+    // ---------------------------------------------------------------------
+    // 6s — live captions (0.8.3)
+    //
+    // A second window, opened through the SAME function the tray item calls:
+    // the step is about the path a person uses, not about a second path that
+    // exists for tests. It has to be up BEFORE the nudge below, because the
+    // thing it has to prove is what it does with a live feed — and the nudge is
+    // the one moment in this run where a live turn and a re-published archive
+    // row arrive together.
+    // ---------------------------------------------------------------------
+
+    await step('captions-open-on-top-of-everything', async () => {
+      deps.captions.open();
+      const w = await waitFor('the captions window', async () => deps.captions.window() ?? null);
+      if (w.webContents.isLoading()) await new Promise((r) => w.webContents.once('did-finish-load', r));
+      await waitFor('the captions window to seed itself', async () =>
+        capJs('!!window.__captionsDebug && window.__captionsDebug.seeded()').catch(() => false)
+      );
+
+      // The four facts that make it furniture rather than a window: it floats,
+      // it is not in the switcher, it has no frame, and the pointer goes
+      // straight through it into whatever is underneath.
+      assert(w.isAlwaysOnTop(), 'the captions window is not always on top');
+      assert(!w.isVisible() === false, 'the captions window is not visible');
+      const s = deps.captions.settings();
+      assert(s.clickThrough === true, 'captions are not click-through by default');
+
+      // The one hard rule of this surface: the ground is DARK on both of NX
+      // Clear's grounds, because captions float over somebody else's pixels and
+      // a light slab over a dark game is worse than no captions. Read as a
+      // computed colour, not as a class — a token nobody can see is not a rule.
+      const g = await capJs('window.__captionsDebug.ground()');
+      const rgb = /rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)/.exec(g.row);
+      assert(rgb, `the captions ground is not a colour: ${g.row}`);
+      const lum = (Number(rgb[1]) * 299 + Number(rgb[2]) * 587 + Number(rgb[3]) * 114) / 1000;
+      assert(lum < 40, `the captions ground is not dark (${g.row}, luma ${lum.toFixed(1)}) on the ${deps.theme?.().forced ?? 'system'} pass`);
+      assert(g.theme === 'dark', `the captions document is stamped "${g.theme}"`);
+
+      return { alwaysOnTop: w.isAlwaysOnTop(), settings: s, ground: g, luma: Number(lum.toFixed(1)) };
+    });
+
+    // The live feed itself, before the nudge: turns arrive, they are bounded by
+    // the `turns` setting, and the sibling `translation` track renders under
+    // the original rather than instead of it.
+    await step('captions-show-the-live-feed-and-nothing-else', async () => {
+      const rows = await waitFor(
+        'captions rows',
+        async () => {
+          const r = await capJs('window.__captionsDebug.rows()');
+          return r.length ? r : null;
+        },
+        { timeout: 20000 }
+      );
+      const turns = deps.captions.settings().turns;
+      assert(rows.length <= turns, `${rows.length} rows on screen for a ${turns}-turn setting`);
+      assert(rows.every((r) => r.text.length), 'a caption row has no words in it');
+      // Large type is the entire point of the surface.
+      assert(parseFloat(rows[0].size) >= 18, `captions are set at ${rows[0].size}`);
+
+      // The `translation` sibling track. The mock puts one on two canned lines,
+      // so it takes a lap of the feed to come round — and its absence on every
+      // other row is the other half of the contract.
+      const tr = await waitFor(
+        'a translated turn',
+        async () => {
+          const fed = await capJs(`(() => {
+            const rows = window.__captionsDebug.rows();
+            const one = rows.find((r) => r.translation);
+            return one ?? null;
+          })()`);
+          return fed;
+        },
+        { timeout: 45000 }
+      );
+      assert(tr.translation.includes('EN') || tr.translation.length > 0, `no translation rendered: ${JSON.stringify(tr)}`);
+      assert(tr.translation !== tr.text, 'the translation replaced the original instead of sitting under it');
+
+      const file = await shotOf(capWin(), 'captions');
+      return { rows: rows.length, turns, size: rows[0].size, translated: tr.translation.slice(0, 48), file };
+    });
+
     // A note arriving live goes to the TOP of the list — it is the newest thing
     // you said to yourself, and it is why you are looking. The mock delivers it
     // on the first SIGUSR2, because a note that turns up at second 19 of a run
     // lands in whatever step happens to be on screen and proves nothing.
     if (process.env.NX_RECALL_MOCK_PID) {
+      // When the nudge went out, so the captions step below can say how long it
+      // took rather than how long the driver took to get round to asking.
+      let nudgeAt = null;
+
       await step('a-note-arriving-live-goes-to-the-top', async () => {
         const before = await js('window.__recallDebug.accuracy()');
+        nudgeAt = Date.now();
         process.kill(Number(process.env.NX_RECALL_MOCK_PID), 'SIGUSR2');
         const after = await waitFor(
           'the new note',
@@ -1350,6 +1457,53 @@ export function runE2E(deps) {
         assert(view.lastDom === view.lastModel, `newest row on screen is ${view.lastDom}, the model says ${view.lastModel}`);
         assert(view.domInOrder, 'the rows on screen are not in time order');
         return { rows: view.rows.length, last: view.lastDom };
+      });
+
+      // The same two events, read from the OTHER window. This is the step the
+      // captions feature exists to survive: one SIGUSR2 delivered a turn that
+      // was said just now AND an archive row the re-decode worker re-published,
+      // and the caption bar has to show exactly one of them.
+      await step('captions-take-the-live-turn-and-refuse-the-archive-row', async () => {
+        const noteSaid = 'the portal in the stairwell only opens at night';
+        const row = await waitFor(
+          'the live turn in the captions',
+          async () => {
+            const rows = await capJs('window.__captionsDebug.rows()');
+            return rows.find((r) => r.text.includes(noteSaid)) ?? null;
+          },
+          { timeout: 8000 }
+        );
+        // Not "the driver found it in eight seconds" — when the window actually
+        // rendered it, measured from the instant the nudge went out.
+        const latency = row.at - nudgeAt;
+        assert(latency >= 0 && latency <= 2000, `the captions took ${latency} ms to show the live turn`);
+        // It came off the microphone, so it is the user's own voice: the one
+        // place violet is spent in that window.
+        assert(row.you, 'a turn from your own microphone is not marked as yours in the captions');
+
+        // And the archive row is not there — not on screen, and not even in the
+        // feed the window has been handed. `applyEvent` refuses it because this
+        // window seeded itself from the live tail first, which is the whole
+        // reason the seeding exists.
+        const headMs = await capJs('window.__captionsDebug.headMs()');
+        const fed = await capJs('window.__captionsDebug.fed()');
+        assert(headMs != null, 'the captions window never learned where the live window starts');
+        const stale = fed.filter((f) => f.t_ms < headMs);
+        assert(stale.length === 0, `re-published archive rows reached the captions: ${JSON.stringify(stale)}`);
+        const rows = await capJs('window.__captionsDebug.rows()');
+        assert(rows.every((r) => r.t_ms >= headMs), 'a caption on screen is older than the live window');
+
+        return { latency, fed: fed.length, rows: rows.length, headMs };
+      });
+
+      // …and it goes away again through the same toggle the tray offers.
+      await step('captions-close-from-the-same-place-they-opened', async () => {
+        deps.captions.close();
+        await sleep(400);
+        assert(deps.captions.window() == null, 'the captions window survived being closed');
+        const labels = deps.buildTrayMenu().items.map((i) => i.label).filter(Boolean);
+        assert(labels.some((l) => /^Captions$/.test(l)), `the tray no longer offers to open them: ${labels.join(' | ')}`);
+        return { labels };
       });
     }
 
@@ -2046,6 +2200,54 @@ export function runE2E(deps) {
       const file = await shot('sources');
       await js(`document.querySelector('[data-toggle="${key}"]').click()`); // put it back
       return { deniedBefore: denied, toggled: key, file };
+    });
+
+    // 12a2 — 0.8.3: the captions card. It is on THIS page because this page is
+    // already where the app's shape is decided — what it listens to, what it
+    // keeps — and a window that floats over everything is the same kind of
+    // decision. The step drives the real sliders and reads the value back out
+    // of the main process, because a setting that only exists in a renderer is
+    // a setting that is gone the next time the window is opened.
+    await step('the-captions-card-really-sets-the-captions', async () => {
+      const card = await waitFor('the captions card', async () => {
+        const c = await js('window.__recallDebug.captions()');
+        return c.card ? c : null;
+      });
+      const wanted = ['turns', 'size', 'hold_s', 'opacity', 'showYou', 'clickThrough'];
+      const missing = wanted.filter((k) => !(k in card.values));
+      assert(missing.length === 0, `the captions card has no control for ${missing.join(', ')}`);
+      assert(card.open, 'the captions card offers no way to put them on screen');
+      // The rail's own button is the third way in (tray, rail, --captions), and
+      // it reflects a window that can be opened from any of the other two.
+      assert(card.pressed === 'false' || card.pressed === 'true', `the rail button has no state: ${card.pressed}`);
+
+      // Move the real slider, the way a person does.
+      await js(`(() => {
+        const el = document.querySelector('#captions-card [data-cap="size"]');
+        el.value = "34";
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      })()`);
+      const took = await waitFor('the main process to take the new size', async () =>
+        deps.captions.settings().size === 34
+      );
+      assert(took, 'the size slider did not reach the main process');
+      // …and the card is showing the value it just set, in the units it set it
+      // in: a slider with no number on it is a slider you have to guess at.
+      const after = await js('window.__recallDebug.captions()');
+      assert(after.shown.size === '34 px', `the card reads "${after.shown.size}"`);
+
+      // The You switch is a real switch and it really flips.
+      await js('document.querySelector(\'#captions-card [data-cap="showYou"]\').click()');
+      await waitFor('the You switch', async () => deps.captions.settings().showYou === false);
+      await js('document.querySelector(\'#captions-card [data-cap="showYou"]\').click()');
+      await waitFor('the You switch back', async () => deps.captions.settings().showYou === true);
+
+      await js('document.getElementById("captions-card").scrollIntoView({ block: "start" })');
+      const file = await shot('sources-captions');
+      // Leave the size where the defaults had it, so the artefacts of a later
+      // pass are not a different size from this one's.
+      deps.captions.set({ size: 26 });
+      return { values: card.values, shown: after.shown, file };
     });
 
     // 12a — 0.6.1: what all of this costs on disk, broken into the four parts

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/recalld"]
+members = ["crates/recalld", "crates/nx-recall-overlay"]
 
 [workspace.package]
 version = "0.8.2"

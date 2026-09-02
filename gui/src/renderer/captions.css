@@ -1,0 +1,178 @@
+/* Live captions — the one surface in NX Recall that is not a page.
+ *
+ * Three rules, and everything here is one of them:
+ *
+ *  1. The ground is DEEP SPACE and it is dark on both of NX Clear's grounds
+ *     (captions.html says why). Its opacity is the user's, 0.3–0.9, because how
+ *     much of the game underneath you are willing to lose is not a decision this
+ *     app gets to make for you.
+ *  2. Violet is spent on exactly one thing: the dot on your own turn. §14.4's
+ *     "a spark, never a field" is strict here — everything else in view belongs
+ *     to somebody else's screen and a violet wash over it would be vandalism.
+ *  3. Nothing moves except opacity. The window is composited over a game at
+ *     whatever framerate that game is running at; a caption that animates its
+ *     geometry is a caption that stutters.
+ */
+
+:root {
+  /* Deep space, as an unpacked triple so the user's opacity can ride on it.
+     Not #000: a caption over a black letterbox needs to be a shape, and a hair
+     of violet in the ground is what keeps this recognisably NX rather than a
+     generic subtitle box. */
+  --cap-ground: 6, 4, 12;
+  --cap-opacity: 0.6;
+  --cap-size: 26px;
+  --cap-fade: 1;
+}
+
+/* tokens.css paints an opaque token ground on <body>, which is exactly right
+   for a page and exactly wrong for a transparent window: it would put a black
+   slab under the captions and the settable opacity would stop meaning anything.
+   The ground moves to the rows, where it belongs. */
+.captions-body {
+  background: transparent;
+  background-image: none;
+  overflow: hidden;
+  /* The window is click-through by default (main/captions.js). When it is not,
+     the whole surface drags — there is no title bar to grab and adding one
+     would put chrome in front of a game. */
+  -webkit-app-region: drag;
+  user-select: none;
+  cursor: default;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: 10px;
+  gap: 6px;
+}
+
+.cap-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* The stack fades as one thing: a bar where the top line has already gone
+     while the one under it is still solid reads as a rendering fault, not as a
+     conversation ending. See visibleCaptions() in lib/captions.js. */
+  opacity: var(--cap-fade, 1);
+  transition: opacity 240ms linear;
+}
+
+.cap-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px 14px;
+  align-items: baseline;
+  padding: 8px 14px;
+  border-radius: var(--clear-r-card);
+  /* --cap-ground is the deep-space ground; --cap-opacity is the user's. */
+  background: rgba(var(--cap-ground), var(--cap-opacity, 0.6));
+  /* One hairline, because on a ground this dark a shadow has nothing to fall
+     on (§14.1, amended) — and because a caption over a bright game needs an
+     edge or it reads as a smudge. */
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  opacity: var(--cap-dim, 1);
+}
+
+.cap-who {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  /* A name is a label on a caption, not a caption: it stays legible and small
+     however large the words themselves are set. */
+  font-size: max(11px, calc(var(--cap-size, 26px) * 0.44));
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.cap-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: currentColor;
+  flex: none;
+}
+
+/* Your own voice. The one place violet is spent in this window, and it is a
+   ring on a 9px dot — the same mark the transcript uses, for the same reason:
+   the label came from where the audio arrived rather than from a guess. */
+.cap-row.you .cap-dot {
+  box-shadow: 0 0 0 2px rgba(var(--cap-ground), 1), 0 0 0 3px var(--violet);
+}
+
+.cap-text {
+  font-size: var(--cap-size, 26px);
+  line-height: 1.28;
+  color: #f4f3f8;
+  overflow-wrap: anywhere;
+}
+
+/* The second decoder disagreed. The same claim the transcript makes and, on
+   purpose, the same treatment — muted and italic — so the mark is one
+   vocabulary across the app rather than two coincidences. The "≈" travels with
+   it because at this size the italic alone is easy to miss over a moving
+   background. */
+.cap-row.shaky .cap-text {
+  color: #b9b4c9;
+  font-style: italic;
+}
+.cap-mark {
+  font-style: normal;
+  font-weight: 700;
+  color: #8f8aa0;
+  margin-right: 0.4em;
+  cursor: help;
+}
+
+/* A turn whose SPEAKER the pipeline would not claim. Only the name is hedged —
+   the words are still the words, and muting them too would say the sentence is
+   in doubt when only the person is. */
+.cap-row.uncertain .cap-who {
+  color: #8f8aa0;
+  font-style: italic;
+  font-weight: 550;
+}
+
+/* The sibling translation track, when a turn carries one. Under the original,
+   never instead of it: the point is that you can see what was actually said and
+   what it means, and a caption that silently replaced one with the other would
+   be the app putting words in somebody's mouth. */
+.cap-tr {
+  grid-column: 2;
+  margin-top: 2px;
+  font-size: calc(var(--cap-size, 26px) * 0.78);
+  line-height: 1.25;
+  font-weight: 350;
+  color: #c8c3d6;
+  overflow-wrap: anywhere;
+}
+.cap-tr-lang {
+  font-size: max(9px, calc(var(--cap-size, 26px) * 0.34));
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #8f8aa0;
+  margin-right: 0.55em;
+}
+
+/* Nothing has been said yet. It is shown only while the stack is empty, and it
+   is deliberately faint: an empty caption bar with a bright label in it is a
+   worse thing to have on top of a game than an empty caption bar. */
+.cap-idle {
+  align-self: flex-start;
+  padding: 6px 12px;
+  border-radius: var(--clear-r-chip);
+  background: rgba(var(--cap-ground), var(--cap-opacity, 0.6));
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  color: #8f8aa0;
+  font-size: 12px;
+}
+.cap-idle[hidden] {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cap-stack {
+    transition: none;
+  }
+}
