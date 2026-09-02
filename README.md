@@ -302,6 +302,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.8.1 | +83h | the afternoon-after check: one-word rows get no verdict, re-decodes keep the words they replace, the flag re-measured on real audio |
 | 0.8.2 | +84h | yesterday stops landing under now: a re-published archive row is history, not an arrival |
 | 0.9.0 | +92h | ground truth from Discord, the night shift on the GPU, captions, reminders, digests, translation; azimuth and the glossary re-read measured and parked; the quarterly model refresh says keep v3 |
+| 0.9.1 | +93h | `models build-night` fetches the Khronos headers a desktop with a working driver still lacks, and the runtime it installs finds its own libraries |
 
 ## Quickstart
 

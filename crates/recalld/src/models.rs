@@ -179,6 +179,10 @@ pub const NIGHT_MODEL_FILE: &str = "ggml-large-v3-q5_0.bin";
 /// other asset's bytes: a build recipe that follows a moving branch is not a
 /// pinned dependency, it is a hope.
 pub const NIGHT_WHISPER_TAG: &str = "v1.9.3";
+/// Header-only Khronos repos the Vulkan build needs when the distribution has
+/// the driver but not the development headers. One SDK release, pinned.
+pub const NIGHT_VULKAN_HEADERS_TAG: &str = "v1.4.313";
+pub const NIGHT_SPIRV_HEADERS_TAG: &str = "vulkan-sdk-1.4.313.0";
 /// Where the built runtime goes, under the models root.
 pub const NIGHT_DIR: &str = "whisper";
 

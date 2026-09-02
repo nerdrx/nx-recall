@@ -1202,10 +1202,117 @@ fn cmd_build_night(
         .arg(&build)
         .arg("-DCMAKE_BUILD_TYPE=Release")
         .arg("-DWHISPER_BUILD_TESTS=OFF")
-        .arg("-DWHISPER_BUILD_SERVER=OFF");
+        .arg("-DWHISPER_BUILD_SERVER=OFF")
+        // The binary and its .so files are copied into one flat directory and
+        // opened from there for years; a build-tree RUNPATH would point at a
+        // directory that no longer exists after the next `--force`.
+        .arg("-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON")
+        .arg("-DCMAKE_INSTALL_RPATH=$ORIGIN")
+        .arg("-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON");
     match backend {
         NightBackend::Vulkan => {
             configure.arg("-DGGML_VULKAN=ON");
+            // ggml-vulkan needs three things a desktop with a working Vulkan
+            // driver still does not necessarily have: the Vulkan HEADERS, the
+            // SPIRV headers (which it #includes directly, so they must be on
+            // the compiler's include path, not merely findable by cmake), and
+            // `glslc`. The user's machine had the driver and glslc and neither
+            // header set, and cmake's answer was "Could NOT find Vulkan". The
+            // two header repos are header-only and pinned to one SDK release,
+            // so they are cloned beside the source rather than demanded of the
+            // distribution.
+            let glslc = ["/usr/bin/glslc", "/usr/local/bin/glslc"]
+                .iter()
+                .map(Path::new)
+                .find(|p| p.is_file());
+            if glslc.is_none() {
+                anyhow::bail!(
+                    "the Vulkan build needs `glslc` (the shaderc package) and it is not installed"
+                );
+            }
+            if !Path::new("/usr/include/vulkan/vulkan.h").is_file() {
+                let deps = src.join("deps");
+                std::fs::create_dir_all(&deps)?;
+                let vk = deps.join("Vulkan-Headers");
+                let spv = deps.join("SPIRV-Headers");
+                for (dir, tag, url) in [
+                    (
+                        &vk,
+                        models::NIGHT_VULKAN_HEADERS_TAG,
+                        "https://github.com/KhronosGroup/Vulkan-Headers.git",
+                    ),
+                    (
+                        &spv,
+                        models::NIGHT_SPIRV_HEADERS_TAG,
+                        "https://github.com/KhronosGroup/SPIRV-Headers.git",
+                    ),
+                ] {
+                    if !dir.join(".git").is_dir() {
+                        run_step(
+                            &format!(
+                                "fetching {} @ {tag}",
+                                dir.file_name().unwrap().to_string_lossy()
+                            ),
+                            Proc::new("git")
+                                .arg("clone")
+                                .arg("--depth")
+                                .arg("1")
+                                .arg("--branch")
+                                .arg(tag)
+                                .arg(url)
+                                .arg(dir),
+                        )?;
+                    }
+                }
+                let libvulkan = [
+                    "/usr/lib/libvulkan.so",
+                    "/usr/lib/libvulkan.so.1",
+                    "/usr/lib64/libvulkan.so.1",
+                    "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+                ]
+                .iter()
+                .map(Path::new)
+                .find(|p| p.is_file())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no libvulkan.so on this machine — install the Vulkan loader first"
+                    )
+                })?;
+                // ggml-vulkan `find_package(SPIRV-Headers)`s, which wants the
+                // repo's cmake package INSTALLED somewhere, not merely checked
+                // out. Header-only, so the install is a copy.
+                let spv_prefix = deps.join("spirv-install");
+                if !spv_prefix
+                    .join("include/spirv/unified1/spirv.hpp")
+                    .is_file()
+                {
+                    run_step(
+                        "configuring SPIRV-Headers",
+                        Proc::new("cmake")
+                            .arg("-S")
+                            .arg(&spv)
+                            .arg("-B")
+                            .arg(spv.join("build"))
+                            .arg(format!("-DCMAKE_INSTALL_PREFIX={}", spv_prefix.display()))
+                            .arg("-DSPIRV_HEADERS_ENABLE_TESTS=OFF"),
+                    )?;
+                    run_step(
+                        "installing SPIRV-Headers",
+                        Proc::new("cmake").arg("--install").arg(spv.join("build")),
+                    )?;
+                }
+                configure
+                    .arg(format!(
+                        "-DVulkan_INCLUDE_DIR={}",
+                        vk.join("include").display()
+                    ))
+                    .arg(format!("-DVulkan_LIBRARY={}", libvulkan.display()))
+                    .arg(format!("-DCMAKE_PREFIX_PATH={}", spv_prefix.display()))
+                    .arg(format!(
+                        "-DCMAKE_CXX_FLAGS=-I{}",
+                        spv_prefix.join("include").display()
+                    ));
+            }
         }
         NightBackend::Hip => {
             // hipBLAS and rocBLAS, which are a separate and much larger install
