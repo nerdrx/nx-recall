@@ -1003,6 +1003,12 @@ export function runE2E(deps) {
       // not document it.
       await js('document.getElementById("person-threads").scrollIntoView({block: "end"})');
       const listShot = await shot('person-conversations');
+      // 0.9.2: the same Replay affordance the transcript's separators carry.
+      // One feature reached from four places, not four features.
+      assert(
+        (await js('document.querySelectorAll("#thread-list .thread-replay").length')) > 0,
+        'a recent conversation offers no way to play it back'
+      );
 
       await js(`document.querySelector('#thread-list [data-thread="${thread.id}"]').click()`);
       await waitFor('the transcript to mount', async () => js('window.__recallDebug.view() === "transcript"'));
@@ -1043,6 +1049,153 @@ export function runE2E(deps) {
       await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
       await waitFor('the speaker list again', async () => js('document.querySelectorAll("#speaker-list .sp-row").length > 0'));
       return { separators: t.separators.slice(0, 3) };
+    });
+
+    // 6m3 — conversation replay (0.9.2). The whole feature in one pass: it
+    // starts from the boundary that names the conversation, the bar appears,
+    // the playhead reads THROUGH a turn whose audio retention took rather than
+    // skipping it, pause holds it, the rate moves it, and a second replay takes
+    // the sound off the first. Thread 502 is the mock's mixed conversation —
+    // one turn from the aged-out voice, four that still sound.
+    await step('a-conversation-replays-from-its-separator', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      await waitFor('the transcript', async () => js('window.__recallDebug.view() === "transcript"'));
+      const sel = '.thread-sep[data-thread="502"] .replay-start';
+      await waitFor('a Replay affordance on a conversation boundary', async () =>
+        js(`!!document.querySelector('${sel}')`)
+      );
+      await js(`document.querySelector('${sel}').click()`);
+
+      const bar = await waitFor('the replay bar', async () => {
+        const r = await js('window.__recallDebug.replay()');
+        return r.shown && r.ticks.length ? r : null;
+      });
+      assert(bar.who, 'the bar names nobody');
+      assert(/\d\d:\d\d/.test(bar.clock), `the bar has no clock: "${bar.clock}"`);
+      assert(bar.rateLabel === '1×', `the bar did not start at 1×, it started at ${bar.rateLabel}`);
+      // The mixed conversation, and the one sentence that explains it. Said for
+      // the conversation, not for each row it is true of.
+      const gone = bar.ticks.filter((t) => t.gone);
+      assert(gone.length > 0, 'no turn in this conversation lost its audio — the mock must mix both');
+      assert(gone.length < bar.ticks.length, 'every turn lost its audio — that is not a mix');
+      assert(/retention/i.test(bar.note), `the bar never said why a turn is silent: "${bar.note}"`);
+
+      // The transcript follows: a row is lit, and it is the turn the bar names.
+      const first = await waitFor('a lit row', async () => {
+        const r = await js('window.__recallDebug.replay()');
+        return r.row ? r : null;
+      });
+      assert(
+        String(first.row) === String(first.turns[first.index].id),
+        `the lit row is ${first.row}, the playhead is on ${first.turns[first.index].id}`
+      );
+      const startedGone = !first.turns[first.index].has_audio;
+
+      // Rule 1: the silent turn is READ THROUGH — the playhead leaves it on its
+      // own, without anybody pressing anything, and lands on a turn that sounds.
+      const moved = await waitFor(
+        'the playhead to advance past the first turn',
+        async () => {
+          const r = await js('window.__recallDebug.replay()');
+          return r.index > first.index ? r : null;
+        },
+        { timeout: 20000 }
+      );
+      assert(String(moved.row) !== String(first.row), 'the lit row did not move with the playhead');
+      // Photographed here rather than on the first frame: the point of the
+      // picture is the bar AND the row it has scrolled the transcript to.
+      const shot1 = await shot('replay');
+
+      // Pause holds it where it is; resume carries on from there.
+      await js('document.getElementById("replay-play").click()');
+      const paused = await waitFor('the bar to say paused', async () => {
+        const r = await js('window.__recallDebug.replay()');
+        return r.phase === 'paused' ? r : null;
+      });
+      assert(paused.playLabel === 'Play', `a paused bar offers "${paused.playLabel}"`);
+      await sleep(1200);
+      const still = await js('window.__recallDebug.replay()');
+      assert(still.index === paused.index, 'the playhead moved while it was paused');
+      assert(still.audioPaused !== false, 'the element kept playing through a pause');
+      await js('document.getElementById("replay-play").click()');
+      const resumed = await waitFor('the bar to leave paused', async () => {
+        const r = await js('window.__recallDebug.replay()');
+        return r.phase !== 'paused' ? r : null;
+      });
+
+      // The rate control moves both the element and the silences.
+      await js('document.getElementById("replay-rate").click()');
+      const faster = await js('window.__recallDebug.replay()');
+      assert(faster.rate > 1, `the rate button did not change the rate (${faster.rateLabel})`);
+      assert(
+        faster.audioRate === null || faster.audioRate === faster.rate,
+        `the element is at ${faster.audioRate}× while the bar says ${faster.rate}×`
+      );
+
+      // A second replay takes the sound from the first. This one comes in
+      // through the controller — the route a digest, a person page and a search
+      // hit all use — so the two entry shapes are both exercised.
+      await js('window.__recallDebug.startReplay(503)');
+      const second = await waitFor('the second conversation', async () => {
+        const r = await js('window.__recallDebug.replay()');
+        return r.thread === 503 ? r : null;
+      });
+      assert(second.shown, 'the second replay never raised a bar');
+      assert(second.index === 0, 'the second replay inherited the first one\'s playhead');
+
+      // Closing puts the bar away and takes the highlight with it.
+      await js('document.getElementById("replay-close").click()');
+      const closed = await waitFor('the bar to close', async () => {
+        const r = await js('window.__recallDebug.replay()');
+        return !r.shown ? r : null;
+      });
+      assert(!closed.active, 'the engine is still replaying with no bar on screen');
+      assert(closed.row === null, 'a row is still lit after the replay closed');
+      assert(closed.audioPaused !== false, 'a closed replay is still making a sound');
+
+      return {
+        thread: 502,
+        turns: bar.ticks.length,
+        gone: gone.length,
+        startedGone,
+        note: bar.note,
+        advancedTo: moved.index,
+        resumedPhase: resumed.phase,
+        rate: faster.rateLabel,
+        second: second.thread,
+        affordances: bar.rowsWithButton,
+        file: shot1,
+      };
+    });
+
+    // 6m4 — the same one affordance on the other surfaces. It is one feature
+    // reached four ways, and a Replay that exists only in the transcript would
+    // make it a transcript feature. (The person page's is asserted in
+    // `a-conversation-opens-in-the-transcript` and the search hit's in
+    // `search-and-jump`, where those views are already open.)
+    await step('replay-is-offered-wherever-a-conversation-is-named', async () => {
+      const where = {};
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      where.separators = await waitFor('separator affordances', async () =>
+        js('document.querySelectorAll(".thread-sep .replay-start").length')
+      );
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      where.digests = await waitFor(
+        'digest replay affordances',
+        async () => js('document.querySelectorAll(".digest-row .digest-replay").length'),
+        { timeout: 15000 }
+      );
+      // Back where the later steps expect to be.
+      await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
+      await waitFor('the speaker list again', async () =>
+        js('document.querySelectorAll("#speaker-list .sp-row").length > 0')
+      );
+      assert(where.separators > 0, 'no conversation boundary offers a replay');
+      assert(where.digests > 0, 'no digest offers a replay');
+      // The person page's and the search hit's are asserted where those views
+      // are already open — driving the search box from here left a query behind
+      // that the "one query box" step then had to undo.
+      return where;
     });
 
     // 6m2 — audit finding #18: the person page was frozen at mount. Everything
@@ -2016,11 +2169,16 @@ export function runE2E(deps) {
         return n > 0 ? n : null;
       });
       const facets = await js('document.querySelectorAll(".facets .facet").length');
+      // 0.9.2: a hit offers to replay the conversation it came out of, from
+      // this line. Only where the row was threaded, so it is a count and not
+      // one-per-hit.
+      const replayable = await js('document.querySelectorAll("#search-results .seg .hit-replay").length');
+      assert(replayable > 0, 'no search hit offers to replay the conversation it sits in');
       const file = await shot('search');
       await js('document.querySelector("#search-results .seg").click()');
       await waitFor('the transcript to take focus', async () => js('window.__recallDebug.view() === "transcript"'));
       const marked = await waitFor('the hit to be marked', async () => js('!!document.querySelector("#seg-list .seg.hit")'));
-      return { hits, facets, marked, file };
+      return { hits, facets, replayable, marked, file };
     });
 
     await step('shot-search-jump', async () => ({ file: await shot('search-jump') }));

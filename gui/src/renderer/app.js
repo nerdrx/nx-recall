@@ -24,6 +24,7 @@ import {
 import { patchSpeakerLabels } from './lib/labels.js';
 import { toast } from './lib/sheets.js';
 import { stop as stopPreview, playbackState } from './lib/preview.js';
+import * as replay from './lib/replay.js';
 import * as transcriptView from './views/transcript.js';
 import * as speakersView from './views/speakers.js';
 import * as searchView from './views/search.js';
@@ -66,6 +67,8 @@ const ctx = {
   showSpeakerInTranscript,
   openPerson,
   showThreadInTranscript,
+  // 0.9.2: the same jump, but playing. Four surfaces reach it.
+  replayThread,
   back,
   toast,
   resync,
@@ -101,7 +104,11 @@ function repaintAll() {
 
 function go(name, arg = null) {
   if (!VIEWS[name]) return;
-  // Leaving a view takes its stop button off screen, so it takes the sound too.
+  // Leaving a view takes its stop button off screen, so it takes the sound too
+  // — the row preview and, since 0.9.2, a conversation replay. The bar lives in
+  // the transcript and a replay you cannot see or stop is a replay that has got
+  // away from you.
+  replay.close();
   stopPreview();
   // …and any menu it left hanging over a row that is about to stop existing.
   current?.closeMenu?.();
@@ -152,6 +159,30 @@ async function showThreadInTranscript(threadId) {
   mergeSegments(rows);
   go('transcript');
   return current?.focusThread?.(threadId) ?? null;
+}
+
+/**
+ * A conversation → the transcript, positioned on it AND playing (0.9.2).
+ *
+ * Deliberately the same route as `showThreadInTranscript`: the rows are merged
+ * first so the player has something to light, and the landing is identical.
+ * Replay is a way of reading the transcript, not a second place to be.
+ *
+ * `from` is a segment id to start on, which is what a search hit passes: you
+ * searched for a line, so the conversation starts from that line.
+ */
+async function replayThread(threadId, { from = null } = {}) {
+  let rows = [];
+  try {
+    const res = await ask('thread.get', { id: threadId });
+    rows = res.segments ?? [];
+  } catch (e) {
+    toast(`Could not open that conversation — ${e.message}`, 'error');
+    return null;
+  }
+  mergeSegments(rows);
+  go('transcript');
+  return (await current?.startReplay?.(threadId, { from })) ?? null;
 }
 
 for (const btn of document.querySelectorAll('.rail-item[data-view]')) {
@@ -554,6 +585,11 @@ function renderBadges() {
 
 window.recall.onState((st) => {
   applyConnState(st);
+  // A replay is a stream of `segments.audio` calls, so a daemon that has gone
+  // away means the next turn cannot arrive — and a bar that keeps counting over
+  // a dead socket is claiming to play a conversation it cannot fetch. It stops,
+  // and the footer already says why.
+  if (store.conn.status !== 'connected') replay.close();
   renderPause();
   renderUpdateBar();
   renderFooter();
@@ -1074,6 +1110,21 @@ document.addEventListener('keydown', (e) => {
         },
       };
     },
+    // Conversation replay (0.9.2): the engine's state, the bar the transcript
+    // drew from it, and the row it lit. One read, because the whole feature is
+    // "these three agree".
+    replay: () => ({
+      ...(current?.replayUi?.() ?? { ...replay.replayState(), shown: false }),
+      view: currentName,
+      // The one sound in the app, shared with the row preview: if this says
+      // playing while the bar says closed, they have come apart.
+      audioPaused: window.__recallAudio ? window.__recallAudio.paused : null,
+      audioRate: window.__recallAudio ? window.__recallAudio.playbackRate : null,
+    }),
+    startReplay: (thread, opts) => replayThread(thread, opts ?? {}),
+    replayToggle: () => replay.toggle(),
+    replayRate: (r) => replay.setRate(r),
+    replayClose: () => replay.close(),
     // Voice preview: the driver asserts against the real <audio> element, not
     // against the UI's opinion of it.
     audio: () => {

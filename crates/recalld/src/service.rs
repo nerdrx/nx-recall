@@ -290,6 +290,7 @@ impl Service {
             "speakers.sample" => self.speakers_sample(req),
             "person.get" => self.person_get(req),
             "thread.get" => self.thread_get(req),
+            "replay.get" => crate::replay::get(&self.store(), &self.control.data_dir, req),
             // The memory graph's Tiers 2 and 3 (0.7.0, docs/GRAPH.md).
             "graph.summary" => self.graph_summary(),
             "graph.get" => self.graph_get(),

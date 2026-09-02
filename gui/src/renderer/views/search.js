@@ -434,7 +434,36 @@ export function mount(root, ctx) {
         // Only in Both: in the single-leg modes every row arrived the same way
         // and a badge on all of them says nothing.
         modeId === 'both' ? viaBadge(seg.via) : null,
-        h('span', { class: 'chip', text: seg.source ?? 'unknown' })
+        h('span', { class: 'chip', text: seg.source ?? 'unknown' }),
+        // A hit is one line out of a conversation, and the question behind
+        // clicking it is usually "what was going on there". This plays that
+        // conversation FROM THIS LINE — not from the top, because the line is
+        // what you searched for. Only where the daemon threaded the turn: a row
+        // older than threading has no conversation to play.
+        seg.thread != null
+          ? h(
+              'span',
+              {
+                class: 'btn small replay-start hit-replay',
+                role: 'button',
+                tabindex: '0',
+                dataset: { replay: String(seg.thread), from: String(seg.id) },
+                title: 'Play this conversation back from this line',
+                'aria-label': 'Replay this conversation from this line',
+                onclick: (e) => {
+                  e.stopPropagation();
+                  void ctx.replayThread?.(seg.thread, { from: seg.id });
+                },
+                onkeydown: (e) => {
+                  if (e.key !== 'Enter' && e.key !== ' ') return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  void ctx.replayThread?.(seg.thread, { from: seg.id });
+                },
+              },
+              'Replay'
+            )
+          : null
       )
     );
     const jump = () => ctx.jumpToSegment(seg);

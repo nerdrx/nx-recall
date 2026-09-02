@@ -39,6 +39,9 @@ import { separatorWalker } from '../lib/seams.js';
 import { shakyMark } from '../lib/marks.js';
 import { openSheet, toast } from '../lib/sheets.js';
 import { play, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
+// Conversation replay (0.9.2). The engine is in lib/replay.js and holds no DOM;
+// this view owns the bar it draws and the row it lights.
+import * as replay from '../lib/replay.js';
 
 export const id = 'transcript';
 
@@ -60,6 +63,12 @@ export function mount(root, ctx) {
   // span rather than hiding everything else, because the point of arriving at a
   // conversation is to see it in the evening it happened in.
   let highlightThread = null;
+  // The turn conversation replay is on, so a repaint of the rows under a
+  // running replay does not lose the lit row.
+  let replayingSeg = null;
+  // Whether this replay has already put its first turn on screen. See
+  // `paintReplay`: arriving scrolls differently from following.
+  let replayArrived = false;
 
   const following = () => store.window.following;
 
@@ -183,7 +192,95 @@ export function mount(root, ctx) {
   const top = h('div', { class: 'seg-top' }, capNote, loader, beginMark);
   card.prepend(top);
 
-  root.append(head, body);
+  // -------------------------------------------------------------------------
+  // the replay bar (0.9.2)
+  //
+  // Pinned between the header and the rows rather than floating over them: the
+  // whole point of replay is that you are READING along, and a bar over the
+  // bottom of the transcript would cover the words it is playing. It exists
+  // only while a conversation is playing and takes no space otherwise.
+  // -------------------------------------------------------------------------
+
+  const ICON_PLAY = '<path d="M7 4l12 8-12 8z"></path>';
+  const ICON_PAUSE = '<rect x="6" y="5" width="4" height="14"></rect><rect x="14" y="5" width="4" height="14"></rect>';
+
+  const rIco = h('span', { class: 'replay-ico', 'aria-hidden': 'true' });
+  const rPlay = h(
+    'button',
+    { class: 'btn small primary replay-play', id: 'replay-play', onclick: () => replay.toggle() },
+    rIco
+  );
+  const rPrev = h(
+    'button',
+    { class: 'btn small', id: 'replay-prev', title: 'The turn before', 'aria-label': 'Previous turn', onclick: () => replay.prev() },
+    '‹'
+  );
+  const rNext = h(
+    'button',
+    { class: 'btn small', id: 'replay-next', title: 'The next turn', 'aria-label': 'Next turn', onclick: () => replay.next() },
+    '›'
+  );
+  const rRate = h('button', {
+    class: 'btn small replay-rate',
+    id: 'replay-rate',
+    title: 'Playback speed',
+    onclick: () => replay.cycleRate(),
+  });
+  const rWho = h('span', { class: 'replay-who', id: 'replay-who' });
+  const rClock = h('span', { class: 'replay-clock', id: 'replay-clock' });
+  const rScrub = h('div', {
+    class: 'replay-scrub',
+    id: 'replay-scrub',
+    role: 'group',
+    'aria-label': 'The turns in this conversation',
+  });
+  // Rule 1, said once for the whole conversation rather than on every row it
+  // is true of. Hidden entirely when every turn still has its audio.
+  const rNote = h('div', { class: 'replay-note', id: 'replay-note', hidden: true });
+  const rClose = h('button', {
+    class: 'btn small',
+    id: 'replay-close',
+    title: 'Stop replaying',
+    'aria-label': 'Stop replaying',
+    onclick: () => replay.close(),
+  });
+  rClose.textContent = '✕';
+
+  const replayBar = h(
+    'div',
+    {
+      class: 'replay-bar',
+      id: 'replay-bar',
+      hidden: true,
+      tabindex: '0',
+      role: 'group',
+      'aria-label': 'Conversation replay',
+      // Space plays and pauses, the arrows step. Only while the bar itself has
+      // focus — the transcript's rows are buttons and space means "open this
+      // one" on them, and stealing that would be worse than no shortcut.
+      onkeydown: (e) => {
+        if (e.target !== replayBar) return;
+        if (e.key === ' ' || e.key === 'Spacebar') {
+          e.preventDefault();
+          replay.toggle();
+        } else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+          e.preventDefault();
+          replay.next();
+        } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          replay.prev();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          replay.close();
+        }
+      },
+    },
+    h('div', { class: 'replay-controls' }, rPrev, rPlay, rNext, h('span', { class: 'replay-label' }, rWho, rClock), h('span', { class: 'spacer' }), rRate, rClose),
+    rScrub,
+    rNote
+  );
+
+  root.append(head, replayBar, body);
   body.addEventListener('scroll', onScroll, { passive: true });
 
   // -- rendering ------------------------------------------------------------
@@ -263,7 +360,34 @@ export function mount(root, ctx) {
     return h(
       'div',
       { class: 'thread-sep', dataset: { thread: String(seg.thread) } },
-      h('span', { class: 'thread-sep-label', text: names.length ? names.join(' · ') : 'another conversation' })
+      h('span', { class: 'thread-sep-label', text: names.length ? names.join(' · ') : 'another conversation' }),
+      // The boundary is the one place in the transcript that names a whole
+      // conversation, so it is where "play it back" belongs. Quiet until the
+      // hairline is hovered or focused: a row of buttons down the page would
+      // be louder than the separators themselves.
+      replayButton(seg.thread, { className: 'thread-sep-replay' })
+    );
+  }
+
+  /**
+   * The one affordance, wherever a conversation is named. Same element and same
+   * sentence from a separator, a digest, a person page and a search hit — four
+   * routes to one thing, which is what stops it reading as four features.
+   */
+  function replayButton(threadId, { className = '' } = {}) {
+    return h(
+      'button',
+      {
+        class: `btn small replay-start ${className}`.trim(),
+        dataset: { replay: String(threadId) },
+        title: 'Play this conversation back, turn by turn',
+        'aria-label': 'Replay this conversation',
+        onclick: (e) => {
+          e.stopPropagation();
+          void startReplay(threadId);
+        },
+      },
+      'Replay'
     );
   }
 
@@ -290,7 +414,7 @@ export function mount(root, ctx) {
     const row = h('div', {
       class: `seg${uncertain ? ' uncertain' : ''}${shaky ? ' shaky' : ''}${mine ? ' you' : ''}${isNew ? ' new' : ''}${seg.corrected ? ' corrected' : ''}${
         highlightThread != null && seg.thread === highlightThread ? ' in-thread' : ''
-      }`,
+      }${replayingSeg === seg.id ? ' replaying' : ''}`,
       dataset: { seg: String(seg.id), ...(seg.thread != null ? { thread: String(seg.thread) } : {}) },
       role: 'button',
       tabindex: '0',
@@ -696,9 +820,130 @@ export function mount(root, ctx) {
     if (change.status || change.conn) refreshLiveChip();
   }
 
+  // -------------------------------------------------------------------------
+  // painting the replay
+  // -------------------------------------------------------------------------
+
+  /**
+   * Start replaying a conversation. Called from the separator's own button and,
+   * through the controller, from a digest, a person page and a search hit.
+   *
+   * The thread's span is marked the same way arriving at it from a person page
+   * marks it — you are here to read this conversation either way — and the rows
+   * are assumed to be resident, because every route into this merges them
+   * first (app.js `showThreadInTranscript`).
+   */
+  async function startReplay(threadId, { from = null } = {}) {
+    leaveTheTail();
+    highlightThread = Number(threadId);
+    setFilter(null);
+    const res = await replay.start(Number(threadId), { from });
+    if (!res.ok) {
+      toast(replay.startError(res.error), 'error');
+      return null;
+    }
+    replayBar.focus({ preventScroll: true });
+    return res;
+  }
+
+  function paintReplay(rs) {
+    const on = !!rs?.active;
+    replayBar.hidden = !on;
+    // While a replay is running the thread's OWN mark steps back to a rail, so
+    // the one tinted row in the list is the one being said. Two rows painted
+    // the same colour for two different reasons is the same as no mark at all.
+    list.classList.toggle('replaying', on);
+    const wasSeg = replayingSeg;
+    replayingSeg = on ? (rs.turns[rs.index]?.id ?? null) : null;
+    if (wasSeg !== replayingSeg) {
+      for (const el of list.querySelectorAll('.seg.replaying')) el.classList.remove('replaying');
+      if (replayingSeg != null) {
+        const row = list.querySelector(`.seg[data-seg="${replayingSeg}"]`);
+        if (row) {
+          row.classList.add('replaying');
+          // Arriving is a JUMP and following is a nudge, and they want opposite
+          // scrolls. The first turn of a replay can be a thousand rows from
+          // where you were reading, so it lands instantly and in the middle —
+          // an animated flight down an evening is a second of nothing. After
+          // that, `nearest` and smooth: the transcript should move only when
+          // the playing turn would otherwise leave the screen, because yanking
+          // every row to the middle makes a conversation read as a slot machine.
+          if (!replayArrived) reveal(row, { block: 'center', behavior: 'auto' });
+          else reveal(row, { block: 'nearest', behavior: 'smooth' });
+          replayArrived = true;
+        }
+      }
+    }
+    if (!on) {
+      replayArrived = false;
+      clear(rScrub);
+      rNote.hidden = true;
+      return;
+    }
+
+    const turn = rs.turns[rs.index] ?? null;
+    const playing = rs.phase === 'playing' || rs.phase === 'silent' || rs.phase === 'loading';
+    rIco.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true">${playing ? ICON_PAUSE : ICON_PLAY}</svg>`;
+    rPlay.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+    rPlay.title = playing ? 'Pause' : rs.phase === 'ended' ? 'Play it again from the start' : 'Play';
+    rPlay.dataset.phase = rs.phase;
+    rWho.textContent = turn ? segmentSpeakerLabel({ speaker: turn.speaker, overlap_frac: 0 }) : '';
+    if (turn?.speaker != null) rWho.style.color = speakerColor(turn.speaker);
+    else rWho.style.color = '';
+    rClock.textContent = turn
+      ? `${fmtClock(turn.t_ms)} · turn ${rs.index + 1} of ${rs.turns.length}`
+      : '';
+    rRate.textContent = `${rs.rate}×`;
+    rRate.setAttribute('aria-label', `Playback speed ${rs.rate} times — press to change`);
+    rPrev.disabled = rs.index === 0;
+    rNext.disabled = rs.index >= rs.turns.length - 1;
+
+    // The scrubber is over the TURNS, not over the seconds: a conversation is
+    // a sequence of things people said, and the thing a listener wants to get
+    // back to is one of them. A turn whose audio retention took carries a tick
+    // that says so, which is the only per-row mention of it anywhere.
+    if (rScrub.childElementCount !== rs.turns.length) {
+      clear(rScrub);
+      rs.turns.forEach((t, i) => {
+        rScrub.append(
+          h('button', {
+            class: 'replay-tick',
+            dataset: { turn: String(t.id), at: String(i) },
+            style: `flex-grow:${Math.max(1, Math.round((t.dur_ms || 0) / 100))}`,
+            onclick: () => replay.jump(i),
+          })
+        );
+      });
+    }
+    [...rScrub.children].forEach((tick, i) => {
+      const t = rs.turns[i];
+      tick.classList.toggle('gone', !t.has_audio);
+      tick.classList.toggle('at', i === rs.index);
+      tick.classList.toggle('done', i < rs.index);
+      tick.title = `${fmtClock(t.t_ms)} — ${speakerLabel(t.speaker)}${t.has_audio ? '' : ' · no audio kept'}`;
+      tick.setAttribute('aria-label', tick.title);
+    });
+
+    const note = replay.missingNote(rs);
+    rNote.hidden = !note;
+    rNote.textContent = note ?? '';
+  }
+
+  // The engine outlives any one paint, and the view has no unmount hook, so the
+  // subscription retires itself once its DOM is gone (same as the speakers
+  // view's playback subscription).
+  const offReplay = replay.onReplay((rs) => {
+    if (!replayBar.isConnected) {
+      offReplay();
+      return;
+    }
+    paintReplay(rs);
+  });
+
   refreshLiveChip();
   refreshFilterOptions();
   paintFollowBtn();
+  paintReplay(replay.replayState());
   // A mount that follows lands on the tail. A mount that does not is a jump
   // that has already loaded its page and is about to scroll to it itself.
   renderAll({ scroll: following() ? 'end' : 'none' });
@@ -760,6 +1005,29 @@ export function mount(root, ctx) {
       for (const el of list.querySelectorAll('.seg.hit')) el.classList.remove('hit');
       if (rows.length) reveal(rows[0]);
       return { thread: threadId, rows: rows.length };
+    },
+    /** A conversation, played back (0.9.2). Every route in lands here. */
+    startReplay,
+    /** What the bar is saying, for the headless driver. */
+    replayUi() {
+      const rs = replay.replayState();
+      return {
+        ...rs,
+        shown: !replayBar.hidden,
+        who: rWho.textContent,
+        clock: rClock.textContent,
+        rate: rs.rate,
+        rateLabel: rRate.textContent,
+        playLabel: rPlay.getAttribute('aria-label'),
+        note: replayBar.querySelector('#replay-note')?.hidden ? '' : rNote.textContent,
+        ticks: [...rScrub.children].map((t) => ({
+          turn: Number(t.dataset.turn),
+          gone: t.classList.contains('gone'),
+          at: t.classList.contains('at'),
+        })),
+        row: list.querySelector('.seg.replaying')?.dataset.seg ?? null,
+        rowsWithButton: list.querySelectorAll('.thread-sep .replay-start').length,
+      };
     },
     /** For the headless driver and the keyboard: one page further back. */
     loadOlder,

@@ -1433,3 +1433,83 @@ selecting on that is a step the bench cannot skip. And this was **not** a bindin
 limitation: `crate::asr::TimedAsr` already drives sherpa's C API directly and
 sets `hotwords_file`, `modeling_unit` and `bpe_vocab`, so with §12's synthesised
 `bpe.vocab` the Rust side could have done this safely. It was not worth doing.
+
+## 0.9.2 — `replay.get`: a conversation, played back
+
+Replay plays a thread's turns in order with the transcript reading along. The
+audio for it still comes from `segments.audio`, one turn at a time; this method
+exists for everything a client has to know **before** it fetches a single byte.
+
+- **`replay.get {thread}`** → `{thread, turns: [...]}`, in time order:
+
+  ```json
+  {"thread": 502,
+   "turns": [{"id": 1010, "t_ms": 1756670000000, "t_ns": "1756670000000000000",
+              "dur_ms": 4930, "speaker": 5, "speaker_name": "Speaker_31",
+              "text": "my mic keeps cutting out, is it better now?",
+              "has_audio": false}]}
+  ```
+
+  Field conventions, and they are the ones already in force everywhere else:
+  `speaker` is the **id**, because names change and ids do not, and
+  `speaker_name` is the resolved convenience beside it (`null` on an unlabelled
+  turn, and following merges through `speaker_resolved`). `t_ns` is a string
+  like every nanosecond value on the wire; `t_ms` and `dur_ms` are what the
+  scrubber does arithmetic on. An unknown id — and a conversation whose every
+  turn has been deleted, which is the same thing to a client holding a link to
+  it — is `err:not_found`, the same answer `thread.get` gives.
+
+- **`has_audio` means the file is on disk right now, and this is the only place
+  on the wire where it does.** The ordinary segment shape (`thread.get`,
+  `transcript`, `search`) also carries a `has_audio`, and there it means
+  `audio_path != ''` — *the database still names a file*. That is a weaker
+  claim, and the gap between the two is not hypothetical: `retention`'s
+  reconcile pass counts rows whose file has vanished (`dangling_paths`) and
+  deliberately leaves them alone, because the transcript is kept when the
+  recording is not. A player built on the weaker flag draws a playable mark
+  over a turn that answers `err:gone` the moment it is asked for. This method
+  stats the file — one `stat` per turn, over a conversation that is tens of
+  turns long, against the round trip per turn it saves.
+
+- **It is a snapshot, and a client must not treat it as a promise.** Retention
+  can sweep between this reply and the fetch, so `err:gone` from
+  `segments.audio` stays an ordinary answer that a player handles by reading
+  through the turn — `has_audio` only decides what is drawn before anybody
+  presses anything.
+
+### Why this is not `thread.get`
+
+`thread.get` already returns the whole conversation, in the ordinary segment
+shape, in one round trip, and reusing it was the first thing tried. Two reasons
+it is the wrong query for this:
+
+1. The `has_audio` it carries is the weaker one above, which is precisely the
+   field a player is built on.
+2. It carries the whole segment — translations, `night_text`, every provenance
+   field — for a client that wants six values per turn to draw a bar with.
+
+Nothing about `thread.get` changes; it remains the way to *render* a
+conversation, and a client that only wants to read one should keep using it.
+
+### What a client is expected to do with it
+
+Stated because the daemon's half is small and the contract is mostly about the
+client's:
+
+- **A turn with no audio is read through, not skipped.** Hold it for its
+  `dur_ms` at the current rate. The words are the record and the sound is the
+  perishable copy of it; racing through the parts of an evening that can no
+  longer be heard is backwards.
+- **Say that once per conversation, not once per turn.** The count is
+  `turns.filter(t => !t.has_audio).length` and it is one sentence in the
+  player, not a badge on every row it is true of.
+- **Compress the gaps.** Real silence between turns runs to tens of seconds
+  (threads are cut at `[graph].thread_gap_s`, 20 s, so anything shorter than
+  that can appear inside one). The desktop client caps a gap at 700 ms.
+- **One sound at a time.** `segments.audio` is also the per-segment preview,
+  and a client that can play both has to make them share one owner: a preview
+  starting stops a replay, and a replay starting stops a preview.
+
+`mock/mockd.js` implements the method with the same shape, and its thread 502
+mixes turns that still sound with one whose audio has aged out — a client that
+never meets a mixed conversation never renders one.

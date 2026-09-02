@@ -17,6 +17,8 @@ import { ask } from './store.js';
 const CLIP_TIMEOUT_MIN = 5000;
 const CLIP_TIMEOUT_SLACK = 4000;
 const CLIP_TIMEOUT_MAX = 60000;
+/** How often the stall guard looks. Small enough not to blunt the ceiling. */
+const CLIP_TICK_MS = 250;
 
 let el = null;
 let blobUrl = null;
@@ -26,6 +28,23 @@ let token = 0;
 
 const state = { key: null, phase: 'idle', index: 0, total: 0 };
 const listeners = new Set();
+
+// Everything currently parked on "tell me when this clip is over".
+//
+// `stop()` detaches the element's handlers and pauses it, which means a waiter
+// registered before it would never hear anything again — the per-segment
+// preview gets away with that because its loop re-checks the token on the way
+// out, but conversation replay (lib/replay.js) awaits one turn at a time and
+// would sit here until a timeout it no longer cares about. So a stop resolves
+// every waiter at once, with `'stopped'`.
+const waiters = new Set();
+
+function settleWaiters(why) {
+  for (const fn of [...waiters]) {
+    waiters.delete(fn);
+    fn(why);
+  }
+}
 
 /** Subscribe to playback changes. Returns an unsubscribe function. */
 export function onPlayback(fn) {
@@ -86,6 +105,7 @@ export function stop() {
     el.pause();
     el.removeAttribute('src');
   }
+  settleWaiters('stopped');
   release();
   if (state.phase !== 'idle') {
     idle();
@@ -111,12 +131,14 @@ function playOne(url, durationMs, mine) {
     const a = element();
     let timer = null;
     const done = (why) => {
-      if (timer) clearTimeout(timer);
+      if (timer) clearInterval(timer);
+      waiters.delete(done);
       a.onplaying = null;
       a.onended = null;
       a.onerror = null;
       resolve(why);
     };
+    waiters.add(done);
     a.onplaying = () => {
       if (token !== mine || state.phase === 'playing') return;
       state.phase = 'playing';
@@ -125,10 +147,21 @@ function playOne(url, durationMs, mine) {
     a.onended = () => done('ended');
     a.onerror = () => done('error');
     a.src = url;
-    timer = setTimeout(
-      () => done('timeout'),
-      Math.min(CLIP_TIMEOUT_MAX, Math.max(CLIP_TIMEOUT_MIN, (durationMs || 0) + CLIP_TIMEOUT_SLACK))
+    // The guard is against a STUCK element, and an element somebody paused on
+    // purpose is not stuck (conversation replay has a pause button, and a
+    // wall-clock deadline would fire in the middle of a paused turn and advance
+    // the playhead under the user). So the budget only burns while the clip is
+    // either running or has not started at all — a pause AFTER the first frame
+    // freezes it, exactly like the sound it is guarding.
+    let budget = Math.min(
+      CLIP_TIMEOUT_MAX,
+      Math.max(CLIP_TIMEOUT_MIN, (durationMs || 0) + CLIP_TIMEOUT_SLACK)
     );
+    timer = setInterval(() => {
+      if (a.paused && (a.currentTime > 0 || state.phase === 'paused')) return;
+      budget -= CLIP_TICK_MS;
+      if (budget <= 0) done('timeout');
+    }, CLIP_TICK_MS);
     const started = a.play();
     if (started?.catch) started.catch(() => done('error'));
   });
@@ -221,6 +254,76 @@ export async function playSpeaker(key, speakerId, { limit = 3 } = {}) {
   if (!samples.length) return { played: 0, stopped: false, error: 'empty', samples };
   const out = await play(key, samples.map((s) => s.segment_id));
   return { ...out, samples };
+}
+
+/**
+ * Take the one audio element, for a caller that needs to drive it itself.
+ *
+ * Conversation replay (lib/replay.js) plays a whole thread turn by turn, with
+ * pause, a rate and a scrubber, so it cannot go through `play()` — but it must
+ * never be a SECOND sound. This is that seam: it takes the same element under
+ * the same token, so starting a replay stops a preview and starting a preview
+ * stops a replay, with no coordination between them beyond this module.
+ *
+ * The handle goes dead the moment anything else calls `stop()` or `play()`.
+ * Every caller has to check `alive` after every await; `load()` resolving
+ * `'stopped'` says the same thing.
+ */
+export function acquire(key) {
+  stop();
+  const mine = token;
+  state.key = key;
+  state.phase = 'loading';
+  state.index = 0;
+  state.total = 0;
+  emit();
+  return {
+    get alive() {
+      return token === mine;
+    },
+    /** The shared element, for `playbackRate`, `pause()` and `play()`. */
+    audio: element(),
+    /** Say where in the sequence this is, for anything watching playback. */
+    mark(index, total, phase) {
+      if (token !== mine) return;
+      state.index = index;
+      state.total = total;
+      if (phase) state.phase = phase;
+      emit();
+    },
+    /**
+     * Decode a base64 WAV and play it through. Resolves
+     * `'ended' | 'error' | 'timeout' | 'stopped' | 'corrupt'` and never throws,
+     * for the same reason `play()` does not: a clip that will not decode is a
+     * turn to read through, not an exception out of a keypress.
+     */
+    async load(b64, durationMs) {
+      if (token !== mine) return 'stopped';
+      release();
+      try {
+        blobUrl = URL.createObjectURL(toBlob(b64));
+      } catch {
+        return 'corrupt';
+      }
+      return playOne(blobUrl, durationMs, mine);
+    },
+    /**
+     * Abandon the clip in flight WITHOUT giving the element up — what a jump
+     * to another turn needs. `stop()` would bump the token and kill this very
+     * handle, and the caller is not finished with it.
+     */
+    cancelClip() {
+      if (token !== mine) return;
+      if (el) el.pause();
+      settleWaiters('stopped');
+      release();
+    },
+    /** Give the element back. A no-op once something else has taken it. */
+    release() {
+      if (token !== mine) return;
+      stop();
+    },
+  };
 }
 
 /** The message a `gone`/empty preview shows in place, never as a toast alone. */

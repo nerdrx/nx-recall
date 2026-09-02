@@ -317,6 +317,30 @@ export function mount(root, ctx, arg) {
             // A preview is a handle, not a summary: the first thing anybody
             // said, verbatim. Tier 1 does not summarise.
             h('span', { class: 'thread-preview', text: t.preview || 'no transcript for this conversation' })
+          ),
+          // "Read this conversation" is the row; this is "hear it". Nested in a
+          // button, so it is a span with a button's role and stops the click.
+          h(
+            'span',
+            {
+              class: 'btn small replay-start thread-replay',
+              role: 'button',
+              tabindex: '0',
+              dataset: { replay: String(t.thread_id) },
+              title: 'Play this conversation back, turn by turn',
+              'aria-label': 'Replay this conversation',
+              onclick: (e) => {
+                e.stopPropagation();
+                void ctx.replayThread?.(t.thread_id);
+              },
+              onkeydown: (e) => {
+                if (e.key !== 'Enter' && e.key !== ' ') return;
+                e.preventDefault();
+                e.stopPropagation();
+                void ctx.replayThread?.(t.thread_id);
+              },
+            },
+            'Replay'
           )
         )
       );
