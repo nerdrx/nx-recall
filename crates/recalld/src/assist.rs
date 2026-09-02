@@ -54,6 +54,9 @@ impl AssistStop {
 /// What the two passes have done, for `status`.
 #[derive(Debug, Default)]
 pub struct AssistStats {
+    /// When the assistant last got a turn (UTC ns), for the fair-share rule in
+    /// [`gate`]. Zero until it has run once.
+    pub last_pass_ns: std::sync::atomic::AtomicI64,
     pub digests_written: std::sync::atomic::AtomicU64,
     pub digests_refused: std::sync::atomic::AtomicU64,
     pub translated: std::sync::atomic::AtomicU64,
@@ -88,15 +91,30 @@ pub fn gate(store: &Arc<std::sync::Mutex<Store>>, control: &Arc<Control>) -> Opt
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
         guard.graph_counts().map(|c| c.threads_pending).unwrap_or(0)
     };
+    // Promises first — but not promises ONLY. 0.10.1: with a few hundred
+    // conversations queued and new ones arriving all evening, "stand down while
+    // anything is left to enrich" meant the assistant never ran at all (four
+    // hours live: 0 translations, 0 digests, 421 English turns waiting). So the
+    // enrichment queue wins for `SHARE_EVERY_S` after each assistant pass, and
+    // then the assistant gets one pass whatever the queue says.
     if pending > 0 {
-        return Some(format!(
-            "{pending} conversation{} still waiting to be read for commitments — \
-             those come first",
-            if pending == 1 { "" } else { "s" }
-        ));
+        let last = control.assist_stats.last_pass_ns.load(Ordering::Relaxed);
+        let since_s = (crate::clock::utc_now_ns().saturating_sub(last)) / 1_000_000_000;
+        if last > 0 && since_s < SHARE_EVERY_S {
+            return Some(format!(
+                "{pending} conversation{} still waiting to be read for commitments — \
+                 those come first; the assistant's next turn is in {}s",
+                if pending == 1 { "" } else { "s" },
+                SHARE_EVERY_S - since_s
+            ));
+        }
     }
     None
 }
+
+/// How long the enrichment queue may keep the assistant waiting between its
+/// passes while it has work of its own.
+pub const SHARE_EVERY_S: i64 = 300;
 
 /// The background thread. Started whether or not anything here is enabled: all
 /// three switches are live, so something has to be watching them.
@@ -169,6 +187,9 @@ pub fn run(
                         }
                     }
                     refresh(&store, &cfg, &stats);
+                    stats
+                        .last_pass_ns
+                        .store(crate::clock::utc_now_ns(), Ordering::Relaxed);
                 }
             }
         }
@@ -279,8 +300,30 @@ mod tests {
             }
             assert!(guard.graph_counts().unwrap().threads_pending > 0);
         }
+        // Fresh daemon, never ran: the assistant gets its first pass at once
+        // (0.10.1) — the old absolute priority starved it for ever.
+        assert_eq!(
+            gate(&store, &control),
+            None,
+            "a first pass is never withheld"
+        );
+        // Having just run, it yields to the enrichment queue…
+        control
+            .assist_stats
+            .last_pass_ns
+            .store(crate::clock::utc_now_ns(), Ordering::Relaxed);
         let reason = gate(&store, &control).expect("blocked");
         assert!(reason.contains("commitments"), "{reason}");
+        // …until its share comes round again.
+        control.assist_stats.last_pass_ns.store(
+            crate::clock::utc_now_ns() - (SHARE_EVERY_S + 1) * 1_000_000_000,
+            Ordering::Relaxed,
+        );
+        assert_eq!(gate(&store, &control), None, "the share came round");
+        control
+            .assist_stats
+            .last_pass_ns
+            .store(crate::clock::utc_now_ns(), Ordering::Relaxed);
 
         // Once the enrichment pass has walked it, the assistant may run.
         {
