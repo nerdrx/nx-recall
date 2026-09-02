@@ -307,10 +307,14 @@ def make(kind: str, d: Path, threads: int):
             model=one("model.int8.onnx", "*.int8.onnx", "*.onnx"),
             tokens=one("tokens*.txt"), num_threads=threads)
     if kind == "qwen3":
+        # `tokenizer` is the DIRECTORY holding vocab.json + merges.txt, not a file.
+        tok = next((p.parent for p in d.rglob("vocab.json")), d / "tokenizer")
         return so.OfflineRecognizer.from_qwen3_asr(
             conv_frontend=one("*conv*front*.onnx", "*frontend*.onnx"),
             encoder=one("encoder*.onnx"), decoder=one("decoder*.onnx"),
-            tokenizer=one("tokenizer*.json", "tokens*.txt"), num_threads=threads)
+            tokenizer=str(tok), num_threads=threads,
+            # the default 128 truncates a 15 s FLEURS sentence outright
+            max_new_tokens=256, max_total_len=1024)
     if kind == "moonshine_v2":
         return so.OfflineRecognizer.from_moonshine_v2(
             encoder=one("encoder*.onnx"), decoder=one("decoder*.onnx"),
@@ -626,9 +630,9 @@ def table(p: dict) -> str:
         m = r["metrics"]
         s = m["sets"]
         j = r.get("judge") or {}
-        jt = j.get("skipped") or (
+        jt = "—" if k == INCUMBENT else (j.get("skipped") or (
             f"{j.get('wins')} / {j.get('losses')} / {j.get('decided')}"
-            + (f" ({j['win_rate']*100:.0f}%)" if j.get("win_rate") is not None else ""))
+            + (f" ({j['win_rate']*100:.0f}%)" if j.get("win_rate") is not None else "")))
         star = " **(incumbent)**" if k == INCUMBENT else ""
         L.append(f"| {k}{star} | {meta['date']} | {m['lab_wer_pooled']*100:.1f}% | "
                  f"{s.get('de_full',{}).get('wer',0)*100:.1f}% | "

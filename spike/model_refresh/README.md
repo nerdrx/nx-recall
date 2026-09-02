@@ -15,15 +15,20 @@ scratchpad.
 
 ```sh
 cd spike
-taskset -c 16-19 nice -n 19 venv/bin/python model_refresh.py discover
-taskset -c 16-19 nice -n 19 venv/bin/python model_refresh.py bench
-taskset -c 16-19 nice -n 19 venv/bin/python model_refresh.py verdict
+P="chrt -i 0 taskset -c 28-31 nice -n 19"
+$P venv/bin/python model_refresh.py discover
+$P venv/bin/python model_refresh.py bench
+$P venv/bin/python model_refresh.py verdict
 ```
 
-Four cores at nice 19 is not a suggestion. The box runs a VR session and other
-work; more importantly, **a model that only clears the RTF bar when it owns the
-machine has not cleared it** — the daemon decodes in the background while the
-user is in VR.
+Four cores, SCHED_IDLE, nice 19 is not a suggestion, and the script is
+deliberately sequential — one model, one decode at a time, no worker pool. The
+box runs a VR session and other agents; more importantly, **a model that only
+clears the RTF bar when it owns the machine has not cleared it** — the daemon
+decodes in the background while the user is in VR. Which four cores is local
+policy (`NXR_CPUS` tells the judge subprocess where to run; keep it matching the
+`taskset` set). Expect the whole thing to take a night; that is the intended
+trade.
 
 - `discover` — lists sherpa-onnx ASR exports newer than the pinned v3 from the
   GitHub `asr-models` release and `csukuangfj/*` on Hugging Face. It filters
@@ -77,11 +82,17 @@ tidiest form:
 
 ```sh
 systemd-run --user --on-calendar=quarterly --unit=nx-recall-model-refresh \
-  sh -c 'cd ~/…/nx-recall/spike && taskset -c 16-19 nice -n 19 venv/bin/python model_refresh.py discover && taskset -c 16-19 nice -n 19 venv/bin/python model_refresh.py bench'
+  sh -c 'cd ~/…/nx-recall/spike && for c in discover bench; do chrt -i 0 taskset -c 28-31 nice -n 19 venv/bin/python model_refresh.py $c || exit 1; done'
 ```
 
 or, as cron: `0 4 1 1,4,7,10 *`. Read the `verdict` line in the generated
 `<date>.md` afterwards; it is the only output that needs a human.
+
+## Runs so far
+
+- `2026-09-02` — four candidates (omnilingual-asr 300M, qwen3-asr 0.6B, two NeMo
+  multilingual fast-conformers). **Keep v3**; nothing came within 10% relative
+  of it on lab WER. Full write-up in `FINDINGS.md` §15.
 
 ## Where the numbers come from
 
