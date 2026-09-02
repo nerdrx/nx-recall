@@ -387,6 +387,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.10.0 | +98h | replay, world memory, turn-taking statistics, Markdown export, the room microphone, a Discord source card, naming a new voice from the transcript, and captions that really pass clicks through |
 | 0.10.1 | +100h | the captions toggle means two things again (drag, scroll, right-click to give clicks back); the accuracy card stops reporting 113% error; the assistant gets a fair share behind the enrichment queue; heard-on chips and the identity audit; `truth report` stops scoring your own account |
 | 0.10.2 | +101h | translation controls: what to translate into, which languages you read, and whether the translation or the original leads; a detector for eighteen other languages that never once mistook German or English for anything else |
+| 0.10.3 | +102h | the caption bar honours the translation display and crosses screens: drag it past the edge and it re-makes itself on the next monitor; a Screen selector on the card |
 
 ## Quickstart
 
