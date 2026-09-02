@@ -237,6 +237,68 @@ Needs the running daemon: the switch is live and every client has to be told.")]
         action: GraphAction,
     },
 
+    // ---- 0.8.0, the product round -------------------------------------
+    /// Ask the transcript a question in your own words.
+    // Verbatim: clap would reflow the examples into one paragraph.
+    #[command(long_about = "\
+Ask the transcript a question in your own words.
+
+One box. The daemon reads the question apart — a named voice, a time reference
+in German or English, and whatever is left as the search — and tells you what it
+understood before it shows you the answers, so a facet it got wrong is visible
+rather than silent.
+
+  recalld ask \"was hat Aspen gestern über den Shader gesagt\"
+  recalld ask \"what did Kira mention about the fountain last week\"
+  recalld ask \"Aspens Meinung zum Portal am Montag\"
+
+Time words are read BACKWARDS here: a question is about what has already been
+said, so \"am Montag\" is the Monday that happened, not the one coming. With the
+semantic model installed the search is hybrid; without it, keyword only. Either
+way the reply says which ran.")]
+    Ask {
+        #[arg(value_name = "QUESTION")]
+        question: Vec<String>,
+        /// Maximum hits to print.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+
+    /// Notes to self: what you said into the microphone with a wake phrase in
+    /// front of it.
+    // Verbatim: the wake phrases are a list and clap would fuse them.
+    #[command(long_about = "\
+Notes to self.
+
+A MICROPHONE turn that opens with a wake phrase is filed as a note. The turn
+stays in the transcript; the note is an annotation pointing at it.
+
+  \"Recall, merk dir …\"      \"Recall, notiz …\"
+  \"Recall, remember …\"      \"Recall, note …\"
+
+  recalld notes             what is still open
+  recalld notes all         everything, including what you have finished with
+  recalld notes done 3      tick one off
+  recalld notes dismiss 3   it was never a note
+
+Nothing but one of these commands ever moves a note off `open`.")]
+    Notes {
+        #[command(subcommand)]
+        action: Option<NotesAction>,
+    },
+
+    /// What is still outstanding with one person: the thirty seconds before
+    /// you say hello.
+    Brief {
+        #[arg(value_name = "SPEAKER_ID")]
+        speaker_id: i64,
+    },
+
+    /// How wrong the transcripts were, measured from the corrections you made
+    /// to them. A biased sample by construction — you correct what matters —
+    /// and the only real measurement this machine has.
+    Accuracy,
+
     /// Chronological transcript dump.
     Transcript {
         /// Restrict to one capture session.
@@ -245,6 +307,27 @@ Needs the running daemon: the switch is live and every client has to be told.")]
         /// Restrict to one speaker, by id or display name.
         #[arg(long, value_name = "SPEAKER")]
         speaker: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum NotesAction {
+    /// Every note, whatever state it is in. The default lists only open ones.
+    All,
+    /// Tick one off.
+    Done {
+        #[arg(value_name = "NOTE_ID")]
+        id: i64,
+    },
+    /// It was never a note.
+    Dismiss {
+        #[arg(value_name = "NOTE_ID")]
+        id: i64,
+    },
+    /// Put one back on the list.
+    Reopen {
+        #[arg(value_name = "NOTE_ID")]
+        id: i64,
     },
 }
 

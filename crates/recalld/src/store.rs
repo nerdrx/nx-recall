@@ -39,6 +39,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::embed::Embedding;
 use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 
+// ---- 0.8.0 (schema v10) ---------------------------------------------------
+// v10 adds four columns on `segments` (text provenance and the cross-check
+// verdict, see `apply_v10`) and the `notes` table (a mic turn that opened with
+// a wake phrase, see `apply_v10_notes`). Both halves are idempotent and
+// independent; there is no backfill of either.
 pub const SCHEMA_VERSION: i64 = 10;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
@@ -773,6 +778,9 @@ impl Store {
         // migration above it, and deliberately dependent on none of them.
         crate::semantic::migrate_v9(&self.conn)?;
         self.apply_v10()?;
+        // v10 (0.8.0), second half: notes to self. Standalone like v9 — one
+        // table that references `segments` and nothing else, and no backfill.
+        self.apply_v10_notes()?;
 
         match current {
             None => {
@@ -2983,6 +2991,9 @@ impl Store {
             let mut drop_time_refs = tx.prepare("DELETE FROM time_refs WHERE segment_id = ?1")?;
             let mut drop_commitments =
                 tx.prepare("DELETE FROM commitments WHERE segment_id = ?1")?;
+            // v10: a note IS a turn, restated. The turn going means the note
+            // going — and the foreign key would refuse the delete anyway.
+            let mut drop_notes = tx.prepare("DELETE FROM notes WHERE segment_id = ?1")?;
             let mut drop_segment = tx.prepare("DELETE FROM segments WHERE id = ?1")?;
             for id in ids {
                 drop_embeddings.execute(params![id])?;
@@ -2990,6 +3001,7 @@ impl Store {
                 orphan_prototypes.execute(params![id])?;
                 drop_time_refs.execute(params![id])?;
                 drop_commitments.execute(params![id])?;
+                drop_notes.execute(params![id])?;
                 n += drop_segment.execute(params![id])?;
             }
             // A thread is an index into the transcript and nothing else, so a
@@ -4501,6 +4513,280 @@ fn overlap_ns(a: &[(i64, i64)], b: &[(i64, i64)]) -> i64 {
         }
     }
     total
+}
+
+// ===========================================================================
+// 0.8.0 — notes to self, briefs and accuracy (PROTOCOL "the accuracy round")
+//
+// Everything below this line was added by the 0.8.0 product round and is kept
+// together on purpose: it is one table, its queries, and the three read-only
+// compositions the new methods need. Nothing above it changed except the
+// schema version, the migration call and the purge cascade.
+// ===========================================================================
+
+/// `notes.state`. A note is a thing you asked to be reminded of, so the only
+/// transitions are the two ways of being finished with it.
+pub mod note_state {
+    pub const OPEN: &str = "open";
+    pub const DONE: &str = "done";
+    pub const DISMISSED: &str = "dismissed";
+    pub const ALL: [&str; 3] = [OPEN, DONE, DISMISSED];
+
+    /// The canonical spelling of a state named on the wire, or `None`.
+    pub fn parse(s: &str) -> Option<&'static str> {
+        ALL.into_iter().find(|k| *k == s)
+    }
+}
+
+/// One note to self, with the moment it was spoken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteRow {
+    pub id: i64,
+    pub segment_id: i64,
+    /// The turn's words with the wake phrase taken off the front.
+    pub text: String,
+    pub created_utc_ns: i64,
+    pub state: String,
+    /// The segment's start: when you actually said it, which is what a client
+    /// shows and what the transcript can be scrolled to.
+    pub t_start_ns: i64,
+}
+
+/// One conversation label a person took part in, most recent first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonTopic {
+    pub thread_id: i64,
+    pub topic: String,
+    pub last_ns: i64,
+}
+
+impl Store {
+    /// The `notes` half of schema v10, written so it is a no-op on a v10 database.
+    fn apply_v10_notes(&self) -> Result<()> {
+        self.conn.execute_batch(
+            // A note is an ANNOTATION referencing a segment, exactly like a
+            // time reference or a commitment: the turn stays in the transcript
+            // and this row points at it. `segment_id` is UNIQUE because one
+            // turn is one note — a re-decode or a correction updates the words
+            // in place rather than filing a second copy of the same sentence.
+            "CREATE TABLE IF NOT EXISTS notes (
+                 id             INTEGER PRIMARY KEY,
+                 segment_id     INTEGER NOT NULL UNIQUE REFERENCES segments(id),
+                 text           TEXT    NOT NULL,
+                 created_utc_ns INTEGER NOT NULL,
+                 -- open | done | dismissed. Nothing but a person's click moves
+                 -- a note off `open`.
+                 state          TEXT    NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_notes_state ON notes(state, created_utc_ns);
+             CREATE INDEX IF NOT EXISTS idx_notes_segment ON notes(segment_id);",
+        )?;
+        Ok(())
+    }
+
+    const NOTE_COLUMNS: &'static str =
+        "n.id, n.segment_id, n.text, n.created_utc_ns, n.state, g.t_start_ns
+         FROM notes n
+         JOIN segments g ON g.id = n.segment_id AND g.deleted_at IS NULL";
+
+    fn note_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRow> {
+        Ok(NoteRow {
+            id: r.get(0)?,
+            segment_id: r.get(1)?,
+            text: r.get(2)?,
+            created_utc_ns: r.get(3)?,
+            state: r.get(4)?,
+            t_start_ns: r.get(5)?,
+        })
+    }
+
+    /// File a note, or update the one this turn already has.
+    ///
+    /// Returns `None` when the words have not changed, so a re-decode that
+    /// produced the same sentence does not re-announce a note the user has
+    /// already seen — and, crucially, does not resurrect one they dismissed.
+    pub fn upsert_note(
+        &self,
+        segment_id: i64,
+        text: &str,
+        at_utc_ns: i64,
+    ) -> Result<Option<NoteRow>> {
+        let existing: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, text FROM notes WHERE segment_id = ?1",
+                params![segment_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let id = match existing {
+            Some((_, was)) if was == text => return Ok(None),
+            Some((id, _)) => {
+                self.conn.execute(
+                    "UPDATE notes SET text = ?2 WHERE id = ?1",
+                    params![id, text],
+                )?;
+                id
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO notes (segment_id, text, created_utc_ns, state)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![segment_id, text, at_utc_ns, note_state::OPEN],
+                )?;
+                self.conn.last_insert_rowid()
+            }
+        };
+        self.note(id)
+    }
+
+    pub fn note(&self, id: i64) -> Result<Option<NoteRow>> {
+        let sql = format!("SELECT {} WHERE n.id = ?1", Self::NOTE_COLUMNS);
+        Ok(self
+            .conn
+            .query_row(&sql, params![id], Self::note_row_from)
+            .optional()?)
+    }
+
+    /// Notes, newest first. `state` narrows; `None` is all of them.
+    pub fn notes(&self, state: Option<&str>, limit: usize) -> Result<Vec<NoteRow>> {
+        let sql = format!(
+            "SELECT {} WHERE (?1 IS NULL OR n.state = ?1)
+             ORDER BY g.t_start_ns DESC, n.id DESC LIMIT ?2",
+            Self::NOTE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_map(params![state, limit as i64], Self::note_row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Move a note through its state machine. `None` when there is no such
+    /// note.
+    pub fn set_note_state(&self, id: i64, state: &str) -> Result<Option<NoteRow>> {
+        let n = self.conn.execute(
+            "UPDATE notes SET state = ?2 WHERE id = ?1",
+            params![id, state],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        self.note(id)
+    }
+
+    /// Notes whose text names somebody. A substring match, case-insensitive
+    /// over ASCII, because a note is a sentence a person wrote about a person
+    /// and the useful question is "did I write anything about Aspen".
+    pub fn notes_mentioning(&self, name: &str, limit: usize) -> Result<Vec<NoteRow>> {
+        if name.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        // The pattern is escaped so a name containing `%` or `_` is a name.
+        let pattern = format!(
+            "%{}%",
+            name.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let sql = format!(
+            "SELECT {} WHERE n.text LIKE ?1 ESCAPE '\\'
+             ORDER BY g.t_start_ns DESC, n.id DESC LIMIT ?2",
+            Self::NOTE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_map(params![pattern, limit as i64], Self::note_row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every OPEN commitment (`candidate` or `confirmed`) this person is on
+    /// either side of. The caller splits it by direction — the two halves of a
+    /// brief are one query, because a promise is one row whichever way it
+    /// points.
+    pub fn open_commitments_for(
+        &self,
+        speaker_id: i64,
+        limit: usize,
+    ) -> Result<Vec<CommitmentRow>> {
+        let sql = format!(
+            "SELECT {} {}
+             WHERE c.state IN (?2, ?3)
+               AND (c.who_speaker_id = ?1 OR c.to_speaker_id = ?1)
+             ORDER BY (c.due_utc_ns IS NULL) ASC, c.due_utc_ns ASC, g.t_start_ns ASC
+             LIMIT ?4",
+            Self::COMMITMENT_COLUMNS,
+            Self::COMMITMENT_JOINS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_map(
+                params![
+                    speaker_id,
+                    commitment_state::CANDIDATE,
+                    commitment_state::CONFIRMED,
+                    limit as i64
+                ],
+                Self::commitment_row_from,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// What this person's recent conversations were about: `threads.topic` for
+    /// the threads they spoke in, most recent first, each label once.
+    ///
+    /// Threads with no label are simply absent — the Tier 3 pass that writes
+    /// them is off by default, and an empty list is the honest report of that.
+    pub fn person_recent_topics(&self, speaker_id: i64, limit: usize) -> Result<Vec<PersonTopic>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id, t.topic, MAX(g.t_end_ns) AS last_ns
+             FROM segments g
+             JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             JOIN threads t ON t.id = g.thread_id
+             WHERE sp.canonical_id = ?1 AND g.deleted_at IS NULL
+               AND t.topic IS NOT NULL AND TRIM(t.topic) <> ''
+             GROUP BY t.id
+             ORDER BY last_ns DESC, t.id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![speaker_id], |r| {
+                Ok(PersonTopic {
+                    thread_id: r.get(0)?,
+                    topic: r.get(1)?,
+                    last_ns: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // One row per LABEL, not per thread: three conversations about shaders
+        // is one thing this person talks about, not three.
+        let mut seen = BTreeSet::new();
+        Ok(rows
+            .into_iter()
+            .filter(|t| seen.insert(t.topic.clone()))
+            .take(limit)
+            .collect())
+    }
+
+    /// The operations log, narrowed to one `op`, oldest first — which is the
+    /// order `accuracy.summary` has to read corrections in: a second correction
+    /// of the same turn replaced the first one's *result*.
+    pub fn operations_of(&self, op: &str, limit: usize) -> Result<Vec<OperationRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, op, target_ids, prior_state, at_utc_ns
+             FROM operations WHERE op = ?1
+             ORDER BY at_utc_ns ASC, id ASC LIMIT ?2",
+        )?;
+        Ok(stmt
+            .query_map(params![op, limit as i64], |r| {
+                Ok(OperationRow {
+                    id: r.get(0)?,
+                    op: r.get(1)?,
+                    target_ids: r.get(2)?,
+                    prior_state: r.get(3)?,
+                    at_utc_ns: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
 }
 
 #[cfg(test)]

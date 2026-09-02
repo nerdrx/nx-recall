@@ -15,11 +15,14 @@
 // can read the daemon's whole answer in one place.
 #![recursion_limit = "256"]
 
+pub mod accuracy;
 pub mod allowlist;
 pub mod analysis;
 pub mod arbiter;
+pub mod ask;
 pub mod asr;
 pub mod b64;
+pub mod brief;
 pub mod bus;
 pub mod canary;
 pub mod capture;
@@ -37,6 +40,7 @@ pub mod lang;
 pub mod langctx;
 pub mod llm;
 pub mod models;
+pub mod notes;
 pub mod overlap;
 pub mod pipeline;
 pub mod proto;

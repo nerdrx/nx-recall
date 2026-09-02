@@ -35,7 +35,8 @@ use recalld::service::Service;
 use recalld::store::Store;
 
 use crate::cli::{
-    Cli, Command, GraphAction, LangAction, MicAction, ModelsAction, SemanticAction, SpeakersAction,
+    Cli, Command, GraphAction, LangAction, MicAction, ModelsAction, NotesAction, SemanticAction,
+    SpeakersAction,
 };
 
 fn main() -> Result<()> {
@@ -146,6 +147,12 @@ fn main() -> Result<()> {
         Command::Resume => cmd_pause(&cfg, &data_dir, false),
         Command::Status => cmd_status(&cfg, &data_dir),
         Command::Graph { action } => cmd_graph(&cfg, &data_dir, action),
+        // ---- 0.8.0, the product round ---------------------------------
+        Command::Ask { question, limit } => cmd_ask(&cfg, &data_dir, &question.join(" "), limit),
+        Command::Notes { action } => cmd_notes(&cfg, &data_dir, action),
+        Command::Brief { speaker_id } => cmd_brief(&cfg, &data_dir, speaker_id),
+        Command::Accuracy => cmd_accuracy(&cfg, &data_dir),
+        // ---- end 0.8.0 -------------------------------------------------
     }
 }
 
@@ -1708,6 +1715,269 @@ fn print_storage(storage: &Value) {
         "  models",
         fetch::human(n("models_bytes"))
     );
+}
+
+// ---- 0.8.0, the product round --------------------------------------------
+
+/// `recalld ask "<question>"` — one query box, on the command line.
+fn cmd_ask(cfg: &Config, data_dir: &Path, question: &str, limit: usize) -> Result<()> {
+    let question = question.trim();
+    if question.is_empty() {
+        println!("Ask something: `recalld ask \"was hat Aspen gestern gesagt\"`.");
+        return Ok(());
+    }
+    let out = call(
+        cfg,
+        data_dir,
+        "search.ask",
+        json!({"q": question, "limit": limit}),
+    )?;
+    let i = &out["interpretation"];
+
+    // What it understood, FIRST and always — including when it understood
+    // nothing, which is the case a user most needs to see.
+    let mut facets = Vec::new();
+    if let Some(who) = i["speaker_label"].as_str() {
+        facets.push(format!("speaker: {who}"));
+    }
+    if let (Some(from), Some(to)) = (i["from_ms"].as_i64(), i["to_ms"].as_i64()) {
+        facets.push(format!(
+            "when: {} → {}",
+            format_time(from * 1_000_000),
+            format_time(to * 1_000_000)
+        ));
+    }
+    match i["query"].as_str().unwrap_or("") {
+        "" => facets.push("words: (none — the whole question was facets)".into()),
+        q => facets.push(format!("words: {q}")),
+    }
+    println!("understood as   {}", facets.join("\n                "));
+    println!(
+        "search          {}",
+        match i["mode"].as_str().unwrap_or("?") {
+            "hybrid" => "hybrid (keyword + meaning)",
+            "fts" => "keyword only — `recalld models fetch --semantic` adds meaning",
+            "facets" => "no search: the transcript those facets select",
+            other => other,
+        }
+    );
+    println!();
+
+    let hits = out["hits"].as_array().cloned().unwrap_or_default();
+    if hits.is_empty() {
+        println!("Nothing. Which is not the same as nothing having been said —");
+        println!("drop a facet and ask again.");
+        return Ok(());
+    }
+    for h in &hits {
+        println!(
+            "{:<19}  {:<16}  {}",
+            format_time(
+                h["t_ns"]
+                    .as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0)
+            ),
+            h["speaker_name"].as_str().unwrap_or("—"),
+            h["snippet"]
+                .as_str()
+                .or_else(|| h["text"].as_str())
+                .unwrap_or("")
+        );
+    }
+    println!("\n{} hit(s).", hits.len());
+    Ok(())
+}
+
+/// `recalld notes [all|done <id>|dismiss <id>|reopen <id>]`.
+fn cmd_notes(cfg: &Config, data_dir: &Path, action: Option<NotesAction>) -> Result<()> {
+    let state = |id: i64, state: &str| -> Result<()> {
+        let n = call(
+            cfg,
+            data_dir,
+            "notes.set_state",
+            json!({"id": id, "state": state}),
+        )?;
+        println!(
+            "note {} is {}: {}",
+            n["id"].as_i64().unwrap_or(id),
+            n["state"].as_str().unwrap_or(state),
+            n["text"].as_str().unwrap_or("")
+        );
+        Ok(())
+    };
+    let filter = match action {
+        Some(NotesAction::Done { id }) => return state(id, "done"),
+        Some(NotesAction::Dismiss { id }) => return state(id, "dismissed"),
+        Some(NotesAction::Reopen { id }) => return state(id, "open"),
+        // The default list is what is still open: a note you have finished
+        // with is not a thing to be reminded of.
+        Some(NotesAction::All) => json!({}),
+        None => json!({"state": "open"}),
+    };
+    let out = call(cfg, data_dir, "notes.list", filter)?;
+    let rows = out["notes"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!(
+            "No notes. Say \"Recall, merk dir …\" or \"Recall, remember …\" into the microphone\n\
+             and the turn is filed here — the transcript keeps it either way."
+        );
+        return Ok(());
+    }
+    println!("{:<5}  {:<10}  {:<19}  NOTE", "ID", "STATE", "SAID AT");
+    for n in &rows {
+        println!(
+            "{:<5}  {:<10}  {:<19}  {}",
+            n["id"].as_i64().unwrap_or(0),
+            n["state"].as_str().unwrap_or("?"),
+            format_time(
+                n["t_ns"]
+                    .as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0)
+            ),
+            n["text"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
+/// `recalld brief <speaker_id>` — what is outstanding with one person.
+fn cmd_brief(cfg: &Config, data_dir: &Path, speaker_id: i64) -> Result<()> {
+    let b = call(cfg, data_dir, "person.brief", json!({"id": speaker_id}))?;
+    let who = b["speaker"]["name"]
+        .as_str()
+        .or_else(|| b["speaker"]["auto"].as_str())
+        .unwrap_or("?");
+    println!(
+        "{who}{}",
+        if b["speaker"]["you"] == json!(true) {
+            "  (you)"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "{:<16}{}",
+        "last heard",
+        b["last_heard_ms"]
+            .as_i64()
+            .map(|ms| format_time(ms * 1_000_000))
+            .unwrap_or_else(|| "never".into())
+    );
+
+    let list = |label: &str, key: &str| {
+        let rows = b[key].as_array().cloned().unwrap_or_default();
+        if rows.is_empty() {
+            println!("{label:<16}—");
+            return;
+        }
+        for (i, c) in rows.iter().enumerate() {
+            let due = c["due_ms"]
+                .as_i64()
+                .map(|ms| format_time(ms * 1_000_000))
+                .unwrap_or_else(|| c["due_raw"].as_str().unwrap_or("—").to_string());
+            println!(
+                "{:<16}[{}] {:<10}  {:<19}  {}",
+                if i == 0 { label } else { "" },
+                c["state"].as_str().unwrap_or("?"),
+                c["source"].as_str().unwrap_or("?"),
+                due,
+                c["what"].as_str().unwrap_or(""),
+            );
+        }
+    };
+    list("they owe you", "open_to_you");
+    list("you owe them", "open_from_you");
+
+    let topics: Vec<&str> = b["recent_topics"]
+        .as_array()
+        .map(|v| v.iter().filter_map(|t| t["topic"].as_str()).collect())
+        .unwrap_or_default();
+    println!(
+        "{:<16}{}",
+        "recent topics",
+        if topics.is_empty() {
+            "— (the local model writes these; it is off by default)".to_string()
+        } else {
+            topics.join(", ")
+        }
+    );
+    for (i, n) in b["notes_mentioning"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        println!(
+            "{:<16}{}",
+            if i == 0 { "your notes" } else { "" },
+            n["text"].as_str().unwrap_or("")
+        );
+    }
+    println!("\nEvery promise here is a suggestion until you say otherwise.");
+    Ok(())
+}
+
+/// `recalld accuracy` — the word error rate the corrections imply.
+fn cmd_accuracy(cfg: &Config, data_dir: &Path) -> Result<()> {
+    let a = call(cfg, data_dir, "accuracy.summary", json!({}))?;
+    let n = a["corrections"].as_i64().unwrap_or(0);
+    if n == 0 {
+        println!(
+            "Nothing corrected yet, so there is nothing to measure — which is not\n\
+             an error rate of zero. Fix a line in the GUI and it starts counting."
+        );
+        return Ok(());
+    }
+    let pct = |v: &Value| {
+        v.as_f64()
+            .map(|w| format!("{:.1}%", w * 100.0))
+            .unwrap_or_else(|| "—".into())
+    };
+    println!("{:<16}{n}", "corrections");
+    println!("{:<16}{}", "estimated WER", pct(&a["estimated_wer"]));
+    println!(
+        "{:<16}{}",
+        "since",
+        a["since_ms"]
+            .as_i64()
+            .map(|ms| format_time(ms * 1_000_000))
+            .unwrap_or_else(|| "—".into())
+    );
+    for (label, key, name) in [
+        ("by source", "by_source", "source"),
+        ("by speaker", "by_speaker", "speaker_id"),
+    ] {
+        for (i, row) in a[key]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
+            println!(
+                "{:<16}{:<20}  {:>4}  {}",
+                if i == 0 { label } else { "" },
+                row[name]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| row[name]
+                        .as_i64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "unlabelled".into())),
+                row["corrections"].as_i64().unwrap_or(0),
+                pct(&row["estimated_wer"]),
+            );
+        }
+    }
+    println!(
+        "\nMeasured against YOUR corrections, so it is the error rate of the turns\n\
+         somebody bothered to fix — biased high, and the number that moves when the\n\
+         vocabulary or the window length changes."
+    );
+    Ok(())
 }
 
 fn call(cfg: &Config, data_dir: &Path, method: &str, params: Value) -> Result<Value> {
