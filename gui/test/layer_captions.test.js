@@ -178,12 +178,12 @@ test('the file this side writes is the text the overlay compares against', () =>
   const settings = normalizeCaptionSettings({ opacity: 0.65 });
   assert.equal(
     JSON.stringify(settings, null, 2),
-    '{\n  "turns": 5,\n  "size": 26,\n  "hold_s": 12,\n  "opacity": 0.65,\n  "showYou": true,\n  "clickThrough": true,\n  "bounds": null\n}'
+    '{\n  "turns": 5,\n  "size": 26,\n  "hold_s": 12,\n  "opacity": 0.65,\n  "showYou": true,\n  "clickThrough": true,\n  "bounds": null,\n  "output": null\n}'
   );
-  const placed = normalizeCaptionSettings({ opacity: 0.65, bounds: { x: 12, y: 34, width: 1100, height: 340 } });
+  const placed = normalizeCaptionSettings({ opacity: 0.65, bounds: { x: 12, y: 34, width: 1100, height: 340 }, output: 'DP-2' });
   assert.equal(
     JSON.stringify(placed, null, 2),
-    '{\n  "turns": 5,\n  "size": 26,\n  "hold_s": 12,\n  "opacity": 0.65,\n  "showYou": true,\n  "clickThrough": true,\n  "bounds": {\n    "x": 12,\n    "y": 34,\n    "width": 1100,\n    "height": 340\n  }\n}'
+    '{\n  "turns": 5,\n  "size": 26,\n  "hold_s": 12,\n  "opacity": 0.65,\n  "showYou": true,\n  "clickThrough": true,\n  "bounds": {\n    "x": 12,\n    "y": 34,\n    "width": 1100,\n    "height": 340\n  },\n  "output": "DP-2"\n}'
   );
 });
 
@@ -194,9 +194,14 @@ test('a position the bar wrote survives being read back here', () => {
   const fromTheBar = {
     turns: 5, size: 31, hold_s: 12, opacity: 0.6, showYou: true, clickThrough: false,
     bounds: { x: 1460, y: 1004, width: 1100, height: 340 },
+    output: 'DP-1',
   };
   const read = normalizeCaptionSettings(fromTheBar);
   assert.deepEqual(read.bounds, fromTheBar.bounds);
+  // 0.10.3: the screen the bar was carried to survives the trip as well. A
+  // field the normalizer dropped would be a field the next write erased, and
+  // the bar would be back on the other monitor at the next launch.
+  assert.equal(read.output, 'DP-1');
   assert.equal(read.size, 31);
   assert.equal(read.clickThrough, false);
   // …and writing it straight back out is the same bytes, so neither side sees

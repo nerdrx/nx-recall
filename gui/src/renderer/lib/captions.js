@@ -27,6 +27,12 @@ export const CAPTION_DEFAULTS = Object.freeze({
   showYou: true,
   clickThrough: true,
   bounds: null,
+  // Which screen the bar is on, by connector name (0.10.3). Only the
+  // layer-shell path can act on it — a layer surface belongs to one wl_output
+  // and cannot change it, so this is the field that says which surface to make
+  // — but it is normalized here like everything else, because both sides write
+  // this file and a field the normalizer does not know is a field it drops.
+  output: null,
 });
 
 /**
@@ -76,7 +82,22 @@ export function normalizeCaptionSettings(raw) {
     showYou: src.showYou === undefined ? CAPTION_DEFAULTS.showYou : !!src.showYou,
     clickThrough: src.clickThrough === undefined ? CAPTION_DEFAULTS.clickThrough : !!src.clickThrough,
     bounds: normalizeBounds(src.bounds),
+    output: normalizeOutput(src.output),
   };
+}
+
+/**
+ * A connector name, or null.
+ *
+ * Not checked against the screens that are plugged in right now: a monitor that
+ * is off today may be back tomorrow, and the overlay already falls back to
+ * choosing a screen when the remembered name is not there. What is refused is
+ * anything that is not a name.
+ */
+function normalizeOutput(v) {
+  if (typeof v !== 'string') return null;
+  const name = v.trim();
+  return name ? name : null;
 }
 
 /**

@@ -12,7 +12,7 @@
 // window: no second socket, no second model. What arrives there arrives here.
 
 import { BrowserWindow, screen } from 'electron';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { accessSync, constants, readFileSync, writeFileSync, mkdirSync, watch } from 'node:fs';
 import { delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -111,6 +111,45 @@ function overlayBinary() {
 }
 
 /**
+ * The screens, for the Screen selector on the Captions card (0.10.3).
+ *
+ * A layer surface belongs to one `wl_output` and cannot change it, so "which
+ * screen" is a real setting rather than a hint — and the card that offers it is
+ * a page in a renderer with no Wayland access at all. So the overlay is asked:
+ * `--list-outputs` prints the desk as one line of JSON and exits.
+ *
+ * A subprocess rather than an `outputs` block in captions.json, deliberately.
+ * That file is what a person chose; writing hardware state into it on every
+ * launch would rewrite a file both sides watch, trip both echo guards, churn
+ * something people diff, and mix a cache in with the settings. This costs a few
+ * milliseconds, once.
+ *
+ * Cached for the life of the process. A monitor plugged in mid-session is not
+ * picked up until the app restarts; the OVERLAY notices immediately, which is
+ * the half that matters — the list here is only what the selector offers.
+ */
+let outputsCache;
+function captionOutputs() {
+  if (outputsCache !== undefined) return outputsCache;
+  outputsCache = [];
+  const bin = overlayBinary();
+  if (!bin || !wantsLayerCaptions()) return outputsCache;
+  try {
+    const run = spawnSync(bin, ['--list-outputs'], { encoding: 'utf8', timeout: 4000 });
+    if (run.status !== 0) return outputsCache;
+    const parsed = JSON.parse(run.stdout);
+    if (Array.isArray(parsed?.outputs)) {
+      outputsCache = parsed.outputs.filter((o) => typeof o?.name === 'string' && o.name);
+    }
+  } catch (e) {
+    // No list is not a failure: the card simply does not offer the selector,
+    // and the overlay keeps choosing a screen the way it always did.
+    console.warn('[recall] could not list the screens:', e.message);
+  }
+  return outputsCache;
+}
+
+/**
  * The settings, plus the one fact about them that is not a setting.
  *
  * `surface` is deliberately outside the normalized block: `save()` writes the
@@ -119,7 +158,7 @@ function overlayBinary() {
  */
 export function getCaptionSettings() {
   if (!settings) settings = normalizeCaptionSettings(null);
-  return { ...settings, surface: captionSurface() };
+  return { ...settings, surface: captionSurface(), outputs: captionOutputs() };
 }
 
 /**

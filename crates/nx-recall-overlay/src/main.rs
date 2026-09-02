@@ -53,6 +53,12 @@ struct Args {
     #[arg(long)]
     desktop: bool,
 
+    /// Print the desk — every output, with its name, its logical size and
+    /// where it sits — as one line of JSON, and stop. The settings card's
+    /// Screen selector is built from this; it has no Wayland access of its own.
+    #[arg(long)]
+    list_outputs: bool,
+
     /// The captions.json the settings card writes. Defaults to the one in
     /// Electron's userData directory; the main process passes it explicitly.
     /// Only ever READ — two writers on one settings file is how a settings file
@@ -146,9 +152,16 @@ fn render_once(args: &Args, out: &std::path::Path) -> Result<()> {
     for seg in tail["segments"].as_array().into_iter().flatten() {
         caps.seed_turn(seg);
     }
+    // The same layout the bar and the transcript would use — asked for, not
+    // assumed, so `--render` is a picture of what a person would actually see.
+    let display = f
+        .call("status", serde_json::json!({}))
+        .map(|st| feed::TranslationDisplay::from_envelope(&st, Default::default()))
+        .unwrap_or_default();
     let style = raster::Style {
         size: args.size,
         opacity: args.opacity,
+        translation_display: display,
         ..raster::Style::default()
     };
     let renderer = raster::Renderer::new(style, args.font.as_deref())?;
@@ -167,6 +180,10 @@ fn render_once(args: &Args, out: &std::path::Path) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.list_outputs {
+        return desktop::list_outputs();
+    }
 
     if args.desktop {
         return desktop::run(desktop::Options {
