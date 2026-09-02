@@ -76,6 +76,8 @@ const ctx = {
   showBrief,
   // 0.9.0: a reminder, from anywhere, lands on its note in Memory.
   openNote,
+  // 0.10.0: a world chip anywhere → Search, with the world facet already on.
+  searchWorld,
 };
 
 /**
@@ -133,6 +135,19 @@ function go(name, arg = null) {
 function openPerson(spId) {
   if (spId == null) return;
   go('person', { id: Number(spId) });
+}
+
+/**
+ * A world → Search, filtered to it (0.10.0).
+ *
+ * The FACET is the destination, not a world page. There is no world page and
+ * there deliberately is not one: what a person wants from "The Great Pug" is
+ * what was said there, and that is a search — one surface, already built, that
+ * can then be narrowed further by speaker and by day.
+ */
+function searchWorld(worldId, label) {
+  if (!worldId) return;
+  go('search', { world: worldId, worldLabel: label ?? null });
 }
 
 /** Leave a pushed view for the rail view it was opened from. */
@@ -883,6 +898,51 @@ document.addEventListener('keydown', (e) => {
           preview: r.querySelector('.thread-preview').textContent,
         })),
         back: !!document.getElementById('person-back'),
+        // 0.10.0 — "Where you meet" and "How you talk".
+        worlds: [...document.querySelectorAll('#person-world-chips .world-chip')].map((c) => ({
+          id: c.dataset.world,
+          name: c.querySelector('.world-name').textContent,
+          meta: c.querySelector('.world-meta').textContent,
+        })),
+        talk: (() => {
+          const card = document.getElementById('person-talk');
+          if (!card || card.hidden) return null;
+          return {
+            share: document.getElementById('talk-share-pct')?.textContent ?? '',
+            shareFrac: Number(document.getElementById('talk-share')?.dataset.share ?? 0),
+            barWidth: document.querySelector('#talk-share .talk-bar-fill')?.style.width ?? '',
+            cells: [...document.querySelectorAll('#talk-strip .person-stat')].map((s) => [
+              s.dataset.talk,
+              s.querySelector('b').textContent,
+              // The definition the daemon sent, as the tooltip a person can
+              // actually read. An approximation rendered without one is a claim.
+              s.getAttribute('title') ?? '',
+            ]),
+          };
+        })(),
+      };
+    },
+    // 0.10.0 — the Memory view's Worlds card, and the world facet pill.
+    worlds: () => {
+      const card = document.getElementById('worlds-card');
+      return {
+        shown: !!card && !card.hidden,
+        rows: [...document.querySelectorAll('#world-list .world-row')].map((r) => ({
+          id: r.dataset.world,
+          name: r.querySelector('.world-name').textContent,
+          // The number only: `.world-num` also carries its own <small> label,
+          // and "16visits" is not a count.
+          visits: r.querySelectorAll('.world-num')[0]?.firstChild?.textContent ?? '',
+          people: [...r.querySelectorAll('.world-people .chip.person')].map((c) => c.textContent),
+        })),
+        // Share bars on the digest card's participants, so "the digest lists
+        // participants" and "the digest says who did the talking" are two
+        // separate, checkable facts.
+        digestShares: [...document.querySelectorAll('#digest-card .chip.person[data-share]')].map((c) => ({
+          share: Number(c.dataset.share),
+          width: c.querySelector('.share-bar-fill')?.style.width ?? '',
+          title: c.getAttribute('title') ?? '',
+        })),
       };
     },
     threads: () => ({

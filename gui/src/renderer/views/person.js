@@ -56,9 +56,14 @@ export function mount(root, ctx, arg) {
 
   const header = h('div', { class: 'card', id: 'person-header' });
   const stats = h('div', { class: 'card', id: 'person-stats' });
+  // 0.10.0. Two cards, in the order the questions come: WHERE you meet, then
+  // HOW you talk. Both sit above "people they talk with" because both are
+  // about this person, and the edges are about everybody else.
+  const worlds = h('div', { class: 'card', id: 'person-worlds' });
+  const talk = h('div', { class: 'card', id: 'person-talk' });
   const edges = h('div', { class: 'card', id: 'person-edges' });
   const threads = h('div', { class: 'card', id: 'person-threads' });
-  const body = h('div', { class: 'view-body view-enter' }, header, stats, edges, threads);
+  const body = h('div', { class: 'view-body view-enter' }, header, stats, worlds, talk, edges, threads);
 
   root.append(
     h('div', { class: 'view-head' }, back, h('div', {}, title, sub), h('div', { class: 'spacer' })),
@@ -194,6 +199,175 @@ export function mount(root, ctx, arg) {
         stat('last heard', t.last_heard_ms ? fmtDate(new Date(t.last_heard_ms).toISOString()) : '—', null, t.last_heard_ms ?? 0)
       )
     );
+  }
+
+  // -- where you meet (0.10.0) ----------------------------------------------
+  //
+  // Chips rather than rows: a world is a NAME and a couple of numbers, and
+  // five of them read at a glance where five table rows do not. The card is
+  // absent entirely when the daemon has no worlds for this person — which is
+  // every Discord-only voice, and every conversation older than the visits
+  // table. An empty state here would be an advertisement for VRChat.
+
+  function renderWorlds() {
+    clear(worlds);
+    const list = page?.worlds ?? [];
+    worlds.hidden = !list.length;
+    if (!list.length) return;
+    worlds.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('div', { class: 'card-title', text: 'Where you meet' }),
+        h('span', {
+          class: 'sub',
+          id: 'person-worlds-sub',
+          text: 'From VRChat\u2019s own log. Time in conversation there — not time in the world.',
+        })
+      )
+    );
+    const row = h('div', { class: 'world-chips', id: 'person-world-chips' });
+    for (const w of list) {
+      // A world with no name renders as its id. The name arrives on a separate
+      // log line and sometimes never does, and an id is still a place.
+      const named = !!w.name;
+      row.append(
+        h(
+          'button',
+          {
+            class: `world-chip${named ? '' : ' unnamed'}`,
+            dataset: { world: w.world_id },
+            title: named ? w.world_id : 'This world has no name in the log',
+            onclick: () => ctx.searchWorld?.(w.world_id, w.name),
+          },
+          h('span', { class: 'world-name', text: named ? w.name : w.world_id }),
+          h(
+            'span',
+            { class: 'world-meta' },
+            `${w.visits} visit${w.visits === 1 ? '' : 's'}`,
+            ' \u00b7 ',
+            fmtDur(w.together_ms ?? 0),
+            ' \u00b7 ',
+            w.last_ms ? fmtDate(new Date(w.last_ms).toISOString()) : '\u2014'
+          )
+        )
+      );
+    }
+    worlds.append(row);
+  }
+
+  // -- how you talk (0.10.0) -------------------------------------------------
+  //
+  // Its own request (`person.stats`), not part of `person.get`: it is a
+  // different question, it is the more expensive one, and a page that already
+  // renders should not wait on it.
+  //
+  // Two of these numbers are approximations and BOTH carry their definition in
+  // a tooltip, taken from the daemon rather than written here — one wording,
+  // one meaning. A statistic whose caveat lives in a different file is a
+  // statistic that will eventually be shown without one.
+
+  let talkStats = null;
+
+  function pct(v) {
+    return `${Math.round((v ?? 0) * 100)}%`;
+  }
+
+  function renderTalk() {
+    clear(talk);
+    const t = talkStats;
+    // No turns means nothing to say about how they talk — and a row of zeroes
+    // would be a claim that they never interrupt anybody.
+    talk.hidden = !t || !t.turns;
+    if (!t || !t.turns) return;
+    const defs = t.definitions ?? {};
+
+    talk.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('div', { class: 'card-title', text: 'How you talk' }),
+        h('span', {
+          class: 'sub',
+          id: 'talk-sub',
+          text: `${t.turns} turn${t.turns === 1 ? '' : 's'} across ${
+            (t.by_conversation ?? []).length
+          } recent conversation${(t.by_conversation ?? []).length === 1 ? '' : 's'}`,
+        })
+      )
+    );
+
+    // The share bar. A number and a bar, because "34%" is a fact and the bar
+    // is what makes it a comparison.
+    talk.append(
+      h(
+        'div',
+        { class: 'talk-share', id: 'talk-share', dataset: { share: String(t.share ?? 0) } },
+        h(
+          'div',
+          { class: 'talk-share-head' },
+          h('b', { id: 'talk-share-pct', text: pct(t.share) }),
+          h('small', {
+            title: defs.share ?? '',
+            text: 'of the speech in the conversations they were in',
+          })
+        ),
+        h(
+          'div',
+          { class: 'talk-bar' },
+          h('span', {
+            class: 'talk-bar-fill',
+            style: `width:${Math.min(100, Math.max(0, (t.share ?? 0) * 100))}%`,
+          })
+        )
+      )
+    );
+
+    const cell = (key, value, label, title) =>
+      h(
+        'div',
+        { class: 'person-stat', dataset: { talk: key }, title: title ?? '' },
+        h('b', { text: value }),
+        h('small', { text: label }),
+        title ? h('em', { class: 'talk-why', text: 'hover for what this counts' }) : null
+      );
+
+    talk.append(
+      h(
+        'div',
+        { class: 'person-strip', id: 'talk-strip' },
+        cell('mean-turn', fmtDur(t.mean_turn_ms ?? 0), 'mean turn'),
+        cell('monologue', fmtDur(t.longest_monologue_ms ?? 0), 'longest run'),
+        cell(
+          'interruptions',
+          `${t.interruptions_given ?? 0} / ${t.interruptions_received ?? 0}`,
+          'interruptions given / received',
+          defs.interruption ??
+            'A turn that starts while somebody else is still talking, with overlapped speech in it. An approximation.'
+        ),
+        cell(
+          'latency',
+          // Null is not zero. Zero would say they always answered instantly;
+          // the dash says nobody measured a reply.
+          t.median_latency_ms == null ? '\u2014' : fmtDur(t.median_latency_ms),
+          'usual reply gap',
+          defs.latency ??
+            'Median gap from the previous speaker finishing to them starting, over gaps of at most five seconds.'
+        ),
+        cell('tpm', (t.turns_per_minute ?? 0).toFixed(1), 'turns per minute')
+      )
+    );
+
+    if (t.median_latency_ms == null) {
+      talk.append(
+        h('p', {
+          class: 'rail-hint',
+          id: 'talk-latency-note',
+          style: 'padding:10px 0 0;max-width:70ch',
+          text: 'No reply gap yet: nothing they said followed somebody else inside five seconds. Longer gaps are dropped rather than squashed to five, because past that it is a lull and not an answer.',
+        })
+      );
+    }
   }
 
   // -- who they talk with ---------------------------------------------------
@@ -380,6 +554,13 @@ export function mount(root, ctx, arg) {
       clear(stats);
       clear(edges);
       clear(threads);
+      // 0.10.0: both cards are absent-by-default, so a failed load hides them
+      // rather than leaving last answer's worlds under an error message.
+      talkStats = null;
+      clear(worlds);
+      worlds.hidden = true;
+      clear(talk);
+      talk.hidden = true;
       return;
     }
     const payload = JSON.stringify(fetched);
@@ -392,8 +573,24 @@ export function mount(root, ctx, arg) {
     } · ${fmtDur(t.speech_ms)} of speech`;
     renderHeader();
     renderStats();
+    renderWorlds();
     renderEdges();
     renderThreads();
+  }
+
+  /**
+   * `person.stats` (0.10.0), on its own. A daemon too old to know the method
+   * is not an error worth a red box on a page that is otherwise complete: the
+   * card simply is not there.
+   */
+  async function loadTalk() {
+    try {
+      talkStats = await ask('person.stats', { id: spId });
+    } catch {
+      talkStats = null;
+    }
+    if (!body.isConnected) return;
+    renderTalk();
   }
 
   /**
@@ -416,6 +613,7 @@ export function mount(root, ctx, arg) {
       // behind must not keep querying on a DOM nobody can see.
       if (!body.isConnected) return;
       void load();
+      void loadTalk();
     }, REFRESH_MS);
   }
 
@@ -432,9 +630,12 @@ export function mount(root, ctx, arg) {
 
   renderHeader();
   renderStats();
+  renderWorlds();
+  renderTalk();
   renderEdges();
   renderThreads();
   void load();
+  void loadTalk();
 
   return {
     update(change) {
@@ -460,6 +661,6 @@ export function mount(root, ctx, arg) {
       // file the row.
       if (change.added || change.detached || change.purged || change.opFinished) scheduleRefresh();
     },
-    reload: load,
+    reload: () => Promise.all([load(), loadTalk()]),
   };
 }

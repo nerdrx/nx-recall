@@ -70,8 +70,14 @@ pub mod truth;
 pub mod truthnet;
 // ---- end 0.9.0 -----------------------------------------------------------
 pub mod turns;
+// ---- 0.10.0, worlds and turn-taking --------------------------------------
+/// Turn-taking statistics: how a person talks (0.10.0).
+pub mod turntaking;
 pub mod vad;
 pub mod vocab;
+/// World memory: where a conversation happened (0.10.0).
+pub mod worlds;
+// ---- end 0.10.0 ----------------------------------------------------------
 
 /// ~640 KB, bundled so the daemon has no runtime asset lookup. The heavier
 /// analysis models are *not* bundled — they live in `[models].dir`.

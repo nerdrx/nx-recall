@@ -1513,3 +1513,167 @@ client's:
 `mock/mockd.js` implements the method with the same shape, and its thread 502
 mixes turns that still sound with one whose audio has aged out — a client that
 never meets a mixed conversation never renders one.
+## 0.10.0 — worlds and turn-taking
+
+Two additions, both of which are memory rather than capture: **where** a
+conversation happened, and **how** the people in it took turns. Nothing here
+needs a model, a network or a download; both halves are queries over rows the
+daemon already had.
+
+Schema **v12**. Additive and idempotent like every migration since v9: one
+table (`visits`) and one column (`threads.world_id`), read by nothing that
+already existed. A 0.9.x daemon opening a v12 database refuses it, as it always
+has; a 0.10.0 daemon opening a v11 one migrates in place.
+
+### Worlds
+
+`roster.rs` has parsed VRChat's `Joining wrld_…:12345~region(eu)` and
+`Entering Room: <name>` lines since Step 4, and until now it threw both away
+after stamping a roster row. They are now kept:
+
+- **`visits(id, session_id, world_id, world_name, instance_id, t_start_ns,
+  t_end_ns)`.** One row per world entry. `t_end_ns` is NULL until the next
+  entry — or the daemon's shutdown — closes it. `session_id` is nullable and
+  frequently null: the roster comes from a log file that knows nothing about
+  capture, and a world entered while nothing was being recorded is still a
+  visit. `world_name` is nullable because the name arrives on a *separate* log
+  line a moment after the id, and sometimes never arrives; a world with no name
+  renders as its id.
+- **`threads.world_id`.** The visit that was open when the conversation's first
+  turn happened, stamped once at `create_thread` and never revisited. A
+  conversation that ran across a world change belongs to the world it started
+  in — a thread with two places is not a thing anybody can be shown. NULL for
+  everything that is not VRChat: a Discord call and a microphone-only session
+  happen nowhere, and saying so is more useful than naming the last world the
+  user was in.
+
+**Instances are recorded and never grouped on.** "The Great Pug" is a place a
+person remembers; `12345~region(eu)` is a lobby number that changes every time
+the door opens.
+
+#### Backfill — what was possible, and what was not
+
+There is **no backfill from `segments`**. Inventing a visit for a conversation
+that predates the table would be a claim about where somebody was, which is the
+kind of guess the tier boundary exists to prevent.
+
+What *is* recovered is whatever the evidence still on disk supports: on every
+start the roster tailer reads every `output_log_*.txt` in its log directories,
+writes each world entry it finds (idempotent on `(world_id, t_start_ns)`, so
+this is unconditional and free on the second run), and then stamps
+`threads.world_id` on conversations that have none from the visits it just
+learned. VRChat rotates and prunes those logs, so in practice that reaches back
+days, not months — and a database older than the surviving logs keeps threads
+with no world for ever. **Nothing fills those in.**
+
+#### Methods
+
+- **`person.get`** gains `worlds: [{world_id, name, visits, last_ms, last_ns,
+  minutes_together, together_ms}]`, top 8 by time. `minutes_together` is the
+  wall-clock length of the conversations that person took part in *there* — not
+  how long they were in the world, which the daemon does not know. It knows
+  when **it** was in a world and when a **voice** was talking; the conversation
+  is the honest intersection.
+- **`worlds.list {limit?}`** → `{total, worlds: [{world_id, name, visits,
+  last_ms, last_ns, people: [{speaker_id, label}], topics: [...]}]}`, newest
+  visit first. `topics` is Tier 2 output (`threads.topic`) and is an empty list
+  on a machine that has never run enrichment, which is most of them.
+- **`thread.get`** gains `world: {world_id, name} | null`.
+- **`digest.list`** rows gain `world` (the id, or null).
+
+#### The `world` facet
+
+`search`, `search.semantic` and `search.ask` all accept `world`. It is either
+an id (`wrld_…`, matched exactly) or a **case-insensitive substring of a
+name** ("pug"). A facet matching no known world selects **nothing** — never
+everything: an unmatched facet quietly widening to "everywhere" would answer a
+question nobody asked.
+
+`search.ask` learns the phrase, in both languages: `in <world>`,
+`in the <world> world`, `in der <world> Welt`. The interpretation gains
+`world_id` and `world_label`, and the pill is removable like every other. Three
+rules keep it from eating questions:
+
+- **The preposition is mandatory.** A world name is free text and can contain
+  anybody's name; "who mentioned the Great Pug" is a search, not a filter.
+- **Longest name wins**, so a world called "Pug" cannot steal a question about
+  "The Great Pug".
+- **A German article may stand in for the world's own.** "in der Great Pug
+  Welt" resolves to *The Great Pug*, and the trailing "Welt"/"world" is
+  swallowed rather than left in the query as a word nobody said.
+
+#### Events
+
+A world entry now publishes a second event on topic `roster`, named `visit`:
+`{world_id, instance, name, t}`. It is deliberately not a rename of the `roster`
+`world`/`room` events — `roster` says who is present, `visit` says a place was
+entered — and `name` is whatever is known *at that moment*: null on the entry,
+filled in on the room line a second later.
+
+### Turn-taking
+
+`person.stats {id, days?}` and a `stats` block on `thread.get`. Every number is
+a query over turns that already exist; nothing is stored and nothing is
+cached, so a deleted segment stops counting the moment it is deleted.
+
+Four of the six are **definitions**, not measurements, and they ship with their
+definitions attached — `person.stats` returns a `definitions` object and
+`recalld stats` prints it under the numbers. The definitions are part of the
+contract:
+
+| field | definition |
+|---|---|
+| `share` | their speech nanoseconds over the speech nanoseconds of **every identified voice** in the same conversations. Unlabelled turns count towards neither side. |
+| `mean_turn_ms` | their speech over their turn count. |
+| `longest_monologue_ms` | the longest unbroken run of their turns inside one conversation, from the run's first start to its last end — so the pauses *inside* a monologue count towards it. Broken by any turn of another identified voice; an unlabelled turn does not break it. |
+| `interruptions_given` / `_received` | see below. |
+| `median_latency_ms` | see below. `null`, never `0`, when they never answered anybody inside the cap. |
+| `turns_per_minute` | their turn count over the summed wall-clock length of the conversations considered. |
+
+**Interruption, stated honestly.** Turn B interrupts turn A when, in the same
+conversation, (1) A and B have different identified speakers, (2) B starts
+strictly inside A — `A.t_start < B.t_start < A.t_end` — and (3) B's
+`overlap_frac` is at or above **0.10**, the same line above which `identity`
+refuses to put a name to a voice.
+
+This is an approximation, and the way it fails is worth stating. `overlap_frac`
+is a property of B's own audio — the share of B's speech frames in which the
+segmentation model heard two people — and **it does not name the second
+voice**. Condition (2) supplies the name, from the clock, and the clock cannot
+tell a genuine interruption from a back-channel "mhm" or from two people
+starting a sentence at once. Condition (3) is what stops every clock
+coincidence counting: a turn that merely *begins* while another runs, with no
+overlapped speech in it at all, is two microphones being generous about a
+boundary. The count is a floor on rudeness and a ceiling on nothing.
+
+**Response latency.** For each of their turns whose immediately preceding
+*identified* turn belongs to somebody else: the gap from that turn's end to
+theirs, and the reported figure is the **median**. A negative gap is an
+overlap, not a response, and a gap over **5 000 ms** is a lull that happened to
+end with them speaking. Both are **dropped rather than clamped** — clamping
+would let a silent hour vote for "5 s" and drag the median towards a number
+nobody experienced.
+
+#### Methods
+
+- **`person.stats {id, days?}`** → `{id, days, from_ms, turns, speech_ms,
+  conversation_speech_ms, share, mean_turn_ms, longest_monologue_ms,
+  interruptions_given, interruptions_received, median_latency_ms, span_ms,
+  turns_per_minute, definitions, by_conversation}`. `by_conversation` is the
+  last 10 as `[{thread_id, share, turns, last_ms}]`. `days` must be positive;
+  a voice that does not exist is `err:not_found`.
+- **`thread.get`** gains `stats: {shares: [{speaker_id, turns, share,
+  speech_ms}]}`, most talkative first. `share` is **speech time, not turn
+  count**: two people take the same number of turns and one of them talks four
+  times as long, and it is the second fact a person recognises.
+- **`digest.list`** participants gain `share` and `turns`, so the Memory
+  digest card can draw a share bar without a second round trip. Attached to the
+  participant rather than offered as a parallel list, because a client that has
+  to join two arrays to draw one bar will eventually join them wrong.
+
+### CLI
+
+- `recalld worlds [--limit N]` — every place a conversation has happened, with
+  who is there and what gets talked about.
+- `recalld stats <speaker_id> [--days N]` — the numbers above, with the
+  interruption and latency definitions printed underneath them.

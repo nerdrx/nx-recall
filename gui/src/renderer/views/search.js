@@ -40,10 +40,26 @@ const facetState = {
   // the results on screen was an explicit one. It is what the pills are drawn
   // from, and clearing a pill edits it and re-runs.
   asked: null,
+  // 0.10.0. A world facet set by HAND — from a world chip on a person page or
+  // the Memory card — as opposed to one the daemon read out of a question,
+  // which lives on `asked`. Sticky like the rest of the facets.
+  world: '',
+  worldLabel: '',
 };
 let lastHits = [];
 
-export function mount(root, ctx) {
+export function mount(root, ctx, arg) {
+  // Arriving from a world chip: the facet is the whole point of the trip, so
+  // it is set before anything renders and the search runs with it on.
+  //
+  // Deliberately NOT sticky, unlike the speaker and date facets. "Filtered to
+  // The Great Pug" is a trip you took, not a preference you set: leaving
+  // Search and coming back later to a filter you no longer remember switching
+  // on is how a search box starts lying to you. `remount()` passes `arg`
+  // through, so a mode change inside the trip keeps it.
+  facetState.world = arg?.world ? String(arg.world) : '';
+  facetState.worldLabel = arg?.world ? (arg.worldLabel ?? '') : '';
+  if (arg?.world) facetState.asked = null;
   const results = h('div', { id: 'search-results' });
   const resultCard = h('div', { class: 'card' }, results);
   const sub = h('span', { class: 'sub', id: 'search-sub', text: 'Everything captured, by word or by meaning.' });
@@ -222,6 +238,7 @@ export function mount(root, ctx) {
     if (!it) return run();
     const params = { q: it.query ?? '', limit: 100 };
     if (it.speaker_id != null) params.speaker = it.speaker_id;
+    if (it.world_id) params.world = it.world_id;
     if (it.from_ns) params.from = new Date(nsToMs(it.from_ns)).toISOString();
     if (it.to_ns) params.to = new Date(nsToMs(it.to_ns)).toISOString();
     // An empty query with facets is a browse, and only the keyword leg can
@@ -272,11 +289,22 @@ export function mount(root, ctx) {
     return `until ${fmtDay(to)}`;
   }
 
+  /** What to call a world when only its id is known. */
+  function worldLabel(id, label) {
+    if (label) return label;
+    return String(id ?? '').startsWith('wrld_') ? `${String(id).slice(0, 13)}…` : String(id ?? '');
+  }
+
   function renderPills() {
     clear(pills);
     const it = facetState.asked;
-    pills.hidden = !it;
-    if (!it) return;
+    // The world pill shows on BOTH paths: a facet the daemon read out of a
+    // question, and one a world chip set by hand. Without the second, arriving
+    // from "Where you meet" would filter the results with nothing on screen
+    // saying so — a filter you cannot see is a filter you cannot take off.
+    const handWorld = !it && facetState.world;
+    pills.hidden = !it && !handWorld;
+    if (!it && !handWorld) return;
 
     const pill = (key, label, title, drop) =>
       h(
@@ -299,7 +327,26 @@ export function mount(root, ctx) {
         )
       );
 
-    pills.append(h('span', { class: 'ask-pills-label', text: 'understood as' }));
+    pills.append(
+      h('span', {
+        class: 'ask-pills-label',
+        text: handWorld ? 'filtered to' : 'understood as',
+      })
+    );
+    if (handWorld) {
+      pills.append(
+        pill(
+          'world',
+          `in ${worldLabel(facetState.world, facetState.worldLabel)}`,
+          'Only what was said in this world — press ✕ to search everywhere',
+          () => {
+            facetState.world = '';
+            facetState.worldLabel = '';
+          }
+        )
+      );
+      return;
+    }
     if (it.query) {
       // Not removable: with the words gone there is no question left, only
       // facets — and the box above is where you change the words.
@@ -314,6 +361,19 @@ export function mount(root, ctx) {
           delete facetState.asked.speaker_id;
           delete facetState.asked.speaker_label;
         })
+      );
+    }
+    if (it.world_id) {
+      pills.append(
+        pill(
+          'world',
+          `in ${worldLabel(it.world_id, it.world_label)}`,
+          'Only what was said in this world — press ✕ to search everywhere',
+          () => {
+            delete facetState.asked.world_id;
+            delete facetState.asked.world_label;
+          }
+        )
       );
     }
     if (it.from_ns || it.to_ns) {
@@ -345,13 +405,44 @@ export function mount(root, ctx) {
     facetState.from = fromInput.value;
     facetState.to = toInput.value;
 
+    // Nothing left to ask. Taking the last facet off a wordless browse is the
+    // way here, and an empty query is a `params` error on the daemon — so this
+    // says "ask me something" rather than showing a red box for a question
+    // nobody asked.
+    if (!facetState.q.trim() && !facetState.world && !facetState.speaker && !facetState.source) {
+      lastHits = [];
+      clear(results);
+      sub.textContent = 'Everything captured, by word or by meaning.';
+      results.append(
+        h(
+          'div',
+          { class: 'empty' },
+          h('b', { text: 'Search everything you have said and heard' }),
+          h('p', {
+            text: 'Type a few words, or narrow by speaker, source and date. Results open in the transcript where they were said.',
+          })
+        )
+      );
+      return;
+    }
+
     const params = { q: facetState.q, limit: 100 };
     if (facetState.speaker) params.speaker = Number(facetState.speaker);
     if (facetState.source) params.source = facetState.source;
     if (facetState.from) params.from = `${facetState.from}T00:00:00Z`;
     if (facetState.to) params.to = `${facetState.to}T23:59:59Z`;
+    if (facetState.world) params.world = facetState.world;
 
     try {
+      // A world with no words is a BROWSE, not a search for nothing: arriving
+      // from a world chip, the facet is the whole question and there is no
+      // query to rank by. `transcript` takes the same facet and answers it.
+      if (!facetState.q.trim() && facetState.world) {
+        const res = await ask('transcript', { world: facetState.world, limit: 100 });
+        lastHits = [...(res.segments ?? [])].reverse();
+        renderHits({ total: lastHits.length, hits: lastHits }, 'keyword');
+        return;
+      }
       const [method, p] = requestFor(facetState.mode, params);
       const res = await ask(method, p);
       lastHits = res.hits ?? [];
@@ -498,13 +589,13 @@ export function mount(root, ctx) {
   // its buttons, and rebuilding is cheaper to reason about than mutating them.
   function remount() {
     clear(root);
-    return mount(root, ctx);
+    return mount(root, ctx, arg);
   }
 
   fillFacets();
   paintAdvanced();
   renderPills();
-  if (facetState.q || facetState.speaker || facetState.source) run();
+  if (facetState.q || facetState.speaker || facetState.source || facetState.world) run();
   else
     results.append(
       h(

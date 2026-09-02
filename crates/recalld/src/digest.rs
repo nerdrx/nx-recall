@@ -313,6 +313,19 @@ pub fn local_day(utc_ns: i64) -> String {
 /// from one function, so the two cannot drift.
 pub fn digest_json(store: &Store, row: &DigestRow) -> Value {
     let summary = store.thread_summary(row.thread_id).ok().flatten();
+    // 0.10.0: who did the talking. Attached to the participant rather than
+    // offered as a second list, because a share is a property OF a person in
+    // a conversation and a client that has to join two arrays to draw one bar
+    // will eventually join them wrong.
+    let shares: std::collections::HashMap<i64, crate::turntaking::Share> =
+        crate::turntaking::thread_turns(store, row.thread_id)
+            .map(|turns| {
+                crate::turntaking::shares(&turns)
+                    .into_iter()
+                    .map(|s| (s.speaker_id, s))
+                    .collect()
+            })
+            .unwrap_or_default();
     let participants: Vec<Value> = store
         .thread_participants(row.thread_id)
         .unwrap_or_default()
@@ -323,6 +336,8 @@ pub fn digest_json(store: &Store, row: &DigestRow) -> Value {
                 // The name as the voicebank spells it now, so a rename moves
                 // every digest that quoted them without a re-derivation.
                 "label": store.speaker_name(id).ok().flatten(),
+                "share": shares.get(&id).map(|s| s.share),
+                "turns": shares.get(&id).map(|s| s.turns),
             })
         })
         .collect();
@@ -339,6 +354,10 @@ pub fn digest_json(store: &Store, row: &DigestRow) -> Value {
         "ended_ms": summary.as_ref().map(|s| ns_to_ms(s.ended_ns)),
         "ended_ns": summary.as_ref().map(|s| s.ended_ns.to_string()),
         "turns": summary.as_ref().map(|s| s.segments),
+        // 0.10.0: where it happened, for the same reason `thread.get` carries
+        // it — a paragraph about an evening reads differently once you know
+        // which room it was in.
+        "world": store.thread_world(row.thread_id).ok().flatten(),
         "model_id": row.model_id,
         "created_ms": ns_to_ms(row.created_ns),
     })

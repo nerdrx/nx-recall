@@ -987,6 +987,70 @@ export function runE2E(deps) {
       return { from: p.id, to: next.id, edges: p.edges.length, file: await shot('person-edges') };
     });
 
+    // 6k2 — 0.10.0. "Where you meet": the world chips, and the fact that one
+    // of them is a way INTO the transcript rather than a badge.
+    await step('the-person-page-says-where-you-meet', async () => {
+      const p = await waitFor('the world chips', async () => {
+        const p = await js('window.__recallDebug.person()');
+        return p.worlds.length ? p : null;
+      });
+      assert(p.worlds.length >= 1, 'no world chips at all');
+      for (const w of p.worlds) {
+        assert(/^wrld_/.test(w.id), `a chip has no world id: ${JSON.stringify(w)}`);
+        assert(w.name && w.name.trim(), `a chip renders no name: ${JSON.stringify(w)}`);
+        // visits · time · when. All three, because one of them alone is not a
+        // memory of a place.
+        assert(/visit/.test(w.meta), `a chip does not say how often: "${w.meta}"`);
+        assert(w.meta.split('·').length >= 3, `a chip is missing a column: "${w.meta}"`);
+      }
+      return { worlds: p.worlds.map((w) => w.name) };
+    });
+
+    // 6k3 — 0.10.0. "How you talk". The two approximations MUST carry the
+    // daemon's own definition where they are rendered: a statistic whose caveat
+    // lives in a different file is a statistic that gets shown without one.
+    await step('the-person-page-says-how-you-talk', async () => {
+      const p = await waitFor(
+        'the turn-taking card',
+        async () => {
+          const p = await js('window.__recallDebug.person()');
+          return p.talk && p.talk.cells.length ? p : null;
+        },
+        { timeout: 15000 }
+      );
+      const talk = p.talk;
+      assert(/%$/.test(talk.share), `the share does not read as a percentage: "${talk.share}"`);
+      assert(talk.shareFrac > 0 && talk.shareFrac <= 1, `the share is not a fraction: ${talk.shareFrac}`);
+      // The bar has to agree with the number it sits under.
+      const barPct = Number(String(talk.barWidth).replace('%', ''));
+      assert(
+        Math.abs(barPct - talk.shareFrac * 100) < 1.5,
+        `the bar says ${talk.barWidth} and the number says ${talk.share}`
+      );
+
+      const cells = Object.fromEntries(talk.cells.map(([k, v, title]) => [k, { v, title }]));
+      for (const want of ['mean-turn', 'monologue', 'interruptions', 'latency', 'tpm']) {
+        assert(cells[want], `no "${want}" cell: ${JSON.stringify(Object.keys(cells))}`);
+        assert(cells[want].v.trim(), `the ${want} cell renders nothing`);
+      }
+      assert(/\d+\s*\/\s*\d+/.test(cells.interruptions.v), `interruptions read "${cells.interruptions.v}"`);
+      for (const want of ['interruptions', 'latency']) {
+        assert(
+          cells[want].title.length > 40,
+          `the ${want} cell offers no definition — an approximation shown without its caveat is a claim`
+        );
+      }
+      assert(
+        /overlap/i.test(cells.interruptions.title),
+        `the interruption definition does not mention the overlap it rests on: "${cells.interruptions.title}"`
+      );
+      return {
+        share: talk.share,
+        cells: talk.cells.map(([k, v]) => [k, v]),
+        file: await shot('person-talk'),
+      };
+    });
+
     // 6l — a conversation on the page lands in the TRANSCRIPT, unfiltered, with
     // its own span marked. Unfiltered is the point: you opened a conversation
     // to read what everybody said.
@@ -1408,6 +1472,103 @@ export function runE2E(deps) {
       const rows = await js('document.querySelectorAll("#seg-list .seg").length');
       assert(rows > 0, 'opening a topic rendered nothing');
       return { topics: m.topics.map((t) => t.topic), rows };
+    });
+
+    // 6r5 — 0.10.0. The Worlds card, and the share bars the digest card gained.
+    await step('the-worlds-card-lists-places-and-who-is-in-them', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      const w = await waitFor(
+        'the worlds card',
+        async () => {
+          const w = await js('window.__recallDebug.worlds()');
+          return w.shown && w.rows.length ? w : null;
+        },
+        { timeout: 15000 }
+      );
+      assert(w.rows.length >= 2, `only ${w.rows.length} world(s) — one proves nothing`);
+      for (const row of w.rows) {
+        assert(/^wrld_/.test(row.id), `a row has no world id: ${JSON.stringify(row)}`);
+        assert(row.name && row.name.trim(), 'a world row renders no name');
+        assert(Number(row.visits) > 0, `${row.name} claims ${row.visits} visits`);
+        assert(row.people.length > 0, `${row.name} names nobody who has been there`);
+      }
+      // The digest card lists participants, so 0.10.0 gave it share bars. A
+      // bar whose width disagrees with its number is worse than no bar.
+      assert(w.digestShares.length > 0, 'the digest card lists participants but no shares');
+      for (const sh of w.digestShares) {
+        assert(sh.share > 0 && sh.share <= 1, `a share is not a fraction: ${sh.share}`);
+        const width = Number(String(sh.width).replace('%', ''));
+        assert(
+          Math.abs(width - sh.share * 100) < 1.5,
+          `a share bar is ${sh.width} wide for a share of ${sh.share}`
+        );
+        // Speech time, not turn count — and the tooltip has to say which.
+        assert(/speech/i.test(sh.title), `a share bar does not say what it measures: "${sh.title}"`);
+      }
+      // The card lives below the digest and the commitments, so the artefact
+      // has to be scrolled to it or it photographs the top of the page.
+      await js('document.getElementById("worlds-card").scrollIntoView({ block: "center" })');
+      await sleep(250);
+      const file = await shot('memory-worlds');
+
+      // A world row is a DOOR: it leads to Search, already filtered, with a
+      // pill saying so. A filter you cannot see is a filter you cannot remove.
+      const target = w.rows[0];
+      await js(`document.querySelector('#world-list [data-world="${target.id}"]').click()`);
+      await waitFor('search to mount', async () => js('window.__recallDebug.view() === "search"'));
+      const pills = await waitFor(
+        'the world pill',
+        async () => {
+          const a = await js('window.__recallDebug.ask()');
+          return a.shown && a.pills.some((p) => p.facet === 'world') ? a : null;
+        },
+        { timeout: 15000 }
+      );
+      const pill = pills.pills.find((p) => p.facet === 'world');
+      assert(
+        pill.text.includes(target.name),
+        `the pill reads "${pill.text}" for the world "${target.name}"`
+      );
+      assert(pill.removable, 'the world pill cannot be taken off');
+
+      // The browse really is a browse: rows, from that world, with no query.
+      // The pill renders before the rows land, so this waits for the rows.
+      const browsed = await waitFor(
+        'the world browse to render',
+        async () => {
+          const a = await js('window.__recallDebug.ask()');
+          return a.hits > 0 ? a : null;
+        },
+        { timeout: 15000 }
+      );
+      const narrowed = browsed.hits;
+      assert(narrowed > 0, 'the world filter returned nothing at all');
+
+      // Taking the pill off leaves no question behind — which is the honest
+      // answer, not an empty result set that reads as "nothing was said".
+      await js('document.querySelector(\'#ask-pills [data-drop="world"]\').click()');
+      const cleared = await waitFor(
+        'the world pill to come off',
+        async () => {
+          const a = await js('window.__recallDebug.ask()');
+          return !a.pills.some((p) => p.facet === 'world') ? a : null;
+        },
+        { timeout: 15000 }
+      );
+      assert(!cleared.shown, 'the pill row is still up with nothing in it');
+      const prompt = await js(
+        'document.querySelector("#search-results .empty b")?.textContent ?? ""'
+      );
+      assert(
+        /search everything/i.test(prompt),
+        `dropping the last facet left "${prompt}" rather than an invitation to ask something`
+      );
+      return {
+        worlds: w.rows.map((r) => r.name),
+        shares: w.digestShares.length,
+        browsed: narrowed,
+        file,
+      };
     });
 
     // -----------------------------------------------------------------------

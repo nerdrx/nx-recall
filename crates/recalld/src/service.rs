@@ -289,6 +289,10 @@ impl Service {
             "speakers.split" => self.speakers_split(req),
             "speakers.sample" => self.speakers_sample(req),
             "person.get" => self.person_get(req),
+            // ---- 0.10.0, worlds and turn-taking ------------------------
+            "worlds.list" => self.worlds_list(req),
+            "person.stats" => self.person_stats(req),
+            // ---- end 0.10.0 --------------------------------------------
             "thread.get" => self.thread_get(req),
             "replay.get" => crate::replay::get(&self.store(), &self.control.data_dir, req),
             // The memory graph's Tiers 2 and 3 (0.7.0, docs/GRAPH.md).
@@ -1662,6 +1666,9 @@ impl Service {
         let threads = store
             .person_threads(id, PERSON_THREADS)
             .map_err(Error::from)?;
+        // 0.10.0: where they meet.
+        let worlds = crate::worlds::person_worlds(&store, id, crate::worlds::PERSON_WORLDS)
+            .map_err(Error::from)?;
         // Participant *names*, resolved here rather than in the client: the
         // page lists people who may not be in the client's speaker list at all
         // (a merged-away id, a voice minted since the last query).
@@ -1721,6 +1728,26 @@ impl Service {
                     "roster_seconds": e.roster_ns.map(|ns| ns as f64 / 1e9),
                 }))
                 .collect::<Vec<_>>(),
+            // ---- 0.10.0: where you meet ------------------------------
+            // Top eight by time spent in conversation there, which is not the
+            // same as time in the world: the daemon knows when IT was in a
+            // world and when a voice was talking, and the conversation is the
+            // honest intersection. A world with no name renders as its id —
+            // the name arrives on a separate log line and sometimes never
+            // does.
+            "worlds": worlds
+                .iter()
+                .map(|w| json!({
+                    "world_id": w.world_id,
+                    "name": w.name,
+                    "visits": w.visits,
+                    "last_ms": ns_to_ms(w.last_ns),
+                    "last_ns": w.last_ns.to_string(),
+                    "minutes_together": w.together_ns as f64 / 60e9,
+                    "together_ms": ns_to_ms(w.together_ns),
+                }))
+                .collect::<Vec<_>>(),
+            // ---- end 0.10.0 ------------------------------------------
             "recent_threads": threads
                 .iter()
                 .map(|t| json!({
@@ -1751,6 +1778,15 @@ impl Service {
             .map_err(Error::from)?
             .ok_or_else(|| Error::not_found(format!("no thread with id {id}")))?;
         let rows = store.thread_rows(id).map_err(Error::from)?;
+        // 0.10.0: who did the talking, and where it happened.
+        let shares = crate::turntaking::shares(
+            &crate::turntaking::thread_turns(&store, id).map_err(Error::from)?,
+        );
+        let world_id = store.thread_world(id).map_err(Error::from)?;
+        let world_name = match &world_id {
+            Some(w) => crate::worlds::name_of(&store, w).map_err(Error::from)?,
+            None => None,
+        };
         // A conversation whose every turn has been deleted is not a
         // conversation with nothing in it — it is gone, and saying so is the
         // only honest answer (audit finding #15). The sweeper removes the row
@@ -1779,9 +1815,132 @@ impl Service {
             "ended_ms": ns_to_ms(summary.ended_ns),
             "participants": participants,
             "preview": summary.preview,
+            // ---- 0.10.0 ----------------------------------------------
+            // `share` is speech time, not turn count: two people take the
+            // same number of turns and one of them talks for four times as
+            // long, and it is the second fact a person recognises.
+            "stats": {
+                "shares": shares
+                    .iter()
+                    .map(|sh| json!({
+                        "speaker_id": sh.speaker_id,
+                        "turns": sh.turns,
+                        "share": sh.share,
+                        "speech_ms": ns_to_ms(sh.speech_ns),
+                    }))
+                    .collect::<Vec<_>>(),
+            },
+            "world": world_id.as_ref().map(|w| json!({"world_id": w, "name": world_name})),
+            // ---- end 0.10.0 ------------------------------------------
             "segments": rows.iter().map(segment_json).collect::<Vec<_>>(),
         }))
     }
+
+    // ---- 0.10.0, worlds and turn-taking ----------------------------------
+
+    /// `worlds.list` — every place a conversation has happened.
+    fn worlds_list(&self, req: &Request) -> Result<Value, Error> {
+        let limit = req
+            .usize_or("limit", crate::worlds::WORLDS_LIMIT)?
+            .clamp(1, 500);
+        let rows = crate::worlds::list(&self.store(), limit).map_err(Error::from)?;
+        Ok(json!({
+            "total": rows.len(),
+            "worlds": rows
+                .iter()
+                .map(|w| json!({
+                    "world_id": w.world_id,
+                    "name": w.name,
+                    "visits": w.visits,
+                    "last_ms": ns_to_ms(w.last_ns),
+                    "last_ns": w.last_ns.to_string(),
+                    "people": w.people
+                        .iter()
+                        .map(|(id, label)| json!({"speaker_id": id, "label": label}))
+                        .collect::<Vec<_>>(),
+                    // Tier 2 output, so absent on a machine that has never run
+                    // enrichment — which is most of them, and is not an error.
+                    "topics": w.topics,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// `person.stats` — how somebody talks.
+    ///
+    /// Every number is defined in `crate::turntaking`, and the definitions are
+    /// part of the contract: an interruption in particular is an approximation
+    /// with a named failure mode, and a client is expected to say so where it
+    /// renders one.
+    fn person_stats(&self, req: &Request) -> Result<Value, Error> {
+        use crate::turntaking as tt;
+
+        let id = req.i64("id")?;
+        let days = req.opt_i64("days")?;
+        if let Some(d) = days
+            && d <= 0
+        {
+            return Err(Error::params("days must be positive"));
+        }
+        let from_ns = days.map(|d| utc_now_ns() - d * 86_400 * 1_000_000_000);
+
+        let store = self.store();
+        store
+            .speaker_summary(id)
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::not_found(format!("no speaker with id {id}")))?;
+        let turns = tt::person_turns(&store, id, from_ns).map_err(Error::from)?;
+        drop(store);
+
+        let s = tt::stats_for(&turns, id);
+        let by = tt::by_conversation(&turns, id, tt::BY_CONVERSATION);
+        Ok(json!({
+            "id": id,
+            "days": days,
+            "from_ms": from_ns.map(ns_to_ms),
+            "turns": s.turns,
+            "speech_ms": ns_to_ms(s.speech_ns),
+            "conversation_speech_ms": ns_to_ms(s.total_speech_ns),
+            "share": s.share,
+            "mean_turn_ms": ns_to_ms(s.mean_turn_ns),
+            "longest_monologue_ms": ns_to_ms(s.longest_monologue_ns),
+            "interruptions_given": s.interruptions_given,
+            "interruptions_received": s.interruptions_received,
+            // Null when they never answered anybody inside the five-second
+            // cap. A zero would say they always answered instantly.
+            "median_latency_ms": s.median_latency_ms,
+            "span_ms": ns_to_ms(s.span_ns),
+            "turns_per_minute": s.turns_per_minute,
+            "definitions": {
+                "interruption": format!(
+                    "a turn of theirs that starts while somebody else is still talking AND \
+                     whose own audio holds at least {:.0}% overlapped speech — the same line \
+                     above which the daemon refuses to name a voice. The overlap says two \
+                     people were audible, not which two; the clock supplies the name. It \
+                     cannot tell an interruption from a back-channel.",
+                    tt::INTERRUPTION_OVERLAP * 100.0
+                ),
+                "latency": format!(
+                    "the median gap from the previous speaker's turn ending to theirs \
+                     starting, over gaps of 0 to {} ms. Longer gaps are dropped rather than \
+                     clamped: past that it is a lull, not a reply.",
+                    tt::LATENCY_CAP_MS
+                ),
+                "share": "their speech time over the speech time of every identified voice \
+                          in the same conversations",
+            },
+            "by_conversation": by
+                .iter()
+                .map(|c| json!({
+                    "thread_id": c.thread_id,
+                    "share": c.share,
+                    "turns": c.turns,
+                    "last_ms": ns_to_ms(c.last_ns),
+                }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+    // ---- end 0.10.0 ------------------------------------------------------
 
     // ---- the memory graph, Tiers 2 and 3 (0.7.0, docs/GRAPH.md) ----------
 
@@ -2348,12 +2507,25 @@ impl Service {
     // ---- reading ---------------------------------------------------------
 
     fn filter_of(&self, req: &Request) -> Result<SegmentFilter, Error> {
+        // ---- 0.10.0: the world facet -----------------------------------
+        // Resolved here rather than in SQL, because "pug" is a name substring
+        // and `wrld_…` is an id and the difference is a question for the
+        // store, not for a WHERE clause. A facet that matches nothing resolves
+        // to an id that cannot exist, so the answer is empty rather than
+        // unfiltered — the one failure mode that would be a lie.
+        let worlds = match req.opt_str("world")? {
+            None => None,
+            Some(w) if w.trim().is_empty() => None,
+            Some(w) => Some(crate::worlds::resolve_facet(&self.store(), w).map_err(Error::from)?),
+        };
+        // ---- end 0.10.0 ------------------------------------------------
         Ok(SegmentFilter {
             speaker: req.opt_i64("speaker")?,
             session: req.opt_i64("session")?,
             source: req.opt_str("source")?.map(str::to_string),
             from: time_param(req, "from")?,
             to: time_param(req, "to")?,
+            worlds,
         })
     }
 
@@ -2785,7 +2957,13 @@ impl Service {
                 })
             })
             .collect();
-        let interpretation = crate::ask::parse(&q, utc_now_ns(), &named);
+        // ---- 0.10.0: "in <world>" is a facet too ------------------------
+        let worlds: Vec<crate::ask::World> = crate::worlds::known_names(&self.store())
+            .map_err(Error::from)?
+            .into_iter()
+            .map(|(id, label)| crate::ask::World { id, label })
+            .collect();
+        let interpretation = crate::ask::parse_with_worlds(&q, utc_now_ns(), &named, &worlds);
 
         let filter = SegmentFilter {
             speaker: interpretation.speaker_id,
@@ -2793,7 +2971,9 @@ impl Service {
             source: None,
             from: interpretation.from_ns,
             to: interpretation.to_ns,
+            worlds: interpretation.world_id.clone().map(|id| vec![id]),
         };
+        // ---- end 0.10.0 -------------------------------------------------
         let expression = crate::ask::fts_expression(&interpretation.query);
         let (hits, mode) = self.ask_hits(&interpretation.query, &expression, &filter, limit)?;
 
@@ -2807,6 +2987,10 @@ impl Service {
                 "speaker_id": interpretation.speaker_id,
                 // Spelled as the voicebank spells it, not as it was typed.
                 "speaker_label": interpretation.speaker_label,
+                // 0.10.0. The id is what a client passes back as the `world`
+                // facet; the label is what the pill says.
+                "world_id": interpretation.world_id,
+                "world_label": interpretation.world_label,
                 // Both forms, as everywhere else: `_ns` is a string because
                 // 1.8e18 does not survive a JSON number in a browser.
                 "from_ns": interpretation.from_ns.map(|v| v.to_string()),
@@ -4806,6 +4990,316 @@ mod tests {
         assert_eq!(e.code, "not_found");
     }
 
+    // ---- 0.10.0: worlds and turn-taking ----------------------------------
+
+    const PUG: &str = "wrld_aaaaaaaa-0000-0000-0000-000000000000";
+    const CLUB: &str = "wrld_bbbbbbbb-0000-0000-0000-000000000000";
+    const MS: i64 = 1_000_000;
+
+    /// One conversation, in a world, with turns at the times given.
+    ///
+    /// `(start_ms, end_ms, speaker, overlap)` — the same shape the pure tests
+    /// in `crate::turntaking` use, so the two halves can be compared by eye.
+    fn a_turn_run(r: &Rig, sess: i64, turns: &[(i64, i64, i64, f32)]) -> i64 {
+        let store = r.service.store();
+        let started = turns.first().map(|t| t.0 * MS).unwrap_or(0);
+        let ended = turns.last().map(|t| t.1 * MS).unwrap_or(0);
+        let thread = store.create_thread(sess, started, ended).unwrap();
+        for (a, b, who, ov) in turns {
+            let seg = store
+                .insert_segment(sess, a * MS, b * MS, "segments/x.wav", 0)
+                .unwrap();
+            store
+                .set_segment_analysis(
+                    seg,
+                    &SegmentAnalysis {
+                        text: Some(format!("turn at {a}")),
+                        overlap_frac: Some(*ov),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store
+                .set_segment_speaker(seg, Some(*who), Some(0.9))
+                .unwrap();
+            store.set_segment_thread(seg, thread, b * MS).unwrap();
+        }
+        thread
+    }
+
+    #[test]
+    fn a_conversation_remembers_the_world_it_started_in() {
+        let r = rig("world-thread");
+        let sess = a_session(&r);
+        {
+            let store = r.service.store();
+            crate::worlds::open_visit(&store, PUG, Some("11"), 0).unwrap();
+            crate::worlds::name_visit(&store, "The Great Pug", 1).unwrap();
+        }
+        let who = r.service.store().mint_speaker(0).unwrap();
+        let thread = a_turn_run(&r, sess, &[(1_000, 3_000, who, 0.0)]);
+
+        let out = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"thread.get","params":{{"id":{thread}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(out["world"]["world_id"], json!(PUG));
+        assert_eq!(out["world"]["name"], json!("The Great Pug"));
+
+        // A conversation with no visit covering it happens NOWHERE, and says
+        // so with a null rather than with the last world anybody was in.
+        let nowhere = a_turn_run(&r, sess, &[(-5_000, -4_000, who, 0.0)]);
+        let out = call(
+            &r,
+            &format!(r#"{{"id":2,"method":"thread.get","params":{{"id":{nowhere}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(out["world"], Value::Null);
+    }
+
+    #[test]
+    fn the_person_page_says_where_they_meet_and_worlds_list_says_who_is_there() {
+        let r = rig("worlds-list");
+        let sess = a_session(&r);
+        let (a, b) = {
+            let store = r.service.store();
+            crate::worlds::open_visit(&store, PUG, Some("11"), 0).unwrap();
+            crate::worlds::name_visit(&store, "The Great Pug", 1).unwrap();
+            (
+                store.mint_speaker(0).unwrap(),
+                store.mint_speaker(0).unwrap(),
+            )
+        };
+        r.service.store().rename_speaker(a, "Ines", 1).unwrap();
+        a_turn_run(&r, sess, &[(1_000, 3_000, a, 0.0), (4_000, 6_000, b, 0.0)]);
+        // A second evening, somewhere else.
+        {
+            let store = r.service.store();
+            crate::worlds::open_visit(&store, CLUB, Some("22"), 100_000 * MS).unwrap();
+        }
+        a_turn_run(&r, sess, &[(101_000, 102_000, a, 0.0)]);
+
+        let page = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"person.get","params":{{"id":{a}}}}}"#),
+        )
+        .unwrap();
+        let worlds = page["worlds"].as_array().unwrap();
+        assert_eq!(worlds.len(), 2, "{worlds:#?}");
+        // The Pug leads: five seconds of conversation against one.
+        assert_eq!(worlds[0]["world_id"], json!(PUG));
+        assert_eq!(worlds[0]["name"], json!("The Great Pug"));
+        assert_eq!(worlds[0]["visits"], json!(1));
+        assert!((worlds[0]["minutes_together"].as_f64().unwrap() - 5.0 / 60.0).abs() < 1e-9);
+        // A world nobody has a name for is still a world.
+        assert_eq!(worlds[1]["world_id"], json!(CLUB));
+        assert_eq!(worlds[1]["name"], Value::Null);
+
+        let list = call(&r, r#"{"id":2,"method":"worlds.list"}"#).unwrap();
+        let rows = list["worlds"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest visit first, which is the order a person looks for.
+        assert_eq!(rows[0]["world_id"], json!(CLUB));
+        let pug = &rows[1];
+        assert_eq!(pug["name"], json!("The Great Pug"));
+        let people = pug["people"].as_array().unwrap();
+        assert_eq!(people.len(), 2);
+        assert!(
+            people.iter().any(|p| p["label"] == json!("Ines")),
+            "a named voice is named: {people:#?}"
+        );
+        // Enrichment has never run here, so there are no topics — an empty
+        // list, never a fabricated one.
+        assert_eq!(pug["topics"], json!([]));
+    }
+
+    #[test]
+    fn a_world_facet_narrows_a_search_and_a_world_nobody_knows_narrows_it_to_nothing() {
+        let r = rig("world-facet");
+        let sess = a_session(&r);
+        let who = r.service.store().mint_speaker(0).unwrap();
+        {
+            let store = r.service.store();
+            crate::worlds::open_visit(&store, PUG, Some("11"), 0).unwrap();
+            crate::worlds::name_visit(&store, "The Great Pug", 1).unwrap();
+        }
+        a_turn_run(&r, sess, &[(1_000, 3_000, who, 0.0)]);
+        {
+            let store = r.service.store();
+            crate::worlds::open_visit(&store, CLUB, Some("22"), 100_000 * MS).unwrap();
+            crate::worlds::name_visit(&store, "Ghost Club", 100_001 * MS).unwrap();
+        }
+        a_turn_run(&r, sess, &[(101_000, 102_000, who, 0.0)]);
+
+        let all = call(&r, r#"{"id":1,"method":"search","params":{"q":"turn"}}"#).unwrap();
+        assert_eq!(all["total"], json!(2));
+
+        // By name substring, case-insensitively.
+        let pug = call(
+            &r,
+            r#"{"id":2,"method":"search","params":{"q":"turn","world":"PUG"}}"#,
+        )
+        .unwrap();
+        assert_eq!(pug["total"], json!(1));
+
+        // By id.
+        let by_id = call(
+            &r,
+            &format!(r#"{{"id":3,"method":"search","params":{{"q":"turn","world":"{CLUB}"}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(by_id["total"], json!(1));
+
+        // A world nothing was ever recorded in selects NOTHING. The failure
+        // mode worth guarding is the other one: an unmatched facet quietly
+        // falling back to "everywhere" would answer a question nobody asked.
+        let nowhere = call(
+            &r,
+            r#"{"id":4,"method":"search","params":{"q":"turn","world":"atlantis"}}"#,
+        )
+        .unwrap();
+        assert_eq!(nowhere["total"], json!(0));
+    }
+
+    #[test]
+    fn a_question_can_name_a_world_in_two_languages() {
+        let r = rig("ask-world");
+        let sess = a_session(&r);
+        let who = r.service.store().mint_speaker(0).unwrap();
+        {
+            let store = r.service.store();
+            crate::worlds::open_visit(&store, PUG, Some("11"), 0).unwrap();
+            crate::worlds::name_visit(&store, "The Great Pug", 1).unwrap();
+        }
+        a_turn_run(&r, sess, &[(1_000, 3_000, who, 0.0)]);
+
+        for q in [
+            "was wurde in der Great Pug Welt gesagt",
+            "what was said in The Great Pug",
+        ] {
+            let out = call(
+                &r,
+                &format!(
+                    r#"{{"id":1,"method":"search.ask","params":{{"q":{}}}}}"#,
+                    serde_json::to_string(q).unwrap()
+                ),
+            )
+            .unwrap();
+            let it = &out["interpretation"];
+            assert_eq!(it["world_id"], json!(PUG), "{q}");
+            assert_eq!(it["world_label"], json!("The Great Pug"), "{q}");
+            // "Welt" is swallowed with the phrase: it is not a word anybody
+            // said, and leaving it in the query would find nothing.
+            assert!(
+                !it["query"]
+                    .as_str()
+                    .unwrap()
+                    .to_lowercase()
+                    .contains("welt"),
+                "{q} left the trailer in the query: {it:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn person_stats_reports_the_shape_of_a_conversation_with_its_definitions() {
+        let r = rig("person-stats");
+        let sess = a_session(&r);
+        let (a, b) = {
+            let store = r.service.store();
+            (
+                store.mint_speaker(0).unwrap(),
+                store.mint_speaker(0).unwrap(),
+            )
+        };
+        // A talks for 10 s, B answers 1 s later for 2 s, then B starts again
+        // inside A's next turn with real overlap — one interruption.
+        let thread = a_turn_run(
+            &r,
+            sess,
+            &[
+                (0, 10_000, a, 0.0),
+                (11_000, 13_000, b, 0.0),
+                (14_000, 20_000, a, 0.0),
+                (16_000, 18_000, b, 0.4),
+            ],
+        );
+
+        let out = call(
+            &r,
+            &format!(r#"{{"id":1,"method":"person.stats","params":{{"id":{a}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(out["turns"], json!(2));
+        assert_eq!(out["speech_ms"], json!(16_000));
+        assert_eq!(out["conversation_speech_ms"], json!(20_000));
+        assert_eq!(out["share"], json!(0.8));
+        assert_eq!(out["mean_turn_ms"], json!(8_000));
+        assert_eq!(out["longest_monologue_ms"], json!(10_000));
+        assert_eq!(out["interruptions_given"], json!(0));
+        assert_eq!(out["interruptions_received"], json!(1));
+        // A answered B once, 1 s later.
+        assert_eq!(out["median_latency_ms"], json!(1_000));
+        assert_eq!(out["span_ms"], json!(20_000));
+        // The definitions travel with the numbers: an approximation that
+        // arrives without its caveat is a claim.
+        for key in ["interruption", "latency", "share"] {
+            assert!(
+                out["definitions"][key].as_str().unwrap().len() > 40,
+                "no definition for {key}"
+            );
+        }
+        let by = out["by_conversation"].as_array().unwrap();
+        assert_eq!(by.len(), 1);
+        assert_eq!(by[0]["thread_id"], json!(thread));
+        assert_eq!(by[0]["share"], json!(0.8));
+        assert_eq!(by[0]["turns"], json!(2));
+
+        // B's side is the mirror image, which is what makes it a share.
+        let out = call(
+            &r,
+            &format!(r#"{{"id":2,"method":"person.stats","params":{{"id":{b}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(out["share"], json!(0.2));
+        assert_eq!(out["interruptions_given"], json!(1));
+        assert_eq!(out["median_latency_ms"], json!(1_000));
+
+        // And the conversation carries the same shares, so a thread header and
+        // a person page can never disagree.
+        let t = call(
+            &r,
+            &format!(r#"{{"id":3,"method":"thread.get","params":{{"id":{thread}}}}}"#),
+        )
+        .unwrap();
+        let shares = t["stats"]["shares"].as_array().unwrap();
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0]["speaker_id"], json!(a));
+        assert_eq!(shares[0]["share"], json!(0.8));
+        assert_eq!(shares[1]["share"], json!(0.2));
+
+        // A voice nobody has heard of is not found, and `days` must be real.
+        assert_eq!(
+            call(
+                &r,
+                r#"{"id":4,"method":"person.stats","params":{"id":9999}}"#
+            )
+            .unwrap_err()
+            .code,
+            "not_found"
+        );
+        assert_eq!(
+            call(
+                &r,
+                &format!(r#"{{"id":5,"method":"person.stats","params":{{"id":{a},"days":0}}}}"#)
+            )
+            .unwrap_err()
+            .code,
+            "params"
+        );
+    }
+
     // ---- 0.6.1: storage --------------------------------------------------
 
     #[test]
@@ -6051,7 +6545,7 @@ mod tests {
     fn status_says_which_assistant_features_are_on() {
         let r = rig("assist-status");
         let s = call(&r, r#"{"id":1,"method":"status"}"#).unwrap();
-        assert_eq!(s["schema"], json!(11));
+        assert_eq!(s["schema"], json!(12));
         // Shipped defaults: reminders and digests on (both need something else
         // before they do anything), translation off with no guess at a target.
         assert_eq!(s["assist"]["reminders"], json!(true));

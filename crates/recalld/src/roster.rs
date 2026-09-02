@@ -275,6 +275,32 @@ pub fn run(
         None => Vec::new(),
     };
     let mut announced_missing = false;
+    // ---- 0.10.0: world memory --------------------------------------------
+    // Recover every world entry from whatever logs VRChat has not rotated
+    // away, then give the conversations that predate the table the world the
+    // log says they happened in. Idempotent, so it is unconditional; bounded,
+    // because a log directory holds a handful of files; and best-effort,
+    // because a missing log is the ordinary state of a machine with no VRChat
+    // on it and must never cost the tailer its start.
+    {
+        let dirs = if dirs.is_empty() {
+            default_log_dirs()
+        } else {
+            dirs.clone()
+        };
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        match crate::worlds::backfill_from_logs(&guard, &dirs)
+            .and_then(|n| Ok((n, crate::worlds::stamp_threads(&guard)?)))
+        {
+            Ok((0, 0)) => {}
+            Ok((entries, threads)) => info!(
+                entries,
+                threads, "recovered world visits from the VRChat logs still on disk"
+            ),
+            Err(e) => warn!("could not read world history out of the VRChat logs: {e:#}"),
+        }
+    }
+    // ---- end 0.10.0 -------------------------------------------------------
 
     while !stop.stopped() {
         let candidates = if dirs.is_empty() {
@@ -439,13 +465,25 @@ fn record(
             .roster_join(world, instance, who, line.t_utc_ns)
             .map(|_| ()),
         Event::Leave { who } => guard.roster_leave(who, line.t_utc_ns).map(|_| ()),
-        Event::World { .. } => guard.roster_close_all(line.t_utc_ns).map(|_| ()),
+        // ---- 0.10.0: world memory ------------------------------------
+        // The same line that empties the roster opens a visit. One log entry,
+        // two facts: nobody is in the old instance any more, and we are
+        // somewhere new as of exactly this instant.
+        Event::World { world_id, instance } => guard
+            .roster_close_all(line.t_utc_ns)
+            .and_then(|_| {
+                crate::worlds::open_visit(&guard, world_id, Some(instance), line.t_utc_ns)
+            })
+            .map(|_| ()),
         // The human-readable world name is the one thing in this log that is
         // vocabulary rather than presence: "The Great Pug" is a phrase people
         // say out loud and no ASR model has heard of. Remembered here (0.8.0,
         // `crate::vocab`) because this is the only place it exists — the
         // roster table stores world *ids*.
-        Event::Room { name } => crate::vocab::remember_world(&guard, name).map(|_| ()),
+        Event::Room { name } => crate::vocab::remember_world(&guard, name)
+            .and_then(|_| crate::worlds::name_visit(&guard, name, line.t_utc_ns))
+            .map(|_| ()),
+        // ---- end 0.10.0 ----------------------------------------------
     };
     drop(guard);
     if let Err(e) = outcome {
@@ -462,6 +500,33 @@ fn record(
         Event::Room { name } => json!({"ev": "room", "name": name, "t": line.t_utc_ns}),
     };
     bus.publish(Topic::Roster, "roster", data);
+
+    // ---- 0.10.0: world memory --------------------------------------------
+    // A SECOND event, on the same topic and deliberately not a rename of the
+    // first. `roster` says who is present; `visit` says a place was entered,
+    // and a client that only cares about the latter should not have to
+    // reconstruct it from two lines that arrive a second apart. The name is
+    // whatever is known NOW — null on the `world` line, filled in on the
+    // `room` line that follows it.
+    let visit = match &line.event {
+        Event::World { world_id, instance } => Some(json!({
+            "world_id": world_id,
+            "instance": instance,
+            "name": state.world_name,
+            "t": line.t_utc_ns,
+        })),
+        Event::Room { name } => Some(json!({
+            "world_id": state.world_id,
+            "instance": state.instance,
+            "name": name,
+            "t": line.t_utc_ns,
+        })),
+        _ => None,
+    };
+    if let Some(visit) = visit {
+        bus.publish(Topic::Roster, "visit", visit);
+    }
+    // ---- end 0.10.0 -------------------------------------------------------
 }
 
 /// After replaying a log's history: make the table say what the log says, and

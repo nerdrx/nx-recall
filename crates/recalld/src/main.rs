@@ -171,6 +171,10 @@ fn main() -> Result<()> {
         // ---- end 0.9.0 -------------------------------------------------
         // ---- 0.9.0, the assistant ---------------------------------------
         Command::Digest { day } => cmd_digest(&cfg, &data_dir, day.as_deref()),
+        // ---- 0.10.0, worlds and turn-taking ---------------------------
+        Command::Stats { speaker_id, days } => cmd_stats(&cfg, &data_dir, speaker_id, days),
+        Command::Worlds { limit } => cmd_worlds(&cfg, &data_dir, limit),
+        // ---- end 0.10.0 -----------------------------------------------
         // ---- end 0.9.0 ---------------------------------------------------
     }
 }
@@ -2318,6 +2322,155 @@ fn cmd_notes(cfg: &Config, data_dir: &Path, action: Option<NotesAction>) -> Resu
     }
     Ok(())
 }
+
+// ---- 0.10.0, worlds and turn-taking --------------------------------------
+
+/// `recalld stats <speaker_id>` — how somebody talks.
+fn cmd_stats(cfg: &Config, data_dir: &Path, speaker_id: i64, days: Option<i64>) -> Result<()> {
+    let mut params = json!({"id": speaker_id});
+    if let Some(d) = days {
+        params["days"] = json!(d);
+    }
+    let s = call(cfg, data_dir, "person.stats", params)?;
+    let who = call(cfg, data_dir, "person.get", json!({"id": speaker_id}))
+        .ok()
+        .and_then(|p| {
+            p["speaker"]["name"]
+                .as_str()
+                .or_else(|| p["speaker"]["auto"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| speaker_id.to_string());
+    let ms = |k: &str| s[k].as_i64().unwrap_or(0);
+    let dur = |v: i64| {
+        if v >= 60_000 {
+            format!("{}m {:02}s", v / 60_000, (v % 60_000) / 1000)
+        } else {
+            format!("{:.1}s", v as f64 / 1000.0)
+        }
+    };
+
+    println!("{who}");
+    match days {
+        Some(d) => println!("{:<20}the last {d} days", "over"),
+        None => println!("{:<20}everything captured", "over"),
+    }
+    println!(
+        "{:<20}{:.0}%  ({} of {})",
+        "talk share",
+        s["share"].as_f64().unwrap_or(0.0) * 100.0,
+        dur(ms("speech_ms")),
+        dur(ms("conversation_speech_ms"))
+    );
+    println!("{:<20}{}", "turns", s["turns"].as_i64().unwrap_or(0));
+    println!("{:<20}{}", "mean turn", dur(ms("mean_turn_ms")));
+    println!(
+        "{:<20}{}",
+        "longest monologue",
+        dur(ms("longest_monologue_ms"))
+    );
+    println!(
+        "{:<20}{:.2}",
+        "turns per minute",
+        s["turns_per_minute"].as_f64().unwrap_or(0.0)
+    );
+    println!(
+        "{:<20}{} given, {} received",
+        "interruptions",
+        s["interruptions_given"].as_i64().unwrap_or(0),
+        s["interruptions_received"].as_i64().unwrap_or(0)
+    );
+    println!(
+        "{:<20}{}",
+        "response latency",
+        match s["median_latency_ms"].as_i64() {
+            // Null is not zero. Zero would say they always answered
+            // instantly; null says they never answered anybody inside the cap.
+            None => "never answered anybody within 5 s".to_string(),
+            Some(v) => format!("{} (median)", dur(v)),
+        }
+    );
+
+    let by = s["by_conversation"].as_array().cloned().unwrap_or_default();
+    if !by.is_empty() {
+        println!();
+        println!("{:<20}{:>7}  {:>6}", "conversation", "share", "turns");
+        for c in &by {
+            println!(
+                "{:<20}{:>6.0}%  {:>6}",
+                c["thread_id"].as_i64().unwrap_or(0),
+                c["share"].as_f64().unwrap_or(0.0) * 100.0,
+                c["turns"].as_i64().unwrap_or(0)
+            );
+        }
+    }
+
+    // The caveats travel with the numbers. An approximation printed without
+    // its definition is a claim.
+    println!();
+    for key in ["interruption", "latency"] {
+        if let Some(text) = s["definitions"][key].as_str() {
+            println!("{key}: {text}");
+        }
+    }
+    Ok(())
+}
+
+/// `recalld worlds` — every place a conversation has happened.
+fn cmd_worlds(cfg: &Config, data_dir: &Path, limit: usize) -> Result<()> {
+    let out = call(cfg, data_dir, "worlds.list", json!({"limit": limit}))?;
+    let rows = out["worlds"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!("No worlds recorded yet.");
+        println!(
+            "Worlds come from VRChat's own log. Nothing is recorded for a machine that has \
+             not run it, and nothing is invented for conversations that predate the table."
+        );
+        return Ok(());
+    }
+    println!(
+        "{:<34}{:>7}  {:<19}  who is there",
+        "world", "visits", "last"
+    );
+    for w in &rows {
+        let name = w["name"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| w["world_id"].as_str().unwrap_or("?").to_string());
+        let people: Vec<&str> = w["people"]
+            .as_array()
+            .map(|ps| ps.iter().filter_map(|p| p["label"].as_str()).collect())
+            .unwrap_or_default();
+        println!(
+            "{:<34}{:>7}  {:<19}  {}",
+            truncate(&name, 33),
+            w["visits"].as_i64().unwrap_or(0),
+            w["last_ms"]
+                .as_i64()
+                .map(|ms| format_time(ms * 1_000_000))
+                .unwrap_or_else(|| "—".into()),
+            people.join(", ")
+        );
+        let topics: Vec<&str> = w["topics"]
+            .as_array()
+            .map(|ts| ts.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if !topics.is_empty() {
+            println!("{:<34}{}", "", topics.join(" · "));
+        }
+    }
+    Ok(())
+}
+
+/// Cut a display string to `n` characters — characters, not bytes, because a
+/// world name is as likely to be Japanese as English.
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    s.chars().take(n.saturating_sub(1)).collect::<String>() + "…"
+}
+// ---- end 0.10.0 ----------------------------------------------------------
 
 /// `recalld brief <speaker_id>` — what is outstanding with one person.
 fn cmd_brief(cfg: &Config, data_dir: &Path, speaker_id: i64) -> Result<()> {

@@ -63,7 +63,15 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // translation and the model that wrote it) and one new table, `digests`. See
 // `apply_v11`. No backfill of any of it — a note captured before v11 had no
 // due date to lose, and a translation nobody has computed is correctly absent.
-pub const SCHEMA_VERSION: i64 = 11;
+//
+// ---- 0.10.0 (schema v12): worlds -----------------------------------------
+// v12 adds `visits` (one row per VRChat world entry, closed by the next one)
+// and `threads.world_id` (the visit that was open when the conversation
+// began). Both live in `crate::worlds`; both are additive and idempotent, and
+// neither is backfilled from anything already in the database. The turn-taking
+// half of 0.10.0 adds no schema at all — every number it reports is a query
+// over turns that were already there.
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -527,12 +535,36 @@ pub struct SegmentFilter {
     pub source: Option<String>,
     pub from: Option<i64>,
     pub to: Option<i64>,
+    /// 0.10.0 — the world facet, already resolved to the ids it selects
+    /// (`crate::worlds::resolve_facet`). `None` is "anywhere"; an EMPTY vector
+    /// is impossible by construction, because a facet that matches no world
+    /// resolves to one id that cannot exist rather than to nothing.
+    pub worlds: Option<Vec<String>>,
 }
 
 impl SegmentFilter {
     pub fn is_everything(&self) -> bool {
         *self == Self::default()
     }
+
+    /// The world facet as a JSON array, which is how it reaches SQL: a
+    /// `json_each` subquery is the one way to bind a *list* to a prepared
+    /// statement without building the SQL out of the values.
+    pub fn worlds_json(&self) -> Option<String> {
+        self.worlds
+            .as_ref()
+            .map(|ids| serde_json::Value::from(ids.clone()).to_string())
+    }
+}
+
+/// The world predicate, spelled once so no read path can spell it differently.
+/// `{n}` is the parameter index carrying [`SegmentFilter::worlds_json`].
+pub(crate) fn world_clause(n: usize) -> String {
+    format!(
+        "AND (?{n} IS NULL OR g.thread_id IN (
+              SELECT t.id FROM threads t
+               WHERE t.world_id IN (SELECT value FROM json_each(?{n}))))"
+    )
 }
 
 /// What one person's page adds up to. Every number here is a `COUNT` or a
@@ -887,6 +919,15 @@ impl Store {
         // table, reading nothing another migration writes.
         self.apply_v11_assist()?;
         // ---- end 0.9.0 ----------------------------------------------------
+
+        // ---- 0.10.0 (schema v12): worlds ----------------------------------
+        // Standalone like v9: one table (`visits`) and one column
+        // (`threads.world_id`), reading nothing another migration writes.
+        // Additive, idempotent, and with no backfill against `segments` — see
+        // `crate::worlds::migrate_v12` for why, and for the one backfill that
+        // IS honest (the VRChat logs still on disk).
+        crate::worlds::migrate_v12(&self.conn)?;
+        // ---- end 0.10.0 ---------------------------------------------------
 
         match current {
             None => {
@@ -3026,7 +3067,8 @@ impl Store {
     /// How many live segments match, before any LIMIT — what "total" means.
     pub fn search_count(&self, query: &str, filter: &SegmentFilter) -> Result<i64> {
         Ok(self.conn.query_row(
-            "SELECT COUNT(*)
+            &format!(
+                "SELECT COUNT(*)
              FROM segments_fts
              JOIN segments g ON g.id = segments_fts.rowid
              JOIN sessions ss ON ss.id = g.session_id
@@ -3037,14 +3079,18 @@ impl Store {
                AND (?3 IS NULL OR g.session_id = ?3)
                AND (?4 IS NULL OR sc.match_key = ?4)
                AND (?5 IS NULL OR g.t_start_ns >= ?5)
-               AND (?6 IS NULL OR g.t_start_ns < ?6)",
+               AND (?6 IS NULL OR g.t_start_ns < ?6)
+               {}",
+                world_clause(7)
+            ),
             params![
                 query,
                 filter.speaker,
                 filter.session,
                 filter.source,
                 filter.from,
-                filter.to
+                filter.to,
+                filter.worlds_json()
             ],
             |r| r.get(0),
         )?)
@@ -3069,9 +3115,11 @@ impl Store {
                AND (?4 IS NULL OR sc.match_key = ?4)
                AND (?5 IS NULL OR g.t_start_ns >= ?5)
                AND (?6 IS NULL OR g.t_start_ns < ?6)
+               {}
              ORDER BY g.t_start_ns DESC
-             LIMIT ?7",
-            Self::SEGMENT_COLUMNS
+             LIMIT ?8",
+            Self::SEGMENT_COLUMNS,
+            world_clause(7)
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
@@ -3083,6 +3131,7 @@ impl Store {
                     filter.source,
                     filter.from,
                     filter.to,
+                    filter.worlds_json(),
                     limit as i64
                 ],
                 |r| {
@@ -3128,9 +3177,11 @@ impl Store {
                AND (?3 IS NULL OR sc.match_key = ?3)
                AND (?4 IS NULL OR g.t_start_ns >= ?4)
                AND (?5 IS NULL OR g.t_start_ns < ?5)
+               {world}
              ORDER BY g.t_start_ns {order}, g.id {order}
-             LIMIT ?6",
-            Self::SEGMENT_COLUMNS
+             LIMIT ?7",
+            Self::SEGMENT_COLUMNS,
+            world = world_clause(6)
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt
@@ -3141,6 +3192,7 @@ impl Store {
                     filter.source,
                     filter.from,
                     filter.to,
+                    filter.worlds_json(),
                     limit as i64
                 ],
                 Self::segment_row_from,
@@ -3164,7 +3216,7 @@ impl Store {
     /// Live segments a filter selects, as `(id, audio_path)`. The delete path's
     /// preview and its run read exactly the same set.
     pub fn segments_matching(&self, filter: &SegmentFilter) -> Result<Vec<(i64, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT g.id, g.audio_path
              FROM segments g
              JOIN sessions ss ON ss.id = g.session_id
@@ -3176,8 +3228,10 @@ impl Store {
                AND (?3 IS NULL OR sc.match_key = ?3)
                AND (?4 IS NULL OR g.t_start_ns >= ?4)
                AND (?5 IS NULL OR g.t_start_ns < ?5)
+               {}
              ORDER BY g.t_start_ns ASC, g.id ASC",
-        )?;
+            world_clause(6)
+        ))?;
         let rows = stmt
             .query_map(
                 params![
@@ -3185,7 +3239,8 @@ impl Store {
                     filter.session,
                     filter.source,
                     filter.from,
-                    filter.to
+                    filter.to,
+                    filter.worlds_json()
                 ],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?
@@ -3418,12 +3473,34 @@ impl Store {
     }
 
     /// Open a conversation.
+    ///
+    /// 0.10.0: the conversation is stamped with the world that was open when
+    /// its FIRST turn happened, and never revisited. A conversation that ran
+    /// across a world change belongs to the world it started in — the
+    /// alternative is a thread with two places, which is not a thing a person
+    /// can be shown. NULL for anything that is not VRChat: a Discord call and a
+    /// microphone-only session happen nowhere.
     pub fn create_thread(&self, session_id: i64, started_ns: i64, ended_ns: i64) -> Result<i64> {
+        let world = crate::worlds::visit_at(&self.conn, started_ns)?.map(|v| v.world_id);
         self.conn.execute(
-            "INSERT INTO threads (session_id, started_ns, ended_ns) VALUES (?1, ?2, ?3)",
-            params![session_id, started_ns, ended_ns],
+            "INSERT INTO threads (session_id, started_ns, ended_ns, world_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, started_ns, ended_ns, world],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Which world a conversation happened in, if any (0.10.0).
+    pub fn thread_world(&self, thread_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT world_id FROM threads WHERE id = ?1",
+                params![thread_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Put a turn in a conversation and extend the conversation to cover it.
@@ -6351,7 +6428,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(v, 11);
+        assert_eq!(v, 12);
 
         // The note is still there, and it is not a reminder: nothing invented a
         // date for a sentence that never had one.

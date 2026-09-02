@@ -1112,7 +1112,7 @@ pub fn candidates(store: &Store, filter: &SegmentFilter) -> Result<Candidates> {
             .collect::<rusqlite::Result<_>>()?;
         return Ok(Candidates::AllBut(dead));
     }
-    let mut stmt = store.conn().prepare(
+    let mut stmt = store.conn().prepare(&format!(
         "SELECT g.id
          FROM segments g
          JOIN sessions ss ON ss.id = g.session_id
@@ -1123,8 +1123,10 @@ pub fn candidates(store: &Store, filter: &SegmentFilter) -> Result<Candidates> {
            AND (?2 IS NULL OR g.session_id = ?2)
            AND (?3 IS NULL OR sc.match_key = ?3)
            AND (?4 IS NULL OR g.t_start_ns >= ?4)
-           AND (?5 IS NULL OR g.t_start_ns < ?5)",
-    )?;
+           AND (?5 IS NULL OR g.t_start_ns < ?5)
+           {}",
+        crate::store::world_clause(6)
+    ))?;
     let ids = stmt
         .query_map(
             params![
@@ -1132,7 +1134,8 @@ pub fn candidates(store: &Store, filter: &SegmentFilter) -> Result<Candidates> {
                 filter.session,
                 filter.source,
                 filter.from,
-                filter.to
+                filter.to,
+                filter.worlds_json()
             ],
             |r| r.get::<_, i64>(0),
         )?
