@@ -10,6 +10,7 @@
 import { h, svg, clear, fmtDate, fmtBytes, speakerHue } from '../lib/dom.js';
 import { store, ask, applyMic, micChip, appSources, allowedAppCount } from '../lib/store.js';
 import { toast } from '../lib/sheets.js';
+import { CAPTION_RANGES, normalizeCaptionSettings } from '../lib/captions.js';
 
 export const id = 'sources';
 
@@ -18,6 +19,7 @@ export function mount(root, ctx) {
   const sub = h('span', { class: 'sub', id: 'sources-sub' });
   const micCard = h('div', { class: 'card mic-card', id: 'mic-card' });
   const storageCard = h('div', { class: 'card', id: 'storage-card' });
+  const captionsCard = h('div', { class: 'card', id: 'captions-card' });
   const body = h(
     'div',
     { class: 'view-body view-enter' },
@@ -36,6 +38,11 @@ export function mount(root, ctx) {
       }),
       list
     ),
+    // Live captions (0.8.3). On this page rather than a settings page of its
+    // own because this page is already where the app's shape is decided — what
+    // it listens to, what it keeps — and a second window that floats over
+    // everything is the same kind of decision.
+    captionsCard,
     // What all of that costs on disk. It belongs on this page because this is
     // where the decisions that grow it are made.
     storageCard
@@ -201,11 +208,114 @@ export function mount(root, ctx) {
     );
   }
 
+  // -- live captions --------------------------------------------------------
+  //
+  // Six controls and one button. Every one of them is a preference about a
+  // window that sits over somebody's game, and not one of them reaches the
+  // daemon: the captions are drawn from the same live feed this window is
+  // already reading, so all the settings decide is how it looks.
+  //
+  // The values are pushed live rather than on release. A person setting the
+  // type size of a caption bar is looking at the caption bar, not at this card,
+  // and a slider that only takes effect when you let go makes that a guessing
+  // game. The main process debounces the disk write behind it.
+
+  let caps = normalizeCaptionSettings(null);
+  let capsOpen = false;
+
+  async function pushCaptions(patch) {
+    caps = normalizeCaptionSettings(await window.recall.captions.set(patch));
+    renderCaptions();
+  }
+
+  function capSlider(key, label, hint, format) {
+    const range = CAPTION_RANGES[key];
+    const value = h('span', { class: 'cap-value', dataset: { capValue: key }, text: format(caps[key]) });
+    const input = h('input', {
+      class: 'cap-range',
+      type: 'range',
+      dataset: { cap: key },
+      min: String(range.min),
+      max: String(range.max),
+      step: String(range.step),
+      value: String(caps[key]),
+      'aria-label': label,
+      oninput: (e) => {
+        // Paint the number from the INPUT, not from the round trip: the round
+        // trip is a millisecond away and a label that lags the thumb by one
+        // frame is the thing that makes a slider feel broken.
+        value.textContent = format(Number(e.target.value));
+        void pushCaptions({ [key]: Number(e.target.value) });
+      },
+    });
+    return h(
+      'div',
+      { class: 'cap-row-ctl' },
+      h('span', { class: 'cap-label' }, h('b', { text: label }), h('small', { text: hint })),
+      input,
+      value
+    );
+  }
+
+  function capToggle(key, label, hint) {
+    return h(
+      'div',
+      { class: 'cap-row-ctl' },
+      h('span', { class: 'cap-label' }, h('b', { text: label }), h('small', { text: hint })),
+      h('span', { class: 'spacer' }),
+      h('button', {
+        class: 'toggle',
+        role: 'switch',
+        dataset: { cap: key },
+        'aria-pressed': String(!!caps[key]),
+        'aria-label': label,
+        onclick: () => pushCaptions({ [key]: !caps[key] }),
+      })
+    );
+  }
+
+  function renderCaptions() {
+    clear(captionsCard);
+    captionsCard.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('span', { class: 'card-title', text: 'Captions' }),
+        h(
+          'button',
+          {
+            class: 'btn small',
+            id: 'captions-open',
+            'aria-pressed': String(capsOpen),
+            onclick: async () => {
+              capsOpen = await window.recall.captions.toggle();
+              renderCaptions();
+            },
+          },
+          capsOpen ? 'Hide captions' : 'Show captions'
+        )
+      ),
+      h('p', {
+        class: 'rail-hint',
+        id: 'captions-hint',
+        style: 'padding:0 0 12px;max-width:64ch',
+        text: 'The last few turns, in large type, in a window that floats over everything else and ignores the mouse. It shows what is being said now — never history — and it is the same live feed this transcript is reading. There is no keyboard shortcut on purpose: a global one would take a key away from whatever you are playing.',
+      }),
+      capSlider('turns', 'Turns on screen', 'How many of the most recent turns the bar holds.', (v) => String(v)),
+      capSlider('size', 'Text size', 'The words themselves; names and translations scale with them.', (v) => `${v} px`),
+      capSlider('hold_s', 'Hold', 'How long the bar stays up after the last thing anybody said.', (v) => `${v} s`),
+      capSlider('opacity', 'Ground', 'How much of what is underneath the captions cover.', (v) => `${Math.round(v * 100)}%`),
+      capToggle('showYou', 'Show your own turns', 'Kept dimmer than everybody else’s, because you already know what you said.'),
+      capToggle('clickThrough', 'Ignore the mouse', 'On, clicks land in whatever is underneath. Off, the bar can be dragged and resized.')
+    );
+  }
+
   // -- the applications -----------------------------------------------------
 
   function render() {
     renderMic();
     renderStorage();
+    renderCaptions();
     clear(list);
     // The microphone has its own card above; it must not also appear as a row
     // in a list whose every other entry is opted in through the allowlist —
@@ -299,12 +409,38 @@ export function mount(root, ctx) {
   }
 
   render();
+  // The captions card's truth lives in the main process — the window can be
+  // opened from the tray or from a command line while this view is not
+  // mounted — so a mount ASKS rather than assuming the defaults it just drew.
+  void (async () => {
+    try {
+      const st = await window.recall.captions.state();
+      caps = normalizeCaptionSettings(st?.settings);
+      capsOpen = !!st?.open;
+      renderCaptions();
+    } catch {
+      /* an older main process with no captions channel: the defaults stand */
+    }
+  })();
+
   void ctx;
   return {
     update(change) {
       if (change?.mic || change?.conn) renderMic();
       if (change?.status) renderStorage();
       if (change?.sources || change?.status) render();
+      // A settings broadcast carries the whole block; the rail button's own
+      // click carries only `true`, and then only the open/closed half moved.
+      if (change?.captions) {
+        if (typeof change.captions === 'object') caps = normalizeCaptionSettings(change.captions);
+        void window.recall.captions
+          .state()
+          .then((st) => {
+            capsOpen = !!st?.open;
+            renderCaptions();
+          })
+          .catch(() => renderCaptions());
+      }
     },
     render,
   };

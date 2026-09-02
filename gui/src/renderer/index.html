@@ -88,6 +88,23 @@
           </button>
         </div>
 
+        <!-- Live captions (0.8.3). Deliberately BELOW the tablist and not in
+             it: the other five buttons swap what this window is showing, and
+             this one puts a different window on top of your game. It is an
+             action, so it is a plain button with no `data-view`, no
+             aria-selected, and no place in the 1–5 keyboard map. There is no
+             hotkey for it anywhere — a global grab is a thing that breaks
+             somebody's game — so this, the tray, and `nx-recall --captions`
+             are the three ways in. -->
+        <div class="rail-actions">
+          <button class="rail-item rail-action" id="captions-btn" data-action="captions" aria-pressed="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+              <path d="M3 5h18v12H3z M7 10h4M7 13h7M14 10h3" stroke-linecap="square" />
+            </svg>
+            <span>Captions</span>
+          </button>
+        </div>
+
         <!-- Pause surface #2 (the tray dropdown is #1) — DESIGN §8. -->
         <div class="rail-pause">
           <button class="pause-btn" id="pause-btn" data-paused="false" disabled>

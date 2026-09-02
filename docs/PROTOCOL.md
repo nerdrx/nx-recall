@@ -913,6 +913,44 @@ see until a user hits it.
   `notes.list` return. Clients may show it when a `roster` join event names a
   linked speaker (the join itself is unchanged).
 
+## 0.8.3 — `translation` on a segment (contract for two parallel builds)
+
+A sibling track adds a translation to turns in languages the user does not read.
+It is a purely additive field on a segment row and on the `segment` event, and
+every client that has never heard of it ignores it (see "Versioning rules"):
+
+```json
+{"id": 41902, "text": "…", "lang": "de",
+ "translation": {"lang": "en", "text": "…", "via": "nllb-200"}}
+```
+
+The shape the caption surfaces already read, written down here so the two builds
+cannot drift apart:
+
+- **`translation` is absent on most rows, and absent means nothing.** A turn in
+  a language the reader speaks needs no second line. A client must not render an
+  empty one, and must not infer "not translated yet" from its absence — there is
+  no pending state on the wire.
+- **`text` is required and is the translated words.** A block with no `text`, or
+  with only whitespace in it, is treated as absent. Renderers trim it.
+- **`lang` is the language the TRANSLATION is in** — the target, not the source.
+  The source is the segment's own `lang`. Short tag (`"en"`, `"de"`). Optional:
+  a block with no `lang` still renders, just without the tag beside it.
+- **`via` names what produced it** (a model id, `"cloud"` never — nothing leaves
+  the machine). Provenance for a sheet; no surface renders it today.
+- **The original is never replaced.** Both caption surfaces draw the translation
+  *under* the words that were actually said, in a lighter weight. A client that
+  substituted one for the other would be putting words in somebody's mouth.
+- **It travels on the re-published segment too.** A `text_via: "context"`
+  re-decode changes the words, so a translation of the old words is stale: the
+  daemon either re-translates and re-publishes both, or omits `translation`
+  entirely on that event. It must not re-publish a segment whose `text` moved
+  while its `translation` did not.
+
+Rendered by `gui/src/renderer/captions.js` (the desktop caption bar) and by
+`crates/nx-recall-overlay/src/raster.rs` (the headset one), and read in one
+place each: `translationOf()` and `Turn::translation`.
+
 ## Versioning rules
 
 - `proto` bumps only on breaking changes; additive fields/methods/events are free.

@@ -14,6 +14,16 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { RecallClient, defaultSocketPath } from './client.js';
 import { registerIpc, broadcast } from './ipc.js';
+import {
+  captionsAreOpen,
+  getCaptionSettings,
+  getCaptionsWindow,
+  hideCaptions,
+  initCaptionSettings,
+  setCaptionSettings,
+  showCaptions,
+  toggleCaptions,
+} from './captions.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..', '..');
@@ -68,6 +78,18 @@ function noteDaemonVersion(daemon) {
 
 const startMinimized =
   process.argv.includes('--minimized') || process.env.NX_RECALL_START_MINIMIZED === '1';
+
+/**
+ * `nx-recall --captions` (0.8.3). There is deliberately no hotkey for this — a
+ * global grab is a thing that breaks somebody's game — so the three ways in are
+ * the tray, the rail button, and this flag. The launcher already forwards its
+ * arguments, so the flag is the whole feature on that side.
+ *
+ * Read from any argv, not only this process's: a SECOND `nx-recall --captions`
+ * hits the single-instance lock and hands its command line to the copy that is
+ * already running, which is exactly the case a person means by typing it twice.
+ */
+const wantsCaptions = (argv) => argv.includes('--captions');
 
 // ---------------------------------------------------------------------------
 // theme
@@ -175,6 +197,27 @@ function buildTrayMenu() {
       label: ui.paused ? 'Resume capture' : 'Pause capture',
       enabled: online && !ui.pausePending,
       click: () => setPaused(!ui.paused),
+    },
+    { type: 'separator' },
+    // Live captions (0.8.3). Two items rather than one, because they answer
+    // two different questions: "is the bar on screen" and "can I click through
+    // it". The second is a checkbox and not a button precisely because the
+    // window it describes is invisible to the pointer while it is on — the
+    // tray is where you find out what state you left it in.
+    {
+      id: 'captions',
+      label: captionsAreOpen() ? 'Hide captions' : 'Captions',
+      click: () => {
+        toggleCaptions();
+        updateTray();
+      },
+    },
+    {
+      id: 'captions-click-through',
+      label: 'Captions ignore the mouse',
+      type: 'checkbox',
+      checked: getCaptionSettings().clickThrough,
+      click: (item) => setCaptionSettings({ clickThrough: item.checked }),
     },
     { type: 'separator' },
     { label: 'Open NX Recall', click: () => showWindow() },
@@ -343,6 +386,14 @@ async function bootstrap() {
     if (win && !win.isDestroyed()) win.setBackgroundColor(groundColor());
   });
 
+  // Before any window: the captions window is constructed from these, and the
+  // e2e path has already pointed userData at a scratch directory, so the
+  // headless suite writes its captions.json there and never near the profile.
+  initCaptionSettings(app.getPath('userData'), (next) => {
+    broadcast('recall:captions:settings', next);
+    updateTray();
+  });
+
   registerIpc({
     request: (method, params) => client.request(method, params),
     setPaused,
@@ -355,12 +406,36 @@ async function bootstrap() {
     }),
     showWindow,
     relaunch: relaunchApp,
+    captions: {
+      get: getCaptionSettings,
+      set: (patch) => setCaptionSettings(patch),
+      open: () => {
+        showCaptions();
+        updateTray();
+        return true;
+      },
+      close: () => {
+        hideCaptions();
+        updateTray();
+        return true;
+      },
+      toggle: () => {
+        const on = toggleCaptions();
+        updateTray();
+        return on;
+      },
+      isOpen: captionsAreOpen,
+    },
   });
 
   startClient();
   createTray();
   createWindow({ show: !startMinimized });
   if (startMinimized) console.log('[recall] started to the tray');
+  if (wantsCaptions(process.argv)) {
+    showCaptions();
+    updateTray();
+  }
 
   if (process.env.NX_RECALL_E2E === '1') {
     const { runE2E } = await import('./e2e.js');
@@ -376,6 +451,24 @@ async function bootstrap() {
         dark: nativeTheme.shouldUseDarkColors,
         ground: groundColor(),
       }),
+      // Live captions (0.8.3). The driver opens the window through the SAME
+      // function the tray item calls — the point of the step is that the path
+      // a person uses works, not that a second one exists for tests.
+      captions: {
+        open: () => {
+          showCaptions();
+          updateTray();
+          return true;
+        },
+        close: () => {
+          hideCaptions();
+          updateTray();
+          return true;
+        },
+        window: getCaptionsWindow,
+        settings: getCaptionSettings,
+        set: setCaptionSettings,
+      },
       quit: () => {
         quitting = true;
         app.quit();
@@ -399,7 +492,17 @@ if (process.env.NX_RECALL_E2E !== undefined) {
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', () => showWindow());
+  // A second `nx-recall --captions` means "put the captions up", not "show me
+  // the main window I already have open" — the flag travels with the command
+  // line the losing copy hands over.
+  app.on('second-instance', (_e, argv) => {
+    if (wantsCaptions(argv ?? [])) {
+      showCaptions();
+      updateTray();
+      return;
+    }
+    showWindow();
+  });
   app.whenReady().then(bootstrap);
 }
 

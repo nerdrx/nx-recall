@@ -207,6 +207,29 @@ const CANNED_LINES = [
   [3, 'give me five minutes, I need to fix my avatar first', 0.02, 0.63],
 ];
 
+/**
+ * The `translation` sibling track, on two of the canned lines (0.8.3).
+ *
+ * A separate track is adding `translation: {lang, text, via}` to segments whose
+ * turn was in a language the user does not read. It is purely additive — every
+ * other row carries no such field and every client that does not know about it
+ * ignores it (PROTOCOL "Versioning rules") — so the mock's job here is small
+ * and specific: make sure at least one row on the LIVE feed has one, because a
+ * rendering nobody ever produces is a rendering nobody ever checks.
+ *
+ * Keyed by index into CANNED_LINES rather than woven into it, for the same
+ * reason the pathological rows are: those tuples are positional, several
+ * fixtures elsewhere in this file count on their contents, and a fifth element
+ * on two of sixteen would be a trap for the next person to read them.
+ *
+ * Both are speaker 1, who is declared `de` — which is the case the field
+ * exists for. `lang` is the language of the TEXT here, not of the turn.
+ */
+const TRANSLATED = new Map([
+  [0, { lang: 'en', text: 'wait — which portal was it, the one behind the bar or the one in the stairwell?', via: 'nllb-200' }],
+  [3, { lang: 'en', text: 'no rush, we are still waiting on two people', via: 'nllb-200' }],
+]);
+
 /// Which conversation a canned row belongs to (schema v6). Blocks of five, so
 /// the history really does contain several threads with different people in
 /// them — the transcript's separators and the person page's "people they talk
@@ -1395,7 +1418,8 @@ export function startMock({
       emitMine();
       return;
     }
-    const [sp, text, overlap, score] = CANNED_LINES[state.feedIdx % CANNED_LINES.length];
+    const line = state.feedIdx % CANNED_LINES.length;
+    const [sp, text, overlap, score] = CANNED_LINES[line];
     state.feedIdx += 1;
     // A voice the client has never seen gets minted mid-session: there is no
     // relabel broadcast for coming into existence, only this segment. The GUI
@@ -1421,8 +1445,14 @@ export function startMock({
       // The cross-check runs on live rows too, and disagrees on some of them.
       asr_confidence: state.feedIdx % 5 === 2 ? 'shaky' : 'solid',
       text_via: 'live',
+      lang: sp === 1 ? 'de' : 'en',
       thread: liveThread(),
     };
+    // Additive and often absent, exactly as it is on the wire: only the two
+    // canned lines in TRANSLATED carry one, and only while the speaker they
+    // belong to is the one talking.
+    const tr = TRANSLATED.get(line);
+    if (tr && seg.speaker === sp) seg.translation = { ...tr };
     state.segments.push(seg);
     state.queue = state.feedIdx % 4;
     emit('segments', 'segment', seg);

@@ -7,6 +7,16 @@
 # enable: whether it autostarts at login stays the user's systemctl decision).
 # Capture remains default-deny regardless — starting recalld records nothing
 # the user hasn't explicitly allowed.
+#
+# Flags are forwarded to the app verbatim (both exec lines below end in "$@"),
+# which is the whole of the launcher's part in:
+#
+#   nx-recall --captions   put the live caption bar on screen
+#   nx-recall --minimized  start to the tray with no window
+#
+# `--captions` works whether or not a copy is already running: a second
+# invocation loses the single-instance lock and hands its command line to the
+# copy that holds it, which reads the flag and raises the bar (src/main/index.js).
 set -eu
 
 sock="${NXR_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nx-recall.sock}"
