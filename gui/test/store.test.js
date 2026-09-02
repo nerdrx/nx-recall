@@ -944,3 +944,24 @@ test('a split past the event cap asks for a re-query, and says what moved', () =
   assert.equal(small.resync, false, 'below the cap the per-row events already did the work');
   assert.match(small.text, /1 segment moved/);
 });
+
+test('a re-published row older than the window is not news', () => {
+  // The re-decode and cross-check workers announce every archive row they
+  // stamp. A client holding the tail must not file yesterday under now, and
+  // must not count the turn against its speaker a second time.
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', segments: 3, total_ms: 6000 });
+  for (const id of [10, 11, 12]) applyEvent({ seq: id, ev: 'segment', data: seg(id) });
+  const before = store.segments.map((s) => s.id);
+  const change = applyEvent({ seq: 99, ev: 'segment', data: seg(3, { text_via: 'context' }) });
+  assert.deepEqual(store.segments.map((s) => s.id), before, 'the window is unchanged');
+  assert.ok(!store.segById.has(3), 'the old row is not held');
+  assert.ok(!change?.added, 'nothing was added');
+  assert.equal(store.speakers.get(1).segments, 6, 'no double count: three arrivals, one re-publish');
+  assert.equal(store.appended, 3);
+  // …but a row that belongs INSIDE the window (a late turn) is still filed in order.
+  applyEvent({ seq: 100, ev: 'segment', data: seg(11, { text: 'late twin' }) }); // known → update
+  const late = applyEvent({ seq: 101, ev: 'segment', data: { ...seg(11), id: 111, t_ms: seg(11).t_ms + 1 } });
+  assert.ok(late.added);
+  assert.deepEqual(store.segments.map((s) => s.id), [10, 11, 111, 12]);
+});

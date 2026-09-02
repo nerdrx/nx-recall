@@ -769,6 +769,15 @@ export function applyEvent(evt, opts = {}) {
         Object.assign(known, d);
         return { updated: [known] };
       }
+      // An id we do not hold that is OLDER than everything we hold is not
+      // news — it is history being re-published: the re-decode and cross-check
+      // workers walk the archive at idle priority and announce every row they
+      // stamp (0.8.0). Filing those as arrivals put yesterday under now, made
+      // the tail unreachable while the backlog drained, and counted each
+      // re-published turn against its speaker a second time. Not in view, not
+      // ours to show — the tail is one query away if the reader goes there.
+      const head = store.segments[0];
+      if (head && typeof d.t_ms === 'number' && d.t_ms < head.t_ms) return { outside: true };
       store.appended += 1;
       bumpCount(d.speaker, +1, d.dur_ms);
       // The window is somewhere else entirely — the date picker rebuilt it on

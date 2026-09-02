@@ -623,6 +623,16 @@ export function mount(root, ctx) {
           thread: lastSeg?.thread ?? null,
           seen: !!lastSeg,
         });
+        // Where the MODEL filed it decides where the row goes. A late turn — a
+        // mic segment that closed after an app segment that started later, a
+        // row the daemon re-read — lands before the rows it precedes, not at
+        // the bottom as if it had just happened.
+        const at = store.segments.indexOf(seg);
+        const next = at >= 0 ? store.segments.slice(at + 1).find((s) => list.querySelector(`.seg[data-seg="${s.id}"]`)) : null;
+        if (next) {
+          list.insertBefore(segRow(seg, true), list.querySelector(`.seg[data-seg="${next.id}"]`));
+          continue;
+        }
         for (const sep of walk(seg)) list.append(sep);
         list.append(segRow(seg, true));
       }

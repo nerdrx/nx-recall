@@ -2357,6 +2357,13 @@ export function startMock({
           text_via: 'live',
           thread: liveThread(),
         });
+        // First, what the real daemon does all afternoon after 0.8.0: the
+        // re-decode worker re-publishes an ARCHIVE row it just stamped — the
+        // oldest one here, far outside any live window. A client must treat
+        // it as history, not as an arrival (0.8.2: it went under "now").
+        const oldest = state.segments.reduce((a, b) => (b.t_ms < a.t_ms ? b : a));
+        oldest.text_via = 'context';
+        emit('segments', 'segment', oldest);
         // The turn itself stays in the transcript — a note is a second reading
         // of a turn, not a turn that was filed somewhere else — so BOTH events
         // go out, and a client that only knows `segment` still sees the words.

@@ -1320,6 +1320,37 @@ export function runE2E(deps) {
         assert(inModel, `the turn behind the note (${seg}) is not in the transcript`);
         return { was: before.notes.length, now: after.notes.length, top: after.notes[0].text.slice(0, 40) };
       });
+
+      await step('a-re-published-archive-row-does-not-land-under-now', async () => {
+        // The same SIGUSR2 re-published the mock's OLDEST segment first, the
+        // way the re-decode worker announces every archive row it stamps. The
+        // live transcript must not have filed it as an arrival: every DOM row
+        // is a row the model holds, the model holds nothing older than its
+        // head, and the newest row on screen is still the newest turn.
+        await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+        const view = await waitFor('the transcript rows', async () => {
+          const v = await js(`(() => {
+            const s = window.__recallDebug.store;
+            const rows = [...document.querySelectorAll('.seg')].map((r) => Number(r.dataset.seg));
+            if (!rows.length) return null;
+            return {
+              rows,
+              orphans: rows.filter((id) => !s.segById.has(id)),
+              headMs: s.segments[0]?.t_ms ?? null,
+              oldestHeldMs: Math.min(...s.segments.map((x) => x.t_ms)),
+              lastDom: rows[rows.length - 1],
+              lastModel: s.segments[s.segments.length - 1]?.id ?? null,
+              domInOrder: rows.every((id, i) => i === 0 || (s.segById.get(rows[i - 1])?.t_ms ?? 0) <= (s.segById.get(id)?.t_ms ?? 0)),
+            };
+          })()`);
+          return v;
+        });
+        assert(view.orphans.length === 0, `rows on screen the model does not hold: ${view.orphans.join(',')}`);
+        assert(view.oldestHeldMs === view.headMs, 'the model holds a row older than its own head');
+        assert(view.lastDom === view.lastModel, `newest row on screen is ${view.lastDom}, the model says ${view.lastModel}`);
+        assert(view.domInOrder, 'the rows on screen are not in time order');
+        return { rows: view.rows.length, last: view.lastDom };
+      });
     }
 
     await step('the-accuracy-card-is-honest-arithmetic', async () => {

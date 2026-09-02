@@ -229,7 +229,7 @@ or sharing surface at all** — not a missing feature, the
 |---|---|
 | Daemon | Rust, 39k lines — PipeWire capture, four ONNX runtimes, one GGUF via llama.cpp, SQLite WAL, NDJSON socket |
 | Client | Electron, 12k lines, zero runtime dependencies, NX Clear in both grounds |
-| Tests | **645 Rust + 99 node + 69 headless-compositor steps × 2 themes** |
+| Tests | **647 Rust + 100 node + 70 headless-compositor steps × 2 themes** |
 | Schema | v10, migrated in place from v1 on a live database, every step idempotent |
 | Models | pyannote gate 6 MB · Parakeet v3 620 MB · ERes2Net 26 MB · e5 135 MB · Qwen 3B 1.9 GB · Canary cross-checker 154 MB · arbiters on demand — all pinned to exact bytes |
 | Updates | the daemon watches its own binary, drains, restarts; the GUI offers one click; a dozen hands-free updates and counting |
@@ -262,6 +262,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.7.7 | +67h | the conversational language prior + the German arbiter |
 | 0.8.0 | +80h | the accuracy round: short turns re-read in context, a second decoder as a warning light, fix-in-place, one query box, notes to self, briefs |
 | 0.8.1 | +83h | the afternoon-after check: one-word rows get no verdict, re-decodes keep the words they replace, the flag re-measured on real audio |
+| 0.8.2 | +84h | yesterday stops landing under now: a re-published archive row is history, not an arrival |
 
 ## Quickstart
 

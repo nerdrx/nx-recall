@@ -1578,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "recalld"
-version = "0.8.0"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "bzip2",
