@@ -82,7 +82,11 @@ impl Lang {
 }
 
 /// Every language tag this daemon understands, in the order clients show them.
-pub const KNOWN: &[&str] = &["de", "en"];
+/// Languages a voice may be TAGGED with. `de`/`en` are what the text
+/// classifier can check; `ja` (0.11.0) is what the audio identifier and the
+/// Japanese decoder can route — a friend tagged `ja` skips the European model
+/// entirely (analysis.rs `Pre::Direct`).
+pub const KNOWN: &[&str] = &["de", "en", "ja"];
 
 const DE: &[&str] = &[
     "der", "die", "das", "und", "ist", "nicht", "ich", "du", "wir", "ihr", "sie", "es", "ein",
@@ -667,8 +671,8 @@ pub fn normalise_languages(codes: &[String]) -> Result<Option<Vec<String>>, Stri
         }
         if !KNOWN.contains(&code.as_str()) {
             return Err(format!(
-                "unknown language {code:?}; this daemon classifies {} only",
-                KNOWN.join(" and ")
+                "unknown language {code:?}; this daemon knows {} only",
+                KNOWN.join(", ")
             ));
         }
         if !out.contains(&code) {

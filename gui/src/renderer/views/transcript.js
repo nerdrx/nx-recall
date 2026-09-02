@@ -29,6 +29,11 @@ import {
   textViaNote,
   isYou,
   ask,
+  // 0.11.0: the turn somebody is still saying. `livePartial` applies the
+  // staleness rule, so this view and the captions bar can never disagree about
+  // whether anybody is talking.
+  livePartial,
+  PARTIAL_STALE_MS,
   setFollowing,
   loadOlderPage,
   replaceSegments,
@@ -71,9 +76,18 @@ export function mount(root, ctx) {
   let replayArrived = false;
 
   const following = () => store.window.following;
+  /** The one timer this view owns: see `renderPartial`. */
+  let staleTimer = null;
 
   const list = h('div', { class: 'seg-list', id: 'seg-list' });
-  const card = h('div', { class: 'card' }, list);
+  // 0.11.0 — the live tail. Its own container, AFTER the list rather than
+  // inside it, and that is not tidiness: `.seg:last-of-type`, the trim loop and
+  // the separator walker all reason about the last child of `#seg-list`, and a
+  // provisional row in there would quietly become "the last segment" to every
+  // one of them. It is not a segment. It has no id, it is never counted, it
+  // never reaches history, and it is gone the instant the real row lands.
+  const tail = h('div', { class: 'seg-tail', id: 'seg-tail', 'aria-live': 'polite' });
+  const card = h('div', { class: 'card' }, list, tail);
   const body = h('div', { class: 'view-body view-enter', id: 'transcript-body' }, card);
 
   // Capture state belongs where the words are, not only in the rail: this is
@@ -306,6 +320,7 @@ export function mount(root, ctx) {
           })
         )
       );
+      renderPartial();
       updateCount();
       return;
     }
@@ -314,6 +329,7 @@ export function mount(root, ctx) {
       for (const sep of walk(seg)) list.append(sep);
       list.append(segRow(seg));
     }
+    renderPartial();
     updateCount();
     if (scroll === 'end') scrollToEnd(true);
     else if (scroll === 'top') scrollTo(0);
@@ -481,6 +497,80 @@ export function mount(root, ctx) {
         open();
       }
     });
+    return row;
+  }
+
+  // ---- 0.11.0, the live tail ----------------------------------------------
+
+  /**
+   * Draw, update or remove the provisional row for the turn being said now.
+   *
+   * Four reasons there is nothing to draw, and all four are the same reason —
+   * this is the LIVE tail: the reader is up in history, the window is somewhere
+   * else entirely, a speaker filter is on and the guess does not match it, or
+   * nobody is talking. In every one of those the honest thing is an absent row
+   * rather than a row somewhere it does not belong.
+   */
+  function renderPartial() {
+    clearTimeout(staleTimer);
+    staleTimer = null;
+    const p = following() && !store.window.detached ? livePartial() : null;
+    const show = p && (filterSpeaker == null || p.speaker === filterSpeaker);
+    if (!show) {
+      if (tail.firstChild) {
+        const stick = following() && nearBottom();
+        clear(tail);
+        if (stick) scrollToEnd();
+      }
+      return;
+    }
+    // Nothing else in this view is on a clock, and this is the one thing that
+    // has to come off the screen without an event: a pause, a discarded turn
+    // after an audio gap, or a daemon that went away all end a turn silently.
+    // One timer, only while a row is up, aimed at the exact moment it expires.
+    staleTimer = setTimeout(renderPartial, Math.max(250, PARTIAL_STALE_MS - (Date.now() - p.at) + 100));
+    const stick = following() && nearBottom();
+    // Rebuilt rather than patched: it is one row of four spans and it changes
+    // once a second, and a patch would have to know which of them moved.
+    clear(tail);
+    tail.append(partialRow(p));
+    if (stick) scrollToEnd();
+  }
+
+  /**
+   * The provisional row itself. Deliberately the same shape as `segRow` — the
+   * same four columns in the same order — so the final row replaces it without
+   * the page shifting under whoever is reading it.
+   *
+   * It is NOT a button and it does NOT open the sheet: there is no segment to
+   * reassign or correct yet, and offering it would be offering to edit
+   * something that does not exist.
+   */
+  function partialRow(p) {
+    const seg = { speaker: p.speaker, label_via: p.speaker_hint === 'proximity' ? 'proximity' : null };
+    const color = speakerColor(p.speaker);
+    const row = h('div', {
+      class: `seg partial${isYou(p.speaker) ? ' you' : ''}`,
+      dataset: { partial: String(p.seq_in_turn) },
+      // Not a control and not a row anybody can act on. Announced politely by
+      // the container, never focusable.
+      'aria-label': 'still being said',
+    });
+    row.append(
+      h('span', { class: 't', text: p.t_start_ms ? fmtClock(p.t_start_ms) : '' }),
+      h(
+        'span',
+        { class: 'who' },
+        h('span', { class: 'dot', style: `color:${color}` }),
+        h('span', {
+          class: `nm${p.speaker == null ? ' reasoned' : ''}`,
+          text: segmentSpeakerLabel(seg),
+          style: p.speaker == null ? '' : `color:${color}`,
+        })
+      ),
+      h('span', { class: 'txt' }, p.text, h('span', { class: 'seg-ell', text: '…' })),
+      h('span', { class: 'meta' })
+    );
     return row;
   }
 
@@ -803,6 +893,11 @@ export function mount(root, ctx) {
       repaint();
     }
     if (change.status || change.conn) refreshLiveChip();
+    // 0.11.0. `change.partial` is set both by a partial arriving and by the
+    // segment that replaces it, so one call covers "draw it", "update it" and
+    // "it is gone". Pause and a dropped connection reach it through the same
+    // door — `livePartial` refuses to answer in either state.
+    if (change.partial || change.added || change.status || change.conn || change.mic) renderPartial();
   }
 
   // -------------------------------------------------------------------------
@@ -990,6 +1085,23 @@ export function mount(root, ctx) {
       for (const el of list.querySelectorAll('.seg.hit')) el.classList.remove('hit');
       if (rows.length) reveal(rows[0]);
       return { thread: threadId, rows: rows.length };
+    },
+    /**
+     * The live tail (0.11.0), read off the DOM: what a person would actually
+     * see, not what the model believes it was handed.
+     */
+    partial() {
+      const el = tail.querySelector('.seg.partial');
+      if (!el) return null;
+      return {
+        seq: Number(el.dataset.partial),
+        who: el.querySelector('.nm')?.textContent ?? '',
+        text: el.querySelector('.txt')?.textContent ?? '',
+        ellipsis: !!el.querySelector('.seg-ell'),
+        // The two rules that make it a tail and not a row.
+        inList: !!list.querySelector('.seg.partial'),
+        counted: list.querySelectorAll('.seg').length,
+      };
     },
     /** A conversation, played back (0.9.2). Every route in lands here. */
     startReplay,

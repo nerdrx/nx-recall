@@ -275,6 +275,45 @@ impl Bus {
         seq
     }
 
+    // ---- 0.11.0, partial turns: begin --------------------------------------
+    /// Fan an event out to subscribers **without** recording it for replay.
+    ///
+    /// For events that describe a moment rather than a fact: a partial turn is
+    /// provisional words about a turn that has not finished, and by the time a
+    /// reconnecting client could be handed one, the finished `segment` that
+    /// replaces it has already gone past. Replaying it would put a stale
+    /// half-sentence on screen with nothing following to clear it.
+    ///
+    /// It still takes a sequence number, and that is deliberate: `seq` is the
+    /// stream's clock, clients dedupe on it, and an event that went out without
+    /// one would make two clients disagree about ordering. The gap a skipped
+    /// ephemeral leaves in a replay is exactly what `events.since` already
+    /// tolerates — the ring is filtered by subscription anyway, so a client has
+    /// never been entitled to assume its seqs are contiguous.
+    pub fn publish_ephemeral(&self, topic: Topic, ev: &str, data: Value) -> u64 {
+        let mut inner = self.lock();
+        inner.seq += 1;
+        let seq = inner.seq;
+        let line = Arc::new(encode_event(seq, ev, &data));
+
+        let mut any_dead = false;
+        for client in &inner.clients {
+            if client.is_dead() {
+                any_dead = true;
+                continue;
+            }
+            if client.wants(topic) && !client.send(Arc::clone(&line)) {
+                any_dead = true;
+            }
+        }
+        if any_dead {
+            inner.clients.retain(|c| !c.is_dead());
+        }
+        debug!(seq, ev, topic = topic.as_str(), "ephemeral event published");
+        seq
+    }
+    // ---- 0.11.0, partial turns: end ----------------------------------------
+
     /// Everything after `since`, subject to the client's subscriptions, as a
     /// batch for the reply.
     ///
@@ -435,6 +474,64 @@ mod tests {
         assert!(bus.events_since(&client, 7).is_ok());
         // A client remembering the future saw a different daemon.
         assert_eq!(bus.events_since(&client, 99).err(), Some(Resync));
+    }
+
+    #[test]
+    fn an_ephemeral_event_reaches_clients_and_never_the_replay_ring() {
+        let bus = Bus::new(64, 16);
+        let (client, rx) = bus.attach(None);
+        client.subscribe(&[Topic::Segments]);
+
+        bus.publish(Topic::Segments, "segment", json!({"id": 1}));
+        let eph = bus.publish_ephemeral(Topic::Segments, "partial", json!({"text": "but in"}));
+        bus.publish(Topic::Segments, "segment", json!({"id": 2}));
+
+        // Live, it is an ordinary event on the wire with its own seq.
+        let seen: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|b| serde_json::from_slice(&b).unwrap())
+            .collect();
+        assert_eq!(
+            seen.iter()
+                .map(|e| e["ev"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["segment", "partial", "segment"]
+        );
+        assert_eq!(seen[1]["seq"].as_u64().unwrap(), eph);
+
+        // Replayed, it is not there at all — and the two real events are.
+        let (events, _) = bus.events_since(&client, 0).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e["ev"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["segment", "segment"]
+        );
+        // The seq it consumed is simply missing from the replay, which is the
+        // same hole a subscription filter already leaves.
+        assert!(events.iter().all(|e| e["seq"].as_u64() != Some(eph)));
+    }
+
+    #[test]
+    fn an_ephemeral_event_does_not_evict_the_replay_buffer() {
+        // The failure this guards against: a talkative caption feed pushing
+        // every real event out of a three-deep ring, so a client that blinked
+        // gets a full resync instead of a replay.
+        let bus = Bus::new(3, 16);
+        for i in 0..3 {
+            bus.publish(Topic::Segments, "segment", json!({"id": i}));
+        }
+        for _ in 0..50 {
+            bus.publish_ephemeral(Topic::Segments, "partial", json!({"text": "…"}));
+        }
+        let (client, _rx) = bus.attach(None);
+        client.subscribe(&[Topic::Segments]);
+        let (events, _) = bus.events_since(&client, 0).unwrap();
+        assert_eq!(
+            events.len(),
+            3,
+            "the ring still holds the three real events"
+        );
     }
 
     #[test]

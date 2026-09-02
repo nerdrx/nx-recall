@@ -308,6 +308,26 @@ select.input option, select.input optgroup {
 .seg .txt { font-size: 13.5px; line-height: 1.55; color: var(--clear-ink); }
 .seg .meta { display: flex; align-items: center; gap: 6px; }
 
+/* 0.11.0 — the live tail: the turn somebody is STILL SAYING.
+ *
+ * It lives in `#seg-tail`, outside `#seg-list`, because it is not a segment —
+ * see the comment where it is built (views/transcript.js). Visually it is the
+ * same row as any other, and that is the requirement rather than a shortcut:
+ * the real row replaces it in place, and any change of grid, padding or height
+ * would make the transcript jump at the moment somebody is reading it.
+ *
+ * Two differences, both saying the same thing. The ink is lighter, because
+ * these words are provisional and often wrong at first — a short window decodes
+ * at 57% WER on its own (FINDINGS §12) and the first partial of a turn IS a
+ * short window. And there is a trailing ellipsis, because the sentence has not
+ * finished. Nothing pulses, nothing spins: the transcript is a page. */
+.seg-tail { display: flex; flex-direction: column; }
+.seg-tail:not(:empty) { margin-top: 1px; }
+.seg.partial { cursor: default; }
+.seg.partial:hover { background: transparent; border-color: transparent; }
+.seg.partial .txt { color: var(--clear-muted); }
+.seg-ell { white-space: nowrap; margin-left: 0.15em; color: var(--clear-muted); }
+
 /* Segments the pipeline itself does not trust: overlapped speech (the identity
    was refused) or a weak match score. They stay readable — the words are still
    the point — but they must never look as settled as a confident line, so the

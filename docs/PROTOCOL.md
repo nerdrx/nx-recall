@@ -2487,3 +2487,98 @@ measurement rather than a saving. Base has the better Japanese recall and hears
 utterances as Japanese at any length. Numbers in `spike/FINDINGS.md` §22–§24,
 which also record what this does *not* cover — Korean and Chinese have the same
 failure and no catalogued decoder yet.
+## 0.11.0 — partial turns
+
+Provisional words on the glass while somebody is **still talking**. One new event,
+no new topic, no new row, nothing stored.
+
+```json
+{"seq": 41830, "ev": "partial", "data": {
+  "session": 3, "source": "VRChat.exe",
+  "speaker": 7, "speaker_hint": "proximity",
+  "t_start_ms": 1772486400123, "t_start_ns": "1772486400123456789",
+  "elapsed_ms": 2400,
+  "text": "but in his hands solitude",
+  "seq_in_turn": 2,
+  "final": false
+}}
+```
+
+It rides on the **`segments`** topic, so no client changes its subscription and one
+too old to know the event ignores it (Versioning rules).
+
+### When one is emitted
+
+While a turn is OPEN — from the first voiced frame, not from the moment the VAD
+closes a span — subject to three rules, all of them about never costing a recording:
+
+| rule | key | default |
+|---|---|---|
+| at most one partial per | `[asr] partial_every_ms` | 1000 |
+| and only once the turn has lasted | `[asr] partial_min_ms` | 800 |
+| and never while the inference queue holds more than | `[asr] partial_backlog_max_s` | 5 s |
+| the feature at all | `[asr] partials` | see §20 |
+
+The backlog rule is the same rule and the same reason as `[graph] max_queue_seconds`:
+the capture queue drops the **oldest** audio when it overflows, so a partial that put
+the inference thread behind would be paying for a caption with a lost turn.
+
+**Pausing stops partials instantly.** The pipeline discards the session's whole state
+on the first paused buffer, and the emit path re-checks the pause flag both before and
+after the decode — the same discipline `write_segment` uses, for the same reason.
+
+### Each decode is over the WHOLE open turn
+
+Not the newest chunk — the whole turn so far, every time, so the text **converges**.
+Parakeet v3 is an offline transducer; there is no streaming API and this feature does
+not add one. (sherpa-onnx does ship online zipformer models. They are English-only and
+would be a second model in RAM, which is exactly the cost this feature is not allowed
+to have.) The reason for re-reading from the top is measured: FINDINGS §12 puts a 1.5 s
+slice decoded alone at **56.7% WER** against **20.4%** for the same slice with context
+around it. A partial built from the last second would be noise that never improved.
+
+It runs **on the inference thread, through the same recogniser instance** the finished
+turn will go through. No second model, no second thread.
+
+### Replacing the provisional row
+
+When the turn closes, the ordinary `segment` event follows. There is **no**
+`partial_of` field and no id to match on: a client replaces the provisional row by
+matching **`(session, t_start_ns)`** — the same turn has the same start, and the
+`segment`'s `t_start_ns` is exactly the partial's. Both are strings, as every `_ns`
+field on this protocol is.
+
+`seq_in_turn` counts partials **within one turn**, from 0, and restarts on the next
+turn. It is for a client that wants to say "still listening" versus "settling", not
+for ordering — `seq` already orders everything.
+
+### The speaker on a partial is a guess or nothing
+
+**No embedding is ever computed for a partial.** The identity ladder only labels
+finished turns: it needs an embedding, an embedding needs the overlap gate's verdict,
+and both are decided over the completed audio. So:
+
+| `speaker_hint` | means |
+|---|---|
+| `"proximity"` | the previous turn in this session ended **less than 2 s** ago; `speaker` repeats that turn's identity because the same person is probably still talking |
+| `null` | `speaker` is `null` too — nothing recent enough to borrow |
+| `"match"` | reserved. The daemon never emits it on a partial; a client should render it like a settled label if a future version does |
+
+A client MUST render a proximity speaker as uncertain. It is the cheapest true thing
+available, not a reading of the voice.
+
+### Never stored, never replayed
+
+A partial is not a row, is not in `segments.list`, and is **not in the `events.since`
+replay buffer** — it is published ephemerally (`bus::publish_ephemeral`). It still
+consumes a `seq`, because `seq` is the stream's clock and clients dedupe on it; a
+replay therefore has a hole where a partial went, which is the same hole a subscription
+filter has always been allowed to leave. Clients must not assume contiguous `seq`.
+
+### What a client is expected to do with it
+
+Show it as **provisional**: lighter ink, a trailing `…`, updated in place, replaced by
+the final row without the row jumping. Never count it, never put it in history, never
+export it. A provisional row with no update and no `segment` for several seconds should
+be dropped — a pause, a discarded turn after an audio gap, or a daemon that went away
+all end a turn with no event to say so.

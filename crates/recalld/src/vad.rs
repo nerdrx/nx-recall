@@ -226,6 +226,22 @@ impl Segmenter {
         self.cursor
     }
 
+    // ---- 0.11.0, partial turns: begin --------------------------------------
+    /// Where the speech currently being detected began, padded, or `None` when
+    /// the segmenter is idle.
+    ///
+    /// The turn merger only learns about a span once the segmenter has CLOSED
+    /// it, which needs `min_silence` (500 ms) of quiet. So while somebody is
+    /// mid-sentence — the entire case partial captions exist for —
+    /// `TurnMerger::pending_start` is `None` and this is the only thing that
+    /// knows a turn is open. It is exactly the lower bound
+    /// [`Self::retain_from`] already promises to keep buffered, said out loud.
+    pub fn speech_open(&self) -> Option<u64> {
+        self.in_speech
+            .then(|| self.speech_start.saturating_sub(self.cfg.pad_samples))
+    }
+    // ---- 0.11.0, partial turns: end ----------------------------------------
+
     /// Sample index below which buffered audio can never be needed again.
     pub fn retain_from(&self) -> u64 {
         if self.in_speech {

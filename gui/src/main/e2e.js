@@ -1964,6 +1964,133 @@ export function runE2E(deps) {
         return { latency, fed: fed.length, rows: rows.length, headMs };
       });
 
+      // ---------------------------------------------------------------
+      // 0.11.0 — partial turns. The second SIGUSR2 delivers ONE turn the way
+      // a turn really arrives: three provisional readings a second apart, all
+      // with the same `t_start_ns`, and then the `segment` that replaces them.
+      //
+      // Four claims, and every one of them is about a row that must not be
+      // there afterwards: the provisional row appears, it UPDATES rather than
+      // stacking, exactly one final row is left, and the model holds no
+      // partial once the turn has landed.
+      // ---------------------------------------------------------------
+      await step('a-partial-turn-updates-in-place-and-is-replaced-by-one-row', async () => {
+        // The main window is on the transcript and following, so the SAME turn
+        // has to produce a live tail there too — and it must be a tail rather
+        // than a row: outside `#seg-list`, and not in the count.
+        await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+        // …and back ON the tail. Earlier steps read history, played a
+        // conversation back and jumped to a day, and the live tail is for the
+        // tail: a provisional row under July would be a row in the wrong place.
+        // That refusal is the behaviour, so the test has to undo it to see the
+        // row at all.
+        await js(`(() => {
+          const b = document.getElementById('follow-btn');
+          if (b && b.getAttribute('aria-pressed') !== 'true') b.click();
+        })()`);
+        await waitFor('the transcript to be following again', async () =>
+          js('window.__recallDebug.scrollback().following')
+        );
+        process.kill(Number(process.env.NX_RECALL_MOCK_PID), 'SIGUSR2');
+
+        // 1. It appears, lighter and unfinished.
+        const first = await waitFor(
+          'the provisional caption',
+          async () => capJs('window.__captionsDebug.partial()'),
+          { timeout: 10000 }
+        );
+        assert(first.ellipsis, 'a provisional caption does not say it is unfinished');
+        assert(first.text.trim().length > 0, 'the provisional caption is empty');
+        // Its speaker is a proximity guess or nobody, never a settled label
+        // (PROTOCOL 0.11.0: no embedding is computed for a partial).
+        const firstText = first.text;
+
+        // 2. It updates IN PLACE. The sequence number rises and the words grow;
+        // what must NOT happen is a second provisional row appearing under it.
+        // The transcript's own live tail is read INSIDE this wait rather than
+        // after it: both windows are fed by the same event and the turn settles
+        // a second later, so a second round trip is a second in which the row
+        // it is asking about has legitimately gone.
+        let tailWhileOpen = null;
+        const grown = await waitFor(
+          'the provisional caption to be re-read',
+          async () => {
+            const p = await capJs('window.__captionsDebug.partial()');
+            tailWhileOpen = (await js('window.__recallDebug.partial()')).drawn ?? tailWhileOpen;
+            return p && p.seq > first.seq && p.text !== firstText ? p : null;
+          },
+          { timeout: 10000 }
+        );
+        const stacked = await capJs('document.querySelectorAll(".cap-row.provisional").length');
+        assert(stacked === 1, `${stacked} provisional rows are on screen; there can only be one`);
+        // Lighter ink than a settled row: the app saying these words are a
+        // first reading and first readings are often wrong (FINDINGS §12).
+        const settled = await capJs(
+          '(() => { const el = document.querySelector(".cap-row:not(.provisional) .cap-text"); return el ? getComputedStyle(el).color : null; })()'
+        );
+        assert(!settled || settled !== grown.dim, `the provisional row is inked like a settled one (${grown.dim})`);
+        // The transcript's own live tail, while it is still up. It has to be
+        // OUTSIDE `#seg-list` (`.seg:last-of-type`, the trim loop and the
+        // separator walker all reason about the last child of that list) and it
+        // must not be counted.
+        assert(tailWhileOpen, 'the transcript drew no live tail for a turn being said now');
+        const sawTail = tailWhileOpen;
+        assert(sawTail.ellipsis, 'the transcript tail does not say the sentence is unfinished');
+        assert(!sawTail.inList, 'the transcript tail is inside #seg-list, where it would become "the last segment"');
+        const modelRows = await js('window.__recallDebug.scrollback().rows');
+        assert(
+          sawTail.counted === modelRows,
+          `the tail is being counted as a segment: ${sawTail.counted} rows against ${modelRows}`
+        );
+        const file = await shotOf(capWin(), 'captions-partial');
+
+        // 3. The final row replaces it — ONE settled row for the turn, not two,
+        // and no provisional row left behind.
+        //
+        // Counted by matching the words rather than by the length of the stack:
+        // the bar shows the last N turns and the mock's ordinary feed keeps
+        // arriving, so "the stack got longer" is not a fact about this turn.
+        // "The provisional reading appears in exactly one settled row" is.
+        const needle = firstText.replace('…', '').trim();
+        const done = await waitFor(
+          'the turn to settle',
+          async () => {
+            const p = await capJs('window.__captionsDebug.partial()');
+            if (p) return null;
+            const rows = await capJs('window.__captionsDebug.rows()');
+            const hits = rows.filter((r) => r.text.includes(needle));
+            return hits.length ? { rows, hits } : null;
+          },
+          { timeout: 15000 }
+        );
+        assert(done.hits.length === 1, `${done.hits.length} rows carry this turn's words; one turn is one row`);
+        const settledRow = done.hits[0];
+        assert(!settledRow.text.includes('…'), `the settled row is still hedged: "${settledRow.text}"`);
+        // The provisional reading survived into the final, which is what
+        // "converges" means and what lets a client replace rather than append.
+        assert(
+          settledRow.text.length > needle.length,
+          `the final row is no longer than the provisional one: "${settledRow.text}"`
+        );
+        const added = done.hits.length;
+
+        // 4. And the MODEL holds nothing: a partial is never stored, never
+        // counted, and never left behind (PROTOCOL 0.11.0).
+        const held = await capJs('window.__captionsDebug.partialModel()');
+        assert(held == null, `the captions model is still holding a partial: ${JSON.stringify(held)}`);
+        // …and neither does the main window's. Its tail is gone with the same
+        // event, and the row that replaced it is an ordinary segment in the
+        // list — never a leftover under it.
+        const tail = await js('window.__recallDebug.partial()');
+        assert(tail.model == null, `the transcript model is still holding a partial: ${JSON.stringify(tail.model)}`);
+        assert(tail.drawn == null, 'the transcript is still drawing a live tail after the turn landed');
+        assert(
+          (await js('document.querySelectorAll("#seg-list .seg.partial").length')) === 0,
+          'a provisional row leaked into the segment list'
+        );
+        return { seqs: [first.seq, grown.seq], added, provisional: firstText.slice(0, 40), tail: sawTail, file };
+      });
+
       // …and it goes away again through the same toggle the tray offers.
       await step('captions-close-from-the-same-place-they-opened', async () => {
         deps.captions.close();

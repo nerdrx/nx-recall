@@ -124,6 +124,33 @@
   cursor: help;
 }
 
+/* 0.11.0 — a turn that is STILL BEING SAID.
+ *
+ * Two differences from a settled row and no third: lighter ink, and a trailing
+ * "…". Everything structural is identical — same grid, same padding, same
+ * ground — because the final row replaces this one in place and any change of
+ * geometry would make the stack jump at the exact moment somebody is reading
+ * it. Rule 3 at the top of this file, applied to the one row that changes four
+ * times a second.
+ *
+ * The words are also, honestly, often wrong at first: FINDINGS §12 measured a
+ * short window decoding at 57% WER on its own, and a partial's first reading is
+ * a short window. The lighter ink is the app saying so.
+ */
+.cap-row.provisional .cap-text {
+  color: #a9a4bb;
+}
+.cap-ell {
+  /* Never wraps onto its own line: an ellipsis alone at the left margin reads
+     as a fourth row appearing rather than as a sentence continuing. */
+  white-space: nowrap;
+  margin-left: 0.15em;
+  color: #7e7994;
+}
+/* A provisional row's speaker is a proximity guess or nobody (PROTOCOL 0.11.0
+   — no embedding is computed for a partial), so the name is hedged by the
+   `.uncertain` rule below exactly as it is on a settled proximity label. */
+
 /* A turn whose SPEAKER the pipeline would not claim. Only the name is hedged —
    the words are still the words, and muting them too would say the sentence is
    in doubt when only the person is. */
