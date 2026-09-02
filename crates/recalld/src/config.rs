@@ -600,6 +600,70 @@ impl Default for RetentionConfig {
     }
 }
 
+// ---- 0.9.0 (ground truth from Discord) ------------------------------------
+
+/// Ground truth from Discord (0.9.0): a loopback ingest the Vencord plugin
+/// posts who-spoke-when to, and the idle pass that scores the voicebank
+/// against it.
+///
+/// **Off by default, and the one TCP listener in the program.** DESIGN §8 says
+/// no TCP, ever, and this is the exception with its reasons written down:
+/// Discord's renderer can only reach a local service over HTTP, the listener
+/// binds `127.0.0.1` and refuses anything else, and the access control that
+/// the control socket gets from being a 0600 unix socket this one gets from a
+/// bearer token in a 0600 file. It stays off until somebody turns it on.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TruthConfig {
+    /// Whether the loopback ingest listens at all. Off until asked.
+    pub enabled: bool,
+    /// Loopback port. Must match the plugin's.
+    pub port: u16,
+    /// Run the labelling pass over Discord segments. Separate from `enabled`
+    /// on purpose: truth that has already been collected is still worth
+    /// labelling against after the plugin has been turned off.
+    pub label: bool,
+    /// Enrol clean, well-covered, single-speaker turns into the linked
+    /// speaker's voicebank. Off by default — an automatic write to the
+    /// voicebank is the one thing here that changes future behaviour rather
+    /// than merely measuring it.
+    pub enrol: bool,
+    /// A speaking row with no stop is closed this long after it started. The
+    /// plugin sends a stop for every start, so this only fires when Discord
+    /// was killed, the plugin was disabled mid-word, or a batch was dropped.
+    pub open_span_timeout_s: u64,
+    /// Segments per labelling batch, and how long the worker waits between
+    /// batches. The same two knobs `[asr]` has, for the same reason.
+    pub batch_segments: usize,
+    pub batch_pause_s: u64,
+    /// How much audio may be waiting before the worker stands down. Capture
+    /// comes first (`crate::quality::gate`).
+    pub max_queue_seconds: i64,
+    /// Which capture sources count as Discord, as lower-case substrings
+    /// matched against a source's match key and display name. VRChat is not
+    /// Discord and never matches any of these; the list is here so a fork of
+    /// the client under another name can be told about without a rebuild.
+    pub sources: Vec<String>,
+}
+
+impl Default for TruthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 7797,
+            label: true,
+            enrol: false,
+            open_span_timeout_s: 30,
+            batch_segments: 200,
+            batch_pause_s: 20,
+            max_queue_seconds: 5,
+            sources: vec!["discord".into(), "vesktop".into()],
+        }
+    }
+}
+
+// ---- end 0.9.0 ------------------------------------------------------------
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -616,6 +680,8 @@ pub struct Config {
     pub socket: SocketConfig,
     pub roster: RosterConfig,
     pub retention: RetentionConfig,
+    /// Ground truth from Discord (0.9.0). Off by default.
+    pub truth: TruthConfig,
     /// Keyed on the match key (see `allowlist::SourceIdent::match_key`).
     pub rules: BTreeMap<String, Rule>,
 }
@@ -680,10 +746,29 @@ impl Config {
     }
 }
 
+/// `$XDG_CONFIG_HOME/nx-recall`, else `~/.config/nx-recall`.
+pub fn default_config_dir() -> Result<PathBuf> {
+    let base = dirs::config_dir().context("no config directory (XDG_CONFIG_HOME / HOME unset)")?;
+    Ok(base.join("nx-recall"))
+}
+
 /// `$XDG_CONFIG_HOME/nx-recall/config.toml`, else `~/.config/nx-recall/config.toml`.
 pub fn default_config_path() -> Result<PathBuf> {
-    let base = dirs::config_dir().context("no config directory (XDG_CONFIG_HOME / HOME unset)")?;
-    Ok(base.join("nx-recall").join("config.toml"))
+    Ok(default_config_dir()?.join("config.toml"))
+}
+
+/// Where the truth ingest's bearer token lives (0.9.0): beside the config
+/// file, or wherever `NXR_TRUTH_TOKEN` points. The env override exists for the
+/// same reason `NXR_SOCKET` does — it is what keeps a test off the live
+/// daemon's token.
+pub fn truth_token_path(config_path: &Path) -> PathBuf {
+    if let Some(p) = std::env::var_os("NXR_TRUTH_TOKEN").filter(|v| !v.is_empty()) {
+        return PathBuf::from(p);
+    }
+    match config_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join("truth.token"),
+        _ => PathBuf::from("truth.token"),
+    }
 }
 
 /// `$XDG_DATA_HOME/nx-recall`, else `~/.local/share/nx-recall`.

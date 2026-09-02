@@ -299,6 +299,16 @@ Nothing but one of these commands ever moves a note off `open`.")]
     /// and the only real measurement this machine has.
     Accuracy,
 
+    /// Ground truth from Discord: the token the Vencord plugin needs, who has
+    /// been linked to which voice, and how right the voicebank actually is.
+    ///
+    /// Discord's own client knows who is talking. Recall records the mixed
+    /// call and has to guess. This is the two being compared.
+    Truth {
+        #[command(subcommand)]
+        action: Option<TruthAction>,
+    },
+
     /// Chronological transcript dump.
     Transcript {
         /// Restrict to one capture session.
@@ -308,6 +318,33 @@ Nothing but one of these commands ever moves a note off `open`.")]
         #[arg(long, value_name = "SPEAKER")]
         speaker: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TruthAction {
+    /// Print the bearer token the plugin needs, generating one if there is
+    /// none yet. Paste it into Vencord → Plugins → RecallBridge.
+    Token,
+    /// Turn the loopback ingest on. Edits the config; restart `recalld run`.
+    On,
+    /// Turn the loopback ingest off.
+    Off,
+    /// Every Discord account heard so far, and the voice it is linked to.
+    Users,
+    /// Say that a Discord account is a particular voice.
+    Link {
+        #[arg(value_name = "USER_ID")]
+        user_id: String,
+        #[arg(value_name = "SPEAKER_ID")]
+        speaker_id: i64,
+    },
+    /// Take a link back.
+    Unlink {
+        #[arg(value_name = "USER_ID")]
+        user_id: String,
+    },
+    /// How right the voicebank was, marked by Discord.
+    Report,
 }
 
 #[derive(Subcommand, Debug)]
