@@ -148,7 +148,7 @@ it, and pre-conversation briefs ("last time: you owed her the shader link").
 - llama.cpp, CPU-first: `n_threads = 4`, pinned via the existing
   `[runtime] inference_cpus` mechanism, nice 19 — the same discipline as ASR.
   Napkin math: a 1.5B Q4 at ~30 tok/s on 4 Zen 5 cores chews through a full
-  evening's transcript in low minutes of idle time. Optional
+  evening's transcript in low minutes of background time (it does not wait for idle — see the fifth gate below). Optional
   `[graph] gpu_layers` for ROCm offload exists but the default is 0.
 - No network, no torch; the model is fetched once by `models fetch` like
   everything else, byte-verified. **It is an optional asset group** —

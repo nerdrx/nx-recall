@@ -705,7 +705,7 @@ export function mount(root, ctx) {
       role: 'switch',
       id: 'enrich-toggle',
       'aria-pressed': String(!!cfg.enabled),
-      'aria-label': cfg.enabled ? 'Stop the local model' : 'Let the local model run when idle',
+      'aria-label': cfg.enabled ? 'Stop the local model' : 'Let the local model read, all the time',
       disabled: switchPending || store.conn.status !== 'connected',
       onclick: () => void setEnabled(!cfg.enabled),
     });
@@ -740,7 +740,7 @@ export function mount(root, ctx) {
           h('span', {
             class: 'enrich-progress-text',
             id: 'enrich-progress-text',
-            text: `reading conversation ${st.batch_done + 1} of ${st.batch_total}`,
+            text: st.batch_total > 0 ? `reading conversation ${st.batch_done + 1} of ${st.batch_total}` : 'looking for the next conversation',
           })
         )
       );
