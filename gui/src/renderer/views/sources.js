@@ -944,25 +944,22 @@ export function mount(root, ctx) {
       capSlider('hold_s', 'Hold', 'How long the bar stays up after the last thing anybody said.', (v) => `${v} s`),
       capSlider('opacity', 'Ground', 'How much of what is underneath the captions cover.', (v) => `${Math.round(v * 100)}%`),
       capToggle('showYou', 'Show your own turns', 'Kept dimmer than everybody else’s, because you already know what you said.'),
-      // On a Wayland desktop the bar is a layer-shell surface with an empty
-      // input region: the compositor never delivers it a click, so there is
-      // nothing here to switch and no toggle is offered. Everywhere else the
-      // toggle stays — but where it is known not to work, it says so rather
-      // than pretending.
-      caps.surface === 'layer'
-        ? h('p', {
-            class: 'rail-hint',
-            id: 'captions-clickthrough-note',
-            style: 'padding:0;max-width:64ch',
-            text: 'Clicks always land in whatever is underneath: this desktop draws the bar as an overlay layer the pointer cannot reach.',
-          })
-        : capToggle(
-            'clickThrough',
-            'Ignore the mouse',
-            caps.surface === 'window-wayland'
-              ? 'Not available on this desktop — the window cannot refuse a click here, so the bar is draggable either way.'
-              : 'On, clicks land in whatever is underneath. Off, the bar can be dragged and resized.'
-          )
+      // Three desktops, three honest sentences. On the layer path the toggle is
+      // real and does two different things — it is the difference between
+      // scenery and furniture — so it says both. On Wayland WITHOUT layer-shell
+      // it is measurably a no-op and says so rather than pretending. On X11 it
+      // is the switch it always was.
+      capToggle(
+        'clickThrough',
+        'Ignore the mouse',
+        {
+          layer:
+            'On, clicks pass straight through to your game. Off, the bar stays put and you can drag it somewhere else, scroll over it to resize the text, and right-click it to turn this back on.',
+          'window-wayland':
+            'Not available on this desktop — the window cannot refuse a click here, so the bar takes them either way.',
+          window: 'On, clicks land in whatever is underneath. Off, the bar can be dragged and resized.',
+        }[caps.surface] ?? 'On, clicks land in whatever is underneath. Off, the bar can be dragged and resized.'
+      )
     );
   }
 

@@ -216,18 +216,19 @@ function buildTrayMenu() {
         updateTray();
       },
     },
-    // On a Wayland desktop the captions are a layer-shell surface whose input
-    // region is empty, so this is not a setting there — it is what the surface
-    // IS. Shown ticked and greyed rather than hidden: the tray is where you
-    // find out what state you left it in, and "you cannot change this" is a
-    // state. Everywhere else it is the real switch it always was.
+    // The same setting, worded for what it actually does on each desktop. On
+    // the layer path turning click-through OFF is a mode — the bar stops being
+    // scenery and becomes something you can drag — so the tray offers it the way
+    // round a person asks for it, "let me move it", rather than as the double
+    // negative of unticking "ignore the mouse". It is the same boolean; the
+    // caption bar itself and the settings card are the other two ways to it.
     captionsSurface() === 'layer'
       ? {
           id: 'captions-click-through',
-          label: 'Captions ignore the mouse',
+          label: 'Captions: let me move it',
           type: 'checkbox',
-          checked: true,
-          enabled: false,
+          checked: !getCaptionSettings().clickThrough,
+          click: (item) => setCaptionSettings({ clickThrough: !item.checked }),
         }
       : {
           id: 'captions-click-through',

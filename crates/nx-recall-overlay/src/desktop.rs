@@ -21,13 +21,33 @@
 //!
 //! - `zwlr_layer_shell_v1`, layer `OVERLAY`, so it stays above a fullscreen
 //!   game rather than behind it.
-//! - Anchored to the BOTTOM, sized from the same `captions.json` the Electron
-//!   window is sized from, with an exclusive zone of −1 so no maximised window
-//!   ever gets shoved up to make room for scenery.
-//! - `keyboard_interactivity: none`, and an EMPTY input region. Between them,
-//!   the compositor has nothing to deliver here: no pointer, no touch, no keys.
+//! - Anchored to the BOTTOM-LEFT corner, sized and placed from the same
+//!   `captions.json` the Electron window is sized from, with an exclusive zone
+//!   of −1 so no maximised window ever gets shoved up to make room for scenery.
+//! - `keyboard_interactivity: none`, always. The bar is read, never typed into.
 //! - `wl_shm` and the CPU rasteriser in `raster.rs`. No GPU, no wgpu, no Vulkan
 //!   — see `frame time` in docs/OVERLAY.md for what that costs.
+//!
+//! ## Scenery by default, furniture on request
+//!
+//! 0.10.0 shipped the input region as always-empty, and that was one word too
+//! strong. Click-through is what a caption bar wants nearly always — but the
+//! first thing a person does with a new bar is try to move it, and an always-
+//! empty region means they cannot, from either side. So `clickThrough` in
+//! captions.json decides, live:
+//!
+//! - **on** (the default): an empty input region. Unchanged, and still the
+//!   thing Electron could not say.
+//! - **off**: a NULL — i.e. infinite — input region, and the bar becomes
+//!   furniture. **Left-drag** moves it, and the new position is written back
+//!   into `bounds` so it stays put across launches. **Scroll** changes `size`,
+//!   in the settings card's own steps. **Right-click** puts `clickThrough` back
+//!   on, which is the way out that does not require finding the Settings view
+//!   underneath a bar that is currently eating your clicks.
+//!
+//! While it is furniture the stack does not fade: you cannot grab what you
+//! cannot see, and a bar that vanishes twelve seconds into being moved is a bar
+//! that cannot be moved.
 //!
 //! If the compositor does not offer `zwlr_layer_shell_v1`, this prints one line
 //! and exits **2**, which the Electron side reads as "use the BrowserWindow".
@@ -45,6 +65,12 @@ use smithay_client_toolkit::{
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        Capability, SeatHandler, SeatState,
+        pointer::{
+            CursorIcon, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer,
+        },
+    },
     shell::{
         WaylandSurface,
         wlr_layer::{
@@ -57,7 +83,7 @@ use smithay_client_toolkit::{
 use wayland_client::{
     Connection, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 
 use crate::feed::{self, Captions, Turn, visible};
@@ -79,26 +105,68 @@ const KEEP: usize = 40;
 /// The rasteriser's padding at scale 1, matching `raster::Style::default()`.
 const PAD: i64 = 18;
 
+/// `linux/input-event-codes.h`. Wayland reports raw evdev button codes and does
+/// not name them; naming them here is the difference between this file and one
+/// full of `0x110`.
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+
+/// The `size` slider's step, from CAPTION_RANGES in
+/// gui/src/renderer/lib/captions.js. One notch of the wheel is one notch of the
+/// slider, so the two controls cannot disagree about what a step is.
+const SIZE_STEP: f32 = 1.0;
+const SIZE_MIN: f32 = 18.0;
+const SIZE_MAX: f32 = 40.0;
+
+/// How long after the last interaction the file is written. The Electron side
+/// debounces its own saves by 400 ms for the same reason: a wheel spin is thirty
+/// events and thirty rewrites of a file somebody is watching.
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// One notch of the wheel, in the slider's own steps and the slider's own range.
+///
+/// Scrolling UP makes the text bigger, which is the direction every other
+/// zoom on this desktop goes; Wayland's vertical axis is positive DOWNWARD, so
+/// the sign flips exactly once, here.
+pub fn size_after_scroll(size: f32, notches: f32) -> f32 {
+    let stepped = size - notches * SIZE_STEP;
+    stepped.clamp(SIZE_MIN, SIZE_MAX).round()
+}
+
 // ---------------------------------------------------------------------------
 // the two things that can be decided without a compositor, and therefore tested
 // ---------------------------------------------------------------------------
 
 /// What this surface asks the compositor to deliver to it.
 ///
-/// There is one variant that this feature is ever allowed to produce, and the
-/// test below is the reason the enum exists rather than a bare call: the
-/// click-through TOGGLE must not be able to reach this decision. On the layer
-/// path the bar is scenery, always, and a settings file that says otherwise is
-/// a settings file describing the other surface.
+/// 0.10.0 shipped this with one variant and a test asserting that nothing could
+/// produce another: on the layer path the bar was scenery, always. That was
+/// half right and one word too strong. Click-through is what a caption bar
+/// wants almost all of the time — and "almost all" is a DEFAULT, not a law. The
+/// first thing a person did with it was try to move the bar, and there was no
+/// way to, from either side: the toggle was hidden, and the surface would not
+/// have listened if it had been there.
+///
+/// So the setting decides, and the enum still exists for the same reason: this
+/// is the one decision in the module worth being able to check without a
+/// compositor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputRegion {
     /// `wl_surface.set_input_region` with a region that has no rectangles in
     /// it. Not "the client ignores clicks" — the compositor never sends any.
     Empty,
+    /// A NULL region, which the protocol defines as infinite: the whole surface
+    /// takes the pointer. Drag to move, scroll to resize, right-click to hand
+    /// the pointer back.
+    Full,
 }
 
-pub fn input_region(_settings: &CaptionSettings) -> InputRegion {
-    InputRegion::Empty
+pub fn input_region(settings: &CaptionSettings) -> InputRegion {
+    if settings.click_through {
+        InputRegion::Empty
+    } else {
+        InputRegion::Full
+    }
 }
 
 /// Everything the layer surface is configured with, worked out from the
@@ -122,21 +190,29 @@ pub struct LayerConfig {
 pub fn layer_config(
     settings: &CaptionSettings,
     output: (u32, u32),
+    origin: (i32, i32),
     margin_override: Option<i32>,
 ) -> LayerConfig {
     let (width, height) = layout::surface_size(settings.bounds, output);
-    let bottom =
-        margin_override.unwrap_or_else(|| layout::bottom_margin(settings.bounds, height, output));
+    let bottom = margin_override
+        .unwrap_or_else(|| layout::bottom_margin(settings.bounds, height, output, origin));
+    let left = layout::left_margin(settings.bounds, width, output, origin);
     LayerConfig {
         // OVERLAY and not TOP: TOP loses to a fullscreen window, and a
         // fullscreen window is the thing these captions are for.
         layer: Layer::Overlay,
-        // BOTTOM alone, with no LEFT or RIGHT, is what centres a fixed-width
-        // surface horizontally. Adding either side would stretch it.
-        anchor: Anchor::BOTTOM,
+        // BOTTOM | LEFT, not BOTTOM alone. Bottom alone centres a fixed-width
+        // surface for free, which was the right trade while the bar could not be
+        // moved — but "centred" is a position with no number in it, and a bar
+        // you can drag needs one. Two edges, and both margins are ours to set.
+        // (Anchoring to BOTH sides of an axis is what stretches a surface;
+        // anchoring to one corner does not.)
+        anchor: Anchor::BOTTOM.union(Anchor::LEFT),
         width,
         height,
-        margin: (0, 0, bottom, 0),
+        margin: (0, 0, bottom, left),
+        // Still none, and deliberately: the bar is read, never typed into, and
+        // a layer surface that took the keyboard would take it from the game.
         keyboard: KeyboardInteractivity::None,
         exclusive_zone: -1,
         input: input_region(settings),
@@ -207,17 +283,25 @@ pub fn run(opts: Options) -> Result<()> {
     let mut app = App {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
         compositor,
         shm,
         pool,
         layer: None,
         cfg: None,
+        out_size: (1920, 1080),
+        out_origin: (0, 0),
         scale: 1,
         configured: false,
         exit: false,
         dirty: true,
         renderer,
         settings,
+        settings_path: settings_path.clone(),
+        last_written: None,
+        save_at: None,
+        pointer: None,
+        drag: None,
         turns: Vec::new(),
         last_change: Instant::now(),
         faded_out: false,
@@ -275,7 +359,15 @@ pub fn run(opts: Options) -> Result<()> {
         // until somebody speaks or the settings file is written, and a caption
         // bar has no business waking a laptop up sixty times a second to draw
         // the same pixels.
-        let timeout = if app.animating() { 16 } else { 500 };
+        // …and a pending write is its own reason to come back: the debounce
+        // has to expire even on a desktop where nothing else is happening.
+        let timeout = if app.animating() {
+            16
+        } else if app.save_at.is_some() {
+            SAVE_DEBOUNCE.as_millis() as i32 / 4
+        } else {
+            500
+        };
 
         let Some(guard) = queue.prepare_read() else {
             continue;
@@ -306,8 +398,9 @@ pub fn run(opts: Options) -> Result<()> {
             wake.drain();
         }
         if fds[2].revents != 0 && watch.drain() {
-            app.reload_settings(&settings_path);
+            app.reload_settings(&settings_path, &qh);
         }
+        app.flush_save();
 
         // Whatever the feed thread has produced since the last pass, newest
         // wins: an intermediate stack nobody saw is not worth a frame.
@@ -385,17 +478,40 @@ fn pump(socket: &Path, tx: &Sender<Vec<Turn>>, wake: &Waker) -> Result<()> {
 struct App {
     registry_state: RegistryState,
     output_state: OutputState,
+    seat_state: SeatState,
     compositor: CompositorState,
     shm: Shm,
     pool: SlotPool,
     layer: Option<LayerSurface>,
     cfg: Option<LayerConfig>,
+    /// The output the bar is on, as (size, origin) in logical pixels. Cached at
+    /// creation: the drag math needs both on every motion event, and asking the
+    /// registry per frame for a fact that changes when somebody replugs a
+    /// monitor is a round trip for nothing.
+    out_size: (u32, u32),
+    out_origin: (i32, i32),
     scale: i32,
     configured: bool,
     exit: bool,
     dirty: bool,
     renderer: raster::Renderer,
     settings: CaptionSettings,
+    /// Where the settings live, so the pointer handlers can write back.
+    settings_path: PathBuf,
+    /// The exact text of the last write this process made. The inotify watch
+    /// fires on our own writes too, and a reload that took its own echo as
+    /// somebody else's change would fight a drag frame by frame.
+    last_written: Option<String>,
+    /// When to write. Set by a drag release or a scroll notch, cleared by the
+    /// write; the debounce is the Electron side's own 400 ms.
+    save_at: Option<Instant>,
+    /// A pointer, if the seat has one. Themed so the cursor can say "grab" when
+    /// the bar is grabbable — through `wp_cursor_shape_manager_v1` where the
+    /// compositor offers it, which on this KWin it does.
+    pointer: Option<ThemedPointer<(), ()>>,
+    /// Where the left button went down, in surface-local coordinates, and the
+    /// margins at that moment. `None` between drags.
+    drag: Option<Drag>,
     turns: Vec<Turn>,
     last_change: Instant,
     faded_out: bool,
@@ -403,6 +519,34 @@ struct App {
     margin_override: Option<i32>,
     frame_us: u128,
     frames: u64,
+}
+
+/// Is this point on that output?
+fn contains(origin: (i32, i32), size: (u32, u32), p: (i32, i32)) -> bool {
+    p.0 >= origin.0
+        && p.1 >= origin.1
+        && p.0 < origin.0 + size.0 as i32
+        && p.1 < origin.1 + size.1 as i32
+}
+
+/// One output, as the placement math needs it.
+#[derive(Debug, Clone, Copy)]
+struct Placement {
+    size: (u32, u32),
+    origin: (i32, i32),
+    scale: i32,
+}
+
+/// A drag in progress. `press` is the ORIGINAL press point and stays put: see
+/// `layout::drag_margins` for why the loop is self-correcting rather than
+/// accumulating.
+#[derive(Debug, Clone, Copy)]
+struct Drag {
+    press: (f64, f64),
+    from: (i32, i32),
+    /// Whether the pointer has actually gone anywhere. A press-and-release that
+    /// never moved is a click, not a move, and must not rewrite the file.
+    moved: bool,
 }
 
 impl App {
@@ -413,8 +557,12 @@ impl App {
     /// chase. `--output NAME` names one, and with no name the compositor is
     /// asked to place it, which on KWin is the active output at the moment the
     /// surface appears. Documented in docs/OVERLAY.md.
-    fn pick_output(&self) -> (Option<wl_output::WlOutput>, (u32, u32), i32) {
-        let mut fallback = None;
+    fn pick_output(&self) -> (Option<wl_output::WlOutput>, Placement) {
+        let mut named = None;
+        let mut holds_bounds = None;
+        let mut at_origin = None;
+        let mut first = None;
+
         for out in self.output_state.outputs() {
             let Some(info) = self.output_state.info(&out) else {
                 continue;
@@ -424,27 +572,86 @@ impl App {
                 .or_else(|| info.modes.iter().find(|m| m.current).map(|m| m.dimensions))
                 .map(|(w, h)| (w.max(1) as u32, h.max(1) as u32))
                 .unwrap_or((1920, 1080));
-            let scale = info.scale_factor.max(1);
-            match &self.want_output {
-                Some(name) if info.name.as_deref() == Some(name.as_str()) => {
-                    return (Some(out), size, scale);
-                }
-                Some(_) => {}
-                None => return (None, size, scale),
+            // Where this output starts in the global desktop. `bounds` is in
+            // those coordinates and margins are in this output's, and on a
+            // stacked pair of monitors the two are 1440 apart.
+            let origin = info.logical_position.unwrap_or(info.location);
+            let place = Placement {
+                size,
+                origin,
+                scale: info.scale_factor.max(1),
+            };
+            let pick = (out.clone(), place, info.name.clone().unwrap_or_default());
+
+            if self.want_output.as_deref() == info.name.as_deref() && self.want_output.is_some() {
+                named = Some(pick);
+                break;
             }
-            fallback.get_or_insert((size, scale));
+            if let Some(b) = self.settings.bounds
+                && contains(
+                    origin,
+                    size,
+                    (b.x + b.width as i32 / 2, b.y + b.height as i32 / 2),
+                )
+            {
+                holds_bounds.get_or_insert(pick.clone());
+            }
+            if origin == (0, 0) {
+                at_origin.get_or_insert(pick.clone());
+            }
+            first.get_or_insert(pick);
         }
-        if let Some(name) = &self.want_output {
-            eprintln!("[overlay] no output called {name}; letting the compositor choose");
+
+        if self.want_output.is_some() && named.is_none() {
+            eprintln!(
+                "[overlay] no output called {}; choosing one",
+                self.want_output.as_deref().unwrap_or("?")
+            );
         }
-        let (size, scale) = fallback.unwrap_or(((1920, 1080), 1));
-        (None, size, scale)
+        // The output is named EXPLICITLY on the request, never left to the
+        // compositor. Until the bar could be moved, letting the compositor put
+        // it on the active screen was the friendlier answer; now that margins
+        // and `bounds` have to describe the SAME screen, a placement computed
+        // for one output and honoured on another is a bar on the wrong monitor.
+        //
+        // In order: the one you asked for; the one your remembered position is
+        // on; the one at the desktop's origin; whatever came first.
+        let (why, chosen) = match (named, holds_bounds, at_origin, first) {
+            (Some(p), ..) => ("--output", Some(p)),
+            (_, Some(p), ..) => ("the remembered position is on it", Some(p)),
+            (_, _, Some(p), _) => ("it is at the desktop origin", Some(p)),
+            (_, _, _, p) => ("it was the first one offered", p),
+        };
+        match chosen {
+            Some((out, place, name)) => {
+                eprintln!(
+                    "[overlay] output {name} ({}x{} at {},{}) — {why}",
+                    place.size.0, place.size.1, place.origin.0, place.origin.1
+                );
+                (Some(out), place)
+            }
+            None => (
+                None,
+                Placement {
+                    size: (1920, 1080),
+                    origin: (0, 0),
+                    scale: 1,
+                },
+            ),
+        }
     }
 
     fn create_layer(&mut self, shell: &LayerShell, qh: &QueueHandle<Self>) {
-        let (output, size, scale) = self.pick_output();
-        let cfg = layer_config(&self.settings, size, self.margin_override);
-        self.scale = scale;
+        let (output, place) = self.pick_output();
+        let cfg = layer_config(
+            &self.settings,
+            place.size,
+            place.origin,
+            self.margin_override,
+        );
+        self.scale = place.scale;
+        self.out_size = place.size;
+        self.out_origin = place.origin;
 
         let surface = self.compositor.create_surface(qh);
         let layer = shell.create_layer_surface(
@@ -461,13 +668,21 @@ impl App {
         layer.set_keyboard_interactivity(cfg.keyboard);
         layer.set_exclusive_zone(cfg.exclusive_zone);
         apply_input_region(&self.compositor, qh, layer.wl_surface(), &cfg.input);
-        layer.wl_surface().set_buffer_scale(scale);
+        layer.wl_surface().set_buffer_scale(place.scale);
         layer.commit();
 
         eprintln!(
-            "[overlay] layer surface: {}x{} logical at scale {scale}, layer OVERLAY, \
-             anchor BOTTOM, margin {b}px, exclusive zone {}, keyboard none",
-            cfg.width, cfg.height, cfg.exclusive_zone,
+            "[overlay] layer surface: {}x{} logical at scale {}, layer OVERLAY, \
+             anchor BOTTOM|LEFT, margin {l}px from the left and {b}px from the bottom of a \
+             {}x{} output at ({},{}), exclusive zone {}, keyboard none",
+            cfg.width,
+            cfg.height,
+            place.scale,
+            place.size.0,
+            place.size.1,
+            place.origin.0,
+            place.origin.1,
+            cfg.exclusive_zone,
         );
         self.cfg = Some(cfg);
         self.layer = Some(layer);
@@ -481,6 +696,14 @@ impl App {
     }
 
     fn fade(&self) -> f32 {
+        // While the bar is furniture it stays put and stays lit, even with
+        // nothing said yet: you cannot grab what you cannot see, and a bar that
+        // faded out mid-drag would be a bar that cannot be moved. This is the
+        // one place `clickThrough` changes what is DRAWN rather than what is
+        // delivered, and it is why turning it off is a mode rather than a tweak.
+        if !self.settings.click_through {
+            return 1.0;
+        }
         if self.turns.is_empty() {
             return 0.0;
         }
@@ -500,28 +723,139 @@ impl App {
         self.fade() <= 0.0 && !self.faded_out && !self.turns.is_empty()
     }
 
-    fn reload_settings(&mut self, path: &Path) {
+    /// captions.json was written by somebody. Possibly by us.
+    ///
+    /// The echo is the whole subtlety. This process now writes the file too — a
+    /// drag ends, a wheel turns — and inotify does not distinguish. Without a
+    /// guard, every write we make comes straight back as "the settings card
+    /// changed something", which during a drag would re-place the surface from
+    /// the file on the very frame the pointer is moving it. So the exact text of
+    /// our own last write is kept, and a file that still says exactly that is
+    /// not news. Anything else is, including a hand-edit that happens to match
+    /// the values we hold — that is a no-op anyway, caught by the equality below.
+    fn reload_settings(&mut self, path: &Path, qh: &QueueHandle<Self>) {
+        let raw = std::fs::read_to_string(path).ok();
+        if is_our_own_echo(raw.as_deref(), self.last_written.as_deref()) {
+            return;
+        }
         let next = CaptionSettings::load(path);
         if next == self.settings {
             return;
         }
         eprintln!(
-            "[overlay] captions.json changed — turns {}, size {}, hold {}s, ground {:.2}, showYou {}",
-            next.turns, next.size, next.hold_s, next.opacity, next.show_you
+            "[overlay] captions.json changed — turns {}, size {}, hold {}s, ground {:.2}, \
+             showYou {}, clickThrough {}",
+            next.turns, next.size, next.hold_s, next.opacity, next.show_you, next.click_through
         );
-        // The bar's SIZE is layer-shell state and has to be re-sent; everything
-        // else only changes the next frame. `clickThrough` is read and does
-        // nothing here, which is the truth this whole path exists to tell.
-        if let (Some(layer), Some(cfg)) = (self.layer.as_ref(), self.cfg.as_ref()) {
-            let out = (cfg.width, cfg.height);
-            let next_cfg = layer_config(&next, out, self.margin_override);
-            if next_cfg.width != cfg.width || next_cfg.height != cfg.height {
-                layer.set_size(next_cfg.width, next_cfg.height);
-                layer.commit();
-            }
+        self.apply_settings(next, qh);
+    }
+
+    /// Fold a new settings block in and re-send whatever is layer-shell state
+    /// rather than a property of the next frame.
+    ///
+    /// Three things live on the compositor rather than in the pixels: the size,
+    /// the margins, and the input region. Everything else — text size, ground,
+    /// hold, whose turns — is decided again by `draw`.
+    fn apply_settings(&mut self, next: CaptionSettings, qh: &QueueHandle<Self>) {
+        let before = std::mem::replace(&mut self.settings, next);
+        let (Some(layer), Some(cfg)) = (self.layer.as_ref(), self.cfg.as_ref()) else {
+            self.dirty = true;
+            return;
+        };
+        let next_cfg = layer_config(
+            &self.settings,
+            self.out_size,
+            self.out_origin,
+            self.margin_override,
+        );
+        let mut commit = false;
+        if (next_cfg.width, next_cfg.height) != (cfg.width, cfg.height) {
+            layer.set_size(next_cfg.width, next_cfg.height);
+            commit = true;
         }
-        self.settings = next;
+        // Not while a drag is in flight: the person's hand is the authority on
+        // where the bar is, not a file that was written a moment ago.
+        if next_cfg.margin != cfg.margin && self.drag.is_none() {
+            let (t, r, b, l) = next_cfg.margin;
+            layer.set_margin(t, r, b, l);
+            commit = true;
+        }
+        if before.click_through != self.settings.click_through {
+            apply_input_region(&self.compositor, qh, layer.wl_surface(), &next_cfg.input);
+            commit = true;
+        }
+        let margin = if self.drag.is_none() {
+            next_cfg.margin
+        } else {
+            cfg.margin
+        };
+        self.cfg = Some(LayerConfig { margin, ..next_cfg });
+        if commit {
+            layer.commit();
+        }
         self.dirty = true;
+    }
+
+    /// Move the surface, without touching the file. Called on every motion
+    /// event of a drag; the file is written once, on release.
+    fn place(&mut self, margins: (i32, i32)) {
+        let (Some(layer), Some(cfg)) = (self.layer.as_ref(), self.cfg.as_mut()) else {
+            return;
+        };
+        if cfg.margin == (0, 0, margins.1, margins.0) {
+            return;
+        }
+        cfg.margin = (0, 0, margins.1, margins.0);
+        layer.set_margin(0, 0, margins.1, margins.0);
+        layer.commit();
+    }
+
+    fn margins(&self) -> (i32, i32) {
+        self.cfg
+            .as_ref()
+            .map(|c| (c.margin.3, c.margin.2))
+            .unwrap_or((0, 0))
+    }
+
+    fn size(&self) -> (u32, u32) {
+        self.cfg
+            .as_ref()
+            .map(|c| (c.width, c.height))
+            .unwrap_or((0, 0))
+    }
+
+    /// Ask for the settings to be written, once the hand has stopped.
+    fn save_soon(&mut self) {
+        self.save_at = Some(Instant::now() + SAVE_DEBOUNCE);
+    }
+
+    /// Write captions.json, if it is due. Called from the run loop rather than
+    /// from a pointer handler, so a wheel spin is one write and not thirty.
+    fn flush_save(&mut self) {
+        if self.save_at.is_none_or(|at| Instant::now() < at) {
+            return;
+        }
+        self.save_at = None;
+        match self.settings.save_atomic(&self.settings_path) {
+            Ok(text) => {
+                // Remembered BEFORE the inotify event arrives, which is the
+                // whole point: the watch fires on this write and must recognise
+                // it.
+                self.last_written = Some(text);
+                let b = self.settings.bounds;
+                eprintln!(
+                    "[overlay] wrote {} — size {}, bounds {}",
+                    self.settings_path.display(),
+                    self.settings.size,
+                    b.map(|b| format!("{}x{} at ({},{})", b.width, b.height, b.x, b.y))
+                        .unwrap_or_else(|| "null".into()),
+                );
+            }
+            Err(e) => eprintln!(
+                "[overlay] could not write {}: {e}",
+                self.settings_path.display()
+            ),
+        }
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) {
@@ -552,7 +886,15 @@ impl App {
                 opacity: self.settings.opacity,
                 pad: PAD * scale as i64,
             });
-            let shown = visible(&self.turns, self.settings.turns, self.settings.show_you);
+            let mut shown = visible(&self.turns, self.settings.turns, self.settings.show_you);
+            // Furniture you cannot see is furniture you cannot move. Turning
+            // click-through off before anybody has said anything would otherwise
+            // give a fully transparent surface that takes clicks and shows
+            // nothing — the worst of both states. So the empty bar says what it
+            // is and what can be done to it, including the way back out.
+            if shown.is_empty() && !self.settings.click_through {
+                shown.push(move_hint());
+            }
             self.renderer.render(&shown, None)
         });
 
@@ -605,6 +947,43 @@ impl App {
     }
 }
 
+/// Is this inotify event about the file this process just wrote?
+///
+/// Pulled out as a function of two strings so the one rule that keeps a drag
+/// from fighting its own settings file can be checked without a compositor.
+/// Byte identity, not value equality: a file somebody else wrote with the same
+/// VALUES is caught a line later by the settings comparison, and that is a
+/// no-op anyway. What must never happen is our own write coming back as news.
+///
+/// A missing file is never an echo — this process does not delete it, so
+/// something else did, and the defaults are then genuinely the new state.
+pub fn is_our_own_echo(raw: Option<&str>, last_written: Option<&str>) -> bool {
+    match (raw, last_written) {
+        (Some(raw), Some(ours)) => raw == ours,
+        _ => false,
+    }
+}
+
+/// What an empty bar says while it is being moved.
+///
+/// A `Turn` rather than a special case in the rasteriser: it is one line of text
+/// on the same ground in the same layout, and a second drawing path for it would
+/// be a second thing to keep looking like the first. `speaker: None` gives it
+/// the nameless grey, which is right — nobody said this.
+fn move_hint() -> Turn {
+    Turn {
+        id: 0,
+        t_ms: 0,
+        speaker: None,
+        who: "captions".into(),
+        text: "drag to move · scroll to resize the text · right-click to let clicks through again"
+            .into(),
+        shaky: false,
+        translation: None,
+        mine: false,
+    }
+}
+
 /// Straight-alpha RGBA to the premultiplied little-endian ARGB8888 that
 /// `wl_shm` means by `Argb8888` — which is B, G, R, A in memory order — with
 /// the stack's fade folded in on the way.
@@ -633,31 +1012,41 @@ fn to_argb8888(surface: &raster::Surface, out: &mut [u8], fade: f32) {
 /// clicks" — it is the compositor being told there is nowhere on this surface
 /// to deliver a pointer or a touch to, which is why it holds for a game that
 /// has grabbed the pointer, for touch, and for a client that is busy.
+///
+/// `Full` is its opposite and is spelled with a NULL region, which the protocol
+/// defines as infinite. Not a rectangle the size of the surface: a rectangle
+/// would have to be re-sent on every configure, and a bar whose grabbable area
+/// was one resize behind its pixels is worse than either state.
 fn apply_input_region(
     compositor: &CompositorState,
     qh: &QueueHandle<App>,
     surface: &wl_surface::WlSurface,
     spec: &InputRegion,
 ) {
+    let _ = qh;
     match spec {
-        InputRegion::Empty => {
-            let _ = qh;
-            match Region::new(compositor) {
-                Ok(region) => {
-                    surface.set_input_region(Some(region.wl_region()));
-                    eprintln!(
-                        "[overlay] wl_surface.set_input_region: empty region (0 rectangles) — \
-                         the compositor will deliver no pointer, touch or keyboard here"
-                    );
-                }
-                // Said loudly rather than swallowed. A caption bar that quietly
-                // became clickable is the bug this whole path exists to fix, and
-                // the person needs to know before it is over their game.
-                Err(e) => eprintln!(
-                    "[overlay] WARNING: could not create an input region ({e}); \
-                     this surface may take clicks"
-                ),
+        InputRegion::Empty => match Region::new(compositor) {
+            Ok(region) => {
+                surface.set_input_region(Some(region.wl_region()));
+                eprintln!(
+                    "[overlay] wl_surface.set_input_region: empty region (0 rectangles) — \
+                     clicks pass through to whatever is underneath"
+                );
             }
+            // Said loudly rather than swallowed. A caption bar that quietly
+            // became clickable is the bug this whole path exists to fix, and
+            // the person needs to know before it is over their game.
+            Err(e) => eprintln!(
+                "[overlay] WARNING: could not create an input region ({e}); \
+                 this surface may take clicks"
+            ),
+        },
+        InputRegion::Full => {
+            surface.set_input_region(None);
+            eprintln!(
+                "[overlay] wl_surface.set_input_region: null (infinite) — drag to move, \
+                 scroll to resize the text, right-click to hand the pointer back"
+            );
         }
     }
 }
@@ -713,6 +1102,192 @@ impl CompositorHandler for App {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the pointer
+//
+// Only reachable while `clickThrough` is off — with it on, the input region is
+// empty and the compositor has nowhere to deliver any of this. That is worth
+// saying plainly, because it means none of the code below can steal a click
+// from a game: it is not a filter this process applies, it is a delivery the
+// compositor never makes.
+// ---------------------------------------------------------------------------
+
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {
+        self.pointer = None;
+        self.drag = None;
+    }
+
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability != Capability::Pointer || self.pointer.is_some() {
+            return;
+        }
+        // A THEMED pointer, so the cursor can say "grab" while the bar is
+        // grabbable. Where `wp_cursor_shape_manager_v1` is offered — it is, on
+        // this KWin — that costs one request and no cursor theme loading.
+        let shm = self.shm.wl_shm().clone();
+        let surface = self.compositor.create_surface(qh);
+        match self.seat_state.get_pointer_with_theme::<Self, ()>(
+            qh,
+            &seat,
+            &shm,
+            surface,
+            ThemeSpec::default(),
+        ) {
+            Ok(pointer) => {
+                eprintln!("[overlay] pointer acquired (used only while clickThrough is off)");
+                self.pointer = Some(pointer);
+            }
+            Err(e) => {
+                eprintln!("[overlay] no pointer on this seat ({e}); the bar cannot be dragged")
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            self.pointer = None;
+            self.drag = None;
+        }
+    }
+}
+
+impl PointerHandler for App {
+    fn pointer_frame(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        let ours = self.layer.as_ref().map(|l| l.wl_surface().clone());
+        for event in events {
+            if ours.as_ref() != Some(&event.surface) {
+                continue; // the cursor surface, or somebody else's
+            }
+            match event.kind {
+                PointerEventKind::Enter { .. } => {
+                    // The icon has to be re-set on every enter; the protocol
+                    // does not remember it for us.
+                    if let Some(p) = self.pointer.as_ref() {
+                        let _ = p.set_cursor(conn, CursorIcon::Grab);
+                    }
+                }
+                PointerEventKind::Leave { .. } => {
+                    // A drag that ends off the surface still ended. Keeping it
+                    // would leave the bar glued to a pointer that is elsewhere.
+                    if self.drag.take().is_some_and(|d| d.moved) {
+                        self.remember_position();
+                    }
+                }
+                PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
+                    self.drag = Some(Drag {
+                        press: event.position,
+                        from: self.margins(),
+                        moved: false,
+                    });
+                    if let Some(p) = self.pointer.as_ref() {
+                        let _ = p.set_cursor(conn, CursorIcon::Grabbing);
+                    }
+                }
+                PointerEventKind::Motion { .. } => {
+                    let Some(drag) = self.drag else { continue };
+                    let to = layout::drag_margins(
+                        drag.press,
+                        event.position,
+                        drag.from,
+                        self.size(),
+                        self.out_size,
+                    );
+                    if to != self.margins() {
+                        if let Some(d) = self.drag.as_mut() {
+                            d.moved = true;
+                        }
+                        self.place(to);
+                    }
+                }
+                PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
+                    let moved = self.drag.take().is_some_and(|d| d.moved);
+                    if let Some(p) = self.pointer.as_ref() {
+                        let _ = p.set_cursor(conn, CursorIcon::Grab);
+                    }
+                    // A press and release that never moved is a click, not a
+                    // move, and must not rewrite a file somebody is watching.
+                    if moved {
+                        self.remember_position();
+                    }
+                }
+                PointerEventKind::Release { button, .. } if button == BTN_RIGHT => {
+                    // The way out. Somebody who turned click-through off and now
+                    // has a bar eating their clicks cannot reach the settings
+                    // card underneath it — so the bar itself has to be able to
+                    // hand the pointer back.
+                    eprintln!("[overlay] right-click: clicks pass through again");
+                    let next = CaptionSettings {
+                        click_through: true,
+                        ..self.settings.clone()
+                    };
+                    self.apply_settings(next, qh);
+                    self.save_soon();
+                }
+                PointerEventKind::Axis { vertical, .. } => {
+                    // v120 where the compositor sends it, the deprecated
+                    // discrete count where it does not, and pixels as the last
+                    // resort — a touchpad reports only the last of those.
+                    let notches = if vertical.value120 != 0 {
+                        vertical.value120 as f32 / 120.0
+                    } else if vertical.discrete != 0 {
+                        vertical.discrete as f32
+                    } else {
+                        vertical.absolute as f32 / 53.0
+                    };
+                    let next = size_after_scroll(self.settings.size, notches);
+                    if next != self.settings.size {
+                        self.settings.size = next;
+                        self.dirty = true;
+                        self.save_soon();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl App {
+    /// Where the bar has ended up, in the coordinates `bounds` is written in.
+    fn remember_position(&mut self) {
+        let bounds = layout::bounds_from_margins(
+            self.margins(),
+            self.size(),
+            self.out_size,
+            self.out_origin,
+        );
+        if self.settings.bounds != Some(bounds) {
+            self.settings.bounds = Some(bounds);
+            self.save_soon();
+        }
+    }
+}
+
 impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
         eprintln!("[overlay] the compositor closed the layer surface");
@@ -761,7 +1336,7 @@ impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 // One blanket impl rather than a macro per protocol: this smithay-client-toolkit
@@ -918,42 +1493,111 @@ mod tests {
     use super::*;
     use crate::settings::Bounds;
 
-    /// The point of the whole module, as an assertion rather than a hope: there
-    /// is no settings file, and no value of the click-through toggle, that puts
-    /// a rectangle in this surface's input region.
+    /// The setting decides, and nothing else does. 0.10.0 asserted the opposite
+    /// — that nothing could produce anything but `Empty` — and that assertion
+    /// was the bug: it was a law where a default was wanted.
     #[test]
-    fn the_input_region_is_empty_whatever_the_settings_say() {
+    fn the_setting_is_the_only_thing_that_decides_the_input_region() {
+        let on = CaptionSettings {
+            click_through: true,
+            ..CaptionSettings::default()
+        };
+        let off = CaptionSettings {
+            click_through: false,
+            ..CaptionSettings::default()
+        };
+        assert_eq!(input_region(&on), InputRegion::Empty);
+        assert_eq!(input_region(&off), InputRegion::Full);
+        // And it survives the trip through the whole config, with every other
+        // field moved around underneath it.
+        for bounds in [
+            None,
+            Some(Bounds {
+                x: 10,
+                y: 20,
+                width: 900,
+                height: 200,
+            }),
+        ] {
+            for out in [(2560u32, 1440u32), (1366, 768)] {
+                assert_eq!(
+                    layer_config(
+                        &CaptionSettings {
+                            bounds,
+                            ..on.clone()
+                        },
+                        out,
+                        (0, 0),
+                        None
+                    )
+                    .input,
+                    InputRegion::Empty
+                );
+                assert_eq!(
+                    layer_config(
+                        &CaptionSettings {
+                            bounds,
+                            ..off.clone()
+                        },
+                        out,
+                        (0, 0),
+                        None
+                    )
+                    .input,
+                    InputRegion::Full
+                );
+            }
+        }
+    }
+
+    /// Click-through is the DEFAULT. A fresh profile, a corrupt file, an empty
+    /// object: all of them are a bar the pointer passes through, because that is
+    /// what a caption bar is for nearly all of the time.
+    #[test]
+    fn a_bar_nobody_has_configured_is_still_scenery() {
+        assert_eq!(
+            input_region(&CaptionSettings::default()),
+            InputRegion::Empty
+        );
+        assert_eq!(
+            input_region(&CaptionSettings::normalize(&serde_json::json!({}))),
+            InputRegion::Empty
+        );
+        assert_eq!(
+            input_region(&CaptionSettings::normalize(&serde_json::json!(
+                "not json at all"
+            ))),
+            InputRegion::Empty
+        );
+    }
+
+    /// The facts that make this a caption bar rather than a window: above a
+    /// fullscreen game, in a corner so both margins are ours to set, reserving
+    /// nothing, and deaf — deaf in BOTH modes, because a layer surface that took
+    /// the keyboard would take it from the game.
+    #[test]
+    fn the_surface_is_a_caption_bar_in_either_mode() {
         for click_through in [true, false] {
             let s = CaptionSettings {
                 click_through,
                 ..CaptionSettings::default()
             };
-            assert_eq!(input_region(&s), InputRegion::Empty);
+            let cfg = layer_config(&s, (2560, 1440), (0, 0), None);
             assert_eq!(
-                layer_config(&s, (2560, 1440), None).input,
-                InputRegion::Empty
+                cfg.layer,
+                Layer::Overlay,
+                "TOP loses to a fullscreen window"
             );
+            assert_eq!(cfg.anchor, Anchor::BOTTOM.union(Anchor::LEFT));
+            assert_eq!(
+                cfg.exclusive_zone, -1,
+                "a caption bar must reserve no space"
+            );
+            assert_eq!(cfg.keyboard, KeyboardInteractivity::None);
+            assert_eq!((cfg.width, cfg.height), (1100, 340));
+            // Centred by arithmetic now that BOTTOM alone no longer does it.
+            assert_eq!(cfg.margin, (0, 0, layout::DEFAULT_BOTTOM_MARGIN, 730));
         }
-    }
-
-    /// The four facts that make this a caption bar rather than a window: above
-    /// a fullscreen game, anchored at the bottom, reserving nothing, and deaf.
-    #[test]
-    fn the_surface_is_scenery_at_the_bottom_of_the_screen() {
-        let cfg = layer_config(&CaptionSettings::default(), (2560, 1440), None);
-        assert_eq!(
-            cfg.layer,
-            Layer::Overlay,
-            "TOP loses to a fullscreen window"
-        );
-        assert_eq!(cfg.anchor, Anchor::BOTTOM);
-        assert_eq!(
-            cfg.exclusive_zone, -1,
-            "a caption bar must reserve no space"
-        );
-        assert_eq!(cfg.keyboard, KeyboardInteractivity::None);
-        assert_eq!((cfg.width, cfg.height), (1100, 340));
-        assert_eq!(cfg.margin, (0, 0, layout::DEFAULT_BOTTOM_MARGIN, 0));
     }
 
     #[test]
@@ -967,14 +1611,118 @@ mod tests {
             }),
             ..CaptionSettings::default()
         };
-        let cfg = layer_config(&s, (1920, 1080), None);
+        let cfg = layer_config(&s, (1920, 1080), (0, 0), None);
         assert_eq!((cfg.width, cfg.height), (800, 260));
-        assert_eq!(cfg.margin, (0, 0, 1080 - 700 - 260, 0));
-        // …and --margin overrules the remembered position entirely.
+        assert_eq!(cfg.margin, (0, 0, 1080 - 700 - 260, 100));
+        // …and --margin overrules the remembered vertical position entirely.
         assert_eq!(
-            layer_config(&s, (1920, 1080), Some(12)).margin,
-            (0, 0, 12, 0)
+            layer_config(&s, (1920, 1080), (0, 0), Some(12)).margin,
+            (0, 0, 12, 100)
         );
+    }
+
+    /// One notch of the wheel is one notch of the slider, in the slider's own
+    /// range — and up is bigger, which means the sign of Wayland's
+    /// positive-downward axis flips exactly once.
+    #[test]
+    fn the_wheel_moves_the_text_size_in_the_sliders_own_steps() {
+        assert_eq!(
+            size_after_scroll(26.0, -1.0),
+            27.0,
+            "scrolling up did not grow the text"
+        );
+        assert_eq!(size_after_scroll(26.0, 1.0), 25.0);
+        assert_eq!(size_after_scroll(26.0, -3.0), 29.0);
+        // The ends of the slider are the ends of the wheel.
+        assert_eq!(size_after_scroll(40.0, -5.0), 40.0);
+        assert_eq!(size_after_scroll(18.0, 5.0), 18.0);
+        // A touchpad's fractional notches still land on a step the slider could
+        // produce, rather than on 26.4.
+        let after = size_after_scroll(26.0, -0.4);
+        assert_eq!(after, after.round());
+    }
+
+    /// The guard itself, as three strings and a rule. Everything a drag does to
+    /// the file comes back through inotify; without this the surface would be
+    /// re-placed from disk on the frame the pointer is moving it.
+    #[test]
+    fn only_our_own_bytes_are_an_echo() {
+        let ours = "{\n  \"size\": 26\n}\n";
+        assert!(is_our_own_echo(Some(ours), Some(ours)));
+        assert!(
+            !is_our_own_echo(Some("{}"), Some(ours)),
+            "somebody else's write was swallowed"
+        );
+        // Before this process has written anything, nothing is an echo.
+        assert!(!is_our_own_echo(Some(ours), None));
+        // A file that has gone is not an echo either: this process never
+        // deletes it, so something else did and that is real news.
+        assert!(!is_our_own_echo(None, Some(ours)));
+        assert!(!is_our_own_echo(None, None));
+    }
+
+    /// The echo. This process writes captions.json now, inotify fires on its own
+    /// writes, and a reload that took the echo for somebody else's change would
+    /// re-place the surface from the file on the frame the pointer is moving it.
+    ///
+    /// The guard is the exact text, so this checks the round trip that guard
+    /// depends on: what we write is byte-identical to what we would compare
+    /// against, and a real edit is not.
+    #[test]
+    fn our_own_write_is_recognisable_and_somebody_elses_is_not() {
+        let dir = std::env::temp_dir().join(format!("nx-recall-echo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("captions.json");
+
+        let s = CaptionSettings {
+            bounds: Some(Bounds {
+                x: 40,
+                y: 900,
+                width: 1100,
+                height: 340,
+            }),
+            ..CaptionSettings::default()
+        };
+        let written = s.save_atomic(&path).unwrap();
+        // What the watch will read back is exactly what we recorded.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        assert_eq!(
+            Some(std::fs::read_to_string(&path).unwrap()),
+            Some(written.clone())
+        );
+
+        // Somebody else writing the same VALUES a different way is not
+        // byte-identical — which is fine, because the second guard is value
+        // equality and that one catches it.
+        std::fs::write(
+            &path,
+            serde_json::to_string(&serde_json::json!({
+                "turns": 5, "size": 26, "hold_s": 12, "opacity": 0.6,
+                "showYou": true, "clickThrough": true,
+                "bounds": {"x": 40, "y": 900, "width": 1100, "height": 340}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_ne!(
+            raw, written,
+            "the byte guard would have been enough on its own"
+        );
+        assert_eq!(
+            CaptionSettings::load(&path),
+            s,
+            "…and the value guard catches it"
+        );
+
+        // A real change is neither.
+        let mut other = s.clone();
+        other.size = 33.0;
+        other.save_atomic(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_ne!(raw, written);
+        assert_ne!(CaptionSettings::load(&path), s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Premultiplied, in `wl_shm`'s byte order, with the fade folded in. Getting
