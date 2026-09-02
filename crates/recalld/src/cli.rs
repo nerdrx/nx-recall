@@ -220,6 +220,8 @@ the daemon is capturing, and a run that is interrupted loses nothing.
 
 `recalld models fetch --arbiter-de` installs the German arbiter (~208 MB);
 `recalld models fetch --confidence` installs the cross-check decoder (~154 MB);
+`recalld models fetch --japanese` installs a Japanese decoder and the language
+identifier that routes to it (~605 MB);
 `--fallback-asr` installs the English one (~108 MB).")]
     Lang {
         #[command(subcommand)]
@@ -689,6 +691,15 @@ pub enum ModelsAction {
         /// because upstream publishes no GPU-capable whisper-cli for this card.
         #[arg(long)]
         night: bool,
+
+        /// Also install the Japanese decoder and the spoken-language
+        /// identifier that routes turns to it (~605 MB, 0.11.0). Optional —
+        /// without them a Japanese turn comes back as Latin nonsense
+        /// ("Sima Sen Okenki Deska."), which nothing downstream can detect,
+        /// because the multilingual decoder does not speak Japanese and does
+        /// not say so.
+        #[arg(long)]
+        japanese: bool,
 
         /// Also install the text-embedding model that semantic search needs
         /// (~135 MB). Not part of the default set: keyword search works

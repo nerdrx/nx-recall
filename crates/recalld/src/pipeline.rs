@@ -295,6 +295,11 @@ impl Pipeline {
                 if models.complete() {
                     let mut analyzer = Analyzer::load(&models, &cfg.identity)?;
                     analyzer.set_lang_config(&cfg.lang);
+                    // 0.11.0: the Japanese router's switch and operating
+                    // point. Set here rather than in `load` because it owns
+                    // two lazily loaded models and must be built once, before
+                    // the inference thread starts.
+                    analyzer.set_asr_config(&models, &cfg.asr);
                     // 0.11.0: which capture sources count as Discord, so the
                     // source prior's hard presence rule knows where it applies.
                     analyzer.set_truth_config(&cfg.truth);
@@ -318,6 +323,15 @@ impl Pipeline {
                         );
                     } else {
                         info!(arbiters = installed.join(", "), "flip arbiters available");
+                    }
+                    // 0.11.0: whether this machine can hear Japanese at all.
+                    // Said once for the same reason the arbiters are — the
+                    // failure it prevents is silent, so its absence must not
+                    // be.
+                    if let Some(note) = analyzer.japanese_note() {
+                        info!("{note}");
+                    } else {
+                        info!("Japanese turns will be detected and re-decoded");
                     }
                     Some(analyzer)
                 } else {

@@ -109,6 +109,7 @@ fn main() -> Result<()> {
                 arbiter_de,
                 confidence,
                 night,
+                japanese,
                 semantic,
                 no_config,
             } => cmd_models_fetch(
@@ -124,6 +125,7 @@ fn main() -> Result<()> {
                     arbiter_de,
                     confidence,
                     night,
+                    japanese,
                     single_stream: false,
                 },
                 no_config,
@@ -1175,6 +1177,29 @@ fn cmd_models_status(
     } else {
         println!("cross-check:        off  (optional)");
         println!("  {}", models::ConfidenceModel::how_to_get_it());
+    }
+
+    // Japanese (0.11.0). One line for the pair, because the flag installs the
+    // pair: a decoder nothing can route to never runs, and an identifier with
+    // nothing to hand a turn to only writes a log line. Absent is a normal
+    // state and what happens then is what happened in 0.10.3 — a Japanese turn
+    // comes back as Latin nonsense.
+    let japanese = models.japanese();
+    let lid = models.lid();
+    println!();
+    if japanese.present() && lid.present() {
+        println!("japanese:           on   ({})", japanese.model_id());
+    } else {
+        println!("japanese:           off  (optional)");
+        println!("  {}", models::JapaneseModel::how_to_get_it());
+    }
+    for e in japanese.entries().into_iter().chain(lid.entries()) {
+        println!(
+            "  {:<14}  {:>10}  {}",
+            e.role,
+            e.bytes().map(fetch::human).unwrap_or_else(|| "-".into()),
+            e.path.display()
+        );
     }
 
     // The night shift (0.9.0). Reported in two halves because they fail

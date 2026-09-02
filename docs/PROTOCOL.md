@@ -2103,3 +2103,102 @@ a language that is not the target is a rejection, and where it cannot read one,
 three German or English stopwords are. It deliberately does **not** use
 `lang::classify` for a third-language target — that settles on German the moment
 it sees an umlaut, and Swedish, Turkish and Finnish are full of them.
+
+## 0.11.0 — Japanese
+
+A turn spoken in Japanese did not come back wrong-looking. It came back
+**wrong-looking-like-English**: Parakeet-TDT-0.6b-v3 covers 25 European
+languages, does not cover Japanese, and does not say so — it transliterates.
+"sumimasen, ogenki desu ka" was stored as `Sima Sen Okenki Deska.`
+
+That is why this round adds a decision made from **audio** rather than from
+text. Every language mechanism in the protocol before now — `lang_via: "model"`,
+`"classified"`, `"guessed"`, `"context"`, `"re-decode"`, `"mismatch"` — reads
+the transcript, and there was nothing in that transcript to read.
+
+### `segments.lang_via: "lid"`
+
+A sixth value, and it has to be its own. It means: **a model listened to the
+audio and said which language it was**, and a decoder for that language then
+re-read the turn. It is not `re-decode` (nothing disagreed with a speaker's
+declaration) and not `classified` (the words said nothing — they could not).
+
+A row carrying `lang_via: "lid"` has `lang: "ja"`, an `asr_model_id` of
+`sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8@1`, and `text_via:
+"arbiter"` — the same `text_via` the German flip arbiter writes, because it is
+the same kind of event: a constrained decoder replacing a wrong-language
+transcript.
+
+**A `lang_via: "lid"` row is settled.** The conversational language prior
+(0.7.7) does not re-open it, the same way it does not re-open `re-decode` or
+`mismatch`. This matters more than the other two: `lang::classify` reads kana as
+`Unclear`, which is the *inherit* branch, so without the guard a correctly
+re-decoded Japanese turn would be stamped `de` by the German conversation around
+it seconds after being fixed.
+
+### The prior words are kept
+
+The replacement goes through the same path the context pass and the night shift
+use, so an `operations` row is written with op `segments.redecode` and a
+`prior_state` carrying the previous `text`, `asr_model_id` and `text_via`. A
+Japanese re-decode is a machine's edit of a transcript and is comparable and
+revertible exactly like any other. `asr_confidence` is cleared with the words it
+was about.
+
+### When it fires
+
+Per turn, after the speaker is known and before the thread prior runs:
+
+1. speaker tagged **exactly** `ja` → the Japanese decoder directly, no
+   identifier call;
+2. speaker tagged exactly something else → not this feature's business
+   (`correct_language` owns that row);
+3. transcript reads as German, English, or anything `guess_other` is confident
+   about (Japanese included) → **nothing, and no identifier call**;
+4. otherwise — `Unclear` or no words, which is what a transliterated Japanese
+   turn looks like — the spoken-language identifier is asked, and if it says
+   `ja` at or above `[asr].lid_min_confidence` the Japanese decoder re-reads
+   the turn.
+
+Turns shorter than `[lang].arbiter_min_duration_s` (1.5 s) are not offered to
+either model.
+
+The replacement is then judged before it may overwrite anything: it must be
+non-empty and must **contain kana**. A Japanese-only decoder run over German
+audio does not produce kana, so a false positive from step 4 costs one decode
+and changes no row. The arbiter's `arbiter_min_words` floor deliberately does
+not apply — Japanese has no spaces, so every correct answer would be one "word".
+
+### Status counters
+
+`status` gains two, and they are read as a pair:
+
+* `lid_checked` — turns whose transcript nobody could read and which were
+  therefore played to the identifier. This is what the feature **costs**.
+* `routed_ja` — turns the Japanese decoder re-read and replaced. What it
+  **buys**.
+
+`lid_checked` climbing while `routed_ja` stays at zero is not a Japanese
+problem; it means a lot of transcripts are unreadable and the thing to look at
+is why.
+
+### Models
+
+Both optional, both installed by `recalld models fetch --japanese` (~605 MB),
+and one group because either alone does nothing:
+
+| role | export | bytes |
+|------|--------|------:|
+| `japanese.asr` | `sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8` | 489,389,564 |
+| `lid` | `sherpa-onnx-whisper-tiny` | 116,204,861 |
+
+`[asr].japanese` (default `true`) means "use them if they are there", so a
+machine that never fetches them is unaffected. Without them a Japanese turn
+behaves exactly as it did in 0.10.3.
+
+Note for anyone reading the catalogue: whisper **tiny**, not base, and that is a
+measurement rather than a saving. Base has the better Japanese recall and hears
+3–5% of English as Japanese; tiny heard zero of 400 German and English
+utterances as Japanese at any length. Numbers in `spike/FINDINGS.md` §22–§24,
+which also record what this does *not* cover — Korean and Chinese have the same
+failure and no catalogued decoder yet.

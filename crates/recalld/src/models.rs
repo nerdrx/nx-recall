@@ -85,6 +85,14 @@ pub enum Group {
     /// all — there is no ROCm/Vulkan `whisper-cli` release to download, so
     /// `recalld models build-night` compiles one. See [`Group::note`].
     Night,
+    /// Japanese (0.11.0): a decoder that speaks it, and a spoken-language
+    /// identifier to decide when to reach for one.
+    ///
+    /// **Two assets in one group on purpose.** Either alone is useless — a
+    /// Japanese decoder nothing can route to never runs, and a language
+    /// identifier with nothing to hand a Japanese turn to only produces a log
+    /// line. `models fetch --japanese` installs the pair or neither.
+    Japanese,
 }
 
 impl Group {
@@ -116,6 +124,11 @@ impl Group {
             Group::Night => {
                 "optional — the night shift's GPU decoder; the model downloads, \
                  the runtime is built by `recalld models build-night`"
+            }
+            Group::Japanese => {
+                "optional — a Japanese decoder and the language identifier that \
+                 routes to it; without them Japanese turns come back as Latin \
+                 nonsense nothing can detect"
             }
         }
     }
@@ -187,6 +200,18 @@ pub const NIGHT_SPIRV_HEADERS_TAG: &str = "vulkan-sdk-1.4.313.0";
 pub const NIGHT_DIR: &str = "whisper";
 
 pub const CONFIDENCE_ROLE: &str = "confidence";
+
+// ---- Japanese (0.11.0) ----------------------------------------------------
+
+/// `RemoteAsset::role` for the Japanese decoder, for the same reason every
+/// other optional role is named: `models fetch --japanese` and `models status`
+/// both pick it out of the catalogue by this string.
+pub const JAPANESE_ROLE: &str = "japanese.asr";
+/// …and for the spoken-language identifier that routes turns to it.
+pub const LID_ROLE: &str = "lid";
+
+/// The directory the Japanese decoder installs into, under the models root.
+pub const JAPANESE_DIR: &str = "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8";
 
 /// The directory the cross-check decoder installs into, under the models root.
 pub const CONFIDENCE_DIR: &str = "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8";
@@ -401,6 +426,87 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
         install: Install::File(NIGHT_MODEL_FILE),
         group: Group::Night,
         files: &[(NIGHT_MODEL_FILE, 1_081_140_203)],
+    },
+    // ---- Japanese (0.11.0) ------------------------------------------------
+    //
+    // Optional, and the flag is `models fetch --japanese`. Two assets, ~605 MB
+    // together, and they are one group because either alone does nothing.
+    //
+    // The decoder is NVIDIA's Japanese Parakeet as published in the k2-fsa
+    // zoo. Note the shape: `tdt_ctc`, and the export sherpa ships is the **CTC
+    // head** — one `model.int8.onnx`, not the encoder/decoder/joiner triple
+    // the multilingual v3 uses — which is why it is loaded by
+    // `crate::asr_ja::JaAsr` through the offline `nemo_ctc` config rather than
+    // through `Asr::load`.
+    //
+    // Measured (`spike/asr_ja.py`, FLEURS ja test, CER after NFKC
+    // normalisation and punctuation stripping — WER is meaningless for a
+    // language written without spaces): see FINDINGS §23 and the numbers on
+    // `crate::asr_ja`. It is preferred over routing Japanese turns to the
+    // night shift's whisper-large-v3 because it runs on the CPU, in the live
+    // path, in the same place the German arbiter already runs.
+    //
+    // sha256 of the tarball, recorded because a byte count is a weak hash and
+    // this catalogue's contract is exactness:
+    //   4b0a800ef29f4f4c8667339bf6f60d5bfdc2852ddc9dc5741aea65b6f8d1306b
+    RemoteAsset {
+        role: JAPANESE_ROLE,
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2",
+        download_bytes: 489_389_564,
+        install: Install::TarBz2,
+        group: Group::Japanese,
+        files: &[
+            (
+                "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8/model.int8.onnx",
+                655_542_604,
+            ),
+            (
+                "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8/tokens.txt",
+                28_557,
+            ),
+        ],
+    },
+    // The spoken-language identifier (`crate::lid`): Whisper tiny int8, read
+    // for its language token rather than for words.
+    //
+    // Tiny rather than base, and that is a measurement rather than a saving
+    // (`spike/lid_bench.py`, 200 FLEURS utterances per language). Base is
+    // BETTER at recall — 99.5% ja at 3 s against tiny's 96.5% — and it is the
+    // wrong model anyway, because it fails the gate in the direction that
+    // costs something: base hears 3% of English at 3 s and 5% at 1.5 s as
+    // Japanese, while tiny heard **zero of 400** German and English
+    // utterances as Japanese at any length. A missed Japanese turn stays
+    // exactly as wrong as it is today; a German turn handed to a decoder that
+    // speaks only Japanese is a new kind of wrong. Tiny is also a third of the
+    // download and half base's RTF at 1.5 s.
+    //
+    // Base is already on disk for anyone who fetched `--arbiter-de`, and is
+    // still not reused — a feature whose accuracy depends on which *other*
+    // optional group you happened to install is not one anybody can reason
+    // about.
+    //
+    // Only the int8 encoder/decoder and the token table are checked; the
+    // tarball also carries fp32 exports and test WAVs this daemon never reads.
+    //
+    // sha256 of the tarball:
+    //   c46116994e539aa165266d96b325252728429c12535eb9d8b6a2b10f129e66b1
+    RemoteAsset {
+        role: LID_ROLE,
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2",
+        download_bytes: 116_204_861,
+        install: Install::TarBz2,
+        group: Group::Japanese,
+        files: &[
+            (
+                "sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx",
+                12_937_772,
+            ),
+            (
+                "sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx",
+                89_855_401,
+            ),
+            ("sherpa-onnx-whisper-tiny/tiny-tokens.txt", 816_730),
+        ],
     },
     // ---- the memory graph's Tier 3 (GRAPH.md) -----------------------------
     //
@@ -832,6 +938,195 @@ pub fn confidence_download_bytes() -> u64 {
         .sum()
 }
 
+// ---- Japanese, on disk (0.11.0) -------------------------------------------
+
+/// The Japanese decoder's export: a **CTC** head, so one graph file and a token
+/// table, and none of [`AsrExport`]'s four.
+///
+/// Deliberately its own type rather than a fourth `AsrExport` for the same
+/// reason [`WhisperExport`] is its own: the file layout is different, the
+/// sherpa model config it fills in is different (`nemo_ctc`, not
+/// `transducer`), and its language is a property of the weights rather than a
+/// decoding parameter or a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CtcExport {
+    pub dir: &'static str,
+    pub model: &'static str,
+    pub tokens: &'static str,
+    /// The tag stamped on every transcript this decoder produces. A fact about
+    /// the weights: it cannot produce anything else.
+    pub lang: &'static str,
+    pub note: &'static str,
+}
+
+impl CtcExport {
+    pub fn model_id(&self) -> String {
+        format!("{}@{ASR_CONTRACT_VERSION}", self.dir)
+    }
+}
+
+/// NVIDIA's Japanese Parakeet, CTC head, int8.
+pub const JAPANESE_ASR: CtcExport = CtcExport {
+    dir: JAPANESE_DIR,
+    model: "model.int8.onnx",
+    tokens: "tokens.txt",
+    lang: "ja",
+    note: "Japanese only — CPU, live-path speed",
+};
+
+/// The Whisper export the spoken-language identifier runs on. Encoder and
+/// decoder only: LID reads the language token, so nothing ever asks it for
+/// words and the token table it would need for them is not opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LidExport {
+    pub dir: &'static str,
+    pub encoder: &'static str,
+    pub decoder: &'static str,
+    pub note: &'static str,
+}
+
+pub const LID_WHISPER: LidExport = LidExport {
+    dir: "sherpa-onnx-whisper-tiny",
+    encoder: "tiny-encoder.int8.onnx",
+    decoder: "tiny-decoder.int8.onnx",
+    note: "Whisper tiny int8 — 96.5% ja recall at 3 s, 0/400 de+en false positives",
+};
+
+/// Where the Japanese decoder lives under a models root, and whether it is
+/// there. Kept apart from [`ModelSet`] like every other optional model: its
+/// absence is a normal state, and what happens without it is that a Japanese
+/// turn stays transliterated — which is exactly what 0.10.3 did.
+#[derive(Debug, Clone)]
+pub struct JapaneseModel {
+    pub root: PathBuf,
+    pub export: CtcExport,
+    pub model: PathBuf,
+    pub tokens: PathBuf,
+}
+
+impl JapaneseModel {
+    pub fn resolve_at(root: PathBuf, export: CtcExport) -> Self {
+        let dir = root.join(export.dir);
+        Self {
+            model: dir.join(export.model),
+            tokens: dir.join(export.tokens),
+            export,
+            root,
+        }
+    }
+
+    pub fn entries(&self) -> Vec<ModelEntry> {
+        entries_under(
+            &self.root,
+            [
+                ("japanese.model", &self.model),
+                ("japanese.tokens", &self.tokens),
+            ],
+        )
+    }
+
+    /// Both files at exactly the catalogued size. A truncated download is
+    /// *absent*, not broken — the rule every other model here follows.
+    pub fn present(&self) -> bool {
+        self.entries().iter().all(|e| e.ok())
+    }
+
+    pub fn model_id(&self) -> String {
+        self.export.model_id()
+    }
+
+    pub fn how_to_get_it() -> String {
+        format!(
+            "the Japanese decoder is not installed. `recalld models fetch --japanese` \
+             installs {JAPANESE_DIR} and the language identifier beside it ({}), and \
+             until then a Japanese turn comes back transliterated into Latin letters \
+             that nothing downstream can detect.",
+            crate::fetch::human(japanese_download_bytes()),
+        )
+    }
+}
+
+/// Where the spoken-language identifier lives, and whether it is there.
+#[derive(Debug, Clone)]
+pub struct LidModel {
+    pub root: PathBuf,
+    pub export: LidExport,
+    pub encoder: PathBuf,
+    pub decoder: PathBuf,
+}
+
+impl LidModel {
+    pub fn resolve_at(root: PathBuf, export: LidExport) -> Self {
+        let dir = root.join(export.dir);
+        Self {
+            encoder: dir.join(export.encoder),
+            decoder: dir.join(export.decoder),
+            export,
+            root,
+        }
+    }
+
+    pub fn entries(&self) -> Vec<ModelEntry> {
+        entries_under(
+            &self.root,
+            [
+                ("lid.encoder", &self.encoder),
+                ("lid.decoder", &self.decoder),
+            ],
+        )
+    }
+
+    pub fn present(&self) -> bool {
+        self.entries().iter().all(|e| e.ok())
+    }
+
+    /// What decided a row's language, stored as `lang_via` evidence in the log
+    /// and in `operations`. The export's own directory, so a reading taken by
+    /// tiny is never confused with one taken by base.
+    pub fn model_id(&self) -> String {
+        format!("{}@{ASR_CONTRACT_VERSION}", self.export.dir)
+    }
+}
+
+/// `ModelEntry` rows for a fixed list of `(role, path)`, each carrying whatever
+/// size the catalogue has for it.
+///
+/// The four optional models before these two each spell this out inline —
+/// `strip_prefix`, lossy-to-string, backslash fix, `expected_bytes` — and a
+/// fifth and sixth copy is where one of them quietly stops checking sizes.
+/// The existing four are deliberately left alone rather than swept into this
+/// (a size check is not the place for a drive-by refactor); the two new ones
+/// share it, and it is where the others should land next time one of them is
+/// touched for its own reasons.
+fn entries_under<'a>(
+    root: &Path,
+    items: impl IntoIterator<Item = (&'static str, &'a PathBuf)>,
+) -> Vec<ModelEntry> {
+    items
+        .into_iter()
+        .map(|(role, path)| ModelEntry {
+            role,
+            path: path.clone(),
+            expected: path
+                .strip_prefix(root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .as_deref()
+                .and_then(expected_bytes),
+        })
+        .collect()
+}
+
+/// Bytes `models fetch --japanese` has to pull down: the decoder and the
+/// identifier together, because the flag installs the pair or neither.
+pub fn japanese_download_bytes() -> u64 {
+    REMOTE_ASSETS
+        .iter()
+        .filter(|a| a.group == Group::Japanese)
+        .map(|a| a.download_bytes)
+        .sum()
+}
+
 /// Bytes `models fetch --arbiter-de` has to pull down.
 pub fn arbiter_download_bytes() -> u64 {
     REMOTE_ASSETS
@@ -1122,6 +1417,18 @@ impl ModelSet {
     /// English fallback all coming out of one directory.
     pub fn arbiter(&self, export: WhisperExport) -> ArbiterModel {
         ArbiterModel::resolve_at(self.root.clone(), export)
+    }
+
+    /// The Japanese decoder under this set's root (0.11.0), resolved the same
+    /// way and for the same reason the arbiter is: one directory holds every
+    /// decoder this daemon can reach for.
+    pub fn japanese(&self) -> JapaneseModel {
+        JapaneseModel::resolve_at(self.root.clone(), JAPANESE_ASR)
+    }
+
+    /// The spoken-language identifier under this set's root (0.11.0).
+    pub fn lid(&self) -> LidModel {
+        LidModel::resolve_at(self.root.clone(), LID_WHISPER)
     }
 
     /// Is every file of `export` on disk at exactly its catalogued size?
