@@ -67,6 +67,22 @@ impl Correction {
     pub fn wer(&self) -> Option<f64> {
         wer(&self.original, &self.corrected)
     }
+
+    /// The two numbers the summary actually adds up (0.10.1): word edits, and
+    /// the longer of the two word counts. Summed across corrections and then
+    /// divided, that is a rate between 0 and 1 — the share of words in the
+    /// fixed lines that had to change. Averaging per-line WERs was the
+    /// mistake the first version made: one two-word mishearing retyped as ten
+    /// words is 400% on its own and dragged a thirteen-line average to 113%,
+    /// a figure that means nothing to the person reading it.
+    pub fn edits(&self) -> Option<(usize, usize)> {
+        let a: Vec<&str> = self.original.split_whitespace().collect();
+        let b: Vec<&str> = self.corrected.split_whitespace().collect();
+        if b.is_empty() {
+            return None;
+        }
+        Some((edit_distance(&a, &b), a.len().max(b.len())))
+    }
 }
 
 /// Word-level error rate of `heard` against `truth`. `None` when the reference
@@ -156,31 +172,69 @@ pub fn summary(store: &Store) -> Result<Value> {
     let mut since: Option<i64> = None;
 
     for c in &corrections {
-        let Some(rate) = c.wer() else { continue };
+        let Some((edits, words)) = c.edits() else {
+            continue;
+        };
         since = Some(since.map_or(c.at_utc_ns, |s: i64| s.min(c.at_utc_ns)));
-        overall.add(rate);
+        overall.add(edits, words);
         // The row is read now, not from the log: a segment reassigned since
         // the correction belongs to the voice it belongs to today, which is
         // the same rule every other retroactive change in this daemon follows.
         let Some(row) = store.segment_row(c.segment_id)? else {
             continue;
         };
-        bucket(&mut by_source, row.source.clone()).add(rate);
-        bucket(&mut by_speaker, row.speaker_id).add(rate);
+        bucket(&mut by_source, row.source.clone()).add(edits, words);
+        bucket(&mut by_speaker, row.speaker_id).add(edits, words);
     }
 
-    by_source.sort_by(|a, b| b.1.n.cmp(&a.1.n).then(a.0.cmp(&b.0)));
-    by_speaker.sort_by(|a, b| b.1.n.cmp(&a.1.n).then(a.0.cmp(&b.0)));
+    // The unbiased half (0.10.1): the second decoder's verdict exists on every
+    // checked row, fixed or not, so its shaky share says something about the
+    // whole transcript rather than about the lines somebody chose to retype.
+    for cc in store.confidence_counts()? {
+        let (solid, shaky) = match cc.confidence.as_deref() {
+            Some("solid") => (cc.n, 0),
+            Some("shaky") => (0, cc.n),
+            _ => continue,
+        };
+        overall.solid += solid;
+        overall.shaky += shaky;
+        let b = bucket(&mut by_source, cc.source.clone());
+        b.solid += solid;
+        b.shaky += shaky;
+        let b = bucket(&mut by_speaker, cc.speaker_id);
+        b.solid += solid;
+        b.shaky += shaky;
+    }
+
+    // Most evidence first: corrections, then checked rows, then the name.
+    by_source.sort_by(|a, b| {
+        b.1.n
+            .cmp(&a.1.n)
+            .then(b.1.checked().cmp(&a.1.checked()))
+            .then(a.0.cmp(&b.0))
+    });
+    by_speaker.sort_by(|a, b| {
+        b.1.n
+            .cmp(&a.1.n)
+            .then(b.1.checked().cmp(&a.1.checked()))
+            .then(a.0.cmp(&b.0))
+    });
 
     Ok(json!({
         "corrections": overall.n,
-        "estimated_wer": overall.mean(),
+        // Kept under its old key for old clients; the meaning is now the
+        // bounded corpus edit rate described on `Bucket::rate`.
+        "estimated_wer": overall.rate(),
+        "edit_rate": overall.rate(),
+        "cross_check": overall.cross_check_json(),
         "by_source": by_source
             .iter()
             .map(|(source, b)| json!({
                 "source": source,
                 "corrections": b.n,
-                "estimated_wer": b.mean(),
+                "estimated_wer": b.rate(),
+                "edit_rate": b.rate(),
+                "cross_check": b.cross_check_json(),
             }))
             .collect::<Vec<_>>(),
         "by_speaker": by_speaker
@@ -188,7 +242,9 @@ pub fn summary(store: &Store) -> Result<Value> {
             .map(|(speaker_id, b)| json!({
                 "speaker_id": speaker_id,
                 "corrections": b.n,
-                "estimated_wer": b.mean(),
+                "estimated_wer": b.rate(),
+                "edit_rate": b.rate(),
+                "cross_check": b.cross_check_json(),
             }))
             .collect::<Vec<_>>(),
         // The oldest correction counted: the window this estimate is over.
@@ -202,19 +258,41 @@ pub fn summary(store: &Store) -> Result<Value> {
 #[derive(Debug, Default, Clone, Copy)]
 struct Bucket {
     n: i64,
-    total: f64,
+    edits: usize,
+    words: usize,
+    /// The cross-check's verdicts over EVERY row in this bucket (0.10.1), not
+    /// only the corrected ones: `solid`, `shaky`, and how many were checked.
+    solid: i64,
+    shaky: i64,
 }
 
 impl Bucket {
-    fn add(&mut self, rate: f64) {
+    fn add(&mut self, edits: usize, words: usize) {
         self.n += 1;
-        self.total += rate;
+        self.edits += edits;
+        self.words += words;
     }
-    /// The mean of the per-correction rates, not a corpus-level ratio: each
-    /// correction is one person's judgement about one turn, and a long turn is
-    /// not a more important judgement than a short one.
-    fn mean(&self) -> Option<f64> {
-        (self.n > 0).then(|| self.total / self.n as f64)
+    /// Words changed over words present, summed across the bucket's
+    /// corrections before dividing, so the figure is a share between 0 and 1.
+    /// 0.10.1: the first version averaged per-line WERs, which is unbounded
+    /// (a two-word line retyped as ten is 400%) and put "112.9% error" on the
+    /// card — see `Correction::edits`.
+    fn rate(&self) -> Option<f64> {
+        (self.words > 0).then(|| self.edits as f64 / self.words as f64)
+    }
+    fn checked(&self) -> i64 {
+        self.solid + self.shaky
+    }
+    fn shaky_share(&self) -> Option<f64> {
+        (self.checked() > 0).then(|| self.shaky as f64 / self.checked() as f64)
+    }
+    fn cross_check_json(&self) -> Value {
+        json!({
+            "checked": self.checked(),
+            "solid": self.solid,
+            "shaky": self.shaky,
+            "shaky_share": self.shaky_share(),
+        })
     }
 }
 
@@ -408,6 +486,7 @@ mod tests {
         assert_eq!(sources, vec!["Discord.exe", "VRChat.exe"]);
         // 0.25 for the first, 1.0 for the second, and the overall is their
         // mean rather than a corpus ratio.
-        assert_eq!(out["estimated_wer"], json!(0.625));
+        // Pooled, not averaged (0.10.1): 1 edit of 4 words + 4 of 6 = 5/10.
+        assert_eq!(out["estimated_wer"], json!(0.5));
     }
 }

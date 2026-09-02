@@ -1620,18 +1620,34 @@ export function startMock({
       }
       return [...m.entries()].sort((a, b) => b[1].length - a[1].length);
     };
+    // 0.10.1: the cross-check's verdicts over every row, not only the fixed
+    // ones — counted from the canned segments so the card's headline and the
+    // transcript's shaky marks come from the same rows.
+    const cc = (rows) => {
+      const solid = rows.filter((g) => g.asr_confidence === 'solid').length;
+      const shaky = rows.filter((g) => g.asr_confidence === 'shaky').length;
+      return { checked: solid + shaky, solid, shaky, shaky_share: solid + shaky ? shaky / (solid + shaky) : null };
+    };
+    const segsBySource = (source) => state.segments.filter((g) => (g.source ?? 'app') === source);
+    const segsBySpeaker = (id) => state.segments.filter((g) => g.speaker === id);
     return {
       corrections: state.corrections.length,
       estimated_wer: wer(state.corrections),
+      edit_rate: wer(state.corrections),
+      cross_check: cc(state.segments),
       by_source: group('source').map(([source, rows]) => ({
         source,
         corrections: rows.length,
         estimated_wer: wer(rows),
+        edit_rate: wer(rows),
+        cross_check: cc(segsBySource(source)),
       })),
       by_speaker: group('speaker_id').map(([speaker_id, rows]) => ({
         speaker_id,
         corrections: rows.length,
         estimated_wer: wer(rows),
+        edit_rate: wer(rows),
+        cross_check: cc(segsBySpeaker(speaker_id)),
       })),
       since_ns: String(state.startedAt - 30 * DAY) + '000000',
     };

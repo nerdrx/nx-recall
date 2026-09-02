@@ -1098,6 +1098,7 @@ document.addEventListener('keydown', (e) => {
       dash: {
         corrections: (document.getElementById('accuracy-corrections') || {}).textContent ?? '',
         wer: (document.getElementById('accuracy-wer') || {}).textContent ?? '',
+        shaky: (document.getElementById('accuracy-shaky') || {}).textContent ?? '',
         bySource: [...document.querySelectorAll('[data-acc="by-source"] .acc-row')].map((r) => r.dataset.accRow),
         bySpeaker: [...document.querySelectorAll('[data-acc="by-speaker"] .acc-row')].map((r) => r.dataset.accRow),
         empty: (document.getElementById('accuracy-empty') || {}).textContent ?? '',

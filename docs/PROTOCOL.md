@@ -847,6 +847,14 @@ see until a user hits it.
   The list is assembled, stored, served and announced; nothing is fed to the
   recognizer until something can use it without that trade.
 - **Accuracy.** `accuracy.summary` → `{corrections, estimated_wer, by_source:
+  **0.10.1:** `estimated_wer` is no longer a mean of per-line WERs (unbounded:
+  a two-word line retyped as ten scored 400%, and a thirteen-line card read
+  "112.9%"). It is now the bounded corpus **edit share** — word edits summed
+  over the fixed lines, divided by the summed longer word count of each pair
+  — also exposed as `edit_rate`, always in `[0, 1]`. Every level additionally
+  carries `cross_check: {checked, solid, shaky, shaky_share}` — the second
+  decoder's verdicts over EVERY checked row (fixed or not), the one unbiased
+  figure on the card; `shaky_share` is `null` when nothing has been checked.
   [{source, corrections, estimated_wer}], by_speaker: [{speaker_id,
   corrections, estimated_wer}], since_ns, since_ms}`, computed from
   `segments.correct` operations. `prior_state` is

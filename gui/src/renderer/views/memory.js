@@ -760,10 +760,22 @@ export function mount(root, ctx) {
         h(
           'div',
           { class: 'person-stat', dataset: { stat: 'wer' } },
-          h('b', { id: 'accuracy-wer', text: pct(a.estimated_wer) }),
-          h('small', { text: 'estimated error' }),
-          h('em', { text: 'words changed per word said' })
-        )
+          h('b', { id: 'accuracy-wer', text: pct(a.edit_rate ?? a.estimated_wer) }),
+          h('small', { text: 'of their words changed' }),
+          h('em', { text: 'in the lines you fixed — a share, never above 100%' })
+        ),
+        // 0.10.1: the one figure here that covers EVERY row. The second decoder
+        // reads each turn too, so its disagreement rate is not biased toward
+        // the lines somebody bothered to fix.
+        a.cross_check?.checked
+          ? h(
+              'div',
+              { class: 'person-stat', dataset: { stat: 'shaky' } },
+              h('b', { id: 'accuracy-shaky', text: pct(a.cross_check.shaky_share) }),
+              h('small', { text: 'second decoder disagreed' }),
+              h('em', { text: `of ${a.cross_check.checked} checked rows, fixed or not` })
+            )
+          : null
       ),
       byRows('by-source', 'By source', (a.by_source ?? []).map((r) => [r.source, r])),
       byRows('by-speaker', 'By voice', (a.by_speaker ?? []).slice(0, 5).map((r) => [speakerLabel(r.speaker_id), r])),
@@ -771,7 +783,7 @@ export function mount(root, ctx) {
         class: 'rail-hint',
         id: 'accuracy-note',
         style: 'padding:10px 0 0;max-width:70ch',
-        text: 'An estimate, and a biased one: it can only count turns somebody bothered to fix, so it reads high where you have been careful and says nothing at all where you have not.',
+        text: 'Two different measurements. "Changed" counts only the lines somebody retyped, so it reads high where you have been careful and says nothing where you have not. "Shaky" is the share of all checked rows a second decoder read differently — unbiased, but a disagreement is not always an error.',
       })
     );
   }
@@ -786,7 +798,13 @@ export function mount(root, ctx) {
           { class: 'acc-row', dataset: { accRow: label } },
           h('span', { class: 'acc-name', text: label }),
           h('span', { class: 'acc-num' }, String(r.corrections ?? 0), h('small', { text: 'fixed' })),
-          h('span', { class: 'acc-num' }, pct(r.estimated_wer), h('small', { text: 'error' }))
+          h('span', { class: 'acc-num' }, pct(r.edit_rate ?? r.estimated_wer), h('small', { text: 'changed' })),
+          h(
+            'span',
+            { class: 'acc-num' },
+            r.cross_check?.checked ? pct(r.cross_check.shaky_share) : '—',
+            h('small', { text: 'shaky' })
+          )
         )
       );
     }

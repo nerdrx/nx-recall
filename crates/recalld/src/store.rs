@@ -6244,6 +6244,49 @@ impl Store {
 
 // ---- end 0.9.0 ------------------------------------------------------------
 
+// ---- 0.10.1: the cross-check's verdicts, counted -------------------------
+
+/// How many rows carry each cross-check verdict, per source and per voice —
+/// the unbiased half of `accuracy.summary`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfidenceCount {
+    pub source: String,
+    pub speaker_id: Option<i64>,
+    /// `"solid"`, `"shaky"`, or `None` for checked-with-no-verdict.
+    pub confidence: Option<String>,
+    pub n: i64,
+}
+
+impl Store {
+    /// Verdict counts over every live row that has been checked, grouped the
+    /// same way `segment_row` resolves a row: the source's match key and the
+    /// voice after merges.
+    pub fn confidence_counts(&self) -> Result<Vec<ConfidenceCount>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sc.match_key, sp.canonical_id, g.asr_confidence, COUNT(*)
+             FROM segments g
+             JOIN sessions ss ON ss.id = g.session_id
+             JOIN sources sc ON sc.id = ss.source_id
+             LEFT JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             WHERE g.deleted_at IS NULL AND g.confidence_at_ns IS NOT NULL
+             GROUP BY sc.match_key, sp.canonical_id, g.asr_confidence",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ConfidenceCount {
+                    source: r.get(0)?,
+                    speaker_id: r.get(1)?,
+                    confidence: r.get(2)?,
+                    n: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+// ---- end 0.10.1 -----------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     #[test]
