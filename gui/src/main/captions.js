@@ -13,7 +13,7 @@
 
 import { BrowserWindow, screen } from 'electron';
 import { spawn } from 'node:child_process';
-import { accessSync, constants, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { accessSync, constants, readFileSync, writeFileSync, mkdirSync, watch } from 'node:fs';
 import { delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -46,6 +46,14 @@ let layerRestarted = false;
  * once per run, because a compositor does not change under a running app.
  */
 let layerRefused = false;
+/**
+ * The exact text of the last write THIS process made, and the watch that would
+ * otherwise mistake it for somebody else's. Both halves of the feature write
+ * captions.json now — see `watchSettingsFile`.
+ */
+let lastWritten = null;
+let fileWatcher = null;
+let reloadTimer = null;
 
 // ---------------------------------------------------------------------------
 // the settings file
@@ -138,12 +146,96 @@ function save() {
     saveTimer = null;
     try {
       mkdirSync(dirname(settingsFile), { recursive: true });
-      writeFileSync(settingsFile, JSON.stringify(settings, null, 2));
+      const text = JSON.stringify(settings, null, 2);
+      // Recorded BEFORE the write, so the watch below cannot see the change
+      // before it knows the change was ours.
+      lastWritten = text;
+      writeFileSync(settingsFile, text);
     } catch (e) {
       console.warn('[recall] could not save the captions settings:', e.message);
     }
   }, 400);
   if (saveTimer.unref) saveTimer.unref();
+}
+
+/**
+ * Two writers, one file.
+ *
+ * Until the caption bar could be moved, this process was the only thing that
+ * wrote captions.json and reading it once at startup was enough. It is not any
+ * more: on the layer path the bar itself writes `bounds` when it is dragged and
+ * `size` when it is scrolled over. Without this watch, the copy held here would
+ * go stale the moment somebody moved the bar, and the next slider nudge would
+ * write the OLD position back — the drag would quietly undo itself.
+ *
+ * Same echo rule as the Rust side: the exact text we wrote is not news. Byte
+ * identity rather than value equality, because value equality is the second
+ * guard (`same` below) and catching an echo needs the first.
+ *
+ * Watching the DIRECTORY, not the file: the overlay writes atomically, through
+ * a temp file and a rename, and a watch on an inode does not survive that.
+ */
+function watchSettingsFile() {
+  if (fileWatcher || !settingsFile) return;
+  try {
+    mkdirSync(dirname(settingsFile), { recursive: true });
+    fileWatcher = watch(dirname(settingsFile), (_event, name) => {
+      if (name && name !== 'captions.json') return;
+      // Coalesced: one atomic write is a rename plus a couple of events, and a
+      // re-read per event is three reads for one change.
+      if (reloadTimer) clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(reloadFromDisk, 120);
+      if (reloadTimer.unref) reloadTimer.unref();
+    });
+    fileWatcher.unref?.();
+  } catch (e) {
+    // A profile directory that cannot be watched is not a reason to refuse to
+    // run; it only means a drag on the bar is not reflected in an open card
+    // until the next launch.
+    console.warn('[recall] could not watch the captions settings:', e.message);
+  }
+}
+
+/** Re-read captions.json, unless the change was ours. */
+function reloadFromDisk() {
+  reloadTimer = null;
+  if (!settingsFile) return;
+  let text = null;
+  try {
+    text = readFileSync(settingsFile, 'utf8');
+  } catch {
+    return; // gone, or unreadable this instant; the next write repairs it
+  }
+  if (text === lastWritten) return; // our own write, coming back
+  let next;
+  try {
+    next = normalizeCaptionSettings(JSON.parse(text));
+  } catch {
+    return; // half a file, or not JSON any more
+  }
+  const before = settings ?? normalizeCaptionSettings(null);
+  const same = Object.keys(next).every((k) =>
+    k === 'bounds' ? JSON.stringify(next[k]) === JSON.stringify(before[k]) : next[k] === before[k]
+  );
+  if (same) return;
+  settings = next;
+  console.log('[recall] captions.json changed underneath us; taking it');
+  if (win && !win.isDestroyed() && next.clickThrough !== before.clickThrough) applyClickThrough();
+  // Told to the windows and the tray the same way a card change is: the card
+  // has sliders that must show what the bar was just scrolled to.
+  onChange?.(getCaptionSettings());
+}
+
+/** Stop watching. Called on the way out, with everything else. */
+function unwatchSettingsFile() {
+  if (reloadTimer) clearTimeout(reloadTimer);
+  reloadTimer = null;
+  try {
+    fileWatcher?.close();
+  } catch {
+    // Already gone.
+  }
+  fileWatcher = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +338,9 @@ function startLayer() {
     return false;
   }
   layer = child;
+  // Only while the bar is up, and only on this path: the BrowserWindow does not
+  // write the file behind this process's back, so nothing else needs a watch.
+  watchSettingsFile();
   child.on('error', (e) => {
     console.warn('[recall] the captions overlay could not run:', e.message);
     if (layer === child) layer = null;
@@ -283,6 +378,7 @@ function startLayer() {
 function stopLayer() {
   const child = layer;
   layer = null;
+  unwatchSettingsFile();
   if (child) child.kill('SIGTERM');
 }
 

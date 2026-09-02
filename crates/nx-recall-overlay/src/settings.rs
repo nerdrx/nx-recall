@@ -3,12 +3,17 @@
 //! The Electron settings card is the single control surface for captions, and
 //! it writes exactly one file: `captions.json` in the app's userData directory.
 //! When the desktop captions are a layer surface rather than a BrowserWindow,
-//! nothing about that changes — this process READS that file and re-reads it
+//! nothing about that changes — this process reads that file and re-reads it
 //! whenever it is written, so a slider dragged in the Sources view still moves
-//! the bar on screen. There is deliberately no second settings file, no CLI
-//! flag that shadows one of these fields, and no way for this process to write
-//! back: two writers on one file is how a settings file ends up disagreeing
-//! with the UI that owns it.
+//! the bar on screen. There is deliberately no second settings file and no CLI
+//! flag that shadows one of these fields.
+//!
+//! Since 0.10.1 this process also WRITES it, for the two values the bar itself
+//! can now change — you drag it, and you scroll over it to resize the text.
+//! That is two writers on one file, which is how a settings file usually ends
+//! up disagreeing with the UI that owns it, so see "writing it back" below for
+//! the three rules that stop it: the whole file, the same bytes, and each side
+//! able to recognise its own write.
 //!
 //! The clamping below is a transliteration of `normalizeCaptionSettings` in
 //! gui/src/renderer/lib/captions.js, ranges included, and for the same reason
@@ -28,13 +33,14 @@ pub struct CaptionSettings {
     pub hold_s: f32,
     pub opacity: f32,
     pub show_you: bool,
-    /// Read, kept, and — on this path — ignored: a layer surface with an empty
-    /// input region is click-through and cannot be anything else. Kept in the
-    /// struct so the value is never silently rewritten, and so the settings card
-    /// on the Electron fallback keeps meaning what it says.
+    /// On, the compositor delivers nothing to the bar and clicks reach the game;
+    /// off, the bar is furniture you can drag and scroll over. The DEFAULT is on
+    /// and stays on — this is which of two modes, not whether the feature works.
     pub click_through: bool,
-    /// The remembered window rectangle. Only its SIZE is honoured here — see
-    /// `docs/OVERLAY.md`, "Desktop: layer-shell".
+    /// The remembered rectangle, in the same global desktop coordinates the
+    /// Electron window reports. Its size is honoured, and its position too, as
+    /// far as a layer surface can — see `docs/OVERLAY.md`, "Desktop:
+    /// layer-shell".
     pub bounds: Option<Bounds>,
 }
 
@@ -145,6 +151,109 @@ impl CaptionSettings {
             .unwrap_or(Value::Null);
         Self::normalize(&raw)
     }
+}
+
+// ---------------------------------------------------------------------------
+// writing it back
+//
+// Until 0.10.0 this process only ever READ the file, and the note above said so
+// in as many words: two writers on one settings file is how a settings file ends
+// up disagreeing with the UI that owns it. That is still the rule for everything
+// the settings card owns. What changed is that two of these values are now also
+// settable *on the bar itself* — you drag it, and you scroll to resize the text —
+// and a position you have to re-drag on every launch is not a position.
+//
+// So this side writes too, under three constraints that keep the card the owner:
+//
+//   1. it writes the WHOLE file, in the same schema and the same key order the
+//      Electron side writes, so a round trip through either writer is a no-op;
+//   2. it writes atomically — a temp file in the same directory and a rename —
+//      so a reader (the card, or this process's own inotify watch) never sees a
+//      half-written file, and a crash mid-write leaves the old one intact;
+//   3. it hands back the exact bytes, so the inotify watch can recognise its own
+//      write and not treat it as somebody else's change.
+// ---------------------------------------------------------------------------
+
+impl CaptionSettings {
+    /// The file's text, byte for byte as the Electron side would write it:
+    /// `JSON.stringify(settings, null, 2)` over the fields of
+    /// `normalizeCaptionSettings`, in that order, and no trailing newline.
+    ///
+    /// Byte-for-byte matters more than it looks. Both halves of this feature
+    /// write the file and both watch it, and each recognises its own write by
+    /// comparing the text. If the two writers disagreed by so much as a trailing
+    /// newline, the same settings written by the other side would read as a
+    /// change, and the file would churn its own last byte forever.
+    ///
+    /// Hand-rolled rather than handed to `serde_json::to_string_pretty`, for two
+    /// reasons that both matter here: serde's default map is sorted
+    /// alphabetically and would reorder the file under the user every time this
+    /// side wrote it, and serde renders `26.0` where JavaScript renders `26`.
+    /// Neither changes what either side READS — but a file that churns its own
+    /// formatting is a file nobody can diff.
+    pub fn to_pretty_json(&self) -> String {
+        let bounds = match self.bounds {
+            None => "null".to_owned(),
+            Some(b) => format!(
+                "{{\n    \"x\": {},\n    \"y\": {},\n    \"width\": {},\n    \"height\": {}\n  }}",
+                b.x, b.y, b.width, b.height
+            ),
+        };
+        format!(
+            "{{\n  \"turns\": {},\n  \"size\": {},\n  \"hold_s\": {},\n  \"opacity\": {},\n  \
+             \"showYou\": {},\n  \"clickThrough\": {},\n  \"bounds\": {}\n}}",
+            self.turns,
+            js_number(self.size as f64),
+            js_number(self.hold_s as f64),
+            js_number(self.opacity as f64),
+            self.show_you,
+            self.click_through,
+            bounds,
+        )
+    }
+
+    /// Write the whole file atomically. Returns the bytes written, so the caller
+    /// can recognise the inotify event its own write is about to cause.
+    ///
+    /// The temp file carries this process's pid so two overlays — which should
+    /// not exist, but a stuck one and a fresh one is a real Tuesday — cannot
+    /// rename each other's half-written file into place.
+    pub fn save_atomic(&self, path: &Path) -> std::io::Result<String> {
+        let text = self.to_pretty_json();
+        let dir = path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!(
+            ".{}.{}.tmp",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("captions.json"),
+            std::process::id()
+        ));
+        // The rename is what makes it atomic; the write before it is allowed to
+        // fail messily, because nothing is reading that name.
+        if let Err(e) = std::fs::write(&tmp, text.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(text)
+    }
+}
+
+/// A number the way `JSON.stringify` renders one: no trailing `.0`, and no
+/// float noise on the values the opacity step produces.
+fn js_number(v: f64) -> String {
+    if v == v.trunc() && v.abs() < 1e15 {
+        return format!("{}", v as i64);
+    }
+    let mut s = format!("{v:.4}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    s
 }
 
 /// `normalizeBounds`, verbatim: a rectangle no caption bar could use is a
@@ -270,6 +379,100 @@ mod tests {
                 height: 340
             })
         );
+    }
+
+    /// Whatever this side writes, reading it back must give the same settings —
+    /// otherwise a drag would nudge the text size, or a scroll would forget
+    /// where the bar was.
+    #[test]
+    fn what_is_written_reads_back_as_exactly_what_was_written() {
+        for s in [
+            CaptionSettings::default(),
+            CaptionSettings {
+                turns: 8,
+                size: 34.0,
+                hold_s: 45.0,
+                opacity: 0.85,
+                show_you: false,
+                click_through: false,
+                bounds: Some(Bounds {
+                    x: -120,
+                    y: 640,
+                    width: 900,
+                    height: 260,
+                }),
+            },
+        ] {
+            assert_eq!(
+                CaptionSettings::normalize(
+                    &serde_json::from_str::<Value>(&s.to_pretty_json()).unwrap()
+                ),
+                s
+            );
+        }
+    }
+
+    /// The shape the Electron side writes: `JSON.stringify(x, null, 2)`, its key
+    /// order, its number formatting. A file that churns its own formatting every
+    /// time the other writer touches it is a file nobody can diff.
+    #[test]
+    fn the_text_is_the_one_javascript_would_have_written() {
+        let s = CaptionSettings {
+            opacity: 0.65,
+            ..CaptionSettings::default()
+        };
+        assert_eq!(
+            s.to_pretty_json(),
+            "{\n  \"turns\": 5,\n  \"size\": 26,\n  \"hold_s\": 12,\n  \"opacity\": 0.65,\n  \
+             \"showYou\": true,\n  \"clickThrough\": true,\n  \"bounds\": null\n}"
+        );
+        // With a remembered rectangle in it. Both literals were taken from
+        // `node -e 'JSON.stringify(x, null, 2)'` rather than written by hand:
+        // the point of the test is that this side matches THAT side.
+        let placed = CaptionSettings {
+            opacity: 0.65,
+            bounds: Some(Bounds {
+                x: 12,
+                y: 34,
+                width: 1100,
+                height: 340,
+            }),
+            ..CaptionSettings::default()
+        };
+        assert_eq!(
+            placed.to_pretty_json(),
+            "{\n  \"turns\": 5,\n  \"size\": 26,\n  \"hold_s\": 12,\n  \"opacity\": 0.65,\n  \
+             \"showYou\": true,\n  \"clickThrough\": true,\n  \"bounds\": {\n    \"x\": 12,\n    \
+             \"y\": 34,\n    \"width\": 1100,\n    \"height\": 340\n  }\n}"
+        );
+        // 26, not 26.0 — and 0.6, not 0.6000000000000001.
+        assert_eq!(js_number(26.0), "26");
+        assert_eq!(js_number(0.6000000000000001), "0.6");
+        assert_eq!(js_number(0.85), "0.85");
+    }
+
+    /// Atomic: the name the card reads never holds a half-written file, and the
+    /// temp file does not survive.
+    #[test]
+    fn the_write_lands_whole_or_not_at_all() {
+        let dir = std::env::temp_dir().join(format!("nx-recall-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("captions.json");
+        let s = CaptionSettings {
+            size: 33.0,
+            click_through: false,
+            ..CaptionSettings::default()
+        };
+        let written = s.save_atomic(&path).expect("write");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        assert_eq!(CaptionSettings::load(&path), s);
+        // Nothing left behind but the file itself.
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["captions.json".to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The path the Electron side actually writes to, for the run where nobody

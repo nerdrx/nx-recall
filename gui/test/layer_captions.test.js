@@ -47,6 +47,7 @@ registerHooks({
 });
 
 const { wantsLayerCaptions, findOverlayBinary } = await import('../src/main/captions.js');
+const { normalizeCaptionSettings } = await import('../src/renderer/lib/captions.js');
 
 /** Run `fn` with a patched `process.env`, restored afterwards. */
 function withEnv(patch, fn) {
@@ -157,4 +158,58 @@ test('a file that is there but not executable is not the binary', () => {
   writeFileSync(dud, 'not a program');
   chmodSync(dud, 0o644);
   assert.equal(findOverlayBinary({ PATH: '' }, gui), null);
+});
+
+// -- two writers, one file --------------------------------------------------
+//
+// Since 0.10.1 the caption bar writes captions.json too: `bounds` when it is
+// dragged, `size` when it is scrolled over. This side has to take those changes
+// rather than write its stale copy back over them, and has to recognise its own
+// write so a drag does not fight the watch that is meant to follow it.
+//
+// The Rust side's half of this contract is unit-tested there; what is checked
+// here is the half that has to MATCH it — the exact text, so each writer can
+// tell its own bytes from the other's.
+
+test('the file this side writes is the text the overlay compares against', () => {
+  // `save()` writes `JSON.stringify(settings, null, 2)`. The Rust writer
+  // reproduces that byte for byte, including key order and 26 rather than 26.0,
+  // and `crates/nx-recall-overlay/src/settings.rs` pins these same two literals.
+  const settings = normalizeCaptionSettings({ opacity: 0.65 });
+  assert.equal(
+    JSON.stringify(settings, null, 2),
+    '{\n  "turns": 5,\n  "size": 26,\n  "hold_s": 12,\n  "opacity": 0.65,\n  "showYou": true,\n  "clickThrough": true,\n  "bounds": null\n}'
+  );
+  const placed = normalizeCaptionSettings({ opacity: 0.65, bounds: { x: 12, y: 34, width: 1100, height: 340 } });
+  assert.equal(
+    JSON.stringify(placed, null, 2),
+    '{\n  "turns": 5,\n  "size": 26,\n  "hold_s": 12,\n  "opacity": 0.65,\n  "showYou": true,\n  "clickThrough": true,\n  "bounds": {\n    "x": 12,\n    "y": 34,\n    "width": 1100,\n    "height": 340\n  }\n}'
+  );
+});
+
+test('a position the bar wrote survives being read back here', () => {
+  // What the overlay writes after a drag: same schema, a real rectangle. It has
+  // to come back through the normalizer unchanged, or the next slider nudge
+  // would write the old position over the new one.
+  const fromTheBar = {
+    turns: 5, size: 31, hold_s: 12, opacity: 0.6, showYou: true, clickThrough: false,
+    bounds: { x: 1460, y: 1004, width: 1100, height: 340 },
+  };
+  const read = normalizeCaptionSettings(fromTheBar);
+  assert.deepEqual(read.bounds, fromTheBar.bounds);
+  assert.equal(read.size, 31);
+  assert.equal(read.clickThrough, false);
+  // …and writing it straight back out is the same bytes, so neither side sees
+  // a change that is not one.
+  assert.equal(JSON.stringify(read, null, 2), JSON.stringify(normalizeCaptionSettings(read), null, 2));
+});
+
+test('click-through is still the default, and only an explicit false turns it off', () => {
+  // The regression this whole change is about was the opposite mistake: the bar
+  // could not be clicked AT ALL. Making it movable must not make it grabby by
+  // default.
+  assert.equal(normalizeCaptionSettings(null).clickThrough, true);
+  assert.equal(normalizeCaptionSettings({}).clickThrough, true);
+  assert.equal(normalizeCaptionSettings({ size: 30 }).clickThrough, true);
+  assert.equal(normalizeCaptionSettings({ clickThrough: false }).clickThrough, false);
 });

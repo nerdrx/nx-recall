@@ -13,10 +13,11 @@ Two questions, and only one of them has a tested answer.
 If you want captions in your headset this evening, read Route 2.
 
 A third question, added later and answered on the desktop rather than in the
-headset: **do the captions actually let a click through to the game underneath?**
-On X11 they always did. On Wayland they never did, and now they do — as a
-wlr-layer-shell surface rather than an Electron window. See
-"Desktop: layer-shell".
+headset: **do the captions actually let a click through to the game underneath —
+and can you still get hold of the bar when you want to move it?** On X11 the
+first was always true. On Wayland neither was, and 0.10.0 fixed the first by
+making the second impossible. Both now hold, as a wlr-layer-shell surface rather
+than an Electron window. See "Desktop: layer-shell".
 
 ---
 
@@ -201,49 +202,98 @@ nx-recall-overlay --desktop [--settings FILE] [--socket PATH]
                             [--output NAME] [--margin PX] [--seconds N]
 ```
 
+### Scenery by default, furniture on request
+
+0.10.0 shipped this with the input region always empty, and the first report
+back was **"now I can't click on the captions at all."** That was the right bug
+to hear: click-through is what a caption bar wants nearly all of the time, and
+"nearly all of the time" is a **default**, not a law. There was no way to move
+the bar from either side — the settings card hid the toggle, and the surface
+would not have listened if it had been there.
+
+So `clickThrough` decides, live, and the bar has two modes.
+
+**On (the default) — scenery.** Exactly what 0.10.0 did: an empty input region,
+nothing delivered, clicks reach the game.
+
+**Off — furniture.** A NULL (infinite) input region, and the bar becomes
+something you can handle:
+
+| gesture | what it does | where it lands |
+|---|---|---|
+| left-drag | moves the bar; margins follow the pointer live | `bounds.x/y`, written on release |
+| scroll | text size, one notch per slider step, 18–40 | `size`, written after 400 ms |
+| right-click | click-through back **on** | `clickThrough: true`, written |
+
+Right-click is not a nicety. Somebody who has turned click-through off has a bar
+that is now eating clicks — including the clicks they would need to reach the
+settings card underneath it. The way out has to be on the bar itself.
+
+While it is furniture the stack **does not fade**: you cannot grab what you
+cannot see. And an empty bar in that mode draws one line — *drag to move ·
+scroll to resize the text · right-click to let clicks through again* — because a
+fully transparent surface that takes clicks and shows nothing is the worst of
+both states.
+
+Three controls reach the same boolean and no other state exists: the caption bar
+(right-click), the **Sources → Captions** card ("Ignore the mouse"), and the tray
+("Captions: let me move it", worded the way a person asks for it rather than as
+the double negative of unticking a toggle).
+
 ### What it asks the compositor for
 
 | request | value | why |
 |---|---|---|
-| `zwlr_layer_shell_v1.get_layer_surface` | layer `OVERLAY` | `TOP` loses to a fullscreen window, which is the thing captions are for |
-| `set_anchor` | `BOTTOM` only | bottom alone centres a fixed-width surface; adding a side would stretch it |
+| `zwlr_layer_shell_v1.get_layer_surface` | layer `OVERLAY`, on a **named** output | `TOP` loses to a fullscreen window, which is the thing captions are for |
+| `set_anchor` | `BOTTOM \| LEFT` | one corner, so both margins are ours to set. Bottom alone centres a fixed-width surface for free, which was fine until the bar could be dragged — "centred" is a position with no number in it. Anchoring to *both* sides of an axis is what stretches a surface; anchoring to a corner does not |
 | `set_size` | from `captions.json`, else the Electron window's own default shape | one bar, whichever surface draws it |
-| `set_margin` | `(0, 0, bottom, 0)` | `--margin`, else derived from the remembered position, else 96 |
+| `set_margin` | `(0, 0, bottom, left)` | the remembered position, a drag in progress, or centred-and-96-up |
 | `set_exclusive_zone` | `-1` | scenery must never shove a maximised window up |
-| `set_keyboard_interactivity` | `none` | it is read, never typed into |
-| **`wl_surface.set_input_region`** | **an empty `wl_region`** | **the load-bearing one: the compositor delivers no pointer and no touch here, and no setting can change that** |
+| `set_keyboard_interactivity` | `none` | **always**, in both modes: the bar is read, never typed into, and a layer surface that took the keyboard would take it from the game |
+| **`wl_surface.set_input_region`** | **empty `wl_region`**, or **NULL** | the load-bearing one. Empty = the compositor has nowhere to deliver a pointer or touch. NULL = infinite, the whole surface. Re-sent whenever `clickThrough` changes, never on a resize — a rectangle would have to be, and a bar whose grabbable area was one configure behind its pixels is worse than either state |
 | `wl_shm` buffer | `Argb8888`, premultiplied, at the output's scale | no GPU: see "frame time" |
 
 ### What it honours from `captions.json`
 
 The **same file** the settings card writes (Electron's userData —
 `~/.config/NX Recall/captions.json`; the main process passes the path with
-`--settings`, and this binary only ever *reads* it). An inotify watch on the
-directory picks up every write, so the Sources card stays the single control
-surface and a slider moves the live bar.
+`--settings`). An inotify watch on the directory picks up every write, so a
+slider moves the live bar.
 
 - `turns`, `size`, `hold_s`, `opacity`, `showYou` — all live, all clamped to the
   same ranges by a transliteration of `normalizeCaptionSettings` (`settings.rs`).
-- `bounds` — its **size** is honoured. Its **position** becomes a bottom margin
-  when the remembered `y` can be read as an offset from the bottom of this
-  output, which is the single-monitor case; otherwise it falls back to 96 px. A
-  layer surface is placed by anchor and margin, not by a global desktop
-  coordinate, so there is no honest way to honour a `y` that belongs to a
-  monitor that is not there today.
-- `clickThrough` — read, kept, and **ignored**. It cannot be anything but on
-  here. The settings card hides the toggle on this path and says so in one
-  line; on the Electron fallback the toggle stays, and where it is known not to
-  work (a Wayland desktop with no layer-shell) it says *that*.
+- `clickThrough` — live, and the whole of the section above.
+- `bounds` — its **size** is honoured, and its **position** as far as a layer
+  surface can honour one. A layer surface is placed by anchor and margin
+  relative to *its output*; `bounds` is in the global desktop coordinates the
+  Electron window reports. The two are reconciled through the output's own
+  origin, and a position that does not land on this output falls back to
+  centred-and-96-up rather than pinning the bar to an edge it was never at.
+
+**Two writers, one file.** Since a drag and a scroll change settings, this
+process writes `captions.json` too — the whole file, atomically (temp file plus
+rename), in the byte-identical text `JSON.stringify(settings, null, 2)` produces,
+same key order, `26` and not `26.0`. Both halves watch the file and both
+recognise their own write by comparing that text, so a drag does not fight the
+watch that is meant to follow it. The Electron side gained the same watch and
+the same guard: without it, its copy would go stale the moment the bar moved and
+the next slider nudge would write the old position back over the new one.
 
 Content rules are the desktop window's, unchanged and shared with `feed.rs`:
 seed from the live tail, only `added` rows newer than that head, shaky rows
 muted with the same "≈", translation under the original, your own turns dimmed
-by the same `YOU_DIM`, and the whole stack fading one second after `hold_s`.
+by the same `YOU_DIM`, and the whole stack fading one second after `hold_s`
+(except in furniture mode, above).
 
 **Multi-output:** not "the output under the cursor" — a bar that changed monitor
-when you reached for a menu is a bar you have to chase. `--output DP-2` names
-one by connector; with no name the compositor places it, which on KWin is the
-active output when the surface appears.
+when you reached for a menu is a bar you have to chase. The output is now named
+**explicitly** on the request rather than left to the compositor, because
+margins and `bounds` have to describe the same screen and a placement computed
+for one output and honoured on another is a bar on the wrong monitor. In order:
+`--output DP-2`; the output the remembered position is on; the output at the
+desktop's origin; whatever came first. The log says which and why. Moving the
+bar to a *different* monitor by editing `bounds` takes effect on the next
+launch, not live — a layer surface cannot change output without being recreated.
 
 **Fallback:** if `zwlr_layer_shell_v1` is not offered — or there is no Wayland
 display at all — it prints one line and exits **2**, and
@@ -253,35 +303,53 @@ exit is restarted **once**, then the window takes over.
 ### What was verified, and how
 
 Measured on this machine, KDE Wayland (KWin), 2026-09-02, against
-`gui/mock/mockd.js` on a private socket — never the real daemon's, and no
-synthetic input of any kind was used at any point.
+`gui/mock/mockd.js` on a private socket — never the real daemon's, and **no
+synthetic input of any kind was used at any point.**
 
 - **The compositor offers it.** `wayland-info` lists `zwlr_layer_shell_v1`
-  **version 5** among 60-odd globals, alongside `wl_shm` v2 and `wl_compositor`
-  v6.
-- **The surface really appears.** `nx-recall-overlay --desktop --seconds N`
-  against the mock, photographed with `spectacle -b -n`: the bar is at the
-  bottom of DP-2, over the panel, with speaker names in their hues, the mock's
-  live turns in it, and the ground at the 0.75 the file asked for.
-- **Settings are live.** Rewriting `captions.json` mid-run produced
-  `captions.json changed — turns 5, size 34, hold 4s, ground 0.85, showYou
-  false` in the log, from the inotify watch.
+  **version 5** among 60-odd globals, alongside `wl_shm` v2, `wl_compositor` v6
+  and `wp_cursor_shape_manager_v1` v2 (which is how the cursor becomes a grab
+  hand over a movable bar, with no cursor theme loaded).
+- **The surface really appears, in both modes.** `--desktop --seconds N` against
+  the mock, photographed with `spectacle -b -n`: the bar over a fullscreen game
+  at the bottom of the chosen output, speaker names in their hues, the "≈"
+  falling back to "~" where the system font has no such glyph, a translation
+  under its original. With `clickThrough: false` and no daemon at all, the same
+  bar draws the one-line hint.
+- **The mode switches live.** Rewriting `captions.json` mid-run logged
+  `set_input_region: null (infinite)` and then, on the way back,
+  `set_input_region: empty region (0 rectangles)` — no restart, no flicker.
+- **The echo does not loop.** Rewriting the file with byte-identical content
+  produced no reload at all; a real change produced exactly one.
+- **The output is chosen, not accepted.** `output DP-2 (5120x1440 at 0,0) — it
+  is at the desktop origin`, on a two-monitor desktop where 0.10.0 computed its
+  placement from one output and let the compositor put the surface on the other.
 - **Frame time.** 0.29–0.48 ms to rasterise 1100×340 and convert it to
-  premultiplied ARGB8888, release build. The budget was one 60 Hz frame; it is
-  under 3% of it, so the CPU rasteriser stays and no wgpu is pulled in.
+  premultiplied ARGB8888, release build (3.3–3.6 ms for a first frame with cold
+  glyph caches). The budget was one 60 Hz frame.
 - **The fallback code.** With `WAYLAND_DISPLAY` unset it prints the fallback
   line and exits 2, checked directly.
 
-**Not verified: that a click actually passes through.** Doing so would mean
-injecting a synthetic pointer event, which is not something this work is
-permitted to do on somebody's live desktop. What *is* checked is the request
-that makes it true — `wl_surface.set_input_region` with an empty region — in
-three ways: a unit test asserting that no settings file and no value of
-`clickThrough` can produce anything but `InputRegion::Empty`; a unit test on the
-whole `LayerConfig` (layer, anchor, exclusive zone, keyboard interactivity); and
-the request being logged on every run, which is the line quoted above. The
-guarantee is the compositor's, not the client's: a surface with an empty input
-region is one KWin has nowhere to deliver a pointer or touch to.
+**Still not verified by a real click, in either direction.** Neither "the click
+passes through" nor "the drag moves the bar" was exercised by a synthetic
+pointer event; injecting one is not something this work does on somebody's live
+desktop. What is checked instead is everything that decides the outcome:
+
+- `input_region()` as a pure function — `Empty` when `clickThrough` is on,
+  `Full` when it is off, for every other combination of settings, and `Empty`
+  for a fresh profile, an empty object and a corrupt file;
+- the whole `LayerConfig` — layer, anchor, size, margins, exclusive zone, and
+  keyboard interactivity `None` in **both** modes;
+- the drag arithmetic — `layout::drag_margins`, including the vertical sign that
+  is easy to get backwards, and that the bar cannot be dragged off its output;
+- the round trip a drag makes through the file: margins → `bounds` → margins,
+  unchanged, so the bar does not walk a few pixels up the screen on each launch;
+- the echo guard, as a function of two strings;
+- the exact text both writers produce, pinned against `node -e
+  'JSON.stringify(x, null, 2)'` on both sides.
+
+The requests themselves are logged on every run, and the lines quoted above are
+those logs.
 
 The e2e harness cannot exercise this path at all — it runs Electron inside a
 headless gamescope over XWayland — so `wantsLayerCaptions()` refuses whenever
@@ -301,7 +369,7 @@ Electron window, which is exactly the fallback this path needs to keep working.
 | the caption rasteriser (wrap, ground, speaker hues, translations) | `src/raster.rs` | yes — unit tests, plus `--render` against the mock |
 | the overlay session and the Vulkan upload | `src/xr.rs` | **no. never executed.** |
 | the desktop captions window (Route 2's source, and the fallback) | `gui/src/renderer/captions.*` | yes — `npm run headless`, both grounds |
-| the settings reader (`captions.json`, the ranges, the JS's null asymmetry) | `src/settings.rs` | yes — unit tests |
+| the settings reader and writer (`captions.json`: the ranges, the JS's null asymmetry, the byte-identical text, the atomic write) | `src/settings.rs` | yes — unit tests |
 | the bar's size, position and fade schedule | `src/layout.rs` | yes — unit tests |
-| the layer surface (config, empty input region, the shm conversion) | `src/desktop.rs` | yes for the parts a compositor is not needed for; the surface itself was run and photographed on KWin. **The click passing through was NOT exercised by a synthetic click** — see "Desktop: layer-shell" |
+| the layer surface (config, both input regions, the drag math, the shm conversion) | `src/desktop.rs`, `src/layout.rs` | yes for the parts a compositor is not needed for; the surface itself was run and photographed on KWin in both modes. **Neither the click passing through nor the drag was exercised by synthetic input** — see "Desktop: layer-shell" |
 | which surface a desktop gets, and where the binary is | `gui/src/main/captions.js` | yes — `gui/test/layer_captions.test.js` |
