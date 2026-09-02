@@ -233,6 +233,11 @@ pub mod truth_via {
     pub const TRUTH: &str = "truth";
     /// A person said so.
     pub const MANUAL: &str = "manual";
+    // ---- 0.11.0: learned identity -----------------------------------------
+    /// The calibration pass fitted this from the install's own ground truth
+    /// and it cleared the held-out gate (`speakers.threshold_via`).
+    pub const LEARNED: &str = "learned";
+    // ---- end 0.11.0 -------------------------------------------------------
 }
 
 /// `settings` key holding the id of the pinned "You" speaker.
@@ -962,6 +967,13 @@ impl Store {
         // source history is derived from `segments` and `sessions` on demand,
         // so there is no shape change and no version to bump.
         self.apply_source_prior_index()?;
+        // ---- end 0.11.0 ---------------------------------------------------
+
+        // ---- 0.11.0: learned identity -------------------------------------
+        // Five nullable columns on `speakers` and one single-row table. All
+        // NULL/absent means "use the globals", which is exactly what 0.10.2
+        // did, so there is no backfill and nothing to undo.
+        self.apply_learned_identity()?;
         // ---- end 0.11.0 ---------------------------------------------------
 
         match current {
@@ -6667,6 +6679,357 @@ impl Store {
 
 // ---- end 0.11.0 -----------------------------------------------------------
 
+// ---- 0.11.0: learned identity ----------------------------------------------
+//
+// Where the learned operating point lives, and why here rather than in the
+// config file.
+//
+// A threshold fitted from *this* install's ground truth is derived data with
+// provenance — which voice, how many turns, when, by what. A config file is
+// the user's opinion and nothing may quietly rewrite it; the database is
+// already where every other derived-and-refittable thing lives (prototypes,
+// the source matrix, the language votes). Putting it here also means
+// `speakers.threshold` travels with the voice through a merge, a rename and a
+// backup, and that `recalld identity calibrate --reset` is one UPDATE rather
+// than an edit to a file somebody may have hand-annotated.
+//
+// Everything is nullable and absence means the global. A store where nothing
+// has ever been calibrated is byte-for-byte a 0.10.2 store.
+
+/// One voice's learned operating point, with everything needed to explain it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LearnedThreshold {
+    pub speaker_id: i64,
+    pub threshold: f32,
+    pub margin: f32,
+    /// `store::truth_via` — `learned` for a fit, or whatever a future hand
+    /// override calls itself.
+    pub via: String,
+    /// Truth rows the fit saw for this voice. The number a client should show
+    /// as "calibrated on N turns".
+    pub n: i64,
+    pub at_ns: i64,
+}
+
+/// One truth-labelled turn with its embedding, in the shape a calibration fit
+/// needs it. The same rows the bench reads, through the same door.
+#[derive(Debug, Clone)]
+pub struct CalibrationRow {
+    pub segment_id: i64,
+    pub t_start_ns: i64,
+    pub overlap_frac: f32,
+    pub duration_s: f32,
+    pub words: usize,
+    /// The voice Discord's ground truth says this is.
+    pub truth_speaker_id: i64,
+    pub embedding: Embedding,
+}
+
+impl Store {
+    /// The learned-identity shape. Idempotent, additive, no backfill.
+    pub(crate) fn apply_learned_identity(&self) -> Result<()> {
+        self.add_column_if_missing("speakers", "label_threshold", "REAL")?;
+        self.add_column_if_missing("speakers", "label_margin", "REAL")?;
+        self.add_column_if_missing("speakers", "threshold_via", "TEXT")?;
+        self.add_column_if_missing("speakers", "threshold_n", "INTEGER")?;
+        self.add_column_if_missing("speakers", "threshold_at", "INTEGER")?;
+        // One row, enforced by the primary key rather than by convention: a
+        // second projection is not a variant, it is a bug that would make
+        // "which space is live" a question with two answers.
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS identity_projection (
+                 id             INTEGER PRIMARY KEY CHECK (id = 1),
+                 embed_model_id TEXT    NOT NULL,
+                 dim            INTEGER NOT NULL,
+                 matrix         BLOB    NOT NULL,
+                 n_rows         INTEGER NOT NULL,
+                 n_classes      INTEGER NOT NULL,
+                 shrinkage      REAL    NOT NULL,
+                 power          REAL    NOT NULL,
+                 centred        INTEGER NOT NULL,
+                 version        INTEGER NOT NULL,
+                 fitted_at_ns   INTEGER NOT NULL
+             );",
+        )?;
+        Ok(())
+    }
+
+    /// Every learned threshold, resolved through the tombstone view so a
+    /// merged-away voice answers for the one that survived it.
+    pub fn learned_thresholds(&self) -> Result<Vec<LearnedThreshold>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, label_threshold, label_margin, threshold_via,
+                    COALESCE(threshold_n, 0), COALESCE(threshold_at, 0)
+             FROM speakers
+             WHERE merged_into IS NULL AND label_threshold IS NOT NULL
+             ORDER BY id ASC",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(LearnedThreshold {
+                    speaker_id: r.get(0)?,
+                    threshold: r.get::<_, f64>(1)? as f32,
+                    margin: r.get::<_, Option<f64>>(2)?.unwrap_or(0.0) as f32,
+                    via: r
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| truth_via::LEARNED.to_string()),
+                    n: r.get(4)?,
+                    at_ns: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The table the ladder asks, with `global` standing in for every voice
+    /// nothing has been learned about.
+    pub fn threshold_table(&self, global: (f32, f32)) -> Result<crate::calib::Thresholds> {
+        let mut t = crate::calib::Thresholds::global(global.0, global.1);
+        for row in self.learned_thresholds()? {
+            t.insert(row.speaker_id, row.threshold, row.margin);
+        }
+        Ok(t)
+    }
+
+    /// Write one voice's learned point.
+    pub fn set_learned_threshold(
+        &self,
+        speaker_id: i64,
+        threshold: f32,
+        margin: f32,
+        via: &str,
+        n: i64,
+        at_ns: i64,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE speakers
+                SET label_threshold = ?2, label_margin = ?3,
+                    threshold_via = ?4, threshold_n = ?5, threshold_at = ?6
+              WHERE id = ?1",
+            params![speaker_id, threshold as f64, margin as f64, via, n, at_ns],
+        )? > 0)
+    }
+
+    /// Back to the globals. `None` clears every voice; a list clears those.
+    ///
+    /// The count is voices that actually *had* a learned value — an UPDATE
+    /// that nulls a column already NULL touches a row without changing
+    /// anything, and reporting that as "cleared 33 voices" on an install where
+    /// nothing was ever learned is a number that lies.
+    pub fn clear_learned_thresholds(&self, only: Option<&[i64]>) -> Result<usize> {
+        const SQL: &str = "UPDATE speakers
+             SET label_threshold = NULL, label_margin = NULL,
+                 threshold_via = NULL, threshold_n = NULL, threshold_at = NULL
+             WHERE label_threshold IS NOT NULL";
+        Ok(match only {
+            None => self.conn.execute(SQL, [])?,
+            Some(ids) => {
+                let mut n = 0;
+                let mut stmt = self.conn.prepare(&format!("{SQL} AND id = ?1"))?;
+                for id in ids {
+                    n += stmt.execute(params![id])?;
+                }
+                n
+            }
+        })
+    }
+
+    /// The installed projection, if there is one, and its provenance.
+    pub fn installed_projection(&self) -> Result<Option<(crate::calib::Projection, i64, i64)>> {
+        /// `(model, dim, matrix, rows, classes, shrinkage, power, centred,
+        /// version, fitted at)` — one row of `identity_projection`, named so
+        /// the tuple does not have to be read twice.
+        type Row = (String, i64, Vec<u8>, i64, i64, f64, f64, i64, i64, i64);
+        let row: Option<Row> = self
+            .conn
+            .query_row(
+                "SELECT embed_model_id, dim, matrix, n_rows, n_classes,
+                        shrinkage, power, centred, version, fitted_at_ns
+                 FROM identity_projection WHERE id = 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((model, dim, blob, n_rows, n_classes, shrinkage, power, centred, ver, at)) = row
+        else {
+            return Ok(None);
+        };
+        let mut p = crate::calib::Projection::from_blob(model, dim as usize, &blob)?;
+        p.n_rows = n_rows as usize;
+        p.n_classes = n_classes as usize;
+        p.whitening = crate::calib::Whitening {
+            shrinkage,
+            power,
+            centre: centred != 0,
+        };
+        Ok(Some((p, ver, at)))
+    }
+
+    /// Install a projection, replacing whatever was there.
+    ///
+    /// The *decision* to replace belongs to `identity_learn`, which measures
+    /// the incumbent against the candidate first; this is the write it makes
+    /// once it has.
+    pub fn install_projection(
+        &self,
+        p: &crate::calib::Projection,
+        version: i64,
+        at_ns: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO identity_projection
+                 (id, embed_model_id, dim, matrix, n_rows, n_classes,
+                  shrinkage, power, centred, version, fitted_at_ns)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+                 embed_model_id = excluded.embed_model_id,
+                 dim = excluded.dim, matrix = excluded.matrix,
+                 n_rows = excluded.n_rows, n_classes = excluded.n_classes,
+                 shrinkage = excluded.shrinkage, power = excluded.power,
+                 centred = excluded.centred, version = excluded.version,
+                 fitted_at_ns = excluded.fitted_at_ns",
+            params![
+                p.model_id,
+                p.dim as i64,
+                p.to_blob(),
+                p.n_rows as i64,
+                p.n_classes as i64,
+                p.whitening.shrinkage,
+                p.whitening.power,
+                i64::from(p.whitening.centre),
+                version,
+                at_ns
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_projection(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM identity_projection WHERE id = 1", [])?
+            > 0)
+    }
+
+    /// Every truth-labelled turn a calibration fit can use, oldest first.
+    ///
+    /// The same shape as the bench's query and for the same reasons: a
+    /// `single` verdict, a linked account, a stored embedding and at least
+    /// `min_duration_s` of audio. Ordered by time because every split
+    /// downstream is chronological, and a fit that had to sort its own input
+    /// is a fit that could forget to.
+    pub fn truth_calibration_rows(&self, min_duration_s: f64) -> Result<Vec<CalibrationRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.t_start_ns, COALESCE(g.overlap_frac, 0.0),
+                    (g.t_end_ns - g.t_start_ns), COALESCE(g.text, ''),
+                    d.speaker_id, e.vector, e.embed_model_id
+             FROM segments g
+             JOIN discord_users d ON d.user_id = g.truth_user_id
+             JOIN speakers s ON s.id = d.speaker_id
+             JOIN embeddings e ON e.id = (
+                 SELECT MAX(x.id) FROM embeddings x WHERE x.segment_id = g.id)
+             WHERE g.deleted_at IS NULL
+               AND g.truth_verdict = ?1
+               AND d.speaker_id IS NOT NULL
+               AND s.merged_into IS NULL
+               AND (g.t_end_ns - g.t_start_ns) >= ?2
+             ORDER BY g.t_start_ns ASC, g.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![truth_verdict::SINGLE, (min_duration_s * 1e9) as i64],
+                |r| {
+                    let text: String = r.get(4)?;
+                    Ok((
+                        CalibrationRow {
+                            segment_id: r.get(0)?,
+                            t_start_ns: r.get(1)?,
+                            overlap_frac: r.get::<_, f64>(2)? as f32,
+                            duration_s: r.get::<_, i64>(3)? as f32 / 1e9,
+                            words: crate::lang::word_count(&text),
+                            truth_speaker_id: r.get(5)?,
+                            embedding: Embedding::new("", Vec::new()),
+                        },
+                        r.get::<_, Vec<u8>>(6)?,
+                        r.get::<_, String>(7)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(mut row, blob, model)| {
+                row.embedding = Embedding::from_blob(model, &blob)?;
+                Ok(row)
+            })
+            .collect()
+    }
+
+    /// The whole bank with the segment each prototype came from, so a replay
+    /// can drop the prototypes a row produced itself. Without that a row
+    /// scores 1.0 against itself and the measurement is a memory test.
+    pub fn prototypes_with_source(
+        &self,
+        embed_model_id: &str,
+    ) -> Result<Vec<(i64, Option<i64>, Embedding)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.speaker_id, p.source_segment_id, p.vector
+             FROM speaker_prototypes p
+             JOIN speakers s ON s.id = p.speaker_id
+             WHERE s.merged_into IS NULL AND p.embed_model_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![embed_model_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(sp, src, blob)| Ok((sp, src, Embedding::from_blob(embed_model_id, &blob)?)))
+            .collect()
+    }
+
+    /// `(really overlapped, measured overlap fraction)` for every turn with a
+    /// `single` or `overlap` verdict, oldest first — the overlap gate's own
+    /// ground truth, ready to be split chronologically.
+    pub fn truth_overlap_rows_in_order(&self) -> Result<Vec<(i64, bool, f32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t_start_ns, truth_verdict, COALESCE(overlap_frac, 0.0)
+             FROM segments
+             WHERE deleted_at IS NULL AND truth_verdict IN (?1, ?2)
+             ORDER BY t_start_ns ASC, id ASC",
+        )?;
+        Ok(stmt
+            .query_map(
+                params![truth_verdict::SINGLE, truth_verdict::OVERLAP],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)? == truth_verdict::OVERLAP,
+                        r.get::<_, f64>(2)? as f32,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+// ---- end 0.11.0 -----------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -9226,5 +9589,98 @@ mod tests {
             "the microphone follows the user everywhere: {:?}",
             report.foreign
         );
+    }
+
+    // ---- 0.11.0: learned identity ----------------------------------------
+
+    #[test]
+    fn a_store_where_nothing_was_learned_answers_with_the_globals() {
+        let s = store();
+        let a = s.mint_speaker(0).unwrap();
+        assert!(s.learned_thresholds().unwrap().is_empty());
+        let t = s.threshold_table((0.35, 0.0)).unwrap();
+        assert_eq!(t.for_speaker(a), (0.35, 0.0));
+        assert!(t.is_empty());
+        assert!(s.installed_projection().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_learned_threshold_round_trips_with_its_provenance() {
+        let s = store();
+        let a = s.mint_speaker(0).unwrap();
+        let b = s.mint_speaker(0).unwrap();
+        assert!(
+            s.set_learned_threshold(a, 0.52, 0.04, truth_via::LEARNED, 61, 12_345)
+                .unwrap()
+        );
+        let rows = s.learned_thresholds().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].speaker_id, a);
+        assert!((rows[0].threshold - 0.52).abs() < 1e-6);
+        assert!((rows[0].margin - 0.04).abs() < 1e-6);
+        assert_eq!(rows[0].via, truth_via::LEARNED);
+        assert_eq!(rows[0].n, 61);
+        assert_eq!(rows[0].at_ns, 12_345);
+        // And the voice nobody learned anything about still gets the global.
+        let t = s.threshold_table((0.35, 0.0)).unwrap();
+        assert_eq!(t.for_speaker(b), (0.35, 0.0));
+    }
+
+    #[test]
+    fn clearing_counts_only_the_voices_that_had_a_value() {
+        let s = store();
+        let a = s.mint_speaker(0).unwrap();
+        for _ in 0..4 {
+            s.mint_speaker(0).unwrap();
+        }
+        s.set_learned_threshold(a, 0.5, 0.0, truth_via::LEARNED, 40, 1)
+            .unwrap();
+        // Five voices, one learned value: clearing is one voice, not five.
+        assert_eq!(s.clear_learned_thresholds(None).unwrap(), 1);
+        assert!(s.learned_thresholds().unwrap().is_empty());
+        assert_eq!(s.clear_learned_thresholds(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_merged_away_voice_stops_carrying_a_learned_threshold() {
+        // The table the ladder reads must never name a tombstone: the surviving
+        // voice is the one segments point at, and a threshold on the dead id
+        // would apply to nothing while looking like it applied to something.
+        let s = store();
+        let a = s.mint_speaker(0).unwrap();
+        let b = s.mint_speaker(0).unwrap();
+        s.set_learned_threshold(a, 0.5, 0.0, truth_via::LEARNED, 40, 1)
+            .unwrap();
+        s.merge_speakers(a, b).unwrap();
+        assert!(s.learned_thresholds().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_projection_round_trips_through_the_store() {
+        let s = store();
+        let rows: Vec<crate::calib::Labelled> = (0..20)
+            .map(|i| crate::calib::Labelled {
+                class: (i % 2) as i64,
+                v: vec![i as f32 * 0.01, 1.0 - i as f32 * 0.01, 0.5],
+            })
+            .collect();
+        let p =
+            crate::calib::fit_projection("m@1", &rows, crate::calib::Whitening::default()).unwrap();
+        s.install_projection(&p, 7, 999).unwrap();
+        let (back, version, at) = s.installed_projection().unwrap().unwrap();
+        assert_eq!(version, 7);
+        assert_eq!(at, 999);
+        assert_eq!(back.dim, p.dim);
+        assert_eq!(back.a, p.a);
+        assert_eq!(back.mean, p.mean);
+        assert_eq!(back.whitening, p.whitening);
+        assert_eq!(back.n_rows, p.n_rows);
+        // A second install replaces rather than accumulating: "which space is
+        // live" must not be a question with two answers.
+        s.install_projection(&p, 8, 1000).unwrap();
+        assert_eq!(s.installed_projection().unwrap().unwrap().1, 8);
+        assert!(s.clear_projection().unwrap());
+        assert!(s.installed_projection().unwrap().is_none());
+        assert!(!s.clear_projection().unwrap());
     }
 }
