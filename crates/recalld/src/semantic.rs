@@ -1817,16 +1817,29 @@ mod tests {
         assert_eq!(ix.bytes(), n * DIM * 4);
 
         let q = unit(11, DIM);
-        let t = std::time::Instant::now();
+        // Thread CPU time, not wall time. This guard asks whether the ALGORITHM
+        // is still cheap; wall time answers a different question — how busy the
+        // box is — and under `nice 19` on a machine running six other builds it
+        // answered "no" at 620 ms for work that costs 60 ms of CPU. Only the
+        // scheduler's contribution is excluded; a slower algorithm still fails.
+        fn thread_cpu_ms() -> f64 {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: a valid, writable timespec and a clock id libc defines.
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+            ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1e6
+        }
+        let c0 = thread_cpu_ms();
         let hits = ix.search(&q, 50, &Candidates::everything());
-        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let ms = thread_cpu_ms() - c0;
         assert_eq!(hits.len(), 50);
         // Generous by ~10x against the measured figure (see the module docs):
-        // this is a regression guard on the algorithm, not a benchmark, and it
-        // has to pass on a loaded CI box.
+        // this is a regression guard on the algorithm, not a benchmark.
         assert!(
             ms < 500.0,
-            "a {n}-vector scan took {ms:.1} ms — brute force is no longer the right shape"
+            "a {n}-vector scan took {ms:.1} ms of CPU — brute force is no longer the right shape"
         );
         eprintln!(
             "brute force: {n} x {DIM} = {} MB, {ms:.1} ms",
