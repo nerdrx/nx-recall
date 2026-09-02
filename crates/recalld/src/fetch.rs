@@ -92,6 +92,12 @@ pub struct FetchOptions {
     /// default: without it `asr_confidence` is null, which says "nothing has
     /// checked these words" and is true.
     pub confidence: bool,
+    /// Also install the night shift's GGML model (~1.03 GB, 0.9.0). Off by
+    /// default, like the feature: the model is only half of what the night
+    /// shift needs, and the other half — `whisper-cli` with a GPU backend — is
+    /// compiled by `models build-night` rather than downloaded, because
+    /// upstream publishes no such binary for this card.
+    pub night: bool,
     /// Force the single-stream path. Only the test suite sets this; it is how
     /// the fallback is exercised without finding a server that lacks ranges.
     pub single_stream: bool,
@@ -115,6 +121,9 @@ impl FetchOptions {
         }
         if self.confidence {
             out.push(Group::Confidence);
+        }
+        if self.night {
+            out.push(Group::Night);
         }
         out
     }
@@ -883,17 +892,19 @@ mod tests {
 
     #[test]
     fn every_catalogued_url_comes_from_a_publisher_we_named() {
-        // Four publishers, and only four: sherpa-onnx releases for the speech
+        // Five publishers, and only five: sherpa-onnx releases for the speech
         // leg, llama.cpp releases + bartowski's quants for the graph's Tier 3,
-        // and the e5 mirror for semantic search — the latter pinned to a
-        // commit rather than a branch so "the catalogued size" cannot change
-        // under us. A URL that drifts off this list is a supply-chain change
-        // and has to be a visible diff.
-        const HOSTS: [&str; 4] = [
+        // the e5 mirror for semantic search — the latter pinned to a commit
+        // rather than a branch so "the catalogued size" cannot change under us
+        // — and whisper.cpp's own model repository for the night shift's GGML
+        // file (0.9.0). A URL that drifts off this list is a supply-chain
+        // change and has to be a visible diff.
+        const HOSTS: [&str; 5] = [
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/",
             "https://github.com/ggml-org/llama.cpp/releases/download/",
             "https://huggingface.co/bartowski/",
             "https://huggingface.co/Xenova/multilingual-e5-small/resolve/",
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/",
         ];
         for a in REMOTE_ASSETS {
             assert!(

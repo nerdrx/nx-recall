@@ -98,6 +98,11 @@ pub struct Control {
     asr: Mutex<crate::config::AsrConfig>,
     /// What that worker has done since the daemon started.
     pub quality: Arc<crate::quality::QualityStats>,
+    /// The night shift's settings (0.9.0), live for the same reason: it has a
+    /// switch, and a switch that needs a restart is not a switch.
+    night: Mutex<crate::config::NightConfig>,
+    /// What the night shift has done since the daemon started.
+    pub night_stats: Arc<crate::night::NightStats>,
 }
 
 impl Control {
@@ -126,6 +131,8 @@ impl Control {
             graph_state: Mutex::new(GraphState::default()),
             asr: Mutex::new(crate::config::AsrConfig::default()),
             quality: Arc::new(crate::quality::QualityStats::default()),
+            night: Mutex::new(crate::config::NightConfig::default()),
+            night_stats: Arc::new(crate::night::NightStats::default()),
         })
     }
 
@@ -357,6 +364,38 @@ impl Control {
         let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
         *this.asr.get_mut().unwrap_or_else(|p| p.into_inner()) = cfg;
         self
+    }
+
+    // ---- the night shift (0.9.0) -----------------------------------------
+
+    pub fn night(&self) -> crate::config::NightConfig {
+        self.night.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Point the night shift at the running config. Set before the handle is
+    /// shared, like the rest of the wiring.
+    pub fn with_night(mut self: Arc<Self>, cfg: crate::config::NightConfig) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
+        *this.night.get_mut().unwrap_or_else(|p| p.into_inner()) = cfg;
+        self
+    }
+
+    /// Minutes since the last turn was written, or since the daemon started if
+    /// none has been.
+    ///
+    /// This is what "the machine is idle" means here, and it is deliberately
+    /// about *capture* rather than about input devices: the night shift's
+    /// question is whether transcription is still happening, not whether
+    /// somebody is at the keyboard. A machine playing a film with no allowed
+    /// application open is idle by this definition, and that is correct — the
+    /// GPU check is the separate gate that covers the film.
+    pub fn idle_minutes(&self) -> i64 {
+        let last = self
+            .stats
+            .last_segment_ns
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let since = if last > 0 { last } else { self.started_at_ns };
+        (crate::clock::utc_now_ns() - since).max(0) / 60_000_000_000
     }
 
     // ---- the memory graph (GRAPH.md Tiers 2 and 3) -----------------------

@@ -109,6 +109,26 @@ pub fn classify(text: &str) -> Lang {
     }
 }
 
+/// How many of each language's stopwords a transcript contains, as
+/// `(de, en)`.
+///
+/// The raw vote behind [`classify`], exposed for a caller that needs the
+/// evidence rather than the verdict (0.9.0, `crate::night`). The difference
+/// matters exactly once: `classify` settles on German the moment it sees an
+/// umlaut or an ß, which is right for the two-language question it was built
+/// for and **wrong as a filter against a third language** — "Tack för att ni
+/// tittade" is Swedish with an ö in it, and FINDINGS §12 measured
+/// whisper-large-v3 producing precisely that on German lobby audio. A caller
+/// that is deciding whether to overwrite a transcript asks for the counts and
+/// insists on real evidence.
+pub fn stopword_votes(text: &str) -> (usize, usize) {
+    let ws = words(text);
+    (
+        ws.iter().filter(|w| DE.contains(&w.as_str())).count(),
+        ws.iter().filter(|w| EN.contains(&w.as_str())).count(),
+    )
+}
+
 /// How many words a transcript has, for the mint bar (DESIGN §5 / 0.6.1): a
 /// grunt is not a voice, and "two words" is the cheapest honest test of that.
 pub fn word_count(text: &str) -> usize {

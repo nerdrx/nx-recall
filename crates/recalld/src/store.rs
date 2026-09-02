@@ -44,7 +44,13 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // verdict, see `apply_v10`) and the `notes` table (a mic turn that opened with
 // a wake phrase, see `apply_v10_notes`). Both halves are idempotent and
 // independent; there is no backfill of either.
-pub const SCHEMA_VERSION: i64 = 10;
+//
+// ---- 0.9.0 (schema v11), the night shift ----------------------------------
+// v11 adds two columns on `segments` (`night_text`, `night_at_ns`, see
+// `apply_v11`) for the overnight third reading. Additive, idempotent, no
+// backfill: a NULL `night_at_ns` means the night shift has not looked at the
+// row, which is true of every row written before it existed.
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -109,6 +115,9 @@ pub mod text_via {
     pub const CONTEXT: &str = "context";
     /// Re-decoded by a language arbiter (`crate::arbiter`).
     pub const ARBITER: &str = "arbiter";
+    /// Re-read overnight by the night shift's third decoder (`crate::night`,
+    /// 0.9.0), and only ever where two of the three readings agreed.
+    pub const NIGHT: &str = "night";
 }
 
 /// What a second decoder made of a transcript (v10, on the wire as
@@ -220,6 +229,10 @@ pub struct SegmentRow {
     /// `None` when no cross-check has run — which is not the same as "checked
     /// and fine", and is why the null is on the wire.
     pub asr_confidence: Option<String>,
+    /// What the night shift read on its own pass (v11, 0.9.0), whether or not
+    /// it was allowed to replace the words. `None` on a row no night has
+    /// reached — and on every row until `[night].enabled` is turned on.
+    pub night_text: Option<String>,
 }
 
 /// A turn the idle quality worker may act on: enough to find its audio, place
@@ -781,6 +794,8 @@ impl Store {
         // v10 (0.8.0), second half: notes to self. Standalone like v9 — one
         // table that references `segments` and nothing else, and no backfill.
         self.apply_v10_notes()?;
+        // v11 (0.9.0): the night shift's two columns. Standalone and additive.
+        self.apply_v11()?;
 
         match current {
             None => {
@@ -1191,6 +1206,31 @@ impl Store {
         Ok(())
     }
 
+    // ---- 0.9.0 (schema v11): the night shift ----------------------------
+    //
+    /// Two columns on `segments`, both additive and both NULL on every existing
+    /// row.
+    ///
+    /// `night_text` is what the overnight decoder read, kept whether or not it
+    /// was allowed to replace anything — the annotate-only rule is a shipped
+    /// outcome, not a fallback, and a client renders it as "the night shift
+    /// read:". `night_at_ns` is the queue stamp, and it is separate from the
+    /// text for the same reason `redecode_at_ns` is separate from `text`: a
+    /// night that ran and decided to keep the row's words has to be
+    /// distinguishable from a night that never reached it, or the worker walks
+    /// the same segment for ever.
+    fn apply_v11(&self) -> Result<()> {
+        self.add_column_if_missing("segments", "night_text", "TEXT")?;
+        self.add_column_if_missing("segments", "night_at_ns", "INTEGER")?;
+        // The queue is "shaky rows with no night stamp", so the index is on the
+        // verdict and the stamp together.
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_segments_night
+                 ON segments(night_at_ns, asr_confidence, t_start_ns);",
+        )?;
+        Ok(())
+    }
+
     /// Thread every session's existing segments by replaying the live rule.
     ///
     /// Deliberately not clever: sessions in id order, turns in time order, the
@@ -1583,6 +1623,24 @@ impl Store {
         asr_model_id: &str,
         at_utc_ns: i64,
     ) -> Result<()> {
+        self.set_segment_text_via(segment_id, text, asr_model_id, text_via::CONTEXT, at_utc_ns)
+    }
+
+    /// The same replacement, for any offline route that produces words
+    /// (0.9.0). Generalised rather than copied: the night shift writes
+    /// `text_via = 'night'` and everything else about the operation — the
+    /// prior text kept in `operations` as `segments.redecode`, the cleared
+    /// cross-check verdict, the stamp — has to be identical, because a person
+    /// comparing or reverting two machine edits should not have to know which
+    /// worker made them.
+    pub fn set_segment_text_via(
+        &self,
+        segment_id: i64,
+        text: &str,
+        asr_model_id: &str,
+        via: &str,
+        at_utc_ns: i64,
+    ) -> Result<()> {
         // The words being replaced are kept, the same way `segments.correct`
         // keeps them: a re-decode is a machine's edit of the transcript, and an
         // edit nobody can see or undo is not a provenance story, it is a
@@ -1610,7 +1668,7 @@ impl Store {
              SET text = ?2, asr_model_id = ?3, text_via = ?4, redecode_at_ns = ?5,
                  asr_confidence = NULL, confidence_at_ns = NULL
              WHERE id = ?1 AND deleted_at IS NULL",
-            params![segment_id, text, asr_model_id, text_via::CONTEXT, at_utc_ns],
+            params![segment_id, text, asr_model_id, via, at_utc_ns],
         )?;
         self.log_operation(
             "segments.redecode",
@@ -1669,6 +1727,75 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    // ---- the night shift (0.9.0) -----------------------------------------
+
+    /// Turns waiting for the overnight third reading, newest first.
+    ///
+    /// The queue is deliberately narrow: **only rows the cross-check called
+    /// `shaky`**. That is the whole measured case for the feature (FINDINGS
+    /// §12: shaky rows disagree with large-v3 76% of the time against 27% on
+    /// solid ones), and it is also the only place where the cost is justified —
+    /// a third reading of a row two decoders already agree on buys nothing and
+    /// costs a GPU.
+    ///
+    /// The rest of the filters are the same guards the other two queues carry,
+    /// in SQL for the same reason: audio still on disk, a transcript to
+    /// compare against, never a row a person has corrected by hand, and a NULL
+    /// `night_at_ns` so a row is read once and not every night.
+    pub fn segments_for_night(&self, limit: usize) -> Result<Vec<RedecodeCandidate>> {
+        let rows = self
+            .conn
+            .prepare(
+                "SELECT g.id, g.session_id, g.t_start_ns, g.t_end_ns, g.audio_path, g.text
+                 FROM segments g
+                 WHERE g.deleted_at IS NULL
+                   AND g.night_at_ns IS NULL
+                   AND g.asr_confidence = 'shaky'
+                   AND g.text IS NOT NULL AND LENGTH(TRIM(g.text)) > 0
+                   AND g.audio_path <> ''
+                   AND NOT EXISTS (
+                       SELECT 1 FROM operations o
+                       WHERE o.op = 'segments.correct'
+                         AND o.target_ids = '[' || g.id || ']')
+                 ORDER BY g.t_start_ns DESC
+                 LIMIT ?1",
+            )?
+            .query_map(params![limit as i64], |r| {
+                Ok(RedecodeCandidate {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    t_start_ns: r.get(2)?,
+                    t_end_ns: r.get(3)?,
+                    audio_path: r.get(4)?,
+                    text: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Record what the night shift read, and that it has been here.
+    ///
+    /// Always called, on every row the worker reaches — including the ones
+    /// whose words it was not allowed to touch. `night_text` is the annotation
+    /// a client shows as "the night shift read:", and storing it for a row that
+    /// was *not* replaced is the point of the annotate-only outcome: the reader
+    /// is shown the disagreement and decides, which is the honest answer where
+    /// no rule earned the right to decide for them.
+    pub fn set_segment_night(
+        &self,
+        segment_id: i64,
+        night_text: Option<&str>,
+        at_utc_ns: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET night_text = ?2, night_at_ns = ?3
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![segment_id, night_text, at_utc_ns],
+        )?;
+        Ok(())
     }
 
     /// Flag a transcript with what the second decoder made of it. `None` marks
@@ -2681,12 +2808,13 @@ impl Store {
     /// How many columns [`Self::SEGMENT_COLUMNS`] selects. A query that appends
     /// its own — the search's snippet — indexes from here rather than from a
     /// number somebody has to remember to bump.
-    const SEGMENT_COLUMN_COUNT: usize = 17;
+    const SEGMENT_COLUMN_COUNT: usize = 18;
 
     const SEGMENT_COLUMNS: &'static str =
         "g.id, g.session_id, sc.match_key, g.t_start_ns, g.t_end_ns,
          sp.canonical_id, sp.display_name, g.text, g.overlap_frac, g.match_score, g.audio_path,
-         g.lang, g.label_via, g.thread_id, g.lang_via, g.text_via, g.asr_confidence";
+         g.lang, g.label_via, g.thread_id, g.lang_via, g.text_via, g.asr_confidence,
+         g.night_text";
 
     fn segment_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentRow> {
         Ok(SegmentRow {
@@ -2707,6 +2835,7 @@ impl Store {
             lang_via: r.get(14)?,
             text_via: r.get(15)?,
             asr_confidence: r.get(16)?,
+            night_text: r.get(17)?,
         })
     }
 

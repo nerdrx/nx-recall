@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
@@ -221,6 +221,11 @@ pub struct Stats {
     /// (which `drops` already says) and "a turn was actually lost because of
     /// it", and it is the number that says whether the queue is big enough.
     pub gaps_discarded: AtomicU64,
+    /// When the last turn was written, in UTC nanoseconds, or 0 before the
+    /// first one (0.9.0). The night shift's idle rule reads it: "no capture
+    /// activity for N minutes" is a statement about turns landing, and this is
+    /// the one place that knows when the last one did.
+    pub last_segment_ns: AtomicI64,
 }
 
 pub struct Pipeline {
@@ -507,6 +512,9 @@ impl Pipeline {
             store.insert_segment(session_id, t_start_ns, t_end_ns, &rel_str, utc_now_ns())?
         };
         self.stats.segments_written.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .last_segment_ns
+            .store(utc_now_ns(), Ordering::Relaxed);
         info!(
             session_id,
             seconds = samples.len() as f32 / SAMPLE_RATE as f32,

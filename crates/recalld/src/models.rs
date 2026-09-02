@@ -79,6 +79,12 @@ pub enum Group {
     /// decoder whose agreement with the first is the confidence flag. Optional,
     /// and without it `asr_confidence` is null rather than guessed.
     Confidence,
+    /// The night shift's third decoder (0.9.0): whisper-large-v3 as a GGML
+    /// file, run on the GPU overnight over the rows the cross-check called
+    /// shaky. Optional, and the *runtime* for it is not in this catalogue at
+    /// all — there is no ROCm/Vulkan `whisper-cli` release to download, so
+    /// `recalld models build-night` compiles one. See [`Group::note`].
+    Night,
 }
 
 impl Group {
@@ -106,6 +112,10 @@ impl Group {
             Group::Confidence => {
                 "optional — the second decoder behind `asr_confidence`; without \
                  it turns are unflagged rather than wrongly flagged"
+            }
+            Group::Night => {
+                "optional — the night shift's GPU decoder; the model downloads, \
+                 the runtime is built by `recalld models build-night`"
             }
         }
     }
@@ -158,6 +168,20 @@ pub const ARBITER_DE_ROLE: &str = "arbiter.de";
 /// `RemoteAsset::role` for the transcript cross-check decoder (0.8.0), for the
 /// same reason: `models fetch --confidence` and `models status` both pick it
 /// out of the catalogue by this string.
+/// `RemoteAsset::role` for the night shift's GGML model (0.9.0).
+pub const NIGHT_ROLE: &str = "night.model";
+/// The file name the night model installs under, in the models root. Named
+/// rather than derived from the URL for the reason every other model here is:
+/// the config default spells this name, and it must not drift with whatever
+/// upstream calls the file this year.
+pub const NIGHT_MODEL_FILE: &str = "ggml-large-v3-q5_0.bin";
+/// The whisper.cpp tag `models build-night` checks out. Pinned, like every
+/// other asset's bytes: a build recipe that follows a moving branch is not a
+/// pinned dependency, it is a hope.
+pub const NIGHT_WHISPER_TAG: &str = "v1.9.3";
+/// Where the built runtime goes, under the models root.
+pub const NIGHT_DIR: &str = "whisper";
+
 pub const CONFIDENCE_ROLE: &str = "confidence";
 
 /// The directory the cross-check decoder installs into, under the models root.
@@ -352,6 +376,27 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
                 53_555,
             ),
         ],
+    },
+    // ---- the night shift's third decoder (0.9.0) --------------------------
+    //
+    // Optional, and the flag is `models fetch --night`. One asset: the model.
+    // There is deliberately no runtime asset next to it, which is the honest
+    // difference between this group and `Group::Graph` — llama.cpp ships
+    // prebuilt Linux binaries and whisper.cpp's releases carry no GPU backend
+    // for an AMD card, so `models build-night` compiles `whisper-cli` from a
+    // pinned tag on the machine that will run it.
+    //
+    // q5_0 rather than fp16: measured on 20 FLEURS utterances against the
+    // sherpa int8 large-v3 that §11 and §12 used as their ceiling (see
+    // `spike/night_vote_bench.py` and FINDINGS §13), the quantisation is a
+    // wash on words and saves two thirds of the download and of the VRAM.
+    RemoteAsset {
+        role: NIGHT_ROLE,
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin",
+        download_bytes: 1_081_140_203,
+        install: Install::File(NIGHT_MODEL_FILE),
+        group: Group::Night,
+        files: &[(NIGHT_MODEL_FILE, 1_081_140_203)],
     },
     // ---- the memory graph's Tier 3 (GRAPH.md) -----------------------------
     //
@@ -684,6 +729,94 @@ impl ConfidenceModel {
             crate::fetch::human(confidence_download_bytes()),
         )
     }
+}
+
+/// The night shift's model and runtime on disk (0.9.0).
+///
+/// Two halves with different failure modes, which is why they are reported
+/// apart: the model is an ordinary catalogued download and is either there at
+/// the right size or absent, while `whisper-cli` is **built on this machine**
+/// and its absence is the normal state of a fresh install.
+#[derive(Debug, Clone)]
+pub struct NightModels {
+    pub root: PathBuf,
+    /// The GGML file.
+    pub model: PathBuf,
+    /// The binary `crate::night` shells out to.
+    pub cli: PathBuf,
+    /// Where its shared objects live, for `LD_LIBRARY_PATH`.
+    pub lib_dir: PathBuf,
+}
+
+impl NightModels {
+    pub fn resolve_at(root: PathBuf, cfg: &crate::config::NightConfig) -> Self {
+        let dir = root.join(&cfg.whisper_dir);
+        Self {
+            model: root.join(&cfg.model),
+            cli: dir.join("whisper-cli"),
+            lib_dir: dir,
+            root,
+        }
+    }
+
+    /// The model file at exactly the catalogued size, the rule every other
+    /// download here follows.
+    pub fn model_present(&self) -> bool {
+        self.entries().iter().all(|e| e.ok())
+    }
+
+    /// The built runtime. No size check: this file came out of a compiler on
+    /// this machine, not off a release page, so there is no byte count to
+    /// compare it against and the honest test is "is it there and executable".
+    pub fn runtime_present(&self) -> bool {
+        self.cli.is_file()
+    }
+
+    pub fn present(&self) -> bool {
+        self.model_present() && self.runtime_present()
+    }
+
+    pub fn entries(&self) -> Vec<ModelEntry> {
+        vec![ModelEntry {
+            role: NIGHT_ROLE,
+            path: self.model.clone(),
+            expected: expected_bytes(NIGHT_MODEL_FILE),
+        }]
+    }
+
+    /// What produced a night transcript, with the model file in it, so a row
+    /// rewritten by a different quantisation is distinguishable after the fact.
+    pub fn model_id(&self) -> String {
+        format!(
+            "{}@{ASR_CONTRACT_VERSION}",
+            self.model
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| NIGHT_MODEL_FILE.to_string())
+        )
+    }
+
+    /// What every "the night shift cannot run" line says, so the CLI, the
+    /// daemon's warning and `models status` all name the same two commands.
+    pub fn how_to_get_it() -> String {
+        format!(
+            "the night shift is not installed. `recalld models fetch --night` downloads \
+             {NIGHT_MODEL_FILE} ({}) and `recalld models build-night` compiles whisper.cpp \
+             {NIGHT_WHISPER_TAG} into <models>/{NIGHT_DIR} — that one COMPILES, because no \
+             GPU-capable whisper-cli is published for this card. Until both are there, \
+             the night shift stays off.",
+            crate::fetch::human(night_download_bytes()),
+        )
+    }
+}
+
+/// Bytes `models fetch --night` has to pull down.
+pub fn night_download_bytes() -> u64 {
+    REMOTE_ASSETS
+        .iter()
+        .filter(|a| a.group == Group::Night)
+        .map(|a| a.download_bytes)
+        .sum()
 }
 
 /// Bytes `models fetch --confidence` has to pull down.
