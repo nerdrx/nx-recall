@@ -790,6 +790,40 @@ holds it to the same expectation table as the daemon's own unit test — a
 divergence in this one method is not a mock detail, it is a bug the GUI cannot
 see until a user hits it.
 
+## 0.8.0 — the accuracy round (contract for three parallel builds)
+
+- **Transcript confidence.** Segment rows/events gain `asr_confidence`:
+  `"solid"` (a second decoder agreed), `"shaky"` (it disagreed), or `null`
+  (no cross-check ran). Flag only — the text is never replaced by the
+  cross-check. Segments also gain `text_via`: `"live"` (first pass),
+  `"context"` (re-decoded with surrounding session audio), `"arbiter"`
+  (language arbiter). A re-decode re-publishes the segment event.
+- **Vocabulary.** `vocab.get` → `{user: [...], auto: {roster: [...], worlds:
+  [...], corrections: [...]}, effective: [...]}`; `vocab.set {terms: [...]}`
+  replaces the user glossary (persisted). The daemon biases the transducer
+  toward `effective` (hotwords). Event `vocab` on change.
+- **Accuracy.** `accuracy.summary` → `{corrections, estimated_wer,
+  by_source: [{source, corrections, estimated_wer}], by_speaker: [{speaker_id,
+  corrections, estimated_wer}], since_ns}` computed from `segments.correct`
+  operations (the pre-correction text lives in `prior_state`).
+- **One query box.** `search.ask {q, limit?}` → `{interpretation: {query,
+  speaker_id?, speaker_label?, from_ns?, to_ns?, mode}, hits: [...]}`. The
+  daemon parses a natural-language question — speaker mentions, time
+  references in de/en (the Tier-2 parser), the remaining words as the query —
+  and runs the hybrid search with those facets. The interpretation is returned
+  so the GUI can show what it understood and let the user correct a facet.
+- **Notes to self.** A MIC segment whose text starts with a wake phrase
+  (`recall, merk dir`, `recall, remember`, `recall, notiz`, `recall, note`;
+  case/punctuation-insensitive) becomes a note. `notes.list {limit?, state?}`
+  → `{notes: [{id, segment_id, text, t_ms, t_ns, state}]}`,
+  `notes.set_state {id, state: "open"|"done"|"dismissed"}`. Event `note`
+  (topic `segments`) when one is created. The segment itself stays in the
+  transcript.
+- **Briefs.** `person.brief {id}` → `{speaker, last_heard_ms, open_to_you:
+  [commitment], open_from_you: [commitment], recent_topics: [...],
+  notes_mentioning: [...]}`. Clients may show it when a `roster` join event
+  names a linked speaker (the join itself is unchanged).
+
 ## Versioning rules
 
 - `proto` bumps only on breaking changes; additive fields/methods/events are free.
