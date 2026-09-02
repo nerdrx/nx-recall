@@ -1158,6 +1158,81 @@ export function openSegmentSheet(seg, ctx) {
       }
     }
 
+    // ------------------------------------------------------------------
+    // Naming a NEW voice, here (0.10.0)
+    //
+    // The moment you know who a voice is, is the moment you are reading what
+    // they said — not later, on the Speakers page, hunting for "Speaker_38"
+    // among the rest. So a segment whose voice has no name yet offers the
+    // field right under the picker. Enter names it; the daemon's `relabel`
+    // broadcast repaints every row that voice ever spoke, exactly as a rename
+    // from the Speakers page would. A voice that already has a name is not
+    // renamed from here: that is a different, rarer act, and it stays where
+    // its consequences (merges, languages) are visible.
+    // ------------------------------------------------------------------
+    const unnamed = () => {
+      const id = picked ?? null;
+      if (id == null) return null;
+      const sp = store.speakers.get(id);
+      return sp && !sp.name ? sp : null;
+    };
+    const nameInput = h('input', {
+      class: 'input',
+      id: 'name-voice',
+      type: 'text',
+      placeholder: 'Name this voice',
+      'aria-label': 'Name this voice',
+      'data-keep-escape': '',
+      maxlength: '48',
+    });
+    const nameBtn = h('button', { class: 'btn small', id: 'name-voice-save', onclick: () => void saveName() }, 'Name');
+    const nameRow = h(
+      'div',
+      { class: 'name-voice-row', id: 'name-voice-row', hidden: !unnamed() },
+      h('span', { class: 'sp-hint', id: 'name-voice-hint' }),
+      nameInput,
+      nameBtn
+    );
+    function paintNameRow() {
+      const sp = unnamed();
+      nameRow.hidden = !sp;
+      if (sp) nameRow.querySelector('#name-voice-hint').textContent = `${speakerLabel(sp.id)} has no name yet.`;
+    }
+    paintNameRow();
+    // The picker above can move this segment to another unnamed voice; the
+    // offer follows the picked voice, not the row's original one.
+    pick.addEventListener('click', () => queueMicrotask(paintNameRow));
+    nameInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        nameInput.value = '';
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        void saveName();
+      }
+    });
+    async function saveName() {
+      const sp = unnamed();
+      const name = nameInput.value.trim();
+      if (!sp || !name) return;
+      nameBtn.disabled = true;
+      try {
+        await ask('speakers.name', { id: sp.id, name });
+        // No optimistic write: the `relabel` event relabels this row and every
+        // other one, and the hint below reflects the store once it has.
+        toast(`Named ${name}. Every turn of that voice now says so.`, 'ok');
+        nameInput.value = '';
+        setTimeout(paintNameRow, 50);
+      } catch (e) {
+        toast(`Could not name that voice — ${e.message}`, 'error');
+      } finally {
+        nameBtn.disabled = false;
+      }
+    }
+
     const save = async () => {
       const jobs = [];
       if (picked !== (seg.speaker ?? null)) jobs.push(ask('segments.reassign', { segment_id: seg.id, speaker_id: picked }));
@@ -1268,6 +1343,7 @@ export function openSegmentSheet(seg, ctx) {
           : null
       ),
       pick,
+      nameRow,
       h(
         'div',
         { class: 'sheet-head' },

@@ -1581,6 +1581,52 @@ export function runE2E(deps) {
     // vocabulary, and the vocabulary changes what the next turn is heard as.
     // -----------------------------------------------------------------------
 
+    await step('a-new-voice-can-be-named-where-you-read-it', async () => {
+      // A row spoken by a voice with no name yet (the mock's Speaker_07) opens
+      // a sheet that offers a name field under the picker; Enter names it and
+      // the daemon's relabel broadcast repaints the row. A named voice gets no
+      // such offer here — renaming stays on the Speakers page.
+      const target = await js(`(() => {
+        const s = window.__recallDebug.store;
+        const rows = [...document.querySelectorAll('#seg-list .seg')];
+        const row = rows.reverse().find((r) => {
+          const seg = s.segById.get(Number(r.dataset.seg));
+          const sp = seg && seg.speaker != null ? s.speakers.get(seg.speaker) : null;
+          return sp && !sp.name;
+        });
+        if (!row) return null;
+        row.click();
+        const seg = s.segById.get(Number(row.dataset.seg));
+        return { id: seg.id, speaker: seg.speaker, label: row.querySelector('.who')?.textContent ?? row.textContent.slice(0, 40) };
+      })()`);
+      assert(target, 'no row by an unnamed voice in the live window');
+      await waitFor('the sheet', async () => js('!!document.querySelector(".sheet #segment-text")'));
+      const before = await js('window.__recallDebug.accuracy()');
+      assert(before.sheet.nameOffered, 'the sheet did not offer to name the voice');
+      assert(/no name yet/.test(before.sheet.nameHint), `hint does not say so: "${before.sheet.nameHint}"`);
+      const name = `Driver${Date.now() % 10000}`;
+      await js(`(() => {
+        const i = document.getElementById('name-voice');
+        i.value = ${JSON.stringify(name)};
+        i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        return true;
+      })()`);
+      const named = await waitFor('the relabel to land', async () => {
+        const v = await js(`(() => {
+          const s = window.__recallDebug.store;
+          const sp = s.speakers.get(${target.speaker});
+          const row = document.querySelector('#seg-list .seg[data-seg="${target.id}"]');
+          return { name: sp?.name ?? null, row: row ? row.textContent : '' , offered: !!document.getElementById('name-voice-row') && !document.getElementById('name-voice-row').hidden };
+        })()`);
+        return v.name === name && v.row.includes(name) ? v : null;
+      });
+      assert(!named.offered, 'the offer stayed up after the voice was named');
+      // Put the fixture back so later steps meet the voice they expect.
+      await js(`window.recall.request('speakers.name', { id: ${target.speaker}, name: '' })`);
+      await js('document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))');
+      return { segment: target.id, speaker: target.speaker, named: name };
+    });
+
     await step('notes-to-self-render-and-flip-state', async () => {
       await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
       const a = await waitFor('the notes list', async () => {

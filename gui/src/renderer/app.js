@@ -1028,6 +1028,9 @@ document.addEventListener('keydown', (e) => {
         hint: (document.getElementById('segment-fix-hint') || {}).textContent ?? '',
         via: (document.getElementById('segment-text-via') || {}).textContent ?? '',
         shaky: (document.getElementById('segment-shaky') || {}).textContent ?? '',
+        // 0.10.0: the offer to name a voice that has none, right in the sheet.
+        nameOffered: !!document.getElementById('name-voice-row') && !document.getElementById('name-voice-row').hidden,
+        nameHint: (document.getElementById('name-voice-hint') || {}).textContent ?? '',
       },
       notes: [...document.querySelectorAll('#note-list .note-row')].map((r) => ({
         id: Number(r.dataset.note),

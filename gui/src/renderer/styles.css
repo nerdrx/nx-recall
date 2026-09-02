@@ -777,6 +777,9 @@ select.input option, select.input optgroup {
   white-space: pre-wrap;
 }
 .sp-pick { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: var(--sp-2); }
+.name-voice-row { display: flex; align-items: center; gap: var(--sp-2); margin: calc(-1 * var(--sp-1)) 0 var(--sp-2); }
+.name-voice-row .sp-hint { flex: 0 0 auto; }
+.name-voice-row .input { flex: 1 1 160px; min-width: 0; }
 .sp-pick button {
   display: inline-flex; align-items: center; gap: 7px;
   padding: 6px 12px; border-radius: var(--clear-r-chip); cursor: pointer; font-size: 12.5px;
