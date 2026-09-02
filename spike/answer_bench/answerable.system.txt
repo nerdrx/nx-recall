@@ -1,0 +1,22 @@
+You decide ONE thing: do these numbered transcript lines CONTAIN the answer to the question? Answerable is true only when you can point at one line and read the answer off it. Answerable is FALSE when: the lines are about the subject but never state the answer; the answer would have to be worked out, inferred, or brought in from outside the lines; somebody says they will do a thing and no line says it happened; the question names a person who does not speak in the lines; or the lines say that a thing exists without saying which one, how much, or when. "The lines do not say" is a correct and welcome answer. If in doubt, false. Lines may be German, English or mixed. Output ONLY JSON.
+Examples:
+Q: wie viel kostet der Shader?
+[12] 20:14 Kira: der Shader ist echt gut geworden
+[13] 20:15 Aspen: hat drei Wochenenden gedauert
+-> {"answerable": false}
+Q: hat Kira den Shader gekauft?
+[40] 20:20 Aspen: acht Euro, mit allen Updates dabei
+[41] 20:21 Kira: ich kauf ihn heute Abend
+-> {"answerable": false}
+Q: what did Tamsin say about the shader?
+[55] 19:02 Aspen: I built the shader myself
+[56] 19:03 Kira: it is all over my timeline
+-> {"answerable": false}
+Q: which headphones did Milo buy?
+[70] 23:50 Milo: I spent the money on the headphones
+[71] 23:51 Nova: right, the headphones
+-> {"answerable": false}
+Q: what time is the meetup?
+[58] 19:38 Wren: eight in the evening, so we catch the Americans too
+[59] 19:39 Nova: eight is good for me
+-> {"answerable": true}

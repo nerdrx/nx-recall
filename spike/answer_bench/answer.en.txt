@@ -1,0 +1,6 @@
+You answer ONE question using ONLY the numbered lines you are shown. It has already been decided that the answer is in the lines; your job is only to write it down. Write in ENGLISH, in one or two sentences, at most 60 words. Write nothing that is not in the lines — no outside knowledge, no guessing, and never mention "the lines" or "the transcript". `citations` are the numbers of the lines the sentence came from, at least one, and only numbers you were shown. Output ONLY JSON.
+Example:
+Question: what time is the meetup and where?
+[204] 19:38 Wren: eight in the evening, so we catch the Americans too
+[206] 19:40 Wren: I put it in The Great Pug, the usual instance
+-> {"answer": "The meetup is at eight in the evening in The Great Pug.", "citations": [204, 206]}

@@ -45,6 +45,13 @@ const facetState = {
   // which lives on `asked`. Sticky like the rest of the facets.
   world: '',
   worldLabel: '',
+  // 0.11.0. The last `search.answer` reply's `answer`, or its `refused`, or
+  // null when the query that produced what is on screen was not a question.
+  // Deliberately NOT sticky across mounts in any meaningful way: an answer is a
+  // reading of the archive at the moment it was asked, and one left on screen
+  // after the question scrolled away is a sentence with nothing under it.
+  answer: null,
+  refused: null,
 };
 let lastHits = [];
 
@@ -192,14 +199,25 @@ export function mount(root, ctx, arg) {
    */
   async function runAsk() {
     facetState.q = qInput.value;
+    facetState.answer = null;
+    facetState.refused = null;
     if (!facetState.q.trim()) {
       facetState.asked = null;
       renderPills();
       return run();
     }
+    // 0.11.0. A question gets an answer; a keyword query gets what it always
+    // got. The reading is the daemon's own (`interpretation.is_question`), but
+    // the DECISION of which method to call has to happen before the round
+    // trip, so it is made here with the same two rules and then confirmed:
+    // `search.answer` returns everything `search.ask` does, so a query this
+    // guessed wrong about costs a model call it did not need and nothing else.
+    const question = looksLikeAQuestion(facetState.q);
     try {
-      const res = await ask('search.ask', { q: facetState.q, limit: 100 });
+      const res = await ask(question ? 'search.answer' : 'search.ask', { q: facetState.q, limit: 100 });
       facetState.asked = res.interpretation ?? null;
+      facetState.answer = res.answer ?? null;
+      facetState.refused = res.refused ?? null;
       // The mode the daemon chose is the mode the toggle now shows: the control
       // must never claim one thing while the results came from another.
       if (facetState.asked?.mode) {
@@ -211,12 +229,29 @@ export function mount(root, ctx, arg) {
       renderHits(res);
     } catch (e) {
       if (e.code === 'unknown_method') {
+        // A daemon too old for 0.11.0 can still read the question — try the
+        // one method back before giving up on the whole path. Only then does
+        // this fall through to a plain keyword search.
+        if (question) {
+          try {
+            const res = await ask('search.ask', { q: facetState.q, limit: 100 });
+            facetState.asked = res.interpretation ?? null;
+            lastHits = res.hits ?? [];
+            renderPills();
+            renderHits(res);
+            return undefined;
+          } catch (again) {
+            if (again.code !== 'unknown_method') throw again;
+          }
+        }
         facetState.asked = null;
         renderPills();
         toast('This daemon cannot read a question yet — searching for those words instead.', '');
         return run();
       }
       facetState.asked = null;
+      facetState.answer = null;
+      facetState.refused = null;
       renderPills();
       clear(results);
       results.append(
@@ -235,6 +270,10 @@ export function mount(root, ctx, arg) {
    */
   async function rerunAsked() {
     const it = facetState.asked;
+    // Taking a pill off changes which turns were searched, so whatever
+    // sentence was above them was read off a different set of rows. It goes.
+    facetState.answer = null;
+    facetState.refused = null;
     if (!it) return run();
     const params = { q: it.query ?? '', limit: 100 };
     if (it.speaker_id != null) params.speaker = it.speaker_id;
@@ -396,8 +435,11 @@ export function mount(root, ctx, arg) {
   async function run() {
     // An explicit search is a different question from the one that was asked,
     // so the pills go: leaving them up would explain results they did not
-    // produce, which is worse than explaining nothing.
+    // produce, which is worse than explaining nothing. The answer goes with
+    // them, and for the stronger version of the same reason.
     facetState.asked = null;
+    facetState.answer = null;
+    facetState.refused = null;
     renderPills();
     facetState.q = qInput.value;
     facetState.speaker = speakerSel.value;
@@ -464,9 +506,124 @@ export function mount(root, ctx, arg) {
     }
   }
 
+  // -- 0.11.0: the answer card ------------------------------------------------
+
+  /**
+   * Was this typed as a question? Two readings, and a person means either: it
+   * ends in a question mark, or it opens with an interrogative. The daemon has
+   * the same two rules and reports its own reading as
+   * `interpretation.is_question` — but the call has to be chosen BEFORE the
+   * round trip, so this is the copy that picks the method. Deliberately not
+   * "contains an interrogative anywhere": "the world where we met" is a phrase
+   * somebody is searching for, and answering it in a sentence would be the app
+   * talking over them.
+   */
+  const INTERROGATIVES =
+    /^(was|wer|wen|wem|wessen|wann|wo|wohin|woher|wie|warum|wieso|weshalb|welche[rsn]?|what|who|whom|whose|when|where|why|how|which)\b/i;
+
+  function looksLikeAQuestion(q) {
+    const s = String(q ?? '').trim();
+    return s.endsWith('?') || INTERROGATIVES.test(s);
+  }
+
+  /** The hit row for one segment id, if it is on screen. */
+  function hitById(id) {
+    return results.querySelector(`.seg[data-hit="${id}"]`);
+  }
+
+  /**
+   * One citation, as a chip that goes somewhere. It scrolls the hit into view
+   * and flashes it — deliberately NOT a jump into the transcript, which is what
+   * clicking the hit itself does: the question a chip answers is "which line
+   * says that?", and the line is right here.
+   */
+  function citationChip(id) {
+    const seg = lastHits.find((s) => s.id === id);
+    // A citation for a hit that is not on the page cannot be rendered as a
+    // chip that goes nowhere, so it is not rendered at all — and the card
+    // below refuses to draw an answer with no chips left.
+    if (!seg) return null;
+    const label = `${fmtClock(seg.t_ms).slice(0, 5)} ${segmentSpeakerLabel(seg)}`;
+    const go = () => {
+      const row = hitById(id);
+      if (!row) return;
+      row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      row.classList.remove('cited');
+      // Reflow, so re-clicking the same chip restarts the flash instead of
+      // doing nothing because the class never left.
+      void row.offsetWidth;
+      row.classList.add('cited');
+      setTimeout(() => row.classList.remove('cited'), 1600);
+    };
+    return h(
+      'button',
+      {
+        class: 'chip cite-chip',
+        dataset: { cite: String(id) },
+        title: 'Show the turn this came from',
+        'aria-label': `Show the turn at ${label}`,
+        onclick: go,
+      },
+      label
+    );
+  }
+
+  /**
+   * The sentence, above the hits, with the turns it was read off under it.
+   *
+   * Three rules, and all three are the feature:
+   * - an answer is never rendered without its chips. A sentence with no
+   *   evidence attached is the app asserting something, which is the one thing
+   *   this whole path exists not to do;
+   * - a refusal is one quiet line, not a red box. "The transcript does not say"
+   *   is a correct answer, and the hits below it are still useful;
+   * - a query that was not a question gets neither.
+   */
+  function answerCard() {
+    if (facetState.refused) {
+      return h(
+        'div',
+        { class: 'answer-card refused', id: 'answer-card' },
+        h('p', { class: 'answer-refused', id: 'answer-refused', text: refusalLine(facetState.refused.reason) })
+      );
+    }
+    const a = facetState.answer;
+    if (!a?.text) return null;
+    const chips = (a.citations ?? []).map(citationChip).filter(Boolean);
+    if (!chips.length) return null;
+    return h(
+      'div',
+      { class: 'answer-card', id: 'answer-card' },
+      h('p', { class: 'answer-text', id: 'answer-text', text: a.text }),
+      h(
+        'div',
+        { class: 'answer-cites', id: 'answer-cites' },
+        h('span', { class: 'sub', text: 'from' }),
+        ...chips
+      )
+    );
+  }
+
+  /**
+   * What to say when it did not answer. The daemon's reasons are written for a
+   * person already, so most of them are passed through — but the two that name
+   * machinery are not something anybody asked about, and the one a user will
+   * see most often gets the plainest sentence in the app.
+   */
+  function refusalLine(reason) {
+    if (reason === 'there is nothing in the archive about that') return 'Nothing in the transcript is about that.';
+    if (reason === 'the local model is switched off') return 'Answers need the local model, which is switched off.';
+    if (String(reason ?? '').startsWith('answers need the local model')) return 'Answers need the local model, which is not installed.';
+    return 'The transcript does not say.';
+  }
+
   function renderHits(res, modeId = facetState.mode) {
     clear(results);
     sub.textContent = resultSummary(modeId, res, facetState.asked?.query ?? facetState.q);
+    // The card is built AFTER the hits exist in `lastHits` and appended BEFORE
+    // them, because a chip has to be able to find the row it points at.
+    const card = answerCard();
+    if (card) results.append(card);
     if (!lastHits.length) {
       results.append(
         h(

@@ -218,6 +218,51 @@ pub fn source_json(row: &crate::store::SourceRow, allowed: bool) -> Value {
     })
 }
 
+// ---- 0.11.0, grounded answers ---------------------------------------------
+
+/// The top hits of a `search.ask` reply, as rows the model can be shown.
+///
+/// Read out of the JSON rather than out of the database on purpose: the rows a
+/// question is answered from must be **the rows the client is looking at**, or
+/// a citation chip points at something the page does not contain. Rows with no
+/// words are dropped — an empty turn cannot state anything — and the list is
+/// capped at [`crate::answer::MAX_HITS`].
+pub fn answer_rows(asked: &Value) -> Vec<crate::answer::Row> {
+    asked["hits"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|h| {
+            let text = h["text"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            Some(crate::answer::Row {
+                id: h["id"].as_i64()?,
+                clock: hhmm(h["t_ms"].as_i64().unwrap_or(0)),
+                // An unnamed voice is shown as one. Not dropped, unlike
+                // `crate::llm::transcript`'s anonymous turns: nobody is being
+                // attributed a promise here, and a row somebody said is a row
+                // that can hold an answer whoever said it.
+                who: h["speaker_name"].as_str().unwrap_or("someone").to_string(),
+                text: text.to_string(),
+            })
+        })
+        .take(crate::answer::MAX_HITS)
+        .collect()
+}
+
+/// `HH:MM`, on the machine's local clock. A question is very often about when.
+fn hhmm(ms: i64) -> String {
+    let ns = ms * 1_000_000;
+    let local = ms.div_euclid(1000) + crate::clock::local_offset_s(ns);
+    let s = local.rem_euclid(86_400);
+    format!("{:02}:{:02}", s / 3600, (s % 3600) / 60)
+}
+
+// ---- end 0.11.0 ------------------------------------------------------------
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpState {
     Running,
@@ -248,6 +293,22 @@ pub struct Service {
     /// `truth.*` methods answer honestly without it, saying the ingest is not
     /// running, which is exactly what is true.
     truth: std::sync::OnceLock<Arc<TruthWiring>>,
+    // ---- 0.11.0, grounded answers -------------------------------------
+    /// The `[runtime]` discipline a `search.answer` model call runs under, and
+    /// the lock that keeps two of them from ever running at once.
+    ///
+    /// A `OnceLock` for the reason `semantic` and `truth` are ones: only
+    /// `recalld run` has a config file to read this out of, and every other
+    /// caller of `Service::new` would otherwise pass a value it does not care
+    /// about. Absent, the defaults apply — nice 19 and no pin, which is the
+    /// project rule with the machine-specific half missing.
+    answers: std::sync::OnceLock<crate::config::RuntimeConfig>,
+    /// One question at a time. `llama-cli` at four threads is most of a
+    /// person's inference budget, and two of them racing is how an answer
+    /// starts costing a frame — the rule the whole of `crate::llm` exists to
+    /// keep.
+    answering: Mutex<()>,
+    // ---- end 0.11.0 ----------------------------------------------------
 }
 
 /// What `recalld run` hands the service about the truth subsystem (0.9.0).
@@ -272,8 +333,21 @@ impl Service {
             ops: Mutex::new(HashMap::new()),
             semantic: std::sync::OnceLock::new(),
             truth: std::sync::OnceLock::new(),
+            // ---- 0.11.0 ----
+            answers: std::sync::OnceLock::new(),
+            answering: Mutex::new(()),
+            // ---- end 0.11.0 ----
         })
     }
+
+    // ---- 0.11.0, grounded answers ---------------------------------------
+    /// Hand the service the `[runtime]` discipline its own model calls must
+    /// run under. Called once, at start-up, by `recalld run` and by nobody
+    /// else.
+    pub fn attach_answers(&self, runtime: crate::config::RuntimeConfig) {
+        let _ = self.answers.set(runtime);
+    }
+    // ---- end 0.11.0 ------------------------------------------------------
 
     /// Hand the service the truth subsystem's wiring (0.9.0). Called once, at
     /// start-up, by `recalld run` and by nobody else.
@@ -357,6 +431,9 @@ impl Service {
             "search.semantic" => self.search_semantic(req),
             // ---- 0.8.0, the product round (PROTOCOL "the accuracy round") --
             "search.ask" => self.search_ask(req),
+            // ---- 0.11.0, grounded answers (PROTOCOL "0.11.0") --------------
+            "search.answer" => self.search_answer(req),
+            // ---- end 0.11.0 ------------------------------------------------
             "notes.list" => self.notes_list(req),
             "notes.set_state" => self.notes_set_state(req),
             "person.brief" => self.person_brief(req),
@@ -3391,6 +3468,12 @@ impl Service {
                 "from_ms": interpretation.from_ns.map(ns_to_ms),
                 "to_ms": interpretation.to_ns.map(ns_to_ms),
                 "mode": mode,
+                // 0.11.0. Was this typed as a question? A client uses it to
+                // decide whether to call `search.answer` instead, and it is
+                // reported rather than left to each client to work out —
+                // otherwise the daemon's reading of "is this a question" and
+                // the GUI's would eventually differ.
+                "is_question": crate::ask::is_question(&q),
             },
             "total": hits.len(),
             "hits": hits,
@@ -3477,6 +3560,109 @@ impl Service {
             hits.push(item);
         }
         Ok((hits, mode::HYBRID))
+    }
+
+    // ---- 0.11.0, grounded answers (PROTOCOL "0.11.0") --------------------
+
+    /// `search.answer` — the same search, with one sentence on top of it.
+    ///
+    /// Everything `search.ask` returns, plus exactly one of `answer` and
+    /// `refused`. The hits come back either way and that is the whole design:
+    /// a refusal is not an error page, it is the search results with an honest
+    /// line above them saying the transcript does not contain what you asked
+    /// for. Nothing is written to the store — this is a read.
+    ///
+    /// The model call happens with **no store lock held**, which is why the
+    /// search is finished and the rows are copied out before it starts. The
+    /// 2026-09-02 night shift is why that rule is not negotiable
+    /// ([`crate::enrich`]).
+    fn search_answer(self: &Arc<Self>, req: &Request) -> Result<Value, Error> {
+        use crate::answer::{Outcome, refusal};
+
+        // The search half is `search.ask`'s, called rather than copied: the
+        // contract says the interpretation and the hits are the same shapes,
+        // and the only way to keep that true is for them to be the same code.
+        let mut out = self.search_ask(req)?;
+        let q = req.str("q")?.trim().to_string();
+
+        let (answer, refused) = match self.answer_for(&q, &out) {
+            Ok((Outcome::Answered(a), via, took)) => (
+                Some(json!({
+                    "text": a.text,
+                    "lang": crate::answer::question_lang(&q),
+                    "citations": a.citations,
+                    "via": via,
+                    "took_ms": took,
+                })),
+                None,
+            ),
+            Ok((Outcome::Refused(why), _, _)) => (None, Some(why)),
+            Err(e) => {
+                // A model that timed out or died is a refusal, not a 500: the
+                // hits are still a perfectly good answer to the question, and
+                // the whole point of this method is that not answering is a
+                // first-class result.
+                warn!("a grounded answer failed: {e:?}");
+                (None, Some(refusal::UNGROUNDED))
+            }
+        };
+        out["answer"] = answer.unwrap_or(Value::Null);
+        out["refused"] = match refused {
+            Some(reason) => json!({"reason": reason}),
+            None => Value::Null,
+        };
+        // 0.11.0: the daemon says whether it read the query as a question, so
+        // a client does not have to keep its own copy of the interrogative
+        // list and get a different answer from the one that ran.
+        out["interpretation"]["is_question"] = json!(crate::ask::is_question(&q));
+        Ok(out)
+    }
+
+    /// The model half. Split out so the socket method above stays about JSON,
+    /// and so the store lock is provably not held across a `llama-cli` call:
+    /// the rows are `String`s by the time this is entered.
+    fn answer_for(
+        &self,
+        q: &str,
+        asked: &Value,
+    ) -> Result<(crate::answer::Outcome, String, i64), Error> {
+        use crate::answer::{GATE, Outcome, refusal};
+
+        let started = utc_now_ns();
+        let took = |from: i64| (utc_now_ns() - from) / 1_000_000;
+        let no = |why| Ok((Outcome::Refused(why), String::new(), took(started)));
+
+        if !GATE {
+            return no(refusal::OFF);
+        }
+        let cfg = self.control.graph();
+        if !cfg.enabled {
+            return no(refusal::SWITCHED_OFF);
+        }
+        let runtime = self.answers.get().cloned().unwrap_or_default();
+        let Some(llm) = self
+            .control
+            .models_root
+            .as_deref()
+            .and_then(|root| crate::llm::Llm::resolve(root, &cfg, &runtime))
+        else {
+            return no(refusal::NO_MODEL);
+        };
+
+        let rows = answer_rows(asked);
+        if rows.is_empty() {
+            return no(refusal::NO_HITS);
+        }
+
+        // One question at a time. Held across the model calls and nothing
+        // else; a second question waits rather than starting a second
+        // `llama-cli`.
+        let _one = self.answering.lock().unwrap_or_else(|p| p.into_inner());
+        let llm = llm.with_threads(cfg.llm_threads);
+        let tag = crate::answer::question_lang(q);
+        let outcome = crate::answer::judge(&llm, q, &rows, tag)
+            .map_err(|e| Error::new("failed", format!("{e:#}")))?;
+        Ok((outcome, llm.model_id().to_string(), took(started)))
     }
 
     /// `notes.list` — what you told yourself to remember.
@@ -7113,6 +7299,110 @@ mod tests {
         let r = rig("ask-empty");
         let e = call(&r, r#"{"id":1,"method":"search.ask","params":{"q":"   "}}"#).unwrap_err();
         assert_eq!(e.code, "params");
+    }
+
+    // ---- 0.11.0: search.answer -------------------------------------------
+
+    /// Everything `search.ask` returns, plus a refusal — because a test rig has
+    /// no 1.9 GB model, and "no model" is a refusal like any other rather than
+    /// an error. The point of the assertion is the shape: a client that renders
+    /// the hits and the note must be able to do so without a model anywhere in
+    /// the picture.
+    #[test]
+    fn answer_returns_the_hits_and_says_why_it_did_not_answer() {
+        let r = rig("answer-refuse");
+        let session = a_session(&r);
+        let aspen = {
+            let store = r.service.store();
+            let id = store.create_speaker("Speaker_01", 0).unwrap();
+            store.rename_speaker(id, "Aspen", 1).unwrap();
+            id
+        };
+        let wanted = a_turn_at(
+            &r,
+            session,
+            local_noon(-1),
+            Some(aspen),
+            "the shader costs eight euros",
+        );
+
+        let out = call(
+            &r,
+            r#"{"id":1,"method":"search.answer","params":{"q":"what did Aspen say about the shader yesterday?"}}"#,
+        )
+        .unwrap();
+
+        // The search half is `search.ask`'s, field for field.
+        assert_eq!(out["interpretation"]["speaker_id"], json!(aspen));
+        assert_eq!(out["interpretation"]["query"], json!("shader"));
+        assert_eq!(out["interpretation"]["mode"], json!("fts"));
+        assert_eq!(out["interpretation"]["is_question"], json!(true));
+        let hits = out["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["id"], json!(wanted));
+
+        // …and exactly one of the two. Never both, never neither.
+        assert_eq!(out["answer"], Value::Null);
+        assert_eq!(
+            out["refused"]["reason"],
+            json!(crate::answer::refusal::SWITCHED_OFF),
+            "the graph model ships switched off, so that is the honest reason"
+        );
+    }
+
+    /// Nothing matched, so there is nothing to read — and the refusal happens
+    /// before any model is looked for, which is what makes this case free.
+    #[test]
+    fn a_question_nothing_matches_is_refused_without_asking_anything() {
+        let r = rig("answer-empty");
+        let out = call(
+            &r,
+            r#"{"id":1,"method":"search.answer","params":{"q":"what did anybody say about kryptonite?"}}"#,
+        )
+        .unwrap();
+        assert!(out["hits"].as_array().unwrap().is_empty());
+        assert_eq!(out["answer"], Value::Null);
+        assert!(out["refused"]["reason"].is_string());
+    }
+
+    /// The rows the model is shown are the rows the CLIENT is looking at, read
+    /// out of the reply it is about to get — because a citation chip that
+    /// points at a turn the page does not contain is a chip that goes nowhere.
+    #[test]
+    fn the_rows_the_model_reads_are_the_hits_the_client_gets() {
+        let asked = json!({"hits": [
+            {"id": 41, "t_ms": 0, "speaker_name": "Aspen", "text": "acht Euro"},
+            // No words: an empty turn cannot state anything, so it is not a row.
+            {"id": 42, "t_ms": 0, "speaker_name": "Kira", "text": "   "},
+            // No name: shown anyway. Nobody is being attributed a promise here.
+            {"id": 43, "t_ms": 0, "text": "auf Gumroad"},
+        ]});
+        let rows = answer_rows(&asked);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, 41);
+        assert_eq!(rows[0].who, "Aspen");
+        assert_eq!(rows[1].id, 43);
+        assert_eq!(rows[1].who, "someone");
+        // And never more than the contract's k, however long the hit list is.
+        let many: Vec<Value> = (0..50)
+            .map(|i| json!({"id": i, "t_ms": 0, "speaker_name": "E", "text": "x"}))
+            .collect();
+        assert_eq!(
+            answer_rows(&json!({"hits": many})).len(),
+            crate::answer::MAX_HITS
+        );
+    }
+
+    #[test]
+    fn the_clock_on_a_row_is_the_local_one() {
+        // Local midnight, in UTC milliseconds — whatever this machine's zone is.
+        let midnight = local_noon(0) - 12 * 3600 * 1_000_000_000;
+        assert_eq!(hhmm(midnight / 1_000_000), "00:00");
+        assert_eq!(hhmm(local_noon(0) / 1_000_000), "12:00");
+        assert_eq!(
+            hhmm((local_noon(0) + (3 * 3600 + 25 * 60) * 1_000_000_000) / 1_000_000),
+            "15:25"
+        );
     }
 
     #[test]

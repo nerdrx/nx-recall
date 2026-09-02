@@ -1,0 +1,7 @@
+root ::= "{" ws "\"answer\":" ws str "," ws "\"citations\":" ws cites ws "}"
+cites ::= "[" ws id (ws "," ws id)* ws "]"
+id ::= %IDS%
+str ::= "\"" chars "\""
+chars ::= char chars | char
+char ::= [^"\\\x00-\x1f] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])
+ws ::= [ \t\n]?

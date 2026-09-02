@@ -1,0 +1,235 @@
+{
+  "note": "Twenty-four questions over spike/answer_bench/transcript.json. Twelve the transcript answers and twelve it does not. `hits` are the segment ids the model is shown, in rank order — the retrieval is NOT what is being measured here (`search.ask` has its own numbers), so the hits are named by hand, which is also how the two 'the answer is in a different conversation' traps are built: the row that holds the answer is simply not in k.",
+  "gate": "traps refused >= 11/12 AND answerable answered with every citation correct >= 9/12",
+  "cases": [
+    {
+      "id": "de_one_price",
+      "expect": true,
+      "lang": "de",
+      "q": "wie viel kostet Aspens Shader?",
+      "hits": [108, 109, 110, 111],
+      "must_cite": [109],
+      "must_say": ["acht"],
+      "why": "one hit states it outright."
+    },
+    {
+      "id": "de_two_who_and_where",
+      "expect": true,
+      "lang": "de",
+      "q": "wer hat den Shader gebaut und wo kann man ihn kaufen?",
+      "hits": [102, 103, 107, 115],
+      "must_cite": [103, 107],
+      "must_say": ["gumroad"],
+      "why": "the maker is in one row and the shop in another."
+    },
+    {
+      "id": "en_one_time",
+      "expect": true,
+      "lang": "en",
+      "q": "what time is the meetup?",
+      "hits": [203, 204, 205, 209],
+      "must_cite": [204],
+      "must_say": ["eight"],
+      "why": "one hit states it outright."
+    },
+    {
+      "id": "en_two_when_and_where",
+      "expect": true,
+      "lang": "en",
+      "q": "when and where is the meetup?",
+      "hits": [201, 202, 204, 206],
+      "must_cite": [202, 206],
+      "must_say": ["saturday", "pug"],
+      "why": "the day is in one row and the world in another."
+    },
+    {
+      "id": "de_one_gpu",
+      "expect": true,
+      "lang": "de",
+      "q": "welche Grafikkarte hat Milo gekauft?",
+      "hits": [302, 303, 304, 308],
+      "must_cite": [304],
+      "must_say": ["4070"],
+      "why": "one hit names it."
+    },
+    {
+      "id": "de_two_world",
+      "expect": true,
+      "lang": "de",
+      "q": "wie heißt die Fotowelt und was ist da besonders?",
+      "hits": [313, 314, 315, 316],
+      "must_cite": [314],
+      "must_say": ["midnight rooftop"],
+      "why": "the name is in one row, what it looks like in the next two."
+    },
+    {
+      "id": "en_one_mic_fault",
+      "expect": true,
+      "lang": "en",
+      "q": "what was wrong with Aspen's microphone?",
+      "hits": [402, 403, 404, 405],
+      "must_cite": [404],
+      "must_say": ["hub"],
+      "why": "one hit states it, and states the negative too."
+    },
+    {
+      "id": "en_two_mic_model_and_fault",
+      "expect": true,
+      "lang": "en",
+      "q": "what microphone does Aspen use and what was the problem with it?",
+      "hits": [404, 409, 410, 412],
+      "must_cite": [404, 410],
+      "must_say": ["sm7b", "hub"],
+      "why": "the model is in one row and the fault in another."
+    },
+    {
+      "id": "de_one_holiday",
+      "expect": true,
+      "lang": "de",
+      "q": "wohin fährt Milo im August?",
+      "hits": [501, 502, 503, 504],
+      "must_cite": [503],
+      "must_say": ["norwegen"],
+      "why": "one hit names it."
+    },
+    {
+      "id": "de_two_holiday_length_and_company",
+      "expect": true,
+      "lang": "de",
+      "q": "wie lange ist Milo weg und fährt er allein?",
+      "hits": [505, 506, 512, 513],
+      "must_cite": [505, 513],
+      "must_say": ["drei", "allein"],
+      "why": "the length is in one row and the company in another."
+    },
+    {
+      "id": "en_one_job_role",
+      "expect": true,
+      "lang": "en",
+      "q": "what does Wren do at the new job?",
+      "hits": [805, 806, 807, 808],
+      "must_cite": [807],
+      "must_say": ["technical artist"],
+      "why": "one hit states the role."
+    },
+    {
+      "id": "en_two_job_where_and_when",
+      "expect": true,
+      "lang": "en",
+      "q": "where is Wren's new job and how long ago did it start?",
+      "hits": [801, 803, 804, 805],
+      "must_cite": [803, 805],
+      "must_say": ["hamburg", "three weeks"],
+      "why": "the city is in one row and the date in another."
+    },
+
+    {
+      "id": "trap_de_book_never_named",
+      "expect": false,
+      "trap": "topic mentioned, answer never stated",
+      "lang": "de",
+      "q": "wie heißt das Buch das Aspen empfohlen hat?",
+      "hits": [901, 903, 905, 907, 910],
+      "why": "five rows about the book and not one of them says its title."
+    },
+    {
+      "id": "trap_de_gpu_price_never_stated",
+      "expect": false,
+      "trap": "topic mentioned, answer never stated",
+      "lang": "de",
+      "q": "was hat Milos Grafikkarte gekostet?",
+      "hits": [309, 310, 311, 312],
+      "why": "the question is literally asked in the transcript and refused: 'frag lieber nicht'."
+    },
+    {
+      "id": "trap_en_headset_reason_out_of_k",
+      "expect": false,
+      "trap": "the answer is in a different part of the conversation than the hits",
+      "lang": "en",
+      "q": "why did Milo send the headset back?",
+      "hits": [1001, 1002, 1006, 1008],
+      "why": "row 1004 is the reason and it is not in k. The rows say THAT he sent it back, never why."
+    },
+    {
+      "id": "trap_en_gpu_out_of_conversation",
+      "expect": false,
+      "trap": "the answer is in a different conversation than the hits",
+      "lang": "en",
+      "q": "which graphics card did Milo buy?",
+      "hits": [1016, 1017, 1018, 1014],
+      "why": "the whole of c3 is out of k. These rows know a card was bought and not which."
+    },
+    {
+      "id": "trap_de_person_never_spoke",
+      "expect": false,
+      "trap": "a person who never spoke",
+      "lang": "de",
+      "q": "was hat Tamsin über den Shader gesagt?",
+      "hits": [101, 103, 107, 115],
+      "why": "nobody called Tamsin is in the archive at all."
+    },
+    {
+      "id": "trap_en_world_knowledge_author",
+      "expect": false,
+      "trap": "world knowledge",
+      "lang": "en",
+      "q": "who wrote the book Aspen recommended?",
+      "hits": [901, 904, 906, 910],
+      "why": "answerable only from outside the archive, and only if the book had been named."
+    },
+    {
+      "id": "trap_de_world_knowledge_distance",
+      "expect": false,
+      "trap": "world knowledge",
+      "lang": "de",
+      "q": "wie weit ist Tromsö von Hamburg entfernt?",
+      "hits": [503, 505, 510, 805],
+      "why": "both place names are in the hits and the distance is in nobody's transcript."
+    },
+    {
+      "id": "trap_de_intention_is_not_a_fact",
+      "expect": false,
+      "trap": "a yes/no the transcript negates",
+      "lang": "de",
+      "q": "hat Kira den Shader gekauft?",
+      "hits": [108, 109, 112, 118],
+      "why": "she says she WILL buy it tonight. An intention read as a fact is the whole failure mode."
+    },
+    {
+      "id": "trap_de_question_over_english_hits",
+      "expect": false,
+      "trap": "a question in the other language",
+      "lang": "de",
+      "q": "was hat das Headset gekostet?",
+      "hits": [1001, 1002, 1003, 1006],
+      "why": "German question, English rows, and the price is in none of them."
+    },
+    {
+      "id": "trap_en_question_over_german_hits",
+      "expect": false,
+      "trap": "a question in the other language",
+      "lang": "en",
+      "q": "how much did Aspen pay for the mastering?",
+      "hits": [713, 715, 716, 717],
+      "why": "English question, German rows, and 'geht so' is not a price."
+    },
+    {
+      "id": "trap_de_no_hits",
+      "expect": false,
+      "trap": "empty hits",
+      "lang": "de",
+      "q": "was hat Juno gestern über das Wetter gesagt?",
+      "hits": [],
+      "why": "refused before any model call."
+    },
+    {
+      "id": "trap_en_no_hits",
+      "expect": false,
+      "trap": "empty hits",
+      "lang": "en",
+      "q": "what is the wifi password?",
+      "hits": [],
+      "why": "refused before any model call."
+    }
+  ]
+}

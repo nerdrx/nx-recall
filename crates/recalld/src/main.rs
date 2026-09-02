@@ -385,6 +385,10 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     if let Some(leg) = semantic {
         service.attach_semantic(leg);
     }
+    // ---- 0.11.0: `search.answer` runs its own model call, under the same
+    // `[runtime]` discipline every other one does. ----
+    service.attach_answers(cfg.runtime.clone());
+    // ---- end 0.11.0 ----
     let socket = if cfg.socket.enabled {
         let path = config::socket_path(&cfg.socket, data_dir);
         match server::serve(Arc::clone(&service), &path) {
