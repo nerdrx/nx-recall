@@ -15,8 +15,8 @@ your own GPU. Every byte of it on your silicon. Nothing, ever, anywhere else.**
 ![telemetry](https://img.shields.io/badge/telemetry-none._ever.-0a0714?style=for-the-badge)
 ![languages](https://img.shields.io/badge/languages-25-7700FF?style=for-the-badge)
 ![rust](https://img.shields.io/badge/daemon-rust_·_70k_lines-b7410e?style=for-the-badge)
-![tests](https://img.shields.io/badge/tests-883_rust_·_151_node_·_186_e2e-2ea44f?style=for-the-badge)
-![releases](https://img.shields.io/badge/releases-27_in_4_days-7700FF?style=for-the-badge)
+![tests](https://img.shields.io/badge/tests-897_rust_·_152_node_·_188_e2e-2ea44f?style=for-the-badge)
+![releases](https://img.shields.io/badge/releases-28_in_4_days-7700FF?style=for-the-badge)
 ![footprint](https://img.shields.io/badge/live_pipeline-%3C5%25_of_one_core-2ea44f?style=for-the-badge)
 ![experiments](https://img.shields.io/badge/experiments-33_scripts_·_17_findings-0a0714?style=for-the-badge)
 
@@ -334,7 +334,7 @@ missing feature, the [legal architecture](docs/DESIGN.md#12-legal-note).
 | Daemon | Rust, 70k lines — PipeWire capture, four ONNX runtimes, one GGUF via llama.cpp, whisper.cpp on Vulkan at night, SQLite WAL, NDJSON socket, one loopback ingest for Discord's word |
 | Overlay | Rust — layer-shell captions on Wayland at 0.3–0.5 ms a frame, an OpenXR path behind a flag |
 | Client | Electron, 21k lines, zero runtime dependencies, NX Clear in both grounds |
-| Tests | **883 Rust + 151 node + 93 headless-compositor steps × 2 themes** — every fix ships with a test that failed on the old code |
+| Tests | **897 Rust + 152 node + 94 headless-compositor steps × 2 themes** — every fix ships with a test that failed on the old code |
 | Schema | v12, migrated in place from v1 on a live database, every step idempotent, three independent halves where three tracks landed on one number |
 | Models | pyannote gate 6 MB · Parakeet v3 620 MB · ERes2Net 26 MB · e5 135 MB · Qwen 3B 1.9 GB · Canary cross-checker 154 MB · large-v3 q5_0 1.03 GB · arbiters on demand — all pinned to exact bytes |
 | Scheduling | live pipeline at nice 19 on the cores your game does not use; every background pass gated on pause, backlog, and — for the GPU — the busy counter, checked before every batch |
