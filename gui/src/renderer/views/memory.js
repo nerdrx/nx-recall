@@ -783,7 +783,7 @@ export function mount(root, ctx) {
         class: 'rail-hint',
         id: 'accuracy-note',
         style: 'padding:10px 0 0;max-width:70ch',
-        text: 'Two different measurements. "Changed" counts only the lines somebody retyped, so it reads high where you have been careful and says nothing where you have not. "Shaky" is the share of all checked rows a second decoder read differently — unbiased, but a disagreement is not always an error.',
+        text: 'Two different estimates. "Changed" counts only the lines somebody retyped, so it reads high where you have been careful and says nothing where you have not. "Shaky" is the share of all checked rows a second decoder read differently — unbiased, but a disagreement is not always an error.',
       })
     );
   }

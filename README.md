@@ -284,7 +284,7 @@ or sharing surface at all** — not a missing feature, the
 |---|---|
 | Daemon | Rust — PipeWire capture, four ONNX runtimes, one GGUF via llama.cpp, whisper.cpp on Vulkan at night, SQLite WAL, NDJSON socket, one loopback ingest for Discord's word |
 | Client | Electron, 12k lines, zero runtime dependencies, NX Clear in both grounds |
-| Tests | **840 Rust + 144 node + 91 headless-compositor steps × 2 themes** |
+| Tests | **883 Rust + 151 node + 93 headless-compositor steps × 2 themes** |
 | Schema | v12, migrated in place from v1 on a live database, every step idempotent |
 | Models | pyannote gate 6 MB · Parakeet v3 620 MB · ERes2Net 26 MB · e5 135 MB · Qwen 3B 1.9 GB · Canary cross-checker 154 MB · large-v3 q5_0 1.03 GB for the night shift · arbiters on demand — all pinned to exact bytes |
 | Updates | the daemon watches its own binary, drains, restarts; the GUI offers one click; a dozen hands-free updates and counting |
