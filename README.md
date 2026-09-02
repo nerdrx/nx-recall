@@ -243,6 +243,23 @@ And the parts that make a memory useful on its own: reminders that fire
 ("Recall, erinner mich morgen um zehn …"), one paragraph per conversation the
 next morning, and a translation under any turn in a language you do not read.
 
+## Where you were, how you talk, and the bar that never takes a click
+
+**World memory** reads the VRChat log for the world and instance you were in,
+stamps every conversation with it, and gives the person page "where you
+meet". A question can name a world in either language. **Turn-taking
+statistics** are pure queries over turns you already have: talk share, turn
+length, longest monologue, interruptions given and received (an approximation,
+and the tooltip says exactly which one), response latency. **Replay** plays a
+conversation back with the transcript following, reading through the turns
+whose audio retention already took. **Export** writes Markdown to a folder on
+this disk and refuses network filesystems and files it did not write. A
+**room microphone** hears the people physically beside you and goes through
+the same pipeline as everyone else. And because Electron cannot make a window
+ignore clicks on Linux — measured, not assumed — the caption bar on KDE
+Wayland is a native layer-shell surface with an empty input region, drawn by
+the overlay binary from the daemon socket.
+
 ## What never leaves this machine
 
 | Artifact | Lives | Leaves |
@@ -268,7 +285,7 @@ or sharing surface at all** — not a missing feature, the
 | Daemon | Rust — PipeWire capture, four ONNX runtimes, one GGUF via llama.cpp, whisper.cpp on Vulkan at night, SQLite WAL, NDJSON socket, one loopback ingest for Discord's word |
 | Client | Electron, 12k lines, zero runtime dependencies, NX Clear in both grounds |
 | Tests | **768 Rust + 116 node + 81 headless-compositor steps × 2 themes** |
-| Schema | v11, migrated in place from v1 on a live database, every step idempotent |
+| Schema | v12, migrated in place from v1 on a live database, every step idempotent |
 | Models | pyannote gate 6 MB · Parakeet v3 620 MB · ERes2Net 26 MB · e5 135 MB · Qwen 3B 1.9 GB · Canary cross-checker 154 MB · large-v3 q5_0 1.03 GB for the night shift · arbiters on demand — all pinned to exact bytes |
 | Updates | the daemon watches its own binary, drains, restarts; the GUI offers one click; a dozen hands-free updates and counting |
 | Provenance | every derived row carries its model id, confidence, and how the label arrived: `match · mic · proximity · re-decode · context` |
@@ -303,6 +320,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.8.2 | +84h | yesterday stops landing under now: a re-published archive row is history, not an arrival |
 | 0.9.0 | +92h | ground truth from Discord, the night shift on the GPU, captions, reminders, digests, translation; azimuth and the glossary re-read measured and parked; the quarterly model refresh says keep v3 |
 | 0.9.1 | +93h | `models build-night` fetches the Khronos headers a desktop with a working driver still lacks, and the runtime it installs finds its own libraries |
+| 0.10.0 | +98h | replay, world memory, turn-taking statistics, Markdown export, the room microphone, a Discord source card, naming a new voice from the transcript, and captions that really pass clicks through |
 
 ## Quickstart
 
