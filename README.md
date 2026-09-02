@@ -89,7 +89,7 @@ label (0.35, calibrated on real lobbies — the corpus value over-split 3×)
 
 ## Numbers we actually measured
 
-The measurement harness came first — 23 experiment scripts in
+The measurement harness came first — 27 experiment scripts in
 [`spike/`](spike/FINDINGS.md) — and two of the original design's core claims
 died in it before a line of the daemon existed.
 
@@ -106,6 +106,9 @@ died in it before a line of the daemon existed.
 | The promise model's trap-rejection | 9/9 — banter, suggestions, past tense, hypotheticals, absent third parties |
 | Cross-language search, German query → English memory | mean rank 2.7 after the language-hub correction (raw model: rank-32 tail disasters) |
 | Full pipeline: VAD, gate, ASR, identity, vectors | under 5% of one CPU core |
+| A 1.5-second turn decoded alone vs. inside 3 s of its neighbours | **56.7% WER → 20.4%** (2.5 s turns: 34.3% → 17.1%) — same model, more audio |
+| A second decoder disagreeing as a warning light | shaky rows carry **4.2×** the word errors of solid ones |
+| Hotword biasing toward the roster and glossary | +9.1% recall on rare words against a +20% gate; at strength the glossary leaked into unrelated turns (control WER 8% → 29%). Not shipped |
 
 ## The graveyard of clever ideas
 
@@ -134,6 +137,12 @@ respectfully re-implements a corpse.
   every model toward filling the fields that exist — *bigger models
   false-alarmed more* (9/9 traps failed) until the schema forced
   `"is_commitment": true/false` *before* any extractable field existed.
+- **Hotword biasing.** The obvious lever — tell the transducer the names in
+  the room. Measured: a few points of recall on rare words, only under a beam
+  search that costs 1.6 pp of WER before the first hotword, and at useful
+  strength the glossary starts appearing in sentences that never contained it.
+  The vocabulary is assembled, stored and served anyway; every reply says
+  `applied_to_decoder: false` until something can use it without that trade.
 - **`COUNT(*)+1` as an id.** Delete two rows and the next two mints collide.
   Numbers come from row ids now, like they always should have.
 
@@ -178,6 +187,24 @@ defence is layered, each layer measured:
 4. **`recalld lang repair`** — the backlog heals retroactively while its audio
    is still inside the retention window.
 
+## Getting it right, then getting it useful
+
+Four models agreed on only half of a real lobby's sentences, and the biggest
+error was never the model — it was the **window**. A turn cut at 1.5 s loses
+its consonants at both ends, so the daemon now re-reads short turns inside the
+audio around them, at idle priority, and keeps only the words inside the turn.
+A second, cheaper decoder reads every turn too; where it disagrees the row is
+marked **shaky** and muted rather than silently trusted. Fix a transcript in
+place and three things move: the row, the **measured error rate** on the
+Memory tab, and the vocabulary the next turn is checked against.
+
+Then the parts that make an archive worth having: **one query box** that
+understands *"was hat Aspen gestern über den Shader gesagt?"* and shows the
+speaker and the day it read as removable pills; **notes to self** — say
+*"Recall, merk dir …"* into the microphone and it is filed, in VR, without a
+keyboard; and a **brief** when a named friend joins the instance: what they owe
+you, what you owe them, what you last talked about.
+
 ## What never leaves this machine
 
 | Artifact | Lives | Leaves |
@@ -202,10 +229,10 @@ or sharing surface at all** — not a missing feature, the
 |---|---|
 | Daemon | Rust, 39k lines — PipeWire capture, four ONNX runtimes, one GGUF via llama.cpp, SQLite WAL, NDJSON socket |
 | Client | Electron, 12k lines, zero runtime dependencies, NX Clear in both grounds |
-| Tests | **563 Rust + 90 node + 61 headless-compositor steps × 2 themes** |
-| Schema | v9, migrated in place from v1 on a live database, every step idempotent |
-| Models | pyannote gate 6 MB · Parakeet v3 620 MB · ERes2Net 26 MB · e5 135 MB · Qwen 3B 1.9 GB · arbiters on demand — all pinned to exact bytes |
-| Updates | the daemon watches its own binary, drains, restarts; the GUI offers one click; ten hands-free updates and counting |
+| Tests | **645 Rust + 99 node + 69 headless-compositor steps × 2 themes** |
+| Schema | v10, migrated in place from v1 on a live database, every step idempotent |
+| Models | pyannote gate 6 MB · Parakeet v3 620 MB · ERes2Net 26 MB · e5 135 MB · Qwen 3B 1.9 GB · Canary cross-checker 154 MB · arbiters on demand — all pinned to exact bytes |
+| Updates | the daemon watches its own binary, drains, restarts; the GUI offers one click; a dozen hands-free updates and counting |
 | Provenance | every derived row carries its model id, confidence, and how the label arrived: `match · mic · proximity · re-decode · context` |
 
 ## Ship log
@@ -232,7 +259,8 @@ Installed by its first user on day one; every finding became a release.
 | 0.7.4 | +54h | the transcript becomes the whole archive |
 | 0.7.5 | +55h | the audit closes: all 25 findings resolved |
 | 0.7.6 | +65h | the night shift's three bugs — the lock, the split conversations |
-| 0.7.7 | soon | the conversational language prior + the German arbiter |
+| 0.7.7 | +67h | the conversational language prior + the German arbiter |
+| 0.8.0 | +80h | the accuracy round: short turns re-read in context, a second decoder as a warning light, fix-in-place, one query box, notes to self, briefs |
 
 ## Quickstart
 
