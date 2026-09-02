@@ -909,6 +909,65 @@ export function runE2E(deps) {
       return { before: before.label, rowsBefore: rows, after, file };
     });
 
+    // 6i2 — 0.11.0, "heard on". Some people you only ever meet on Discord, and
+    // until this release the list could not say so — which is also why the
+    // voicebank could hand a VRChat turn to a voice that has never been in
+    // VRChat. The chips are the visible half of that fix, so they are asserted
+    // against the mock's own numbers rather than merely counted.
+    await step('speaker-rows-say-where-a-voice-is-heard', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
+      await waitFor('the speaker list', async () =>
+        js('document.querySelectorAll("#speaker-list .sp-row").length > 0')
+      );
+      const chips = await waitFor('the heard-on chips', async () =>
+        js(`(() => {
+          const out = {};
+          for (const row of document.querySelectorAll('#speaker-list .sp-row')) {
+            const id = Number(row.dataset.speaker);
+            const c = [...row.querySelectorAll('.chip.heard')].map((e) => e.dataset.heardSource);
+            if (c.length) out[id] = c;
+          }
+          return Object.keys(out).length ? out : null;
+        })()`)
+      );
+      // The three shapes the feature is about, all on screen at once. Asserted
+      // as shapes rather than by voice id on purpose: by the time this step
+      // runs the driver has already renamed, reassigned and swept voices, and
+      // pinning an id here would make an unrelated step's edit look like a
+      // rendering bug.
+      const shapes = Object.values(chips);
+      assert(
+        shapes.some((c) => c.length === 1 && c[0] === 'Discord'),
+        `no voice is Discord-only: ${JSON.stringify(chips)}`
+      );
+      assert(
+        shapes.some((c) => c.length > 1),
+        `no voice is heard on more than one source: ${JSON.stringify(chips)}`
+      );
+      assert(
+        shapes.some((c) => c.includes('mic')),
+        `nothing is heard on the microphone: ${JSON.stringify(chips)}`
+      );
+      // And they agree with what the daemon actually said, chip for chip.
+      const wire = await js(`(async () => {
+        const r = await window.recall.request('speakers.list');
+        return Object.fromEntries(r.data.speakers.map((s) => [s.id, s.sources.map((x) => x.source)]));
+      })()`);
+      for (const [id, got] of Object.entries(chips)) {
+        assert(
+          JSON.stringify(got) === JSON.stringify(wire[id]),
+          `voice ${id} renders ${JSON.stringify(got)} but the daemon said ${JSON.stringify(wire[id])}`
+        );
+      }
+      // The microphone is the one source whose label is certain rather than
+      // matched, so it is the one chip that reads as a word and not an exe.
+      const mic = await js(
+        `(document.querySelector('.chip.heard.kind-mic') || {}).textContent || ""`
+      );
+      assert(/your mic/i.test(mic), `the mic chip does not name itself: "${mic}"`);
+      return { chips, mic };
+    });
+
     await step('shot-speakers', async () => ({ file: await shot('speakers') }));
 
     // 6j — 0.6.2, the memory graph's first surface. A voice is a person: the
@@ -955,6 +1014,40 @@ export function runE2E(deps) {
       assert(rail === 5, `the rail has ${rail} items, not the five it should`);
       assert(selected === 0, 'a rail item claims to be selected on the person page');
       return { speaker: target, strip: p.strip, sub: p.sub, file: await shot('person-page') };
+    });
+
+    // 6j2 — 0.11.0. The header answers the same question the row does, with the
+    // counts the row has no space for: a voice with 812 Discord turns and three
+    // in VRChat is somebody you know from one place, and that is a fact about a
+    // person rather than a statistic about a source.
+    await step('the-person-page-header-says-where-they-are-heard', async () => {
+      const chips = await waitFor('the header chips', async () =>
+        js(`(() => {
+          const rows = [...document.querySelectorAll('#person-header .chip.heard')];
+          return rows.length ? rows.map((e) => [e.dataset.heardSource, e.textContent]) : null;
+        })()`)
+      );
+      const id = await js('window.__recallDebug.person().id');
+      const wire = await js(`(async () => {
+        const r = await window.recall.request('person.get', { id: ${id} });
+        return r.data.sources;
+      })()`);
+      assert(
+        chips.length === wire.length,
+        `${chips.length} chips for ${wire.length} sources: ${JSON.stringify(chips)}`
+      );
+      for (let i = 0; i < wire.length; i += 1) {
+        assert(
+          chips[i][0] === wire[i].source,
+          `chip ${i} is ${chips[i][0]}, the daemon said ${wire[i].source}`
+        );
+        // The header's chips carry the turn count; the list's do not.
+        assert(
+          chips[i][1].includes(String(wire[i].segments)),
+          `chip "${chips[i][1]}" does not carry its ${wire[i].segments} turns`
+        );
+      }
+      return { chips, file: await shot('person-heard-on') };
     });
 
     // 6k — the edges. "People they talk with" is the claim the graph exists to

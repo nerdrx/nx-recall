@@ -5,7 +5,7 @@
 // banner over this list saying "these voices are most of your conversations —
 // who are they?" with the names right there to type.
 
-import { h, clear, fmtBytes, fmtDur, fmtFirstSeen, speakerColor } from '../lib/dom.js';
+import { h, clear, fmtBytes, fmtDur, fmtFirstSeen, heardOnChips, speakerColor } from '../lib/dom.js';
 import {
   store,
   speakerLabel,
@@ -437,7 +437,11 @@ export function mount(root, ctx) {
                 title: 'Only the voiceprint is left. It still matches new audio — delete the voice to clear it.',
               })
             : null,
-          h('span', { class: 'sp-hint', dataset: { hint: String(sp.id) } })
+          h('span', { class: 'sp-hint', dataset: { hint: String(sp.id) } }),
+          // 0.11.0 — "heard on". Under the name rather than beside the counts,
+          // because it belongs to the same sentence "first heard ..." starts:
+          // it is the rest of where this voice comes from.
+          heardOnChips(sp.sources)
         )
       ),
       // The counts are the second door to the person page. "412 segments" is

@@ -12,7 +12,7 @@
 // trip, because the page is one question and half a person on screen while the
 // other half is still in flight is worse than a moment of nothing.
 
-import { h, clear, fmtDur, fmtDate, speakerColor } from '../lib/dom.js';
+import { h, clear, fmtDur, fmtDate, heardOnChips, speakerColor } from '../lib/dom.js';
 import { store, speakerLabel, isYou, ask } from '../lib/store.js';
 import { toast } from '../lib/sheets.js';
 import { playSpeaker, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
@@ -138,7 +138,12 @@ export function mount(root, ctx, arg) {
               title: 'Which languages this voice speaks — set it from the Speakers list',
               text: languages?.length ? languages.map((l) => l.toUpperCase()).join(' + ') : 'Any language',
             }),
-            sp?.name ? null : h('span', { class: 'chip', text: 'not named yet' })
+            sp?.name ? null : h('span', { class: 'chip', text: 'not named yet' }),
+            // 0.11.0 — where this voice is heard, with counts. The header has
+            // the room the list row does not, and the count is what turns
+            // "Discord" from a tag into a fact: a voice with 812 Discord turns
+            // and 3 in VRChat is a person you know from one place.
+            heardOnChips(page?.sources, { withCounts: true })
           ),
           hint
         ),

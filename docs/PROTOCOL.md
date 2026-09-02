@@ -1851,3 +1851,124 @@ was taken); `last_event_ms` is when the plugin last sent anything, which is the
 difference between "receiving" and "waiting for Discord"; `users` is how many
 accounts it has heard. Everything else stays on `truth.status`, which remains
 the method for the whole picture.
+
+---
+
+## 0.11.0 — source-aware identity
+
+Where the audio came from is evidence about who is on it. A voice heard 2 798
+times on Discord and never once in VRChat should not win a VRChat turn at 0.36,
+and until now it could: the voicebank was asked one question about the whole
+world at once.
+
+This release adds **one new field to two existing methods**, **one CLI command**,
+and **one optional change to the labelling ladder that is off by default**.
+Nothing on the wire is removed or reshaped, and no schema version is bumped —
+the source history is derived from `segments` and `sessions` on demand, so there
+is no new column and no new table, only one index
+(`idx_segments_speaker_session`).
+
+### `sources` on `speakers.list` rows and on `person.get`
+
+Both carry the same array, most-heard first:
+
+```json
+"sources": [
+  {"source": "Discord",    "name": "Chromium", "kind": "app",
+   "segments": 2798, "last_ms": 1788378123000, "last_ns": "1788378123000000000"},
+  {"source": "VRChat.exe", "name": "VRChat",   "kind": "app",
+   "segments": 12,   "last_ms": 1788291000000, "last_ns": "1788291000000000000"}
+]
+```
+
+- **`source` is the match key**, not the display name — an application's
+  executable name, or the literal `mic` / `room`. It is what the prior keys on
+  and the thing that survives a display name changing under it. `name` is what a
+  person should read; the two genuinely differ (a Discord client presents itself
+  to PipeWire as `Chromium`).
+- **`kind`** is `app`, `mic` or `room`, as on `sources.list`.
+- **Both time forms**, per "Field conventions".
+- **`[]`, never `null`.** A voice with no live turns has an *empty* history, not
+  an unknown one, and a client must never have to guard the field. Soft-deleted
+  turns are excluded, so the counts add up to the `segments` beside them.
+- On `person.get` it sits at the **top level**, beside `languages`, for the same
+  reason `languages` does: the page has a row of chips for it and should not
+  have to know the field lives on the speaker row.
+
+### The prior itself (`[identity]`, off by default)
+
+| key | default | what it does |
+|---|---|---|
+| `source_prior` | `false` | whether any of this affects labelling at all |
+| `foreign_source_margin` | `0.10` | added to `label_threshold` for a voice foreign to this source |
+| `foreign_after_segments` | `20` | turns a voice needs before its *absence* from a source counts as evidence |
+| `presence_hard` | `true` | may Discord's own events exclude a candidate outright |
+| `vrchat_sources` | `["vrchat"]` | which sources are VRChat; the mirror of `[truth].sources` |
+
+**It is off because it was measured, not because it is unfinished.** On this
+install's 161 Discord turns with Discord's own ground truth the soft rules
+removed 236 candidates and changed **zero** labels: every voice the ladder was
+choosing between was already native to Discord. `recalld identity audit` finds
+three cross-source labels in 9 039, all scoring 0.361–0.393 — the predicted
+failure, at the predicted scores, in numbers too small to measure against.
+FINDINGS §17 has the table and the gate.
+
+Three rules, applied between ranking and deciding:
+
+1. **Soft — foreign to this source.** A candidate with at least
+   `foreign_after_segments` turns in total and **zero** on this source must
+   score `label_threshold + foreign_source_margin` *and* beat the best native
+   candidate by `enroll_margin`. Failing either, it is **removed** from the
+   candidate list rather than demoted — so the mint rule can create a voice that
+   genuinely belongs to this source instead of the turn being absorbed by a
+   stranger from another app. The pinned "You" voice is never foreign: the
+   microphone follows the user everywhere.
+2. **Hard — Discord says they were not there.** On a Discord-sourced segment, a
+   candidate linked to a Discord account (`discord_users.speaker_id`) with no
+   speaking span within **±5 minutes** is excluded outright. It fires only when
+   truth data exists in that window at all (no plugin is not absence), only for
+   candidates that actually have a link, and only on Discord-sourced segments.
+3. **Soft — the VRChat roster.** On a VRChat-sourced segment, a *named*
+   candidate whose display name is not in the roster within **±10 minutes** gets
+   the foreign treatment, never exclusion. Unnamed voices are untouched.
+
+**The asymmetry between 2 and 3 is deliberate and is about what the two sources
+know.** Discord's events are keyed on an account id that cannot be typed wrong,
+and a turn on the Discord stream is by definition audio Discord decoded — so if
+the account was not talking, the audio is not theirs. The roster is display
+names scraped from VRChat's text log and matched to a voice by nothing but the
+user having typed the same string; people rename themselves and the log rotates,
+so a name that fails to match is more often our failure than their absence.
+Evidence that weak may raise a bar; it may not slam a door.
+
+The known cost of rule 2, stated rather than hidden: `truth_speaking` records
+*speaking*, not membership, so an account that sat silently in the call for more
+than five minutes either side of a turn is excluded from it. That is the trade —
+an account that said nothing for ten minutes around a turn is a poor explanation
+for that turn.
+
+**No new `label_via`.** A label that survived a foreign check is still a match,
+made by the same ladder on the same evidence at a higher bar, and a client that
+saw `label_via: "foreign"` would have to decide what to do about a distinction it
+cannot act on. What the daemon records instead is a log line naming every
+candidate it removed and why, and three counters (`prior_foreign`,
+`prior_absent`, `prior_foreign_kept`).
+
+### `recalld identity audit`
+
+A report; it writes nothing. Three parts: the **voice × source matrix**, the
+**count of labels the rule questions**, and the **twenty most recent** of them
+with their scores and `label_via`.
+
+A past label is judged by **replaying the labels in the order they were made** and
+asking the prior's question of each using only what was known before it. Any
+other reading is circular — a voice that won ten VRChat turns has ten turns of
+VRChat history *today*. The consequence is that a run of wrong labels is counted
+once, at its head; each row carries `followed` saying how long its run got.
+
+`recalld identity repair --foreign` takes those labels back to **unassigned** and
+previews by default (`--apply` writes). It never re-points a row at another
+voice, and must not grow that ability: the finding is that a label is not
+supported by where the audio came from, which argues against the name the row
+has and for no other name at all. The transcript, the audio and the embedding
+all stay, so a later reassignment still has everything to argue from.

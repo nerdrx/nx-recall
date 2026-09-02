@@ -40,6 +40,8 @@ pub mod enrich;
 pub mod export;
 pub mod fetch;
 pub mod identity;
+/// Where the audio came from, as evidence about who is on it (0.11.0).
+pub mod identity_prior;
 pub mod ingest;
 pub mod lang;
 pub mod langctx;

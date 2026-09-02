@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::arbiter::{Arbiters, Arbitration};
 use crate::asr::{Asr, normalise_words};
-use crate::config::{IdentityConfig, LangConfig, SAMPLE_RATE};
+use crate::config::{IdentityConfig, LangConfig, SAMPLE_RATE, TruthConfig};
 use crate::embed::{Embedder, Embedding};
 use crate::identity::{self, Decision, Refusal};
 use crate::lang::{self, Lang};
@@ -66,6 +66,11 @@ pub struct Outcome {
     pub golden: bool,
     /// What the wrong-language correction did, if anything (0.6.1).
     pub language_fix: Option<LanguageFix>,
+    /// What the source-aware prior took off the candidate list before the
+    /// ladder saw it (0.11.0). `None` on every path that never consulted the
+    /// voicebank — the microphone's pin, a refused turn — and `Some` with an
+    /// empty `dropped` when the prior looked and changed nothing.
+    pub prior: Option<crate::identity_prior::Applied>,
     /// **Other** segments this turn's arrival changed — proximity inheritance
     /// labels the turn *before* this one, once this one proves what came after
     /// it. The caller publishes them, so a GUI sees the row change without
@@ -127,6 +132,11 @@ pub struct Analyzer {
     /// The two constrained decoders, each loaded the first time a suspected
     /// flip needs it and resident from then on (`crate::arbiter`).
     arbiters: Arbiters,
+    /// Which capture sources count as Discord (0.11.0). Read from
+    /// `[truth].sources` rather than copied into `[identity]`, and defaulted
+    /// like `lang_cfg` so a caller that does not care — the acceptance rig, the
+    /// mic suite — keeps the two-argument constructor it always had.
+    truth_cfg: TruthConfig,
 }
 
 impl Analyzer {
@@ -147,6 +157,7 @@ impl Analyzer {
             cfg: cfg.clone(),
             lang_cfg: LangConfig::default(),
             arbiters: Arbiters::new(models),
+            truth_cfg: TruthConfig::default(),
         })
     }
 
@@ -154,6 +165,20 @@ impl Analyzer {
     /// inference thread starts.
     pub fn set_lang_config(&mut self, cfg: &LangConfig) {
         self.lang_cfg = cfg.clone();
+    }
+
+    /// Point the source-aware prior at the running config's Discord source
+    /// patterns (0.11.0). Set once, in the same place and for the same reason.
+    pub fn set_truth_config(&mut self, cfg: &TruthConfig) {
+        self.truth_cfg = cfg.clone();
+    }
+
+    /// The pattern lists the prior's family test reads.
+    fn prior_sources(&self) -> crate::identity_prior::Sources<'_> {
+        crate::identity_prior::Sources {
+            discord: &self.truth_cfg.sources,
+            vrchat: &self.cfg.vrchat_sources,
+        }
     }
 
     /// Which languages this install can actually re-decode into. Logged once at
@@ -245,6 +270,7 @@ impl Analyzer {
                     enrolled: false,
                     golden: false,
                     language_fix: None,
+                    prior: None,
                     also_changed: Vec::new(),
                 });
             }
@@ -253,6 +279,29 @@ impl Analyzer {
         store.store_embedding(segment_id, &embedding)?;
         let bank = store.prototypes(&embedding.model_id)?;
         let ranked = identity::rank(&embedding, &bank)?;
+        // The source-aware prior (0.11.0), between ranking and deciding —
+        // which is the only place it can be: it needs the scores to weigh a
+        // foreign candidate against a native one, and it has to be able to
+        // remove a candidate before the mint rule asks whether the bank was
+        // empty. A failure here costs the prior, never the label: the ladder
+        // then sees the list it would have seen in 0.10.0.
+        let prior = match crate::identity_prior::for_segment(
+            store,
+            &self.cfg,
+            self.prior_sources(),
+            segment_id,
+            &ranked,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(segment_id, "the source prior could not be applied: {e:#}");
+                crate::identity_prior::Applied::untouched(&ranked)
+            }
+        };
+        if let Some(note) = prior.note() {
+            info!(segment_id, "source prior: ignored {note}");
+        }
+        let ranked = prior.kept.clone();
         // The word count is the mint bar's second half (0.6.1): a new identity
         // needs seconds *and* words. Matching an existing one never asks.
         let words = text.as_deref().map(lang::word_count).unwrap_or(0);
@@ -308,6 +357,7 @@ impl Analyzer {
             enrolled,
             golden: false,
             language_fix: None,
+            prior: Some(prior),
             also_changed: Vec::new(),
         })
     }
@@ -415,6 +465,9 @@ impl Analyzer {
             enrolled,
             golden,
             language_fix: None,
+            // The microphone never consults the voicebank, so there was no
+            // candidate list for the prior to have an opinion about.
+            prior: None,
             also_changed: Vec::new(),
         })
     }
@@ -738,6 +791,19 @@ pub struct AnalysisStats {
     pub redecoded_en: std::sync::atomic::AtomicU64,
     /// Rows `recalld lang repair` rewrote out of the mismatch backlog.
     pub repairs: std::sync::atomic::AtomicU64,
+
+    // ---- the source-aware prior (0.11.0) ---------------------------------
+    /// Candidates removed because they are foreign to the segment's source and
+    /// did not clear the raised bar. Counted per candidate, not per turn: one
+    /// turn can drop several.
+    pub prior_foreign: std::sync::atomic::AtomicU64,
+    /// Candidates removed because Discord said the linked account was not
+    /// speaking anywhere near the turn.
+    pub prior_absent: std::sync::atomic::AtomicU64,
+    /// Labels that WERE given to a foreign voice, over the raised bar. The
+    /// other half of the story, and the one worth watching: if this number is
+    /// large the margin is too low.
+    pub prior_foreign_kept: std::sync::atomic::AtomicU64,
 }
 
 impl AnalysisStats {
@@ -806,6 +872,20 @@ impl AnalysisStats {
         }
         self.proximity_labelled
             .fetch_add(outcome.also_changed.len() as u64, Ordering::Relaxed);
+        // What the source prior did to this turn's candidate list (0.11.0).
+        if let Some(prior) = &outcome.prior {
+            use crate::identity_prior::Dropped;
+            for (_, _, why) in &prior.dropped {
+                match why {
+                    Dropped::HardAbsent => self.prior_absent.fetch_add(1, Ordering::Relaxed),
+                    Dropped::ForeignBelowBar | Dropped::ForeignBehindNative => {
+                        self.prior_foreign.fetch_add(1, Ordering::Relaxed)
+                    }
+                };
+            }
+            self.prior_foreign_kept
+                .fetch_add(prior.foreign_kept.len() as u64, Ordering::Relaxed);
+        }
     }
 }
 
