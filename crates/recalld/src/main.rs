@@ -312,9 +312,10 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     .with_night(cfg.night.clone())
     // 0.9.0: reminders, digests and translation, for the same reason again.
     .with_assist(cfg.assist.clone());
-    // The target language is read once here rather than threaded through
-    // `segment_json`'s dozen call sites; see `translate::set_target`.
-    recalld::translate::set_target(&cfg.assist.translate_to);
+    // The three translation settings live in one place rather than being
+    // threaded through `segment_json`'s dozen call sites; see `translate::LIVE`.
+    // `assist.set` writes the same three, which is what makes them live.
+    recalld::translate::adopt(&cfg.assist);
     // The ids clients see must be the ids that will be written on segments, so
     // resolve the ASR fallback here exactly as the pipeline does.
     if let Some(mut models) = ModelSet::resolve(&cfg.models) {

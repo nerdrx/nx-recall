@@ -2043,6 +2043,90 @@ export function runE2E(deps) {
       return { translated: v.translated.rows, plain: v.translated.plain, file };
     });
 
+    // 0.10.2 — the three controls, and the one that changes the transcript.
+    await step('the-translation-card-sets-what-is-translated-and-how-it-reads', async () => {
+      // Read the transcript BEFORE leaving it: `#seg-list` only exists while
+      // that view is mounted, and a row count taken from the Memory view is
+      // zero for a reason that has nothing to do with translation.
+      const before = await js('window.__recallDebug.assistant()');
+      assert(before.translated.main > 0, 'the mock ships "main" and no row leads with its translation');
+      assert(
+        before.translated.first.every((c) => c.includes('txt-translated')),
+        `the translation is not the first line: ${JSON.stringify(before.translated.first)}`
+      );
+
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      const card = await waitFor('the translation card', async () => {
+        const t = await js('window.__recallDebug.translation()');
+        return t.target !== null && t.read.length ? t : null;
+      });
+      // All three, and the target selector's "off" option: translation being on
+      // is not a fourth control, it is what having a target means.
+      assert(card.targets.includes(''), 'the target selector cannot be turned off');
+      assert(card.targets.length > 10, `only ${card.targets.length} languages offered`);
+      assert(card.modes.join(',') === 'main,under', `display modes: ${card.modes}`);
+      assert(card.target === 'de', `the mock translates into "${card.target}"`);
+      // The target's own chip is on and is not yours to switch off.
+      const de = card.read.find((r) => r.code === 'de');
+      assert(de?.on && de?.locked, `the target's chip is not locked on: ${JSON.stringify(de)}`);
+      assert(card.read.some((r) => r.code === 'en' && !r.on), 'English is already read, so nothing would translate');
+
+      // 1. Flipping the display re-renders a translated ROW, which is the point
+      //    of the setting — the card is not the surface it changes.
+      await js('document.getElementById("translate-display-under").click()');
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      const under = await waitFor('the original leading', async () => {
+        const v = await js('window.__recallDebug.assistant()');
+        return v.translated.rows && v.translated.main === 0 ? v : null;
+      });
+      assert(
+        under.translated.first.every((c) => c.includes('txt-said')),
+        `"under" did not put the original first: ${JSON.stringify(under.translated.first)}`
+      );
+      // Both lines are still there in both modes. Nothing here removes a line.
+      for (const pair of under.translated.pairs) assert(pair.said && pair.reading, 'a line went missing');
+
+      // …and back, where the original keeps its language code so the reader
+      // can see what they are being shown instead of.
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.getElementById("translate-display-main").click()');
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      const main = await waitFor('the translation leading again', async () => {
+        const v = await js('window.__recallDebug.assistant()');
+        return v.translated.main > 0 ? v : null;
+      });
+      assert(main.translated.saidLangs.length > 0, 'the original lost its language code');
+
+      // 2. Setting the target moves the card's own badge, and takes the new
+      //    target's chip with it.
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js(`(() => {
+        const s = document.getElementById('translate-target');
+        s.value = 'en';
+        s.dispatchEvent(new Event('change', { bubbles: true }));
+      })()`);
+      const en = await waitFor('the new target', async () => {
+        const t = await js('window.__recallDebug.translation()');
+        return t.target === 'en' ? t : null;
+      });
+      assert(/English/.test(en.sub), `the badge still says "${en.sub}"`);
+      const enChip = en.read.find((r) => r.code === 'en');
+      assert(enChip?.on && enChip?.locked, `the new target is not read by definition: ${JSON.stringify(enChip)}`);
+
+      // 3. A language you read is a chip you can turn off. French is not read,
+      //    so pressing it says "leave French alone".
+      await js('document.querySelector(\'#translate-read .toggle-chip[data-lang="fr"]\').click()');
+      const fr = await waitFor('French read', async () => {
+        const t = await js('window.__recallDebug.translation()');
+        return t.read.find((r) => r.code === 'fr')?.on ? t : null;
+      });
+      assert(fr.read.find((r) => r.code === 'fr').on, 'the chip did not go on');
+
+      await js('document.getElementById("translate-card").scrollIntoView({ block: "start" })');
+      const file = await shot('memory-translation');
+      return { targets: card.targets.length, target: en.target, sub: en.sub, file };
+    });
+
     await step('the-accuracy-card-is-honest-arithmetic', async () => {
       await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
       const a = await waitFor('the accuracy card', async () => {

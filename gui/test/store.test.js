@@ -43,6 +43,8 @@ import {
   languageLabel,
   applyRoom,
   roomChip,
+  applyAssist,
+  translationLeads,
 } from '../src/renderer/lib/store.js';
 import { splitOutcome } from '../src/renderer/views/speakers.js';
 
@@ -60,6 +62,7 @@ function reset() {
   store.resync = { stale: [], attempt: 0, retrying: false, since: null };
   store.mic = { enabled: false, mode: 'follow', active: false, state: 'off', device: null, you_speaker: null };
   store.graph = { counts: null, enrichment: { phase: 'off' }, config: null };
+  store.assist = { translate_to: '', read_languages: ['de', 'en'], translation_display: 'main', languages: [] };
 }
 
 const seg = (id, over = { }) => ({
@@ -1077,4 +1080,45 @@ test('a translation rides on the segment and null is the ordinary answer', () =>
   // and the translation it carries replaces the old one rather than merging.
   applyEvent({ seq: 3, ev: 'segment', data: { ...seg(11), translation: null } });
   assert.equal(store.segById.get(11).translation, null, 'a cleared translation clears');
+});
+
+test('the translation settings fold in from four places and never lose the list', () => {
+  reset();
+  // The shipped state: nothing translated, both native languages read, and the
+  // translation on the line when there is one.
+  assert.equal(store.assist.translate_to, '');
+  assert.equal(translationLeads(), true);
+
+  // `assist.get` — the only source that carries the selector's options.
+  applyAssist({
+    translate_to: 'en',
+    read_languages: ['de', 'en'],
+    translation_display: 'under',
+    languages: [{ code: 'en', name: 'English' }, { code: 'de', name: 'German' }],
+  });
+  assert.equal(translationLeads(), false, 'under means the original leads');
+  assert.equal(store.assist.languages.length, 2);
+
+  // `status`, three seconds later, carries the three values and NOT the list.
+  // A replace would empty the selector on every poll.
+  applyEvent({
+    seq: 1,
+    ev: 'status',
+    data: { assist: { translate_to: 'en', read_languages: ['en'], translation_display: 'main' } },
+  });
+  assert.equal(store.assist.languages.length, 2, 'the poll must not empty the selector');
+  assert.deepEqual(store.assist.read_languages, ['en']);
+  assert.equal(translationLeads(), true);
+
+  // The event another window's change arrives as. It repaints the transcript,
+  // which is why it says so.
+  const change = applyEvent({ seq: 2, ev: 'assist', data: { translation_display: 'under' } });
+  assert.deepEqual(change, { assist: true });
+  assert.equal(translationLeads(), false);
+
+  // Junk is ignored rather than stored: a mode nothing can render would make
+  // every row fall back on a different guess in every view.
+  applyAssist({ translation_display: 'sideways' });
+  assert.equal(store.assist.translation_display, 'under');
+  assert.equal(applyEvent({ seq: 3, ev: 'assist', data: null }), null);
 });

@@ -691,6 +691,30 @@ pub struct AssistConfig {
     /// two-word turn is where the decoder is least reliable to begin with.
     pub translate_min_words: usize,
 
+    // ---- 0.10.2, the translation controls ---------------------------------
+    /// The languages the person reading already has. A turn in one of these is
+    /// never translated, and `translate_to` is always implicitly one of them —
+    /// it is not stored here, because a target you did not also list as read
+    /// would be a setting that contradicts itself.
+    ///
+    /// `["de", "en"]` by default, which is this daemon's two native languages
+    /// and the pair the classifier can actually check. Everything else is a
+    /// candidate; see `crate::lang::guess_other` for how a third language is
+    /// recognised at all.
+    pub read_languages: Vec<String>,
+    /// Where the translation goes on a transcript row: `"main"` puts it where
+    /// the words normally are with the original beneath it as subtext, and
+    /// `"under"` is 0.9.0's layout — the original on the line and the
+    /// translation under it.
+    ///
+    /// `"main"` is the default and that is a deliberate change of mind. 0.9.0
+    /// argued the original must lead because the transcript is a record; a
+    /// reader who cannot read the original is not reading a record, they are
+    /// looking at a wall of text with a hint under each line. The original
+    /// never leaves the row either way, and it keeps its language code — which
+    /// is what stops "main" from being a quotation nobody can check.
+    pub translation_display: String,
+    // ---- end 0.10.2 -------------------------------------------------------
     /// Rows per batch, for both model passes.
     pub batch: usize,
     /// Seconds between batches, and between re-checks while a gate is closed.
@@ -713,6 +737,8 @@ impl Default for AssistConfig {
             digest_max_turns: 40,
             translate_to: String::new(),
             translate_min_words: 3,
+            read_languages: vec!["de".to_string(), "en".to_string()],
+            translation_display: crate::translate::DISPLAY_MAIN.to_string(),
             batch: 8,
             batch_pause_s: 10,
             max_queue_seconds: 5,

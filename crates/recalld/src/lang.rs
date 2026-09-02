@@ -13,6 +13,23 @@
 //! daemon writes, so it has to cost nothing. It knows exactly two languages,
 //! which is why `speakers.set_languages` refuses anything else: a tag the
 //! classifier cannot check is a tag that can never be acted on.
+//!
+//! ## The third language (0.10.2)
+//!
+//! "Translate everything that is not German or English" needs one thing the
+//! two-way classifier cannot give: the difference between *a language I do not
+//! read* and *words I could not read at all*. Both come out `Unclear` today, so
+//! a French turn and a mumbled German one are stamped identically and neither
+//! can be queued without queueing the other.
+//!
+//! [`guess_other`] is that difference and nothing more. It never contradicts
+//! [`classify`] — a row already stamped `de` or `en` is not its business — and
+//! it is deliberately a *narrower* set than [`OFFERED`], the list a person may
+//! pick a target from. A person may say they read Norwegian; the guesser will
+//! not claim a sentence is Norwegian, because it cannot tell Norwegian from
+//! Danish and a confident wrong stamp is worse than no stamp. The numbers
+//! behind both halves of that sentence are in `spike/guess_other_bench.py` and
+//! quoted on [`GUESSABLE`].
 
 /// What a transcript reads as. Deliberately four answers, not two: "I cannot
 /// tell" and "there are no words" are different facts, and neither is a
@@ -63,6 +80,279 @@ const EN: &[&str] = &[
     "then", "just", "only", "what", "how", "where", "yes", "no", "about", "into", "over", "under",
     "between", "against", "without", "through",
 ];
+
+// ---- 0.10.2, the third language -------------------------------------------
+
+/// The languages a client may offer as a target or as one you read.
+///
+/// A pair list rather than two, so a code and the name shown beside it cannot
+/// drift apart, and in the order clients render them: the two the daemon
+/// classifies natively first, then the rest by how often a VRChat lobby
+/// produces them.
+///
+/// This is a **wider** set than [`guess_other`] can answer with — see the
+/// module note on the two halves of 0.10.2. Norwegian is the example: a person
+/// may declare that they read it, and a person may translate into it, but the
+/// guesser refuses to *claim* a sentence is Norwegian because it cannot tell it
+/// from Danish.
+pub const OFFERED: &[(&str, &str)] = &[
+    ("en", "English"),
+    ("de", "German"),
+    ("fr", "French"),
+    ("es", "Spanish"),
+    ("it", "Italian"),
+    ("pt", "Portuguese"),
+    ("nl", "Dutch"),
+    ("pl", "Polish"),
+    ("ru", "Russian"),
+    ("uk", "Ukrainian"),
+    ("ja", "Japanese"),
+    ("zh", "Chinese"),
+    ("ko", "Korean"),
+    ("tr", "Turkish"),
+    ("sv", "Swedish"),
+    ("da", "Danish"),
+    ("no", "Norwegian"),
+    ("fi", "Finnish"),
+    ("cs", "Czech"),
+];
+
+/// The English name of a language tag, or `None` for a tag nothing offers.
+pub fn name_of(tag: &str) -> Option<&'static str> {
+    OFFERED
+        .iter()
+        .find(|(code, _)| *code == tag)
+        .map(|(_, name)| *name)
+}
+
+/// Is this a tag a client may set as a target or as a language you read?
+pub fn offered(tag: &str) -> bool {
+    name_of(tag).is_some()
+}
+
+/// What [`guess_other`] concluded: a tag, and whether it is sure enough to be
+/// written onto the row.
+///
+/// Two fields rather than one, because the two answers are used differently.
+/// *Any* guess is enough to put a turn in the translation queue — the cost of
+/// being wrong there is one model call that comes back an echo and is dropped.
+/// Only a **confident** guess is written into `segments.lang`, because that
+/// column is read by the language prior, the arbiter and the transcript, and a
+/// wrong stamp there propagates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OtherLang {
+    pub tag: &'static str,
+    pub confident: bool,
+}
+
+/// Stopwords a guess may be won on, per language. **Verbatim from
+/// `spike/guess_other_bench.py`**, which is where the precision figures come
+/// from, and asserted equal to it by a test below.
+const OTHER_STOPWORDS: &[(&str, &str)] = &[
+    (
+        "fr",
+        "le la les des une est ne pas que qui pour dans sur avec aux cette il elle nous vous ils elles mais ou plus sont été être ce",
+    ),
+    (
+        "es",
+        "el los las del y en que es un una por para con su como más pero está están fue sus",
+    ),
+    (
+        "it",
+        "il lo gli le di della che non è un una per con sono come più anche dei nel alla",
+    ),
+    (
+        "pt",
+        "os as do da dos das que não um uma por para com mais mas está são se na no",
+    ),
+    (
+        "nl",
+        "het een van niet dat op te voor zijn er ook maar als aan door om worden werd deze",
+    ),
+    (
+        "pl",
+        "w nie na że to się do jest ale jak po dla od przez czy tylko już oraz który",
+    ),
+    (
+        "tr",
+        "bir bu için ile çok daha var olarak gibi ki ise ancak sonra kadar veya olan",
+    ),
+    (
+        "sv",
+        "och att är för av på inte till som han var men den det ett har med om",
+    ),
+    (
+        "da",
+        "og af ikke til er jeg han hun som men det den har med om der blev",
+    ),
+    (
+        "no",
+        "og av ikke til er jeg han hun som men det den har med om det være også",
+    ),
+    (
+        "fi",
+        "ja on ei että se ovat kuin myös mutta niin tai kun jos hän oli ollut sekä",
+    ),
+    (
+        "cs",
+        "a v na se že je to do za od pro ale jak nebo který jsou byl také jako",
+    ),
+];
+
+/// The tags [`guess_other`] is allowed to answer with: every language in
+/// `OTHER_STOPWORDS` that cleared the gate, plus the ones settled by script.
+///
+/// `spike/guess_other_bench.py`, 4200 FLEURS sentences — 200 per language, plus
+/// 200 German and 200 English as negatives — precision measured over the whole
+/// mixed set. The gate was **90% precision**, and every tag here cleared it:
+/// ar el ja ko ru uk zh at 99–100%, fi it nl pl tr at 100%, cs da es 98.4/98.4/98.3,
+/// fr pt 97.8, sv 93.1. **Not one German or English sentence in the 400
+/// negatives was guessed to be anything at all.**
+///
+/// Norwegian is in the vote table and is not here. Its function words are
+/// Danish's — 64.8% precision when it was allowed to win — so it stays as a
+/// **blocker**: a Norwegian sentence still wins the vote, and winning with a
+/// tag that is not shipped is answered "I cannot tell" rather than "Danish".
+/// Removing it entirely would have handed those sentences to Danish and taken
+/// Danish's 98.4% down with them.
+pub const GUESSABLE: &[&str] = &[
+    "ar", "cs", "da", "el", "es", "fi", "fr", "it", "ja", "ko", "nl", "pl", "pt", "ru", "sv", "tr",
+    "uk", "zh",
+];
+
+/// Stopwords a language must have before it may win.
+const MIN_VOTES: usize = 3;
+/// …and before the guess is written onto the row.
+const CONFIDENT_VOTES: usize = 4;
+
+/// Which language *other than German or English* this is, if any.
+///
+/// [`classify`] answers a two-way question and answers `Unclear` for everything
+/// else, which is why a French turn and a mumbled German one are stamped
+/// identically today. This is the third-language half: script first, because a
+/// stopword vote cannot be wrong about a sentence with no Latin letters in it,
+/// then the same kind of vote [`classify`] uses, over twelve more tables.
+///
+/// Two guards, both measured:
+///
+/// * a language wins only with `MIN_VOTES` stopwords and **strictly more than
+///   de+en together** ([`stopword_votes`]) — so a German sentence with one
+///   Dutch-looking word in it is still German;
+/// * the win must be outright. A tie is `None`, exactly as in [`classify`],
+///   because the two languages that tie here are always the two nobody can
+///   tell apart from three function words.
+pub fn guess_other(text: &str) -> Option<OtherLang> {
+    if let Some(tag) = guess_by_script(text) {
+        return Some(OtherLang {
+            tag,
+            confident: true,
+        });
+    }
+    let ws = words(text);
+    if ws.is_empty() {
+        return None;
+    }
+    let (de, en) = (
+        ws.iter().filter(|w| DE.contains(&w.as_str())).count(),
+        ws.iter().filter(|w| EN.contains(&w.as_str())).count(),
+    );
+    let mut best = 0usize;
+    let mut best_tag = "";
+    let mut tied = false;
+    for (tag, list) in OTHER_STOPWORDS {
+        let n = ws
+            .iter()
+            .filter(|w| list.split(' ').any(|s| s == w.as_str()))
+            .count();
+        if n > best {
+            best = n;
+            best_tag = tag;
+            tied = false;
+        } else if n == best && n > 0 {
+            tied = true;
+        }
+    }
+    if best < MIN_VOTES || best <= de + en || tied {
+        return None;
+    }
+    if !GUESSABLE.contains(&best_tag) {
+        // A blocker won. See `GUESSABLE`.
+        return None;
+    }
+    Some(OtherLang {
+        tag: best_tag,
+        confident: best >= CONFIDENT_VOTES,
+    })
+}
+
+/// The writing system, when there is one that settles the question.
+fn guess_by_script(text: &str) -> Option<&'static str> {
+    let mut letters = 0usize;
+    let (mut kana, mut hangul, mut han, mut cyr, mut arab, mut greek) = (0, 0, 0, 0, 0, 0);
+    for ch in text.chars() {
+        if !ch.is_alphabetic() {
+            continue;
+        }
+        letters += 1;
+        match ch as u32 {
+            0x3040..=0x30FF | 0x31F0..=0x31FF | 0xFF66..=0xFF9D => kana += 1,
+            0x1100..=0x11FF | 0x3130..=0x318F | 0xAC00..=0xD7A3 => hangul += 1,
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => han += 1,
+            0x0400..=0x052F => cyr += 1,
+            0x0600..=0x06FF
+            | 0x0750..=0x077F
+            | 0x08A0..=0x08FF
+            | 0xFB50..=0xFDFF
+            | 0xFE70..=0xFEFF => arab += 1,
+            0x0370..=0x03FF | 0x1F00..=0x1FFF => greek += 1,
+            _ => {}
+        }
+    }
+    // Kana and hangul are checked by PRESENCE and the rest by dominance.
+    // Japanese writes its content words in the same Han characters Chinese
+    // uses and its grammar in kana, so a kanji-heavy Japanese sentence is
+    // *dominated* by a script Chinese also has: the bench read 22 Japanese
+    // sentences as Chinese under a dominance rule, and zh's precision was
+    // 87.2%. Two characters, so one borrowed word is not a language.
+    if kana >= 2 {
+        return Some("ja");
+    }
+    if hangul >= 2 {
+        return Some("ko");
+    }
+    if letters == 0 {
+        return None;
+    }
+    // A third of the letters: a Russian world name inside a German sentence is
+    // not a Russian sentence.
+    let third = |n: usize| n * 3 >= letters;
+    if third(cyr) {
+        // Ukrainian has four letters Russian does not. Any of them settles it;
+        // otherwise Russian, which is the commoner case by a long way.
+        return Some(
+            if text
+                .chars()
+                .any(|c| matches!(c, 'ї' | 'і' | 'є' | 'ґ' | 'Ї' | 'І' | 'Є' | 'Ґ'))
+            {
+                "uk"
+            } else {
+                "ru"
+            },
+        );
+    }
+    if third(han) {
+        return Some("zh");
+    }
+    if third(arab) {
+        return Some("ar");
+    }
+    if third(greek) {
+        return Some("el");
+    }
+    None
+}
+
+// ---- end 0.10.2 ------------------------------------------------------------
 
 /// A word is a run of letters and apostrophes, lowercased. Digits are not
 /// words: "2019" votes for nothing.
@@ -278,6 +568,153 @@ mod tests {
         assert_eq!(sole_language(Some(&both)), None);
         assert_eq!(sole_language(Some(&one)), Some("en"));
         assert_eq!(sole_language(None), None);
+    }
+
+    // ---- 0.10.2, the third language ---------------------------------------
+
+    #[test]
+    fn the_shipped_tables_are_the_ones_the_precision_was_measured_with() {
+        // The same discipline as `translate::TRANSLATE_GBNF`: the numbers on
+        // `GUESSABLE` are only about this code if this code is the code the
+        // bench ran. The bench's tables are parsed straight out of its source.
+        let bench = include_str!("../../../spike/guess_other_bench.py");
+        let mut seen = 0;
+        for (tag, list) in OTHER_STOPWORDS {
+            let needle = format!("\"{tag}\": \"");
+            let line = bench
+                .lines()
+                .find(|l| l.trim_start().starts_with(&needle))
+                .unwrap_or_else(|| panic!("the bench has no table for {tag}"));
+            let words = line
+                .split_once("\": \"")
+                .and_then(|(_, rest)| rest.split_once("\".split()"))
+                .expect("a bench table line")
+                .0;
+            assert_eq!(*list, words, "the {tag} table drifted from the bench");
+            seen += 1;
+        }
+        assert_eq!(seen, OTHER_STOPWORDS.len());
+        // …and the ship list, which is the gate's actual output.
+        let ship = bench
+            .lines()
+            .find(|l| l.starts_with("SHIP = set("))
+            .expect("the bench's ship set");
+        let mut want: Vec<&str> = ship
+            .split_once('"')
+            .and_then(|(_, r)| r.split_once('"'))
+            .expect("the ship list")
+            .0
+            .split(' ')
+            .collect();
+        want.sort_unstable();
+        assert_eq!(want, GUESSABLE, "the shipped languages drifted");
+        // The de/en tables the vote is compared against are the same ones.
+        for (name, list) in [("DE", DE), ("EN", EN)] {
+            let line = bench
+                .lines()
+                .find(|l| l.starts_with(&format!("{name} = \"")))
+                .expect("the bench's de/en table");
+            let words = line
+                .split_once(" = \"")
+                .and_then(|(_, r)| r.split_once("\".split()"))
+                .expect("a table")
+                .0;
+            assert_eq!(
+                words.split(' ').collect::<Vec<_>>(),
+                list,
+                "the {name} table drifted from the bench"
+            );
+        }
+    }
+
+    #[test]
+    fn a_script_settles_it_and_a_borrowed_word_does_not() {
+        for (text, want) in [
+            ("это единственный способ сделать это", "ru"),
+            ("це єдиний спосіб це зробити", "uk"),
+            ("それが唯一の方法だと思う", "ja"),
+            ("그것이 유일한 방법이라고 생각해요", "ko"),
+            ("我认为这是唯一的方法", "zh"),
+            ("أعتقد أن هذه هي الطريقة الوحيدة", "ar"),
+            ("νομίζω ότι αυτός είναι ο μόνος τρόπος", "el"),
+        ] {
+            assert_eq!(guess_other(text).map(|g| g.tag), Some(want), "{text:?}");
+            assert!(guess_other(text).unwrap().confident, "{text:?}");
+        }
+        // A world name in another script inside an English sentence is not a
+        // turn in that language.
+        assert_eq!(guess_other("meet me in the 東京 world tonight"), None);
+        // Japanese written mostly in kanji is still Japanese, which is the
+        // whole reason kana are checked by presence: under a dominance rule
+        // this reads as Chinese.
+        assert_eq!(
+            guess_other("東京駅の近くで待ってる").map(|g| g.tag),
+            Some("ja")
+        );
+    }
+
+    #[test]
+    fn the_languages_the_user_actually_reads_are_never_guessed_at() {
+        // The one failure that matters: German or English handed to a
+        // translator because a third language was read into it. Zero of the
+        // 400 negatives in the bench, and these are the shapes that come
+        // closest — Dutch-looking German, and English with Romance loanwords.
+        for text in [
+            "ich glaube das ist der einzige weg das zu machen",
+            "das war doch nur ein test mit dem neuen mikrofon",
+            "i think that is the only way to do it",
+            "the cafe menu had a la carte options for the whole group",
+        ] {
+            assert_eq!(guess_other(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_latin_script_guess_needs_an_outright_win_over_de_and_en() {
+        let fr = guess_other("je ne sais pas ce que c'est mais il est dans la boîte").unwrap();
+        assert_eq!(fr.tag, "fr");
+        assert!(fr.confident);
+        assert_eq!(
+            guess_other("no way").map(|g| g.tag),
+            None,
+            "two words vote for nothing"
+        );
+        // Three votes is the floor and it is not a confident stamp: enough to
+        // ask the model, not enough to write into `segments.lang`.
+        let g = guess_other("het is niet voor mij").unwrap();
+        assert_eq!(g.tag, "nl");
+        assert!(!g.confident, "three votes is a queue, not a stamp");
+    }
+
+    #[test]
+    fn a_language_that_cannot_be_told_from_another_is_answered_i_cannot_tell() {
+        // Norwegian Bokmål. It wins its own vote and is refused, which is what
+        // keeps Danish's precision at 98.4% instead of handing it Norwegian.
+        assert_eq!(
+            guess_other("jeg tror ikke det er den eneste måten å gjøre det på"),
+            None
+        );
+        assert!(!GUESSABLE.contains(&"no"), "Norwegian must not be shipped");
+        assert!(offered("no"), "…but it is still a language you can pick");
+    }
+
+    #[test]
+    fn the_offered_list_is_a_code_and_a_name_that_cannot_drift() {
+        assert_eq!(name_of("en"), Some("English"));
+        assert_eq!(name_of("uk"), Some("Ukrainian"));
+        assert_eq!(name_of("xx"), None);
+        assert!(offered("de") && !offered("xx"));
+        assert_eq!(OFFERED[0].0, "en", "the target's default leads the list");
+        // The two lists overlap and neither contains the other, which is not
+        // an oversight. `no` is offered and not guessable (it cannot be told
+        // from Danish); `ar` and `el` are guessable and not offered (a turn in
+        // them is recognised as needing translation, but nobody asked to
+        // *read* in them). Both directions are load-bearing.
+        assert!(offered("no") && !GUESSABLE.contains(&"no"));
+        assert!(GUESSABLE.contains(&"ar") && !offered("ar"));
+        for tag in ["fr", "es", "ja", "ru"] {
+            assert!(offered(tag) && GUESSABLE.contains(&tag), "{tag}");
+        }
     }
 
     #[test]

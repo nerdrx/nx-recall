@@ -91,6 +91,24 @@ export const store = {
    * means "never asked", which is a different thing from an empty glossary.
    */
   vocab: null,
+  /**
+   * The translation settings (0.10.2), cached here for the same reason `vocab`
+   * is: an `assist` event can arrive while the Memory view is not mounted, and
+   * the TRANSCRIPT needs one of these three on every row it draws — which of
+   * the two lines is the main one. A view that had to ask before it could
+   * render a row would draw the wrong layout first and correct it.
+   *
+   * These are the daemon's own shipped defaults, so a client talking to one too
+   * old to have `assist.get` renders exactly what that daemon would have asked
+   * for and its card says the setting cannot be changed from here.
+   */
+  assist: {
+    translate_to: '',
+    read_languages: ['de', 'en'],
+    translation_display: 'main',
+    /** `[{code, name}]`, from the daemon: the selector is built out of what it accepts. */
+    languages: [],
+  },
   ops: new Map(), // op id → {kind, frac, done}
 
   /**
@@ -334,12 +352,16 @@ async function slice(name, run) {
  */
 export async function reloadAll({ retry = true, retryMin = RESYNC_RETRY_MIN, onRepaint = null } = {}) {
   cancelResyncRetry();
-  const [speakers, transcript, sources, mic, graph] = await Promise.all([
+  const [speakers, transcript, sources, mic, graph, assist] = await Promise.all([
     slice('speakers', () => ask('speakers.list')),
     slice('transcript', () => ask('transcript', { limit: MAX_SEGMENTS })),
     slice('sources', () => ask('sources.list')),
     slice('mic', () => ask('mic.get')),
     slice('graph', () => ask('graph.summary')),
+    // 0.10.2. Part of the resync rather than the Memory view's own query
+    // because the transcript needs `translation_display` to draw a row, and
+    // the transcript is what a resync is mostly for.
+    slice('assist', () => ask('assist.get')),
   ]);
 
   if (speakers.ok) store.speakers = new Map((speakers.data?.speakers ?? []).map((s) => [s.id, s]));
@@ -363,7 +385,12 @@ export async function reloadAll({ retry = true, retryMin = RESYNC_RETRY_MIN, onR
   if (graph.ok) store.graph = graph.data ?? { counts: null, enrichment: { phase: 'off' }, config: null };
   else if (graph.absent) store.graph = { counts: null, enrichment: { phase: 'off' }, config: null };
 
-  const stale = [speakers, transcript, sources, mic, graph].filter((s) => !s.ok && !s.absent).map((s) => s.name);
+  if (assist.ok && assist.data) applyAssist(assist.data);
+  // A daemon too old to know the method is not a stale slice (`absent`): the
+  // client keeps the defaults below and the card says it cannot be set here.
+  const stale = [speakers, transcript, sources, mic, graph, assist]
+    .filter((s) => !s.ok && !s.absent)
+    .map((s) => s.name);
   store.resync = {
     stale,
     attempt: stale.length ? store.resync.attempt + 1 : 0,
@@ -420,6 +447,39 @@ export function applyRoom(d) {
   if (!d) return store.room;
   store.room = { ...store.room, ...d };
   return store.room;
+}
+
+/**
+ * Fold an assist block into the model (0.10.2) — from `assist.get`, from
+ * `assist.set`'s reply, from an `assist` event, or from the three keys `status`
+ * carries.
+ *
+ * A merge and not a replacement, because those four sources do not all carry
+ * the same fields: `status` has no `languages` list, and dropping it there
+ * would empty the selector every three seconds.
+ */
+export function applyAssist(d) {
+  if (!d) return store.assist;
+  const next = { ...store.assist };
+  if (typeof d.translate_to === 'string') next.translate_to = d.translate_to;
+  if (Array.isArray(d.read_languages)) next.read_languages = [...d.read_languages];
+  if (d.translation_display === 'main' || d.translation_display === 'under') {
+    next.translation_display = d.translation_display;
+  }
+  if (Array.isArray(d.languages) && d.languages.length) next.languages = [...d.languages];
+  store.assist = next;
+  return store.assist;
+}
+
+/**
+ * Does the translation go where the words normally are (0.10.2)?
+ *
+ * One function rather than four readers of the same field: the transcript, the
+ * search hits, the card and the tests all have to agree about what an unset or
+ * unknown value means, and it means 0.10.2's default rather than 0.9.0's.
+ */
+export function translationLeads() {
+  return store.assist.translation_display !== 'under';
 }
 
 /**
@@ -917,6 +977,10 @@ export function applyEvent(evt, opts = {}) {
       if (d?.room) applyRoom(d.room);
       // …and the graph worker's state, for exactly the same reason (0.7.0).
       if (d?.graph) store.graph = { ...store.graph, enrichment: d.graph };
+      // …and the translation settings (0.10.2), for the third time and the
+      // same reason. `status` carries the three values and not the language
+      // list, so this merges rather than replaces.
+      if (d?.assist) applyAssist(d.assist);
       return { status: true, mic: true, room: true, graph: d?.graph ?? null };
     }
 
@@ -984,6 +1048,19 @@ export function applyEvent(evt, opts = {}) {
       if (!d) return null;
       store.vocab = d;
       return { vocab: d };
+    }
+
+    // The translation settings changed — here, in another window, or in the
+    // config file (0.10.2). On the `status` topic like `vocab` and `mic`, so no
+    // client changes its subscription and an older one ignores it.
+    //
+    // It repaints the TRANSCRIPT as well as the card, which is unusual for a
+    // settings event and is the point of the feature: `translation_display`
+    // decides which of a row's two lines is the main one.
+    case 'assist': {
+      if (!d) return null;
+      applyAssist(d);
+      return { assist: true };
     }
 
     // A MIC turn that began with a wake phrase became a note (0.8.0). The

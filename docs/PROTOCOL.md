@@ -1859,3 +1859,127 @@ was taken); `last_event_ms` is when the plugin last sent anything, which is the
 difference between "receiving" and "waiting for Discord"; `users` is how many
 accounts it has heard. Everything else stays on `truth.status`, which remains
 the method for the whole picture.
+
+## 0.10.2 — translation controls
+
+0.9.0 shipped translation as a config-file entry with one setting: `[assist]
+translate_to`. In use it turned out to be three questions, and the person asked
+all three in one breath — *everything but German and English should be
+translated*, *the original should be subtext and the translated thing the main
+thing*, and *translate it to English*. This round makes each of them a live
+setting with a control in the Memory view, and teaches the daemon to recognise
+a third language at all, because "everything but German and English" is not
+implementable by a classifier that only knows German and English.
+
+Everything here is additive. A client that has never heard of it renders 0.9.0's
+layout, and a daemon that has never heard of it answers `unknown_method` to both
+new methods — which a client treats as "this cannot be set from here", not as a
+failure.
+
+### `[assist]`, three keys
+
+| key | default | meaning |
+|---|---|---|
+| `translate_to` | `""` | the target. `""` is off, and is still the shipped value |
+| `read_languages` | `["de", "en"]` | languages a turn may be in without being translated |
+| `translation_display` | `"main"` | `"main"` or `"under"` — which line leads on a row |
+
+`read_languages` **always implicitly contains the target**: a target you would
+then translate away from is not a setting anybody meant, and every read of this
+value on the wire has the target folded in. It is *not* the same list as
+`speakers.set_languages`, which says what one voice speaks and still accepts
+`de`/`en` only.
+
+`translation_display: "main"` is a deliberate reversal of 0.9.0's argument. That
+round said the original must lead because the transcript is a record; the
+correction is that somebody who cannot read the original is not reading a
+record, they are reading a wall of text with a hint under each line. Both lines
+are on the row in either mode, the translation always says which language it is
+in and which model wrote it, and under `main` the original carries its own
+language code.
+
+### `assist.get` → the state and the selector's options
+
+```json
+{"translate_to": "en",
+ "read_languages": ["de", "en"],
+ "translation_display": "main",
+ "languages": [{"code": "en", "name": "English"}, …]}
+```
+
+`languages` is on the wire for the same reason `graph.get` carries
+`llm_threads_min`/`_max`: a client builds its selector out of what the daemon
+will accept rather than out of a list in its own source that can drift. It is
+`lang::OFFERED` — en de fr es it pt nl pl ru uk ja zh ko tr sv da no fi cs.
+
+### `assist.set {translate_to?, read_languages?, translation_display?}`
+
+At least one field, or `params`. Every code is validated against the list above
+and a bad one is a **refusal**, not a silent drop — a client that asked for
+`"gr"` and was answered `"en", "de"` would show a language it is not translating
+into. `translate_to: ""` is the exception and is how translation is switched
+off. Codes are case-folded and de-duplicated.
+
+The reply is `assist.get`'s shape plus `persisted`. The three values are applied
+to the running daemon *before* the reply, so the answer describes what is
+already true, and written back to `config.toml` the way `graph.set` writes the
+graph settings: re-read the file, move the fields, save.
+
+- **`assist` event**, on the existing **`status`** topic, carrying the same
+  shape. No new topic, so no client changes its subscription and an older one
+  ignores it. It repaints the *transcript* as well as any settings card, which
+  is unusual for a settings event and is the point: `translation_display`
+  decides which of a row's two lines is the main one.
+- **`status`** carries the three values under `assist` (not `languages` — a
+  selector's options do not change and that block is polled every few seconds),
+  beside the existing `assist.reminders` and `assist.digest`.
+
+### Which turns are candidates
+
+A turn is a candidate when its `lang` is **not** in `read_languages ∪
+{translate_to}` — plus the existing rules: three words minimum, nothing already
+looked at (`translation_via IS NULL`), and nothing in a language the user's own
+voice is declared to speak.
+
+`lang` is `de`, `en` or NULL, so before this round a French turn was NULL — the
+same stamp a mumbled German line gets — and invisible to that query. 0.10.2 adds
+`lang::guess_other`, which answers *which language other than German or English
+is this*, and a NULL-language turn is a candidate **only when it answers**. That
+asymmetry is the safety argument: the difference between "a language I do not
+read" and "words nobody could read" is the only thing that stops "translate
+everything I cannot read" from meaning "translate everything".
+
+The rule is script first — Cyrillic (ru, or uk on `і ї є ґ`), kana → ja, hangul
+→ ko, Han → zh, Arabic → ar, Greek → el — then a stopword vote over twelve
+Latin-script tables, which fires only on ≥3 stopwords, strictly more than de+en
+together, and an outright win.
+
+Measured in `spike/guess_other_bench.py` over **4200 FLEURS sentences**: 200 per
+language plus 200 German and 200 English as negatives, precision over the whole
+mixed set. The gate was 90% precision. Shipped: **ar cs da el es fi fr it ja ko
+nl pl pt ru sv tr uk zh** (93.1%–100%; **zero** of the 400 German and English
+negatives was guessed to be anything at all). Norwegian did **not** ship — its
+function words are Danish's, 64.8% precision — and stays in the vote table as a
+blocker, so a Norwegian sentence is answered "I cannot tell" rather than
+"Danish", which is what keeps Danish at 98.4%.
+
+A **confident** guess — a non-Latin script, or four stopwords — is written onto
+the row as `lang` with `lang_via: "guessed"`, a new value beside `model`,
+`classified`, `re-decode`, `mismatch` and `context`. Like `context` it is an
+inference and the words were not re-decoded. An unconfident guess is enough to
+ask the model and not enough to claim anything in the database.
+
+### The prompt
+
+The few-shot example is now **in the target language**. It was German
+hard-coded, from the 0.9.0 bench, and a prompt that says "translate into
+English" under two worked examples answering in German is a prompt arguing with
+itself. Only English and German have written examples, because those are the two
+this project can check; every other target gets the instruction alone.
+
+The wrong-language guard, which used to have no opinion about any target that
+was not `de` or `en`, now guards those too: a confident `guess_other` reading of
+a language that is not the target is a rejection, and where it cannot read one,
+three German or English stopwords are. It deliberately does **not** use
+`lang::classify` for a third-language target — that settles on German the moment
+it sees an umlaut, and Swedish, Turkish and Finnish are full of them.

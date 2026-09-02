@@ -140,6 +140,14 @@ pub mod lang_via {
     /// (`Store::thread_language_stamps`): a context that fed on its own
     /// inferences would confirm itself.
     pub const CONTEXT: &str = "context";
+    /// The third-language guesser read a script or a stopword majority the
+    /// two-language classifier has no vocabulary for (0.10.2,
+    /// `crate::lang::guess_other`). Written only on a *confident* guess — a
+    /// non-Latin script, or four stopwords — because unlike the two-way
+    /// classifier this one is choosing between nineteen answers.
+    ///
+    /// Like [`CONTEXT`] it is an inference and the words were not re-decoded.
+    pub const GUESSED: &str = "guessed";
 }
 
 /// Which pass produced a row's words (v10, on the wire as `text_via`).
@@ -6172,6 +6180,45 @@ impl Store {
         // The word floor is applied here rather than in SQL: SQLite cannot
         // count words, and a LIKE-based approximation would be a second,
         // different definition of "three words" from the one the pass uses.
+        Ok(rows
+            .into_iter()
+            .filter(|c| crate::asr::normalise_words(&c.text).len() >= min_words)
+            .collect())
+    }
+
+    /// Turns nothing has read a language out of, newest first (0.10.2).
+    ///
+    /// The companion to [`Self::segments_for_translation`], which can only see
+    /// rows that already carry a `de`/`en` stamp. A French turn carries none —
+    /// the classifier has no vocabulary for it — so it is invisible to that
+    /// query and to every earlier version of this feature. These are the rows
+    /// `crate::lang::guess_other` is offered, outside the lock.
+    ///
+    /// `limit` is a scan window rather than a batch size: most of what comes
+    /// back is genuinely unreadable (a mumble, two words, a name) and will be
+    /// rejected by the guesser rather than translated. The caller passes
+    /// something in the low thousands and takes its batch out of the far end.
+    pub fn segments_without_language(
+        &self,
+        min_words: usize,
+        limit: usize,
+    ) -> Result<Vec<TranslateCandidate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.text FROM segments g
+             WHERE g.deleted_at IS NULL AND g.translation_via IS NULL
+               AND g.lang IS NULL
+               AND g.text IS NOT NULL AND TRIM(g.text) <> ''
+             ORDER BY g.t_start_ns DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(TranslateCandidate {
+                    id: r.get(0)?,
+                    text: r.get(1)?,
+                    lang: String::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows
             .into_iter()
             .filter(|c| crate::asr::normalise_words(&c.text).len() >= min_words)

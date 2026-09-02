@@ -147,10 +147,19 @@ pub fn segment_json(row: &SegmentRow) -> Value {
         "translation": crate::translate::translation_json(
             row.translation.as_deref(),
             row.translation_via.as_deref(),
-            crate::translate::target(),
+            &crate::translate::target(),
         ),
         // ---- end 0.9.0 -----------------------------------------------------
     })
+}
+
+/// The codes `assist.set` accepts, for the one sentence a refusal is (0.10.2).
+fn offered_codes() -> String {
+    crate::lang::OFFERED
+        .iter()
+        .map(|(code, _)| *code)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One source on the wire — a `sources.list` entry and the body of a `source`
@@ -339,6 +348,10 @@ impl Service {
             // segment, so the assistant round adds exactly one method.
             "digest.list" => self.digest_list(req),
             // ---- end 0.9.0 --------------------------------------------------
+            // ---- 0.10.2, the translation controls --------------------------
+            "assist.get" => self.assist_get(),
+            "assist.set" => self.assist_set(req),
+            // ---- end 0.10.2 -------------------------------------------------
             "transcript" => self.transcript(req),
             "roster.now" => self.roster_now(),
             "operations.list" => self.operations_list(req),
@@ -606,7 +619,13 @@ impl Service {
                 "reminders": c.assist().reminders,
                 "digest": c.assist().digest,
                 // `""` means translation is off, which is the shipped value.
-                "translate_to": c.assist().translate_to,
+                // 0.10.2 adds the other two translation settings here, on the
+                // same three-second poll every client already runs, so a
+                // client that missed the `assist` event still converges — the
+                // same rule as `mic` and `graph` above.
+                "translate_to": crate::translate::target(),
+                "read_languages": crate::translate::read_languages(),
+                "translation_display": crate::translate::display(),
             },
             // ---- end 0.9.0 --------------------------------------------------
             "segments_total": store.segments_total()?,
@@ -3582,6 +3601,155 @@ impl Service {
                 .collect::<Vec<_>>(),
         }))
     }
+
+    // ---- 0.10.2, the translation controls ---------------------------------
+
+    /// The three settings and the list a client builds its selectors from.
+    ///
+    /// `languages` is on the wire for the same reason `graph.get` carries
+    /// `llm_threads_min`/`_max`: a client's dropdown is built out of what the
+    /// daemon will accept, rather than out of a list in its own source that can
+    /// drift away from this one.
+    ///
+    /// `read_languages` is the **effective** set — what was configured, plus
+    /// the target, which is always read by definition. A client renders the
+    /// target's chip as on and not removable; a client that instead echoed the
+    /// stored value would draw a target you do not read.
+    fn assist_state(&self) -> Value {
+        json!({
+            "translate_to": crate::translate::target(),
+            "read_languages": crate::translate::read_languages(),
+            "translation_display": crate::translate::display(),
+            "languages": crate::lang::OFFERED
+                .iter()
+                .map(|(code, name)| json!({"code": code, "name": name}))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    fn assist_get(&self) -> Result<Value, Error> {
+        Ok(self.assist_state())
+    }
+
+    /// Change any of the three, live and persisted.
+    ///
+    /// Live because the controls are in the Memory view and a control that
+    /// needs a restart is not a control; persisted because a control that
+    /// forgets is worse. Persistence is `graph.set`'s: re-read the file, move
+    /// the fields, write it back — so a setting changed by hand between two
+    /// clicks is not silently reverted by a stale copy in memory.
+    ///
+    /// Codes are validated against [`crate::lang::OFFERED`] and a bad one is a
+    /// refusal rather than a silent drop: a client that asked for `"gr"` and
+    /// was answered "en, de" would show a language it is not translating into.
+    /// `translate_to: ""` is the exception, and is how translation is switched
+    /// off.
+    fn assist_set(&self, req: &Request) -> Result<Value, Error> {
+        let to = match req.opt_str("translate_to")? {
+            None => None,
+            Some(raw) => {
+                let code = raw.trim().to_ascii_lowercase();
+                if !code.is_empty() && !crate::lang::offered(&code) {
+                    return Err(Error::params(format!(
+                        "no language {code:?}; translate_to is one of {} or \"\" for off",
+                        offered_codes()
+                    )));
+                }
+                Some(code)
+            }
+        };
+        let read = match req.param("read_languages") {
+            None => None,
+            Some(Value::Array(items)) => {
+                let mut out: Vec<String> = Vec::with_capacity(items.len());
+                for item in items {
+                    let Some(code) = item.as_str() else {
+                        return Err(Error::params("read_languages must be an array of strings"));
+                    };
+                    let code = code.trim().to_ascii_lowercase();
+                    if !crate::lang::offered(&code) {
+                        return Err(Error::params(format!(
+                            "no language {code:?}; read_languages is any of {}",
+                            offered_codes()
+                        )));
+                    }
+                    if !out.contains(&code) {
+                        out.push(code);
+                    }
+                }
+                Some(out)
+            }
+            Some(_) => return Err(Error::params("read_languages must be an array of strings")),
+        };
+        let display = match req.opt_str("translation_display")? {
+            None => None,
+            Some(raw) => {
+                let mode = raw.trim().to_ascii_lowercase();
+                if mode != crate::translate::DISPLAY_MAIN && mode != crate::translate::DISPLAY_UNDER
+                {
+                    return Err(Error::params(format!(
+                        "translation_display is {:?} or {:?}",
+                        crate::translate::DISPLAY_MAIN,
+                        crate::translate::DISPLAY_UNDER
+                    )));
+                }
+                Some(mode)
+            }
+        };
+        if to.is_none() && read.is_none() && display.is_none() {
+            return Err(Error::params(
+                "assist.set needs at least one of translate_to, read_languages, translation_display",
+            ));
+        }
+
+        // Live first, so the reply describes what is already true.
+        if let Some(to) = &to {
+            crate::translate::set_target(to);
+        }
+        if let Some(read) = &read {
+            crate::translate::set_read_languages(read);
+        }
+        if let Some(display) = &display {
+            crate::translate::set_display(display);
+        }
+
+        let mut persisted = false;
+        if let Some(path) = &self.control.config_path {
+            match Config::load(path) {
+                Ok(mut file) => {
+                    if let Some(to) = &to {
+                        file.assist.translate_to = to.clone();
+                    }
+                    if let Some(read) = &read {
+                        file.assist.read_languages = read.clone();
+                    }
+                    if let Some(display) = &display {
+                        file.assist.translation_display = display.clone();
+                    }
+                    match file.save(path) {
+                        Ok(()) => persisted = true,
+                        Err(e) => warn!("could not persist the translation settings: {e:#}"),
+                    }
+                }
+                Err(e) => warn!("could not re-read the config to persist translation: {e:#}"),
+            }
+        }
+        info!(
+            to = crate::translate::target(),
+            display = crate::translate::display(),
+            persisted,
+            "the translation settings changed"
+        );
+        let mut state = self.assist_state();
+        state["persisted"] = json!(persisted);
+        // Every other client's controls, and every open transcript: the
+        // display mode changes what a row LOOKS like, so a window that did not
+        // make the change still has to be told.
+        self.bus.publish(Topic::Status, "assist", state.clone());
+        Ok(state)
+    }
+
+    // ---- end 0.10.2 -------------------------------------------------------
 
     // ---- 0.9.0, the assistant --------------------------------------------
 
@@ -7137,9 +7305,10 @@ mod tests {
 
     #[test]
     fn a_segment_carries_its_translation_as_an_object_or_null() {
-        // The target is read once at start-up (`translate::set_target`), so a
-        // test that wants a translation on the wire has to say what it is
-        // being translated into.
+        // The target is process-wide (`translate::LIVE`), so a test that wants
+        // a translation on the wire says what it is being translated into and
+        // holds the settings still while it looks.
+        let _live = crate::translate::test_guard();
         crate::translate::set_target("de");
         let r = rig("translation");
         let session = a_session(&r);
@@ -7178,6 +7347,7 @@ mod tests {
 
     #[test]
     fn status_says_which_assistant_features_are_on() {
+        let _live = crate::translate::test_guard();
         let r = rig("assist-status");
         let s = call(&r, r#"{"id":1,"method":"status"}"#).unwrap();
         assert_eq!(s["schema"], json!(12));
@@ -7186,6 +7356,9 @@ mod tests {
         assert_eq!(s["assist"]["reminders"], json!(true));
         assert_eq!(s["assist"]["digest"], json!(true));
         assert_eq!(s["assist"]["translate_to"], json!(""));
+        // 0.10.2's two companions, on the same block and on the same poll.
+        assert_eq!(s["assist"]["read_languages"], json!(["de", "en"]));
+        assert_eq!(s["assist"]["translation_display"], json!("main"));
         for key in [
             "digests_written",
             "digests_refused",
@@ -7195,5 +7368,103 @@ mod tests {
         ] {
             assert_eq!(s["counters"][key], json!(0), "{key}");
         }
+    }
+
+    // ---- 0.10.2, the translation controls ---------------------------------
+
+    #[test]
+    fn the_three_translation_settings_are_live_and_come_back_as_the_new_state() {
+        let _live = crate::translate::test_guard();
+        let r = rig("assist-set");
+
+        let got = call(&r, r#"{"id":1,"method":"assist.get"}"#).unwrap();
+        assert_eq!(got["translate_to"], json!(""));
+        assert_eq!(got["read_languages"], json!(["de", "en"]));
+        assert_eq!(got["translation_display"], json!("main"));
+        // The selector's own list, so a client's dropdown is built out of what
+        // the daemon accepts rather than out of a copy of it.
+        let langs = got["languages"].as_array().expect("a language list");
+        assert_eq!(langs.len(), crate::lang::OFFERED.len());
+        assert_eq!(langs[0], json!({"code": "en", "name": "English"}));
+
+        let out = call(
+            &r,
+            r#"{"id":2,"method":"assist.set","params":{"translate_to":"EN","read_languages":["de"],"translation_display":"under"}}"#,
+        )
+        .unwrap();
+        // The target is always read, whatever the list said: a target you would
+        // then translate away from is not a setting anybody meant.
+        assert_eq!(out["translate_to"], json!("en"), "case-folded");
+        assert_eq!(out["read_languages"], json!(["de", "en"]));
+        assert_eq!(out["translation_display"], json!("under"));
+        // …and it took effect on the running daemon, not only in the reply.
+        assert_eq!(crate::translate::target(), "en");
+        assert_eq!(crate::translate::display(), "under");
+        let s = call(&r, r#"{"id":3,"method":"status"}"#).unwrap();
+        assert_eq!(s["assist"]["translate_to"], json!("en"));
+
+        // One field at a time leaves the other two alone.
+        let out = call(
+            &r,
+            r#"{"id":4,"method":"assist.set","params":{"translation_display":"main"}}"#,
+        )
+        .unwrap();
+        assert_eq!(out["translate_to"], json!("en"));
+        assert_eq!(out["translation_display"], json!("main"));
+
+        // Off is a real setting and is spelled "".
+        let out = call(
+            &r,
+            r#"{"id":5,"method":"assist.set","params":{"translate_to":""}}"#,
+        )
+        .unwrap();
+        assert_eq!(out["translate_to"], json!(""));
+        assert_eq!(
+            out["read_languages"],
+            json!(["de"]),
+            "the target left with it"
+        );
+    }
+
+    #[test]
+    fn a_language_the_daemon_does_not_offer_is_refused_rather_than_dropped() {
+        let _live = crate::translate::test_guard();
+        let r = rig("assist-set-bad");
+        for params in [
+            r#"{"translate_to":"gr"}"#,
+            r#"{"read_languages":["en","klingon"]}"#,
+            r#"{"read_languages":"en"}"#,
+            r#"{"translation_display":"beside"}"#,
+            r#"{}"#,
+        ] {
+            let e = call(
+                &r,
+                &format!(r#"{{"id":1,"method":"assist.set","params":{params}}}"#),
+            )
+            .unwrap_err();
+            assert_eq!(e.code, "params", "{params}");
+        }
+        // Nothing moved: a refused call is a call that did not happen.
+        assert_eq!(crate::translate::target(), "");
+        assert_eq!(crate::translate::display(), "main");
+    }
+
+    #[test]
+    fn a_changed_setting_is_pushed_to_every_other_window() {
+        let _live = crate::translate::test_guard();
+        let r = rig("assist-event");
+        call(
+            &r,
+            r#"{"id":1,"method":"assist.set","params":{"translation_display":"under"}}"#,
+        )
+        .unwrap();
+        let ev = events(&r)
+            .into_iter()
+            .find(|e| e["ev"] == json!("assist"))
+            .expect("an assist event");
+        // The same shape the method answers with, so a client has one renderer.
+        assert_eq!(ev["data"]["translation_display"], json!("under"));
+        assert_eq!(ev["data"]["translate_to"], json!(""));
+        assert!(ev["data"]["languages"].is_array());
     }
 }
