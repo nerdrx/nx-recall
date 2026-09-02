@@ -17,6 +17,8 @@ import {
   reloadAll,
   reloadGraph,
   mergeSegments,
+  speakerByDisplayName,
+  speakerLabel,
   ask,
 } from './lib/store.js';
 import { patchSpeakerLabels } from './lib/labels.js';
@@ -67,6 +69,8 @@ const ctx = {
   back,
   toast,
   resync,
+  // 0.8.0: the person page's own way of asking for the bar the roster raises.
+  showBrief,
 };
 
 /**
@@ -271,6 +275,136 @@ function renderUpdateBar() {
 }
 
 // ---------------------------------------------------------------------------
+// the brief bar (0.8.0)
+//
+// A roster JOIN naming a voice the user has named is the one moment in this
+// app where showing something unasked is worth it: you are about to talk to
+// somebody, and what is open between you is a thing you would want to have
+// remembered ten seconds ago rather than ten minutes later.
+//
+// Everything about it is bounded on purpose. It only ever fires for a NAMED
+// voice — an unnamed one has nothing to brief you about and the roster cannot
+// be linked to it anyway. It is one line. It is dismissible. It never sounds,
+// never blocks, and never re-raises itself for the same person inside ten
+// minutes, because a flaky instance can bounce somebody in and out four times
+// in a minute and four identical bars is not four pieces of information.
+// ---------------------------------------------------------------------------
+
+const briefBar = document.getElementById('brief-bar');
+/** How long one person's join stays "the same arrival". */
+const BRIEF_DEBOUNCE_MS = 10 * 60 * 1000;
+const briefSeen = new Map(); // speaker id → when they were last briefed
+let briefShown = null;
+
+function closeBrief() {
+  briefShown = null;
+  clear(briefBar);
+  briefBar.hidden = true;
+}
+
+/**
+ * One person's standing account, in a sentence. The order is what a person
+ * actually wants first: what they owe you, then what you owe them, then what
+ * you were last talking about — the third being the one that makes a hello
+ * easier and the first two being the ones that are easy to be embarrassed by.
+ */
+function briefLine(brief, name) {
+  const what = (c) => c?.what ?? 'something';
+  const when = (c) => (c?.due_raw ? ` (${c.due_raw})` : '');
+  const parts = [];
+  const owed = brief.open_to_you ?? [];
+  const owes = brief.open_from_you ?? [];
+  const topics = brief.recent_topics ?? [];
+  if (owed.length) parts.push(`owes you: ${owed.map((c) => what(c) + when(c)).join(', ')}`);
+  if (owes.length) parts.push(`you owe: ${owes.map((c) => what(c) + when(c)).join(', ')}`);
+  if (topics.length) parts.push(`last talked about: ${topics.slice(0, 2).join(', ')}`);
+  // Nothing open and nothing remembered is still worth one honest clause. The
+  // bar has already been raised by the join; going silent now would read as a
+  // bug rather than as "there is nothing to say".
+  if (!parts.length) parts.push('nothing open between you');
+  return `${name} joined — ${parts.join(' · ')}`;
+}
+
+function renderBrief(brief, sp) {
+  const name = sp?.name || speakerLabel(sp?.id);
+  briefShown = sp?.id ?? null;
+  clear(briefBar);
+  briefBar.hidden = false;
+  briefBar.append(
+    h('span', { class: 'dot' }),
+    h('span', { class: 'update-text', id: 'brief-text', text: briefLine(brief, name), title: briefLine(brief, name) }),
+    h('span', { class: 'spacer' }),
+    h(
+      'button',
+      {
+        class: 'btn small',
+        id: 'brief-open',
+        title: `Open ${name}'s page`,
+        onclick: () => {
+          const id = sp?.id;
+          closeBrief();
+          if (id != null) openPerson(id);
+        },
+      },
+      'Open'
+    ),
+    h(
+      'button',
+      {
+        class: 'btn small',
+        id: 'brief-dismiss',
+        'aria-label': 'Dismiss this brief',
+        title: 'Dismiss',
+        onclick: closeBrief,
+      },
+      '✕'
+    )
+  );
+}
+
+/**
+ * A roster join arrived. Match it to a named voice, debounce, ask, show.
+ *
+ * Exported onto the debug handle rather than kept private because the headless
+ * driver has to be able to prove the DEBOUNCE, and a rule you can only observe
+ * by waiting ten minutes is a rule nobody tests.
+ */
+async function onRosterJoin(data) {
+  const sp = speakerByDisplayName(data?.who ?? data?.display_name);
+  // Not a voice this user has named — there is nothing to brief, and guessing
+  // at a link between a display name and an unnamed voice is exactly the kind
+  // of confident wrong answer this app does not make.
+  if (!sp) return { skipped: 'unlinked', who: data?.who ?? null };
+  const now = Date.now();
+  const last = briefSeen.get(sp.id) ?? 0;
+  if (now - last < BRIEF_DEBOUNCE_MS) return { skipped: 'debounced', speaker: sp.id };
+  briefSeen.set(sp.id, now);
+  try {
+    const brief = await ask('person.brief', { id: sp.id });
+    renderBrief(brief, sp);
+    return { shown: sp.id, name: sp.name };
+  } catch (e) {
+    // A daemon too old to brief is not an error anybody needs to see: the join
+    // itself was never rendered before 0.8.0 either.
+    return { skipped: 'failed', error: e.message };
+  }
+}
+
+/** The "Brief" entry on a person page header calls this. */
+async function showBrief(spId) {
+  const sp = store.speakers.get(Number(spId));
+  if (!sp) return null;
+  briefSeen.set(sp.id, Date.now());
+  try {
+    renderBrief(await ask('person.brief', { id: sp.id }), sp);
+    return { shown: sp.id };
+  } catch (e) {
+    toast(`Could not put together a brief — ${e.message}`, 'error');
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // footer
 // ---------------------------------------------------------------------------
 
@@ -408,6 +542,9 @@ window.recall.onEvent((evt) => {
   // One path, every view: a rename made here, in the CLI, or in another client
   // all arrive as the same broadcast and repaint the same way.
   if (change.relabel) patchSpeakerLabels(change.relabel);
+  // Somebody walked in. The bar this raises sits above every view rather than
+  // inside one, so it belongs to the controller and not to a view.
+  if (change.rosterJoin) void onRosterJoin(change.rosterJoin);
   current?.update?.(change);
   renderFooter();
   if (change.opFinished) {
@@ -691,6 +828,75 @@ document.addEventListener('keydown', (e) => {
         note: (document.getElementById('enrich-note') || {}).textContent ?? '',
         counts: (document.getElementById('enrich-counts') || {}).textContent ?? '',
       },
+    }),
+    // 0.8.0. Everything the driver has to read back about the accuracy round:
+    // the two marks a row can now wear, the sheet's inline fix, the three new
+    // Memory cards, the interpretation pills, and the brief bar.
+    accuracy: () => ({
+      // Rows the second decoder disagreed with, and the mark they wear. The
+      // mark is read off the DOM rather than off the model, because a class
+      // nobody can see is not a distinction anybody can act on.
+      shakyRows: document.querySelectorAll('#seg-list .seg.shaky').length,
+      shakyMarks: document.querySelectorAll('#seg-list .seg.shaky .shaky-mark').length,
+      // …and rows the cross-check agreed with must NOT wear one: a badge on
+      // every row is not a badge.
+      solidMarks: document.querySelectorAll('#seg-list .seg:not(.shaky) .shaky-mark').length,
+      tip: (document.querySelector('#seg-list .shaky-mark') || {}).title ?? '',
+      searchShaky: document.querySelectorAll('#search-results .seg.shaky .shaky-mark').length,
+      sheet: {
+        reader: (document.getElementById('segment-text') || {}).textContent ?? null,
+        editing: !!document.getElementById('correct-text') && !document.getElementById('correct-text').hidden,
+        hint: (document.getElementById('segment-fix-hint') || {}).textContent ?? '',
+        via: (document.getElementById('segment-text-via') || {}).textContent ?? '',
+        shaky: (document.getElementById('segment-shaky') || {}).textContent ?? '',
+      },
+      notes: [...document.querySelectorAll('#note-list .note-row')].map((r) => ({
+        id: Number(r.dataset.note),
+        state: r.dataset.state,
+        segment: Number(r.dataset.segment),
+        pending: r.classList.contains('pending'),
+        text: r.querySelector('.note-text')?.textContent ?? '',
+        acts: [...r.querySelectorAll('[data-note-act]')].map((b) => b.dataset.noteAct),
+      })),
+      notesEmpty: (document.getElementById('notes-empty') || {}).textContent ?? '',
+      dash: {
+        corrections: (document.getElementById('accuracy-corrections') || {}).textContent ?? '',
+        wer: (document.getElementById('accuracy-wer') || {}).textContent ?? '',
+        bySource: [...document.querySelectorAll('[data-acc="by-source"] .acc-row')].map((r) => r.dataset.accRow),
+        bySpeaker: [...document.querySelectorAll('[data-acc="by-speaker"] .acc-row')].map((r) => r.dataset.accRow),
+        empty: (document.getElementById('accuracy-empty') || {}).textContent ?? '',
+        note: (document.getElementById('accuracy-note') || {}).textContent ?? '',
+      },
+      vocab: {
+        user: [...document.querySelectorAll('#vocab-user .vocab-chip')].map((c) => c.dataset.term),
+        effective: (document.getElementById('vocab-effective') || {}).textContent ?? '',
+        counts: Object.fromEntries(
+          [...document.querySelectorAll('[data-count]')].map((c) => [c.dataset.count, Number(c.textContent)])
+        ),
+        // An auto term must not offer a remove button: you cannot argue with
+        // what was heard, and a button that did nothing would say you could.
+        autoRemovable: document.querySelectorAll('.vocab-chip.auto .vocab-chip-x').length,
+      },
+    }),
+    ask: () => ({
+      pills: [...document.querySelectorAll('#ask-pills .ask-pill')].map((p) => ({
+        facet: p.dataset.facet,
+        text: p.querySelector('.ask-pill-text')?.textContent ?? '',
+        removable: !!p.querySelector('.ask-pill-x'),
+      })),
+      shown: !document.getElementById('ask-pills')?.hidden,
+      hits: document.querySelectorAll('#search-results .seg').length,
+      sub: (document.getElementById('search-sub') || {}).textContent ?? '',
+      advanced: (document.getElementById('search-advanced') || {}).getAttribute?.('aria-expanded') ?? null,
+      facetsHidden: !!document.getElementById('search-facets')?.hidden,
+      mode: [...document.querySelectorAll('.seg-ctl .seg-opt')].map((b) => [b.id, b.getAttribute('aria-pressed')]),
+    }),
+    brief: () => ({
+      shown: !briefBar.hidden,
+      speaker: briefShown,
+      text: (document.getElementById('brief-text') || {}).textContent ?? '',
+      open: !!document.getElementById('brief-open'),
+      dismiss: !!document.getElementById('brief-dismiss'),
     }),
     // The one line behind the native-widget fix: without `color-scheme: dark`
     // Chromium draws <select> option popups light-on-light over this palette.

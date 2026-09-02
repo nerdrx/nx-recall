@@ -20,6 +20,19 @@
 // daemon performs is the one it performs onto a REPLACED binary (0.5.3): the
 // window that was already open is now the old client of a new daemon, and that
 // string is the only place it can find that out.
+//
+// SIGUSR2 fires the 0.8.0 events that a canned world cannot produce on its own,
+// one per signal, in order:
+//
+//   1st — a `note` event: a MIC turn that began with a wake phrase.
+//   2nd — a `roster` JOIN naming a voice the user has named (Kira), which is
+//         what a client turns into a brief.
+//   3rd — the SAME join again, immediately, so a client's brief debounce is
+//         testable rather than merely assertable in prose.
+//
+// A signal rather than a timer because both are things a test has to be able to
+// place: a note that arrives at second 19 of a two-minute run lands in whatever
+// step happens to be on screen, and proves nothing about the one that cares.
 
 import net from 'node:net';
 import fs from 'node:fs';
@@ -277,6 +290,13 @@ function buildFiller(base) {
         label_via: 'match',
         lang_via: 'classified',
         lang: speaker === 1 ? 'de' : 'en',
+        // 0.8.0: what the SECOND decoder made of the same audio. "solid" is
+        // agreement, "shaky" is disagreement, and the text on screen is the
+        // first decoder's either way — the cross-check is a flag, never a
+        // replacement. Every eleventh row disagrees, which is roughly the rate
+        // the real bake-off measured and enough that any page has a few.
+        asr_confidence: i % 11 === 5 ? 'shaky' : 'solid',
+        text_via: 'live',
         // Blocks of five, as above, but numbered BELOW the canned threads so
         // "recent conversations" still means the canned ones.
         thread: 100 + block,
@@ -322,6 +342,9 @@ function buildHistory() {
       // 0.7.7: how the LANGUAGE got there. "classified" is the ordinary
       // answer; the two below are the ones the transcript says something about.
       lang_via: 'classified',
+      // 0.8.0, the cross-check and the words' own provenance.
+      asr_confidence: mine ? 'solid' : i % 4 === 1 ? 'shaky' : 'solid',
+      text_via: 'live',
       // schema v6: which conversation this turn is part of.
       thread: threadFor(i),
     });
@@ -346,6 +369,10 @@ function buildHistory() {
     label_via: 'proximity',
     lang: null,
     lang_via: null,
+    // Six hundred milliseconds of "mm": too short for a second decoder to have
+    // an opinion about, which is exactly what a null cross-check means.
+    asr_confidence: null,
+    text_via: 'live',
     thread: threadFor(26),
   });
   out.push({
@@ -363,6 +390,8 @@ function buildHistory() {
     label_via: 'match',
     lang: null,
     lang_via: null,
+    asr_confidence: null,
+    text_via: 'live',
     thread: threadFor(27),
   });
 
@@ -387,6 +416,8 @@ function buildHistory() {
       label_via: 'match',
       lang: p.lang,
       lang_via: 'classified',
+      asr_confidence: 'solid',
+      text_via: 'live',
       thread: threadFor(28 + i),
     });
   });
@@ -410,6 +441,10 @@ function buildHistory() {
     label_via: 'match',
     lang: 'de',
     lang_via: 're-decode',
+    // The arbiter wrote these words, and the second decoder agrees with them.
+    // Two different facts about the same row, which is why they are two fields.
+    asr_confidence: 'solid',
+    text_via: 'arbiter',
     thread: threadFor(31),
   });
   out.push({
@@ -429,10 +464,120 @@ function buildHistory() {
     label_via: 'match',
     lang: null,
     lang_via: 'mismatch',
+    asr_confidence: 'solid',
+    text_via: 'live',
     thread: threadFor(31),
+  });
+
+  // 0.8.0, the row the whole confidence feature is for and the only place this
+  // wording appears: the second decoder read it differently, so the words are
+  // flagged, and the pipeline went back and re-read it with the session audio
+  // either side. Named rather than generated because the e2e searches for it —
+  // a shaky mark has to be provable in the SEARCH results too, and a fixture
+  // that only exists somewhere in a rotation cannot be searched for.
+  out.push({
+    id: 1112,
+    session: SESSIONS[2].id,
+    source: 'VRChat.exe',
+    speaker: 2,
+    text: 'the shader thing on the second floor was flickering again',
+    t_ms: base2 + 7 * 47_000,
+    t_ns: String(base2 + 7 * 47_000) + '000000',
+    dur_ms: 2900,
+    overlap_frac: 0.03,
+    match_score: 0.68,
+    label_via: 'match',
+    lang: 'en',
+    lang_via: 'classified',
+    asr_confidence: 'shaky',
+    text_via: 'context',
+    thread: threadFor(31),
+  });
+
+  // The two notes-to-self, as what they actually are: ordinary MIC turns that
+  // happen to begin with a wake phrase. The segment STAYS in the transcript
+  // (PROTOCOL) — a note is a second reading of a turn, not a turn that was
+  // moved somewhere else.
+  NOTES.forEach((n, i) => {
+    const t = base2 + (8 + i) * 47_000;
+    n.t_ms = t;
+    n.t_ns = String(t) + '000000';
+    out.push({
+      id: n.segment_id,
+      session: SESSIONS[2].id,
+      source: 'mic',
+      speaker: YOU_SPEAKER,
+      text: n.said,
+      t_ms: t,
+      t_ns: n.t_ns,
+      dur_ms: 3100 + i * 400,
+      overlap_frac: 0.02,
+      match_score: null,
+      label_via: 'mic',
+      lang: n.lang,
+      lang_via: 'classified',
+      asr_confidence: 'solid',
+      text_via: 'live',
+      thread: threadFor(32),
+    });
   });
   return out;
 }
+
+/// Notes to self (0.8.0). A MIC turn whose text starts with a wake phrase
+/// becomes one; `text` is what is left after the phrase, because "recall, merk
+/// dir" is the addressing and not the note.
+///
+/// Two of them, in the two languages the daemon classifies, and one already
+/// `done` — a list where every row is in the same state cannot show that the
+/// state chips mean anything.
+const NOTES = [
+  {
+    id: 700,
+    segment_id: 1120,
+    lang: 'de',
+    said: 'recall, merk dir dass der Link zu der Map noch fehlt',
+    text: 'dass der Link zu der Map noch fehlt',
+    state: 'open',
+    t_ms: 0,
+    t_ns: '0',
+  },
+  {
+    id: 701,
+    segment_id: 1121,
+    lang: 'en',
+    said: 'recall, remember to export the shader graph before Friday',
+    text: 'to export the shader graph before Friday',
+    state: 'done',
+    t_ms: 0,
+    t_ns: '0',
+  },
+];
+
+/// The states a note can be in. Same shape of rule as the commitments: only a
+/// person moves one, at either end of the socket.
+const NOTE_STATES = ['open', 'done', 'dismissed'];
+
+/// The third note, delivered live on the first SIGUSR2 so a client's "a note
+/// arrived" path is drivable rather than only reachable by talking.
+const LIVE_NOTE = {
+  id: 702,
+  segment_id: 1122,
+  lang: 'en',
+  said: 'recall, note that the portal in the stairwell only opens at night',
+  text: 'that the portal in the stairwell only opens at night',
+  state: 'open',
+};
+
+/// The user glossary, and the three auto groups the daemon derives (PROTOCOL
+/// "Vocabulary"). The user half is editable; the auto halves are facts about
+/// what has been heard and are read-only wherever they are shown.
+const VOCAB_USER = ['PhysBones', 'Ghost Club', 'Rowan'];
+const VOCAB_AUTO = {
+  roster: ['Kira', 'Ash', 'Rowan', 'nyxx__', 'orbital_moth'],
+  worlds: ['Ghost Club', 'The Great Pug', 'Murder 4', 'Obsidian Lighthouse'],
+  corrections: ['stairwell', 'shader', 'instance'],
+};
 
 /// The commitments the graph found, and the turns they were found in.
 ///
@@ -481,6 +626,37 @@ const PROMISES = [
     due_kind: null,
     source: 'rules',
     confidence: 0.25,
+  },
+  // 0.8.0: two promises with the USER at one end of them. Everything above is
+  // between other people, which was fine while the Memory list was the only
+  // surface — a brief is the first thing that asks "what is open between me and
+  // the person who just walked in", and that question needs both directions to
+  // have an answer.
+  {
+    segment: 1105,
+    who: 1,
+    lang: 'de',
+    said: 'ich schick dir morgen den Link zu der Map',
+    what: 'den Link zu der Map schicken',
+    to: YOU_SPEAKER,
+    due_raw: 'morgen',
+    due_in: DAY,
+    due_kind: 'day',
+    source: 'llm',
+    confidence: 0.78,
+  },
+  {
+    segment: 1106,
+    who: YOU_SPEAKER,
+    lang: 'en',
+    said: "I'll show you the world tour thing I built at the weekend",
+    what: 'show the world tour',
+    to: 1,
+    due_raw: 'at the weekend',
+    due_in: 2 * DAY,
+    due_kind: 'day',
+    source: 'llm',
+    confidence: 0.7,
   },
 ];
 
@@ -672,6 +848,17 @@ export function startMock({
       updated_at: Date.now(),
     })),
     topics: { ...THREAD_TOPICS },
+    // 0.8.0 --------------------------------------------------------------
+    notes: NOTES.map((n) => ({ ...n })),
+    vocab: { user: [...VOCAB_USER] },
+    /// Every `segments.correct` this daemon has served, which is where
+    /// `accuracy.summary` comes from: the pre-correction text lives in the
+    /// record, so a WER estimate is arithmetic over real edits rather than a
+    /// number the daemon made up. Seeded with three, so the card has something
+    /// honest to show before anybody has corrected anything in this session.
+    corrections: [],
+    /// Which of SIGUSR2's three deliveries comes next (see the header).
+    nudges: 0,
     myLineIdx: 0,
     tombstones: new Map(), // merged-away speaker id → surviving id (never chained)
     replay: [],
@@ -975,6 +1162,181 @@ export function startMock({
     if (state.enrichTimer.unref) state.enrichTimer.unref();
   }
 
+  // --- 0.8.0: vocabulary, accuracy, notes, one query box, briefs ----------
+
+  /// The list the transducer is actually biased toward: the user glossary plus
+  /// every auto group, deduplicated, user terms first. Order is not decoration
+  /// — a hotword list has a budget, and what a person typed outranks what the
+  /// daemon noticed.
+  function effectiveVocab() {
+    const out = [];
+    const seen = new Set();
+    for (const term of [...state.vocab.user, ...VOCAB_AUTO.roster, ...VOCAB_AUTO.worlds, ...VOCAB_AUTO.corrections]) {
+      const key = term.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(term);
+    }
+    return out;
+  }
+
+  function vocabPayload() {
+    return {
+      user: [...state.vocab.user],
+      auto: {
+        roster: [...VOCAB_AUTO.roster],
+        worlds: [...VOCAB_AUTO.worlds],
+        corrections: [...VOCAB_AUTO.corrections],
+      },
+      effective: effectiveVocab(),
+    };
+  }
+
+  /// Word-level error rate between what was transcribed and what a person said
+  /// it should have been. A real daemon runs a proper alignment; this is the
+  /// same NUMBER SHAPE from a cheap one, which is all a client can be written
+  /// against — the point is that the figure moves when somebody corrects
+  /// something, and that it is derived rather than invented.
+  function wordDiff(before, after) {
+    const a = String(before ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+    const b = String(after ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+    const bag = new Map();
+    for (const w of a) bag.set(w, (bag.get(w) ?? 0) + 1);
+    let kept = 0;
+    for (const w of b) {
+      const n = bag.get(w) ?? 0;
+      if (n > 0) {
+        bag.set(w, n - 1);
+        kept += 1;
+      }
+    }
+    return { errors: Math.max(a.length, b.length) - kept, words: Math.max(1, a.length) };
+  }
+
+  function recordCorrection(seg, before, after) {
+    const d = wordDiff(before, after);
+    state.corrections.push({
+      segment_id: seg.id,
+      source: seg.source,
+      speaker_id: owner(seg),
+      errors: d.errors,
+      words: d.words,
+      at_ms: Date.now(),
+    });
+  }
+
+  /// Three corrections that happened before this session, so the dashboard has
+  /// numbers on first paint. A card whose honest empty state is the only thing
+  /// anybody ever photographs is a card nobody has actually looked at.
+  function seedCorrections() {
+    const seeds = [
+      [1000, 'wait, which portal was it — the one behind the bar or the one in the stairwell?', 'wait, which portal was it — the one behind the bar or the one in the stairway?'],
+      [1003, 'no rush, we are still waiting on two people', 'no rush, we are still waiting on two more'],
+      [10_007, 'we should write some of this down at some point', 'we should write some of it down at some point'],
+    ];
+    for (const [id, after, before] of seeds) {
+      const seg = state.segments.find((s) => s.id === id);
+      if (seg) recordCorrection(seg, before, after);
+    }
+  }
+
+  function wer(rows) {
+    const errors = rows.reduce((n, c) => n + c.errors, 0);
+    const words = rows.reduce((n, c) => n + c.words, 0);
+    return words ? Math.round((errors / words) * 10_000) / 10_000 : 0;
+  }
+
+  function accuracyPayload() {
+    const group = (key) => {
+      const m = new Map();
+      for (const c of state.corrections) {
+        const k = c[key];
+        if (k == null) continue;
+        const g = m.get(k) ?? [];
+        g.push(c);
+        m.set(k, g);
+      }
+      return [...m.entries()].sort((a, b) => b[1].length - a[1].length);
+    };
+    return {
+      corrections: state.corrections.length,
+      estimated_wer: wer(state.corrections),
+      by_source: group('source').map(([source, rows]) => ({
+        source,
+        corrections: rows.length,
+        estimated_wer: wer(rows),
+      })),
+      by_speaker: group('speaker_id').map(([speaker_id, rows]) => ({
+        speaker_id,
+        corrections: rows.length,
+        estimated_wer: wer(rows),
+      })),
+      since_ns: String(state.startedAt - 30 * DAY) + '000000',
+    };
+  }
+
+  function notePayload(n) {
+    return {
+      id: n.id,
+      segment_id: n.segment_id,
+      text: n.text,
+      t_ms: n.t_ms,
+      t_ns: n.t_ns,
+      state: n.state,
+    };
+  }
+
+  /// The Tier-2 parser, in miniature: pull a speaker mention and a time phrase
+  /// out of a natural-language question and hand back what is left as the
+  /// query. Deliberately the same SHAPE as the daemon's — the interpretation is
+  /// returned so the GUI can show what was understood and let a person take a
+  /// facet back off, and that only works if the leftovers are really the query.
+  const TIME_PHRASES = [
+    [/\b(yesterday|gestern)\b/i, 1, 1],
+    [/\b(today|heute)\b/i, 0, 0],
+    [/\b(last week|letzte woche|this week|diese woche)\b/i, 7, 0],
+  ];
+
+  function interpret(q) {
+    let rest = String(q ?? '');
+    const out = { query: '', mode: state.semantic ? 'hybrid' : 'keyword' };
+
+    // Names first: a speaker called "Heute" would otherwise lose their name to
+    // the clock, and a name is the more specific claim.
+    for (const sp of state.speakers) {
+      const name = sp.name;
+      if (!name) continue;
+      const re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      if (!re.test(rest)) continue;
+      out.speaker_id = sp.id;
+      out.speaker_label = name;
+      rest = rest.replace(re, ' ');
+      break;
+    }
+
+    for (const [re, backDays, spanDays] of TIME_PHRASES) {
+      if (!re.test(rest)) continue;
+      const midnight = new Date();
+      midnight.setHours(0, 0, 0, 0);
+      const from = midnight.getTime() - backDays * DAY;
+      const to = midnight.getTime() + (1 - spanDays) * DAY;
+      out.from_ns = String(from) + '000000';
+      out.to_ns = String(to) + '000000';
+      rest = rest.replace(re, ' ');
+      break;
+    }
+
+    // The stop words a question is made of. What is left is what was asked
+    // about, and if nothing is left the query is empty — which is a real answer
+    // and not an error: "what did Kira say yesterday" is a valid question.
+    out.query = rest
+      .replace(/\b(what|did|say|said|was|were|about|the|a|an|talk|talked|when|who|hat|hab|habe|gesagt|über|uber|wer|wann)\b/gi, ' ')
+      .replace(/[?¿!.,;:]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return out;
+  }
+
   function statusPayload() {
     return {
       uptime_s: Math.round((Date.now() - state.startedAt) / 1000),
@@ -1056,6 +1418,9 @@ export function startMock({
       dur_ms: 1600 + ((state.feedIdx * 911) % 3800),
       overlap_frac: overlap,
       match_score: overlap > 0.1 ? null : score,
+      // The cross-check runs on live rows too, and disagrees on some of them.
+      asr_confidence: state.feedIdx % 5 === 2 ? 'shaky' : 'solid',
+      text_via: 'live',
       thread: liveThread(),
     };
     state.segments.push(seg);
@@ -1080,6 +1445,8 @@ export function startMock({
       dur_ms: 2200 + ((state.myLineIdx * 617) % 3400),
       overlap_frac: 0.02,
       match_score: null,
+      asr_confidence: 'solid',
+      text_via: 'live',
       thread: liveThread(),
     };
     state.segments.push(seg);
@@ -1606,10 +1973,137 @@ export function startMock({
     'segments.correct'(params) {
       const seg = state.segments.find((s) => s.id === Number(params?.segment_id));
       if (!seg) throw err('not_found', `no segment ${params?.segment_id}`);
+      const before = seg.text;
       seg.text = String(params?.text ?? '');
       seg.corrected = true;
+      // 0.8.0: a correction is the daemon's only ground truth about how wrong
+      // it was, so it is kept rather than merely applied — `prior_state` on the
+      // real daemon, one row in this list here. It is what `accuracy.summary`
+      // is computed from and what feeds the corrections vocabulary group.
+      if (before !== seg.text) recordCorrection(seg, before, seg.text);
       emit('segments', 'segment', seg);
-      return { segment_id: seg.id, text: seg.text };
+      return { segment_id: seg.id, text: seg.text, prior_state: { text: before } };
+    },
+
+    // --- 0.8.0: vocabulary -------------------------------------------------
+
+    'vocab.get': () => vocabPayload(),
+
+    'vocab.set'(params) {
+      const raw = params?.terms;
+      if (!Array.isArray(raw)) throw err('bad_params', 'vocab.set needs terms: an array of strings');
+      const out = [];
+      const seen = new Set();
+      for (const item of raw) {
+        if (typeof item !== 'string') throw err('bad_params', 'every term must be a string');
+        const term = item.trim();
+        if (!term) continue;
+        if (term.length > 64) throw err('bad_params', `"${term.slice(0, 20)}…" is longer than a hotword can be (64 characters)`);
+        if (seen.has(term.toLowerCase())) continue;
+        seen.add(term.toLowerCase());
+        out.push(term);
+      }
+      // REPLACES the user glossary — the method is not "add" (PROTOCOL), so a
+      // client that sends a shorter list has removed something and meant to.
+      state.vocab.user = out;
+      const payload = vocabPayload();
+      // On `status`, the topic every client already subscribes to, for exactly
+      // the reason the `mic` event is there: a new topic would make an older
+      // client deaf to it and there is nothing here that wants its own stream.
+      emit('status', 'vocab', payload);
+      return { ...payload, persisted: true };
+    },
+
+    // --- 0.8.0: accuracy ---------------------------------------------------
+
+    'accuracy.summary': () => accuracyPayload(),
+
+    // --- 0.8.0: notes to self ----------------------------------------------
+
+    'notes.list'(params) {
+      const want = params?.state;
+      if (want != null && !NOTE_STATES.includes(want)) {
+        throw err('params', `state must be one of ${JSON.stringify(NOTE_STATES)}, not ${JSON.stringify(want)}`);
+      }
+      const limit = Math.min(500, Math.max(1, Number(params?.limit ?? 100)));
+      const rows = state.notes
+        .filter((n) => want == null || n.state === want)
+        // Newest first: a note is a thing you left for yourself a moment ago.
+        .sort((a, b) => b.t_ms - a.t_ms)
+        .slice(0, limit);
+      return { notes: rows.map(notePayload) };
+    },
+
+    'notes.set_state'(params) {
+      const id = Number(params?.id);
+      const next = params?.state;
+      if (!NOTE_STATES.includes(next)) {
+        throw err('params', `state must be one of ${JSON.stringify(NOTE_STATES)}, not ${JSON.stringify(next)}`);
+      }
+      const row = state.notes.find((n) => n.id === id);
+      if (!row) throw err('not_found', `no note with id ${params?.id}`);
+      row.state = next;
+      return notePayload(row);
+    },
+
+    // --- 0.8.0: one query box ----------------------------------------------
+
+    'search.ask'(params) {
+      const q = String(params?.q ?? '').trim();
+      if (!q) throw err('params', 'q must not be empty');
+      const limit = Number(params?.limit ?? 50);
+      const interpretation = interpret(q);
+
+      const facets = { limit };
+      if (interpretation.speaker_id != null) facets.speaker = interpretation.speaker_id;
+      if (interpretation.from_ns) facets.from = Number(interpretation.from_ns) / 1e6;
+      if (interpretation.to_ns) facets.to = Number(interpretation.to_ns) / 1e6;
+
+      // A question with no words left in it is a browse, not a search: the
+      // facets are the whole query and the keyword leg has nothing to match on.
+      if (!interpretation.query) {
+        const rows = transcriptPage(state.segments, { ...facets, limit: Math.min(limit, 200) });
+        return { interpretation, total: rows.length, hits: [...rows].reverse(), q };
+      }
+      const res =
+        interpretation.mode === 'hybrid'
+          ? methods['search.semantic']({ ...facets, q: interpretation.query, mode: 'hybrid' })
+          : methods.search({ ...facets, q: interpretation.query });
+      return { ...res, interpretation, q };
+    },
+
+    // --- 0.8.0: briefs -----------------------------------------------------
+
+    'person.brief'(params) {
+      const sp = speakerById(Number(params?.id));
+      if (!sp) throw err('not_found', `no speaker ${params?.id}`);
+      const mine = state.segments.filter((s) => owner(s) === sp.id);
+      const threads = new Set(mine.map((s) => s.thread).filter((t) => t != null));
+      const you = youSpeaker();
+      const open = (c) => c.state === 'candidate' || c.state === 'confirmed';
+      return {
+        speaker: {
+          id: sp.id,
+          you: sp.id === you,
+          name: sp.name,
+          auto: sp.auto,
+          languages: sp.languages ?? null,
+        },
+        last_heard_ms: mine.length ? Math.max(...mine.map((s) => s.t_ms)) : null,
+        // What THEY owe YOU, and what you owe them. Two lists rather than one
+        // with a direction flag, because they are two different feelings and a
+        // client renders them in two different sentences.
+        open_to_you: state.commitments.filter((c) => open(c) && c.who === sp.id && (c.to === you || c.to == null)).map(commitmentPayload),
+        open_from_you: state.commitments.filter((c) => open(c) && c.who === you && c.to === sp.id).map(commitmentPayload),
+        recent_topics: [...threads]
+          .map((t) => state.topics[t])
+          .filter(Boolean)
+          .filter((t, i, a) => a.indexOf(t) === i)
+          .slice(0, 4),
+        notes_mentioning: state.notes
+          .filter((n) => sp.name && n.text.toLowerCase().includes(sp.name.toLowerCase()))
+          .map(notePayload),
+      };
     },
 
     search(params) {
@@ -1831,12 +2325,60 @@ export function startMock({
   });
 
   startFeed();
+  seedCorrections();
+
+  /**
+   * One SIGUSR2's worth of the 0.8.0 event stream (see the header). Three
+   * deliveries, in order, because all three are things a canned world cannot
+   * produce on its own and all three have to land where a test can see them.
+   */
+  function nudge() {
+    const n = state.nudges++;
+    if (n === 0) {
+      if (!state.notes.some((x) => x.id === LIVE_NOTE.id)) {
+        const now = Date.now();
+        const note = { ...LIVE_NOTE, t_ms: now, t_ns: String(now) + '000000' };
+        state.notes.push(note);
+        state.segments.push({
+          id: note.segment_id,
+          session: SESSIONS[2].id,
+          source: 'mic',
+          speaker: youSpeaker(),
+          text: note.said,
+          t_ms: now,
+          t_ns: note.t_ns,
+          dur_ms: 3400,
+          overlap_frac: 0.02,
+          match_score: null,
+          label_via: 'mic',
+          lang: 'en',
+          lang_via: 'classified',
+          asr_confidence: 'solid',
+          text_via: 'live',
+          thread: liveThread(),
+        });
+        // The turn itself stays in the transcript — a note is a second reading
+        // of a turn, not a turn that was filed somewhere else — so BOTH events
+        // go out, and a client that only knows `segment` still sees the words.
+        emit('segments', 'segment', state.segments[state.segments.length - 1]);
+        emit('segments', 'note', notePayload(note));
+      }
+      return { sent: 'note', id: LIVE_NOTE.id };
+    }
+    // A named voice walking into the instance. `who` is the VRChat display
+    // name; linking it to a speaker is the client's job and is deliberately
+    // case-insensitive on the user-given name (crates/recalld/src/roster.rs).
+    const who = state.speakers.find((s) => s.name)?.name ?? 'Kira';
+    emit('roster', 'roster', { ev: 'join', who, t: String(Date.now()) + '000000' });
+    return { sent: 'roster.join', who, repeat: n > 1 };
+  }
 
   return {
     server,
     state,
     sockPath,
     emit,
+    nudge,
     // Simulate the daemon dying and coming back with a fresh counter — the case
     // the GUI has to notice and full-resync from.
     restart(newSeq = 1) {
@@ -1881,6 +2423,7 @@ if (isMain) {
     semantic: !args.includes('--no-semantic'),
   });
   process.on('SIGUSR1', () => mock.restart(1));
+  process.on('SIGUSR2', () => mock.nudge());
   const bye = () => {
     mock.close();
     process.exit(0);

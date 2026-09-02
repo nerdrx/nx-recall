@@ -27,6 +27,42 @@ import { toast } from '../lib/sheets.js';
 
 export const id = 'memory';
 
+/**
+ * 0.8.0 put three more cards on this tab, and it is worth saying why here
+ * rather than in a commit message, because the obvious other home was Sources.
+ *
+ * Sources answers "what is this program ALLOWED to hear" — an allowlist, a
+ * microphone switch, and what all of it costs on disk. Every control on it is a
+ * consent decision. Notes, the vocabulary and the accuracy figures are not
+ * consent decisions at all: they are what the app MADE of what it was allowed
+ * to hear, which is the question this tab already exists to answer. A glossary
+ * that changes how words are heard sitting under a disk-usage table would be
+ * filed by the machinery it touches rather than by the thing it is for.
+ *
+ * The vocabulary and the accuracy card are also next to each other on purpose,
+ * and directly under the notes: they are one loop. You fix a transcript, the
+ * fix moves the accuracy figures and lands in the corrections vocabulary, and
+ * the vocabulary is what the next transcript is biased toward. Three cards, one
+ * sentence, in the order it happens.
+ */
+
+/// The states a note can be put in, and what each one means. Same shape as the
+/// commitments above: nothing but a click moves one, at either end of the socket.
+const NOTE_ACTIONS = [
+  ['open', 'Reopen', 'Put it back on the list.'],
+  ['done', 'Done', 'It happened. It stays, greyed, and nothing is deleted.'],
+  ['dismissed', 'Dismiss', 'It was not a note. Nothing is deleted — the turn stays in the transcript.'],
+];
+
+/// A rate as a person reads one. Two significant figures, because the third is
+/// noise on a sample of a dozen corrections and printing it would claim a
+/// precision the estimate does not have.
+function pct(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return '—';
+  return `${(n * 100).toFixed(1)}%`;
+}
+
 /// The states a person can put a commitment into, and what each one means. The
 /// order is the order the buttons appear in: the affirming one first.
 const ACTIONS = [
@@ -82,11 +118,29 @@ export function mount(root, ctx) {
   let busy = new Set();
   let showAll = false;
 
+  let notes = [];
+  let noteBusy = new Set();
+  let accuracy = null;
+  let vocab = store.vocab;
+
   const sub = h('span', { class: 'sub', id: 'memory-sub' });
   const openCard = h('div', { class: 'card', id: 'commitments-card' });
+  const notesCard = h('div', { class: 'card', id: 'notes-card' });
+  const accuracyCard = h('div', { class: 'card', id: 'accuracy-card' });
+  const vocabCard = h('div', { class: 'card', id: 'vocab-card' });
   const topicsCard = h('div', { class: 'card', id: 'topics-card' });
   const enrichCard = h('div', { class: 'card', id: 'enrich-card' });
-  const body = h('div', { class: 'view-body view-enter' }, openCard, topicsCard, enrichCard);
+  const body = h(
+    'div',
+    { class: 'view-body view-enter' },
+    openCard,
+    notesCard,
+    // The correction loop, in the order it happens (see the note at the top).
+    accuracyCard,
+    vocabCard,
+    topicsCard,
+    enrichCard
+  );
 
   root.append(
     h(
@@ -263,6 +317,313 @@ export function mount(root, ctx) {
     } finally {
       busy.delete(c.id);
       renderCommitments();
+    }
+  }
+
+  // -- notes to self (0.8.0) -------------------------------------------------
+  //
+  // A note is not a new kind of data: it is one MIC turn that began with a wake
+  // phrase, and the turn is still in the transcript where it was said. That is
+  // why every row here is a door back to it — the note is a handle on a moment,
+  // and the moment is the thing.
+
+  function renderNotes() {
+    clear(notesCard);
+    notesCard.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('div', { class: 'card-title', text: 'Notes to self' }),
+        h('span', { class: 'sub', id: 'notes-sub', text: notes.length ? `${notes.filter((n) => n.state === 'open').length} open` : '' })
+      )
+    );
+    if (!notes.length) {
+      notesCard.append(
+        h(
+          'div',
+          { class: 'empty', id: 'notes-empty' },
+          h('b', { text: 'No notes yet' }),
+          h('p', {
+            text: 'Say “recall, remember…” or “recall, merk dir…” into your microphone and the rest of the sentence lands here. The turn itself stays in the transcript — this is a second reading of it, not a copy.',
+          })
+        )
+      );
+      return;
+    }
+    const list = h('div', { class: 'note-list', id: 'note-list' });
+    for (const n of notes) list.append(noteRow(n));
+    notesCard.append(list);
+  }
+
+  function noteRow(n) {
+    const pending = noteBusy.has(n.id);
+    const row = h('div', {
+      class: `note-row state-${n.state}${pending ? ' pending' : ''}`,
+      dataset: { note: String(n.id), state: n.state, segment: String(n.segment_id) },
+    });
+    row.append(
+      h(
+        'button',
+        {
+          class: 'note-body',
+          title: 'Read this in the transcript, where it was said',
+          onclick: () => ctx.jumpToSegment?.({ id: n.segment_id, t_ms: n.t_ms ?? Date.now() }),
+        },
+        h('span', { class: 'note-text', text: n.text || '(nothing after the wake phrase)' }),
+        h('span', { class: 'note-when', text: n.t_ms ? fmtDate(new Date(n.t_ms).toISOString()) : '—' })
+      ),
+      h(
+        'span',
+        { class: 'note-actions' },
+        ...NOTE_ACTIONS.filter(([state]) => state !== n.state).map(([state, label, title]) =>
+          h(
+            'button',
+            {
+              class: `chip note-act${state === 'dismissed' ? ' quiet' : ''}`,
+              dataset: { noteAct: state, note: String(n.id) },
+              title,
+              disabled: pending,
+              onclick: () => void setNoteState(n, state),
+            },
+            label
+          )
+        ),
+        h('span', { class: `chip state ${n.state}`, dataset: { noteState: n.state }, text: n.state })
+      )
+    );
+    return row;
+  }
+
+  async function setNoteState(n, state) {
+    const before = n.state;
+    // Optimistic with a rollback, like every other switch in this app.
+    n.state = state;
+    noteBusy.add(n.id);
+    renderNotes();
+    try {
+      Object.assign(n, await ask('notes.set_state', { id: n.id, state }));
+    } catch (e) {
+      n.state = before;
+      toast(`Could not change that note — ${e.message}`, 'error');
+    } finally {
+      noteBusy.delete(n.id);
+      renderNotes();
+    }
+  }
+
+  // -- the accuracy dashboard (0.8.0) ----------------------------------------
+  //
+  // Everything on this card is derived from corrections a PERSON made. That is
+  // the only ground truth the daemon has about how wrong it was, and it is why
+  // the empty state says "correct a few transcripts" rather than "no data":
+  // there is nothing to measure until somebody disagrees with it, and no amount
+  // of waiting produces any.
+
+  function renderAccuracy() {
+    clear(accuracyCard);
+    accuracyCard.append(h('div', { class: 'card-title', text: 'How well it is hearing you' }));
+    const a = accuracy;
+    if (!a || !a.corrections) {
+      accuracyCard.append(
+        h(
+          'div',
+          { class: 'empty', id: 'accuracy-empty' },
+          h('b', { text: 'Nothing to measure yet' }),
+          h('p', { text: 'Correct a few transcripts and this fills in. Every fix is one more line of ground truth, and the estimate is only ever as good as how much of it there is.' })
+        )
+      );
+      return;
+    }
+    accuracyCard.append(
+      h(
+        'div',
+        { class: 'person-strip', id: 'accuracy-strip' },
+        h(
+          'div',
+          { class: 'person-stat', dataset: { stat: 'corrections' } },
+          h('b', { id: 'accuracy-corrections', text: String(a.corrections) }),
+          h('small', { text: 'corrections' }),
+          h('em', { text: 'lines somebody retyped' })
+        ),
+        h(
+          'div',
+          { class: 'person-stat', dataset: { stat: 'wer' } },
+          h('b', { id: 'accuracy-wer', text: pct(a.estimated_wer) }),
+          h('small', { text: 'estimated error' }),
+          h('em', { text: 'words changed per word said' })
+        )
+      ),
+      byRows('by-source', 'By source', (a.by_source ?? []).map((r) => [r.source, r])),
+      byRows('by-speaker', 'By voice', (a.by_speaker ?? []).slice(0, 5).map((r) => [speakerLabel(r.speaker_id), r])),
+      h('p', {
+        class: 'rail-hint',
+        id: 'accuracy-note',
+        style: 'padding:10px 0 0;max-width:70ch',
+        text: 'An estimate, and a biased one: it can only count turns somebody bothered to fix, so it reads high where you have been careful and says nothing at all where you have not.',
+      })
+    );
+  }
+
+  function byRows(key, title, rows) {
+    if (!rows.length) return null;
+    const list = h('div', { class: 'acc-rows', dataset: { acc: key } });
+    for (const [label, r] of rows) {
+      list.append(
+        h(
+          'div',
+          { class: 'acc-row', dataset: { accRow: label } },
+          h('span', { class: 'acc-name', text: label }),
+          h('span', { class: 'acc-num' }, String(r.corrections ?? 0), h('small', { text: 'fixed' })),
+          h('span', { class: 'acc-num' }, pct(r.estimated_wer), h('small', { text: 'error' }))
+        )
+      );
+    }
+    return h('div', { class: 'acc-group' }, h('div', { class: 'acc-group-title', text: title }), list);
+  }
+
+  // -- the vocabulary (0.8.0) ------------------------------------------------
+  //
+  // Two halves that must never be confused. The user glossary is a decision —
+  // editable, removable, and the only thing on this card anybody can change.
+  // The auto groups are OBSERVATIONS: who has been in the instance, which
+  // worlds have been named, which words people keep correcting. Showing them as
+  // chips that cannot be pressed is the point — you cannot argue with what was
+  // heard, and pretending otherwise would be a button that does nothing.
+
+  let vocabPending = false;
+
+  function renderVocab() {
+    clear(vocabCard);
+    vocabCard.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('div', { class: 'card-title', text: 'Vocabulary' }),
+        h('span', {
+          class: 'sub',
+          id: 'vocab-effective',
+          text: vocab ? `${(vocab.effective ?? []).length} terms biasing the transcriber` : '',
+        })
+      ),
+      h('p', {
+        class: 'rail-hint',
+        style: 'padding:0 0 10px;max-width:70ch',
+        text: 'Names, worlds and jargon the transcriber is nudged toward. Add the words it keeps getting wrong — this changes what future turns are heard as, and never rewrites one that already exists.',
+      })
+    );
+    if (!vocab) {
+      vocabCard.append(h('p', { class: 'rail-hint', id: 'vocab-loading', style: 'padding:0', text: 'Loading.' }));
+      return;
+    }
+
+    const input = h('input', {
+      class: 'input',
+      id: 'vocab-add',
+      type: 'text',
+      placeholder: 'add a word or a name',
+      disabled: vocabPending,
+      onkeydown: (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        void addTerm(input.value);
+      },
+    });
+
+    const chips = h('div', { class: 'vocab-chips', id: 'vocab-user' });
+    for (const term of vocab.user ?? []) {
+      chips.append(
+        h(
+          'span',
+          { class: 'vocab-chip', dataset: { term } },
+          h('span', { class: 'vocab-chip-text', text: term }),
+          h(
+            'button',
+            {
+              class: 'vocab-chip-x',
+              dataset: { removeTerm: term },
+              'aria-label': `Remove ${term} from the glossary`,
+              title: `Remove ${term}`,
+              disabled: vocabPending,
+              onclick: () => void setTerms((vocab.user ?? []).filter((t) => t !== term)),
+            },
+            '✕'
+          )
+        )
+      );
+    }
+    if (!(vocab.user ?? []).length) {
+      chips.append(h('span', { class: 'sub', id: 'vocab-user-empty', text: 'Nothing added yet.' }));
+    }
+
+    vocabCard.append(
+      h('div', { class: 'vocab-group' }, h('div', { class: 'acc-group-title', text: 'Yours' }), chips),
+      h('div', { class: 'vocab-add-row' }, input, h('button', {
+        class: 'btn',
+        id: 'vocab-add-go',
+        disabled: vocabPending,
+        onclick: () => void addTerm(input.value),
+      }, 'Add'))
+    );
+
+    const auto = vocab.auto ?? {};
+    const groups = [
+      ['roster', 'From the roster', 'Display names of people who have been in the instance with you.'],
+      ['worlds', 'From worlds', 'Names of worlds that have been named out loud or joined.'],
+      ['corrections', 'From your corrections', 'Words you have retyped, which is the strongest signal there is.'],
+    ];
+    for (const [key, title, hint] of groups) {
+      const terms = auto[key] ?? [];
+      const row = h('div', { class: 'vocab-chips auto', dataset: { autoGroup: key } });
+      for (const term of terms) row.append(h('span', { class: 'vocab-chip auto', dataset: { term } }, h('span', { class: 'vocab-chip-text', text: term })));
+      vocabCard.append(
+        h(
+          'div',
+          { class: 'vocab-group', dataset: { group: key } },
+          h(
+            'div',
+            { class: 'acc-group-title' },
+            title,
+            h('span', { class: 'vocab-count', dataset: { count: key }, text: String(terms.length) })
+          ),
+          h('p', { class: 'rail-hint', style: 'padding:0 0 6px;max-width:70ch', text: hint }),
+          terms.length ? row : h('span', { class: 'sub', text: 'Nothing here yet.' })
+        )
+      );
+    }
+  }
+
+  async function addTerm(raw) {
+    const term = String(raw ?? '').trim();
+    if (!term) return;
+    const have = vocab?.user ?? [];
+    if (have.some((t) => t.toLowerCase() === term.toLowerCase())) {
+      toast(`“${term}” is already in your glossary.`, '');
+      return;
+    }
+    await setTerms([...have, term]);
+  }
+
+  /**
+   * `vocab.set` REPLACES the glossary (PROTOCOL), so both add and remove go
+   * through here with the whole list. Optimistic with a rollback, like every
+   * other write in this app: the daemon confirms with a `vocab` broadcast and a
+   * failure puts the old list back.
+   */
+  async function setTerms(terms) {
+    const before = vocab;
+    vocab = { ...vocab, user: terms };
+    vocabPending = true;
+    renderVocab();
+    try {
+      const out = await ask('vocab.set', { terms });
+      vocab = out;
+      store.vocab = out;
+    } catch (e) {
+      vocab = before;
+      toast(`Could not change the vocabulary — ${e.message}`, 'error');
+    } finally {
+      vocabPending = false;
+      renderVocab();
     }
   }
 
@@ -605,7 +966,47 @@ export function mount(root, ctx) {
     sub.textContent = `${c.open} open · ${c.commitments} noticed · ${c.topics} topic${c.topics === 1 ? '' : 's'}`;
   }
 
+  /**
+   * The 0.8.0 slices, each failing on its own.
+   *
+   * Deliberately not in the `Promise.all` below: a daemon older than 0.8.0
+   * answers `unknown_method` to all three, and folding them into the same await
+   * would make one missing method blank the commitments too. Each card decides
+   * what to say about its own absence, which is the same rule the resync in
+   * store.js follows for the same reason.
+   */
+  async function loadAccuracyRound() {
+    await Promise.all([
+      ask('notes.list', { limit: 100 })
+        .then((r) => {
+          notes = r.notes ?? [];
+        })
+        .catch(() => {
+          notes = [];
+        })
+        .then(renderNotes),
+      ask('accuracy.summary')
+        .then((r) => {
+          accuracy = r;
+        })
+        .catch(() => {
+          accuracy = null;
+        })
+        .then(renderAccuracy),
+      ask('vocab.get')
+        .then((r) => {
+          vocab = r;
+          store.vocab = r;
+        })
+        .catch(() => {
+          vocab = null;
+        })
+        .then(renderVocab),
+    ]);
+  }
+
   async function load() {
+    void loadAccuracyRound();
     try {
       const [s, list, tops] = await Promise.all([
         ask('graph.summary'),
@@ -643,12 +1044,40 @@ export function mount(root, ctx) {
 
   renderSub();
   renderCommitments();
+  renderNotes();
+  renderAccuracy();
+  renderVocab();
   renderTopics();
   renderEnrichment();
   void load();
 
   return {
     update(change) {
+      // A note arriving live goes to the top of the list — it is the newest
+      // thing you said to yourself, and it is the reason you are looking.
+      if (change?.note) {
+        const known = notes.find((n) => n.id === change.note.id);
+        if (known) Object.assign(known, change.note);
+        else notes.unshift(change.note);
+        renderNotes();
+      }
+      // The glossary changed somewhere — here, the CLI, another window. It is a
+      // broadcast, so this repaints rather than re-queries.
+      if (change?.vocab) {
+        vocab = change.vocab;
+        renderVocab();
+      }
+      // A correction anywhere moves the accuracy figures, and a corrected
+      // segment arrives as an ordinary `segment` update. Re-asking is one small
+      // query and is always right; guessing at the arithmetic would not be.
+      if (change?.updated?.some((s) => s.corrected)) {
+        ask('accuracy.summary')
+          .then((a) => {
+            accuracy = a;
+            renderAccuracy();
+          })
+          .catch(() => {});
+      }
       // The worker's state arrives on the status topic, so the card follows a
       // batch without this view polling anything.
       if (change?.graph || change?.status) {

@@ -24,8 +24,10 @@
   position: relative;
   display: grid; height: 100vh;
   grid-template-columns: 208px minmax(0, 1fr);
-  /* row 1 is the update bar; hidden it is `display:none` and the row collapses */
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  /* rows 1 and 2 are the two notice bars — the update notice and the brief a
+     roster join raises. Hidden, each is `display:none` and its row collapses,
+     so the ordinary window is still exactly three rows tall. */
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
 }
 
 /* The "you are the old half" notice: chrome, full width, above the rail and
@@ -55,7 +57,7 @@
    dissolve into it any more, it simply ends. */
 
 .rail {
-  grid-row: 2 / 3;
+  grid-row: 3 / 4;
   display: flex; flex-direction: column; gap: var(--sp-1);
   padding: var(--sp-2) 12px;
   background: var(--clear-surface);
@@ -131,7 +133,7 @@
 
 /* ----------------------------------------------------------------- main -- */
 
-.main { grid-row: 2 / 3; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.main { grid-row: 3 / 4; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
 .view-head {
   display: flex; align-items: center; gap: var(--sp-2);
@@ -705,7 +707,7 @@ select.input option, select.input optgroup {
 /* --------------------------------------------------------------- footer -- */
 
 .footer {
-  grid-column: 1 / -1; grid-row: 3 / 4;
+  grid-column: 1 / -1; grid-row: 4 / 5;
   display: flex; align-items: center; gap: var(--sp-2);
   padding: 7px var(--sp-3); font-size: 11.5px; color: var(--clear-muted);
   background: var(--clear-surface);
@@ -1079,4 +1081,183 @@ button.sp-num:focus-visible { outline: none; box-shadow: var(--clear-focus); }
   min-width: 2.2ch; text-align: center;
   font: 600 15px/1 var(--mono); color: var(--clear-ink);
   font-variant-numeric: tabular-nums;
+}
+
+/* ============================================ the accuracy round (0.8.0) == */
+
+/* -- the brief bar -------------------------------------------------------- */
+/* Same component as the update notice above it — same wash, same hairline,
+   same one-line shape — because it is the same kind of thing: a fact about the
+   whole app, stated once, waved away with an ✕. It sits in its own grid row so
+   the two can be up at the same time without fighting. */
+.brief-bar { grid-row: 2 / 3; }
+#brief-dismiss { width: 30px; padding: 5px 0; justify-content: center; color: var(--clear-muted); }
+#brief-dismiss:hover { color: var(--clear-ink); }
+
+/* -- the cross-check mark ------------------------------------------------- */
+/* A second decoder read the same seconds differently. Deliberately NOT the "?"
+   next to it: that mark is amber and asks a question about who spoke, and this
+   one is about whether the words are the words. Neutral, quiet, and the same
+   size as its neighbour so a row with both still scans as one line. */
+.shaky-mark {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 19px; height: 19px; border-radius: var(--clear-r-mini);
+  border: 1px dashed var(--clear-line-strong); background: transparent;
+  color: var(--clear-muted); font-size: 12px; font-weight: 700; line-height: 1;
+  cursor: help; flex: none;
+}
+/* The muted treatment the uncertain rows already use. It is the same claim —
+   "do not read this as settled" — so it is deliberately the same look, and a
+   row that is both merely gets one of it. */
+.seg.shaky .txt { color: var(--clear-muted); font-style: italic; }
+
+/* -- fix this ------------------------------------------------------------- */
+/* The words are the control. At rest they are set exactly as they will be while
+   you edit them, so clicking changes nothing but the cursor. */
+.fix-text {
+  display: block; width: 100%; text-align: left; cursor: text; font: inherit;
+  font-size: 13px; line-height: 1.5; color: var(--clear-ink);
+  padding: 8px 11px; border-radius: var(--clear-r-control);
+  background: var(--clear-tile); border: 1px solid var(--clear-line);
+  white-space: pre-wrap;
+  transition: border-color var(--dur-fast) var(--ease-soft), background var(--dur-fast) var(--ease-soft);
+}
+.fix-text:hover { background: var(--clear-surface); border-color: var(--clear-line-strong); }
+.fix-text:focus-visible { outline: none; box-shadow: var(--clear-focus); }
+.fix-text[hidden] { display: none; }
+.fix-hint { font-size: 11px; color: var(--clear-muted); }
+.fix-provenance { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.fix-provenance .chip { text-transform: none; letter-spacing: 0.04em; font-size: 10px; }
+
+/* A card's own header: the title, and the one fact or affordance that belongs
+   on the same line as it. Same shape as the sheet's, which is where the class
+   was born — a card is a sheet that never floats. Without this the second half
+   drops to its own line and reads as a subheading rather than as an aside. */
+.card > .sheet-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-2); }
+.card > .sheet-head .card-title { margin-bottom: var(--sp-1); }
+.card > .sheet-head .sub { color: var(--clear-muted); font-size: 11.5px; white-space: nowrap; }
+
+/* -- notes ---------------------------------------------------------------- */
+
+.note-list { display: flex; flex-direction: column; gap: 6px; }
+.note-row {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 10px 12px; border-radius: var(--clear-r-control);
+  background: var(--clear-tile); border: 1px solid var(--clear-line);
+  transition: background var(--dur-fast) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft),
+    opacity var(--dur-fast) var(--ease-soft);
+}
+.note-row:hover { background: var(--clear-surface); border-color: var(--clear-line-accent); }
+/* Settled notes stay readable and plainly no longer live — the same rule the
+   commitments follow, for the same reason: what you dealt with is part of the
+   answer to "what did I ask myself to remember". */
+.note-row.state-done, .note-row.state-dismissed { opacity: 0.6; }
+.note-row.pending { opacity: 0.5; }
+.note-body {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px;
+  text-align: left; cursor: pointer; font: inherit; background: transparent;
+  border: 0; padding: 0; color: var(--clear-ink);
+}
+.note-body:focus-visible { outline: none; box-shadow: var(--clear-focus); }
+.note-text { font-size: 13.5px; line-height: 1.5; }
+.note-body:hover .note-text { text-decoration: underline; text-underline-offset: 3px; }
+.note-when { font: 500 11px/1 var(--mono); color: var(--clear-muted); }
+.note-actions { display: flex; align-items: center; gap: 6px; flex: none; flex-wrap: wrap; }
+/* The actions are chips rather than buttons: a note has three states and no
+   primary action among them, and a row of three buttons would out-weigh the
+   note itself. */
+.chip.note-act { cursor: pointer; text-transform: none; letter-spacing: 0.04em; font-size: 10.5px; }
+.chip.note-act:hover:not(:disabled) { color: var(--clear-ink); border-color: var(--clear-line-strong); }
+.chip.note-act:focus-visible { outline: none; box-shadow: var(--clear-focus); }
+.chip.note-act:disabled { opacity: 0.45; cursor: default; }
+.chip.note-act.quiet { color: var(--clear-faint); }
+.chip.state.open { color: var(--violet); border-color: var(--clear-line-accent); background: var(--violet-soft); }
+
+/* -- the accuracy dashboard ----------------------------------------------- */
+/* The two headline numbers reuse the person page's stat tile, because they are
+   the same kind of object: one figure, one label, one caveat. */
+
+.acc-group { margin-top: var(--sp-2); }
+.acc-group-title {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--clear-muted); margin-bottom: 6px;
+}
+.acc-rows { display: flex; flex-direction: column; }
+.acc-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) 84px 84px; gap: var(--sp-2);
+  align-items: baseline; padding: 8px 0; border-bottom: 1px solid var(--clear-line);
+}
+.acc-row:last-child { border-bottom: 0; }
+.acc-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc-num { font: 600 12.5px/1 var(--mono); text-align: right; color: var(--clear-ink); }
+.acc-num small {
+  display: block; margin-top: 5px; font: 600 9px/1 var(--font);
+  letter-spacing: 0.11em; text-transform: uppercase; color: var(--clear-muted);
+}
+
+/* -- the vocabulary ------------------------------------------------------- */
+/* Chips, per §14.2 — a term is a tag and a tag is a pill. The user's own carry
+   an ✕ and the derived ones do not, which is the whole distinction the card
+   exists to make: one half is a decision and the other half is an observation. */
+
+.vocab-group { margin-top: var(--sp-2); }
+.vocab-count {
+  font: 600 10px/1.6 var(--mono); letter-spacing: 0; color: var(--clear-muted);
+  padding: 0 7px; border-radius: var(--clear-r-chip);
+  border: 1px solid var(--clear-line); background: var(--clear-tile);
+}
+.vocab-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.vocab-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 5px 4px 11px; border-radius: var(--clear-r-chip);
+  border: 1px solid var(--clear-line-accent); background: var(--violet-soft);
+  color: var(--violet); font-size: 12px; font-weight: 550;
+}
+/* Derived terms are neutral and have no ✕: violet is for what somebody chose. */
+.vocab-chip.auto {
+  padding: 4px 11px; border-color: var(--clear-line); background: var(--clear-tile);
+  color: var(--clear-muted); font-weight: 500;
+}
+.vocab-chip-x, .ask-pill-x {
+  width: 18px; height: 18px; flex: none; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 50%; background: transparent;
+  color: inherit; opacity: 0.6; font-size: 10px; line-height: 1;
+  transition: opacity var(--dur-fast) var(--ease-soft), background var(--dur-fast) var(--ease-soft);
+}
+.vocab-chip-x:hover:not(:disabled), .ask-pill-x:hover { opacity: 1; background: var(--clear-surface); }
+.vocab-chip-x:focus-visible, .ask-pill-x:focus-visible { outline: none; box-shadow: var(--clear-focus); }
+.vocab-chip-x:disabled { opacity: 0.3; cursor: default; }
+.vocab-add-row { display: flex; gap: 6px; margin-top: 8px; max-width: 420px; }
+.vocab-add-row .input { flex: 1; }
+
+/* -- the one query box ---------------------------------------------------- */
+
+.ask-row { align-items: flex-end; }
+.ask-row .facet.grow { min-width: 320px; }
+#search-facets[hidden] { display: none; }
+
+/* What the daemon understood, as pills you can take off. Between the question
+   and the answer, which is where "why these results?" belongs. */
+.ask-pills {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  margin-top: var(--sp-2);
+}
+.ask-pills[hidden] { display: none; }
+.ask-pills-label {
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--clear-muted); margin-right: 2px;
+}
+.ask-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 5px 4px 11px; border-radius: var(--clear-r-chip);
+  border: 1px solid var(--clear-line-accent); background: var(--violet-soft);
+  color: var(--violet); font-size: 12px; font-weight: 550;
+}
+/* The words themselves are not a facet you can drop — with them gone there is
+   no question left — so that pill is neutral and carries no ✕. */
+.ask-pill.fixed {
+  padding: 4px 11px; border-color: var(--clear-line); background: var(--clear-tile);
+  color: var(--clear-ink); font-weight: 500;
 }

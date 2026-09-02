@@ -21,6 +21,12 @@ import {
   // than the primary model, which is a different doubt from a doubted name.
   hasMark,
   languageNote,
+  // 0.8.0: a third doubt, and it is about neither the name nor which model
+  // wrote the words down — it is two decoders reading the same seconds and
+  // disagreeing. Its own mark, because it is its own claim.
+  isShaky,
+  SHAKY_NOTE,
+  textViaNote,
   isYou,
   ask,
   setFollowing,
@@ -30,6 +36,7 @@ import {
   HARD_MAX,
 } from '../lib/store.js';
 import { separatorWalker } from '../lib/seams.js';
+import { shakyMark } from '../lib/marks.js';
 import { openSheet, toast } from '../lib/sheets.js';
 import { play, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 
@@ -272,6 +279,7 @@ export function mount(root, ctx) {
 
   function segRow(seg, isNew = false) {
     const uncertain = isUncertain(seg);
+    const shaky = isShaky(seg);
     // The user's own voice, off their own microphone. The label did not come
     // from a match, it came from where the audio arrived — so it is the one
     // name in the transcript that is never a guess. Marked, not shouted: a
@@ -280,7 +288,7 @@ export function mount(root, ctx) {
     const mine = isYou(seg.speaker);
     const color = speakerColor(seg.speaker);
     const row = h('div', {
-      class: `seg${uncertain ? ' uncertain' : ''}${mine ? ' you' : ''}${isNew ? ' new' : ''}${seg.corrected ? ' corrected' : ''}${
+      class: `seg${uncertain ? ' uncertain' : ''}${shaky ? ' shaky' : ''}${mine ? ' you' : ''}${isNew ? ' new' : ''}${seg.corrected ? ' corrected' : ''}${
         highlightThread != null && seg.thread === highlightThread ? ' in-thread' : ''
       }`,
       dataset: { seg: String(seg.id), ...(seg.thread != null ? { thread: String(seg.thread) } : {}) },
@@ -326,6 +334,11 @@ export function mount(root, ctx) {
         'span',
         { class: 'meta' },
         seg.source === 'Discord' ? h('span', { class: 'chip', text: 'discord' }) : null,
+        // Two decoders, one disagreement (0.8.0). Deliberately NOT folded into
+        // the "?": that mark answers "who said this and which model wrote it",
+        // and this one answers "is this even what was said". Same size, own
+        // glyph, own sentence.
+        shaky ? shakyMark() : null,
         // The "?" is now about two things: a name in doubt, and words that
         // did not come from the primary model (0.7.7). Either earns the mark.
         hasMark(seg) ? h('span', { class: 'qmark', text: '?', title: uncertainReason(seg) }) : null
@@ -752,8 +765,96 @@ export function openSegmentSheet(seg, ctx) {
     };
     rebuild();
 
-    const text = h('textarea', { class: 'input', id: 'correct-text', spellcheck: 'false' });
+    // ------------------------------------------------------------------
+    // "Fix this" (0.8.0)
+    //
+    // The correct path has been here since 0.4 and almost nobody used it,
+    // because it was a textarea below a heading below a picker: three
+    // decisions deep for an act that is one — you read a wrong word and you
+    // want to type the right one. So the words themselves are the control.
+    // Click them and you are editing them, in place, at the same size and in
+    // the same position; Enter saves, Escape puts them back. The Save button
+    // is still there and still saves both halves, because the picker above it
+    // has to commit somehow, and because a person who typed and then reached
+    // for the obvious button must not lose their edit.
+    // ------------------------------------------------------------------
+
+    // `data-keep-escape`: Escape in here abandons the edit and keeps the sheet
+    // open (lib/sheets.js). The nearer meaning wins.
+    const text = h('textarea', {
+      class: 'input',
+      id: 'correct-text',
+      spellcheck: 'false',
+      'data-keep-escape': '',
+      hidden: true,
+    });
     text.value = seg.text ?? '';
+
+    const reader = h('button', {
+      class: 'fix-text',
+      id: 'segment-text',
+      title: 'Click to fix these words — Enter saves, Escape cancels',
+      text: seg.text || '…',
+      onclick: () => beginEdit(),
+    });
+    const fixHint = h('span', {
+      class: 'fix-hint',
+      id: 'segment-fix-hint',
+      text: 'click the words to fix them',
+    });
+
+    function beginEdit() {
+      reader.hidden = true;
+      text.hidden = false;
+      fixHint.textContent = 'Enter saves · Escape cancels';
+      text.focus();
+      // The cursor lands at the end rather than selecting everything: a fix is
+      // almost always a word, and select-all makes the first keystroke a delete.
+      text.setSelectionRange(text.value.length, text.value.length);
+    }
+
+    function endEdit({ revert = false } = {}) {
+      if (revert) text.value = seg.text ?? '';
+      text.hidden = true;
+      reader.hidden = false;
+      reader.textContent = text.value || '…';
+      fixHint.textContent = 'click the words to fix them';
+    }
+
+    text.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        // Stopped here so the sheet's own Escape does not also close the sheet:
+        // one keystroke, one meaning, and the nearer thing wins.
+        e.preventDefault();
+        e.stopPropagation();
+        endEdit({ revert: true });
+        return;
+      }
+      // Shift+Enter still breaks a line — a transcript turn can be long, and an
+      // editor where Enter is the only save has to leave a way to type one.
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        void saveText();
+      }
+    });
+
+    /** The one motion: Enter in the words saves the words and nothing else. */
+    async function saveText() {
+      if (text.value === seg.text) {
+        endEdit();
+        return;
+      }
+      try {
+        await ask('segments.correct', { segment_id: seg.id, text: text.value });
+        // No optimistic write: the daemon broadcasts the corrected segment,
+        // every client updates from that, and the row grows its "edited" mark
+        // through the same path a correction made in the CLI would take.
+        endEdit();
+        toast('Fixed. It feeds the accuracy figures and the vocabulary.', 'ok');
+      } catch (e) {
+        toast(`Could not save that — ${e.message}`, 'error');
+      }
+    }
 
     const save = async () => {
       const jobs = [];
@@ -765,8 +866,6 @@ export function openSegmentSheet(seg, ctx) {
       }
       try {
         await Promise.all(jobs);
-        // No optimistic write: the daemon broadcasts the corrected segment and
-        // the model updates from that, so every client agrees (DESIGN §8).
         toast('Segment updated.', 'ok');
         close();
       } catch (e) {
@@ -867,7 +966,18 @@ export function openSegmentSheet(seg, ctx) {
           : null
       ),
       pick,
-      h('div', { class: 'card-title', text: 'What they said' }),
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('span', { class: 'card-title', text: 'What they said' }),
+        fixHint
+      ),
+      // Where the words came from, when it was not the first pass, and whether
+      // a second decoder agreed with them. Both are one short line — a person
+      // deciding whether to retype a sentence wants to know that a machine has
+      // already been round twice, not to read a paragraph about how.
+      provenanceLine(seg),
+      reader,
       text,
       h(
         'div',
@@ -880,4 +990,22 @@ export function openSegmentSheet(seg, ctx) {
 
   // Closing the sheet takes the sound with it — the stop button just left.
   openSheet(build, { onClose: () => stopPreview() });
+}
+
+/**
+ * The one line under "What they said": how these words got here, and what a
+ * second opinion made of them. Absent entirely when there is nothing to say —
+ * a first-pass reading two decoders agreed on is the ordinary case and does not
+ * need to announce itself.
+ */
+function provenanceLine(seg) {
+  const via = textViaNote(seg);
+  const shaky = isShaky(seg);
+  if (!via && !shaky) return null;
+  return h(
+    'p',
+    { class: 'fix-provenance', id: 'segment-provenance' },
+    via ? h('span', { class: 'chip', id: 'segment-text-via', text: via }) : null,
+    shaky ? h('span', { class: 'chip warn', id: 'segment-shaky', text: SHAKY_NOTE }) : null
+  );
 }
