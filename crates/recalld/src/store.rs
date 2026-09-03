@@ -176,7 +176,7 @@ pub mod text_via {
     /// 0.9.0), and only ever where two of the three readings agreed.
     pub const NIGHT: &str = "night";
     /// Re-decoded by the Japanese decoder after the spoken-language identifier
-    /// heard Japanese (`crate::asr_ja`, 0.11.0). Its own value since 0.11.4: a
+    /// heard Japanese (`crate::asr_cjk`, 0.11.0). Its own value since 0.11.4: a
     /// row that says `arbiter` was a German/English flip; this is a different
     /// claim about the audio.
     pub const LID: &str = "lid";

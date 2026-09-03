@@ -110,6 +110,7 @@ fn main() -> Result<()> {
                 confidence,
                 night,
                 japanese,
+                cjk,
                 semantic,
                 translator,
                 no_config,
@@ -127,6 +128,7 @@ fn main() -> Result<()> {
                     confidence,
                     night,
                     japanese,
+                    cjk,
                     translator,
                     single_stream: false,
                 },
@@ -1194,15 +1196,30 @@ fn cmd_models_status(
     // state and what happens then is what happened in 0.10.3 — a Japanese turn
     // comes back as Latin nonsense.
     let japanese = models.japanese();
+    let sense_voice = models.sense_voice();
     let lid = models.lid();
     println!();
     if japanese.present() && lid.present() {
         println!("japanese:           on   ({})", japanese.model_id());
     } else {
         println!("japanese:           off  (optional)");
-        println!("  {}", models::JapaneseModel::how_to_get_it());
+        println!("  {}", models::CjkModel::how_to_get_it(&["ja"]));
     }
-    for e in japanese.entries().into_iter().chain(lid.entries()) {
+    // Korean and Chinese ride on the same identifier and are reported on their
+    // own line because they are their own download (0.11.6): the bench kept two
+    // decoders, so an install can legitimately have one and not the other.
+    if sense_voice.present() && lid.present() {
+        println!("korean/chinese:     on   ({})", sense_voice.model_id());
+    } else {
+        println!("korean/chinese:     off  (optional)");
+        println!("  {}", models::CjkModel::how_to_get_it(&["ko", "zh"]));
+    }
+    for e in japanese
+        .entries()
+        .into_iter()
+        .chain(sense_voice.entries())
+        .chain(lid.entries())
+    {
         println!(
             "  {:<14}  {:>10}  {}",
             e.role,

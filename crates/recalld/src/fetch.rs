@@ -103,6 +103,16 @@ pub struct FetchOptions {
     /// Japanese turn is transliterated into Latin letters by the multilingual
     /// decoder, which is what every release up to 0.10.3 did.
     pub japanese: bool,
+    /// Also install the Korean and Chinese decoder, on top of everything
+    /// `japanese` installs (~1.6 GB together, 0.11.6). Off by default, for the
+    /// same reason and with the same consequence.
+    ///
+    /// A superset rather than an alternative: Japanese is one of the three
+    /// languages this flag promises, and its decoder is the Parakeet rather
+    /// than SenseVoice (FINDINGS §27, rule (b)). So `--cjk` implies
+    /// `--japanese`, and `--japanese` alone still installs exactly the 605 MB
+    /// pair it always did.
+    pub cjk: bool,
     /// Also install the dedicated translator (~911 MB, 0.11.0). Off by
     /// default, and not only because of the size: NLLB-200 is CC-BY-NC 4.0, so
     /// this is the one asset in the catalogue a person has to *choose* for a
@@ -136,8 +146,14 @@ impl FetchOptions {
         if self.night {
             out.push(Group::Night);
         }
-        if self.japanese {
+        // `--cjk` implies `--japanese`: the Japanese arm of the route runs on
+        // the Parakeet, not on SenseVoice, so a flag that promises three
+        // languages has to install both decoders.
+        if self.japanese || self.cjk {
             out.push(Group::Japanese);
+        }
+        if self.cjk {
+            out.push(Group::Cjk);
         }
         if self.translator {
             out.push(Group::Translator);
@@ -241,7 +257,7 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
 /// `Group` is added, rather than the next time somebody reads this file.
 fn optional_group_entries(root: &Path, cfg: &ModelsConfig, group: Group) -> Vec<ModelEntry> {
     use crate::models::{
-        ARBITER_DE, ArbiterModel, ConfidenceModel, JapaneseModel, LidModel, TranslatorModel,
+        ARBITER_DE, ArbiterModel, CjkModel, ConfidenceModel, LidModel, TranslatorModel,
     };
     match group {
         Group::Semantic => SemanticModel::resolve_at(root.to_path_buf(), cfg).entries(),
@@ -249,9 +265,14 @@ fn optional_group_entries(root: &Path, cfg: &ModelsConfig, group: Group) -> Vec<
         Group::Confidence => ConfidenceModel::resolve_at(root.to_path_buf(), 1).entries(),
         Group::Translator => TranslatorModel::resolve_at(root.to_path_buf()).entries(),
         Group::Japanese => {
-            let ja = JapaneseModel::resolve_at(root.to_path_buf(), crate::models::JAPANESE_ASR);
+            let ja = CjkModel::resolve_at(root.to_path_buf(), crate::models::JAPANESE_ASR);
             let lid = LidModel::resolve_at(root.to_path_buf(), crate::models::LID_WHISPER);
             ja.entries().into_iter().chain(lid.entries()).collect()
+        }
+        // The identifier is verified with `Group::Japanese`, which `--cjk`
+        // always brings with it, so it is not checked twice here.
+        Group::Cjk => {
+            CjkModel::resolve_at(root.to_path_buf(), crate::models::SENSE_VOICE_ASR).entries()
         }
         // The model downloads and is byte-checked with everything else; the
         // *runtime* is compiled by `models build-night` and is deliberately
@@ -1272,6 +1293,41 @@ mod tests {
         assert_eq!(ja.len(), 4, "the decoder's two files and the identifier's");
         assert!(ja.iter().any(|e| e.role.starts_with("japanese")));
         assert!(ja.iter().any(|e| e.role.starts_with("lid")));
+
+        // Korean and Chinese are one decoder and no second identifier: they
+        // ride on the same whisper-tiny, which `--cjk` always brings along
+        // through `Group::Japanese` (0.11.6).
+        let cjk = optional_group_entries(root, &cfg, Group::Cjk);
+        assert_eq!(cjk.len(), 2, "SenseVoice's graph and its token table");
+        assert!(cjk.iter().all(|e| e.role.starts_with("cjk")));
+    }
+
+    #[test]
+    fn asking_for_cjk_asks_for_japanese_too() {
+        // Japanese is one of the three languages `--cjk` promises and its
+        // decoder is the Parakeet, not SenseVoice (FINDINGS §27, rule (b)), so
+        // the flag is a superset rather than an alternative — and `--japanese`
+        // alone must still install exactly the pair it always did.
+        let cjk = FetchOptions {
+            cjk: true,
+            ..Default::default()
+        };
+        assert!(cjk.extra_groups().contains(&Group::Japanese));
+        assert!(cjk.extra_groups().contains(&Group::Cjk));
+        assert_eq!(
+            total_download_bytes(&cjk.extra_groups()) - total_download_bytes(&[]),
+            crate::models::cjk_download_bytes()
+        );
+
+        let ja = FetchOptions {
+            japanese: true,
+            ..Default::default()
+        };
+        assert_eq!(ja.extra_groups(), vec![Group::Japanese]);
+        assert_eq!(
+            total_download_bytes(&ja.extra_groups()) - total_download_bytes(&[]),
+            crate::models::japanese_download_bytes()
+        );
     }
 
     #[test]

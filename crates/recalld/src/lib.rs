@@ -25,7 +25,7 @@ pub mod arbiter;
 pub mod ask;
 // ---- 0.9.0, the assistant ------------------------------------------------
 pub mod asr;
-pub mod asr_ja;
+pub mod asr_cjk;
 pub mod assist;
 pub mod b64;
 pub mod brief;

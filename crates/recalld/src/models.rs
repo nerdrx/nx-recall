@@ -93,6 +93,17 @@ pub enum Group {
     /// identifier with nothing to hand a Japanese turn to only produces a log
     /// line. `models fetch --japanese` installs the pair or neither.
     Japanese,
+    /// Korean and Chinese (0.11.6): SenseVoice-Small, the one model in the zoo
+    /// that speaks both — and the only thing that speaks Korean at all, since
+    /// there is no Korean Parakeet (`…-0.6b-ko-3000-int8` is a 404).
+    ///
+    /// Its own group rather than a third asset in [`Group::Japanese`] because
+    /// the bench kept two decoders rather than one (FINDINGS §27, rule (b)):
+    /// SenseVoice is 4.0 CER points behind the Japanese Parakeet on Japanese at
+    /// 3 s, so an install that only ever meets Japanese speakers should not
+    /// download it. `models fetch --cjk` installs both groups, because Japanese
+    /// is one of the three languages that flag promises.
+    Cjk,
     /// The dedicated translator (0.11.0): NLLB-200-distilled-600M as two int8
     /// ONNX graphs plus its tokenizer. Optional, and **CC-BY-NC 4.0** — see
     /// the catalogue entry, which says what that means for anything commercial.
@@ -133,6 +144,10 @@ impl Group {
                 "optional — a Japanese decoder and the language identifier that \
                  routes to it; without them Japanese turns come back as Latin \
                  nonsense nothing can detect"
+            }
+            Group::Cjk => {
+                "optional — a Korean and Chinese decoder; without it those turns \
+                 come back as Latin nonsense nothing can detect"
             }
             Group::Translator => {
                 "optional — the dedicated translator; without it translation \
@@ -244,6 +259,14 @@ pub const LID_ROLE: &str = "lid";
 
 /// The directory the Japanese decoder installs into, under the models root.
 pub const JAPANESE_DIR: &str = "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8";
+
+// ---- Korean and Chinese (0.11.6) ------------------------------------------
+
+/// `RemoteAsset::role` for the Korean and Chinese decoder.
+pub const SENSE_VOICE_ROLE: &str = "cjk.asr";
+
+/// The directory SenseVoice installs into, under the models root.
+pub const SENSE_VOICE_DIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
 
 /// The directory the cross-check decoder installs into, under the models root.
 pub const CONFIDENCE_DIR: &str = "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8";
@@ -468,13 +491,13 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
     // zoo. Note the shape: `tdt_ctc`, and the export sherpa ships is the **CTC
     // head** — one `model.int8.onnx`, not the encoder/decoder/joiner triple
     // the multilingual v3 uses — which is why it is loaded by
-    // `crate::asr_ja::JaAsr` through the offline `nemo_ctc` config rather than
+    // `crate::asr_cjk::CjkAsr` through the offline `nemo_ctc` config rather than
     // through `Asr::load`.
     //
-    // Measured (`spike/asr_ja.py`, FLEURS ja test, CER after NFKC
+    // Measured (`spike/asr_ja.py` and `spike/asr_cjk.py`, FLEURS ja test, CER after NFKC
     // normalisation and punctuation stripping — WER is meaningless for a
     // language written without spaces): see FINDINGS §23 and the numbers on
-    // `crate::asr_ja`. It is preferred over routing Japanese turns to the
+    // `crate::asr_cjk`. It is preferred over routing Japanese turns to the
     // night shift's whisper-large-v3 because it runs on the CPU, in the live
     // path, in the same place the German arbiter already runs.
     //
@@ -498,6 +521,52 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
             ),
         ],
     },
+    // ---- Korean and Chinese (0.11.6) --------------------------------------
+    //
+    // SenseVoice-Small, the FunASR model as published in the k2-fsa zoo:
+    // zh + en + ja + ko + yue in one graph. The flag is `models fetch --cjk`,
+    // which installs this on top of `--japanese`'s pair.
+    //
+    // It is here for Korean and Chinese and NOT for Japanese, and that split is
+    // a measurement rather than caution (`spike/asr_cjk.py`, 200 FLEURS
+    // utterances per language, CER after NFKC normalisation and punctuation
+    // stripping — WER is meaningless for two languages written without spaces).
+    // The rule going in was "one decoder for all three if SenseVoice is within
+    // 2 CER points of the Japanese Parakeet on ja at 3 s":
+    //
+    //   ja  full 7.6% / 3 s 15.3%   against the Parakeet's 7.5% / 11.3%
+    //   ko  full 9.2% / 3 s  9.6%
+    //   zh  full 10.7% / 3 s 9.6%
+    //
+    // Level on whole utterances and 4.0 points behind on the 3 s fragment this
+    // daemon lives in — twice the bar — so the Parakeet keeps Japanese. On
+    // Korean and Chinese it has no competition: there is no Korean Parakeet
+    // (`…-0.6b-ko-3000-int8` is a 404), and both languages sit at 9.6% CER at
+    // 3 s, comfortably inside the 20% usability bar. RTF 0.012 on 4 cores.
+    //
+    // Only the int8 graph and the token table are checked; the tarball also
+    // carries the 937 MB fp32 export and five test WAVs this daemon never
+    // opens, which is why the download is four times what it installs.
+    //
+    // sha256 of the tarball:
+    //   f6b2a72ebcb1ac7a764d4cfccd886e6bcb2a95c4657c2199d0ba95ed4b9ea71a
+    RemoteAsset {
+        role: SENSE_VOICE_ROLE,
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+        download_bytes: 1_047_870_769,
+        install: Install::TarBz2,
+        group: Group::Cjk,
+        files: &[
+            (
+                "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx",
+                239_233_841,
+            ),
+            (
+                "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt",
+                315_894,
+            ),
+        ],
+    },
     // The spoken-language identifier (`crate::lid`): Whisper tiny int8, read
     // for its language token rather than for words.
     //
@@ -511,6 +580,16 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
     // exactly as wrong as it is today; a German turn handed to a decoder that
     // speaks only Japanese is a new kind of wrong. Tiny is also a third of the
     // download and half base's RTF at 1.5 s.
+    //
+    // Re-measured on five languages for 0.11.6 (`spike/lid_cjk.py`, FINDINGS
+    // §27) before Korean and Chinese were added as targets, because adding a
+    // target adds a way for a German turn to be stolen. At 3 s: ja 96.5%,
+    // ko 97.5%, zh 100.0%, and again **zero of 400** German and English
+    // utterances heard as any of the three. The confusion that was expected —
+    // ja↔zh, one script and much of a vocabulary — did not appear either
+    // (0.5% one way, 0.0% the other); the cross-talk runs ja↔ko at 1.5–2.0%
+    // and `asr_cjk::judge` reads the script rather than the reading, so it
+    // costs nothing.
     //
     // Base is already on disk for anyone who fetched `--arbiter-de`, and is
     // still not reused — a feature whose accuracy depends on which *other*
@@ -1024,24 +1103,31 @@ pub fn confidence_download_bytes() -> u64 {
         .sum()
 }
 
-// ---- Japanese, on disk (0.11.0) -------------------------------------------
+// ---- the CJK decoders, on disk (0.11.0, 0.11.6) ----------------------------
 
-/// The Japanese decoder's export: a **CTC** head, so one graph file and a token
-/// table, and none of [`AsrExport`]'s four.
+/// A single-graph offline export: one model file and a token table, and none of
+/// [`AsrExport`]'s four.
 ///
 /// Deliberately its own type rather than a fourth `AsrExport` for the same
 /// reason [`WhisperExport`] is its own: the file layout is different, the
-/// sherpa model config it fills in is different (`nemo_ctc`, not
-/// `transducer`), and its language is a property of the weights rather than a
-/// decoding parameter or a guess.
+/// sherpa model config it fills in is different (`nemo_ctc` or `sense_voice`,
+/// not `transducer`), and the languages it can write are a property of the
+/// weights rather than a decoding parameter or a guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CtcExport {
     pub dir: &'static str,
     pub model: &'static str,
     pub tokens: &'static str,
-    /// The tag stamped on every transcript this decoder produces. A fact about
-    /// the weights: it cannot produce anything else.
-    pub lang: &'static str,
+    /// Which sherpa model config loads it, and therefore which languages
+    /// [`crate::asr_cjk::judge`] will accept from it.
+    ///
+    /// Carried on the export rather than inferred from the directory name
+    /// because getting it wrong is the one mistake in this area that neither
+    /// fails to compile nor fails to load — it comes back as empty strings.
+    pub decoder: crate::asr_cjk::Decoder,
+    /// The languages a transcript from this export may be stamped with, in the
+    /// catalogue's words rather than the router's. A fact about the weights.
+    pub langs: &'static [&'static str],
     pub note: &'static str,
 }
 
@@ -1056,8 +1142,20 @@ pub const JAPANESE_ASR: CtcExport = CtcExport {
     dir: JAPANESE_DIR,
     model: "model.int8.onnx",
     tokens: "tokens.txt",
-    lang: "ja",
-    note: "Japanese only — CPU, live-path speed",
+    decoder: crate::asr_cjk::Decoder::Japanese,
+    langs: &["ja"],
+    note: "Japanese only — 11.3% CER at 3 s, CPU, live-path speed",
+};
+
+/// SenseVoice-Small int8: Korean and Chinese, and it writes Japanese too even
+/// though nothing routes Japanese to it (FINDINGS §27).
+pub const SENSE_VOICE_ASR: CtcExport = CtcExport {
+    dir: SENSE_VOICE_DIR,
+    model: "model.int8.onnx",
+    tokens: "tokens.txt",
+    decoder: crate::asr_cjk::Decoder::SenseVoice,
+    langs: &["ko", "zh", "ja"],
+    note: "Korean and Chinese — 9.6% CER each at 3 s, CPU",
 };
 
 /// The Whisper export the spoken-language identifier runs on. Encoder and
@@ -1075,22 +1173,22 @@ pub const LID_WHISPER: LidExport = LidExport {
     dir: "sherpa-onnx-whisper-tiny",
     encoder: "tiny-encoder.int8.onnx",
     decoder: "tiny-decoder.int8.onnx",
-    note: "Whisper tiny int8 — 96.5% ja recall at 3 s, 0/400 de+en false positives",
+    note: "Whisper tiny int8 — 96.5/97.5/100% ja/ko/zh recall at 3 s, 0/400 de+en false positives",
 };
 
-/// Where the Japanese decoder lives under a models root, and whether it is
-/// there. Kept apart from [`ModelSet`] like every other optional model: its
-/// absence is a normal state, and what happens without it is that a Japanese
-/// turn stays transliterated — which is exactly what 0.10.3 did.
+/// Where one CJK decoder lives under a models root, and whether it is there.
+/// Kept apart from [`ModelSet`] like every other optional model: its absence is
+/// a normal state, and what happens without it is that a Japanese, Korean or
+/// Chinese turn stays transliterated — which is exactly what 0.10.3 did.
 #[derive(Debug, Clone)]
-pub struct JapaneseModel {
+pub struct CjkModel {
     pub root: PathBuf,
     pub export: CtcExport,
     pub model: PathBuf,
     pub tokens: PathBuf,
 }
 
-impl JapaneseModel {
+impl CjkModel {
     pub fn resolve_at(root: PathBuf, export: CtcExport) -> Self {
         let dir = root.join(export.dir);
         Self {
@@ -1102,13 +1200,11 @@ impl JapaneseModel {
     }
 
     pub fn entries(&self) -> Vec<ModelEntry> {
-        entries_under(
-            &self.root,
-            [
-                ("japanese.model", &self.model),
-                ("japanese.tokens", &self.tokens),
-            ],
-        )
+        let (model, tokens) = match self.export.decoder {
+            crate::asr_cjk::Decoder::Japanese => ("japanese.model", "japanese.tokens"),
+            crate::asr_cjk::Decoder::SenseVoice => ("cjk.model", "cjk.tokens"),
+        };
+        entries_under(&self.root, [(model, &self.model), (tokens, &self.tokens)])
     }
 
     /// Both files at exactly the catalogued size. A truncated download is
@@ -1121,13 +1217,27 @@ impl JapaneseModel {
         self.export.model_id()
     }
 
-    pub fn how_to_get_it() -> String {
+    /// The one line every "it is not installed" message says, for whichever of
+    /// ja/ko/zh has no decoder on disk.
+    ///
+    /// Two flags because there are two downloads: `--japanese` is the 605 MB
+    /// pair it has always been, and `--cjk` is that plus SenseVoice. Naming the
+    /// smaller one when only Japanese is missing matters — telling somebody who
+    /// wants Japanese to fetch 1.6 GB is how a correct message becomes an
+    /// ignored one.
+    pub fn how_to_get_it(missing: &[&str]) -> String {
+        let only_ja = missing == ["ja"];
+        let (flag, bytes) = if only_ja {
+            ("--japanese", japanese_download_bytes())
+        } else {
+            ("--cjk", cjk_download_bytes())
+        };
         format!(
-            "the Japanese decoder is not installed. `recalld models fetch --japanese` \
-             installs {JAPANESE_DIR} and the language identifier beside it ({}), and \
-             until then a Japanese turn comes back transliterated into Latin letters \
-             that nothing downstream can detect.",
-            crate::fetch::human(japanese_download_bytes()),
+            "no decoder is installed for {}. `recalld models fetch {flag}` installs it \
+             and the language identifier beside it ({}), and until then such a turn comes \
+             back transliterated into Latin letters that nothing downstream can detect.",
+            missing.join("/"),
+            crate::fetch::human(bytes),
         )
     }
 }
@@ -1209,6 +1319,17 @@ pub fn japanese_download_bytes() -> u64 {
     REMOTE_ASSETS
         .iter()
         .filter(|a| a.group == Group::Japanese)
+        .map(|a| a.download_bytes)
+        .sum()
+}
+
+/// Bytes `models fetch --cjk` has to pull down: both groups, because Japanese
+/// is one of the three languages that flag promises and its decoder is the
+/// Parakeet rather than SenseVoice (FINDINGS §27, rule (b)).
+pub fn cjk_download_bytes() -> u64 {
+    REMOTE_ASSETS
+        .iter()
+        .filter(|a| matches!(a.group, Group::Japanese | Group::Cjk))
         .map(|a| a.download_bytes)
         .sum()
 }
@@ -1591,8 +1712,13 @@ impl ModelSet {
     /// The Japanese decoder under this set's root (0.11.0), resolved the same
     /// way and for the same reason the arbiter is: one directory holds every
     /// decoder this daemon can reach for.
-    pub fn japanese(&self) -> JapaneseModel {
-        JapaneseModel::resolve_at(self.root.clone(), JAPANESE_ASR)
+    pub fn japanese(&self) -> CjkModel {
+        CjkModel::resolve_at(self.root.clone(), JAPANESE_ASR)
+    }
+
+    /// The Korean and Chinese decoder under this set's root (0.11.6).
+    pub fn sense_voice(&self) -> CjkModel {
+        CjkModel::resolve_at(self.root.clone(), SENSE_VOICE_ASR)
     }
 
     /// The spoken-language identifier under this set's root (0.11.0).

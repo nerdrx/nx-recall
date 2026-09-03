@@ -584,7 +584,7 @@ pub struct AsrConfig {
     /// Ceiling on the vocabulary's `effective` list.
     pub vocab_max_terms: usize,
 
-    // ---- Japanese (0.11.0, `crate::asr_ja`) ------------------------------
+    // ---- Japanese, Korean, Chinese (0.11.0/0.11.6, `crate::asr_cjk`) -----
     /// Listen for Japanese turns and re-decode them with a decoder that speaks
     /// it.
     ///
@@ -600,8 +600,24 @@ pub struct AsrConfig {
     /// classifier, not the third-language guesser, not a person skimming —
     /// can ever see it. See `crate::lid`.
     pub japanese: bool,
+    /// The same, for **Korean and Chinese** (0.11.6, `crate::asr_cjk`).
+    ///
+    /// A second switch rather than one folded switch, and the reason is that
+    /// the bench kept two decoders rather than one (FINDINGS §27, rule (b)):
+    /// SenseVoice-Small is 4.0 CER points behind the Japanese Parakeet on
+    /// Japanese at 3 s, so Japanese keeps its own model. Two decoders means two
+    /// downloads (`--japanese`, 605 MB; `--cjk`, 1.6 GB), two lazily loaded
+    /// residents (655 MB and 239 MB) and two failure modes — and one switch
+    /// over two of those would mean turning Japanese off silently took Korean
+    /// with it, or that a machine which only ever hears Korean paid 655 MB of
+    /// resident Parakeet for it.
+    ///
+    /// **On**, like `japanese`, and costing nothing on a machine that has not
+    /// opted in: the model is an optional download, so "on" means "use it if it
+    /// is there".
+    pub cjk: bool,
     /// Share of the identifier's windows that must agree before a turn is
-    /// handed to the Japanese decoder.
+    /// handed to a CJK decoder.
     ///
     /// **Measured** (`spike/lid_bench.py`, 200 FLEURS utterances per
     /// language): whisper-tiny heard **zero of 400** German and English
@@ -660,6 +676,7 @@ impl Default for AsrConfig {
             max_queue_seconds: 5,
             vocab_max_terms: 500,
             japanese: true,
+            cjk: true,
             lid_min_confidence: 1.0,
             lid_windows: 1,
             // ---- 0.11.0, partial turns ------------------------------------

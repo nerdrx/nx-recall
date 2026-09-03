@@ -221,7 +221,8 @@ the daemon is capturing, and a run that is interrupted loses nothing.
 `recalld models fetch --arbiter-de` installs the German arbiter (~208 MB);
 `recalld models fetch --confidence` installs the cross-check decoder (~154 MB);
 `recalld models fetch --japanese` installs a Japanese decoder and the language
-identifier that routes to it (~605 MB);
+identifier that routes to it (~605 MB), `--cjk` adds Korean and Chinese (~1.6 GB
+in total);
 `--fallback-asr` installs the English one (~108 MB).")]
     Lang {
         #[command(subcommand)]
@@ -738,6 +739,15 @@ pub enum ModelsAction {
         /// not say so.
         #[arg(long)]
         japanese: bool,
+
+        /// Also install the Korean and Chinese decoder on top of `--japanese`
+        /// (~1.6 GB together, 0.11.6): SenseVoice-Small, which speaks both and
+        /// is the only thing in the zoo that speaks Korean at all. A superset
+        /// of `--japanese` rather than an alternative — Japanese still runs on
+        /// its own Parakeet, which is 4.0 CER points better on the 3 s
+        /// fragments a lobby speaks in.
+        #[arg(long)]
+        cjk: bool,
 
         /// Also install the text-embedding model that semantic search needs
         /// (~135 MB). Not part of the default set: keyword search works

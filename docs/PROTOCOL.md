@@ -2488,11 +2488,11 @@ audio and said which language it was**, and a decoder for that language then
 re-read the turn. It is not `re-decode` (nothing disagreed with a speaker's
 declaration) and not `classified` (the words said nothing — they could not).
 
-A row carrying `lang_via: "lid"` has `lang: "ja"`, an `asr_model_id` of
-`sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8@1`, and `text_via:
-"arbiter"` — the same `text_via` the German flip arbiter writes, because it is
-the same kind of event: a constrained decoder replacing a wrong-language
-transcript.
+A row carrying `lang_via: "lid"` has `lang: "ja"` (or, since 0.11.6, `"ko"` or
+`"zh"`), an `asr_model_id` naming the decoder that produced it, and `text_via:
+"lid"` — its own value since 0.11.4, because a person filtering for "what did
+the language router change" should not have to separate it from the German flip
+arbiter's rows by hand.
 
 **A `lang_via: "lid"` row is settled.** The conversational language prior
 (0.7.7) does not re-open it, the same way it does not re-open `re-decode` or
@@ -2564,9 +2564,119 @@ behaves exactly as it did in 0.10.3.
 Note for anyone reading the catalogue: whisper **tiny**, not base, and that is a
 measurement rather than a saving. Base has the better Japanese recall and hears
 3–5% of English as Japanese; tiny heard zero of 400 German and English
-utterances as Japanese at any length. Numbers in `spike/FINDINGS.md` §22–§24,
-which also record what this does *not* cover — Korean and Chinese have the same
-failure and no catalogued decoder yet.
+utterances as Japanese at any length. Numbers in `spike/FINDINGS.md` §22–§24.
+
+## 0.11.6 — the same route, for Korean and Chinese
+
+§24 wrote down what 0.11.0 did not cover: a Korean or Chinese speaker in the
+same lobby got **precisely** the failure the Japanese round had just fixed. The
+multilingual decoder does not speak either, does not say so, and transliterates.
+This round closes that, and nothing above changes — the route, the guards, the
+`lang_via: "lid"` provenance, the `segments.redecode` operations row and the
+duration floor are all the same mechanism with two more arms.
+
+### What is different: two decoders, not one
+
+The obvious move was one model for all three, and the bench said no. Rule going
+in: one decoder if SenseVoice-Small came within 2 CER points of the Japanese
+Parakeet on Japanese at 3 s (`spike/asr_cjk.py`, 200 FLEURS utterances per
+language, FINDINGS §27):
+
+| decoder | lang | full | 3 s | RTF at 3 s |
+|---------|------|-----:|----:|-----------:|
+| `ja-parakeet-tdt_ctc-0.6b` int8 | ja | 7.5% | 11.3% | 0.026 |
+| `sense-voice-small` int8 | ja | 7.6% | **15.3%** | 0.014 |
+| `sense-voice-small` int8 | ko | 9.2% | 9.6% | 0.012 |
+| `sense-voice-small` int8 | zh | 10.7% | 9.6% | 0.012 |
+
+Level on whole utterances, 4.0 points behind on the 3 s fragment a lobby
+actually speaks in — twice the bar. So **Japanese keeps the Parakeet** and
+SenseVoice is catalogued for Korean and Chinese, where it has no competition at
+all (there is no Korean Parakeet in the zoo).
+
+### The identifier, re-measured
+
+Adding a target adds a way for a German turn to be stolen, so the §22 gate was
+re-run on five languages (`spike/lid_cjk.py`, 200 utterances each):
+
+| length | ja | ko | zh | de correct | en correct | de/en → any of the three |
+|--------|---:|---:|---:|-----------:|-----------:|-------------------------:|
+| full | 100.0% | 100.0% | 100.0% | 99.5% | 100.0% | **0.0%** |
+| 3 s | 96.5% | 97.5% | 100.0% | 91.0% | 100.0% | **0.0%** |
+
+Zero of 400 German and English utterances were heard as any of the three, at
+either length. The ja↔zh confusion the shared script made likely did not
+appear (0.5% one way, 0.0% the other); the cross-talk that exists runs ja↔ko at
+1.5–2.0%, and the judge below makes it free.
+
+### The judge: the script decides the tag
+
+Unchanged in shape, generalised in content. The replacement must be non-empty
+and must read as one of the languages **the decoder that produced it can
+write** — two kana for `ja`, two hangul for `ko`, a Han majority for `zh`, the
+same bars `guess_other` already uses. A German turn that reaches either decoder
+comes back in none of those and overwrites nothing.
+
+One deliberate refinement: the tag written to `segments.lang` is taken off the
+**script of the text**, not off the identifier's reading. Forcing SenseVoice's
+language changes nothing about what it writes — a Japanese clip decoded as `ko`
+still comes back in kana, measured — so on the 1.5% of Japanese turns the
+identifier hands to the Korean arm, reading the script keeps a correct
+transcript with a correct `ja` stamp where trusting the reading would have
+thrown both away. The identifier still chooses the decoder; the writing system
+chooses the tag.
+
+SenseVoice also wraps its output in metadata tags — `<|ja|>`, `<|NEUTRAL|>`,
+`<|HAPPY|>`, `<|Speech|>`, `<|BGM|>`, `<|woitn|>`. At the sherpa-onnx version
+this daemon links, those arrive in the result struct's own fields and the text
+comes back clean (0.0% of 1200 decodes carried one). They are stripped anyway,
+before anything reads the string: a transcript beginning with a Latin `<|ja|>`
+would be classified as English, which is the exact class of undetectable failure
+this route exists to remove.
+
+### Status counters
+
+`routed_ja` keeps its meaning and is joined by **`routed_ko`** and
+**`routed_zh`**. Three counters rather than one total, because the three arms
+have different decoders, different downloads and different accuracies — a
+single number could not answer "is Korean working". `lid_checked` is unchanged
+and is still the cost against all three.
+
+### Speaker tags
+
+`speakers.languages` accepts `"ko"` and `"zh"` alongside `de`, `en` and `ja`, so
+a voice can be pinned to one and skip the identifier entirely. `yue` is **not**
+accepted even though SenseVoice writes it: a tag exists only if a decoder for it
+is catalogued, and nothing routes Cantonese.
+
+### Models
+
+| role | export | tarball bytes | sha256 |
+|------|--------|--------------:|--------|
+| `japanese.asr` | `sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8` | 489,389,564 | `4b0a800e…6f8d1306b` |
+| `cjk.asr` | `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` | 1,047,870,769 | `f6b2a72e…4b9ea71a` |
+| `lid` | `sherpa-onnx-whisper-tiny` | 116,204,861 | `c4611699…129e66b1` |
+
+Installed files the fetch verifies:
+
+| path | bytes |
+|------|------:|
+| `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx` | 239,233,841 |
+| `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt` | 315,894 |
+
+`recalld models fetch --japanese` is **unchanged**: the same 605 MB pair it has
+always installed. `--cjk` is a superset — 1.65 GB — because Japanese is one of
+the three languages it promises and its decoder is the Parakeet. The 1 GB
+tarball installs 239 MB: it also carries an fp32 export and test WAVs this
+daemon never opens.
+
+`[asr].cjk` (default `true`) joins `[asr].japanese`, with the same "use it if it
+is there" meaning. Two switches rather than one because there are two downloads
+and two residents: a machine that only hears Korean should not hold 655 MB of
+Japanese Parakeet, and turning Japanese off must not silently take Korean with
+it.
+
+Numbers in `spike/FINDINGS.md` §27.
 ## 0.11.0 — partial turns
 
 Provisional words on the glass while somebody is **still talking**. One new event,

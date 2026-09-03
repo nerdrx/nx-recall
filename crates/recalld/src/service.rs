@@ -771,13 +771,19 @@ impl Service {
                 "redecoded_de": c.analysis.redecoded_de.load(Ordering::Relaxed),
                 "redecoded_en": c.analysis.redecoded_en.load(Ordering::Relaxed),
                 "repairs": c.analysis.repairs.load(Ordering::Relaxed),
-                // 0.11.0, Japanese: turns whose transcript nobody could read
-                // and were therefore played to the spoken-language identifier,
-                // and the ones it heard Japanese in and a Japanese decoder
-                // then re-read. The pair is the whole story — the first is
-                // what the feature costs, the second what it buys.
+                // 0.11.0, Japanese and 0.11.6, Korean and Chinese: turns whose
+                // transcript nobody could read and were therefore played to the
+                // spoken-language identifier, and the ones a CJK decoder then
+                // re-read. The set is the whole story — the first is what the
+                // feature costs, the rest what it buys.
+                //
+                // Three counters rather than one total because the three arms
+                // have different decoders and different downloads (FINDINGS
+                // §27): a single number could not answer "is Korean working".
                 "lid_checked": c.analysis.lid_checked.load(Ordering::Relaxed),
                 "routed_ja": c.analysis.routed_ja.load(Ordering::Relaxed),
+                "routed_ko": c.analysis.routed_ko.load(Ordering::Relaxed),
+                "routed_zh": c.analysis.routed_zh.load(Ordering::Relaxed),
                 // 0.8.0, the idle quality worker: turns re-decoded with their
                 // session's audio, turns that had none to re-decode with, and
                 // the two verdicts of the cross-check.
