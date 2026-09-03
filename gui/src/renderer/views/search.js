@@ -54,6 +54,15 @@ const facetState = {
   refused: null,
 };
 let lastHits = [];
+// Which search is current. Every path that talks to the daemon takes a ticket
+// on the way in and checks it on the way out: a reply that arrives after a
+// newer search started paints nothing. Without this, "flickering" asked and
+// then "portal" searched left the pills for "flickering" on screen — the
+// explicit search cleared them and the older reply put them back (0.11.8, seen
+// only under load, which is exactly when replies arrive out of order).
+let generation = 0;
+const ticket = () => ++generation;
+const stale = (my) => my !== generation;
 
 export function mount(root, ctx, arg) {
   // Arriving from a world chip: the facet is the whole point of the trip, so
@@ -198,6 +207,7 @@ export function mount(root, ctx, arg) {
    * explicit path and says so once.
    */
   async function runAsk() {
+    const my = ticket();
     facetState.q = qInput.value;
     facetState.answer = null;
     facetState.refused = null;
@@ -215,6 +225,7 @@ export function mount(root, ctx, arg) {
     const question = looksLikeAQuestion(facetState.q);
     try {
       const res = await ask(question ? 'search.answer' : 'search.ask', { q: facetState.q, limit: 100 });
+      if (stale(my)) return undefined;
       facetState.asked = res.interpretation ?? null;
       facetState.answer = res.answer ?? null;
       facetState.refused = res.refused ?? null;
@@ -228,6 +239,7 @@ export function mount(root, ctx, arg) {
       renderPills();
       renderHits(res);
     } catch (e) {
+      if (stale(my)) return undefined;
       if (e.code === 'unknown_method') {
         // A daemon too old for 0.11.0 can still read the question — try the
         // one method back before giving up on the whole path. Only then does
@@ -235,6 +247,7 @@ export function mount(root, ctx, arg) {
         if (question) {
           try {
             const res = await ask('search.ask', { q: facetState.q, limit: 100 });
+            if (stale(my)) return undefined;
             facetState.asked = res.interpretation ?? null;
             lastHits = res.hits ?? [];
             renderPills();
@@ -269,6 +282,7 @@ export function mount(root, ctx, arg) {
    * the facet straight back.
    */
   async function rerunAsked() {
+    const my = ticket();
     const it = facetState.asked;
     // Taking a pill off changes which turns were searched, so whatever
     // sentence was above them was read off a different set of rows. It goes.
@@ -286,10 +300,12 @@ export function mount(root, ctx, arg) {
     try {
       const [method, p] = requestFor(modeId, params);
       const res = await ask(method, p);
+      if (stale(my)) return undefined;
       lastHits = res.hits ?? [];
       renderPills();
       renderHits(res, modeId);
     } catch (e) {
+      if (stale(my)) return undefined;
       clear(results);
       results.append(
         h('div', { class: 'empty' }, h('b', { text: 'Search failed' }), h('p', { text: e.message }))
@@ -433,6 +449,7 @@ export function mount(root, ctx, arg) {
   }
 
   async function run() {
+    const my = ticket();
     // An explicit search is a different question from the one that was asked,
     // so the pills go: leaving them up would explain results they did not
     // produce, which is worse than explaining nothing. The answer goes with
@@ -481,15 +498,18 @@ export function mount(root, ctx, arg) {
       // query to rank by. `transcript` takes the same facet and answers it.
       if (!facetState.q.trim() && facetState.world) {
         const res = await ask('transcript', { world: facetState.world, limit: 100 });
+        if (stale(my)) return;
         lastHits = [...(res.segments ?? [])].reverse();
         renderHits({ total: lastHits.length, hits: lastHits }, 'keyword');
         return;
       }
       const [method, p] = requestFor(facetState.mode, params);
       const res = await ask(method, p);
+      if (stale(my)) return;
       lastHits = res.hits ?? [];
       renderHits(res);
     } catch (e) {
+      if (stale(my)) return;
       // The one error worth demoting a mode over: the daemon lost (or never
       // had) the model. Fall back rather than showing the user a red box for
       // a search that keyword can still answer.

@@ -2654,11 +2654,14 @@ export function runE2E(deps) {
 
     // 8 — pause from the TRAY path stops the feed (DESIGN §8, the marquee case)
     await step('tray-pause-stops-feed', async () => {
-      const before = (await js('window.__recallDebug.counts()')).appended;
       await deps.setPaused(true); // exactly what the tray menu item calls
       await waitFor('the UI to show paused', async () =>
         js('document.getElementById("pause-btn").dataset.paused === "true"')
       );
+      // Counted AFTER the pause is in effect: a row the mock emitted in the
+      // round trip between "count" and "pause" is not the feed running while
+      // paused, and under load that window is wide enough to hit (42 → 43).
+      const before = (await js('window.__recallDebug.counts()')).appended;
       const label = await js('document.getElementById("pause-label").textContent');
       const chip = await js('(document.getElementById("live-chip")||{}).textContent || ""');
       await sleep(6000); // three feed intervals
