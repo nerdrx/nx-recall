@@ -22,7 +22,7 @@ use crate::clock::{iso8601, ns_to_ms, parse_iso8601, utc_now_ns};
 use crate::config::Config;
 use crate::control::Control;
 use crate::proto::{Error, Request};
-use crate::store::{SegmentFilter, SegmentRow, Store};
+use crate::store::{SegmentFilter, SegmentRow, SpeakerStyles, Store};
 
 /// How many segments one delete step touches before it reports progress.
 const DELETE_BATCH: usize = 200;
@@ -104,6 +104,22 @@ pub fn source_chips(rows: Option<&Vec<crate::store::SpeakerSource>>) -> Value {
     )
 }
 
+/// One voice's highlight out of a `Store::speaker_styles` map, as the two
+/// values a payload puts on the wire.
+///
+/// A voice that is not in the map is not highlighted, which is nearly all of
+/// them — the map holds only the rows that have something to say. Returning a
+/// pair rather than an `Option<&(..)>` is what lets a `json!` block spell
+/// `"colour"` and `"icon"` unconditionally: the fields are always present and
+/// null is the ordinary value, which is the rule the rest of this protocol
+/// follows for `name`.
+pub fn style_of(styles: &SpeakerStyles, id: i64) -> (Option<&str>, Option<&str>) {
+    match styles.get(&id) {
+        Some((colour, icon)) => (colour.as_deref(), icon.as_deref()),
+        None => (None, None),
+    }
+}
+
 /// One segment on the wire.
 ///
 /// Both time forms, deliberately (PROTOCOL "Field conventions"): `t_ms` is what
@@ -118,6 +134,14 @@ pub fn segment_json(row: &SegmentRow) -> Value {
         // and a relabel event updates every view in place because of that.
         "speaker": row.speaker_id,
         "speaker_name": row.speaker_name,
+        // Schema v15: the highlight a person pinned to this voice — a palette
+        // token (never a hex; see `crate::palette`) and a short emoji, both
+        // null on every voice nobody has picked out, which is nearly all of
+        // them. Carried on the row for the same reason `speaker_name` is: a
+        // caption bar resolves a turn once and must not need a second query to
+        // know what colour to draw the name in.
+        "speaker_colour": row.speaker_colour,
+        "speaker_icon": row.speaker_icon,
         "text": row.text,
         "t_ms": ns_to_ms(row.t_start_ns),
         "t_ns": row.t_start_ns.to_string(),
@@ -398,6 +422,8 @@ impl Service {
             "speakers.list" => self.speakers_list(),
             "speakers.name" => self.speakers_name(req),
             "speakers.set_languages" => self.speakers_set_languages(req),
+            "speakers.set" => self.speakers_set(req),
+            "speakers.palette" => self.speakers_palette(),
             "speakers.prune" => self.speakers_prune(req),
             "speakers.delete" => self.speakers_delete(req),
             "speakers.merge" => self.speakers_merge(req),
@@ -1389,6 +1415,14 @@ impl Service {
                     // says otherwise — it is what turns a wrong-language decode
                     // from an unfixable annoyance into a decidable question.
                     "languages": r.languages,
+                    // The highlight (schema v15): a palette TOKEN — never a
+                    // hex, so the same pick is legible on both of NX Clear's
+                    // grounds and in the headset overlay, which has no CSS to
+                    // resolve a colour with (`crate::palette`). Both null on
+                    // every voice nobody has picked out, which is nearly all of
+                    // them, and null is the whole of "not highlighted".
+                    "colour": r.colour,
+                    "icon": r.icon,
                     "first_seen": iso8601(r.created_at),
                     "segments": r.segments,
                     "total_ms": ns_to_ms(r.speech_ns),
@@ -1478,6 +1512,109 @@ impl Service {
         Ok(json!({"id": id, "languages": languages, "seq": seq}))
     }
 
+    /// The palette a highlight may be picked from.
+    ///
+    /// Served rather than assumed, so a daemon that grows an eleventh colour
+    /// does not need a matching client release before anybody can pick it. A
+    /// client that draws swatches from a copy it invented would also be a
+    /// second definition of the brand colour, and there is only one.
+    fn speakers_palette(&self) -> Result<Value, Error> {
+        Ok(json!({"palette": crate::palette::wire()}))
+    }
+
+    /// Pin a colour and an emoji to a voice — or take them off.
+    ///
+    /// `speakers.set {id, colour?, icon?}`. Both are optional and the omission
+    /// is meaningful: **an absent key leaves that half alone, an explicit
+    /// `null` clears it.** The two halves are independent (somebody may want a
+    /// colour and no emoji, or the reverse), and collapsing "say nothing about
+    /// the icon" into "clear the icon" would make it impossible to change one
+    /// without restating the other — which is exactly the bug
+    /// `speakers.set_languages` avoids by carrying the name on its event.
+    ///
+    /// What is stored is a palette **token**, not a colour. A free-form hex
+    /// would let somebody pick a highlight that is invisible on one of the two
+    /// grounds, and the daemon cannot warn them because the daemon does not
+    /// know which ground anybody is looking at. See `crate::palette`.
+    fn speakers_set(&self, req: &Request) -> Result<Value, Error> {
+        let id = req.i64("id")?;
+
+        // `params` distinguishes the three cases the semantics turn on:
+        // the key is absent (leave it), the key is null (clear it), or the key
+        // carries a value (set it). `req.param` already filters null out, so
+        // the raw params object is what has to be asked.
+        let said =
+            |key: &str| -> bool { req.params.as_object().is_some_and(|o| o.contains_key(key)) };
+        let colour_said = said("colour");
+        let icon_said = said("icon");
+        if !colour_said && !icon_said {
+            return Err(Error::params(
+                "speakers.set needs colour, icon, or both (null clears one)",
+            ));
+        }
+        let colour = req.opt_str("colour")?;
+        let icon = req.opt_str("icon")?;
+        crate::palette::check_colour(colour).map_err(|e| Error::params(e.message()))?;
+        crate::palette::check_icon(icon).map_err(|e| Error::params(e.message()))?;
+        // One representation of "no icon" in the database, so every reader can
+        // test it with `IS NULL` rather than also having to know about "".
+        let icon = crate::palette::normalise_icon(icon);
+
+        let store = self.store();
+        let prior = store
+            .speaker_style(id)
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::not_found(format!("no speaker with id {id}")))?;
+        // The same refusal `speakers.name` and `speakers.set_languages` give,
+        // for the sharper of the two reasons: `speaker_style` READS through the
+        // tombstone to the canonical voice while `set_speaker_style` WRITES the
+        // row it was handed. Allowed, this would report success, change
+        // nothing anybody can see, and log the canonical voice's colour as the
+        // prior state — the audit trail would lie too.
+        Self::tombstone_check(&store, id)?;
+
+        let (prior_colour, prior_icon) = prior;
+        let colour = if colour_said {
+            colour.map(str::to_owned)
+        } else {
+            prior_colour.clone()
+        };
+        let icon = if icon_said { icon } else { prior_icon.clone() };
+
+        store
+            .set_speaker_style(id, colour.as_deref(), icon.as_deref())
+            .map_err(Error::from)?;
+        store
+            .log_operation(
+                "speakers.set",
+                &json!([id]).to_string(),
+                &json!({"id": id, "colour": prior_colour, "icon": prior_icon}).to_string(),
+                utc_now_ns(),
+            )
+            .map_err(Error::from)?;
+        let summary = store.speaker_summary(id).map_err(Error::from)?;
+        drop(store);
+
+        // On the existing `relabel` event, carrying the name for the same
+        // reason `speakers.set_languages` does: a client folds one shape into
+        // its speaker row and must never be made to choose between applying the
+        // highlight and keeping the name. Both halves are always stated here,
+        // because by this point the omit-versus-null question has been answered
+        // and what is left is the voice's actual style.
+        let seq = self.bus.publish(
+            Topic::Relabel,
+            "relabel",
+            json!({
+                "speaker": id,
+                "name": summary.as_ref().and_then(|s| s.name()),
+                "colour": colour,
+                "icon": icon,
+            }),
+        );
+        info!(speaker = id, ?colour, ?icon, "speaker highlight set");
+        Ok(json!({"id": id, "colour": colour, "icon": icon, "seq": seq}))
+    }
+
     /// The one-off voices sweep (0.6.1): list, or delete.
     ///
     /// A grunt that slipped past the mint bar — or one minted before the bar
@@ -1507,6 +1644,11 @@ impl Service {
                     "id": s.id,
                     "auto": s.auto_label,
                     "name": s.name(),
+                    // The highlight (v15): a voice somebody bothered to pick
+                    // out is exactly the kind the sweep should be shown
+                    // hesitating over.
+                    "colour": s.colour,
+                    "icon": s.icon,
                     "segments": s.segments,
                     "total_ms": ns_to_ms(s.speech_ns),
                     "speech_ns": s.speech_ns.to_string(),
@@ -2172,6 +2314,11 @@ impl Service {
                         "speaker_id": p,
                         "name": summary.as_ref().and_then(|s| s.name()),
                         "auto": summary.as_ref().map(|s| s.auto_label.clone()),
+                        // The highlight (v15): the same split as
+                        // `speakers.list`, in every place a person appears, so
+                        // a client can render a voice it has never queried.
+                        "colour": summary.as_ref().and_then(|s| s.colour.clone()),
+                        "icon": summary.as_ref().and_then(|s| s.icon.clone()),
                     }));
                 }
             }
@@ -2185,6 +2332,8 @@ impl Service {
                 "you": Some(speaker.id) == you,
                 "name": speaker.name(),
                 "auto": speaker.auto_label,
+                "colour": speaker.colour,
+                "icon": speaker.icon,
                 "languages": speaker.languages,
                 "first_seen": iso8601(speaker.created_at),
             },
@@ -2212,6 +2361,10 @@ impl Service {
                     "speaker_id": e.speaker_id,
                     "name": e.named_at.map(|_| e.display_name.clone()),
                     "auto": e.auto_label,
+                    // The highlight (v15): co-presence is a list of names, and
+                    // a name is where a highlight is read.
+                    "colour": e.colour,
+                    "icon": e.icon,
                     "threads": e.threads,
                     // Seconds, as the brief's shape asks; `speech_ms` is the
                     // same number a client can render without arithmetic.
@@ -2297,6 +2450,9 @@ impl Service {
                 "speaker_id": p,
                 "name": summary.as_ref().and_then(|s| s.name()),
                 "auto": summary.as_ref().map(|s| s.auto_label.clone()),
+                // The highlight (v15), like everywhere else a person appears.
+                "colour": summary.as_ref().and_then(|s| s.colour.clone()),
+                "icon": summary.as_ref().and_then(|s| s.icon.clone()),
             }));
         }
         drop(store);
@@ -2337,7 +2493,12 @@ impl Service {
         let limit = req
             .usize_or("limit", crate::worlds::WORLDS_LIMIT)?
             .clamp(1, 500);
-        let rows = crate::worlds::list(&self.store(), limit).map_err(Error::from)?;
+        let store = self.store();
+        let rows = crate::worlds::list(&store, limit).map_err(Error::from)?;
+        // Every highlighted voice in one query, not one per name: a busy world
+        // lists a dozen people and this page draws several worlds at once.
+        let styles = store.speaker_styles().map_err(Error::from)?;
+        drop(store);
         Ok(json!({
             "total": rows.len(),
             "worlds": rows
@@ -2350,7 +2511,18 @@ impl Service {
                     "last_ns": w.last_ns.to_string(),
                     "people": w.people
                         .iter()
-                        .map(|(id, label)| json!({"speaker_id": id, "label": label}))
+                        .map(|(id, label)| {
+                            let (colour, icon) = style_of(&styles, *id);
+                            json!({
+                                "speaker_id": id,
+                                "label": label,
+                                // The highlight (v15): this list is how "who is
+                                // in this world" is read, and it is a list of
+                                // names like every other.
+                                "colour": colour,
+                                "icon": icon,
+                            })
+                        })
                         .collect::<Vec<_>>(),
                     // Tier 2 output, so absent on a machine that has never run
                     // enrichment — which is most of them, and is not an error.
@@ -2461,9 +2633,14 @@ pub fn commitment_json(c: &crate::store::CommitmentRow) -> Value {
             "thread": c.thread_id,
             // `name` is null until somebody names the voice; `auto` is always
             // there. The same split as every other place a person appears.
-            "who": {"speaker_id": c.who_speaker_id, "name": c.who_name, "auto": c.who_auto},
+            // `colour`/`icon` ride along on both sides (v15), for the same
+            // reason the name/auto split does: a client renders a commitment
+            // without having queried either voice.
+            "who": {"speaker_id": c.who_speaker_id, "name": c.who_name, "auto": c.who_auto,
+                    "colour": c.who_colour, "icon": c.who_icon},
             "to": c.to_speaker_id.map(|_| json!({
                 "speaker_id": c.to_speaker_id, "name": c.to_name, "auto": c.to_auto,
+                "colour": c.to_colour, "icon": c.to_icon,
             })),
             "what": c.what,
             // The line the claim is about, so a person can disagree with it
@@ -5696,6 +5873,348 @@ mod tests {
         );
     }
 
+    // ---- 0.11.9 (schema 15): highlighted people --------------------------
+
+    /// Set both halves, and check the highlight arrives everywhere a name does.
+    /// Shaped after `a_voices_languages_are_set_listed_and_broadcast`, because
+    /// this is the same kind of setting: a per-voice fact a client folds into a
+    /// row it already holds, announced on `relabel` with the name riding along.
+    #[test]
+    fn a_voices_highlight_is_set_listed_and_broadcast() {
+        let r = rig("highlight");
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"speakers.name","params":{{"id":{spk},"name":"Kira"}}}}"#
+            ),
+        )
+        .unwrap();
+        let _ = events(&r);
+
+        // Nobody is highlighted until somebody picks them out.
+        let listed = call(&r, r#"{"id":2,"method":"speakers.list"}"#).unwrap();
+        assert_eq!(listed["speakers"][0]["colour"], Value::Null);
+        assert_eq!(listed["speakers"][0]["icon"], Value::Null);
+
+        let out = call(
+            &r,
+            &format!(
+                r#"{{"id":3,"method":"speakers.set","params":{{"id":{spk},"colour":"violet","icon":"🌙"}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(out["id"], json!(spk));
+        assert_eq!(out["colour"], json!("violet"));
+        assert_eq!(out["icon"], json!("🌙"));
+
+        let listed = call(&r, r#"{"id":4,"method":"speakers.list"}"#).unwrap();
+        assert_eq!(listed["speakers"][0]["colour"], json!("violet"));
+        assert_eq!(listed["speakers"][0]["icon"], json!("🌙"));
+
+        // The person page carries it on the speaker block, so a client that
+        // opened straight onto a profile does not have to fetch the whole list
+        // to know what colour to draw the header in.
+        let person = call(
+            &r,
+            &format!(r#"{{"id":5,"method":"person.get","params":{{"id":{spk}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(person["speaker"]["colour"], json!("violet"));
+        assert_eq!(person["speaker"]["icon"], json!("🌙"));
+
+        // Broadcast — with the name intact, for the reason
+        // `speakers.set_languages` carries it: a client folding the event into
+        // its speaker row must not be made to choose between applying the
+        // highlight and keeping the name.
+        let relabel = events(&r)
+            .into_iter()
+            .find(|e| e["ev"] == "relabel")
+            .expect("a highlight is broadcast like any other relabel");
+        assert_eq!(relabel["data"]["speaker"], json!(spk));
+        assert_eq!(relabel["data"]["name"], json!("Kira"));
+        assert_eq!(relabel["data"]["colour"], json!("violet"));
+        assert_eq!(relabel["data"]["icon"], json!("🌙"));
+        assert_eq!(relabel["seq"], out["seq"]);
+    }
+
+    /// The subtle half of the contract, and the one a client will get wrong if
+    /// it is not written down: **an absent key leaves that half alone, an
+    /// explicit `null` clears it.** Collapsing the two would make it impossible
+    /// to change a colour without restating the emoji — a picker with two
+    /// independent controls would have to send both every time, and the one
+    /// that was not touched would race the one that was.
+    #[test]
+    fn an_omitted_half_is_left_alone_and_an_explicit_null_clears_it() {
+        let r = rig("highlight-omit");
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        let set = |params: String| -> Value {
+            call(
+                &r,
+                &format!(r#"{{"id":1,"method":"speakers.set","params":{params}}}"#),
+            )
+            .unwrap()
+        };
+
+        let out = set(format!(r#"{{"id":{spk},"colour":"teal","icon":"✨"}}"#));
+        assert_eq!(out["colour"], json!("teal"));
+
+        // Saying nothing about the colour says nothing about the colour.
+        let out = set(format!(r#"{{"id":{spk},"icon":"🚀"}}"#));
+        assert_eq!(
+            out["colour"],
+            json!("teal"),
+            "an omitted key changes nothing"
+        );
+        assert_eq!(out["icon"], json!("🚀"));
+
+        // …and the mirror: only the colour named, the emoji untouched.
+        let out = set(format!(r#"{{"id":{spk},"colour":"amber"}}"#));
+        assert_eq!(out["colour"], json!("amber"));
+        assert_eq!(out["icon"], json!("🚀"));
+
+        // An explicit null clears exactly the half it names.
+        let out = set(format!(r#"{{"id":{spk},"colour":null}}"#));
+        assert_eq!(out["colour"], Value::Null);
+        assert_eq!(out["icon"], json!("🚀"), "the emoji was not mentioned");
+
+        let out = set(format!(r#"{{"id":{spk},"icon":null}}"#));
+        assert_eq!(out["colour"], Value::Null);
+        assert_eq!(out["icon"], Value::Null);
+
+        // The store agrees, which is the point: this is a persisted fact and
+        // not a shape the reply invented.
+        assert_eq!(
+            r.service.store().speaker_style(spk).unwrap(),
+            Some((None, None))
+        );
+    }
+
+    /// An emptied field in a picker means "no emoji". Making somebody press a
+    /// separate clear button to say the thing they just said is a worse
+    /// control, so a blank icon clears — and it clears to NULL, so there is one
+    /// representation of "no icon" and every reader can test it with `IS NULL`.
+    #[test]
+    fn an_emptied_icon_clears_rather_than_storing_an_empty_string() {
+        let r = rig("highlight-blank");
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        call(
+            &r,
+            &format!(r#"{{"id":1,"method":"speakers.set","params":{{"id":{spk},"icon":"🌙"}}}}"#),
+        )
+        .unwrap();
+        for blank in ["\"\"", "\"   \""] {
+            let out = call(
+                &r,
+                &format!(
+                    r#"{{"id":2,"method":"speakers.set","params":{{"id":{spk},"icon":{blank}}}}}"#
+                ),
+            )
+            .unwrap();
+            assert_eq!(out["icon"], Value::Null, "{blank}");
+        }
+        // NULL, not "": an empty string would be a second spelling of "no
+        // icon" that every reader would then have to know about.
+        assert_eq!(
+            r.service.store().speaker_style(spk).unwrap(),
+            Some((None, None)),
+            "no empty string got as far as the database"
+        );
+    }
+
+    /// Every way a highlight can be wrong, refused at the door.
+    ///
+    /// A hex is refused because the daemon does not know which ground anybody
+    /// is reading on and so cannot warn that `#111111` is invisible on the dark
+    /// one; the validation instead makes that unrepresentable (`crate::palette`).
+    #[test]
+    fn a_highlight_that_would_not_render_is_refused_rather_than_stored() {
+        let r = rig("highlight-refuse");
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        let err = |params: String| -> Error {
+            call(
+                &r,
+                &format!(r#"{{"id":1,"method":"speakers.set","params":{params}}}"#),
+            )
+            .unwrap_err()
+        };
+
+        // Not a palette token — including the shape somebody would reach for.
+        let e = err(format!(r##"{{"id":{spk},"colour":"#7700ff"}}"##));
+        assert_eq!(e.code, "params");
+        assert!(
+            e.msg.contains("violet"),
+            "the refusal lists the box: {}",
+            e.msg
+        );
+        assert_eq!(
+            err(format!(r#"{{"id":{spk},"colour":"Violet"}}"#)).code,
+            "params"
+        );
+        assert_eq!(err(format!(r#"{{"id":{spk},"colour":5}}"#)).code, "params");
+
+        // Three glyphs is a word, not a mark.
+        assert_eq!(
+            err(format!(r#"{{"id":{spk},"icon":"🌙✨⭐"}}"#)).code,
+            "params"
+        );
+        // Two glyphs with a space between them is two things.
+        assert_eq!(
+            err(format!(r#"{{"id":{spk},"icon":"🌙 ✨"}}"#)).code,
+            "params"
+        );
+
+        // Neither key is not "clear both": it is a client that forgot to say
+        // what it wanted, and guessing would be the destructive guess.
+        assert_eq!(err(format!(r#"{{"id":{spk}}}"#)).code, "params");
+
+        // Nothing above wrote anything.
+        assert_eq!(
+            r.service.store().speaker_style(spk).unwrap(),
+            Some((None, None))
+        );
+
+        // A voice that does not exist, and a voice that is a tombstone. The
+        // second is the sharp one: `speaker_style` READS through the tombstone
+        // while `set_speaker_style` WRITES the row it is handed, so allowing it
+        // would report success, change nothing anybody can see, and log the
+        // canonical voice's colour as the prior state.
+        assert_eq!(
+            err(r#"{"id":4242,"colour":"violet"}"#.to_owned()).code,
+            "not_found"
+        );
+        let survivor = r.service.store().mint_speaker(0).unwrap();
+        call(
+            &r,
+            &format!(
+                r#"{{"id":2,"method":"speakers.merge","params":{{"from":{spk},"into":{survivor}}}}}"#
+            ),
+        )
+        .unwrap();
+        let e = err(format!(r#"{{"id":{spk},"colour":"violet"}}"#));
+        assert_eq!(e.code, "conflict");
+        assert!(e.msg.contains(&survivor.to_string()), "{}", e.msg);
+    }
+
+    /// The highlight rides on the segment row, so a transcript line and a
+    /// search hit both know what colour to draw the name in without a second
+    /// query — exactly as `speaker_name` already does.
+    #[test]
+    fn a_segment_carries_the_speakers_highlight_on_every_read_path() {
+        let r = rig("highlight-segment");
+        let (_, seg) = a_segment(&r, "die Shader sind fertig");
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        r.service
+            .store()
+            .set_segment_speaker(seg, Some(spk), Some(0.9))
+            .unwrap();
+
+        // Before: present and null, never absent. A client spells the field
+        // unconditionally, the way it does for `name`.
+        let row = &call(&r, r#"{"id":1,"method":"transcript"}"#).unwrap()["segments"][0];
+        assert_eq!(row["speaker_colour"], Value::Null);
+        assert_eq!(row["speaker_icon"], Value::Null);
+
+        call(
+            &r,
+            &format!(
+                r#"{{"id":2,"method":"speakers.set","params":{{"id":{spk},"colour":"cyan","icon":"🌙"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let row = &call(&r, r#"{"id":3,"method":"transcript"}"#).unwrap()["segments"][0];
+        assert_eq!(row["id"], json!(seg));
+        assert_eq!(row["speaker_colour"], json!("cyan"));
+        assert_eq!(row["speaker_icon"], json!("🌙"));
+
+        let hit =
+            &call(&r, r#"{"id":4,"method":"search","params":{"q":"Shader"}}"#).unwrap()["hits"][0];
+        assert_eq!(hit["id"], json!(seg));
+        assert_eq!(hit["speaker_colour"], json!("cyan"));
+        assert_eq!(hit["speaker_icon"], json!("🌙"));
+    }
+
+    /// Served rather than assumed: a daemon that grows an eleventh colour must
+    /// not need a matching client release before anybody can pick it, and a
+    /// client drawing swatches from a copy it invented would be a second
+    /// definition of the brand colour.
+    #[test]
+    fn the_palette_is_served_so_a_client_need_not_invent_one() {
+        let r = rig("palette");
+        let out = call(&r, r#"{"id":1,"method":"speakers.palette"}"#).unwrap();
+        let rows = out["palette"].as_array().expect("an array of entries");
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows[0]["token"], json!("violet"));
+        assert_eq!(rows[0]["hex"], json!("#7700ff"), "the suite's own colour");
+        assert_eq!(rows[0]["hue"], json!(268));
+        for row in rows {
+            assert!(row["token"].as_str().is_some_and(|t| !t.is_empty()));
+            assert!(row["hue"].as_u64().is_some_and(|h| h < 360));
+            // A swatch needs the colour as a *thing*, not as this row's
+            // rendering of it.
+            assert!(row["hex"].as_str().is_some_and(|h| h.len() == 7), "{row}");
+        }
+        // …and every token the palette serves is one `speakers.set` accepts.
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        for row in rows {
+            let token = row["token"].as_str().unwrap();
+            let out = call(
+                &r,
+                &format!(
+                    r#"{{"id":2,"method":"speakers.set","params":{{"id":{spk},"colour":"{token}"}}}}"#
+                ),
+            )
+            .unwrap();
+            assert_eq!(out["colour"], json!(token));
+        }
+    }
+
+    /// The rest of the payload did not move. Two new keys, both null, and
+    /// nothing renamed or reordered — this is the assertion that catches an
+    /// "append, do not insert" mistake in a positional SQL projection, which is
+    /// exactly how `speakers.list`'s `ORDER BY 7` could have gone wrong.
+    #[test]
+    fn an_unhighlighted_voice_gains_two_nulls_and_nothing_else() {
+        let r = rig("highlight-absent");
+        let spk = r.service.store().mint_speaker(0).unwrap();
+        call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"speakers.name","params":{{"id":{spk},"name":"Wren"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let row = call(&r, r#"{"id":2,"method":"speakers.list"}"#).unwrap()["speakers"][0].clone();
+        assert_eq!(row["colour"], Value::Null);
+        assert_eq!(row["icon"], Value::Null);
+        // Present, not absent: null is the ordinary value here, the way it is
+        // for `name`, so a client can spell the field unconditionally.
+        assert!(row.get("colour").is_some() && row.get("icon").is_some());
+        // Everything the list said before v15 it still says, unshifted.
+        assert_eq!(row["id"], json!(spk));
+        assert_eq!(row["name"], json!("Wren"));
+        assert_eq!(row["auto"], json!("Speaker_01"));
+        assert_eq!(row["you"], json!(false));
+        assert_eq!(row["languages"], Value::Null);
+        assert_eq!(row["segments"], json!(0));
+        assert_eq!(row["total_ms"], json!(0));
+        assert_eq!(row["speech_ns"], json!("0"));
+        assert!(row["first_seen"].as_str().unwrap().ends_with('Z'));
+
+        let person = call(
+            &r,
+            &format!(r#"{{"id":3,"method":"person.get","params":{{"id":{spk}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(person["speaker"]["colour"], Value::Null);
+        assert_eq!(person["speaker"]["icon"], Value::Null);
+        assert_eq!(person["speaker"]["name"], json!("Wren"));
+        assert_eq!(person["speaker"]["auto"], json!("Speaker_01"));
+        assert_eq!(person["totals"]["segments"], json!(0));
+    }
+
     // ---- 0.6.1: sweeping one-off voices ----------------------------------
 
     #[test]
@@ -7813,7 +8332,7 @@ mod tests {
         let _live = crate::translate::test_guard();
         let r = rig("assist-status");
         let s = call(&r, r#"{"id":1,"method":"status"}"#).unwrap();
-        assert_eq!(s["schema"], json!(13));
+        assert_eq!(s["schema"], json!(15));
         // Shipped defaults: reminders and digests on (both need something else
         // before they do anything), translation off with no guess at a target.
         assert_eq!(s["assist"]["reminders"], json!(true));

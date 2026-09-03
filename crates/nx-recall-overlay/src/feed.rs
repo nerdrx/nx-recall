@@ -58,6 +58,13 @@ pub struct Turn {
     /// no socket, and a "You" row that stops being dimmer because two facts
     /// arrived out of order is a flicker nobody can explain.
     pub mine: bool,
+    /// The palette token a person pinned to this voice, or none. Stamped here
+    /// for the same reason `mine` is: `raster` has no socket and no roster, and
+    /// resolving a highlight at draw time would mean the bar knowing about
+    /// `speakers.list`.
+    pub colour: Option<String>,
+    /// The emoji that goes before the name, or none.
+    pub icon: Option<String>,
 }
 
 /// `[assist] translation_display` — which of a translated row's two lines
@@ -113,6 +120,40 @@ impl TranslationDisplay {
     }
 }
 
+/// One voice's highlight. Both halves are independent: a person may pin a
+/// colour with no emoji, an emoji with no colour, or both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Style {
+    pub colour: Option<String>,
+    pub icon: Option<String>,
+}
+
+impl Style {
+    /// Read one off a wire object carrying `colour` and `icon` — a
+    /// `speakers.list` row or a `relabel` event, which have the same two keys
+    /// for the same reason every other speaker fact does.
+    ///
+    /// An absent key and a null one both read as "no highlight" HERE, because
+    /// this is only ever used where the whole style is being (re)stated. The
+    /// omit-versus-null distinction that `speakers.set` draws is the daemon's
+    /// business, and by the time it reaches an event it has already been
+    /// resolved into a value.
+    fn from_wire(v: &Value) -> Self {
+        Self {
+            colour: v["colour"].as_str().map(str::to_owned),
+            icon: v["icon"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.colour.is_none() && self.icon.is_none()
+    }
+}
+
 /// The last N turns, and the rule that keeps history out of them.
 pub struct Captions {
     turns: VecDeque<Turn>,
@@ -121,6 +162,12 @@ pub struct Captions {
     /// already hold is the archive being re-published, not somebody talking.
     newest_ms: i64,
     names: std::collections::HashMap<i64, String>,
+    /// The highlight a person pinned to a voice: a palette token and an emoji,
+    /// either of which may be absent. Learned from `speakers.list` and kept
+    /// current by `relabel`, exactly like `names` — a highlight is a property
+    /// of the VOICE, and re-asking for it per caption would be a socket
+    /// round-trip inside a draw.
+    styles: std::collections::HashMap<i64, Style>,
     /// Which voice is the person wearing the microphone, if the daemon has said.
     /// `isYou` in gui/src/renderer/lib/store.js: `mic.get`'s `you_speaker`
     /// first, and `speakers.list`'s own `you` flag as the answer that survives a
@@ -135,6 +182,7 @@ impl Captions {
             keep: keep.max(1),
             newest_ms: 0,
             names: std::collections::HashMap::new(),
+            styles: std::collections::HashMap::new(),
             you: None,
         }
     }
@@ -170,6 +218,15 @@ impl Captions {
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Speaker_{id:02}"));
             self.names.insert(id, name);
+            // Absent leaves nothing behind rather than storing an empty style:
+            // the map's job is "who is highlighted", and a row per voice that
+            // is not would make every lookup answer yes.
+            let style = Style::from_wire(sp);
+            if style.is_empty() {
+                self.styles.remove(&id);
+            } else {
+                self.styles.insert(id, style);
+            }
         }
     }
 
@@ -233,6 +290,43 @@ impl Captions {
         let Some(id) = data["speaker"].as_i64() else {
             return;
         };
+
+        // The highlight, if this event says anything about one. Each half is
+        // read independently and only when its KEY IS PRESENT, which is the
+        // same omit-versus-null rule `speakers.set` obeys: `speakers.name`
+        // broadcasts `{speaker, name}` and must not be read as "and clear their
+        // colour". `get` returns `Some(Null)` for an explicit null, so a
+        // deliberate clear still lands.
+        if data.get("colour").is_some() || data.get("icon").is_some() {
+            let style = self.styles.entry(id).or_default();
+            if let Some(c) = data.get("colour") {
+                style.colour = c.as_str().map(str::to_owned);
+            }
+            if let Some(i) = data.get("icon") {
+                style.icon = i
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+            }
+            let style = style.clone();
+            if style.is_empty() {
+                self.styles.remove(&id);
+            }
+            // Retroactive, exactly as a rename is: every caption already on the
+            // bar showing that voice changes in place, and nothing is
+            // re-queried.
+            for t in self.turns.iter_mut() {
+                if t.speaker == Some(id) {
+                    t.colour = style.colour.clone();
+                    t.icon = style.icon.clone();
+                }
+            }
+        }
+
+        // The name half, unchanged: a relabel that carries no name (a prune, a
+        // delete, or a style-only change on an unnamed voice) is not an
+        // instruction to forget the one the voice is wearing.
         let Some(name) = data["name"].as_str() else {
             return;
         };
@@ -266,7 +360,23 @@ impl Captions {
     }
 
     fn to_turn_with(&self, seg: &Value, who: &str) -> Turn {
+        // The roster's answer first, because it is the one a `relabel` keeps
+        // current; the segment's own `speaker_colour`/`speaker_icon` are the
+        // fallback for a voice this process has not learned yet (a caption can
+        // arrive before `speakers.list` comes back on a reconnect).
+        let style = seg["speaker"]
+            .as_i64()
+            .and_then(|id| self.styles.get(&id))
+            .cloned()
+            .unwrap_or_else(|| {
+                Style::from_wire(&json!({
+                    "colour": seg["speaker_colour"].clone(),
+                    "icon": seg["speaker_icon"].clone(),
+                }))
+            });
         Turn {
+            colour: style.colour,
+            icon: style.icon,
             id: seg["id"].as_i64().unwrap_or(0),
             t_ms: seg["t_ms"].as_i64().unwrap_or(0),
             speaker: seg["speaker"].as_i64(),
@@ -517,6 +627,100 @@ mod tests {
         let t = caps.turns().next().unwrap();
         assert_eq!(t.text, "line 7, corrected");
         assert_eq!(t.who, "Kira B");
+    }
+
+    /// A highlight is seeded from the roster and worn by every caption of that
+    /// voice, exactly as the name is.
+    #[test]
+    fn a_highlighted_voice_wears_its_colour_and_icon_on_every_caption() {
+        let mut caps = Captions::new(5);
+        caps.learn_speakers(&json!({"speakers": [
+            {"id": 1, "name": "Kira", "colour": "violet", "icon": "\u{1f319}"},
+            {"id": 2, "name": "Ash"},
+        ]}));
+        caps.apply(&seg(1, 1000));
+        let t = caps.turns().next().unwrap();
+        assert_eq!(t.who, "Kira");
+        assert_eq!(t.colour.as_deref(), Some("violet"));
+        assert_eq!(t.icon.as_deref(), Some("\u{1f319}"));
+
+        // The voice nobody highlighted carries nothing, and must look exactly
+        // as it did before this feature existed.
+        let mut other = seg(2, 2000);
+        other["speaker"] = json!(2);
+        caps.apply(&other);
+        let t = caps.turns().last().unwrap();
+        assert_eq!(t.colour, None);
+        assert_eq!(t.icon, None);
+    }
+
+    /// Retroactive, like a rename: captions already on the bar change in place.
+    /// And the two facts do not clobber each other — `speakers.name` says
+    /// nothing about a colour, so it must not clear one.
+    #[test]
+    fn a_highlight_change_is_retroactive_and_a_rename_does_not_clear_it() {
+        let mut caps = Captions::new(5);
+        caps.learn_speakers(&json!({"speakers": [{"id": 1, "name": "Kira"}]}));
+        caps.apply(&seg(7, 9000));
+        assert_eq!(caps.turns().next().unwrap().colour, None);
+
+        caps.apply_relabel(&json!({
+            "speaker": 1, "name": "Kira", "colour": "rose", "icon": "\u{2728}"
+        }));
+        let t = caps.turns().next().unwrap();
+        assert_eq!(t.colour.as_deref(), Some("rose"));
+        assert_eq!(t.icon.as_deref(), Some("\u{2728}"));
+
+        // A plain rename mentions neither key. The highlight survives it.
+        caps.apply_relabel(&json!({"speaker": 1, "name": "Kira B"}));
+        let t = caps.turns().next().unwrap();
+        assert_eq!(t.who, "Kira B");
+        assert_eq!(t.colour.as_deref(), Some("rose"));
+        assert_eq!(t.icon.as_deref(), Some("\u{2728}"));
+
+        // An explicit null is a deliberate clear, and it lands.
+        caps.apply_relabel(&json!({"speaker": 1, "colour": null, "icon": null}));
+        let t = caps.turns().next().unwrap();
+        assert_eq!(t.who, "Kira B", "clearing a colour is not a rename");
+        assert_eq!(t.colour, None);
+        assert_eq!(t.icon, None);
+    }
+
+    /// One half at a time: clearing the emoji is not clearing the colour.
+    #[test]
+    fn the_two_halves_of_a_highlight_are_independent() {
+        let mut caps = Captions::new(5);
+        caps.learn_speakers(&json!({"speakers": [
+            {"id": 1, "name": "Kira", "colour": "teal", "icon": "\u{2728}"}
+        ]}));
+        caps.apply(&seg(1, 1000));
+        caps.apply_relabel(&json!({"speaker": 1, "icon": null}));
+        let t = caps.turns().next().unwrap();
+        assert_eq!(t.colour.as_deref(), Some("teal"));
+        assert_eq!(t.icon, None);
+    }
+
+    /// A caption can arrive before `speakers.list` comes back — on a
+    /// reconnect, the socket is subscribed before the roster is re-read. The
+    /// segment's own copy of the style is what covers that window.
+    #[test]
+    fn a_segment_carries_the_highlight_for_a_voice_not_yet_learned() {
+        let mut caps = Captions::new(5);
+        let mut s = seg(1, 1000);
+        s["speaker_colour"] = json!("indigo");
+        s["speaker_icon"] = json!("\u{2b50}");
+        caps.apply(&s);
+        let t = caps.turns().next().unwrap();
+        assert_eq!(t.colour.as_deref(), Some("indigo"));
+        assert_eq!(t.icon.as_deref(), Some("\u{2b50}"));
+
+        // Once the roster arrives it is the authority: it is the thing a
+        // `relabel` keeps current, and the segment is a snapshot.
+        caps.learn_speakers(&json!({"speakers": [{"id": 1, "name": "Kira", "colour": "lime"}]}));
+        let mut next = seg(2, 2000);
+        next["speaker_colour"] = json!("indigo");
+        caps.apply(&next);
+        assert_eq!(caps.turns().last().unwrap().colour.as_deref(), Some("lime"));
     }
 
     #[test]

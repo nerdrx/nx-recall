@@ -304,7 +304,13 @@ select.input option, select.input optgroup {
 .seg .t { font: 400 11px/1.6 var(--mono); color: var(--clear-muted); }
 .seg .who { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .seg .who .dot { width: 8px; height: 8px; }
-.seg .who .nm { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* `min-width: 0` is what actually buys the ellipsis. A flex item's floor is
+   `auto` — its longest unbreakable run — so before 0.11.9 the name column got
+   away with it only because the dot is 8px and there was nothing else in the
+   row to compete. An emoji in front of the name (`.sp-icon`) is a second
+   `flex: none` item eating that 148px, and without this the name would push
+   past the column instead of ellipsising inside it. */
+.seg .who .nm { font-size: 13px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .seg .txt { font-size: 13.5px; line-height: 1.55; color: var(--clear-ink); }
 .seg .meta { display: flex; align-items: center; gap: 6px; }
 
@@ -331,11 +337,23 @@ select.input option, select.input optgroup {
 /* Segments the pipeline itself does not trust: overlapped speech (the identity
    was refused) or a weak match score. They stay readable — the words are still
    the point — but they must never look as settled as a confident line, so the
-   text drops to muted and carries a "?" affordance. */
+   text drops to muted and carries a "?" affordance.
+
+   THE NEXT TWO RULES DELIBERATELY OVERRIDE THE INLINE SPEAKER COLOUR, and that
+   is load-bearing rather than incidental. `segRow` writes `color:` straight
+   onto `.nm`; these win because they are more specific, and they have to: a row
+   whose speaker is a GUESS must not be painted as a confident identity. 0.11.9
+   made that matter twice over — a person's chosen highlight is the most
+   confident-looking thing this app can put on a name, and pinning one to a
+   voice must never make a doubted row look certain. That is also why
+   views/highlight.js `markRow` refuses the row accent on `.uncertain` at all,
+   rather than relying on a rule here to undo it. Do not "tidy" these into the
+   inline style. */
 .seg.uncertain .txt { color: var(--clear-muted); font-style: italic; }
 .seg.uncertain .who .nm { color: var(--clear-muted); font-weight: 500; }
 /* "several voices" / "unknown voice" are descriptions, not names — the italic
-   is what keeps them from being read as somebody called that. */
+   is what keeps them from being read as somebody called that. Same override,
+   same reason: nothing nameless wears a person's colour. */
 .seg .who .nm.reasoned { font-style: italic; font-weight: 500; color: var(--clear-muted); }
 /* A name in a transcript row is a filter: say so on hover, quietly. */
 .seg .who .nm:not(.reasoned) { cursor: pointer; border-bottom: 1px solid transparent; }
@@ -348,6 +366,117 @@ select.input option, select.input optgroup {
 .seg.you .who .dot { box-shadow: 0 0 0 2px var(--clear-surface), 0 0 0 3px var(--violet); }
 .seg.you .who .nm:not(.reasoned) { border-bottom-color: var(--violet); }
 .seg.you .who .nm:not(.reasoned):hover { border-bottom-color: currentColor; }
+
+/* ------------------------------------------------- per-person highlights -- */
+/* 0.11.9. A person pins a palette token and an emoji to a voice and both then
+   follow it everywhere a name is drawn. Two rules do the whole visual job; the
+   arithmetic is in lib/palette.js and the decision of WHICH rows wear it is in
+   views/highlight.js (`markRow`).
+ *
+ * NOT to be confused with `.seg .txt .hl` further down this file (the search
+ * section): that `.hl` is the SEARCH-TERM mark inside a hit's words, a
+ * violet wash on a few characters, and it has nothing to do with a person.
+ * Two unrelated meanings of "hl" one element apart is exactly why the row
+ * class here is `person-hl` and not `hl` — do not merge the two rules. */
+
+/* The emoji in front of a name. `flex: none` because the transcript's name
+   column is a fixed 148px (`.seg` above) and `.nm` earns its ellipsis by being
+   the only thing allowed to shrink in there — an icon that flexed would eat
+   the name instead of the name eating the overflow. It is only ever rendered
+   when there IS one (views/highlight.js `iconSpan` returns null otherwise), so
+   an unhighlighted voice pays neither the element nor the gap. */
+.sp-icon {
+  flex: none;
+  font-size: 0.95em;
+  line-height: 1;
+  /* Emoji fonts sit high on the em box; the nudge puts it on the name's
+     optical centre rather than on its baseline. */
+  position: relative; top: 0.5px;
+  font-style: normal; font-weight: 400;
+}
+
+/* The row accent, on a transcript row and on a search hit alike — both are
+   `.seg`. An inset shadow rather than a border: `.seg` already spends its
+   1px border on hover and `.seg.hit`, and a real border would move every
+   unhighlighted row by 2px the moment one row gained a colour. `--person-hl`
+   is set inline per row (views/highlight.js) so a theme flip repaints it
+   without re-rendering a single row.
+   Quiet on purpose: a 2px rule at the start of the line, no fill, no glass —
+   DESIGN §14 keeps glass on chrome and off content. */
+.seg.person-hl { box-shadow: inset 2px 0 0 var(--person-hl); }
+/* An emoji cannot be muted the way a name can, so on a doubted row it is dimmed
+   instead — same argument as `.seg.uncertain .who .nm` above: a guess must not
+   wear somebody's mark at full strength. It is not removed, because a row that
+   dropped an element depending on a match score would change height. */
+.seg.uncertain .who .sp-icon { opacity: 0.5; }
+/* The focus ring is the more urgent message and `.seg:focus-visible` above has
+   the same specificity as the rule beside it, so the two are spelled out
+   together rather than letting source order decide. */
+.seg.person-hl:focus-visible { box-shadow: var(--clear-focus), inset 2px 0 0 var(--person-hl); }
+
+/* The picker (views/highlight.js `highlightPicker`), mounted in two places: the
+   person page's identity block and the transcript's segment sheet. One row —
+   a label, ten swatches and a "none", then a short emoji field and its clear.
+   It borrows the app's existing control language rather than inventing one:
+   the field is a plain `.input`, the clear is a `.btn.small`, and the swatches
+   are the only new shape here. */
+.hl-picker {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: 8px; margin-top: var(--sp-1);
+}
+.hl-label {
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--clear-muted); flex: none;
+}
+.hl-swatches { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+/* Each swatch carries its own colour as an inline `--person-hl`, and it is the
+   colour the NAME will actually wear on this ground rather than the canonical
+   hex (lib/palette.js `swatchColor`) — a swatch that promised one colour and
+   painted another would be the one thing this control must not do. */
+.hl-sw {
+  width: 18px; height: 18px; flex: none; padding: 0; cursor: pointer;
+  border-radius: 999px;
+  background: var(--person-hl, var(--clear-tile));
+  border: 1px solid var(--clear-line-strong);
+  transition: transform var(--dur-fast) var(--ease-spring), box-shadow var(--dur-fast) var(--ease-soft);
+}
+.hl-sw:hover { transform: scale(1.12); }
+/* The chosen one is ringed rather than enlarged or ticked: a tick would need
+   ink that reads on all ten colours, and there is no such ink on both grounds.
+   The gap between swatch and ring is punched in the page's own surface, so the
+   ring works over a card and over a sheet alike. */
+.hl-sw.on { box-shadow: 0 0 0 2px var(--clear-surface), 0 0 0 3.5px var(--person-hl, var(--clear-faint)); }
+.hl-sw:focus-visible { outline: none; box-shadow: var(--clear-focus); }
+/* "No colour" is not a colour, so it is not a filled circle: it is the same
+   18px target drawn as an empty one with a ✕ in muted ink. */
+.hl-sw.hl-none {
+  display: grid; place-items: center;
+  background: var(--clear-tile); color: var(--clear-muted);
+  font-size: 10px; line-height: 1;
+}
+.hl-sw.hl-none.on { color: var(--clear-ink); box-shadow: 0 0 0 2px var(--clear-surface), 0 0 0 3.5px var(--clear-line-strong); }
+/* The emoji field sets its own 64px width inline (two clusters plus room for a
+   wide flag); everything else it takes from `.input`. Centred because one
+   emoji left-aligned in a 64px box reads as a mistake. */
+.hl-icon { text-align: center; padding-left: 6px; padding-right: 6px; flex: none; }
+.hl-clear { flex: none; }
+/* On the person page the icon leads a heading rather than a 13px row name, so
+   it is sized to that heading and given the gap the `.person-head` flexbox
+   does not (the `<b>` is inline text, not a flex row). */
+.person-icon { margin-right: 6px; }
+
+/* Four surfaces put the icon INSIDE the name element rather than beside it,
+   and so have no flex `gap` to separate the two:
+     `.edge-name`  — `.edge-row` is a five-column grid and a sixth child would
+                     shift every number one column along;
+     `.acc-name`   — the accuracy table's only name column, plain text;
+     `.commit-to`  — the far side of "X → Y", one inline span;
+     `.person-name`— a heading (`.person-icon`, above).
+   An em-relative gap rather than a pixel one, because these four are set at
+   four different sizes. */
+.edge-name .sp-icon,
+.acc-name .sp-icon,
+.commit-to .sp-icon { margin-right: 0.35em; }
 
 .seg.new { animation: seg-in var(--dur) var(--ease-out) both; }
 @keyframes seg-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
@@ -815,6 +944,12 @@ select.input option, select.input optgroup {
 .name-voice-row { display: flex; align-items: center; gap: var(--sp-2); margin: calc(-1 * var(--sp-1)) 0 var(--sp-2); }
 .name-voice-row .sp-hint { flex: 0 0 auto; }
 .name-voice-row .input { flex: 1 1 160px; min-width: 0; }
+/* The highlight row in the segment sheet. It sits under the naming row and,
+   unlike it, is up for ANY picked voice — naming is rare and consequential,
+   marking somebody you already know is neither (views/transcript.js
+   `paintHlRow`). Same rhythm as the row above it so the two read as one
+   block rather than as a control that turned up. */
+.hl-row { margin: calc(-1 * var(--sp-1)) 0 var(--sp-2); }
 .sp-pick button {
   display: inline-flex; align-items: center; gap: 7px;
   padding: 6px 12px; border-radius: var(--clear-r-chip); cursor: pointer; font-size: 12.5px;

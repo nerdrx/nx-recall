@@ -8,6 +8,10 @@
 // it ever makes a sound (DESIGN §3).
 
 import { h, svg, clear, fmtDate, fmtBytes, speakerHue } from '../lib/dom.js';
+// 0.11.9 — per-person highlights. Only `iconOf` is wanted in this view: the one
+// place a speaker is named here is inside a native <option>, which cannot be
+// coloured. See `truthRow`.
+import { iconOf } from '../lib/palette.js';
 import {
   store,
   ask,
@@ -474,9 +478,20 @@ export function mount(root, ctx) {
         onchange: (e) => setTruthLink(u, e.target.value),
       },
       h('option', { value: '', selected: u.speaker == null, text: 'Link…' }),
-      ...named.map((sp) =>
-        h('option', { value: String(sp.id), selected: sp.id === u.speaker, text: sp.name ?? sp.auto })
-      ),
+      // 0.11.9 — the icon, and only the icon. An `<option>` is drawn by the
+      // platform, not by us: Chromium ignores every colour we could put on one
+      // (tokens.css says as much about `color-scheme` and native popups), so a
+      // highlight's colour has nowhere to go here. The emoji renders fine, and
+      // on a long list of named voices it is the fastest way to find the person
+      // you are linking a Discord account to.
+      ...named.map((sp) => {
+        const ic = iconOf(sp);
+        return h('option', {
+          value: String(sp.id),
+          selected: sp.id === u.speaker,
+          text: `${ic ? `${ic} ` : ''}${sp.name ?? sp.auto}`,
+        });
+      }),
       // A voice linked automatically may not be named yet, and the select must
       // still be able to show what it is linked TO.
       ...(u.speaker != null && !named.some((sp) => sp.id === u.speaker)

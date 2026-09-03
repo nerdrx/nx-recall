@@ -617,6 +617,11 @@ pub fn digest_json(store: &Store, row: &DigestRow) -> Value {
         .unwrap_or_default()
         .into_iter()
         .map(|id| {
+            let style = store
+                .speaker_style(id)
+                .ok()
+                .flatten()
+                .unwrap_or((None, None));
             json!({
                 "speaker_id": id,
                 // The name as the voicebank spells it now, so a rename moves
@@ -625,6 +630,13 @@ pub fn digest_json(store: &Store, row: &DigestRow) -> Value {
                 // chips went through, because a chip that says `Speaker_07`
                 // beside a sentence about "Speaker 07" reads as two people.
                 "label": label(store, id),
+                // The highlight (v15). The chips under a digest are the same
+                // people the paragraph names, and a person who is picked out
+                // everywhere else in the app must be picked out here too —
+                // otherwise the highlight is a per-page decoration rather than
+                // a property of the person.
+                "colour": style.0,
+                "icon": style.1,
                 "share": shares.get(&id).map(|s| s.share),
                 "turns": shares.get(&id).map(|s| s.turns),
             })

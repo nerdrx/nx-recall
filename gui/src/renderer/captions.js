@@ -16,6 +16,11 @@
 // no way to scroll into any.
 
 import { h, clear, speakerColor } from './lib/dom.js';
+// 0.11.9 — per-person highlights. This window deliberately does NOT import
+// views/highlight.js: that module owns the picker, which pulls in lib/sheets.js
+// and a sheet root this document does not have. All it needs is the same two
+// answers, and both are plain store selectors.
+import { accentColor, iconOf } from './lib/palette.js';
 import {
   store,
   applyConnState,
@@ -64,7 +69,14 @@ function row({ seg, dim }) {
   const shaky = isShaky(seg);
   const mine = isYou(seg.speaker);
   const uncertain = isUncertain(seg);
-  const color = speakerColor(seg.speaker);
+  // The store first, the row second — the same precedence views/highlight.js
+  // uses, and it matters here because a caption arrives as an event and this
+  // window seeds its speaker list separately. Byte-identical to
+  // `speakerColor(seg.speaker)` for a voice nobody has highlighted.
+  const known = seg.speaker != null && store.speakers.has(seg.speaker);
+  const token = known ? store.speakers.get(seg.speaker)?.colour : seg.speaker_colour;
+  const color = accentColor(token) || speakerColor(seg.speaker);
+  const icon = known ? iconOf(store.speakers.get(seg.speaker)) : iconOf({ icon: seg.speaker_icon });
   const tr = translationOf(seg);
 
   const el = h('div', {
@@ -77,6 +89,10 @@ function row({ seg, dim }) {
       'span',
       { class: 'cap-who', style: seg.speaker == null ? '' : `color:${color}` },
       h('span', { class: 'cap-dot' }),
+      // `.cap-dot` takes its colour from `.cap-who`'s `currentColor`, so the
+      // highlight reaches it for free. The icon is a sibling of the name rather
+      // than part of it, so the always-dark caption CSS can size it on its own.
+      icon ? h('span', { class: 'sp-icon', 'aria-hidden': 'true', text: icon }) : null,
       segmentSpeakerLabel(seg)
     ),
     h(

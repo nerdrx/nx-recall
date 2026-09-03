@@ -22,6 +22,9 @@ import {
   ask,
 } from './lib/store.js';
 import { patchSpeakerLabels } from './lib/labels.js';
+// 0.11.9 — the half of a relabel lib/labels.js does not know about, and the
+// look-up the roster brief needs for the voice that just walked in.
+import { lookOf, iconSpan, paintHighlights } from './views/highlight.js';
 import { toast } from './lib/sheets.js';
 import { stop as stopPreview, playbackState } from './lib/preview.js';
 import * as replay from './lib/replay.js';
@@ -419,8 +422,15 @@ function renderBrief(brief, sp) {
   briefShown = sp?.id ?? null;
   clear(briefBar);
   briefBar.hidden = false;
+  // The bar that says somebody walked in is the one surface where a highlight
+  // earns the most: you are not reading it, you are catching it out of the
+  // corner of an eye mid-game. Only the HIGHLIGHT is spent here, never the
+  // hashed identity hue — this dot has been plain accent ink since 0.8 and
+  // colouring every join would be a redesign rather than this feature.
+  const { hl, icon } = lookOf(sp?.id ?? null);
   briefBar.append(
-    h('span', { class: 'dot' }),
+    h('span', { class: 'dot', ...(hl ? { style: `color:${hl}` } : {}) }),
+    iconSpan(icon),
     h('span', { class: 'update-text', id: 'brief-text', text: briefLine(brief, name), title: briefLine(brief, name) }),
     h('span', { class: 'spacer' }),
     h(
@@ -635,7 +645,15 @@ window.recall.onEvent((evt) => {
   }
   // One path, every view: a rename made here, in the CLI, or in another client
   // all arrive as the same broadcast and repaint the same way.
-  if (change.relabel) patchSpeakerLabels(change.relabel);
+  if (change.relabel) {
+    patchSpeakerLabels(change.relabel);
+    // Straight after, and never before: `patchSpeakerLabels` paints
+    // `speakerColor(id)` — the HASHED hue — onto every dot and name it finds,
+    // so running it second would wash a just-picked highlight back to the
+    // colour the voice had before anybody chose one. This is the other half of
+    // the same repaint; see views/highlight.js `paintHighlights`.
+    paintHighlights(change.relabel);
+  }
   // Somebody walked in. The bar this raises sits above every view rather than
   // inside one, so it belongs to the controller and not to a view.
   if (change.rosterJoin) void onRosterJoin(change.rosterJoin);

@@ -439,8 +439,17 @@ pub fn render_people(store: &Store) -> anyhow::Result<String> {
             Some(&ns) => format!("{} {}", day_name(day_of(ns)), hh_mm(ns)),
             None => "never (every turn deleted)".to_string(),
         };
+        // The emoji half of a highlight, and only that half. Markdown has no
+        // ground and no stylesheet, so a colour token would have to be printed
+        // as the word "amber" — which is a note about this program's UI, not a
+        // fact about the person, and `people.md` is a file about people. An
+        // emoji is the same mark here that it is on every other surface.
+        let icon = match sp.icon.as_deref().map(str::trim).filter(|i| !i.is_empty()) {
+            Some(i) => format!("{i} "),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "- **{}** — {languages} — last heard {heard}\n",
+            "- **{icon}{}** — {languages} — last heard {heard}\n",
             sp.display_name
         ));
     }
@@ -643,6 +652,8 @@ mod tests {
             t_end_ns: t + 2 * S,
             speaker_id: Some(1),
             speaker_name: Some(speaker.into()),
+            speaker_colour: None,
+            speaker_icon: None,
             text: Some(text.into()),
             overlap_frac: None,
             match_score: None,

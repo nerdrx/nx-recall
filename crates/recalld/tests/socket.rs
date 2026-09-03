@@ -445,6 +445,124 @@ fn a_rename_is_broadcast_to_every_connected_client_with_one_seq() {
     assert!(row["auto"].as_str().unwrap().starts_with("Speaker_"));
 }
 
+/// A highlight is set over the socket, broadcast to every client, and worn by
+/// the transcript rows that were already fetched (0.11.9, schema v15).
+///
+/// The same shape as the rename above, because it is the same promise: a
+/// property of a VOICE changes once and every view of that voice changes with
+/// it. What this adds is the omit-versus-null rule, which has no analogue in
+/// `speakers.name` and is the part a client can get wrong — picking a colour
+/// must not silently clear the emoji somebody set a minute earlier.
+#[test]
+fn a_highlight_is_broadcast_and_rides_the_transcript() {
+    let mut d = Daemon::start("highlight");
+    let mut a = d.connect();
+    let mut b = d.connect();
+    a.hello();
+    b.hello();
+    a.subscribe(&["relabel"]);
+    b.subscribe(&["relabel"]);
+
+    let ids = d.ingest("clean_single_0.wav");
+    let speaker = {
+        let store = d.store.lock().unwrap();
+        match store.list_speakers().unwrap().first().map(|s| s.id) {
+            Some(id) => id,
+            None => {
+                let id = store.mint_speaker(0).unwrap();
+                store
+                    .set_segment_speaker(ids[0], Some(id), Some(0.5))
+                    .unwrap();
+                id
+            }
+        }
+    };
+
+    // The palette is served rather than assumed, so a client can draw swatches
+    // for a colour this build knows and an older GUI does not.
+    let palette = a.call("speakers.palette", json!({}));
+    let entries = palette["palette"].as_array().expect("a palette");
+    assert_eq!(entries.len(), 10);
+    assert!(
+        entries.iter().any(|e| e["hex"] == "#7700ff"),
+        "the suite's own colour is not in the palette"
+    );
+
+    let ok = a.call(
+        "speakers.set",
+        json!({"id": speaker, "colour": "violet", "icon": "\u{1f319}"}),
+    );
+    assert_eq!(ok["colour"], "violet");
+    assert_eq!(ok["icon"], "\u{1f319}");
+
+    let ev_a = a.wait_event("relabel");
+    let ev_b = b.wait_event("relabel");
+    assert_eq!(ev_a, ev_b, "both clients see the identical event");
+    assert_eq!(ev_a["seq"], ok["seq"]);
+    assert_eq!(ev_a["data"]["speaker"], speaker);
+    assert_eq!(ev_a["data"]["colour"], "violet");
+    assert_eq!(ev_a["data"]["icon"], "\u{1f319}");
+    // The `name` key is on the event too, for the reason
+    // `speakers.set_languages` puts it there: a client folds ONE shape into its
+    // speaker row, so an event that carried the highlight and dropped the name
+    // would make it choose between applying the new fact and keeping the old
+    // one. It is null here only because nobody has named this voice.
+    assert!(
+        ev_a["data"].get("name").is_some(),
+        "the name rides along on a highlight relabel: {}",
+        ev_a["data"]
+    );
+
+    // Retroactive, exactly as a rename is: the rows carry it without anybody
+    // re-querying the speaker.
+    let t = b.call("transcript", json!({}));
+    assert_eq!(t["segments"][0]["speaker_colour"], "violet");
+    assert_eq!(t["segments"][0]["speaker_icon"], "\u{1f319}");
+
+    let row = |c: &mut Conn| -> Value {
+        c.call("speakers.list", json!({}))["speakers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == speaker)
+            .expect("the highlighted voice is listed")
+            .clone()
+    };
+    let listed = row(&mut a);
+    assert_eq!(listed["colour"], "violet");
+    assert_eq!(listed["icon"], "\u{1f319}");
+
+    // The rule that needs a socket to be convincing: changing ONE half leaves
+    // the other alone. A picker that sent both would pass a unit test and lose
+    // somebody's emoji here.
+    a.call("speakers.set", json!({"id": speaker, "colour": "teal"}));
+    let _ = a.wait_event("relabel");
+    let listed = row(&mut a);
+    assert_eq!(listed["colour"], "teal");
+    assert_eq!(
+        listed["icon"], "\u{1f319}",
+        "the emoji was collateral damage"
+    );
+
+    // And an explicit null is a deliberate clear, of that half only.
+    a.call("speakers.set", json!({"id": speaker, "icon": null}));
+    let _ = a.wait_event("relabel");
+    let listed = row(&mut a);
+    assert_eq!(listed["colour"], "teal");
+    assert_eq!(listed["icon"], Value::Null);
+
+    // A colour no build can paint is refused rather than stored: a highlight
+    // that renders as nothing for ever is worse than no highlight.
+    let bad = a.call_err(
+        "speakers.set",
+        json!({"id": speaker, "colour": "chartreuse"}),
+    );
+    assert_eq!(bad["code"], "params");
+    // A name is not an icon.
+    let bad = a.call_err("speakers.set", json!({"id": speaker, "icon": "Kira"}));
+    assert_eq!(bad["code"], "params");
+}
+
 /// The recovery path for the failure this whole design fears: two people on one
 /// id (DESIGN §8, FINDINGS §5). Merge two different voices on purpose, then
 /// split them and check they land apart again.

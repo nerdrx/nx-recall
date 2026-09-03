@@ -1240,6 +1240,9 @@ fn move_hint() -> Turn {
         lang: None,
         translation: None,
         mine: false,
+        // Nobody said this, so there is nobody to highlight.
+        colour: None,
+        icon: None,
     }
 }
 

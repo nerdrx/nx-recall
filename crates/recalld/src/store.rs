@@ -79,7 +79,16 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // column lives in `crate::truth::migrate_v13`, which also backfills it for
 // verdicts already on disk — but only where the speaking spans survive, since
 // a purged span and a quiet turn would otherwise both read 0.0.
-pub const SCHEMA_VERSION: i64 = 13;
+//
+// ---- 0.11.9 (schema v15): highlighted people ------------------------------
+// v15 adds `speakers.colour` and `speakers.icon`: a palette token and a short
+// emoji a person pins to a voice so it can be picked out of a wall of names.
+// Both nullable, both NULL for every voice that exists today, and NULL is the
+// whole of "not highlighted" — which is why there is no backfill and nothing to
+// undo. `colour` is a token from `crate::palette`, not a hex, so the same
+// highlight is legible on both of NX Clear's grounds and in the headset
+// overlay, which has no CSS to resolve one with. See `apply_v15`.
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -292,6 +301,16 @@ pub struct SegmentAnalysis {
     pub overlap_frac: Option<f32>,
 }
 
+/// Every highlighted voice's `(colour, icon)`, by speaker id (v15).
+///
+/// Named rather than spelled out at each use: the payload builders in
+/// `service.rs`, `brief.rs`, `digest.rs`, `replay.rs` and `truth.rs` all hold
+/// one of these and pass it to `service::style_of`, and five copies of the same
+/// nested `Option` pair is the shape clippy calls a complex type — rightly, in
+/// the sense that "a map of ids to highlights" is what it means and the tuple
+/// is only how it is stored.
+pub type SpeakerStyles = std::collections::HashMap<i64, (Option<String>, Option<String>)>;
+
 #[derive(Debug, Clone)]
 pub struct SpeakerSummary {
     pub id: i64,
@@ -308,6 +327,11 @@ pub struct SpeakerSummary {
     /// Which languages this voice actually speaks (v5). `None` is *any*, the
     /// default: nothing is corrected until somebody says what to expect.
     pub languages: Option<Vec<String>>,
+    /// The palette token this voice is highlighted with (v15), or `None` for
+    /// the overwhelming majority of voices, which nobody has picked out.
+    pub colour: Option<String>,
+    /// The emoji that goes before this voice's name (v15), or `None`.
+    pub icon: Option<String>,
 }
 
 impl SpeakerSummary {
@@ -328,6 +352,13 @@ pub struct SegmentRow {
     pub t_end_ns: i64,
     pub speaker_id: Option<i64>,
     pub speaker_name: Option<String>,
+    /// The palette token this voice is highlighted with, or `None` (v15). On
+    /// the row rather than looked up per render because a caption surface
+    /// resolves a name once and must not need a second query to know what
+    /// colour to draw it in.
+    pub speaker_colour: Option<String>,
+    /// The emoji that goes before this voice's name, or `None` (v15).
+    pub speaker_icon: Option<String>,
     pub text: Option<String>,
     pub overlap_frac: Option<f32>,
     pub match_score: Option<f32>,
@@ -654,6 +685,10 @@ pub struct PersonEdge {
     /// `None` when either voice has no name that matches a roster entry, which
     /// is the common case and is reported rather than guessed at.
     pub roster_ns: Option<i64>,
+    /// The highlight this voice wears (v15), so the "people they talk with"
+    /// list picks the same person out that the transcript does.
+    pub colour: Option<String>,
+    pub icon: Option<String>,
 }
 
 /// One conversation, summarised for a list.
@@ -719,6 +754,11 @@ pub struct CommitmentRow {
     pub to_speaker_id: Option<i64>,
     pub to_name: Option<String>,
     pub to_auto: Option<String>,
+    /// The highlight (v15) on each side of the promise.
+    pub who_colour: Option<String>,
+    pub who_icon: Option<String>,
+    pub to_colour: Option<String>,
+    pub to_icon: Option<String>,
     pub what: String,
     pub due_utc_ns: Option<i64>,
     pub due_raw: Option<String>,
@@ -1000,6 +1040,13 @@ impl Store {
         // `digest::digest_json` renders those the legacy way at read time.
         self.apply_digest_names()?;
         // ---- end 0.11.6 ---------------------------------------------------
+
+        // ---- 0.11.9 (schema v15): highlighted people ----------------------
+        // Two nullable columns on `speakers`. Additive, idempotent, no
+        // backfill: NULL is exactly "this voice is not highlighted", which is
+        // true of every voice that predates the feature.
+        self.apply_v15()?;
+        // ---- end 0.11.9 ---------------------------------------------------
 
         match current {
             None => {
@@ -2929,7 +2976,11 @@ impl Store {
                     s.named_at, s.created_at,
                     COUNT(g.id),
                     COALESCE(SUM(g.t_end_ns - g.t_start_ns), 0),
-                    s.languages
+                    s.languages,
+                    -- Appended, not inserted: the ORDER BY below is POSITIONAL
+                    -- and 7 is the speech total. A column added in the middle
+                    -- would silently re-sort the speakers page.
+                    s.colour, s.icon
              FROM speakers s
              LEFT JOIN segments g
                  ON g.speaker_id = s.id AND g.deleted_at IS NULL
@@ -2950,6 +3001,8 @@ impl Store {
                     languages: crate::lang::parse_languages(
                         r.get::<_, Option<String>>(7)?.as_deref(),
                     ),
+                    colour: r.get(8)?,
+                    icon: r.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3072,13 +3125,13 @@ impl Store {
     /// How many columns [`Self::SEGMENT_COLUMNS`] selects. A query that appends
     /// its own — the search's snippet — indexes from here rather than from a
     /// number somebody has to remember to bump.
-    const SEGMENT_COLUMN_COUNT: usize = 20;
+    const SEGMENT_COLUMN_COUNT: usize = 22;
 
     const SEGMENT_COLUMNS: &'static str =
         "g.id, g.session_id, sc.match_key, g.t_start_ns, g.t_end_ns,
          sp.canonical_id, sp.display_name, g.text, g.overlap_frac, g.match_score, g.audio_path,
          g.lang, g.label_via, g.thread_id, g.lang_via, g.text_via, g.asr_confidence,
-         g.night_text, g.translation, g.translation_via";
+         g.night_text, g.translation, g.translation_via, sp.colour, sp.icon";
 
     fn segment_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentRow> {
         Ok(SegmentRow {
@@ -3103,6 +3156,12 @@ impl Store {
             // 0.9.0 (v11), the assistant.
             translation: r.get(18)?,
             translation_via: r.get(19)?,
+            // 0.11.9 (v15), the highlight. Resolved through the tombstone view
+            // like the name beside it, so a merged-away voice wears the
+            // surviving one's colour rather than the one it had before somebody
+            // decided the two were the same person.
+            speaker_colour: r.get(20)?,
+            speaker_icon: r.get(21)?,
         })
     }
 
@@ -3920,7 +3979,9 @@ impl Store {
                         s.named_at,
                         COUNT(DISTINCT g.thread_id),
                         COALESCE(SUM(g.t_end_ns - g.t_start_ns), 0),
-                        MAX(g.t_end_ns)
+                        MAX(g.t_end_ns),
+                        -- Appended: the ORDER BY below is positional.
+                        s.colour, s.icon
                  FROM segments g
                  JOIN mine ON mine.tid = g.thread_id
                  JOIN speaker_resolved other ON other.id = g.speaker_id
@@ -3938,6 +3999,8 @@ impl Store {
                     threads: r.get(4)?,
                     speech_ns: r.get(5)?,
                     last_ns: r.get(6)?,
+                    colour: r.get(7)?,
+                    icon: r.get(8)?,
                     roster_ns: None,
                 })
             })?
@@ -4183,7 +4246,11 @@ impl Store {
         CASE WHEN tows.named_at IS NULL THEN NULL ELSE tow.display_name END, tows.auto_label,
         c.what, c.due_utc_ns, c.due_raw, c.due_kind,
         c.state, c.source, c.model_id, c.confidence, c.created_at, c.updated_at,
-        g.t_start_ns, g.text";
+        g.t_start_ns, g.text,
+        -- The highlight (v15), through the same tombstone view the names came
+        -- through, so a merged voice's promise wears the surviving voice's
+        -- colour rather than the one it had before the merge.
+        who.colour, who.icon, tow.colour, tow.icon";
 
     /// The joins [`Self::COMMITMENT_COLUMNS`] reads. The segment join is an
     /// INNER one on purpose: it is what makes a soft-deleted line take its
@@ -4219,6 +4286,10 @@ impl Store {
             updated_at: r.get(18)?,
             t_start_ns: r.get(19)?,
             said: r.get(20)?,
+            who_colour: r.get(21)?,
+            who_icon: r.get(22)?,
+            to_colour: r.get(23)?,
+            to_icon: r.get(24)?,
         })
     }
 
@@ -4779,7 +4850,8 @@ impl Store {
                     s.named_at, s.created_at,
                     COUNT(g.id) AS segments,
                     COALESCE(SUM(g.t_end_ns - g.t_start_ns), 0) AS speech,
-                    s.languages
+                    s.languages,
+                    s.colour, s.icon
              FROM speakers s
              LEFT JOIN segments g
                  ON g.speaker_id = s.id AND g.deleted_at IS NULL
@@ -4803,6 +4875,8 @@ impl Store {
                     languages: crate::lang::parse_languages(
                         r.get::<_, Option<String>>(7)?.as_deref(),
                     ),
+                    colour: r.get(8)?,
+                    icon: r.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -5483,7 +5557,11 @@ impl Store {
 
     const DISCORD_USER_COLUMNS: &'static str =
         "d.user_id, d.name, d.speaker_id, d.via, d.linked_at_ns, d.first_seen_ns, d.last_seen_ns,
-         (SELECT s.display_name FROM speakers s WHERE s.id = d.speaker_id)
+         (SELECT s.display_name FROM speakers s WHERE s.id = d.speaker_id),
+         -- The highlight (v15), so the truth-link list picks a person out the
+         -- same way every other list of names does.
+         (SELECT s.colour FROM speakers s WHERE s.id = d.speaker_id),
+         (SELECT s.icon FROM speakers s WHERE s.id = d.speaker_id)
          FROM discord_users d";
 
     fn discord_user_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<DiscordUserRow> {
@@ -5496,6 +5574,8 @@ impl Store {
             first_seen_ns: r.get(5)?,
             last_seen_ns: r.get(6)?,
             speaker_name: r.get(7)?,
+            speaker_colour: r.get(8)?,
+            speaker_icon: r.get(9)?,
         })
     }
 
@@ -5915,6 +5995,9 @@ pub struct DiscordUserRow {
     pub last_seen_ns: i64,
     /// The linked voice's name, for a client that wants to show both.
     pub speaker_name: Option<String>,
+    /// And the linked voice's highlight (v15).
+    pub speaker_colour: Option<String>,
+    pub speaker_icon: Option<String>,
 }
 
 /// One stretch of one Discord user talking (v11).
@@ -6893,6 +6976,122 @@ pub struct CalibrationRow {
 }
 
 impl Store {
+    /// Schema v15: a voice can be highlighted.
+    ///
+    /// Two nullable columns and nothing else. `colour` holds a palette *token*
+    /// (`crate::palette::PALETTE`) rather than a hex string, so that the three
+    /// renderers — light ground, dark ground, and the headset overlay's own
+    /// rasteriser — can each paint it at the saturation and lightness their
+    /// surface was measured at. A stored `#111111` would be a highlight that
+    /// makes a name harder to read, which is the opposite of the feature.
+    ///
+    /// The column is deliberately NOT constrained to the palette in SQL. A
+    /// build that drops a token would otherwise fail to *open* a database that
+    /// still had it, turning a cosmetic setting into a startup error; instead
+    /// an unknown token reads back as "no highlight" and the row is left alone
+    /// until somebody sets it again. Validation lives on the write path, where
+    /// it can say something useful to the person typing.
+    fn apply_v15(&self) -> Result<()> {
+        self.add_column_if_missing("speakers", "colour", "TEXT")?;
+        self.add_column_if_missing("speakers", "icon", "TEXT")?;
+        // `speaker_resolved` is how every segment gets its speaker's name, and
+        // it now has to carry the highlight for the same reason: a merged-away
+        // voice must answer with the SURVIVING voice's colour, not with the one
+        // it wore before somebody decided the two were the same person.
+        //
+        // Dropped and rebuilt rather than created-if-missing, because the view
+        // already exists on every database this migration will ever run
+        // against — `apply_v2` made it — and `CREATE VIEW IF NOT EXISTS` would
+        // therefore do nothing at all, leaving a three-column view under a
+        // five-column query. A view holds no rows, so dropping one costs
+        // nothing and loses nothing.
+        self.conn.execute_batch(
+            "DROP VIEW IF EXISTS speaker_resolved;
+             CREATE VIEW speaker_resolved AS
+                 SELECT s.id                                AS id,
+                        COALESCE(t.id, s.id)                AS canonical_id,
+                        COALESCE(t.display_name, s.display_name) AS display_name,
+                        COALESCE(t.colour, s.colour)        AS colour,
+                        COALESCE(t.icon, s.icon)            AS icon
+                 FROM speakers s
+                 LEFT JOIN speakers t ON t.id = s.merged_into;",
+        )?;
+        Ok(())
+    }
+
+    /// Set or clear one voice's highlight.
+    ///
+    /// `None` clears; `Some` sets. The caller decides which of those an absent
+    /// parameter means — `speakers.set` leaves an omitted key alone and clears
+    /// an explicit null, and that distinction cannot be made once both have
+    /// collapsed into an `Option` here.
+    ///
+    /// Writes `id` directly rather than through `speaker_resolved`, and the
+    /// caller is expected to have refused a tombstone first: this is the
+    /// mirror-image of the `set_speaker_languages` trap (a read that resolves
+    /// through the tombstone and a write that does not), and the guard lives at
+    /// the same place for the same reason.
+    pub fn set_speaker_style(
+        &self,
+        speaker_id: i64,
+        colour: Option<&str>,
+        icon: Option<&str>,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE speakers SET colour = ?2, icon = ?3 WHERE id = ?1",
+            params![speaker_id, colour, icon],
+        )?;
+        if n == 0 {
+            bail!("no speaker with id {speaker_id}");
+        }
+        Ok(())
+    }
+
+    /// One voice's highlight, resolved through the tombstone view.
+    pub fn speaker_style(
+        &self,
+        speaker_id: i64,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT sp.colour, sp.icon FROM speaker_resolved sp WHERE sp.id = ?1",
+                params![speaker_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Every highlighted voice, by id, resolved through the tombstone view.
+    ///
+    /// One query for the whole table rather than one per name, because the
+    /// surfaces that need this — a thread's participants, a person's edges, a
+    /// digest's roster — render a dozen names at once and an N+1 here would be
+    /// the only expensive thing on the page. Same shape and same reasoning as
+    /// `speaker_source_matrix`.
+    ///
+    /// Only highlighted voices are in the map. "Not in the map" is the answer
+    /// for everybody else, which is also what an older database says for
+    /// everybody.
+    pub fn speaker_styles(&self) -> Result<SpeakerStyles> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sp.id, sp.colour, sp.icon FROM speaker_resolved sp
+             WHERE sp.colour IS NOT NULL OR sp.icon IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    (
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ),
+                ))
+            })?
+            .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+        Ok(rows)
+    }
+
     /// The learned-identity shape. Idempotent, additive, no backfill.
     pub(crate) fn apply_learned_identity(&self) -> Result<()> {
         self.add_column_if_missing("speakers", "label_threshold", "REAL")?;
@@ -7501,7 +7700,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(v, 13);
+        assert_eq!(v, 15);
 
         // The note is still there, and it is not a reminder: nothing invented a
         // date for a sentence that never had one.
@@ -7523,6 +7722,125 @@ mod tests {
         assert_eq!(s.digest_rows(None, 10).unwrap(), Vec::new());
         s.snooze_note(note_id, 5, 0).unwrap().unwrap();
         assert_eq!(s.notes_due(6 * 60_000_000_000, 10).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0.11.9 (v15). Two nullable columns is the easy half; the half that can
+    /// actually break is the **view**.
+    ///
+    /// `speaker_resolved` has existed since v2 and every read path in this file
+    /// joins through it, so v15 cannot add its two columns with
+    /// `CREATE VIEW IF NOT EXISTS` — the view is already there, the create would
+    /// be a no-op, and every segment query would then ask a three-column view
+    /// for `sp.colour`. That is not a wrong answer, it is `no such column` on
+    /// the transcript, which is the whole application. So the migration DROPs
+    /// and rebuilds, and this test is the thing that notices if it ever stops.
+    ///
+    /// Built by taking a current database back to the shape 0.11.8 left (the
+    /// two columns off, the three-column view restored, the stamp back at 13)
+    /// rather than by pasting a historical schema in here — the same
+    /// downgrade-simulation the v5 and v11 migration tests use, and for the
+    /// same reason. It also covers the skipped stamp: this tree carries no
+    /// `apply_v14`, so a 13 has to arrive at 15 in one open.
+    #[test]
+    fn a_pre_highlight_database_gains_the_highlight_and_its_view_is_rebuilt() {
+        let dir = std::env::temp_dir().join(format!(
+            "nx-recall-v15-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (kira, seg) = {
+            let s = Store::open(&dir).unwrap();
+            let src = s.upsert_source("VRChat.exe", "VRChat", 0).unwrap();
+            let sess = s.begin_session(src, 0).unwrap();
+            let seg = s.insert_segment(sess, 100, 200, "x.wav", 0).unwrap();
+            let kira = s.create_speaker("Kira", 1).unwrap();
+            s.set_segment_speaker(seg, Some(kira), Some(0.9)).unwrap();
+            s.set_segment_analysis(
+                seg,
+                &SegmentAnalysis {
+                    text: Some("die Shader sind fertig".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            // A database as 0.11.8 left it. The view goes first: SQLite will
+            // not drop a column another object still names, and a real v13
+            // database has the three-column view anyway.
+            s.conn
+                .execute_batch(
+                    "DROP VIEW IF EXISTS speaker_resolved;
+                     ALTER TABLE speakers DROP COLUMN colour;
+                     ALTER TABLE speakers DROP COLUMN icon;
+                     CREATE VIEW speaker_resolved AS
+                         SELECT s.id                                AS id,
+                                COALESCE(t.id, s.id)                AS canonical_id,
+                                COALESCE(t.display_name, s.display_name) AS display_name
+                         FROM speakers s
+                         LEFT JOIN speakers t ON t.id = s.merged_into;
+                     UPDATE schema_version SET version = 13;",
+                )
+                .unwrap();
+            (kira, seg)
+        };
+
+        let s = Store::open(&dir).unwrap();
+        let v: i64 = s
+            .conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(v, 15);
+
+        // The columns are back…
+        let columns = |table: &str| -> Vec<String> {
+            let mut stmt = s
+                .conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let speakers = columns("speakers");
+        assert!(speakers.contains(&"colour".to_owned()), "{speakers:?}");
+        assert!(speakers.contains(&"icon".to_owned()), "{speakers:?}");
+
+        // …and so is the five-column view, which is the half a
+        // `CREATE VIEW IF NOT EXISTS` would have quietly skipped.
+        assert_eq!(
+            columns("speaker_resolved"),
+            vec!["id", "canonical_id", "display_name", "colour", "icon"]
+        );
+
+        // The voice survived the round trip and is simply not highlighted,
+        // which is the only thing NULL has ever meant here — no backfill, no
+        // invented colour for somebody who never picked one.
+        let row = s.speaker_summary(kira).unwrap().expect("Kira survived");
+        assert_eq!(row.display_name, "Kira");
+        assert_eq!(row.colour, None);
+        assert_eq!(row.icon, None);
+        assert_eq!(s.speaker_style(kira).unwrap(), Some((None, None)));
+
+        // And a segment reads back through the rebuilt view. This is the
+        // assertion that fails with `no such column: sp.colour` if the view is
+        // ever created-if-missing instead of dropped and rebuilt.
+        let seg_row = s.segment_row(seg).unwrap().expect("the turn survived");
+        assert_eq!(seg_row.speaker_name.as_deref(), Some("Kira"));
+        assert_eq!(seg_row.speaker_colour, None);
+        assert_eq!(seg_row.speaker_icon, None);
+
+        // The new surface works on the migrated database.
+        s.set_speaker_style(kira, Some("violet"), Some("\u{1f319}"))
+            .unwrap();
+        let seg_row = s.segment_row(seg).unwrap().unwrap();
+        assert_eq!(seg_row.speaker_colour.as_deref(), Some("violet"));
+        assert_eq!(seg_row.speaker_icon.as_deref(), Some("\u{1f319}"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8867,6 +9185,112 @@ mod tests {
             s.speaker_languages(a).unwrap(),
             Some(vec!["de".to_string()])
         );
+    }
+
+    // ---- v15: highlighted people (0.11.9) --------------------------------
+
+    #[test]
+    fn a_voice_is_unhighlighted_until_somebody_picks_it_out() {
+        let s = store();
+        let id = s.create_speaker("Kira", 1).unwrap();
+        assert_eq!(s.speaker_style(id).unwrap(), Some((None, None)));
+        assert_eq!(s.list_speakers().unwrap()[0].colour, None);
+        assert_eq!(s.list_speakers().unwrap()[0].icon, None);
+
+        s.set_speaker_style(id, Some("violet"), Some("\u{1f319}"))
+            .unwrap();
+        assert_eq!(
+            s.speaker_style(id).unwrap(),
+            Some((Some("violet".into()), Some("\u{1f319}".into())))
+        );
+        let row = &s.list_speakers().unwrap()[0];
+        assert_eq!(row.colour.as_deref(), Some("violet"));
+        assert_eq!(row.icon.as_deref(), Some("\u{1f319}"));
+
+        // The two halves are independent: a colour with no emoji is a perfectly
+        // ordinary highlight, and so is the reverse.
+        s.set_speaker_style(id, Some("teal"), None).unwrap();
+        assert_eq!(
+            s.speaker_style(id).unwrap(),
+            Some((Some("teal".into()), None))
+        );
+        s.set_speaker_style(id, None, Some("\u{2728}")).unwrap();
+        assert_eq!(
+            s.speaker_style(id).unwrap(),
+            Some((None, Some("\u{2728}".into())))
+        );
+
+        // …and both off is back to where the voice started. This layer takes
+        // `None` as "clear"; the omit-versus-null question is `speakers.set`'s,
+        // because it cannot be asked once both have collapsed into an `Option`.
+        s.set_speaker_style(id, None, None).unwrap();
+        assert_eq!(s.speaker_style(id).unwrap(), Some((None, None)));
+
+        // A voice that does not exist is not a voice with no highlight.
+        assert_eq!(s.speaker_style(4242).unwrap(), None);
+        assert!(s.set_speaker_style(4242, Some("violet"), None).is_err());
+    }
+
+    /// The whole reason `apply_v15` rebuilt `speaker_resolved` rather than
+    /// leaving it alone: a merged-away id has to answer with the SURVIVING
+    /// voice's highlight. Otherwise the day after somebody merges two ids their
+    /// transcript is two colours for one person — which is precisely the "two
+    /// people on one row" confusion the highlight exists to end.
+    #[test]
+    fn a_merged_away_id_wears_the_surviving_voices_highlight() {
+        let s = store();
+        let src = s.upsert_source("VRChat.exe", "VRChat.exe", 1).unwrap();
+        let sess = s.begin_session(src, 1_000).unwrap();
+        let a = s.create_speaker("A", 1).unwrap();
+        let b = s.create_speaker("B", 1).unwrap();
+        let seg = s.insert_segment(sess, 1_000, 2_000, "a.wav", 0).unwrap();
+        s.set_segment_speaker(seg, Some(a), Some(0.8)).unwrap();
+
+        // Highlight the survivor, then collapse a onto it. Nothing rewrites
+        // `segments.speaker_id`, so the row still points at the tombstone and
+        // the view is the only thing that can make it right.
+        s.set_speaker_style(b, Some("rose"), Some("\u{2728}"))
+            .unwrap();
+        s.merge_speakers(a, b).unwrap();
+
+        assert_eq!(
+            s.speaker_style(a).unwrap(),
+            Some((Some("rose".into()), Some("\u{2728}".into()))),
+            "the tombstone answers for the voice holding the rows"
+        );
+        let row = s.segment_row(seg).unwrap().unwrap();
+        assert_eq!(row.speaker_id, Some(b));
+        assert_eq!(row.speaker_colour.as_deref(), Some("rose"));
+        assert_eq!(row.speaker_icon.as_deref(), Some("\u{2728}"));
+    }
+
+    #[test]
+    fn the_bulk_style_map_holds_only_the_voices_somebody_picked_out() {
+        let s = store();
+        let a = s.create_speaker("A", 1).unwrap();
+        let b = s.create_speaker("B", 1).unwrap();
+        let plain = s.create_speaker("C", 1).unwrap();
+        assert!(s.speaker_styles().unwrap().is_empty());
+
+        s.set_speaker_style(a, Some("amber"), None).unwrap();
+        s.set_speaker_style(b, None, Some("\u{1f680}")).unwrap();
+        let map = s.speaker_styles().unwrap();
+        // Half a highlight is still a highlight: the map's job is "has this
+        // voice anything to say", not "has it both halves".
+        assert_eq!(map.len(), 2, "{map:?}");
+        assert_eq!(map[&a], (Some("amber".into()), None));
+        assert_eq!(map[&b], (None, Some("\u{1f680}".into())));
+        assert!(
+            !map.contains_key(&plain),
+            "absent is how the map says 'not highlighted'"
+        );
+
+        // Clearing takes a voice back out rather than leaving a pair of nulls
+        // behind for every caller to test.
+        s.set_speaker_style(a, None, None).unwrap();
+        let map = s.speaker_styles().unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(!map.contains_key(&a));
     }
 
     // ---- v5: label provenance --------------------------------------------

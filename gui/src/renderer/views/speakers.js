@@ -5,7 +5,15 @@
 // banner over this list saying "these voices are most of your conversations —
 // who are they?" with the names right there to type.
 
-import { h, clear, fmtBytes, fmtDur, fmtFirstSeen, heardOnChips, speakerColor } from '../lib/dom.js';
+import { h, clear, fmtBytes, fmtDur, fmtFirstSeen, heardOnChips } from '../lib/dom.js';
+// 0.11.9 — per-person highlights. The picker itself lives on the person page
+// and in the transcript's segment sheet, not here: this list is where you find
+// out WHO a voice is, and a colour is something you pin once you already know.
+// What this view owes the feature is showing the mark on every row.
+import { lookOf, iconSpan } from './highlight.js';
+// The sweep preview is a plain-text list in a confirm sheet, so it reads the
+// icon straight off the daemon's row rather than through a look().
+import { iconOf } from '../lib/palette.js';
 import {
   store,
   speakerLabel,
@@ -97,7 +105,13 @@ export function mount(root, ctx) {
           h(
             'button',
             { class: 'btn primary', dataset: { onboard: String(sp.id) }, onclick: () => startRename(sp.id, { listen: true }) },
-            h('span', { class: 'dot', style: `color:${speakerColor(sp.id)}` }),
+            h('span', { class: 'dot', style: `color:${lookOf(sp.id).color}` }),
+            // The onboarding banner is about voices with no name, which is
+            // almost never a voice anybody has highlighted — but "almost" is
+            // not "never" (a colour can be pinned from the transcript sheet
+            // before the name is known), and a mark that vanished on this one
+            // surface would read as a bug.
+            iconSpan(lookOf(sp.id).icon),
             ` Name ${speakerLabel(sp.id)} · ${fmtDur(sp.total_ms)}`
           )
         )
@@ -367,7 +381,11 @@ export function mount(root, ctx) {
   }
 
   function speakerRow(sp) {
-    const color = speakerColor(sp.id);
+    // `color` is what the dot has always worn — the hashed identity hue, or the
+    // highlight where there is one. `hl` is the half the NAME gets: this list
+    // has printed names in plain ink since 0.4 and putting the identity hue on
+    // all of them would be a redesign, so only a pinned colour shows here.
+    const { color, hl, icon } = lookOf(sp.id);
     const named = isNamed(sp);
     // The user's own voice, pinned by their microphone. Same quiet treatment as
     // in the transcript: it is a fact about where the label came from, not a
@@ -376,6 +394,7 @@ export function mount(root, ctx) {
     const name = h('span', {
       class: `sp-name${named ? '' : ' unnamed'}`,
       text: speakerLabel(sp.id),
+      ...(hl ? { style: `color:${hl}` } : {}),
       title: mine
         ? 'Your own voice, labelled from your microphone rather than matched. Click to rename — renames are retroactive'
         : 'Click to rename — renames are retroactive',
@@ -420,6 +439,10 @@ export function mount(root, ctx) {
         'span',
         { class: 'sp-id', dataset: { sp: String(sp.id) } },
         h('span', { class: 'dot', style: `color:${color}` }),
+        // A direct child of `.sp-id` rather than tucked in beside the name,
+        // because that is where `paintHighlights` puts it back after a
+        // `relabel` and the two must not build a different row.
+        iconSpan(icon),
         h(
           'span',
           {},
@@ -643,8 +666,15 @@ export function mount(root, ctx) {
   }
 
   async function doSweep() {
+    // The prune preview carries `colour`/`icon` too, and this is a list of
+    // things about to be deleted — the one place a person most wants to spot a
+    // voice they had marked as somebody. It is plain text in a confirm sheet,
+    // so the icon is the only half of a highlight that can be shown.
     const list = sweepable
-      .map((v) => `${v.name ?? v.auto} · ${v.segments} segment · ${fmtDur(v.total_ms)}`)
+      .map((v) => {
+        const ic = iconOf(v);
+        return `${ic ? `${ic} ` : ''}${v.name ?? v.auto} · ${v.segments} segment · ${fmtDur(v.total_ms)}`;
+      })
       .join('\n');
     const ok = await confirmSheet({
       title: `Sweep ${sweepable.length} one-off voice${sweepable.length === 1 ? '' : 's'}?`,
@@ -678,7 +708,8 @@ export function mount(root, ctx) {
                 doMerge(fromId, sp.id);
               },
             },
-            h('span', { class: 'dot', style: `color:${speakerColor(sp.id)}` }),
+            h('span', { class: 'dot', style: `color:${lookOf(sp.id).color}` }),
+            iconSpan(lookOf(sp.id).icon),
             speakerLabel(sp.id)
           )
         );

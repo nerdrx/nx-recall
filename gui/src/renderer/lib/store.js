@@ -3,6 +3,9 @@
 // is what DESIGN §2 means by "clients are dumb views that survive daemon
 // restarts". No state here is authoritative and none of it is persisted.
 
+import { isAccent, nameColor } from './palette.js';
+import { speakerColor } from './dom.js';
+
 const OVERLAP_REFUSE = 0.1; // DESIGN §4: embeddings only run at overlap_frac ≤ 0.1
 const WEAK_MATCH = 0.4; // below this the label is a guess worth flagging
 
@@ -36,7 +39,14 @@ export const store = {
   statusLive: false,
   update: null, // {from, to} — the daemon came back as a different version
 
-  speakers: new Map(), // id → {id, name, auto, segments, total_ms, first_seen, you}
+  // id → {id, name, auto, segments, total_ms, first_seen, you, colour, icon}.
+  // `colour` is a palette TOKEN and not a colour ('violet', not '#7700ff' —
+  // see lib/palette.js for why only the hue crosses the wire) and `icon` is a
+  // short emoji; both are null for a voice nobody has highlighted, which is
+  // almost all of them. Read them through `speakerColour`/`speakerIcon` below
+  // rather than off the row, so an unknown token from a newer daemon degrades
+  // to "no highlight" in one place instead of in every view.
+  speakers: new Map(),
   segments: [], // ascending by t_ms
   segById: new Map(),
   /**
@@ -153,6 +163,51 @@ export function speakerLabel(id) {
   const sp = store.speakers.get(id);
   if (!sp) return `Speaker ${id}`;
   return sp.name || sp.auto || `Speaker_${String(id).padStart(2, '0')}`;
+}
+
+/**
+ * A voice's highlight token, or null.
+ *
+ * Validated rather than passed through, and for the same reason `accent()` in
+ * lib/palette.js returns null for an unknown token: a daemon newer than this
+ * GUI may name an eleventh colour, and the honest reading of a token this
+ * build has never heard of is "no highlight" — which falls back to the hashed
+ * hue the voice has always had. A view that painted `hsl(undefined …)` would
+ * render a black name on a black ground and say nothing about why.
+ */
+export function speakerColour(id) {
+  if (id == null) return null;
+  const token = store.speakers.get(id)?.colour;
+  return isAccent(token) ? token : null;
+}
+
+/**
+ * A voice's icon, or ''. Trimmed for the same reason `iconOf` trims: the
+ * daemon stores NULL for a blank one, and a client that rendered ' ' would
+ * open a gap before a name for no reason.
+ */
+export function speakerIcon(id) {
+  if (id == null) return '';
+  const icon = store.speakers.get(id)?.icon;
+  return typeof icon === 'string' ? icon.trim() : '';
+}
+
+/**
+ * What colour to paint a voice's NAME. Every surface that draws a name calls
+ * this and nothing else.
+ *
+ * One function rather than a `??` in each view, because half of them would
+ * eventually be written the other way round and a highlight would apply in the
+ * transcript but not in search — the same class of bug as audit finding #25a,
+ * where the rail badge and the Sources view counted different sources.
+ *
+ * A voice with no highlight gets byte-identical output to `speakerColor(id)`,
+ * which is the whole compatibility claim of the feature: the hashed identity
+ * band (DESIGN §8) is still what an un-highlighted person wears, and nothing
+ * about the existing UI changes until somebody picks a colour.
+ */
+export function speakerNameColor(id) {
+  return nameColor({ colour: speakerColour(id) }, speakerColor(id));
 }
 
 /**
@@ -1072,12 +1127,22 @@ export function applyEvent(evt, opts = {}) {
         // Only when the event carries it: a plain rename must not silently
         // clear a language declaration it never mentioned.
         if (d.languages !== undefined) sp.languages = d.languages;
+        // The same guard, and it is the same rule the WIRE uses: `speakers.set`
+        // treats an omitted key as "leave it alone" and an explicit null as
+        // "clear it", so `undefined` is the only value that may be ignored
+        // here. Fold these with `??` instead and renaming somebody would strip
+        // the colour they were given a minute ago, from a view that never
+        // offered to change it.
+        if (d.colour !== undefined) sp.colour = d.colour;
+        if (d.icon !== undefined) sp.icon = d.icon;
       } else {
         store.speakers.set(d.speaker, {
           id: d.speaker,
           name: d.name ?? null,
           auto: null,
           languages: d.languages ?? null,
+          colour: d.colour ?? null,
+          icon: d.icon ?? null,
           segments: 0,
           total_ms: 0,
         });

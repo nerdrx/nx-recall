@@ -10,7 +10,7 @@
 // lib/store.js, and its one rule is that trimming never happens in the
 // direction you are looking.
 
-import { h, clear, fmtClock, fmtDay, fmtDayLabel, speakerColor } from '../lib/dom.js';
+import { h, clear, fmtClock, fmtDay, fmtDayLabel } from '../lib/dom.js';
 import {
   store,
   speakerLabel,
@@ -40,6 +40,12 @@ import {
   followTail,
   HARD_MAX,
 } from '../lib/store.js';
+// 0.11.9 — per-person highlights. `look()` answers "what colour and what icon
+// does this row wear", preferring the store and falling back to the row's own
+// `speaker_colour`/`speaker_icon` for a voice this client has not listed yet;
+// `markRow` is the quiet accent on a highlighted row. All three live in one
+// module so the transcript and search cannot disagree about them.
+import { look, lookOf, iconSpan, markRow, highlightPicker } from './highlight.js';
 import { separatorWalker } from '../lib/seams.js';
 import { shakyMark, translationCell } from '../lib/marks.js';
 import { openSheet, toast } from '../lib/sheets.js';
@@ -426,7 +432,10 @@ export function mount(root, ctx) {
     // filled dot and an underline on the name, no layout change, no colour of
     // its own beyond the accent.
     const mine = isYou(seg.speaker);
-    const color = speakerColor(seg.speaker);
+    // The colour is `speakerColor(seg.speaker)` byte for byte until somebody
+    // highlights this voice — see lib/store.js `speakerNameColor`. The icon is
+    // '' for everybody else, and an '' icon renders no element at all.
+    const { color, hl, icon } = look(seg);
     const row = h('div', {
       class: `seg${uncertain ? ' uncertain' : ''}${shaky ? ' shaky' : ''}${mine ? ' you' : ''}${isNew ? ' new' : ''}${seg.corrected ? ' corrected' : ''}${
         highlightThread != null && seg.thread === highlightThread ? ' in-thread' : ''
@@ -464,8 +473,16 @@ export function mount(root, ctx) {
       'span',
       { class: 'who', ...(seg.speaker != null ? { dataset: { sp: String(seg.speaker) } } : {}) },
       h('span', { class: 'dot', style: `color:${color}` }),
+      // Between the dot and the name, and absent entirely without a highlight:
+      // the name column is a fixed 148px (styles.css) and an icon that appeared
+      // on every row would spend a fifth of it on nothing.
+      iconSpan(icon),
       nm
     );
+    // The row accent. Guarded on `uncertain` on purpose: styles.css already
+    // overrides the inline speaker colour on a doubted row, and a row whose
+    // speaker is a guess must not be painted as somebody's confident mark.
+    markRow(row, hl, { uncertain });
     // 0.9.0: a turn in a language you do not read, in one you do. Both lines
     // are always on the row — the transcript is a record and the original never
     // leaves it — and which of the two LEADS is `[assist] translation_display`
@@ -548,7 +565,11 @@ export function mount(root, ctx) {
    */
   function partialRow(p) {
     const seg = { speaker: p.speaker, label_via: p.speaker_hint === 'proximity' ? 'proximity' : null };
-    const color = speakerColor(p.speaker);
+    // A partial carries no highlight of its own (PROTOCOL 0.11.0 sends only the
+    // proximity hint), so this is the store's answer or nothing — and it has to
+    // be the same answer `segRow` gives, or the row would change colour at the
+    // moment the final replaces it.
+    const { color, icon } = lookOf(p.speaker);
     const row = h('div', {
       class: `seg partial${isYou(p.speaker) ? ' you' : ''}`,
       dataset: { partial: String(p.seq_in_turn) },
@@ -562,6 +583,7 @@ export function mount(root, ctx) {
         'span',
         { class: 'who' },
         h('span', { class: 'dot', style: `color:${color}` }),
+        iconSpan(icon),
         h('span', {
           class: `nm${p.speaker == null ? ' reasoned' : ''}`,
           text: segmentSpeakerLabel(seg),
@@ -571,6 +593,10 @@ export function mount(root, ctx) {
       h('span', { class: 'txt' }, p.text, h('span', { class: 'seg-ell', text: '…' })),
       h('span', { class: 'meta' })
     );
+    // The same accent the final row will wear, so nothing moves or lights up
+    // when the provisional is replaced. `isUncertain` refuses it for a
+    // proximity guess, which is what most partials are.
+    markRow(row, lookOf(p.speaker).hl, { uncertain: isUncertain(seg) });
     return row;
   }
 
@@ -627,7 +653,14 @@ export function mount(root, ctx) {
     clear(speakerFilter);
     speakerFilter.append(h('option', { value: '' }, 'Everyone'));
     for (const sp of [...store.speakers.values()].sort((a, b) => (b.total_ms ?? 0) - (a.total_ms ?? 0))) {
-      speakerFilter.append(h('option', { value: String(sp.id) }, speakerLabel(sp.id)));
+      // The icon and not the colour, for the same reason the Discord truth
+      // links in views/sources.js get only the icon: an `<option>` popup is
+      // drawn by the platform and takes nothing we can style (see the
+      // `color-scheme` note at the top of tokens.css). The emoji renders.
+      const ic = lookOf(sp.id).icon;
+      speakerFilter.append(
+        h('option', { value: String(sp.id) }, ic ? `${ic} ${speakerLabel(sp.id)}` : speakerLabel(sp.id))
+      );
     }
     speakerFilter.value = cur;
   }
@@ -967,8 +1000,14 @@ export function mount(root, ctx) {
     rPlay.setAttribute('aria-label', playing ? 'Pause' : 'Play');
     rPlay.title = playing ? 'Pause' : rs.phase === 'ended' ? 'Play it again from the start' : 'Play';
     rPlay.dataset.phase = rs.phase;
-    rWho.textContent = turn ? segmentSpeakerLabel({ speaker: turn.speaker, overlap_frac: 0 }) : '';
-    if (turn?.speaker != null) rWho.style.color = speakerColor(turn.speaker);
+    // The replay turn carries its own `speaker_colour`/`speaker_icon` (PROTOCOL
+    // `replay.turns`), so a conversation replayed out of an evening the store
+    // has forgotten still says who is talking in their own colour.
+    const turnLook = turn ? look(turn) : null;
+    rWho.textContent = turn
+      ? `${turnLook.icon ? `${turnLook.icon} ` : ''}${segmentSpeakerLabel({ speaker: turn.speaker, overlap_frac: 0 })}`
+      : '';
+    if (turn?.speaker != null) rWho.style.color = turnLook.color;
     else rWho.style.color = '';
     rClock.textContent = turn
       ? `${fmtClock(turn.t_ms)} · turn ${rs.index + 1} of ${rs.turns.length}`
@@ -1000,7 +1039,12 @@ export function mount(root, ctx) {
       tick.classList.toggle('gone', !t.has_audio);
       tick.classList.toggle('at', i === rs.index);
       tick.classList.toggle('done', i < rs.index);
-      tick.title = `${fmtClock(t.t_ms)} — ${speakerLabel(t.speaker)}${t.has_audio ? '' : ' · no audio kept'}`;
+      // A tick is a bar three pixels wide; the icon can only go in the tooltip,
+      // where it is the fastest way to spot your own turns in a long scrub.
+      const tickIcon = look(t).icon;
+      tick.title = `${fmtClock(t.t_ms)} — ${tickIcon ? `${tickIcon} ` : ''}${speakerLabel(t.speaker)}${
+        t.has_audio ? '' : ' · no audio kept'
+      }`;
       tick.setAttribute('aria-label', tick.title);
     });
 
@@ -1144,8 +1188,11 @@ export function openSegmentSheet(seg, ctx) {
     const pick = h('div', { class: 'sp-pick' });
     const rebuild = () => {
       clear(pick);
-      const mk = (spId, label) =>
-        h(
+      const mk = (spId, label) => {
+        // `lookOf(null)` is the muted grey "Unassigned" has always had, and no
+        // icon — the same two answers this line gave before highlights existed.
+        const { color, icon } = lookOf(spId);
+        return h(
           'button',
           {
             'aria-pressed': String(picked === spId),
@@ -1154,9 +1201,11 @@ export function openSegmentSheet(seg, ctx) {
               rebuild();
             },
           },
-          h('span', { class: 'dot', style: `color:${speakerColor(spId)}` }),
+          h('span', { class: 'dot', style: `color:${color}` }),
+          iconSpan(icon),
           label
         );
+      };
       pick.append(mk(null, 'Unassigned'));
       for (const sp of [...store.speakers.values()].sort((a, b) => (b.total_ms ?? 0) - (a.total_ms ?? 0))) {
         pick.append(mk(sp.id, speakerLabel(sp.id)));
@@ -1295,10 +1344,39 @@ export function openSegmentSheet(seg, ctx) {
       nameRow.hidden = !sp;
       if (sp) nameRow.querySelector('#name-voice-hint').textContent = `${speakerLabel(sp.id)} has no name yet.`;
     }
+    // ------------------------------------------------------------------
+    // Highlighting the picked voice, here (0.11.9)
+    //
+    // The naming row above is hidden for a voice that already has a name,
+    // because renaming is a rarer act with consequences that belong on the
+    // Speakers page. A HIGHLIGHT is the opposite: you want to mark the person
+    // you are reading, and you almost always already know their name. So this
+    // row follows `picked` and nothing else — it is up for any voice, named or
+    // not, and it is deliberately not folded into `paintNameRow`'s hidden rule.
+    //
+    // Rebuilt rather than re-targeted when the pick moves, because the picker
+    // closes over one speaker id (its swatches' aria-labels name that person)
+    // and a control that quietly started writing to somebody else would be the
+    // worst possible bug in a feature about telling people apart.
+    // ------------------------------------------------------------------
+    const hlRow = h('div', { class: 'hl-row', id: 'highlight-row', hidden: picked == null });
+    function paintHlRow() {
+      clear(hlRow);
+      hlRow.hidden = picked == null;
+      if (picked == null) return;
+      hlRow.append(highlightPicker(picked));
+    }
+
     paintNameRow();
+    paintHlRow();
     // The picker above can move this segment to another unnamed voice; the
     // offer follows the picked voice, not the row's original one.
-    pick.addEventListener('click', () => queueMicrotask(paintNameRow));
+    pick.addEventListener('click', () =>
+      queueMicrotask(() => {
+        paintNameRow();
+        paintHlRow();
+      })
+    );
     nameInput.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
         e.preventDefault();
@@ -1441,6 +1519,10 @@ export function openSegmentSheet(seg, ctx) {
       ),
       pick,
       nameRow,
+      // Under the naming offer and not inside it: `nameRow` is hidden the
+      // moment a voice has a name, and a highlight is for exactly the voice
+      // you already know the name of. See `paintHlRow` above.
+      hlRow,
       h(
         'div',
         { class: 'sheet-head' },

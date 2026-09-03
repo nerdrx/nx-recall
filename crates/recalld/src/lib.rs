@@ -66,6 +66,7 @@ pub mod night;
 pub mod nllb;
 pub mod notes;
 pub mod overlap;
+pub mod palette;
 pub mod partial;
 pub mod pipeline;
 pub mod polyglot;

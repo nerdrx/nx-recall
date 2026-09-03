@@ -93,6 +93,22 @@
   flex: none;
 }
 
+/* 0.11.9 — a highlighted voice's emoji, in front of the name. `.cap-who` is
+   already a flex row with an 8px gap, so the icon needs nothing but a refusal
+   to shrink: the name column here is `auto`-sized and the words next to it are
+   what gives, exactly as in the transcript. Rendered only when there IS one
+   (views/highlight.js `iconSpan` returns null otherwise), so a caption for an
+   unmarked voice is the same three-element row it has always been.
+
+   Sized off `--cap-size` like the name beside it, because this window scales
+   with a slider and an emoji pinned at 11px next to a 40px caption would read
+   as a rendering fault. */
+.cap-who .sp-icon {
+  flex: none;
+  font-size: 1.05em;
+  line-height: 1;
+}
+
 /* Your own voice. The one place violet is spent in this window, and it is a
    ring on a 9px dot — the same mark the transcript uses, for the same reason:
    the label came from where the audio arrived rather than from a guess. */

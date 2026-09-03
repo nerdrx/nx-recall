@@ -277,7 +277,15 @@ impl Renderer {
         let mut blocks: Vec<Block> = Vec::new();
         let mut used = 0;
         for turn in turns.iter().rev() {
-            let name = format!("{}  ", turn.who);
+            // The icon goes BEFORE the name, in the name's own colour column,
+            // so a highlighted row is picked out by two independent marks — one
+            // for anybody, one for anybody who cannot separate these hues.
+            // `drawable_icon` is what keeps that promise honest on a machine
+            // whose font has no emoji: see its note.
+            let name = match self.drawable_icon(turn.icon.as_deref()) {
+                Some(icon) => format!("{icon} {}  ", turn.who),
+                None => format!("{}  ", turn.who),
+            };
             let name_w = self.measure(&name, name_size);
             let lines = row_lines(turn, self.style.translation_display);
             let column = inner - name_w - DOT_COLUMN;
@@ -297,7 +305,7 @@ impl Renderer {
             blocks.push(Block {
                 name,
                 name_w,
-                hue: speaker_hue(turn.speaker),
+                hue: turn_hue(turn),
                 // Either the feed already stamped it (the desktop path, where
                 // the roster is known before a caption exists) or the caller
                 // named the voice (the headset path, which has no feed).
@@ -414,6 +422,27 @@ impl Renderer {
             .round() as i64
     }
 
+    /// The icon, if this machine's font can actually draw it.
+    ///
+    /// `glyph` turns anything the font lacks into `'?'`, which is right for a
+    /// stray character inside a sentence and very wrong here: a highlight that
+    /// renders as "? Kira" is worse than no highlight at all, and the system
+    /// sans-serif this surface rasterises with (Noto Sans, DejaVu — see
+    /// `DEFAULT_FONTS`) carries almost no emoji. There is no colour-emoji path
+    /// in a monochrome coverage rasteriser to fall back to.
+    ///
+    /// So the icon is drawn only if every one of its characters is really in
+    /// the font, and dropped silently otherwise. The colour half of the
+    /// highlight always works, which is why dropping this half is a
+    /// degradation rather than a failure — and why the desktop, which has a
+    /// full font stack, is where an emoji highlight is really read.
+    fn drawable_icon(&self, icon: Option<&str>) -> Option<String> {
+        let icon = icon.map(str::trim).filter(|s| !s.is_empty())?;
+        icon.chars()
+            .all(|c| self.font.lookup_glyph_index(c) != 0)
+            .then(|| icon.to_owned())
+    }
+
     /// The character, or something the font actually has.
     ///
     /// The system sans-serif is whatever this machine happens to ship and it is
@@ -515,6 +544,23 @@ const DEFAULT_FONTS: &[&str] = &[
 /// a voice that is one colour on the desktop and another in the headset is two
 /// identities. Dark-theme saturation and lightness (72% / 74%), since this
 /// surface is always dark.
+/// What colour this row's name and dot are.
+///
+/// A pinned highlight wins over the hash; anything else — no highlight, or a
+/// token from a daemon newer than this build — falls through to the colour the
+/// voice has always had. That fallthrough is the reason a highlight can never
+/// make a caption worse: the failure mode is the old colour, not no colour.
+///
+/// Both branches end at the same `hsl_to_rgb` with the same saturation and
+/// lightness, so a highlight changes WHICH hue a name wears and nothing about
+/// how legible it is against this surface.
+fn turn_hue(turn: &Turn) -> [u8; 3] {
+    match turn.colour.as_deref().and_then(crate::palette::hue) {
+        Some(hue) => hsl_to_rgb(hue, 0.72, 0.74),
+        None => speaker_hue(turn.speaker),
+    }
+}
+
 fn speaker_hue(id: Option<i64>) -> [u8; 3] {
     let Some(id) = id else {
         return FAINT;
@@ -559,6 +605,8 @@ mod tests {
             lang: None,
             translation: None,
             mine: false,
+            colour: None,
+            icon: None,
         }
     }
 
@@ -809,5 +857,84 @@ mod tests {
             assert_ne!(rgb, FAINT, "voice {id} got the nameless grey");
         }
         assert_eq!(speaker_hue(Some(7)), speaker_hue(Some(7)));
+    }
+
+    /// A pinned colour replaces the hash, and only for the voice it was pinned
+    /// to. The point of the feature is that one name in a stack is picked out;
+    /// a highlight that also moved everybody else's colour would be a theme.
+    #[test]
+    fn a_highlight_repaints_one_voice_and_leaves_the_rest_alone() {
+        let plain = turn(1, "hello");
+        let lit = Turn {
+            colour: Some("amber".into()),
+            ..turn(1, "hello")
+        };
+        assert_eq!(turn_hue(&plain), speaker_hue(Some(1)));
+        assert_ne!(turn_hue(&lit), turn_hue(&plain));
+        assert_eq!(turn_hue(&lit), hsl_to_rgb(44.0, 0.72, 0.74));
+
+        // Another voice, same stack, untouched.
+        let other = Turn {
+            speaker: Some(2),
+            ..turn(2, "hello")
+        };
+        assert_eq!(turn_hue(&other), speaker_hue(Some(2)));
+    }
+
+    /// A colour this build has never heard of is the OLD colour, not no colour
+    /// — a daemon may name an eleventh accent before this binary is rebuilt.
+    #[test]
+    fn a_colour_from_a_newer_daemon_falls_back_to_the_hash() {
+        let odd = Turn {
+            colour: Some("chartreuse".into()),
+            ..turn(1, "hello")
+        };
+        assert_eq!(turn_hue(&odd), speaker_hue(Some(1)));
+
+        // And a highlight on a nameless turn still cannot invent a speaker.
+        let nameless = Turn {
+            speaker: None,
+            colour: None,
+            ..turn(1, "hello")
+        };
+        assert_eq!(turn_hue(&nameless), FAINT);
+    }
+
+    /// The icon is drawn when the font has it and dropped — never turned into
+    /// the `?` that `glyph` gives everything else — when it does not.
+    #[test]
+    fn an_icon_is_drawn_only_if_this_machines_font_really_has_it() {
+        let Some(r) = renderer() else { return };
+        assert_eq!(r.drawable_icon(None), None);
+        assert_eq!(r.drawable_icon(Some("")), None);
+        assert_eq!(r.drawable_icon(Some("   ")), None);
+        // ASCII is in every font this list names, so it stands in for "the
+        // font has this glyph" without depending on which font is installed.
+        assert_eq!(r.drawable_icon(Some("x")), Some("x".to_owned()));
+        // A private-use codepoint is in no font, and must vanish rather than
+        // become a tofu or a question mark in front of somebody's name.
+        assert_eq!(r.drawable_icon(Some("\u{f8ff}")), None);
+    }
+
+    /// An icon widens the name column rather than overprinting the words —
+    /// the bug `DOT_COLUMN`'s note is about, one field later.
+    #[test]
+    fn an_icon_pushes_the_words_right_instead_of_colliding_with_them() {
+        let Some(r) = renderer() else { return };
+        let plain = turn(1, "some words");
+        let lit = Turn {
+            icon: Some("x".into()),
+            ..turn(1, "some words")
+        };
+        let name_size = (r.style.size * 0.44).max(11.0);
+        let plain_w = r.measure(&format!("{}  ", plain.who), name_size);
+        let lit_w = r.measure(&format!("x {}  ", lit.who), name_size);
+        assert!(lit_w > plain_w, "the icon took no width in the name column");
+
+        // Both still render, and the highlighted one has more ink in it.
+        let a = r.render(&[plain], None);
+        let b = r.render(&[lit], None);
+        assert_eq!(a.width, b.width);
+        assert_eq!(a.height, b.height);
     }
 }

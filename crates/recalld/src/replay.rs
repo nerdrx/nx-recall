@@ -75,6 +75,11 @@ pub fn turns(store: &Store, data_dir: &Path, thread: i64) -> Result<Value, Error
                 // resolved through merges, and `null` on an unlabelled turn.
                 "speaker": row.speaker_id,
                 "speaker_name": row.speaker_name,
+                // The highlight (v15), resolved through merges with the name
+                // beside it: the player bar paints one name at a time and it
+                // must be the same colour the transcript gave it.
+                "speaker_colour": row.speaker_colour,
+                "speaker_icon": row.speaker_icon,
                 "text": row.text,
                 "has_audio": on_disk(data_dir, &row.audio_path),
             })
