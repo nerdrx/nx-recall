@@ -2697,3 +2697,17 @@ on French into German. NLLB echoed **none**.
 The gate to switch the default was: chrF wins on ≥ 80% of pairs, no pair worse
 by more than 2 chrF, fewer empties and echoes, lower median latency. All five
 passed.
+
+## 0.11.4 — provenance, made consistent
+
+- `text_via` gains `"lid"`: the row's words were re-decoded by the Japanese
+  decoder after the spoken-language identifier heard Japanese. A row that says
+  `"arbiter"` is a German/English flip re-read by a constrained decoder; the
+  two are different claims about the audio and now read differently.
+- The language arbiter's rewrite (`text_via: "arbiter"`) follows the same
+  three rules as the context pass and the night shift: the words it replaces
+  are kept in an `operations` row `op: "segments.redecode"` whose
+  `prior_state` carries `{segment_id, text, asr_model_id, text_via, route}`;
+  the cross-check verdict about the old words is cleared (`asr_confidence:
+  null` until the pass looks again); and any translation of the old words is
+  dropped. Up to 0.11.3 this path did none of the three.

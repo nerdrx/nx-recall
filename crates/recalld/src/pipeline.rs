@@ -798,7 +798,12 @@ impl Pipeline {
             // word floor, the guess, the reader's own languages. It queues an
             // id and rings a bell; the model call happens on the assistant's
             // thread, never on this one.
-            crate::translate::queue_live(&store, segment_id);
+            // Same guard as the note hook above: a pause that landed mid-write
+            // queues nothing (the drain re-checks pause too — this is the
+            // consistency, not the safety).
+            if !paused_mid_write {
+                crate::translate::queue_live(&store, segment_id);
+            }
             // ---- end hook ----
             publish_segment(&self.bus, &store, segment_id);
             for id in also_changed {

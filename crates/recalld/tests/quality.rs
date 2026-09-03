@@ -631,3 +631,48 @@ fn the_cross_check_flags_without_rewriting() {
     drop(guard);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 0.11.4: the language arbiter's rewrite follows the same three rules as the
+/// context pass — prior words on the record, the cross-check verdict cleared,
+/// the translation dropped. It used to do none of the three.
+#[test]
+fn an_arbiter_rewrite_is_on_the_record_and_clears_what_it_invalidates() {
+    let store = Store::open_in_memory().expect("store");
+    let source = store.upsert_source("VRChat.exe", "VRChat", 0).expect("src");
+    let session = store.begin_session(source, 0).expect("session");
+    let id = store
+        .insert_segment(session, 0, 2_000_000_000, "a.wav", 0)
+        .expect("segment");
+    store
+        .set_segment_analysis(
+            id,
+            &recalld::store::SegmentAnalysis {
+                text: Some("das war good".into()),
+                lang: Some("en".into()),
+                lang_via: None,
+                asr_model_id: Some("m".into()),
+                overlap_frac: None,
+            },
+        )
+        .expect("analysis");
+    store
+        .set_segment_confidence(id, Some("solid"), 7)
+        .expect("verdict");
+    store
+        .set_segment_text_from_redecode(id, "das war gut", "de", "arbiter-de")
+        .expect("rewrite");
+    let row = store.segment_row(id).expect("row").expect("live");
+    assert_eq!(row.text.as_deref(), Some("das war gut"));
+    assert_eq!(row.text_via.as_deref(), Some("arbiter"));
+    assert!(
+        row.asr_confidence.is_none(),
+        "a verdict about words that were replaced must not survive them"
+    );
+    let ops = store
+        .operations_of("segments.redecode", 10)
+        .expect("operations");
+    assert_eq!(ops.len(), 1, "one rewrite, one operations row");
+    let prior: serde_json::Value = serde_json::from_str(&ops[0].prior_state).expect("json");
+    assert_eq!(prior["text"], serde_json::json!("das war good"));
+    assert_eq!(prior["route"], serde_json::json!("arbiter"));
+}

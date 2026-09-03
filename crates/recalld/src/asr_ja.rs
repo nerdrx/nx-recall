@@ -552,7 +552,7 @@ pub fn route_segment(
                 segment_id,
                 &new,
                 &model_id,
-                crate::store::text_via::ARBITER,
+                crate::store::text_via::LID,
                 now_utc_ns,
             )?;
             store.set_segment_language(segment_id, JA, LANG_VIA_LID)?;

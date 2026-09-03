@@ -167,6 +167,11 @@ pub mod text_via {
     /// Re-read overnight by the night shift's third decoder (`crate::night`,
     /// 0.9.0), and only ever where two of the three readings agreed.
     pub const NIGHT: &str = "night";
+    /// Re-decoded by the Japanese decoder after the spoken-language identifier
+    /// heard Japanese (`crate::asr_ja`, 0.11.0). Its own value since 0.11.4: a
+    /// row that says `arbiter` was a German/English flip; this is a different
+    /// claim about the audio.
+    pub const LID: &str = "lid";
 }
 
 /// What a second decoder made of a transcript (v10, on the wire as
@@ -1705,9 +1710,25 @@ impl Store {
         lang: &str,
         asr_model_id: &str,
     ) -> Result<()> {
+        // 0.11.4: the same three rules as every other machine edit of a
+        // transcript (`set_segment_text_via`): keep the words being replaced on
+        // the record, clear the cross-check verdict that was about them, and
+        // drop the translation of them. This path had none of the three.
+        let prior: Option<(Option<String>, Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT text, asr_model_id, text_via FROM segments
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                params![segment_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((prior_text, prior_model, prior_via)) = prior else {
+            return Ok(());
+        };
         self.conn.execute(
             "UPDATE segments SET text = ?2, lang = ?3, lang_via = ?4, asr_model_id = ?5,
-                 text_via = ?6
+                 text_via = ?6, asr_confidence = NULL, confidence_at_ns = NULL
              WHERE id = ?1",
             params![
                 segment_id,
@@ -1718,12 +1739,20 @@ impl Store {
                 text_via::ARBITER
             ],
         )?;
-        // The words changed, so the translation of the old words is not a
-        // translation of this row any more. Same rule as
-        // `set_segment_text_via`, and it has to be spelled twice because these
-        // two are the only paths that replace a transcript and they do not
-        // share a body.
         self.clear_segment_translation(segment_id)?;
+        self.log_operation(
+            "segments.redecode",
+            &format!("[{segment_id}]"),
+            &serde_json::json!({
+                "segment_id": segment_id,
+                "text": prior_text,
+                "asr_model_id": prior_model,
+                "text_via": prior_via,
+                "route": text_via::ARBITER,
+            })
+            .to_string(),
+            crate::clock::utc_now_ns(),
+        )?;
         Ok(())
     }
 

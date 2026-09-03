@@ -241,6 +241,7 @@ export const SHAKY_NOTE = 'a second decoder disagreed with this reading';
 export function textViaNote(seg) {
   if (seg?.text_via === 'context') return 're-read with surrounding audio';
   if (seg?.text_via === 'arbiter') return 're-read by the language arbiter';
+  if (seg?.text_via === 'lid') return 're-read by the Japanese decoder after the audio was heard as Japanese';
   return '';
 }
 
