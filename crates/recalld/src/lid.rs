@@ -62,11 +62,22 @@
 //! over `windows` slices of the turn and the confidence is the share of them
 //! that said the same thing.
 //!
-//! `windows` defaults to 1, which makes the confidence trivially 1.0, and that
-//! default is a measurement rather than a shrug: at zero false positives in
-//! 400 negatives there is nothing for a second window to rule out, and a vote
-//! would triple the only cost this feature has. The knob is real for a machine
-//! that hears something this corpus did not — see `[asr].lid_windows`.
+//! `windows` defaulted to **1** until 0.11.10, which made the confidence
+//! trivially 1.0, and the argument for it was the FLEURS table above: at zero
+//! false positives in 400 negatives there is nothing for a second window to
+//! rule out, and a vote triples the only cost this feature has.
+//!
+//! **That was wrong, and the way it was wrong is worth keeping.** The table is
+//! read speech and a lobby is not. Asked about a two-second "Mm-hmm." this
+//! model does not abstain — it names a language, and on this install's own rows
+//! it named Korean and Chinese often enough to rewrite 45 transcripts
+//! (FINDINGS §30, §31). Measured on those rows and on 200 German/English
+//! back-channels from the same voice, one window keeps seven false positives
+//! and three windows keeps one: **7.45% against 1.06%**, on a gate of 1%. So
+//! `windows` defaults to 3 and the confidence is a real vote. What made that
+//! affordable is the other half of the same round — `asr_cjk::pre_route`'s
+//! declaration and back-channel guards, which took the number of turns asked
+//! about at all from 245 to one on that same data.
 
 use std::path::Path;
 

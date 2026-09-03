@@ -178,6 +178,10 @@ fn main() -> Result<()> {
                 limit,
             ),
             // ---- end 0.11.9 ----------------------------------------------
+            // ---- 0.11.10, taking a route back ----------------------------
+            LangAction::Unroute { apply, dir } => {
+                cmd_lang_unroute(&cfg, &data_dir, dir.as_deref(), apply)
+            } // ---- end 0.11.10 ---------------------------------------------
         },
         // ---- 0.11.0, source-aware identity -----------------------------
         Command::Identity { action } => cmd_identity(&cfg, &data_dir, action),
@@ -2123,6 +2127,86 @@ fn cmd_lang_sweep(
     );
     Ok(())
 }
+
+/// `recalld lang unroute [--apply]` — put back the rows the audio route should
+/// never have rewritten (0.11.10, `crate::unroute`).
+///
+/// In this process rather than through the daemon, for `cmd_lang_sweep`'s
+/// reasons: it is a batch over the whole archive, it wants to be niceable and
+/// interruptible, and with the identifier installed it loads a model the daemon
+/// may not have resident.
+fn cmd_lang_unroute(cfg: &Config, data_dir: &Path, dir: Option<&Path>, apply: bool) -> Result<()> {
+    use recalld::unroute::Verdict;
+
+    pipeline::deprioritise_current_thread(19, &[]);
+    let store = Store::open(data_dir)?;
+    // The identifier is optional and its absence is not an error: the audio
+    // test can only ever put MORE rows back, so a run without it is a strict
+    // subset of a run with it.
+    let root = fetch::target_dir(dir, &cfg.models, data_dir);
+    let models = ModelSet::resolve_at(root, &cfg.models);
+    let mut cjk = recalld::asr_cjk::Cjk::new(&models, &cfg.asr);
+    let with_audio = models.lid().present() && cjk.lid_ready();
+    if !with_audio {
+        println!(
+            "the identifier is not installed, so the guards are re-run on the stored text and \
+             durations only — which can only put back FEWER rows, never more."
+        );
+    }
+
+    let report = recalld::unroute::run(
+        &store,
+        with_audio.then_some(&mut cjk),
+        data_dir,
+        &cfg.asr,
+        apply,
+        recalld::clock::utc_now_ns(),
+    )?;
+    if report.looked_at() == 0 {
+        println!("no turn on this install was settled by the spoken-language route.");
+        return Ok(());
+    }
+    println!(
+        "{} turn(s) were settled by the spoken-language route.\n",
+        report.looked_at()
+    );
+    for row in &report.rows {
+        let (mark, why) = match &row.verdict {
+            Verdict::Revert(why) => ("<-", *why),
+            Verdict::Keep => ("  ", "the guards still accept it"),
+            Verdict::NoPrior => ("??", "no prior transcript was recorded; nothing to restore"),
+        };
+        println!(
+            "{mark} {:>7}  {:>5.2}s  {}  {:?}",
+            row.id, row.duration_s, row.lang, row.now
+        );
+        println!(
+            "            {} {:?}  ({why}{})",
+            if matches!(row.verdict, Verdict::Revert(_)) {
+                "back to"
+            } else {
+                "was"
+            },
+            row.before,
+            if row.by_audio { ", by the audio" } else { "" }
+        );
+    }
+    println!();
+    println!(
+        "{} to put back, {} left alone, {} with no recorded prior.",
+        report.reverted, report.kept, report.no_prior
+    );
+    if apply {
+        println!(
+            "done. Each one wrote a `segments.unroute` operation carrying what it discarded, so \
+             this is undoable in its turn."
+        );
+    } else {
+        println!("`recalld lang unroute --apply` does it.");
+    }
+    Ok(())
+}
+// ---- end 0.11.10 -----------------------------------------------------------
 
 /// `recalld speakers prune [--apply]` — the one-off voice sweep.
 fn cmd_prune(cfg: &Config, data_dir: &Path, apply: bool) -> Result<()> {

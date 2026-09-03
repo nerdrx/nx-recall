@@ -842,7 +842,7 @@ mod tests {
             asr: &AsrConfig,
             lang_cfg: &LangConfig,
         ) -> &'static str {
-            if crate::asr_cjk::pre_route(None, Some(v3)) == crate::asr_cjk::Pre::Nothing {
+            if crate::asr_cjk::pre_route(None, Some(v3), asr) == crate::asr_cjk::Pre::Nothing {
                 return "never asked";
             }
             let Some(want) = post_route(
@@ -975,7 +975,8 @@ mod tests {
             let heard = s["heard"].as_str().unwrap_or("");
             let e = reach.entry((truth.clone(), length.clone())).or_default();
             e.1 += 1;
-            let asked = crate::asr_cjk::pre_route(None, Some(v3)) != crate::asr_cjk::Pre::Nothing;
+            let asked =
+                crate::asr_cjk::pre_route(None, Some(v3), &asr_cfg) != crate::asr_cjk::Pre::Nothing;
             if asked {
                 e.0 += 1;
                 if routable(heard, &asr_cfg) {
@@ -1038,7 +1039,7 @@ mod tests {
             let hyp = r["hyp"].as_str().unwrap_or("");
             // The live route, in full: unreadable transcript, a routable
             // reading, and the reading is what we forced.
-            if crate::asr_cjk::pre_route(None, Some(v3)) == crate::asr_cjk::Pre::Nothing {
+            if crate::asr_cjk::pre_route(None, Some(v3), &asr_cfg) == crate::asr_cjk::Pre::Nothing {
                 continue;
             }
             if heard != forced || !routable(heard, &asr_cfg) {
