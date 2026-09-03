@@ -397,6 +397,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.11.2 | +110h | the morning-after check: 658 audio gaps in the night-shift hour, because the whole daemon ran at nice 19 and capture queued behind its own homework; now the process is normal priority and every background pass drops itself into the idle class |
 | 0.11.3 | +112h | the night audit: eleven things that looked like they worked — a Japanese-tagged voice re-decoded with the English model, translations kept for words that no longer existed, the translator gated behind a switch for a different model, a crash that spoke for the archive — each fixed with a test that fails on the old code |
 | 0.11.4 | +113h | the arbiter's rewrite keeps its prior words, clears the verdict about them and drops their translation like every other machine edit; a Japanese re-read carries its own provenance |
+| 0.11.5 | +114h | Japanese questions in grounded answers: 3 of 3 traps refused, 3 of 3 answered with correct citations, the German and English set unchanged |
 
 ## Quickstart
 
