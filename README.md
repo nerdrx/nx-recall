@@ -403,7 +403,7 @@ Installed by its first user on day one; every finding became a release.
 
 ```bash
 cargo build --release
-./target/release/recalld models fetch          # the speech set; --semantic --graph --confidence --night --japanese --translator --arbiter-de for the rest
+./target/release/recalld models fetch          # the speech set; --semantic --graph --confidence --night --japanese --cjk --translator --arbiter-de for the rest
 ./target/release/recalld models build-night    # compiles whisper.cpp for your GPU; the only thing here that compiles
 ./target/release/recalld probe                 # see every app making sound — none captured
 ./target/release/recalld allow VRChat.exe

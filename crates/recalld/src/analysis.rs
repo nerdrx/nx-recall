@@ -81,10 +81,12 @@ pub struct Outcome {
     /// turns whose transcript nobody could read, which is a fact worth being
     /// able to watch whether or not any of them turned out to be Japanese.
     pub lid_checked: bool,
-    /// The turn was re-decoded by the Japanese decoder and the row now says so
-    /// (0.11.0). `None` on every turn that was not Japanese, which is nearly
-    /// all of them.
-    pub routed_ja: Option<crate::asr_ja::Routed>,
+    /// The turn was re-decoded by a CJK decoder and the row now says so
+    /// (0.11.0 for `ja`, 0.11.6 for `ko`/`zh`). `None` on every turn that was
+    /// none of the three, which is nearly all of them. The tag it carries is
+    /// what the decoder's *script* turned out to be, not what the identifier
+    /// said — see `crate::asr_cjk::judge`.
+    pub routed_cjk: Option<crate::asr_cjk::Routed>,
 }
 
 /// Everything the microphone leg needs that the matching leg does not: who the
@@ -147,10 +149,10 @@ pub struct Analyzer {
     /// mic suite — keeps the two-argument constructor it always had.
     truth_cfg: TruthConfig,
 
-    // ---- Japanese (0.11.0, `crate::asr_ja`) ------------------------------
-    /// The Japanese decoder and the spoken-language identifier that routes to
-    /// it, each loaded the first time it is needed and resident from then on.
-    japanese: crate::asr_ja::Japanese,
+    // ---- Japanese, Korean, Chinese (0.11.0/0.11.6, `crate::asr_cjk`) -----
+    /// The CJK decoders and the spoken-language identifier that routes to
+    /// them, each loaded the first time it is needed and resident from then on.
+    cjk: crate::asr_cjk::Cjk,
     /// The switch and the operating point the router reads. Defaulted like
     /// `lang_cfg`, and set from the running config by [`Analyzer::
     /// set_asr_config`].
@@ -176,7 +178,7 @@ impl Analyzer {
             lang_cfg: LangConfig::default(),
             arbiters: Arbiters::new(models),
             truth_cfg: TruthConfig::default(),
-            japanese: crate::asr_ja::Japanese::new(models, &crate::config::AsrConfig::default()),
+            cjk: crate::asr_cjk::Cjk::new(models, &crate::config::AsrConfig::default()),
             asr_cfg: crate::config::AsrConfig::default(),
         })
     }
@@ -207,14 +209,14 @@ impl Analyzer {
     /// **before** the inference thread starts, because it rebuilds the router
     /// and the router owns two lazily loaded models.
     pub fn set_asr_config(&mut self, models: &ModelSet, cfg: &crate::config::AsrConfig) {
-        self.japanese = crate::asr_ja::Japanese::new(models, cfg);
+        self.cjk = crate::asr_cjk::Cjk::new(models, cfg);
         self.asr_cfg = cfg.clone();
     }
 
     /// The line the daemon logs once at start-up about Japanese, `None` when
     /// there is nothing worth saying.
     pub fn japanese_note(&self) -> Option<String> {
-        self.japanese.startup_note()
+        self.cjk.startup_note()
     }
     // ---- end Japanese ----------------------------------------------------
 
@@ -314,7 +316,7 @@ impl Analyzer {
                 store.set_segment_speaker(segment_id, None, None)?;
                 return Ok(Outcome {
                     lid_checked: false,
-                    routed_ja: None,
+                    routed_cjk: None,
                     overlap_frac,
                     text,
                     decision: Decision::Refused(refusal),
@@ -438,7 +440,7 @@ impl Analyzer {
             prior: Some(prior),
             also_changed: Vec::new(),
             lid_checked: false,
-            routed_ja: None,
+            routed_cjk: None,
         })
     }
 
@@ -550,7 +552,7 @@ impl Analyzer {
             prior: None,
             also_changed: Vec::new(),
             lid_checked: false,
-            routed_ja: None,
+            routed_cjk: None,
         })
     }
 
@@ -567,7 +569,7 @@ impl Analyzer {
         outcome: &mut Outcome,
         samples: &[f32],
     ) {
-        // ---- Japanese (0.11.0, `crate::asr_ja`) --------------------------
+        // ---- Japanese, Korean, Chinese (`crate::asr_cjk`) ----------------
         //
         // FIRST, before the declared-language correction, because the two
         // answer different questions and only one of them can be right about a
@@ -581,11 +583,11 @@ impl Analyzer {
         //
         // Best-effort like every other correction here: a language nobody
         // could settle never costs a recording.
-        let mut settled_ja = false;
-        match crate::asr_ja::route_segment(
-            &mut self.japanese,
+        let mut settled_cjk = false;
+        match crate::asr_cjk::route_segment(
+            &mut self.cjk,
             store,
-            crate::asr_ja::Turn {
+            crate::asr_cjk::Turn {
                 segment_id,
                 declared: outcome
                     .speaker_id
@@ -602,15 +604,15 @@ impl Analyzer {
                 outcome.lid_checked = checked.lid_checked;
                 if let Some(routed) = checked.routed {
                     outcome.text = Some(routed.text.clone());
-                    outcome.routed_ja = Some(routed);
-                    settled_ja = true;
+                    outcome.routed_cjk = Some(routed);
+                    settled_cjk = true;
                 }
             }
-            Err(e) => warn!(segment_id, "the Japanese route failed: {e:#}"),
+            Err(e) => warn!(segment_id, "the CJK route failed: {e:#}"),
         }
-        // ---- end Japanese ------------------------------------------------
+        // ---- end Japanese, Korean, Chinese --------------------------------
 
-        if let Some(speaker_id) = outcome.speaker_id.filter(|_| !settled_ja) {
+        if let Some(speaker_id) = outcome.speaker_id.filter(|_| !settled_cjk) {
             match self.correct_language(
                 store,
                 segment_id,
@@ -794,7 +796,7 @@ impl Analyzer {
         // `Unclear` — which is the *inherit* branch. Without this line a
         // correctly re-decoded Japanese turn would be stamped "de" by the
         // German conversation around it, seconds after being fixed.
-        if crate::asr_ja::settled_by_lid(store, segment_id)? {
+        if crate::asr_cjk::settled_by_lid(store, segment_id)? {
             return Ok(None);
         }
         // ---- end Japanese ------------------------------------------------
@@ -949,7 +951,7 @@ pub struct AnalysisStats {
     /// large the margin is too low.
     pub prior_foreign_kept: std::sync::atomic::AtomicU64,
 
-    // ---- Japanese (0.11.0, `crate::asr_ja`) ------------------------------
+    // ---- Japanese, Korean, Chinese (0.11.0/0.11.6, `crate::asr_cjk`) -----
     /// Turns handed to the spoken-language identifier — the ones whose
     /// transcript nobody could read. This is what the feature COSTS, and the
     /// two counters are reported side by side on purpose: a `lid_checked` that
@@ -957,9 +959,14 @@ pub struct AnalysisStats {
     /// a turn to be told "German", and the answer is to look at why so many
     /// transcripts are unreadable rather than to look at Japanese.
     pub lid_checked: std::sync::atomic::AtomicU64,
-    /// Turns the Japanese decoder re-read, whose words it replaced, and whose
-    /// language is now `ja` via `lid`.
+    /// Turns a CJK decoder re-read, whose words it replaced, and whose
+    /// language is now `ja`, `ko` or `zh` via `lid`. Counted per language
+    /// rather than as one total, because the three arms have different
+    /// decoders, different downloads and different accuracies (FINDINGS §27),
+    /// and a number that mixed them could not answer "is Korean working".
     pub routed_ja: std::sync::atomic::AtomicU64,
+    pub routed_ko: std::sync::atomic::AtomicU64,
+    pub routed_zh: std::sync::atomic::AtomicU64,
 }
 
 impl AnalysisStats {
@@ -1046,9 +1053,12 @@ impl AnalysisStats {
         if outcome.lid_checked {
             self.lid_checked.fetch_add(1, Ordering::Relaxed);
         }
-        if outcome.routed_ja.is_some() {
-            self.routed_ja.fetch_add(1, Ordering::Relaxed);
-        }
+        match outcome.routed_cjk.as_ref().map(|r| r.lang) {
+            Some(crate::asr_cjk::JA) => self.routed_ja.fetch_add(1, Ordering::Relaxed),
+            Some(crate::asr_cjk::KO) => self.routed_ko.fetch_add(1, Ordering::Relaxed),
+            Some(crate::asr_cjk::ZH) => self.routed_zh.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
     }
 }
 

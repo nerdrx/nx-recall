@@ -296,6 +296,10 @@ export const LANGUAGE_CHOICES = [
   // 0.11.0: routed by the audio identifier and the Japanese decoder, not by
   // the text classifier — a voice tagged Japanese skips the European model.
   { value: 'ja', label: 'Japanese', title: 'Every turn of this voice goes straight to the Japanese decoder; the European model never sees it.' },
+  // 0.11.6: the same route, two more languages. Both run on SenseVoice rather
+  // than on the Japanese Parakeet — one decoder, catalogued for the pair.
+  { value: 'ko', label: 'Korean', title: 'Every turn of this voice goes straight to the Korean decoder; the European model never sees it.' },
+  { value: 'zh', label: 'Chinese', title: 'Every turn of this voice goes straight to the Chinese decoder; the European model never sees it.' },
 ];
 
 export function languageValue(sp) {

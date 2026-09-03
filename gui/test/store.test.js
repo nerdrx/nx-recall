@@ -438,13 +438,22 @@ test('a speaker language is a closed set with one label per state', () => {
   assert.equal(languageLabel({ languages: ['en', 'de'] }), 'German + English');
   // 0.11.0: Japanese is routed by the audio identifier, not the text classifier.
   assert.equal(languageLabel({ languages: ['ja'] }), 'Japanese');
+  // 0.11.6: and the two the same route learned to decode.
+  assert.equal(languageLabel({ languages: ['ko'] }), 'Korean');
+  assert.equal(languageLabel({ languages: ['zh'] }), 'Chinese');
   // Every choice the control offers has a value the daemon accepts and a line
   // saying what it does — "German" alone does not explain a changed transcript.
-  assert.equal(LANGUAGE_CHOICES.length, 5);
+  assert.equal(LANGUAGE_CHOICES.length, 7);
   for (const c of LANGUAGE_CHOICES) {
     assert.ok(c.title.length > 20, `${c.label} does not explain itself`);
     for (const code of c.value ? c.value.split(',') : []) {
-      assert.ok(['de', 'en', 'ja'].includes(code), `${code} is not a language the daemon knows`);
+      // The closed set is `lang::KNOWN` in the daemon: a tag exists only if a
+      // decoder for it is catalogued, which is why `yue` is not here even
+      // though SenseVoice writes it.
+      assert.ok(
+        ['de', 'en', 'ja', 'ko', 'zh'].includes(code),
+        `${code} is not a language the daemon knows`,
+      );
     }
   }
 });

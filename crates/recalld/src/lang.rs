@@ -83,10 +83,16 @@ impl Lang {
 
 /// Every language tag this daemon understands, in the order clients show them.
 /// Languages a voice may be TAGGED with. `de`/`en` are what the text
-/// classifier can check; `ja` (0.11.0) is what the audio identifier and the
-/// Japanese decoder can route — a friend tagged `ja` skips the European model
-/// entirely (analysis.rs `Pre::Direct`).
-pub const KNOWN: &[&str] = &["de", "en", "ja"];
+/// classifier can check; `ja` (0.11.0) and `ko`/`zh` (0.11.6) are what the
+/// audio identifier and the CJK decoders can route — a friend tagged with one
+/// of the three skips the European model entirely (`asr_cjk::Pre::Direct`).
+///
+/// The rule this list follows is "a tag exists only if something can act on
+/// it": each of `ja`, `ko` and `zh` is here because a decoder for it is
+/// catalogued (`asr_cjk::Decoder::for_lang`), and `yue` is NOT here even
+/// though SenseVoice writes it, because nothing routes it. A tag that only
+/// decorates a speaker row is a promise the daemon does not keep.
+pub const KNOWN: &[&str] = &["de", "en", "ja", "ko", "zh"];
 
 const DE: &[&str] = &[
     "der", "die", "das", "und", "ist", "nicht", "ich", "du", "wir", "ihr", "sie", "es", "ein",
