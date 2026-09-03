@@ -778,6 +778,17 @@ impl Service {
                 // what the feature costs, the second what it buys.
                 "lid_checked": c.analysis.lid_checked.load(Ordering::Relaxed),
                 "routed_ja": c.analysis.routed_ja.load(Ordering::Relaxed),
+                // 0.11.6, the other half of the same route: turns the
+                // identifier heard as fr/es/it/… in, which a decoder forced to
+                // that language then re-read. `lid_checked` above is what BOTH
+                // halves cost; these two are what each buys.
+                "routed_other": c.analysis.routed_other.load(Ordering::Relaxed),
+                "routed_other_by_lang": c
+                    .analysis
+                    .routed_other_counts()
+                    .into_iter()
+                    .map(|(tag, n)| (tag.to_string(), serde_json::json!(n)))
+                    .collect::<serde_json::Map<_, _>>(),
                 // 0.8.0, the idle quality worker: turns re-decoded with their
                 // session's audio, turns that had none to re-decode with, and
                 // the two verdicts of the cross-check.

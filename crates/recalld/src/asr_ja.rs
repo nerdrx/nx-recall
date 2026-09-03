@@ -520,7 +520,15 @@ pub fn route_segment(
         // The duration floor before the identifier, not only before the
         // decoder: LID on a 0.4 s fragment costs a model pass to produce a
         // reading nothing is allowed to act on.
-        if (samples.len() as f32 / SAMPLE_RATE as f32) < lang_cfg.arbiter_min_duration_s {
+        //
+        // `[asr].lid_min_s` since 0.11.6, where this read
+        // `[lang].arbiter_min_duration_s`. The two were the same number and
+        // are not the same question — that floor is about whether a
+        // replacement is better than what it overwrites, and this one is about
+        // whether a model can tell what language it is hearing. Fusing them
+        // meant that "Wanky Daska." (1.30 s, "genki desu ka") was never even
+        // asked about. See the config note.
+        if (samples.len() as f32 / SAMPLE_RATE as f32) < asr_cfg.lid_min_s {
             return Ok(checked);
         }
         // Counted only when a model actually ran. See `Japanese::identify`:
@@ -530,6 +538,11 @@ pub fn route_segment(
             return Ok(checked);
         };
         checked.lid_checked = true;
+        // Kept whatever it said, so the caller can hand it to the other half
+        // of the route (`crate::polyglot`) instead of paying for a second
+        // identical model pass. A reading is a fact about the turn, not about
+        // Japanese.
+        checked.heard = reading.clone();
         if !post_route(reading.as_ref(), asr_cfg) {
             debug!(
                 segment_id,
@@ -598,6 +611,17 @@ pub struct Checked {
     pub lid_checked: bool,
     /// The row's words were replaced.
     pub routed: Option<Routed>,
+    /// What the identifier said, when it was asked and had an opinion (0.11.6).
+    ///
+    /// Here so the *other* half of the audio-language route
+    /// ([`crate::polyglot`], which acts on fr/es/it/pt/nl/pl) can read the
+    /// answer this module already paid for. LID is the one cost either feature
+    /// has, and asking twice about the same turn would double it for nothing.
+    ///
+    /// `None` covers three different situations that need no distinguishing
+    /// downstream: not asked, asked and no opinion, and the router not ready.
+    /// A caller that must tell them apart has `lid_checked`.
+    pub heard: Option<Reading>,
 }
 
 /// Was this row's language settled by the Japanese router?
