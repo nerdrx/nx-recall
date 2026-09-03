@@ -18,7 +18,7 @@ your own GPU. Every byte of it on your silicon. Nothing, ever, anywhere else.**
 ![tests](https://img.shields.io/badge/tests-1047_rust_·_171_node_·_192_e2e-2ea44f?style=for-the-badge)
 ![releases](https://img.shields.io/badge/releases-33_in_4_days-7700FF?style=for-the-badge)
 ![footprint](https://img.shields.io/badge/live_pipeline-%3C5%25_of_one_core-2ea44f?style=for-the-badge)
-![experiments](https://img.shields.io/badge/experiments-40_scripts_·_24_findings-0a0714?style=for-the-badge)
+![experiments](https://img.shields.io/badge/experiments-38_scripts_·_25_findings-0a0714?style=for-the-badge)
 
 <br>
 
@@ -112,7 +112,7 @@ label (0.35, calibrated on real lobbies — the corpus value over-split 3×)
 
 ## Numbers we actually measured
 
-The measurement harness came first — **33 experiment scripts and seventeen
+The measurement harness came first — **38 experiment scripts and twenty-five
 numbered findings** in [`spike/FINDINGS.md`](spike/FINDINGS.md) — and two of
 the original design's core claims died in it before a line of the daemon
 existed. Every feature since has had a gate it had to clear, and the ones that
