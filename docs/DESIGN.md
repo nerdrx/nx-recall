@@ -180,6 +180,18 @@ set). Measured selections:
   dev box) is priority/placement. The daemon sets nice 19 on inference threads and
   supports `[runtime] inference_cpus` to pin off the game's CCD (9950X3D: game keeps
   0–15/X3D). Both implemented in Step 1.
+- **Three tiers, not one (0.11.2).** The first night with the night shift, the
+  digests, the translator, the cross-check and the truth pass all running, the
+  capture thread missed its PipeWire deadlines 658 times in one hour — because
+  the unit ran the *whole* daemon at nice 19, so capture queued at the same
+  priority as its own homework. The rule is now: the **process** runs at normal
+  priority (capture, socket, roster, sweeper — nothing that loads a model); the
+  **live inference thread** (VAD, ASR, identity) lowers itself to nice 19 in the
+  normal class, so it still transcribes under load; every **background pass**
+  lowers itself to nice 19 *and* `SCHED_IDLE`, which yields to anything runnable
+  at all, and the child processes it spawns (llama-cli, whisper-cli) inherit that
+  class on top of their own explicit nice. Capture costs under one percent of a
+  core and must never wait for a paragraph.
 - Singing passes VAD (observed at first light): the §8 sustained-non-speech filter
   for world music remains a real requirement.
 
