@@ -464,6 +464,8 @@ pub struct TruthStats {
     pub linked: AtomicU64,
     pub enrolled: AtomicU64,
     pub closed_stale: AtomicU64,
+    /// 0.11.9: turns named from a `single` verdict that the ladder left blank.
+    pub retro_labelled: AtomicU64,
 }
 
 impl TruthStats {
@@ -477,6 +479,7 @@ impl TruthStats {
             "linked": g(&self.linked),
             "enrolled": g(&self.enrolled),
             "closed_stale": g(&self.closed_stale),
+            "retro_labelled": g(&self.retro_labelled),
         })
     }
 }
@@ -624,6 +627,169 @@ pub fn truth_link_json(
         "segments": segments,
     })
 }
+
+// ---- 0.11.9: retro-labelling from ground truth -----------------------------
+
+/// How many rows one `truth label` pass will move at most.
+///
+/// Two hundred, matching `service`'s delete chunk rather than
+/// `[truth].batch_segments`, because the number that matters here is how many
+/// segments one `operations` row is allowed to describe. The nightly caller
+/// loops until the pass returns zero, so this bounds the transaction and the
+/// undo record, never the work.
+pub const LABEL_CHUNK: usize = 200;
+
+/// The `operations` op name for a retro-labelling pass. One row per chunk,
+/// carrying every segment's prior state, so the whole pass is reversible the
+/// way `speakers.split` is.
+pub const OP_LABEL: &str = "truth.label";
+
+/// One row moved by [`label_from_truth`], for the report and the undo record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Relabelled {
+    pub segment_id: i64,
+    pub speaker_id: i64,
+    pub user_id: String,
+    pub user_name: String,
+    pub t_start_ns: i64,
+    pub duration_s: f64,
+    pub coverage: Option<f64>,
+}
+
+/// Put Discord's name on the turns the voicebank left blank.
+///
+/// ## Why this exists
+///
+/// The identity ladder's failure mode is not usually a *wrong* name, it is *no*
+/// name: a turn whose top candidate missed the label bar keeps its transcript
+/// and its embedding and stays speaker-NULL. On the install §29 was measured
+/// on that is 168 turns — and for every one of them Discord had already written
+/// down who was talking, in a `single` verdict at ≥ 0.8 coverage, for a user
+/// that the auto-linker had already tied to a voice. Two facts the database
+/// held all along, never joined.
+///
+/// ## What it will not do
+///
+/// * **It never overwrites a label.** The `WHERE` demands `speaker_id IS NULL`
+///   in both the gather and the commit. A row the ladder named, a row a person
+///   named, a row proximity inherited — all untouched. Discord's word is used
+///   only where nothing else had a word at all, so this pass cannot lower the
+///   93.9% identity precision `truth report` measures: every row it writes was
+///   previously counted `unlabelled`, and none was counted `correct`.
+/// * **It never enrols.** Not one prototype comes out of this, however clean
+///   the turn. `calib.rs` and `identity.rs` are the only things that have ever
+///   decided a recording is worth keeping, and the enrol bar is deliberately
+///   not learned; a pass that added prototypes on Discord's word alone would be
+///   the enrol bar learning itself through the side door. `truth::enrol_batch`
+///   is the supervised route and it stays behind `[truth] enrol`.
+/// * **It never mints.** Only users the auto-linker already tied to an existing
+///   voice are read, so no new identity can appear here.
+///
+/// Returns the rows it moved. With `apply` false it returns exactly the same
+/// list and writes nothing — the preview is the same computation, not a
+/// second one that could disagree with it.
+pub fn label_from_truth(
+    store: &Arc<std::sync::Mutex<Store>>,
+    limit: usize,
+    apply: bool,
+    at_ns: i64,
+) -> Result<Vec<Relabelled>> {
+    // ---- gather (lock held) ----
+    let candidates = {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        guard.segments_for_truth_label(guard.you_speaker_id()?, limit)?
+    };
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut moved = Vec::new();
+    // ---- commit (lock held) ----
+    //
+    // One acquisition for the whole chunk. The pass writes at most
+    // `LABEL_CHUNK` single-row UPDATEs against a primary key and then one
+    // `operations` insert, which is nothing beside the embedding decode
+    // `calibrate_pass` was warned about; splitting it per row would only widen
+    // the window in which a row can be labelled underneath us.
+    let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+    for c in candidates {
+        // Losing the race to the live ladder is the right outcome, so the
+        // preview counts a row it could still lose and the apply does not.
+        if apply && !guard.label_segment_from_truth(c.id, c.speaker_id)? {
+            continue;
+        }
+        moved.push(Relabelled {
+            segment_id: c.id,
+            speaker_id: c.speaker_id,
+            user_id: c.user_id,
+            user_name: c.user_name,
+            t_start_ns: c.t_start_ns,
+            duration_s: (c.t_end_ns - c.t_start_ns) as f64 / 1e9,
+            coverage: c.coverage,
+        });
+    }
+
+    if apply {
+        // Every row this pass touches had `speaker_id NULL, match_score NULL,
+        // label_via NULL` — that is the query's precondition, not an
+        // assumption — so the prior state is fully described by the id list.
+        // It is written out per row anyway, in `speakers.split`'s shape,
+        // because an undo that has to re-derive a precondition from the op name
+        // is an undo that breaks the day the precondition changes.
+        //
+        // Chunked at `LABEL_CHUNK` for `speakers.delete`'s reason rather than
+        // this pass's: the nightly caller never hands us more than a chunk, but
+        // `recalld truth label --apply` with no `--limit` hands us the whole
+        // backlog, and one `operations` row carrying ten thousand segments is a
+        // row nothing can read back.
+        for chunk in moved.chunks(LABEL_CHUNK) {
+            let targets: Vec<i64> = chunk.iter().map(|m| m.segment_id).collect();
+            let prior = json!({
+                "segments": chunk.iter().map(|m| json!({
+                    "segment_id": m.segment_id,
+                    "speaker_id": Value::Null,
+                    "match_score": Value::Null,
+                    "label_via": Value::Null,
+                    "to_speaker_id": m.speaker_id,
+                    "truth_user_id": m.user_id,
+                })).collect::<Vec<_>>(),
+            });
+            guard.log_operation(
+                OP_LABEL,
+                &serde_json::to_string(&targets)?,
+                &prior.to_string(),
+                at_ns,
+            )?;
+        }
+    }
+    Ok(moved)
+}
+
+/// The nightly half: keep going until there is nothing left, then stop.
+///
+/// Gated on `[truth].label` with the verdict pass, and for the same reason —
+/// this reads verdicts that pass writes, so running it while labelling is off
+/// would work through a backlog that has stopped growing and then spin.
+fn label_from_truth_pass(store: &Arc<std::sync::Mutex<Store>>, stats: &TruthStats) -> Result<()> {
+    loop {
+        let moved = label_from_truth(store, LABEL_CHUNK, true, utc_now_ns())?;
+        if moved.is_empty() {
+            return Ok(());
+        }
+        stats
+            .retro_labelled
+            .fetch_add(moved.len() as u64, Ordering::Relaxed);
+        info!(
+            n = moved.len(),
+            "named turns the voicebank had left blank, on Discord's word"
+        );
+        if moved.len() < LABEL_CHUNK {
+            return Ok(());
+        }
+    }
+}
+
+// ---- end 0.11.9 ------------------------------------------------------------
 
 /// Enrol the cleanest of a linked user's turns into that voice's bank.
 ///
@@ -875,6 +1041,15 @@ pub fn run(
                 if let Err(e) = link_batch(&store, &bus, &stats) {
                     warn!("the ground-truth auto-linker failed: {e:#}");
                 }
+                // ---- 0.11.9: retro-labelling -----------------------------
+                // After the linker and never before it: the pass can only act
+                // on users that are already linked, so running it first would
+                // do nothing on the evening a link is made and leave the
+                // backlog for tomorrow.
+                if let Err(e) = label_from_truth_pass(&store, &stats) {
+                    warn!("the ground-truth retro-labelling pass failed: {e:#}");
+                }
+                // ---- end 0.11.9 ------------------------------------------
                 if cfg.enrol
                     && let Err(e) = enrol_batch(&store, &control, &cfg, &identity, &stats, &stop)
                 {
@@ -1003,6 +1178,27 @@ pub fn summary(store: &Store, identity: &IdentityConfig, cfg: &TruthConfig) -> R
 
     Ok(json!({
         "segments_labelled": labelled,
+        // ---- 0.11.9: the two queues, said out loud ----
+        //
+        // §29 went looking for a bug in `enrol_batch` and found an off switch:
+        // `segments.truth_enrol_ns` was NULL on all 1,461 `single` rows because
+        // `[truth] enrol` defaults to false and had never been turned on, while
+        // 137 turns sat queued for it. Nothing anybody could run said so — the
+        // report showed enrolment neither working nor waiting. These two counts
+        // are the cure, and they are counts rather than a flag on purpose: "off"
+        // is a setting, "off with 137 turns waiting" is a decision.
+        "enrol": {
+            "on": cfg.enrol,
+            "waiting": store.truth_enrol_waiting(ENROL_MIN_DURATION_S, ENROL_MIN_COVERAGE)?,
+            "min_duration_ms": (ENROL_MIN_DURATION_S * 1000.0) as i64,
+            "min_coverage": ENROL_MIN_COVERAGE,
+        },
+        "retro_label": {
+            "waiting": store
+                .segments_for_truth_label(store.you_speaker_id()?, usize::MAX)?
+                .len() as i64,
+        },
+        // ---- end 0.11.9 ----
         "single": count_of(truth_verdict::SINGLE),
         "overlap": count_of(truth_verdict::OVERLAP),
         "partial": count_of(truth_verdict::PARTIAL),
@@ -1498,5 +1694,249 @@ mod tests {
         // And the stamp is left alone, so the evening the evidence DOES arrive
         // is the evening it is fitted on — not six hours after it.
         assert_eq!(last.map(|(_, n)| n), Some(seen));
+    }
+
+    // ---- 0.11.9: retro-labelling from ground truth -------------------------
+
+    /// A store with one linked user and one unlinked one, four `single` turns
+    /// each, and every turn left unlabelled by the ladder.
+    fn a_store_to_relabel() -> Arc<std::sync::Mutex<Store>> {
+        use crate::store::truth_via;
+        let s = Store::open_in_memory().unwrap();
+        let src = s.upsert_source("vesktop", "Vesktop", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let sec = 1_000_000_000i64;
+        let linked = s.mint_speaker(0).unwrap();
+        s.upsert_discord_user("linked", "Aspen", 0).unwrap();
+        s.set_discord_link("linked", Some(linked), Some(truth_via::MANUAL), 0)
+            .unwrap();
+        // A user the auto-linker has NOT tied to any voice. Its turns are
+        // exactly as well attested and must still be left alone.
+        s.upsert_discord_user("loose", "Nobody's Voice", 0).unwrap();
+        for (i, user) in ["linked", "loose"].iter().enumerate() {
+            for k in 0..4i64 {
+                let t = (i as i64 * 100 + k + 1) * 10 * sec;
+                let seg = s.insert_segment(sess, t, t + 2 * sec, "a.wav", 0).unwrap();
+                s.set_segment_truth(seg, Some(user), "single", Some(0.95))
+                    .unwrap();
+            }
+        }
+        Arc::new(std::sync::Mutex::new(s))
+    }
+
+    fn label_of(store: &Arc<std::sync::Mutex<Store>>, seg: i64) -> (Option<i64>, Option<String>) {
+        let g = store.lock().unwrap();
+        g.conn()
+            .query_row(
+                "SELECT speaker_id, label_via FROM segments WHERE id = ?1",
+                [seg],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_preview_names_nothing() {
+        let store = a_store_to_relabel();
+        let moved = label_from_truth(&store, usize::MAX, false, 1).unwrap();
+        assert_eq!(moved.len(), 4, "the four turns of the linked user");
+        for m in &moved {
+            assert_eq!(label_of(&store, m.segment_id), (None, None));
+        }
+        // And it is the same list the apply would move — the preview is the
+        // same computation, not a second one that could disagree with it.
+        let applied = label_from_truth(&store, usize::MAX, true, 1).unwrap();
+        assert_eq!(
+            applied.iter().map(|m| m.segment_id).collect::<Vec<_>>(),
+            moved.iter().map(|m| m.segment_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn discords_word_names_the_blank_turns_of_a_linked_user_only() {
+        let store = a_store_to_relabel();
+        let moved = label_from_truth(&store, usize::MAX, true, 1).unwrap();
+        assert_eq!(moved.len(), 4);
+        let linked = moved[0].speaker_id;
+        for m in &moved {
+            assert_eq!(m.user_id, "linked");
+            assert_eq!(
+                label_of(&store, m.segment_id),
+                (
+                    Some(linked),
+                    Some(crate::store::label_via::TRUTH.to_string())
+                ),
+                "named on Discord's word, and said so"
+            );
+        }
+        // The unlinked user's turns are just as well attested and stay blank:
+        // there is no voice to point them at, and this pass never mints one.
+        let g = store.lock().unwrap();
+        let loose: i64 = g
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM segments WHERE truth_user_id = 'loose' AND speaker_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(loose, 4);
+    }
+
+    #[test]
+    fn a_turn_that_already_has_a_speaker_is_never_touched() {
+        let store = a_store_to_relabel();
+        // Give one of the four a speaker the way the live ladder would, and a
+        // different one from the linked voice, so an overwrite would be loud.
+        let (first, other) = {
+            let g = store.lock().unwrap();
+            let first: i64 = g
+                .conn()
+                .query_row(
+                    "SELECT MIN(id) FROM segments WHERE truth_user_id = 'linked'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let other = g.mint_speaker(0).unwrap();
+            g.set_segment_speaker(first, Some(other), Some(0.9))
+                .unwrap();
+            (first, other)
+        };
+        let moved = label_from_truth(&store, usize::MAX, true, 1).unwrap();
+        assert_eq!(moved.len(), 3, "the labelled one is not a candidate");
+        assert!(moved.iter().all(|m| m.segment_id != first));
+        assert_eq!(
+            label_of(&store, first),
+            (
+                Some(other),
+                Some(crate::store::label_via::MATCH.to_string())
+            ),
+            "the ladder's label survived intact"
+        );
+    }
+
+    #[test]
+    fn the_pass_is_reversible_because_it_wrote_down_what_it_changed() {
+        let store = a_store_to_relabel();
+        let moved = label_from_truth(&store, usize::MAX, true, 4242).unwrap();
+        let g = store.lock().unwrap();
+        let ops = g.operations_of(OP_LABEL, 10).unwrap();
+        assert_eq!(ops.len(), 1, "one row for the one chunk");
+        assert_eq!(ops[0].at_utc_ns, 4242);
+        let targets: Vec<i64> = serde_json::from_str(&ops[0].target_ids).unwrap();
+        assert_eq!(
+            targets,
+            moved.iter().map(|m| m.segment_id).collect::<Vec<_>>()
+        );
+        let prior: Value = serde_json::from_str(&ops[0].prior_state).unwrap();
+        let rows = prior["segments"].as_array().unwrap();
+        assert_eq!(rows.len(), moved.len());
+        for row in rows {
+            // The whole point: what to put back, not merely what changed.
+            assert!(row["speaker_id"].is_null());
+            assert!(row["label_via"].is_null());
+            assert!(row["to_speaker_id"].as_i64().is_some());
+        }
+    }
+
+    #[test]
+    fn a_second_pass_has_nothing_left_to_do() {
+        let store = a_store_to_relabel();
+        assert_eq!(
+            label_from_truth(&store, usize::MAX, true, 1).unwrap().len(),
+            4
+        );
+        assert!(
+            label_from_truth(&store, usize::MAX, true, 2)
+                .unwrap()
+                .is_empty(),
+            "the rows it named are no longer blank, so they are no longer candidates"
+        );
+        // …and the nightly wrapper therefore terminates rather than spinning.
+        let stats = TruthStats::default();
+        label_from_truth_pass(&store, &stats).unwrap();
+        assert_eq!(stats.retro_labelled.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_short_turn_is_named_like_any_other() {
+        // The one pass in this file with no duration bar, deliberately. It
+        // measures nothing, so the reason every other pass has one does not
+        // apply — and the shortest turns are the ones no other route can name.
+        let store = a_store_to_relabel();
+        let seg = {
+            let g = store.lock().unwrap();
+            let src = g.upsert_source("vesktop", "Vesktop", 1).unwrap();
+            let sess = g.begin_session(src, 0).unwrap();
+            // 300 ms: under `MIN_SCORE_DURATION_S` and under the embedder's bar.
+            let seg = g
+                .insert_segment(sess, 9_000, 309_000_000, "s.wav", 0)
+                .unwrap();
+            g.set_segment_truth(seg, Some("linked"), "single", Some(0.9))
+                .unwrap();
+            seg
+        };
+        let moved = label_from_truth(&store, usize::MAX, true, 1).unwrap();
+        assert!(
+            moved.iter().any(|m| m.segment_id == seg),
+            "a 300 ms turn Discord is sure about is still a turn Discord is sure about"
+        );
+    }
+
+    #[test]
+    fn your_own_account_never_names_a_turn_however_sure_discord_is() {
+        // The rule 0.10.1 found by measurement and this pass has to inherit: a
+        // Discord client does not play your microphone back to you, so a turn
+        // captured from its output is the one place your voice cannot be. A
+        // `single` verdict on your own account means "you were talking over
+        // this", and writing it as a label would put your name on somebody
+        // else's voice — 17 times on the install §29 measured.
+        let store = a_store_to_relabel();
+        {
+            let g = store.lock().unwrap();
+            let you = g.ensure_you_speaker(0).unwrap();
+            g.upsert_discord_user("me", "nerdrx", 0).unwrap();
+            g.set_discord_link("me", Some(you), Some(crate::store::truth_via::MANUAL), 0)
+                .unwrap();
+            let src = g.upsert_source("vesktop", "Vesktop", 1).unwrap();
+            let sess = g.begin_session(src, 0).unwrap();
+            for k in 0..3i64 {
+                let t = (500 + k) * 10 * 1_000_000_000;
+                let seg = g
+                    .insert_segment(sess, t, t + 4_000_000_000, "me.wav", 0)
+                    .unwrap();
+                // As clean as ground truth ever gets, and still refused.
+                g.set_segment_truth(seg, Some("me"), "single", Some(1.0))
+                    .unwrap();
+            }
+        }
+        let moved = label_from_truth(&store, usize::MAX, true, 1).unwrap();
+        assert!(
+            moved.iter().all(|m| m.user_id != "me"),
+            "your own account is not evidence about audio that cannot contain you"
+        );
+        assert_eq!(moved.len(), 4, "the other user's four turns still land");
+    }
+
+    #[test]
+    fn only_a_single_verdict_counts_as_discords_word() {
+        let store = a_store_to_relabel();
+        let seg = {
+            let g = store.lock().unwrap();
+            let src = g.upsert_source("vesktop", "Vesktop", 1).unwrap();
+            let sess = g.begin_session(src, 0).unwrap();
+            let seg = g
+                .insert_segment(sess, 5_000_000_000, 7_000_000_000, "p.wav", 0)
+                .unwrap();
+            // `partial` is the verdict that exists precisely because it is not
+            // good enough to be `single`. It must not become a label.
+            g.set_segment_truth(seg, Some("linked"), "partial", Some(0.5))
+                .unwrap();
+            seg
+        };
+        let moved = label_from_truth(&store, usize::MAX, true, 1).unwrap();
+        assert!(moved.iter().all(|m| m.segment_id != seg));
+        assert_eq!(label_of(&store, seg), (None, None));
     }
 }

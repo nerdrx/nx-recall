@@ -3052,3 +3052,140 @@ passed.
   `digest rerender`.
 - Additive only. A client that reads `summary` and ignores the rest sees the
   same field it always did, with names in it.
+
+## 0.11.9 — Discord's word, applied; and the second client
+
+Three things, and the third is the reason the other two are shaped the way they
+are. The daemon had 168 turns it could name and had not; it had 137 turns queued
+for an enrolment pass that was switched off with nothing saying so; and it had a
+verdict, `nobody`, that it had been reading as a fact about a *person* when on
+this install it was a fact about *which of two Discord clients the plugin was
+sitting in*. The first two ship. The third ends two features that were designed
+and measured and then refused, and ships the one column that makes the question
+answerable next time.
+
+### `label_via = "truth"` — Discord names the blank turns
+
+A fifth value for `segments.label_via`, beside `match`, `mic`, `proximity` and
+`manual`. It means: the identity ladder declined to name this turn, Discord's
+verdict for it was `single`, and the account that owned it was already linked to
+a voice. `match_score` is NULL, as it is for `proximity`, because nothing was
+compared.
+
+**`recalld truth label`** lists what it would name; `--apply` writes; `--limit N`
+stops after N. Also runs nightly inside the truth worker, after the auto-linker
+and never before it (a user linked tonight has their backlog named tonight).
+
+Four things it will not do, by construction rather than by flag:
+
+- **It never overwrites.** A row that already has a speaker is not a candidate —
+  ladder, person or proximity, it is left alone. So the pass cannot move the
+  identity precision `truth report` prints: every row it writes was counted
+  `unlabelled` before and none was counted `correct`.
+- **It never enrols.** Not one prototype. The enrol bar is deliberately not
+  learned, and a pass that added prototypes on Discord's word would be that bar
+  learning itself through the side door. `[truth] enrol` remains the supervised
+  route.
+- **It never mints.** Only accounts already linked to a voice are read.
+- **It never uses your own account.** A `single` verdict naming *you* is not
+  evidence about audio captured from your own Discord client — that client never
+  plays your microphone back to you, so yours is the one voice the stream cannot
+  contain. 0.10.1 established this for scoring (FINDINGS §17, 73% → 88%); 0.11.9
+  inherits it for labelling, where getting it wrong would have put the user's
+  name on 17 turns of somebody else's voice, permanently.
+
+There is **no duration bar**, which makes it the only truth pass without one.
+Every other one is *measuring* the voicebank, where a sub-second turn measures
+the floor rather than the model. This one measures nothing; it copies a name.
+Discord's word about a one-second turn is as good as its word about a ten-second
+one, and the short turns are the ones no other route can ever name.
+
+Each `--apply` logs one **`truth.label`** operation per 200 rows, carrying every
+segment's prior state in `speakers.split`'s shape, so the pass is reversible as a
+class.
+
+### `truth.summary` — the two queues, said out loud
+
+Two new objects. Additive; a client that ignores them sees 0.11.8's reply.
+
+```json
+{"enrol": {"on": false, "waiting": 137,
+           "min_duration_ms": 3000, "min_coverage": 0.95},
+ "retro_label": {"waiting": 168}}
+```
+
+`enrol.waiting` is the count of turns that *would* be considered if `[truth]
+enrol` were true. It exists because of the shape of §29's investigation: the
+enrolment pass had never once fired, `segments.truth_enrol_ns` was NULL on all
+1,461 `single` rows, and the cause was neither a bug nor a bar the data could not
+reach — the feature was off by default and had never been turned on. Nothing
+anybody could run said so. A switch nobody can see is indistinguishable from a
+bug, and an evening went into telling them apart. `"off"` is a setting;
+`"off, with 137 turns waiting"` is a decision. `recalld truth report` prints both
+queues whenever they are non-empty.
+
+### Schema v14 — `sessions.instance_key`
+
+One nullable column, no backfill: for a session already on disk the answer is
+genuinely unknown, and NULL is the only honest way to say so. NULL is **not**
+"instance one".
+
+It holds `serial:<object.serial>`, or `pid:<application.process.id>` where
+PipeWire gave no serial — both already read by `capture::node_info_from_props`
+and, until now, thrown away at `Shared::attach`.
+
+**Why it is on the session and must never go on the source.** `sources.match_key`
+comes from `application.process.binary`, so two copies of one application share
+one source row. The obvious fix — suffix the key with the pid — is a trap:
+`allowlist::decide` looks that key up in the `[rules]` table by exact string, so
+`"vesktop#4711"` matches no rule, falls through to default-deny, and **capture
+silently stops for an app the user explicitly allowed**. `[rules.X]` would grow
+an entry per launch, `recalld allow <KEY>` would need a number a human cannot
+know, and the GUI's source card and per-source search filter are keyed the same
+way. A session, by contrast, is already per-PipeWire-node — two instances already
+open two concurrent `sessions` rows against the one source — so the identity has
+a home that costs nothing.
+
+What the column does **not** do is say which instance the ground-truth plugin is
+sitting in. That needs the plugin to name the call it is watching, which is a
+wire change and is not in this round.
+
+### The two-client failure mode
+
+Read this before trusting a `nobody` verdict for anything.
+
+`truth_verdict = 'nobody'` means *no account the RecallBridge plugin can see
+reached 20% coverage of this turn, and the plugin was running*. It has always
+been documented as "a real disagreement worth looking at". On an install running
+**two Discord clients** it is frequently not a disagreement at all:
+
+- Both clients are Vesktop, so PipeWire names both nodes `vesktop` and both
+  collapse into one `sources` row and, on the evening §29 measured, into one
+  session.
+- Only one client carries the plugin. The other's call — different account,
+  different channel, different people — arrives through the same source with no
+  speaking spans behind it at all.
+- The plugin's own call is live and noisy, so `truth_spans_between` finds spans
+  within five minutes and the verdict is `nobody` rather than `unknown`.
+
+The result is a confident-looking `nobody` on turns of real people the plugin was
+never able to see. On the measured install that was **190 rows across four
+voices, every one of them a person the user had named by hand within two minutes
+of the voice being minted**. Neither of the two obvious daemon-side repairs
+works, and both were measured before being dropped (§29): a session-level rule
+("a session with no positive verdict is not the bridge's call") rescues 31 of 350
+rows and not one of the 190, because both calls shared session 305; a voice-level
+rule ("a voice that never once got a positive verdict") rescues 20 and not one of
+the 190, because cross-talk from the local user gave all four voices `single`
+verdicts of their own.
+
+Consequences, which are contracts and not advice:
+
+- **`nobody` is not evidence that no human spoke.** Nothing may unassign a label,
+  refuse a mint, or downgrade a voice on the strength of it. 0.11.9 designed both
+  a `identity repair --media` and a mint guard keyed on `nobody`, measured them,
+  and shipped neither; §29 has the numbers and the reasoning.
+- **`nobody` remains excluded from every score,** as it has been since 0.9.0.
+  Nothing about the identity or overlap numbers changes.
+- The honest fix is to stop merging the two instances, which is what
+  `sessions.instance_key` begins and a plugin that names its call will finish.

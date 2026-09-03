@@ -79,7 +79,16 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // column lives in `crate::truth::migrate_v13`, which also backfills it for
 // verdicts already on disk — but only where the speaking spans survive, since
 // a purged span and a quiet turn would otherwise both read 0.0.
-pub const SCHEMA_VERSION: i64 = 13;
+// ---- 0.11.9 (schema v14): which instance a session was ---------------------
+// v14 adds `sessions.instance_key`: which *copy* of an application opened the
+// session, from `object.serial` or `application.process.id`. Two Vesktop
+// clients share one `sources` row because the key is the process binary, and
+// §29 is what that costs when only one of them carries the ground-truth
+// plugin. Nullable, no backfill — for a session already on disk the answer is
+// unknown and NULL is the only honest way to say so. See
+// `Store::begin_session_for`, including why the discriminator is not allowed
+// anywhere near `match_key`.
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -122,6 +131,20 @@ pub mod label_via {
     pub const PROXIMITY: &str = "proximity";
     /// A person said so.
     pub const MANUAL: &str = "manual";
+    // ---- 0.11.9: retro-labelling from ground truth -------------------------
+    /// Discord said so (0.11.9). The segment carries a `single` verdict, the
+    /// Discord user who owned it is linked to a voice, and the voicebank had
+    /// declined to name the row at all.
+    ///
+    /// It is deliberately **not** `MATCH`: nothing was compared, so
+    /// `match_score` stays NULL for the same reason [`PROXIMITY`]'s does, and a
+    /// client that renders provenance must be able to say where the name came
+    /// from. It is deliberately not `MANUAL` either — a person did not look at
+    /// this row, and `MANUAL` is the one value the auto-linker is forbidden to
+    /// overwrite (see `truth::link_batch`). Giving Discord its own value keeps
+    /// that promise intact and keeps this pass reversible as a class.
+    pub const TRUTH: &str = "truth";
+    // ---- end 0.11.9 --------------------------------------------------------
 }
 
 /// `segments.lang_via` — how this row's *language* came to be what it is (v5).
@@ -252,6 +275,22 @@ pub mod truth_via {
     pub const LEARNED: &str = "learned";
     // ---- end 0.11.0 -------------------------------------------------------
 }
+
+// ---- 0.11.9: retro-labelling from ground truth -----------------------------
+
+/// A turn Discord can name that the voicebank left blank.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TruthLabelCandidate {
+    pub id: i64,
+    pub user_id: String,
+    pub user_name: String,
+    pub speaker_id: i64,
+    pub t_start_ns: i64,
+    pub t_end_ns: i64,
+    pub coverage: Option<f64>,
+}
+
+// ---- end 0.11.9 -----------------------------------------------------------
 
 /// `settings` key holding the id of the pinned "You" speaker.
 pub const YOU_SPEAKER_KEY: &str = "you_speaker_id";
@@ -1001,6 +1040,13 @@ impl Store {
         self.apply_digest_names()?;
         // ---- end 0.11.6 ---------------------------------------------------
 
+        // ---- 0.11.9 (schema v14): which instance a session was -------------
+        // One nullable column on `sessions`, no backfill: for every session
+        // that already exists the answer is genuinely unknown, and NULL is the
+        // only honest way to say so. See `apply_session_instance`.
+        self.apply_session_instance()?;
+        // ---- end 0.11.9 ---------------------------------------------------
+
         match current {
             None => {
                 self.conn.execute(
@@ -1650,12 +1696,73 @@ impl Store {
     }
 
     pub fn begin_session(&self, source_id: i64, started_at_utc_ns: i64) -> Result<i64> {
+        self.begin_session_for(source_id, started_at_utc_ns, None)
+    }
+
+    // ---- 0.11.9: which instance a session was ------------------------------
+
+    /// `begin_session`, remembering *which copy of the application* opened it.
+    ///
+    /// ## The failure this exists to end
+    ///
+    /// `sources.match_key` is derived from `application.process.binary`, so two
+    /// simultaneously-running copies of one app — two Vesktop clients signed
+    /// into two Discord accounts — collapse into a single `sources` row and a
+    /// single name on every turn. §29 is the bill for that: one account's call
+    /// carried the RecallBridge plugin and one did not, both landed under
+    /// `"vesktop"`, and Discord's ground truth was therefore asked about turns
+    /// it had never been able to see. It answered `nobody`, correctly and
+    /// uselessly, 190 times, and four real people came within one `--apply` of
+    /// having their labels stripped on the strength of it.
+    ///
+    /// ## Why the discriminator goes here and not on the source
+    ///
+    /// The obvious fix — suffix `match_key` with the pid — is a trap, and the
+    /// blast radius is worth writing down because it is not obvious:
+    /// `allowlist::decide` looks the key up in the `[rules]` table by exact
+    /// string, so `"vesktop#4711"` matches no rule, falls through to
+    /// default-deny, and **capture silently stops for an app the user allowed**.
+    /// Every `[rules.X]` entry, `recalld allow <KEY>`, the GUI's source card and
+    /// its per-source search filter are keyed the same way.
+    ///
+    /// A session is already per-PipeWire-node — `Shared::captures` is keyed by
+    /// `node_id`, so two instances already open two concurrent `sessions` rows
+    /// against the one source. The instance identity was in `NodeInfo` at that
+    /// exact call site and was thrown away. This column stops throwing it away.
+    /// Nothing keyed on `match_key` changes, so nothing above breaks.
+    ///
+    /// ## What it is, and what it deliberately is not
+    ///
+    /// `object.serial` where PipeWire gave one — never reused within a boot —
+    /// else `application.process.id`. It identifies a *stream*, not an account:
+    /// it cannot say which instance is the bridge's, and it must not be read as
+    /// if it could. Deciding that needs the plugin to name the call it is
+    /// watching, which is a wire change and is not in this round. What the
+    /// column buys today is that the question becomes *answerable* from data
+    /// the daemon is already collecting, where before tonight it was not.
+    ///
+    /// NULL means a session recorded before this column existed, or one opened
+    /// by a node that carried neither property. NULL is not "one instance".
+    pub fn begin_session_for(
+        &self,
+        source_id: i64,
+        started_at_utc_ns: i64,
+        instance_key: Option<&str>,
+    ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO sessions (source_id, started_at_utc_ns) VALUES (?1, ?2)",
-            params![source_id, started_at_utc_ns],
+            "INSERT INTO sessions (source_id, started_at_utc_ns, instance_key)
+             VALUES (?1, ?2, ?3)",
+            params![source_id, started_at_utc_ns, instance_key],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
+
+    fn apply_session_instance(&self) -> Result<()> {
+        self.add_column_if_missing("sessions", "instance_key", "TEXT")?;
+        Ok(())
+    }
+
+    // ---- end 0.11.9 --------------------------------------------------------
 
     pub fn end_session(&self, session_id: i64, ended_at_utc_ns: i64) -> Result<()> {
         self.conn.execute(
@@ -5739,6 +5846,116 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    // ---- 0.11.9: retro-labelling from ground truth -------------------------
+
+    /// How many turns would enrol if `[truth] enrol` were on, and never will
+    /// while it is off.
+    ///
+    /// The same `WHERE` as [`Self::segments_for_truth_enrol`] with the `LIMIT`
+    /// and the column list taken off. It exists because §29 found the enrolment
+    /// pass had never fired on an install with 137 turns queued for it, and the
+    /// reason was neither a bug nor a bar the data could not reach: the feature
+    /// was simply off, and nothing anybody could run said so. A count in
+    /// `truth.summary` is the cheapest possible cure — the operator sees the
+    /// queue and the switch in the same report.
+    pub fn truth_enrol_waiting(&self, min_duration_s: f64, min_coverage: f64) -> Result<i64> {
+        let min_ns = (min_duration_s * 1e9) as i64;
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*)
+               FROM segments g
+               JOIN discord_users d ON d.user_id = g.truth_user_id
+              WHERE g.deleted_at IS NULL
+                AND g.truth_verdict = ?1
+                AND g.truth_enrol_ns IS NULL
+                AND d.speaker_id IS NOT NULL
+                AND g.truth_coverage >= ?2
+                AND (g.t_end_ns - g.t_start_ns) >= ?3",
+            params![truth_verdict::SINGLE, min_coverage, min_ns],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Turns Discord can name and the voicebank could not: `single` verdict, a
+    /// linked user, and no speaker at all.
+    ///
+    /// No duration bar, deliberately, and it is the one place in this file that
+    /// does not have one. Every other truth pass filters short turns because it
+    /// is *measuring* the voicebank, and a sub-second grunt the embedder refused
+    /// would measure the floor rather than the model
+    /// (`truth::MIN_SCORE_DURATION_S`). This pass measures nothing. It copies a
+    /// name Discord already wrote onto a row that has none, and Discord's word
+    /// about a one-second turn is exactly as good as its word about a ten-second
+    /// one — the ring was drawn from the same flux event. Refusing the short
+    /// ones would leave the shortest turns, which are the hardest to label by
+    /// any other route, permanently anonymous for no reason anybody could state.
+    ///
+    /// Ordered oldest-first so a `--limit` run takes the backlog in the order it
+    /// happened rather than a random slice of it.
+    ///
+    /// `you` is the pinned "You" voice and is **excluded**, which is not a
+    /// nicety — it is the difference between this pass helping and quietly
+    /// corrupting the archive. 0.10.1 already established the fact
+    /// (`truth::summary`, FINDINGS §17): a Discord client never plays your own
+    /// microphone back to you, so yours is the one voice a turn captured from
+    /// that client's output *cannot* contain. A `single` verdict naming your own
+    /// account therefore says "you were talking over this", not "this is you",
+    /// and the scoring path drops those rows for exactly that reason. Writing
+    /// them as labels would put your name on 17 turns of somebody else's voice
+    /// on the install §29 measured — permanently, in the thing you later read
+    /// back as memory. Passing `None` disables the exclusion and is meant for
+    /// tests; the daemon and the CLI both pass `store.you_speaker_id()`.
+    pub fn segments_for_truth_label(
+        &self,
+        you: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TruthLabelCandidate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.truth_user_id, d.name, d.speaker_id, g.t_start_ns, g.t_end_ns,
+                    g.truth_coverage
+               FROM segments g
+               JOIN discord_users d ON d.user_id = g.truth_user_id
+              WHERE g.deleted_at IS NULL
+                AND g.truth_verdict = ?1
+                AND g.speaker_id IS NULL
+                AND d.speaker_id IS NOT NULL
+                AND (?3 IS NULL OR d.speaker_id != ?3)
+              ORDER BY g.t_start_ns ASC, g.id ASC
+              LIMIT ?2",
+        )?;
+        Ok(stmt
+            .query_map(params![truth_verdict::SINGLE, limit as i64, you], |r| {
+                Ok(TruthLabelCandidate {
+                    id: r.get(0)?,
+                    user_id: r.get(1)?,
+                    user_name: r.get(2)?,
+                    speaker_id: r.get(3)?,
+                    t_start_ns: r.get(4)?,
+                    t_end_ns: r.get(5)?,
+                    coverage: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Put Discord's name on a row the voicebank left blank.
+    ///
+    /// `AND speaker_id IS NULL` is repeated here even though the query that
+    /// produced the candidate already required it: the gather and the commit
+    /// happen under two different acquisitions of the store lock, and in between
+    /// them the live ladder may well have labelled the row itself. Losing the
+    /// race is the correct outcome — the live label was made with the audio in
+    /// hand — so the guard is in the `WHERE` and the return value says whether
+    /// the write landed.
+    pub fn label_segment_from_truth(&self, segment_id: i64, speaker_id: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE segments SET speaker_id = ?2, match_score = NULL, label_via = ?3
+              WHERE id = ?1 AND speaker_id IS NULL AND deleted_at IS NULL",
+            params![segment_id, speaker_id, label_via::TRUTH],
+        )? > 0)
+    }
+
+    // ---- end 0.11.9 --------------------------------------------------------
+
     /// Mark an enrolment candidate as considered, whether or not it enrolled.
     /// Without this the pass would re-embed the same refused turn forever.
     pub fn mark_truth_enrol_considered(&self, segment_id: i64, at_ns: i64) -> Result<()> {
@@ -7313,6 +7530,65 @@ mod tests {
 
     // ---- Step 1 behaviour, unchanged -------------------------------------
 
+    // ---- 0.11.9 (schema v14): which instance a session was -----------------
+
+    #[test]
+    fn two_copies_of_one_app_share_a_source_and_no_longer_share_an_identity() {
+        let s = store();
+        // What PipeWire gives us: one `application.process.binary`, so one
+        // source row — and that stays true, because the allowlist, the
+        // `[rules]` table and the GUI's source card are all keyed on it.
+        let src = s.upsert_source("vesktop", "Vesktop", 1).unwrap();
+        let a = s.begin_session_for(src, 10, Some("serial:8801")).unwrap();
+        let b = s.begin_session_for(src, 11, Some("serial:8802")).unwrap();
+        let same: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT source_id) FROM sessions WHERE id IN (?1, ?2)",
+                params![a, b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(same, 1, "one app, one source row — unchanged");
+        let keys: Vec<Option<String>> = ["a", "b"]
+            .iter()
+            .zip([a, b])
+            .map(|(_, id)| {
+                s.conn
+                    .query_row(
+                        "SELECT instance_key FROM sessions WHERE id = ?1",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![Some("serial:8801".into()), Some("serial:8802".into())],
+            "…and the two copies are now distinguishable, which is the whole change"
+        );
+    }
+
+    #[test]
+    fn a_session_from_a_node_with_no_instance_property_is_null_not_a_guess() {
+        // NULL has to stay distinguishable from "instance one". A session
+        // recorded before v14, or opened by a node carrying neither
+        // `object.serial` nor `application.process.id`, genuinely does not know.
+        let s = store();
+        let src = s.upsert_source("vesktop", "Vesktop", 1).unwrap();
+        let id = s.begin_session(src, 10).unwrap();
+        let key: Option<String> = s
+            .conn
+            .query_row(
+                "SELECT instance_key FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, None);
+    }
+
     #[test]
     fn schema_version_is_stamped() {
         let s = store();
@@ -7501,7 +7777,6 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(v, 13);
 
         // The note is still there, and it is not a reminder: nothing invented a
         // date for a sentence that never had one.

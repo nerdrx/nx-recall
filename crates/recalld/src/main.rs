@@ -2980,8 +2980,88 @@ fn cmd_truth(
             Ok(())
         }
         TruthAction::Report => cmd_truth_report(cfg, data_dir),
+        // ---- 0.11.9: retro-labelling from ground truth ----------------
+        TruthAction::Label { apply, limit } => cmd_truth_label(data_dir, apply, limit),
+        // ---- end 0.11.9 -----------------------------------------------
     }
 }
+
+// ---- 0.11.9: retro-labelling from ground truth -----------------------------
+
+/// `recalld truth label` — name the blank turns Discord can already name.
+///
+/// Opens the database directly, like `identity repair` beside it and for the
+/// same reason: this is a bulk correction to history rather than a live
+/// decision, and it has to work on a machine where no daemon is running. When
+/// one *is* running the two cannot corrupt each other — every write carries
+/// `AND speaker_id IS NULL`, so whichever of them reaches a row first wins it
+/// and the other simply does not count it.
+fn cmd_truth_label(data_dir: &Path, apply: bool, limit: Option<usize>) -> Result<()> {
+    let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open(data_dir)?));
+    let now = recalld::clock::utc_now_ns();
+    let moved = recalld::truth::label_from_truth(&store, limit.unwrap_or(usize::MAX), apply, now)?;
+    if moved.is_empty() {
+        println!(
+            "Nothing to name. Every turn Discord gave a `single` verdict to, for an\n\
+             account linked to a voice, already has a speaker."
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} turn(s) the voicebank left blank, and Discord can name{}. Each gets\n\
+         `label_via = truth` and no match score — nothing was compared. No prototype\n\
+         is enrolled and no voice is minted, and your own account never names a turn:\n\
+         a Discord stream is the one place your own voice cannot be.\n",
+        moved.len(),
+        if apply { "" } else { " (preview only)" }
+    );
+    let mut by_user: Vec<(String, i64, usize)> = Vec::new();
+    for m in &moved {
+        match by_user
+            .iter_mut()
+            .find(|(u, s, _)| *u == m.user_name && *s == m.speaker_id)
+        {
+            Some((_, _, n)) => *n += 1,
+            None => by_user.push((m.user_name.clone(), m.speaker_id, 1)),
+        }
+    }
+    for (name, speaker_id, n) in &by_user {
+        println!("  {:<24} → voice {speaker_id:<5} {n} turn(s)", name);
+    }
+
+    println!(
+        "\n{:<9} {:<21} {:>7} {:>9}",
+        "SEGMENT", "WHEN", "SECONDS", "COVERAGE"
+    );
+    for m in moved.iter().take(AUDIT_TAIL) {
+        println!(
+            "{:<9} {:<21} {:>7.1} {:>9}",
+            m.segment_id,
+            format_time(m.t_start_ns),
+            m.duration_s,
+            m.coverage
+                .map(|c| format!("{c:.2}"))
+                .unwrap_or_else(|| "—".into()),
+        );
+    }
+    if moved.len() > AUDIT_TAIL {
+        println!("  … and {} more", moved.len() - AUDIT_TAIL);
+    }
+
+    if apply {
+        println!(
+            "\n{} turn(s) named. Logged as `truth.label`, prior state and all.",
+            moved.len()
+        );
+        println!("Restart nothing: the rows are already what every client will read next.");
+    } else {
+        println!("\nNothing written. Add --apply.");
+    }
+    Ok(())
+}
+
+// ---- end 0.11.9 ------------------------------------------------------------
 
 /// `recalld truth report` — the measurement this whole subsystem exists for.
 fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
@@ -3018,6 +3098,36 @@ fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
         ("  unknown", "unknown"),
     ] {
         println!("{label:<20}{}", n(key));
+    }
+
+    // ---- 0.11.9: the two queues ----
+    //
+    // Printed whenever there is something in them, and silent when there is
+    // not. §29's finding was that 137 turns had been queued for an enrolment
+    // pass that was switched off, for as long as the feature had existed, and
+    // no report said so — a switch nobody can see is indistinguishable from a
+    // bug, and the operator spent the evening looking for the bug.
+    let enrol = &a["enrol"];
+    let enrol_waiting = enrol["waiting"].as_i64().unwrap_or(0);
+    if enrol_waiting > 0 || enrol["on"].as_bool().unwrap_or(false) {
+        println!(
+            "\n{:<20}{}",
+            "enrolment from truth",
+            if enrol["on"].as_bool().unwrap_or(false) {
+                "ON"
+            } else {
+                "OFF — `[truth] enrol = true` turns it on"
+            }
+        );
+        println!("{:<20}{enrol_waiting} turn(s) queued", "  waiting");
+    }
+    let retro_waiting = a["retro_label"]["waiting"].as_i64().unwrap_or(0);
+    if retro_waiting > 0 {
+        println!("\n{:<20}{retro_waiting} turn(s)", "blank but nameable");
+        println!(
+            "{:<20}`recalld truth label` lists them; --apply names them",
+            ""
+        );
     }
 
     let id = &a["identity"];
