@@ -1725,9 +1725,10 @@ export function runE2E(deps) {
           const row = document.querySelector('#seg-list .seg[data-seg="${target.id}"]');
           return { name: sp?.name ?? null, row: row ? row.textContent : '' , offered: !!document.getElementById('name-voice-row') && !document.getElementById('name-voice-row').hidden };
         })()`);
-        return v.name === name && v.row.includes(name) ? v : null;
+        // The row repaints from the relabel event and the sheet's offer repaints
+        // a beat later; both are waited for, not asserted on the first paint.
+        return v.name === name && v.row.includes(name) && !v.offered ? v : null;
       });
-      assert(!named.offered, 'the offer stayed up after the voice was named');
       // Put the fixture back so later steps meet the voice and the row they expect.
       await js(`window.recall.request('speakers.name', { id: ${target.speaker}, name: '' })`);
       await js(`window.recall.request('segments.reassign', { segment_id: ${target.id}, speaker_id: ${target.was === null ? 'null' : target.was} })`);
