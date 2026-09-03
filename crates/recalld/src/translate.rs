@@ -537,7 +537,6 @@ pub fn drain_live(
         if text.trim().is_empty() {
             continue;
         }
-        worked = true;
 
         // ---- ask (no lock) ----
         // 0.11.0: the same backend rule as `batch` — the dedicated translator
@@ -578,6 +577,11 @@ pub fn drain_live(
                 }
             }
         }
+        // Here and not before the ask: the turn is only work once something
+        // decided it. The `break` above puts an untouched id back on the queue
+        // and is not work — claiming it was halved the worker's sleep for a
+        // pass that translated nothing.
+        worked = true;
         if matches!(verdict, Verdict::Translated(_)) {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
             crate::pipeline::publish_segment(bus, &guard, id);
@@ -967,6 +971,13 @@ pub fn batch(
     // person turning the setting mid-batch cannot produce a run of rows with
     // two different `via`s and no way to tell which is which.
     let nllb = nllb_selected();
+    // What was actually decided, not what was considered. The caller uses this
+    // to halve its sleep — "a backlog should drain at the pace of the model,
+    // not at the pace of the sleep" — so a pass that broke out of the loop
+    // before it touched anything and still answered `Ok(true)` had the worker
+    // re-scanning the database twice as often for ever, on the strength of
+    // work it did not do.
+    let mut worked = false;
     for c in candidates {
         if stop() || crate::enrich::gate(control, &control.graph()).is_some() {
             break;
@@ -1020,12 +1031,14 @@ pub fn batch(
                 }
             }
         }
+        // A row was decided, either way. This is the only place it is set.
+        worked = true;
         if matches!(verdict, Verdict::Translated(_)) {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
             crate::pipeline::publish_segment(bus, &guard, c.id);
         }
     }
-    Ok(true)
+    Ok(worked)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1729,6 +1742,113 @@ mod tests {
         // …and the row is left completely alone: no language stamped by a
         // feature that is switched off.
         assert_eq!(store.segment_row(ids[0]).unwrap().unwrap().lang, None);
+    }
+
+    #[test]
+    fn words_that_were_replaced_take_their_translation_with_them() {
+        let _live = test_guard();
+        set_read_languages(&["en".to_string()]);
+        let (store, ids) = store_with(&[("Sima Sen Okenki Deska.", Some("ja"))]);
+        let id = ids[0];
+        store
+            .set_segment_translation(id, "Sima Sen, how are you.", "q@1")
+            .unwrap();
+        assert!(
+            store
+                .segments_for_translation("en", &read_languages(), 3, 50)
+                .unwrap()
+                .is_empty(),
+            "a translated row is out of the queue, which is the whole problem"
+        );
+
+        // Now the Japanese router re-decodes it — the same call the context
+        // pass and the night shift use.
+        store
+            .set_segment_text_via(
+                id,
+                "しませんお元気ですか。",
+                "parakeet-ja@1",
+                crate::store::text_via::ARBITER,
+                42,
+            )
+            .unwrap();
+
+        let row = store.segment_row(id).unwrap().unwrap();
+        assert_eq!(row.text.as_deref(), Some("しませんお元気ですか。"));
+        // The translation of the words nobody said is gone, and gone with its
+        // `via` — a `via` naming a model that translated a different sentence
+        // is provenance for the wrong thing.
+        assert_eq!(
+            row.translation, None,
+            "the row served a translation of the text it no longer has"
+        );
+        assert_eq!(row.translation_via, None);
+        // …so the ordinary pass sees it again, against the words it now says.
+        // (`translation_via IS NULL` is the queue predicate, which is why a
+        // stale translation was permanent rather than merely wrong.) The floor
+        // is one word here because Japanese has no spaces — the same reason
+        // `judge`'s length guard counts characters as well as words.
+        assert_eq!(
+            store
+                .segments_for_translation("en", &read_languages(), 1, 50)
+                .unwrap()
+                .len(),
+            1
+        );
+        // And the prior text is still in the audit trail, as it always was.
+        assert_eq!(
+            store.operations_of("segments.redecode", 10).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_pass_with_no_backend_at_all_does_not_report_that_it_worked() {
+        let _live = test_guard();
+        set_target("en");
+        set_read_languages(&["en".to_string()]);
+        // NLLB is selected but there is no models root, so it is not
+        // *installed* — and no graph model is handed in either.
+        set_translator(TRANSLATOR_NLLB, 4);
+        assert!(!nllb_selected(), "nothing is on disk");
+
+        let (store, ids) = store_with(&[("das ist der einzige weg", Some("de"))]);
+        // The row really is a candidate: this is a pass with work in front of
+        // it and nothing to do the work with.
+        assert_eq!(
+            store
+                .segments_for_translation("en", &read_languages(), 3, 50)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let bus = Bus::new(64, 32);
+        let control = Control::new(
+            std::path::PathBuf::from("/nonexistent"),
+            None,
+            &crate::allowlist::Allowlist::from_rules([("VRChat.exe", true)]),
+        );
+        let store = Arc::new(std::sync::Mutex::new(store));
+        let did = batch(
+            &store,
+            &control,
+            &bus,
+            None,
+            &AssistConfig::default(),
+            &|| false,
+        )
+        .unwrap();
+
+        // `Ok(true)` means "there was work". Nothing was asked, nothing was
+        // written, nothing was even declined — and the caller uses this answer
+        // to halve its sleep, so saying yes here is a worker that re-scans the
+        // database twice as fast for ever on the strength of a pass that did
+        // nothing.
+        assert!(!did, "a pass that decided nothing has not worked");
+        let row = store.lock().unwrap().segment_row(ids[0]).unwrap().unwrap();
+        assert_eq!(row.translation, None);
+        assert_eq!(row.translation_via, None, "not even declined");
     }
 
     // ---- against the real model --------------------------------------------

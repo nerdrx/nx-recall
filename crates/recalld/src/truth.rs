@@ -621,13 +621,37 @@ fn calibrate_pass(
     last: &mut Option<(i64, usize)>,
 ) -> Result<()> {
     let now = utc_now_ns();
-    let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-    let rows = guard
-        .truth_calibration_rows(crate::identity_learn::MIN_DURATION_S)?
-        .len();
-    if let Some((at, seen)) = *last
-        && (now - at < CALIBRATE_INTERVAL_NS || (rows as f64) < (seen as f64) * CALIBRATE_GROWTH)
+    // ---- the cheap half of the limit, before the store is even locked ----
+    //
+    // 0.11.x. This used to load the corpus first and consult the clock second,
+    // which meant `truth_calibration_rows` — every truth-labelled turn, with
+    // its embedding blob read and deserialised — ran on **every tick of this
+    // worker**, `[truth].batch_pause_s` apart, twenty seconds by default, and
+    // did it holding the store mutex. Six-hourly was the fit; the walk was
+    // three times a minute, for a number that was thrown away.
+    //
+    // The mutex is the part that matters. `crate::enrich` carries the note
+    // from the night this project learned it: a worker that holds the store
+    // lock across long work blocks the capture pipeline's segment inserts, and
+    // the queue overflows into audio gaps. A full-table join with a
+    // per-row embedding decode is long work, and it grows with the archive.
+    if let Some((at, _)) = *last
+        && now - at < CALIBRATE_INTERVAL_NS
     {
+        return Ok(());
+    }
+    let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+    // ---- the growth half, as a count rather than a corpus ----
+    //
+    // "Has the truth corpus grown by a fifth" is a question about how many
+    // rows there are, not about what is in them.
+    let rows = guard.truth_calibration_row_count(crate::identity_learn::MIN_DURATION_S)?;
+    if let Some((_, seen)) = *last
+        && (rows as f64) < (seen as f64) * CALIBRATE_GROWTH
+    {
+        // Deliberately does NOT stamp `last`: once six hours have passed, the
+        // pass should fit on the evening the evidence arrives, not six hours
+        // after it. The re-check that costs is now a `COUNT(*)`.
         return Ok(());
     }
     let report = crate::identity_learn::calibrate(&guard, identity, true, now)?;
@@ -1027,5 +1051,129 @@ mod tests {
         assert_eq!(ratio(0, 0), Value::Null);
         assert_eq!(ratio(3, 0), Value::Null);
         assert_eq!(ratio(1, 4), json!(0.25));
+    }
+
+    // ---- 0.11.x: what the calibration pass costs between fits -------------
+
+    /// Two linked voices with `n` truth turns each and a prototype apiece —
+    /// enough for `truth_calibration_rows` to have real work to do.
+    fn a_store_with_truth(n: usize) -> Store {
+        use crate::embed::Embedding;
+        use crate::store::truth_via;
+        let s = Store::open_in_memory().unwrap();
+        let src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let sec = 1_000_000_000i64;
+        for (i, (user, centre)) in [("u1", [1.0f32, 0.0, 0.0]), ("u2", [0.0, 1.0, 0.0])]
+            .iter()
+            .enumerate()
+        {
+            let sp = s.mint_speaker(0).unwrap();
+            s.upsert_discord_user(user, user, 0).unwrap();
+            s.set_discord_link(user, Some(sp), Some(truth_via::MANUAL), 0)
+                .unwrap();
+            s.add_prototype(
+                sp,
+                &Embedding::new("m@1", centre.to_vec()),
+                None,
+                false,
+                20,
+                0,
+            )
+            .unwrap();
+            for k in 0..n {
+                let t = ((i * n + k) as i64 + 1) * 10 * sec;
+                let seg = s.insert_segment(sess, t, t + 5 * sec, "a.wav", 0).unwrap();
+                let mut v = centre.to_vec();
+                v[2] = (k % 7) as f32 * 0.01;
+                s.store_embedding(seg, &Embedding::new("m@1", v)).unwrap();
+                s.set_segment_truth(seg, Some(user), "single", Some(0.95))
+                    .unwrap();
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn calibration_count_matches_the_rows_it_counts() {
+        // Two queries, one predicate. If they ever drift the rate limit is
+        // measuring a different corpus from the one the fit reads.
+        let s = a_store_with_truth(9);
+        let loaded = s
+            .truth_calibration_rows(crate::identity_learn::MIN_DURATION_S)
+            .unwrap()
+            .len();
+        assert!(loaded > 0, "the fixture has rows");
+        assert_eq!(
+            s.truth_calibration_row_count(crate::identity_learn::MIN_DURATION_S)
+                .unwrap(),
+            loaded
+        );
+        // …and on an empty store, where the fit gives up straight away.
+        let empty = Store::open_in_memory().unwrap();
+        assert_eq!(
+            empty
+                .truth_calibration_row_count(crate::identity_learn::MIN_DURATION_S)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn the_six_hour_limit_is_in_front_of_the_expensive_read_and_not_behind_it() {
+        use crate::store::CALIBRATION_ROW_LOADS;
+        let store = Arc::new(std::sync::Mutex::new(a_store_with_truth(20)));
+        let identity = IdentityConfig {
+            learn: true,
+            ..Default::default()
+        };
+        let mut last = None;
+
+        let before = CALIBRATION_ROW_LOADS.with(|c| c.get());
+        calibrate_pass(&store, &identity, &mut last).unwrap();
+        let after_fit = CALIBRATION_ROW_LOADS.with(|c| c.get());
+        assert!(after_fit > before, "the first pass fits, and a fit reads");
+        assert!(last.is_some(), "and it remembers when");
+
+        // Now the next six hours of ticks. `[truth].batch_pause_s` is twenty
+        // seconds, so this is a couple of minutes of a live daemon — and every
+        // one of these used to load and deserialise the whole truth corpus,
+        // holding the store mutex the capture pipeline writes through, only to
+        // discard the number because the clock said no.
+        for _ in 0..40 {
+            calibrate_pass(&store, &identity, &mut last).unwrap();
+        }
+        assert_eq!(
+            CALIBRATION_ROW_LOADS.with(|c| c.get()),
+            after_fit,
+            "a rate limit that reads the corpus first is not rate-limiting the cost"
+        );
+    }
+
+    #[test]
+    fn a_corpus_that_has_not_grown_does_not_get_refitted_when_the_clock_comes_round() {
+        use crate::store::CALIBRATION_ROW_LOADS;
+        let store = Arc::new(std::sync::Mutex::new(a_store_with_truth(20)));
+        let identity = IdentityConfig {
+            learn: true,
+            ..Default::default()
+        };
+        let mut last = None;
+        calibrate_pass(&store, &identity, &mut last).unwrap();
+        let (_, seen) = last.expect("a first pass");
+        assert!(seen > 0);
+
+        // Six hours later, with not one new truth row.
+        last = Some((utc_now_ns() - CALIBRATE_INTERVAL_NS - 1, seen));
+        let before = CALIBRATION_ROW_LOADS.with(|c| c.get());
+        calibrate_pass(&store, &identity, &mut last).unwrap();
+        assert_eq!(
+            CALIBRATION_ROW_LOADS.with(|c| c.get()),
+            before,
+            "the growth bar is checked with a COUNT, not with the corpus"
+        );
+        // And the stamp is left alone, so the evening the evidence DOES arrive
+        // is the evening it is fitted on — not six hours after it.
+        assert_eq!(last.map(|(_, n)| n), Some(seen));
     }
 }
