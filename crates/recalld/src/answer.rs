@@ -37,7 +37,9 @@
 //!   is the second net, and it is free);
 //! * the sentence shares at least [`MIN_OVERLAP`] content words with the rows
 //!   it cited. A sentence that cites row 109 and has no word in common with row
-//!   109 was not read off row 109, whatever the model believes.
+//!   109 was not read off row 109, whatever the model believes. For a language
+//!   that does not write spaces the unit is a character bigram and the floor is
+//!   [`MIN_OVERLAP_CJK`] — see there for why the word split was no check at all.
 //!
 //! A failed post-check is `refused`, and the hits are still returned: the
 //! honest fallback for "I cannot answer this" is the search results, which is
@@ -53,8 +55,9 @@
 //! ## The gate
 //!
 //! `spike/answer_bench` — 24 cases over a seeded 200-turn de/en transcript, 12
-//! answerable and 12 traps, run against the real Qwen on four pinned cores at
-//! nice 19. See [`GATE`] for what it measured and whether this ships.
+//! answerable and 12 traps, plus six over a 44-turn Japanese one (`--lang ja`),
+//! run against the real Qwen on four pinned cores at nice 19. See [`GATE`] for
+//! what it measured and whether this ships.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -86,8 +89,27 @@ const MAX_ROW_CHARS: usize = 320;
 /// one word in common is what any two sentences about the same evening have.
 pub const MIN_OVERLAP: usize = 2;
 
+/// The same check, counted in character bigrams, for text that is not written
+/// with spaces in it (0.11.x).
+///
+/// A Japanese sentence handed to [`overlap`]'s word split is **one token**, so
+/// the grounding check had exactly two outcomes: 1 if the answer was character
+/// for character the row, and 0 otherwise. That is not a weak check, it is no
+/// check — every honest Japanese answer failed it and the feature could only
+/// ever refuse. Bigrams are the standard substitute for a segmenter here and
+/// cost nothing: 「八ユーロ」 shares 八ユ, ユー, ーロ with the row it came from.
+///
+/// Three rather than two, because bigrams are far commoner than content words:
+/// です and ました alone hand any two Japanese sentences a bigram each.
+pub const MIN_OVERLAP_CJK: usize = 3;
+
 /// Words in an answer. The prompt asks for sixty; this is what is enforced.
 const MAX_ANSWER_WORDS: usize = 60;
+
+/// …and the same cap for a language that does not put spaces between them.
+/// Sixty words of German is roughly sixty characters of Japanese worth of
+/// content, which is what the Japanese prompt asks for.
+const MAX_ANSWER_CHARS_CJK: usize = 60;
 
 /// Tokens each call may take. The verdict is one boolean; the answer is two
 /// sentences and a short list of small integers.
@@ -103,6 +125,11 @@ const ANSWER_TOKENS: i32 = 200;
 ///
 /// **2026-09-02: 12/12 traps refused, 10/12 answerable answered with every
 /// citation correct.** The gate was ≥11/12 and ≥9/12. It ships.
+///
+/// **2026-09-03, Japanese (`--lang ja`, six cases, FINDINGS §19.1): 3/3 traps
+/// refused, 3/3 answered with every citation correct.** The gate was 3/3 and
+/// ≥2/3, and it is one switch with the rest: a Japanese question is answered
+/// on the same terms as a German one, or refused with the same seven reasons.
 ///
 /// The two it lost are both compound questions ("wer hat den Shader gebaut
 /// **und** wo kann man ihn kaufen") where the two halves sit in two rows: the
@@ -242,6 +269,34 @@ pub const ANSWERABLE_SYSTEM: &str = concat!(
 /// finding: as a line of the *input*, "answer in German" was obeyed once in
 /// four. It never re-litigates the verdict; that call has already happened.
 pub fn answer_system(tag: &str) -> String {
+    if tag == "ja" {
+        // Written in Japanese for the reason the German one is written in
+        // German, and it matters more here: as a line of the input, "答えは
+        // 日本語で" competes with a system prompt in English that the model has
+        // just read, and the model writes in the language its instructions are
+        // in. The example is Japanese too, including the answer inside the
+        // JSON — an example whose `answer` field is English is an instruction
+        // to write English, whatever the prose above it says.
+        //
+        // The length is asked for in characters, not words: a Japanese
+        // sentence has no spaces to count.
+        return concat!(
+            "あなたは、示された番号つきの行だけを使って質問に一つ答えます。",
+            "答えが行の中にあることはすでに判断済みです。あなたの仕事は、",
+            "それを書き写すことだけです。日本語で、一文か二文、60文字以内で",
+            "答えてください。行に書かれていないことは一切書かないでください",
+            "——外部の知識も、推測も、「行」や「記録」への言及も禁止です。",
+            "`citations` は、その文の出どころとなった行の番号で、最低一つ、",
+            "そして示された番号だけです。JSONだけを出力してください。\n",
+            "例:\n",
+            "質問: シェーダーはいくらですか\n",
+            "[107] 19:08 エンバー: 昨日Gumroadにアップロードした\n",
+            "[109] 19:10 エンバー: 八ユーロで、アップデートも全部込み\n",
+            "-> {\"answer\": \"シェーダーは八ユーロで、アップデートも全部",
+            "含まれていて、Gumroadにあります。\", \"citations\": [109, 107]}"
+        )
+        .to_string();
+    }
     if tag == "de" {
         concat!(
             "Du beantwortest EINE Frage und benutzt dafür ausschließlich die ",
@@ -401,7 +456,11 @@ pub const VERDICT_CHECK: &str = concat!(
 
 /// What the answer call reads.
 pub fn answer_prompt(question: &str, rows_text: &str, tag: &str) -> String {
-    let label = if tag == "de" { "Frage" } else { "Question" };
+    let label = match tag {
+        "de" => "Frage",
+        "ja" => "質問",
+        _ => "Question",
+    };
     format!("{label}: {}\n\n{rows_text}", question.trim())
 }
 
@@ -445,7 +504,7 @@ pub fn check(value: &Value, rows: &[Row], shown: &[i64]) -> Outcome {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| clip_words(s, MAX_ANSWER_WORDS));
+        .map(clip_answer);
     let Some(text) = text else {
         return Outcome::Refused(refusal::UNGROUNDED);
     };
@@ -487,7 +546,7 @@ pub fn check(value: &Value, rows: &[Row], shown: &[i64]) -> Outcome {
         .map(|r| r.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    if overlap(&text, &cited) < MIN_OVERLAP {
+    if overlap(&text, &cited) < min_overlap(&text) {
         return Outcome::Refused(refusal::UNGROUNDED);
     }
     Outcome::Answered(Answer { text, citations })
@@ -499,7 +558,24 @@ pub fn check(value: &Value, rows: &[Row], shown: &[i64]) -> Outcome {
 /// of ([`crate::ask`]'s list, which is exactly the de/en function words) is
 /// shared by every pair of sentences in both languages, so counting it would
 /// make this check pass for anything.
+///
+/// …unless the answer is written without spaces, in which case the unit is a
+/// **character bigram** and not a word: see [`MIN_OVERLAP_CJK`] for why a word
+/// split is not a check at all on a Japanese sentence. The unit is chosen off
+/// the ANSWER, because the answer is what is being held to the rows, and an
+/// English sentence about Japanese rows sharing nothing with them is exactly
+/// the failure this is here to catch.
 pub fn overlap(answer: &str, cited: &str) -> usize {
+    if crate::ask::is_japanese_text(answer) {
+        let theirs = bigrams(cited);
+        let mut seen: Vec<String> = Vec::new();
+        for b in bigrams(answer) {
+            if theirs.contains(&b) && !seen.contains(&b) {
+                seen.push(b);
+            }
+        }
+        return seen.len();
+    }
     let theirs = content_words(cited);
     let mut seen: Vec<String> = Vec::new();
     for w in content_words(answer) {
@@ -510,6 +586,77 @@ pub fn overlap(answer: &str, cited: &str) -> usize {
     seen.len()
 }
 
+/// How much overlap this particular answer has to show. The unit differs, so
+/// the threshold has to as well — three bigrams, two content words.
+pub fn min_overlap(answer: &str) -> usize {
+    if crate::ask::is_japanese_text(answer) {
+        MIN_OVERLAP_CJK
+    } else {
+        MIN_OVERLAP
+    }
+}
+
+/// Every adjacent pair of characters, over each run of letters and digits.
+///
+/// Normalised first — the compatibility folds that actually occur in this
+/// pipeline, which are the fullwidth ASCII forms an IME emits (`Ｇｕｍｒｏａｄ`)
+/// and halfwidth katakana (`ｼｪｰﾀﾞｰ`), both of which a decoder and a person can
+/// produce for the same word. Full NFKC would be a dependency and a table for
+/// two rules; these two are the ones that decide a match here.
+///
+/// Punctuation is a boundary rather than a character, so 「八ユーロ、全部込み」
+/// does not manufacture the bigram 「ロ全」 out of a comma.
+fn bigrams(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for run in normalise_cjk(text).split(|c: char| !(c.is_alphanumeric())) {
+        let chars: Vec<char> = run.chars().collect();
+        for pair in chars.windows(2) {
+            let b: String = pair.iter().collect();
+            if !out.contains(&b) {
+                out.push(b);
+            }
+        }
+        // A one-character run is still evidence — 「八」 on its own is the
+        // answer to "how much" — but only as itself, so it is kept whole.
+        if chars.len() == 1 {
+            let b: String = chars.iter().collect();
+            if !out.contains(&b) {
+                out.push(b);
+            }
+        }
+    }
+    out
+}
+
+/// The part of NFKC this pipeline meets: fullwidth ASCII down to ASCII,
+/// halfwidth katakana up to fullwidth, and case folded.
+fn normalise_cjk(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        let c = match ch as u32 {
+            // Fullwidth ! .. ~ -> ASCII.
+            n @ 0xFF01..=0xFF5E => char::from_u32(n - 0xFEE0).unwrap_or(ch),
+            0x3000 => ' ',
+            // Halfwidth katakana -> fullwidth. The mapping is not arithmetic
+            // (the halfwidth block is a different order and splits the voiced
+            // marks off), so the table is the block, written out.
+            0xFF66..=0xFF9D => HALFWIDTH_KATAKANA
+                .chars()
+                .nth(ch as usize - 0xFF66)
+                .unwrap_or(ch),
+            _ => ch,
+        };
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
+/// U+FF66..U+FF9D in order, as their fullwidth katakana equivalents. The
+/// voiced forms `ｶﾞ` are two characters halfwidth and one fullwidth; they are
+/// left as the bare kana plus a mark, which is a boundary either way and does
+/// not change whether two spellings of a word share bigrams.
+const HALFWIDTH_KATAKANA: &str = "ヲァィゥェォャュョッーアイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワン゙゚";
+
 /// Lower-cased, umlauts folded, punctuation gone, function words dropped.
 fn content_words(text: &str) -> Vec<String> {
     crate::asr::normalise_words(text)
@@ -517,6 +664,39 @@ fn content_words(text: &str) -> Vec<String> {
         .map(|w| crate::ask::fold_word(w))
         .filter(|w| w.chars().count() >= 2 && !crate::ask::is_scaffolding_word(w))
         .collect()
+}
+
+/// The length cap, in whichever unit this answer is measured in.
+///
+/// Japanese is counted in characters because it has no spaces to count: sixty
+/// "words" of it is the whole reply, however long, and the cap would never
+/// fire. Sixty characters is what the Japanese prompt asks for.
+fn clip_answer(s: &str) -> String {
+    if crate::ask::is_japanese_text(s) {
+        return clip_chars(s, MAX_ANSWER_CHARS_CJK);
+    }
+    clip_words(s, MAX_ANSWER_WORDS)
+}
+
+/// The first `max` characters, cut at a sentence end where there is one in the
+/// second half of the budget — `clip_words`' rule, with 。 as the stop.
+fn clip_chars(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    // By character, not by byte: `。` is three bytes and a byte-indexed slice
+    // one past its start is a panic, not a sentence.
+    let stop = head
+        .char_indices()
+        .rfind(|(_, c)| matches!(c, '。' | '？' | '！' | '.' | '?' | '!'));
+    match stop {
+        Some((at, c)) if at + c.len_utf8() >= head.len() / 2 => {
+            head[..at + c.len_utf8()].to_string()
+        }
+        _ => head,
+    }
 }
 
 /// The first `max` words, cut at a sentence end where there is one inside the
@@ -569,6 +749,12 @@ pub fn question_lang(question: &str) -> &'static str {
         "there", "was",
     ];
 
+    // The script first, as `lang::guess_other` does it and for its reason: a
+    // writing system is not a vote, it is an answer, and it is available on a
+    // six-word question where a stopword count is not.
+    if crate::ask::is_japanese_text(question) {
+        return "ja";
+    }
     if question
         .chars()
         .any(|c| matches!(c, 'ä' | 'ö' | 'ü' | 'Ä' | 'Ö' | 'Ü' | 'ß'))
@@ -980,6 +1166,131 @@ mod tests {
         assert_eq!(question_lang("shader"), "en");
     }
 
+    // ---- 0.11.x: Japanese ---------------------------------------------------
+
+    fn ja_page() -> Vec<Row> {
+        vec![
+            row(
+                301,
+                "19:08",
+                "エンバー",
+                "昨日Gumroadにアップロードしたんだ",
+            ),
+            row(
+                303,
+                "19:10",
+                "エンバー",
+                "八ユーロで、アップデートも全部込みだよ",
+            ),
+            row(305, "19:13", "キラ", "今晩買うつもり"),
+        ]
+    }
+
+    #[test]
+    fn a_japanese_question_is_answered_in_japanese() {
+        for q in [
+            "シェーダーはいくらですか",
+            "誰が作ったの？",
+            "何時？",
+            "エンバーはいつアップロードした",
+        ] {
+            assert_eq!(question_lang(q), "ja", "{q}");
+        }
+        // …and nothing else changed: the de/en vote still runs on de/en.
+        assert_eq!(question_lang("wie viel kostet der Shader?"), "de");
+        assert_eq!(question_lang("what time is the meetup?"), "en");
+    }
+
+    #[test]
+    fn the_japanese_prompt_is_written_in_japanese() {
+        let ja = answer_system("ja");
+        assert!(ja.contains("日本語で"), "{ja}");
+        assert!(ja.contains("60文字以内"), "the cap is in characters");
+        // The example — including the sentence inside the JSON — is Japanese.
+        // An `answer` field in English is an instruction to write English.
+        assert!(ja.contains("シェーダーは八ユーロ"), "{ja}");
+        assert!(!ja.contains("Write in ENGLISH") && !ja.contains("Antworte AUF DEUTSCH"));
+        // It does not re-litigate the verdict, and it forbids the world.
+        assert!(ja.contains("すでに判断済み") && ja.contains("外部の知識"));
+        // The user turn asks in the same language.
+        assert!(answer_prompt("いくら", "[1] x", "ja").starts_with("質問: いくら"));
+    }
+
+    /// The check that had no teeth. A Japanese sentence split on whitespace is
+    /// one token, so the word overlap of an honest answer with the row it was
+    /// read off was 1 — under [`MIN_OVERLAP`], and therefore a refusal every
+    /// time.
+    #[test]
+    fn japanese_grounding_is_counted_in_bigrams_because_words_are_not_marked() {
+        let answer = "シェーダーは八ユーロです。";
+        let cited = "八ユーロで、アップデートも全部込みだよ";
+        assert!(
+            overlap(answer, cited) >= MIN_OVERLAP_CJK,
+            "{}",
+            overlap(answer, cited)
+        );
+        assert_eq!(min_overlap(answer), MIN_OVERLAP_CJK);
+        // A sentence about a price, pointed at the row about buying it tonight.
+        assert!(overlap(answer, "今晩買うつもり") < MIN_OVERLAP_CJK);
+        // Latin text is untouched — same unit, same threshold, same numbers.
+        assert_eq!(min_overlap("Der Shader kostet acht Euro."), MIN_OVERLAP);
+        assert_eq!(
+            overlap("acht Euro Updates", "acht Euro, mit allen Updates"),
+            3
+        );
+        // Punctuation is a boundary, not a character: a comma does not
+        // manufacture a bigram across it.
+        assert!(!bigrams("八ユーロ、全部").contains(&"ロ全".to_string()));
+        // The two compatibility folds this pipeline actually meets.
+        assert!(overlap("ｼｪｰﾀﾞｰは八ユーロです", cited) >= MIN_OVERLAP_CJK);
+        assert_eq!(normalise_cjk("Ｇｕｍｒｏａｄ"), "gumroad");
+    }
+
+    #[test]
+    fn a_grounded_japanese_answer_survives_both_checks_and_a_wrong_citation_does_not() {
+        let ok = check(
+            &json!({"answer": "シェーダーは八ユーロです。", "citations": [303]}),
+            &ja_page(),
+            &[301, 303, 305],
+        );
+        assert_eq!(
+            ok,
+            Outcome::Answered(Answer {
+                text: "シェーダーは八ユーロです。".into(),
+                citations: vec![303],
+            })
+        );
+        assert_eq!(
+            check(
+                &json!({"answer": "シェーダーは八ユーロです。", "citations": [305]}),
+                &ja_page(),
+                &[301, 303, 305],
+            ),
+            Outcome::Refused(refusal::UNGROUNDED)
+        );
+    }
+
+    /// Sixty *words* of Japanese is the whole reply however long, so the cap is
+    /// counted in the unit the language has.
+    #[test]
+    fn a_japanese_answer_is_capped_in_characters() {
+        let long = format!(
+            "シェーダーは八ユーロです。{}",
+            "とても長い話です。".repeat(20)
+        );
+        let Outcome::Answered(a) = check(
+            &json!({"answer": long, "citations": [303]}),
+            &ja_page(),
+            &[301, 303, 305],
+        ) else {
+            panic!("grounded, merely long");
+        };
+        assert!(a.text.chars().count() <= MAX_ANSWER_CHARS_CJK, "{}", a.text);
+        assert!(a.text.starts_with("シェーダーは八ユーロです。"));
+        // …and it stops on a sentence end rather than mid-clause.
+        assert!(a.text.ends_with('。'), "{}", a.text);
+    }
+
     // ---- the bench's copies ------------------------------------------------
 
     /// The prompts are measured artefacts, so the bench and the daemon must run
@@ -994,6 +1305,7 @@ mod tests {
             ("answerable.check.txt", VERDICT_CHECK.to_string()),
             ("answer.de.txt", answer_system("de")),
             ("answer.en.txt", answer_system("en")),
+            ("answer.ja.txt", answer_system("ja")),
             ("answerable.gbnf", ANSWERABLE_GBNF.to_string()),
             ("answer.gbnf.tmpl", ANSWER_GBNF_TEMPLATE.to_string()),
             // Not a prompt, but exported for the same reason: the bench scores

@@ -230,6 +230,60 @@
       "q": "what is the wifi password?",
       "hits": [],
       "why": "refused before any model call."
+    },
+    {
+      "id": "ja_one_who",
+      "expect": true,
+      "lang": "ja",
+      "q": "エンバーのアバターは誰が作ったの？",
+      "hits": [1106, 1107, 1108, 1109],
+      "must_cite": [1107],
+      "must_say": ["ノヴァ"],
+      "why": "one hit says outright who built it."
+    },
+    {
+      "id": "ja_one_what",
+      "expect": true,
+      "lang": "ja",
+      "q": "ミロは何を買ったの？",
+      "hits": [1121, 1122, 1123, 1124],
+      "must_cite": [1123],
+      "must_say": ["index"],
+      "why": "one hit names the headset."
+    },
+    {
+      "id": "ja_one_when",
+      "expect": true,
+      "lang": "ja",
+      "q": "週末の集まりは何時からですか",
+      "hits": [1134, 1135, 1136, 1137],
+      "must_cite": [1136],
+      "must_say": ["九時"],
+      "why": "one hit states the hour."
+    },
+    {
+      "id": "ja_trap_price_never_said",
+      "expect": false,
+      "lang": "ja",
+      "q": "そのシェーダーはいくらですか",
+      "hits": [1113, 1114, 1116, 1119],
+      "why": "the shader is all over the hits and no line says a price."
+    },
+    {
+      "id": "ja_trap_never_spoke",
+      "expect": false,
+      "lang": "ja",
+      "q": "タムシンはアバターについて何て言ってた？",
+      "hits": [1101, 1102, 1107, 1143],
+      "why": "Tamsin does not speak in this archive at all."
+    },
+    {
+      "id": "ja_trap_world_knowledge",
+      "expect": false,
+      "lang": "ja",
+      "q": "Indexの解像度はいくつですか",
+      "hits": [1121, 1122, 1123, 1127],
+      "why": "the headset is named and its specification is not; that is the world's knowledge, not the transcript's."
     }
   ]
 }

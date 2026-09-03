@@ -2400,6 +2400,60 @@ prompt, immediately after the rows and immediately before generation. In the
 system prompt alone — same words, same examples — the traps sat at 9/12; moved
 to the end of the user turn they went to 12/12. A small model's attention is a
 recency effect, and a system prompt is the least recent thing in the window.
+
+### 0.11.x — questions asked in Japanese
+
+Everything above holds, with three additions. Japanese turns have been in the
+archive since the `lid` re-decode below; asking about them in Japanese did not
+work, and it failed **quietly**, in the way that costs a person the feature
+without ever telling them so.
+
+**`is_question` reads a Japanese question.** The rule was "ends in `?` or opens
+with an interrogative", and Japanese satisfies neither: the mark is `？`, and
+Japanese does not front its interrogatives — 誰 and 何 sit wherever the clause
+puts them. So a typed Japanese question was a keyword search, and because the
+client picks the method off its own copy of this rule, the round trip that
+could have refused never happened. Now: a trailing `？` counts, and so does a
+Japanese-by-script sentence ending in one of `でしょうか`, `ですか`, `ますか`,
+`かな`, `か`, `の` — with or without the mark. The script test is the guard, and
+it is kana-first for `lang.guess_other`'s reason: kanji alone are Chinese's
+characters too.
+
+**`answer.lang` can be `"ja"`.** The question's own script decides it, ahead of
+the de/en stopword vote, because a writing system is an answer where a
+six-word stopword count is not. The system prompt for it is written **in**
+Japanese with a Japanese worked example — including the sentence inside the
+example's JSON, since an `answer` field in English is an instruction to write
+English whatever the prose above it says. It asks for one or two sentences and
+**at most 60 characters**, not 60 words: a Japanese sentence has no spaces to
+count, so the word cap could never fire and the character cap is what is
+enforced. The verdict call is unchanged, byte for byte — one boolean, the same
+four rules repeated at the end of the user turn, which is the finding doing the
+work here too. Naming Japanese in it was tried and cost a de/en positive while
+changing nothing Japanese, so it was not kept.
+
+**Grounding is counted in character bigrams.** The post-check is otherwise
+unchanged and just as hard, but its unit is not: split on whitespace, a
+Japanese sentence is one token, so the check had two possible outcomes — 1 if
+the answer was character-for-character the row and 0 otherwise. Every honest
+Japanese answer failed it. For an answer that is Japanese by script the answer
+and the cited rows are compared as adjacent character pairs (compatibility
+forms folded, punctuation a boundary rather than a character) and **at least
+three** must be shared, rather than two content words; bigrams are commoner
+than content words, and です alone hands any two Japanese sentences one. Latin
+text is untouched, unit and threshold both.
+
+`refused.reason` gains nothing: a Japanese question that cannot be answered is
+refused with the same seven strings, for the same seven reasons.
+
+**What it measured.** `spike/answer_bench --lang ja`: six questions over a
+44-turn spoken-Japanese fixture, same binary, same four pinned cores. Gate: 3/3
+traps refused **and** ≥2/3 answered with every citation correct. **Shipped: 3/3
+traps refused (a price never stated, a person who never spoke, a specification
+that is the world's knowledge and not the transcript's), 3/3 answered with
+correct citations**, 10.5 s median — about twice a de/en case, which is the
+tokeniser.
+
 ## 0.11.0 — Japanese
 
 A turn spoken in Japanese did not come back wrong-looking. It came back

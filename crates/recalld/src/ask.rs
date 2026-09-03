@@ -883,12 +883,78 @@ const INTERROGATIVES: &[&str] = &[
 /// `interpretation.is_question` rather than acted on behind anybody's back.
 pub fn is_question(question: &str) -> bool {
     let q = question.trim();
-    if q.ends_with('?') {
+    // A question mark, in either width. `？` is what a Japanese IME produces
+    // and what a Japanese speaker types; a rule that only knows the ASCII one
+    // reads a typed question as a keyword search, and the client then never
+    // calls the method that could refuse.
+    if q.ends_with('?') || q.ends_with('？') {
+        return true;
+    }
+    if ja_ends_like_a_question(q) {
         return true;
     }
     tokenize(q)
         .first()
         .is_some_and(|t| INTERROGATIVES.contains(&t.folded.as_str()))
+}
+
+// ---- 0.11.x, Japanese questions -------------------------------------------
+
+/// How a Japanese sentence ends when it is a question.
+///
+/// Japanese does not front its interrogatives — 誰, 何, いつ can sit anywhere in
+/// the clause — so the front-of-sentence rule the de/en list is built on cannot
+/// be transplanted. What *is* positional is the sentence-final particle, and
+/// these six endings are the ones a spoken question actually lands on. Longest
+/// first, so `ですか` is not read as the bare `か` it ends with.
+///
+/// `の` is on the list: sentence-final `の` with a rising tone is a question,
+/// and it is the one ending here that a declarative can also wear. It is
+/// tolerated for the same reason the de/en rule tolerates `wie's` being a near
+/// miss — this is a Tier-2 reading, reported as `interpretation.is_question`,
+/// and its worst case is a refusal line above hits that were coming anyway.
+pub(crate) const JA_QUESTION_ENDINGS: &[&str] =
+    &["でしょうか", "ですか", "ますか", "かな", "か", "の"];
+
+/// Does this end the way a Japanese question ends — and is it Japanese at all?
+///
+/// The script test is not decoration. `の` and `か` are two characters that
+/// occur inside romanised text approximately never, but the *guard* is what
+/// keeps this rule from ever being asked about a German sentence in the first
+/// place, and it is what the whole `"ja"` answer path keys off.
+fn ja_ends_like_a_question(q: &str) -> bool {
+    if !is_japanese_text(q) {
+        return false;
+    }
+    // A trailing mark is already handled by the caller; strip it and any other
+    // sentence punctuation anyway, so `ですか。` and `ですか…` still read as one.
+    let tail = q.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '?' | '？' | '。' | '.' | '！' | '!' | '…' | '、' | ',' | '」' | '"' | '\''
+        ) || c.is_whitespace()
+    });
+    JA_QUESTION_ENDINGS.iter().any(|e| tail.ends_with(e))
+}
+
+/// Is this text Japanese, by the writing system alone?
+///
+/// [`crate::lang::guess_other`]'s test, narrowed to the one language and to the
+/// lengths a *question* has. Kana settle it outright — no other language uses
+/// them. Kanji alone do not, because Chinese has the same characters, so han
+/// counts only when kana keep it company or when there is no Latin word in the
+/// string to suggest something else. `何時？` is four characters and has to work.
+pub(crate) fn is_japanese_text(s: &str) -> bool {
+    let (mut kana, mut han, mut latin) = (0usize, 0usize, 0usize);
+    for ch in s.chars() {
+        match ch as u32 {
+            0x3040..=0x30FF | 0x31F0..=0x31FF | 0xFF66..=0xFF9D => kana += 1,
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => han += 1,
+            _ if ch.is_alphabetic() => latin += 1,
+            _ => {}
+        }
+    }
+    kana >= 2 || (kana >= 1 && han >= 1) || (han >= 1 && latin == 0 && kana == 0)
 }
 
 // ---- end 0.11.0 ------------------------------------------------------------
@@ -1263,6 +1329,57 @@ mod tests {
         // do until the client's copy learned to strip it.
         assert!(is_question("„was hat Aspen gesagt"));
         assert!(is_question("- wann war das"));
+    }
+
+    /// 0.11.x. Japanese does not front its interrogatives, so the front-of-
+    /// sentence rule finds nothing; what it lands on is the final particle.
+    #[test]
+    fn a_japanese_question_is_read_off_its_ending() {
+        for q in [
+            // The mark, in the width a Japanese keyboard produces.
+            "シェーダーはいくら？",
+            "誰が作ったの？",
+            "何時？",
+            // …and the endings, with no mark at all, which is how somebody
+            // types when they are typing fast.
+            "シェーダーはいくらですか",
+            "エンバーはいつ来ますか",
+            "あれは誰だったかな",
+            "ミロは何を買ったの",
+            "本当にそうでしょうか",
+            "キラは来るか",
+            // A mark plus a full stop is still one question.
+            "誰が作ったんですか。",
+        ] {
+            assert!(is_question(q), "{q:?} is a question");
+        }
+        for q in [
+            // A Japanese statement is not a question because it is Japanese.
+            "シェーダーを作りました",
+            "ミロはヘッドホンを買った",
+            "エンバーはグムロードにアップロードした",
+            // The endings are Japanese endings: a Latin word that happens to
+            // end in one of those letters is not a question.
+            "kana",
+            "no",
+        ] {
+            assert!(!is_question(q), "{q:?} is not a question");
+        }
+    }
+
+    /// The guard the whole `"ja"` path keys off. Kana settle it; kanji only do
+    /// when nothing Latin is arguing otherwise, because Chinese writes with the
+    /// same characters.
+    #[test]
+    fn japanese_is_decided_by_the_writing_system() {
+        assert!(is_japanese_text("シェーダーはいくら"));
+        assert!(is_japanese_text("何時")); // kanji only, nothing else in it
+        assert!(is_japanese_text("誰が"));
+        assert!(!is_japanese_text("wie viel kostet der Shader"));
+        assert!(!is_japanese_text(""));
+        // One borrowed kanji inside a German sentence is not a Japanese
+        // sentence — `lang::guess_other`'s rule, and its reason.
+        assert!(!is_japanese_text("der Shader heisst 光"));
     }
 
     #[test]

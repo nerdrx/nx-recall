@@ -1915,9 +1915,29 @@ export function startMock({
     { match: /shader/, lang: 'en', cite: 1, text: 'Aspen built the shader and put the file on Gumroad.' },
   ];
 
+  // 0.11.x, the Japanese half. Japanese does not front its interrogatives, so
+  // the list above finds nothing in a Japanese question; what is positional is
+  // the sentence-final particle (`ask.rs`, `JA_QUESTION_ENDINGS`). Longest
+  // first, so `ですか` is not read as the bare `か` it ends with.
+  const JA_ENDING = /(?:でしょうか|ですか|ますか|かな|か|の)$/;
+  const JA_TRAILING = /[?？。.！!…、,」"']+$/;
+
+  function isJapanese(s) {
+    let kana = 0;
+    let han = 0;
+    let latin = 0;
+    for (const ch of s) {
+      if (/[\u3040-\u30FF\u31F0-\u31FF\uFF66-\uFF9D]/.test(ch)) kana += 1;
+      else if (/[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/.test(ch)) han += 1;
+      else if (/\p{L}/u.test(ch)) latin += 1;
+    }
+    return kana >= 2 || (kana >= 1 && han >= 1) || (han >= 1 && latin === 0 && kana === 0);
+  }
+
   function isQuestion(q) {
     const s = String(q ?? '').trim();
-    if (s.endsWith('?')) return true;
+    if (s.endsWith('?') || s.endsWith('？')) return true;
+    if (isJapanese(s) && JA_ENDING.test(s.replace(JA_TRAILING, ''))) return true;
     return INTERROGATIVES.test(s.replace(/^[^\p{L}\p{N}]+/u, ''));
   }
 

@@ -521,9 +521,37 @@ export function mount(root, ctx, arg) {
   const INTERROGATIVES =
     /^(was|wer|wen|wem|wessen|wann|wo|wohin|woher|wie|warum|wieso|weshalb|wor(?:ü|ue)ber|worum|wovon|welche[rsn]?|what|who|whom|whose|when|where|why|how|which)(?![\w'’])/i;
 
+  /**
+   * The Japanese half (0.11.x). Japanese does not front its interrogatives —
+   * 誰 and 何 sit wherever the clause puts them — so the rule above finds
+   * nothing in a Japanese question. What is positional is the final particle,
+   * and this is the daemon's list of them (`ask.rs`, `JA_QUESTION_ENDINGS`),
+   * longest first so `ですか` is not read as the bare `か` it ends with. The
+   * script test is the guard: it is what keeps `no` and `kana` from being
+   * questions.
+   */
+  const JA_ENDING = /(?:でしょうか|ですか|ますか|かな|か|の)$/;
+  const JA_TRAILING = /[?？。.！!…、,」"']+$/;
+
+  function isJapanese(s) {
+    let kana = 0;
+    let han = 0;
+    let latin = 0;
+    for (const ch of s) {
+      if (/[\u3040-\u30FF\u31F0-\u31FF\uFF66-\uFF9D]/.test(ch)) kana += 1;
+      else if (/[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/.test(ch)) han += 1;
+      else if (/\p{L}/u.test(ch)) latin += 1;
+    }
+    return kana >= 2 || (kana >= 1 && han >= 1) || (han >= 1 && latin === 0 && kana === 0);
+  }
+
   function looksLikeAQuestion(q) {
     const s = String(q ?? '').trim();
-    if (s.endsWith('?')) return true;
+    // Both widths of the mark. `？` is what a Japanese IME produces, and a copy
+    // that only knows the ASCII one picks `search.ask` for a typed question —
+    // so the person gets no answer and no line saying why.
+    if (s.endsWith('?') || s.endsWith('？')) return true;
+    if (isJapanese(s) && JA_ENDING.test(s.replace(JA_TRAILING, ''))) return true;
     // The daemon tokenises, and tokenising walks past opening punctuation; an
     // anchored regex does not. `„was hat Aspen gesagt` was a question to one
     // copy and not to the other, and the copy that loses is always the one

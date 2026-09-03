@@ -158,6 +158,66 @@ test('the client and the daemon agree on what an interrogative is', async () => 
   }
 });
 
+// 0.11.x. Japanese does not front its interrogatives, so the list above is
+// blind to a Japanese question and each client copy carries a second rule: the
+// sentence-final particle. Same failure mode as the `wor-` compounds — the
+// client picks the method, so a copy that does not know `ですか` sends a typed
+// question down `search.ask`, which has nothing to refuse with — so it is held
+// to the daemon's list the same way, by reading the list out of `ask.rs`.
+test('the client and the daemon agree on how a Japanese question ends', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const { fileURLToPath } = await import('node:url');
+  const { dirname, resolve: resolvePath } = await import('node:path');
+  const here = dirname(fileURLToPath(import.meta.url));
+  const root = resolvePath(here, '..', '..');
+
+  const ask = await readFile(resolvePath(root, 'crates/recalld/src/ask.rs'), 'utf8');
+  const block = ask.slice(ask.indexOf('JA_QUESTION_ENDINGS'));
+  const endings = [...block.slice(0, block.indexOf('];')).matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  assert.equal(endings.length, 6, `found ${endings.length} Japanese endings in ask.rs`);
+  assert.ok(endings.includes('ですか') && endings.includes('でしょうか'));
+
+  for (const file of ['gui/src/renderer/views/search.js', 'gui/mock/mockd.js']) {
+    const src = await readFile(resolvePath(root, file), 'utf8');
+    const at = src.indexOf('const JA_ENDING');
+    assert.notEqual(at, -1, `${file} has no Japanese ending rule`);
+    const decl = src.slice(at, src.indexOf(';', at));
+    const re = new RegExp(decl.slice(decl.indexOf('/') + 1, decl.lastIndexOf('/')));
+    for (const e of endings) assert.ok(re.test(`シェーダーは${e}`), `${file} does not know ${e}`);
+    // The ending is where it says it is: a particle in the middle is not a
+    // question, exactly as an interrogative in the middle is not one.
+    assert.equal(re.test('かの話をした'), false, file);
+  }
+});
+
+test('the mock reads a Japanese question the same way the daemon would', async () => {
+  const { mock, client } = await connected();
+  try {
+    for (const [q, want] of [
+      // The fullwidth mark, which is what a Japanese IME produces.
+      ['シェーダーはいくら？', true],
+      ['誰が作ったの？', true],
+      // …and the endings, with no mark at all.
+      ['シェーダーはいくらですか', true],
+      ['エンバーはいつ来ますか', true],
+      ['あれは誰だったかな', true],
+      ['本当にそうでしょうか', true],
+      // A Japanese statement is not a question because it is Japanese.
+      ['シェーダーを作りました', false],
+      ['ミロはヘッドホンを買った', false],
+      // The endings are Japanese endings — a Latin word ending in those
+      // letters is not a question.
+      ['no', false],
+    ]) {
+      const res = await client.request('search.ask', { q });
+      assert.equal(res.interpretation.is_question, want, `is_question of ${JSON.stringify(q)}`);
+    }
+  } finally {
+    client.close();
+    mock.close();
+  }
+});
+
 test('the mock reads a question the same way the daemon would', async () => {
   const { mock, client } = await connected();
   try {
