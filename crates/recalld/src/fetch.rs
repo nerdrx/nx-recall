@@ -46,7 +46,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::ModelsConfig;
 use crate::models::{
-    EntryState, Group, Install, ModelSet, REMOTE_ASSETS, RemoteAsset, SemanticModel,
+    EntryState, Group, Install, ModelEntry, ModelSet, REMOTE_ASSETS, RemoteAsset, SemanticModel,
 };
 
 /// Read timeout for a single chunk. The whole download has no deadline — a
@@ -197,30 +197,16 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
     let mut set = ModelSet::resolve_at(root.to_path_buf(), cfg);
     set.select_asr();
     let mut missing = set.missing();
-    // The semantic model is verified only when it was asked for: it is not part
-    // of `ModelSet` precisely because its absence must never read as a broken
-    // install (see `models::SemanticModel`).
-    if opts.semantic {
-        let sem = SemanticModel::resolve_at(root.to_path_buf(), cfg);
-        missing.extend(sem.entries().into_iter().filter(|e| !e.ok()));
-    }
-    // Same rule for the arbiter: verified when it was asked for, invisible
-    // otherwise. A machine that never wanted a German arbiter is not broken.
-    if opts.arbiter_de {
-        let arb =
-            crate::models::ArbiterModel::resolve_at(root.to_path_buf(), crate::models::ARBITER_DE);
-        missing.extend(arb.entries().into_iter().filter(|e| !e.ok()));
-    }
-    // …and for the cross-check decoder.
-    if opts.confidence {
-        let conf = crate::models::ConfidenceModel::resolve_at(root.to_path_buf(), 1);
-        missing.extend(conf.entries().into_iter().filter(|e| !e.ok()));
-    }
-    // …and for the translator, on the same rule: verified when it was asked
-    // for, invisible otherwise.
-    if opts.translator {
-        let tr = crate::models::TranslatorModel::resolve_at(root.to_path_buf());
-        missing.extend(tr.entries().into_iter().filter(|e| !e.ok()));
+    // Each optional group is verified only when it was asked for: an absent
+    // optional model must never read as a broken install (see
+    // `models::SemanticModel`). A machine that never wanted a German arbiter
+    // is not broken.
+    for group in opts.extra_groups() {
+        missing.extend(
+            optional_group_entries(root, cfg, group)
+                .into_iter()
+                .filter(|e| !e.ok()),
+        );
     }
     if !missing.is_empty() {
         eprintln!();
@@ -234,6 +220,54 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
         );
     }
     Ok(report)
+}
+
+/// What one optional group's files resolve to, through the same door the
+/// daemon will open them by.
+///
+/// A `match` with **no catch-all arm**, and that is the whole point of the
+/// function existing. The four groups that had a verify block before 0.11.x
+/// each had it written out by hand as `if opts.semantic { … }`, and a fifth
+/// and sixth group arrived without one: `--japanese` installed a 605 MB pair
+/// and nothing ever asked `JapaneseModel::present()` or `LidModel::present()`
+/// afterwards. `--night` never had one either. The gap is latent today —
+/// every resolver derives the same paths from the same constants the
+/// catalogue uses — but it is exactly the gap the surrounding code was
+/// written to close, and it closes silently: a rename or a config-overridable
+/// directory makes `models fetch --japanese` print its files and exit 0 while
+/// `Japanese::ready()` is false and the feature never runs.
+///
+/// Written as a match so the compiler asks the question the next time a
+/// `Group` is added, rather than the next time somebody reads this file.
+fn optional_group_entries(root: &Path, cfg: &ModelsConfig, group: Group) -> Vec<ModelEntry> {
+    use crate::models::{
+        ARBITER_DE, ArbiterModel, ConfidenceModel, JapaneseModel, LidModel, TranslatorModel,
+    };
+    match group {
+        Group::Semantic => SemanticModel::resolve_at(root.to_path_buf(), cfg).entries(),
+        Group::ArbiterDe => ArbiterModel::resolve_at(root.to_path_buf(), ARBITER_DE).entries(),
+        Group::Confidence => ConfidenceModel::resolve_at(root.to_path_buf(), 1).entries(),
+        Group::Translator => TranslatorModel::resolve_at(root.to_path_buf()).entries(),
+        Group::Japanese => {
+            let ja = JapaneseModel::resolve_at(root.to_path_buf(), crate::models::JAPANESE_ASR);
+            let lid = LidModel::resolve_at(root.to_path_buf(), crate::models::LID_WHISPER);
+            ja.entries().into_iter().chain(lid.entries()).collect()
+        }
+        // The model downloads and is byte-checked with everything else; the
+        // *runtime* is compiled by `models build-night` and is deliberately
+        // not a catalogue asset, so there is nothing here a resolver could
+        // check that `fetch_one` has not already checked.
+        Group::Night => Vec::new(),
+        // Verified through `ModelSet` above, like the default set: the graph
+        // model is resolved by `Llm::resolve` from `[graph]`, not from
+        // `[models]`, and a half-installed one is reported by `models status`.
+        Group::Graph => Vec::new(),
+        // The old English-only export is part of the ASR selection `set`
+        // already made above.
+        Group::FallbackAsr => Vec::new(),
+        // Not an optional group: `extra_groups` cannot yield it.
+        Group::Speech => Vec::new(),
+    }
 }
 
 /// Every file this asset installs is on disk at exactly the catalogued size.
@@ -1165,6 +1199,79 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A flag that installs files nothing checks afterwards is a fetch that
+    /// can print its files, exit 0, and leave the feature off.
+    ///
+    /// Every optional group with files a *resolver* can find has to be
+    /// verified through that resolver after the download, which is what the
+    /// four hand-written `if opts.x { … }` blocks used to do — and what
+    /// `--japanese` never got. `optional_group_entries` is a match with no
+    /// catch-all so the compiler asks about the next group; this asks about
+    /// the ones already here.
+    #[test]
+    fn every_optional_group_is_verified_through_the_door_the_daemon_opens() {
+        let cfg = ModelsConfig::default();
+        let root = std::path::Path::new("/nonexistent/nx-recall-audit");
+        // Flags on, so `extra_groups` yields every optional group there is.
+        let all = FetchOptions {
+            fallback_asr: true,
+            graph: true,
+            semantic: true,
+            arbiter_de: true,
+            confidence: true,
+            night: true,
+            japanese: true,
+            translator: true,
+            ..Default::default()
+        };
+        let groups = all.extra_groups();
+        assert_eq!(groups.len(), 8, "a flag was added without a group");
+
+        for group in groups {
+            let entries = optional_group_entries(root, &cfg, group);
+            // The four groups whose files a resolver owns must produce them,
+            // and every one of those paths must be a path the catalogue knows
+            // a size for — otherwise `ModelEntry::state` degrades to "it
+            // exists" and the size check silently stops happening.
+            let checked = REMOTE_ASSETS.iter().any(|a| {
+                a.group == group
+                    && !matches!(
+                        group,
+                        // Night ships a model and a runtime it compiles, and
+                        // the model is byte-checked by `fetch_one`; the graph
+                        // model and the old English-only export are both
+                        // resolved through `ModelSet` above.
+                        Group::Night | Group::Graph | Group::Speech | Group::FallbackAsr
+                    )
+            });
+            if !checked {
+                continue;
+            }
+            assert!(
+                !entries.is_empty(),
+                "`models fetch` for {group:?} verifies nothing afterwards"
+            );
+            for e in &entries {
+                assert!(
+                    e.expected.is_some(),
+                    "{:?} / {} resolves to {} — a path the catalogue has no size for, \
+                     so its size is never checked",
+                    group,
+                    e.role,
+                    e.path.display()
+                );
+                // …and it is a path under the root that was asked for.
+                assert!(e.path.starts_with(root), "{}", e.path.display());
+            }
+        }
+
+        // Japanese is the pair, both halves.
+        let ja = optional_group_entries(root, &cfg, Group::Japanese);
+        assert_eq!(ja.len(), 4, "the decoder's two files and the identifier's");
+        assert!(ja.iter().any(|e| e.role.starts_with("japanese")));
+        assert!(ja.iter().any(|e| e.role.starts_with("lid")));
     }
 
     #[test]

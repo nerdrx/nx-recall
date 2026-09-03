@@ -891,12 +891,6 @@ pub fn is_question(question: &str) -> bool {
         .is_some_and(|t| INTERROGATIVES.contains(&t.folded.as_str()))
 }
 
-/// The interrogative list, for the guard that holds the client's copy to it.
-#[cfg(test)]
-pub(crate) fn interrogatives() -> &'static [&'static str] {
-    INTERROGATIVES
-}
-
 // ---- end 0.11.0 ------------------------------------------------------------
 
 #[cfg(test)]
