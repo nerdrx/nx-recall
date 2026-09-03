@@ -141,6 +141,7 @@ failed are listed further down with their numbers.
 | Hearing Japanese in the audio (whisper-tiny), 200 utterances per language | **96.5% recall at 3 s, 0 of 400** German or English utterances heard as Japanese — the larger model was more accurate and failed the false-alarm gate |
 | Reading Japanese, character error rate on 3 s turns | Japanese Parakeet 11.3% on the CPU vs whisper-large-v3 11.5% on the GPU at twelve times the cost — the big model's lead exists only on long sentences a lobby never produces |
 | Partial captions while a turn is still open | words 2.4 s sooner and 96% of them survive into the final — at seven times the pipeline's CPU. Shipped off; the number an incremental decoder has to beat is written down |
+| NLLB-200 (600M, int8) against the 3B prompt as translator, 13 FLEURS directions × 100 sentences, chrF | **wins 13 of 13**, mean +9.5 chrF, Finnish +26; 0 echoes against the prompt's 171 — a 3B cannot tell a language it cannot read from English. Licence CC-BY-NC, which is fine here and a wall for anything sold |
 | Telling eighteen other languages apart from the two you read, 4 200 FLEURS sentences | **0 of 400** German or English sentences misidentified; Norwegian withheld because its function words are Danish's |
 | Quarterly model refresh, four newer checkpoints vs Parakeet v3 | **keep v3** — nearest 3.6% vs 3.3% lab WER; qwen3-asr ties on real audio and loses on speed |
 | Hotword biasing toward the roster and glossary | +9.1% recall on rare words against a +20% gate; at strength the glossary leaked into unrelated turns (control WER 8% → 29%). Not shipped |
@@ -392,6 +393,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.10.2 | +101h | translation controls: what to translate into, which languages you read, and whether the translation or the original leads; a detector for eighteen other languages that never once mistook German or English for anything else |
 | 0.10.3 | +102h | the caption bar honours the translation display and crosses screens: drag it past the edge and it re-makes itself on the next monitor; a Screen selector on the card |
 | 0.11.0 | +106h | Japanese: the audio identifier hears it with zero false alarms and a Japanese decoder reads it; grounded answers with citations that refuse 12 of 12 traps; live translation within seconds and short-line detection for eighteen languages; learned identity ships its mechanism with nothing installed yet, honestly; streaming captions measured at seven times the CPU and shipped off |
+| 0.11.1 | +108h | NLLB-200 becomes the translator after beating the 3B prompt on 13 of 13 language pairs; translation no longer needs the graph model; the 3B echoed a third of Finnish lines back untranslated, and the metric that would have hidden it is retired |
 
 ## Quickstart
 
