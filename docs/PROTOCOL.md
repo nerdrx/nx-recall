@@ -2285,6 +2285,115 @@ Nothing is required. When it wants to:
 
 A client must not present a *proposed* threshold as an installed one:
 `thresholds_swap` is the difference, and it is false far more often than true.
+
+## 0.11.9 — how a voice's prototypes become one score, and a bank that can be repaired
+
+Three changes to identity, all of them measured against this install's own
+ground truth on the same held-out rows (`spike/FINDINGS.md` §29). Two are
+learned and travel through `identity.calibrate`; one is an operator command.
+
+### A third learnable: the scoring rule
+
+A voice has up to twenty prototypes. Until 0.11.9 it scored the **best** of
+them, which answers *could this be them?* and is generous in exactly the wrong
+way: one recording of somebody that happens to sit near another person's turns
+wins those turns forever, and nothing the voice's other nineteen prototypes say
+can outvote it.
+
+The alternative asks whether the voice's record **agrees**: the mean of its k
+best. On this install that one change is worth more than everything 0.11.0
+learned — held out, wrong labels 13 → 7 and F-0.5 0.947 → 0.972, and it wins at
+the *global* threshold with no per-voice fitting at all, so it is the aggregate
+and not a threshold artefact. The mean over *all* prototypes is measured and
+catastrophic (F-0.5 0.774): prototypes are supposed to span a voice's range, so
+averaging the bad ones in measures the spread rather than the match.
+
+Stored as a `settings` row, not a column: it is one rule for the install rather
+than a property of a voice. **Absent means `"max"`** — every version before
+0.11.9, and every install that has learned nothing.
+
+`identity.calibrate` gains three fields:
+
+```jsonc
+{
+  "aggregate": {"rule": "top-3",
+                "score": {"n": 460, "correct": 426, "wrong": 7, "declined": 27,
+                          "precision": 0.984, "recall": 0.926, "f_beta": 0.972}},
+  "aggregate_installed": "max",   // the rule every other arm was measured under
+  "aggregate_swap": true          // did the gate approve it?
+}
+```
+
+`rule` is `"max"` or `"top-<k>"` for k in 1..5. A client that does not know a
+value must fall back to "the best prototype" rather than refuse to render.
+
+**Changing the rule clears every learned threshold.** 0.41 under max cosine and
+0.41 under a top-3 mean are not the same operating point, so a bar fitted
+against the old scale is a number nothing stands behind. One run moves the
+scale; the next calibrates to it. Clients should expect `cleared > 0` with
+`written == 0` on the run that swaps the aggregate, and that is not a bug.
+
+### A projection is now taken back, not merely refused
+
+Through 0.11.8 the pass only ever *wrote* projections. One evening's `--apply`
+installed a whitening; every later run measured it, refused it, and left it in
+the table — and the daemon went on labelling every turn in a space its own
+held-out numbers called worse. On this install that cost twenty-one correct
+labels and 4.5 pp of held-out recall, silently, for two days.
+
+A projection this run's held-out numbers do not re-earn is now dropped, and
+`projection_cleared: true` says so. It only fires when the pass actually
+measured something: a run that could not split has no verdict to refuse with,
+and absence of evidence is not refusal.
+
+### `identity.repair` — prototypes that are somebody else
+
+```jsonc
+// request
+{"method": "identity.repair", "params": {"prototypes": true, "apply": false}}
+```
+
+A prototype enrolled from a turn that carries a `single` verdict — one linked
+account covering at least `SINGLE_MIN` (0.8) of the audio — naming a **different**
+voice than the prototype's owner is a recording of that other person filed
+under this one. It is not a fit and it has no parameter: it is a consistency
+check between the bank and Discord's own word.
+
+```jsonc
+{
+  "condemned": [{"prototype": 2114, "owner": 55, "owner_name": "Speaker_55",
+                 "truth_speaker": 25, "truth_name": "Aspen",
+                 "segment": 17991, "coverage": 0.90}],
+  "deleted": 0,
+  "before": {"n": 458, "correct": 430, "wrong": 7, "…": null},
+  "after":  {"n": 458, "correct": 432, "wrong": 5, "…": null},
+  "note": null
+}
+```
+
+Three kinds of evidence are deliberately **not** used, and a client explaining
+the command should say so:
+
+* **`partial` and `overlap` verdicts.** A `partial` verdict is one account under
+  the coverage bar; an `overlap` turn has two mouths open and the embedder is
+  captured by one of them, so the prototype may perfectly well be its owner.
+  Measured: removing the twenty overlap-sourced prototypes on this install
+  *raises* the wrong-label count.
+* **The user's own account.** A `single` verdict naming the user's own Discord
+  account is not ground truth about audio captured from the user's own client
+  (0.10.1). The same rule that keeps those rows out of every headline keeps them
+  from condemning a prototype — on this install it spares twenty-seven.
+* **Golden prototypes.** Hand-enrolled audio is the user's own word about who
+  this is, and it outranks a speaking ring.
+
+`before` and `after` are measured on the held-out rows **minus** any row whose
+own verdict the repair read. That is the same rule as "no row is scored against
+a prototype it produced itself", one step further out.
+
+Unlike `identity.calibrate` this **never runs itself**. Deleting a prototype is
+permanent, and the gate that stops a six-hourly job churning an operating point
+is not the right gate for a correctness fix an operator asked for. Writes go to
+`operations` as `identity.repair`.
 ## 0.11.0 — live translation and short-line detection
 
 Two changes, one complaint behind both: a French line — "Tu arrêtes

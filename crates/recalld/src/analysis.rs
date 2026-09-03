@@ -387,7 +387,11 @@ impl Analyzer {
         };
         let thresholds = learned_thresholds(store, &self.cfg);
         // ---- end 0.11.0 -----------------------------------------------
-        let ranked = identity::rank(&probe, &bank)?;
+        // 0.11.9: how a voice's several prototypes become the one score the
+        // ladder compares. A read failure is not a reason to stop labelling —
+        // the fallback is the rule every version before 0.11.9 used.
+        let aggregate = learned_aggregate(store, &self.cfg);
+        let ranked = identity::rank_with(&probe, &bank, aggregate)?;
         // The source-aware prior (0.11.0), between ranking and deciding —
         // which is the only place it can be: it needs the scores to weigh a
         // foreign candidate against a native one, and it has to be able to
@@ -1341,6 +1345,24 @@ fn learned_thresholds(store: &Store, cfg: &IdentityConfig) -> crate::calib::Thre
         Err(e) => {
             warn!("the learned thresholds could not be read: {e:#}");
             globals
+        }
+    }
+}
+
+/// How a voice's several prototypes become one score, as learned (0.11.9).
+///
+/// Same shape and same reasoning as [`learned_thresholds`]: it is an
+/// improvement on the shipped rule, not a prerequisite for it, so an
+/// unreadable value costs the improvement and never the label.
+fn learned_aggregate(store: &Store, cfg: &IdentityConfig) -> crate::calib::Aggregate {
+    if !cfg.learn {
+        return crate::calib::Aggregate::Max;
+    }
+    match store.learned_aggregate() {
+        Ok(a) => a,
+        Err(e) => {
+            warn!("the learned prototype aggregate could not be read: {e:#}");
+            crate::calib::Aggregate::Max
         }
     }
 }

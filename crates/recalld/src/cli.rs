@@ -543,16 +543,22 @@ pub enum IdentityAction {
     /// The report: the voice × source matrix, the count of labels the rule
     /// questions, and the most recent of them. Changes nothing. The default.
     Audit,
-    /// Take questioned labels back to unassigned. Previews unless `--apply`.
+    /// Take questioned labels back to unassigned, or throw out prototypes that
+    /// are recordings of somebody else. Previews unless `--apply`.
     Repair {
-        /// Required, and the only selector there is. Naming it is the point:
-        /// this command must never grow a mode that rewrites anything else.
+        /// Labels the source prior questions. Naming it is the point: this
+        /// command must never grow a mode that rewrites anything else.
         #[arg(long)]
         foreign: bool,
+        /// Prototypes whose OWN source turn Discord says was somebody else
+        /// (0.11.9). Spelled out rather than assumed, because it deletes from
+        /// the voicebank.
+        #[arg(long, conflicts_with = "foreign")]
+        prototypes: bool,
         /// Actually write. Without it the command only lists.
         #[arg(long)]
         apply: bool,
-        /// Stop after this many rows.
+        /// Stop after this many rows. `--foreign` only.
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
     },
@@ -563,25 +569,32 @@ pub enum IdentityAction {
 Fit the operating point to the turns Discord itself labelled, and print what
 that would change.
 
-Two things can be learned, and each has to earn its place on rows the fit never
-saw. The truth rows are split by TIME — the first 60% may be fitted on, the
-last 40% is the only thing any verdict reads — and no row is ever scored
+Three things can be learned, and each has to earn its place on rows the fit
+never saw. The truth rows are split by TIME — the first 60% may be fitted on,
+the last 40% is the only thing any verdict reads — and no row is ever scored
 against a prototype it produced itself.
 
   thresholds   a label bar per voice, bounded to [0.30, 0.60], for voices with
                at least thirty truth rows. Others keep the global.
   the space    a within-class whitening applied before cosine, so the
                directions one person's own turns wander along count for less.
+  the scoring  how a voice's several prototypes become the one score the ladder
+               compares: its single best, or the mean of its best few. The best
+               single prototype answers `could this be them?`; the mean of the
+               best three asks whether the voice's whole record agrees.
 
 Nothing is installed that does not beat what is already there on the held-out
 rows, and a candidate that lowers held-out PRECISION is refused whatever it
 does to recall: a wrong name corrupts what you later read back as memory, a
-missed one costs a shrug.
+missed one costs a shrug. A value installed on an earlier evening that tonight's
+numbers do not re-earn is TAKEN BACK — a learned value nothing stands behind is
+worse than no value.
 
   (no flag)    measure and print. Writes nothing.
   --apply      install whatever cleared the gate, and log the before/after
                table to `operations` as `identity.calibrate`.
-  --reset      put every voice back on the globals and drop the learned space.
+  --reset      put every voice back on the globals, drop the learned space and
+               score a voice on its best prototype again.
 
 `[identity].learn = false` turns the nightly refit off; this command still
 reports.")]

@@ -59,6 +59,99 @@ pub const THRESHOLD_BOUNDS: (f32, f32) = (0.30, 0.60);
 /// fitted rather than inherited from the global operating point.
 pub const MIN_ROWS_PER_VOICE: usize = 30;
 
+// ---- 0.11.9: how a voice's prototypes become one score ----------------------
+
+/// How the several cosines a voice's prototypes produce collapse into the one
+/// number the ladder compares.
+///
+/// [`Aggregate::Max`] is what 0.11.8 and everything before it did: a voice
+/// scores its single best prototype. That rule answers "could this be them?",
+/// and it is generous in exactly the wrong way — one recording of somebody
+/// that happens to sit near another person's turns wins those turns forever,
+/// and nothing the voice's other twenty prototypes say can outvote it. On this
+/// install that single rule is most of the Rowan/Aspen confusion, and most of
+/// the phantom `Speaker_5x` voices stealing turns (FINDINGS §29).
+///
+/// [`Aggregate::TopK`] asks a different question — "does this voice's record
+/// *agree* that it is them?" — by averaging the k best. It is deliberately not
+/// a mean over all of them: a voice's prototypes are supposed to span its
+/// range, so a person on a bad microphone day is *meant* to have prototypes
+/// this turn scores badly against, and averaging those in measures the spread
+/// rather than the match. Held out, the mean of all lands at F-0.5 0.774
+/// against max's 0.949 and top-3's 0.974.
+///
+/// The k is clamped to what a voice actually has, so a one-prototype voice is
+/// scored on its one prototype rather than on a third of it. A new voice must
+/// not be penalised for being new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Aggregate {
+    /// The single best prototype. The shipped default, and what an install
+    /// that has learned nothing does.
+    #[default]
+    Max,
+    /// The mean of the k best, k clamped to the voice's prototype count.
+    TopK(usize),
+}
+
+impl Aggregate {
+    /// Collapse one voice's cosines. `scores` is reordered in place — the
+    /// caller owns a scratch buffer rather than this allocating per voice per
+    /// turn, because this runs once per voice on every turn the daemon hears.
+    ///
+    /// A voice with no prototypes has no score, and says so with NaN rather
+    /// than with a zero that would sort like a real (very bad) match.
+    pub fn of(&self, scores: &mut [f32]) -> f32 {
+        if scores.is_empty() {
+            return f32::NAN;
+        }
+        match self {
+            Aggregate::Max | Aggregate::TopK(1) => scores
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, |a, b| if b > a { b } else { a }),
+            Aggregate::TopK(k) => {
+                let k = (*k).min(scores.len());
+                // Partial sort: only the k best have to be in the right place.
+                scores
+                    .sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                scores[..k].iter().sum::<f32>() / k as f32
+            }
+        }
+    }
+
+    /// The stored name. Stable, because it is written into the database.
+    pub fn as_str(&self) -> String {
+        match self {
+            Aggregate::Max => "max".to_string(),
+            Aggregate::TopK(k) => format!("top-{k}"),
+        }
+    }
+
+    /// The inverse, total: an unreadable value is `None` and the caller falls
+    /// back to the default rather than refusing to label.
+    pub fn parse(s: &str) -> Option<Self> {
+        if s == "max" {
+            return Some(Aggregate::Max);
+        }
+        let k: usize = s.strip_prefix("top-")?.parse().ok()?;
+        (1..=MAX_AGGREGATE_K)
+            .contains(&k)
+            .then_some(Aggregate::TopK(k))
+    }
+}
+
+/// The largest k the fit will consider, and the largest one `parse` will
+/// accept. Above the prototype cap a top-k mean is just the mean, which is
+/// measured and refused.
+pub const MAX_AGGREGATE_K: usize = 5;
+
+/// The aggregates the calibration pass chooses between, incumbent first.
+pub fn aggregate_grid() -> Vec<Aggregate> {
+    let mut v = vec![Aggregate::Max];
+    v.extend((2..=MAX_AGGREGATE_K).map(Aggregate::TopK));
+    v
+}
+
 // ---- scoring ---------------------------------------------------------------
 
 /// One arm's report card against ground truth.
@@ -854,6 +947,52 @@ pub fn overlap_grid() -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- how a voice's prototypes become one score (0.11.9) --------------
+
+    #[test]
+    fn max_is_the_highest_single_prototype() {
+        assert_eq!(Aggregate::Max.of(&mut [0.1, 0.9, 0.4]), 0.9);
+    }
+
+    #[test]
+    fn top_k_averages_the_k_best_and_ignores_the_rest() {
+        // 0.9, 0.8, 0.7 -> 0.8. The 0.1 is the point: one bad recording of a
+        // person should not drag their score down, and under `mean` it does.
+        let v = Aggregate::TopK(3).of(&mut [0.1, 0.9, 0.7, 0.8]);
+        assert!((v - 0.8).abs() < 1e-6, "{v}");
+    }
+
+    #[test]
+    fn top_k_falls_back_to_what_a_voice_actually_has() {
+        // A voice with one prototype is scored on that one prototype, not on
+        // a third of it. Without the clamp a new voice is penalised for being
+        // new, which is exactly backwards.
+        assert_eq!(Aggregate::TopK(3).of(&mut [0.6]), 0.6);
+        let v = Aggregate::TopK(3).of(&mut [0.6, 0.4]);
+        assert!((v - 0.5).abs() < 1e-6, "{v}");
+    }
+
+    #[test]
+    fn top_one_is_max() {
+        assert_eq!(Aggregate::TopK(1).of(&mut [0.1, 0.9, 0.4]), 0.9);
+    }
+
+    #[test]
+    fn an_aggregate_round_trips_through_its_wire_name() {
+        for a in [Aggregate::Max, Aggregate::TopK(2), Aggregate::TopK(3)] {
+            assert_eq!(Aggregate::parse(&a.as_str()), Some(a));
+        }
+        assert_eq!(Aggregate::parse("nonsense"), None);
+        // The default is what 0.11.8 did, so a store that has learned nothing
+        // behaves exactly as it did before this existed.
+        assert_eq!(Aggregate::default(), Aggregate::Max);
+    }
+
+    #[test]
+    fn no_prototypes_is_not_a_score() {
+        assert!(Aggregate::TopK(3).of(&mut []).is_nan());
+    }
 
     // ---- the chronological split ----------------------------------------
 

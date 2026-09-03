@@ -255,6 +255,10 @@ pub mod truth_via {
 
 /// `settings` key holding the id of the pinned "You" speaker.
 pub const YOU_SPEAKER_KEY: &str = "you_speaker_id";
+
+/// `settings` key for the learned prototype aggregate (0.11.9). Absent means
+/// [`crate::calib::Aggregate::Max`], which is what every earlier version did.
+pub const AGGREGATE_KEY: &str = "identity_aggregate";
 /// The generated label the pinned speaker is minted with. It survives a rename
 /// (the user may call themselves anything), so it is also how a database that
 /// somehow lost its settings row re-adopts the existing voice instead of
@@ -2381,7 +2385,7 @@ impl Store {
             .collect()
     }
 
-    fn speaker_prototypes(
+    pub(crate) fn speaker_prototypes(
         &self,
         speaker_id: i64,
         embed_model_id: &str,
@@ -6892,6 +6896,21 @@ pub struct CalibrationRow {
     pub embedding: Embedding,
 }
 
+/// A prototype ground truth says is a recording of somebody else (0.11.9).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CondemnedPrototype {
+    pub prototype_id: i64,
+    /// The voice it is filed under.
+    pub owner: i64,
+    pub owner_name: String,
+    /// The voice Discord's verdict says was actually talking.
+    pub truth_speaker: i64,
+    pub truth_name: String,
+    pub source_segment_id: i64,
+    pub coverage: f64,
+    pub created_at: i64,
+}
+
 impl Store {
     /// The learned-identity shape. Idempotent, additive, no backfill.
     pub(crate) fn apply_learned_identity(&self) -> Result<()> {
@@ -7088,6 +7107,169 @@ impl Store {
             .conn
             .execute("DELETE FROM identity_projection WHERE id = 1", [])?
             > 0)
+    }
+
+    // ---- 0.11.9: the learned aggregate ------------------------------------
+
+    /// How a voice's several prototypes become the one score the ladder
+    /// compares, as this install has learned it.
+    ///
+    /// A `settings` row and not a column, because it is one value for the
+    /// whole install rather than a property of any voice. Absent — or
+    /// unreadable, which a hand-edited or future-version value could be —
+    /// means [`Aggregate::Max`](crate::calib::Aggregate::Max): the rule every
+    /// version before 0.11.9 used. A store that has learned nothing must
+    /// behave exactly as it did before this existed, and a bad value must cost
+    /// the learned rule rather than the label.
+    pub fn learned_aggregate(&self) -> Result<crate::calib::Aggregate> {
+        Ok(self
+            .setting(AGGREGATE_KEY)?
+            .as_deref()
+            .and_then(crate::calib::Aggregate::parse)
+            .unwrap_or_default())
+    }
+
+    pub fn set_learned_aggregate(&self, a: crate::calib::Aggregate) -> Result<()> {
+        self.set_setting(AGGREGATE_KEY, &a.as_str())
+    }
+
+    /// Back to the shipped rule. `true` when there was something to take back.
+    pub fn clear_learned_aggregate(&self) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params![AGGREGATE_KEY],
+        )? > 0)
+    }
+
+    // ---- 0.11.9: prototypes ground truth condemns -------------------------
+
+    /// Every prototype whose **own source segment** Discord says was somebody
+    /// else talking.
+    ///
+    /// This is a consistency check, not a fit: there is no parameter in it and
+    /// nothing is learned. A prototype enrolled from a turn that carries a
+    /// `single` verdict — one linked account covering at least
+    /// [`truth_verdict::SINGLE_MIN`] of the audio — naming a *different* voice
+    /// than the prototype's owner is a recording of that other person filed
+    /// under this one, and it will go on winning turns forever, because a
+    /// wrong prototype is permanent in a way a wrong label is not.
+    ///
+    /// Three exclusions, each of them load-bearing:
+    ///
+    /// * **`partial` and `overlap` verdicts are not evidence.** A `partial`
+    ///   verdict is one account under the coverage bar, which is as easily our
+    ///   segmentation being generous as it is the wrong person; an `overlap`
+    ///   turn has two mouths open and the embedder is captured by one of them
+    ///   ([`crate::identity`]), so the prototype may perfectly well be its
+    ///   owner. Measured: removing the twenty overlap-sourced prototypes on
+    ///   this install *raises* the wrong-label count (§29 step 2).
+    /// * **The user's own account is not evidence.** A `single` verdict naming
+    ///   the user's own Discord account is not ground truth about audio
+    ///   captured from the user's own Discord client — a client does not play
+    ///   your microphone back to you (0.10.1, §17). The same rule that keeps
+    ///   those rows out of every headline keeps them from condemning a
+    ///   prototype, and on this install that rule alone spares twenty-seven.
+    /// * **Golden prototypes are never condemned.** Hand-enrolled audio is the
+    ///   user's own word about who this is, and it outranks a speaking ring.
+    pub fn condemned_prototypes(&self, embed_model_id: &str) -> Result<Vec<CondemnedPrototype>> {
+        let you = self.you_speaker_id()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.speaker_id, own.display_name, d.speaker_id, said.display_name,
+                    g.id, g.truth_coverage, p.created_at
+               FROM speaker_prototypes p
+               JOIN speakers own  ON own.id = p.speaker_id
+               JOIN segments g    ON g.id = p.source_segment_id
+               JOIN discord_users d ON d.user_id = g.truth_user_id
+               JOIN speakers said ON said.id = d.speaker_id
+              WHERE p.embed_model_id = ?1
+                AND p.is_golden = 0
+                AND own.merged_into IS NULL
+                AND said.merged_into IS NULL
+                AND g.deleted_at IS NULL
+                AND g.truth_verdict = ?2
+                AND COALESCE(g.truth_coverage, 0.0) >= ?3
+                AND d.speaker_id <> p.speaker_id
+              ORDER BY p.id",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    embed_model_id,
+                    truth_verdict::SINGLE,
+                    truth_verdict::SINGLE_MIN
+                ],
+                |r| {
+                    Ok(CondemnedPrototype {
+                        prototype_id: r.get(0)?,
+                        owner: r.get(1)?,
+                        owner_name: r.get(2)?,
+                        truth_speaker: r.get(3)?,
+                        truth_name: r.get(4)?,
+                        source_segment_id: r.get(5)?,
+                        coverage: r.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                        created_at: r.get(7)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|c| Some(c.truth_speaker) != you)
+            .collect())
+    }
+
+    /// Which embedding spaces the bank actually holds vectors in. Ordered by
+    /// how many, so the first is the one that matters.
+    pub fn embed_model_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT embed_model_id FROM speaker_prototypes
+             GROUP BY embed_model_id ORDER BY COUNT(*) DESC",
+        )?;
+        let v = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(v)
+    }
+
+    /// [`Self::prototypes_with_source`], minus the named prototypes — the bank
+    /// as it *would* look after a repair, without writing anything.
+    pub fn prototypes_with_source_excluding(
+        &self,
+        embed_model_id: &str,
+        exclude: &[i64],
+    ) -> Result<Vec<(i64, Option<i64>, Embedding)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.speaker_id, p.source_segment_id, p.vector
+             FROM speaker_prototypes p
+             JOIN speakers s ON s.id = p.speaker_id
+             WHERE s.merged_into IS NULL AND p.embed_model_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![embed_model_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .filter(|(id, ..)| !exclude.contains(id))
+            .map(|(_, sp, src, blob)| Ok((sp, src, Embedding::from_blob(embed_model_id, &blob)?)))
+            .collect()
+    }
+
+    /// Remove prototypes by id, reporting how many rows actually went. The
+    /// count is the honest one: an id that was not there is not a deletion.
+    pub fn delete_prototypes(&self, ids: &[i64]) -> Result<usize> {
+        let mut n = 0;
+        for id in ids {
+            n += self
+                .conn
+                .execute("DELETE FROM speaker_prototypes WHERE id = ?1", params![id])?;
+        }
+        Ok(n)
     }
 
     /// Every truth-labelled turn a calibration fit can use, oldest first.
@@ -9799,6 +9981,122 @@ mod tests {
         assert_eq!(t.for_speaker(a), (0.35, 0.0));
         assert!(t.is_empty());
         assert!(s.installed_projection().unwrap().is_none());
+    }
+
+    // ---- 0.11.9: the learned aggregate, and prototype repair --------------
+
+    #[test]
+    fn a_store_where_nothing_was_learned_scores_a_voice_on_its_best_prototype() {
+        let s = store();
+        assert_eq!(
+            s.learned_aggregate().unwrap(),
+            crate::calib::Aggregate::Max,
+            "an install that has learned nothing must behave exactly as 0.11.8 did"
+        );
+    }
+
+    #[test]
+    fn a_learned_aggregate_round_trips_and_can_be_taken_back() {
+        let s = store();
+        s.set_learned_aggregate(crate::calib::Aggregate::TopK(3))
+            .unwrap();
+        assert_eq!(
+            s.learned_aggregate().unwrap(),
+            crate::calib::Aggregate::TopK(3)
+        );
+        assert!(s.clear_learned_aggregate().unwrap());
+        assert_eq!(s.learned_aggregate().unwrap(), crate::calib::Aggregate::Max);
+        assert!(!s.clear_learned_aggregate().unwrap(), "already gone");
+    }
+
+    #[test]
+    fn a_setting_nothing_wrote_is_not_a_reason_to_stop_labelling() {
+        // A hand-edited or future-version value must not become an error the
+        // ladder has to handle. It falls back to the shipped behaviour.
+        let s = store();
+        s.set_setting(AGGREGATE_KEY, "top-99999999999999999999")
+            .unwrap();
+        assert_eq!(s.learned_aggregate().unwrap(), crate::calib::Aggregate::Max);
+    }
+
+    #[test]
+    fn the_repair_finds_a_prototype_whose_own_turn_was_somebody_else() {
+        let s = store();
+        let src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let mine = s.mint_speaker(0).unwrap();
+        let theirs = s.mint_speaker(0).unwrap();
+        let you = s.mint_speaker(0).unwrap();
+        for (u, sp) in [("them", theirs), ("me", you)] {
+            s.upsert_discord_user(u, u, 0).unwrap();
+            s.set_discord_link(u, Some(sp), Some(truth_via::MANUAL), 0)
+                .unwrap();
+        }
+        s.set_setting(YOU_SPEAKER_KEY, &you.to_string()).unwrap();
+
+        let v = Embedding::new("m@1", vec![1.0, 0.0]);
+        // 1: condemned — Discord says this turn was `theirs`, in full.
+        let bad = s.insert_segment(sess, 10, 20, "a.wav", 0).unwrap();
+        s.set_segment_truth(bad, Some("them"), truth_verdict::SINGLE, Some(0.95))
+            .unwrap();
+        let bad_p = s.add_prototype(mine, &v, Some(bad), false, 20, 0).unwrap();
+        // 2: safe — the verdict agrees with the prototype's owner.
+        let ok = s.insert_segment(sess, 30, 40, "b.wav", 0).unwrap();
+        s.set_segment_truth(ok, Some("them"), truth_verdict::SINGLE, Some(0.95))
+            .unwrap();
+        let ok_p = s.add_prototype(theirs, &v, Some(ok), false, 20, 0).unwrap();
+        // 3: safe — a `partial` verdict is one voice under the bar, not proof.
+        let weak = s.insert_segment(sess, 50, 60, "c.wav", 0).unwrap();
+        s.set_segment_truth(weak, Some("them"), truth_verdict::PARTIAL, Some(0.4))
+            .unwrap();
+        let weak_p = s.add_prototype(mine, &v, Some(weak), false, 20, 0).unwrap();
+        // 4: safe — the verdict names the user's OWN account, and a Discord
+        // client does not play your microphone back to you (§17). The same
+        // rule that keeps those rows out of the headline keeps them from
+        // condemning a prototype.
+        let own = s.insert_segment(sess, 70, 80, "d.wav", 0).unwrap();
+        s.set_segment_truth(own, Some("me"), truth_verdict::SINGLE, Some(0.95))
+            .unwrap();
+        let own_p = s.add_prototype(mine, &v, Some(own), false, 20, 0).unwrap();
+
+        let found = s.condemned_prototypes("m@1").unwrap();
+        let ids: Vec<i64> = found.iter().map(|c| c.prototype_id).collect();
+        assert_eq!(ids, vec![bad_p.unwrap()], "{found:?}");
+        assert_eq!(found[0].owner, mine);
+        assert_eq!(found[0].truth_speaker, theirs);
+        for other in [ok_p, weak_p, own_p] {
+            assert!(!ids.contains(&other.unwrap()));
+        }
+    }
+
+    #[test]
+    fn a_golden_prototype_is_never_condemned_by_a_verdict() {
+        // Hand-enrolled audio is the user's own word about who this is, and it
+        // outranks anything inferred from a Discord speaking ring.
+        let s = store();
+        let src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let mine = s.mint_speaker(0).unwrap();
+        let theirs = s.mint_speaker(0).unwrap();
+        s.upsert_discord_user("them", "them", 0).unwrap();
+        s.set_discord_link("them", Some(theirs), Some(truth_via::MANUAL), 0)
+            .unwrap();
+        let seg = s.insert_segment(sess, 10, 20, "a.wav", 0).unwrap();
+        s.set_segment_truth(seg, Some("them"), truth_verdict::SINGLE, Some(0.95))
+            .unwrap();
+        let g = Embedding::new("m@1", vec![1.0, 0.0]);
+        s.add_prototype(mine, &g, Some(seg), true, 20, 0).unwrap();
+        assert!(s.condemned_prototypes("m@1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_prototypes_reports_what_it_actually_removed() {
+        let s = store();
+        let a = s.mint_speaker(0).unwrap();
+        let v = Embedding::new("m@1", vec![1.0, 0.0]);
+        let p = s.add_prototype(a, &v, None, false, 20, 0).unwrap().unwrap();
+        assert_eq!(s.delete_prototypes(&[p, p + 9_000]).unwrap(), 1);
+        assert!(s.prototypes("m@1").unwrap().is_empty());
     }
 
     #[test]
