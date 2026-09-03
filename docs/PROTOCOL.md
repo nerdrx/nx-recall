@@ -1443,7 +1443,13 @@ Three guards, and they are the feature:
 
 A declined turn is **marked** (`translation_via` set, `translation` NULL) so the
 queue stays finite. A re-decode that changes the words clears both, putting the
-row back at the end of the queue.
+row back at the end of the queue. A turn whose source language the translator
+has no code for is declined the same way with `translation_via:
+"unsupported-language"` (0.11.9) rather than left for a retry — it fails
+identically every pass, and before this two French rows the guesser had named
+without confidence went to the model with an empty tag every five minutes for
+an evening. The guesser's tag now reaches the model even when it is not
+confident enough to be written onto the row.
 
 Measured (`spike/translate_bench.py`): 20 FLEURS sentence ids present in both
 `en_us` and `de_de` — FLEURS is parallel, so the German reference is a human's.
