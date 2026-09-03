@@ -392,6 +392,11 @@ pub fn run(
     runtime: crate::config::RuntimeConfig,
     stop: Arc<EnrichStop>,
 ) {
+    // 0.11.2: this thread does the gather/commit work around llama-cli and
+    // used to rely on the unit's Nice=19 for its place in the queue. The unit
+    // now runs the daemon at normal priority so capture is never behind its
+    // own homework, and every background pass lowers itself here instead.
+    crate::pipeline::background_current_thread(runtime.inference_nice, &runtime.inference_cpus);
     let mut state = GraphState::default();
     let mut ops = 0u64;
     // Resolved lazily and re-resolved when the settings move: the model may be

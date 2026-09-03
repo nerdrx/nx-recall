@@ -24,6 +24,33 @@ use crate::store::{KIND_MIC, Store};
 use crate::turns::TurnMerger;
 use crate::vad::{FRAME_SAMPLES, SegmenterConfig, SileroVad, VadState};
 
+/// The stronger form for BACKGROUND passes (0.11.2): nice, pin, and then the
+/// idle scheduling class, which yields to anything else runnable at all —
+/// including this daemon's own capture thread. The live inference thread must
+/// NOT use this (an idle-class ASR under load would never transcribe); the
+/// night shift, the digests, the translator, the cross-check and the truth
+/// pass must, because on the first night all of them ran at once the capture
+/// thread, then at the same nice as they were, missed its PipeWire deadlines
+/// 658 times in one hour. Children spawned from the thread (llama-cli,
+/// whisper-cli) inherit the class.
+pub fn background_current_thread(nice: i32, cpus: &[usize]) {
+    deprioritise_current_thread(nice, cpus);
+    // SAFETY: gettid cannot fail; sched_setscheduler with SCHED_IDLE takes a
+    // zeroed sched_param and needs no privilege to LOWER a thread's class.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::pid_t;
+        let param: libc::sched_param = std::mem::zeroed();
+        if libc::sched_setscheduler(tid, libc::SCHED_IDLE, &param) != 0 {
+            warn!(
+                "could not move a background thread to SCHED_IDLE: {}",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            debug!("background thread moved to SCHED_IDLE");
+        }
+    }
+}
+
 /// Apply the project's "never steal a VR frame" rule to the calling thread.
 ///
 /// `setpriority(PRIO_PROCESS, tid, ...)` is per-thread on Linux despite the

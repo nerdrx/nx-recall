@@ -875,7 +875,7 @@ pub fn run(
     stats: Arc<NightStats>,
     stop: Arc<NightStop>,
 ) {
-    crate::pipeline::deprioritise_current_thread(runtime.inference_nice, &runtime.inference_cpus);
+    crate::pipeline::background_current_thread(runtime.inference_nice, &runtime.inference_cpus);
     let scratch = data_dir.join("tmp");
     let _ = std::fs::create_dir_all(&scratch);
     let mut said_unavailable = false;

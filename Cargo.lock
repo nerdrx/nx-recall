@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "nx-recall-overlay"
-version = "0.11.0"
+version = "0.11.2"
 dependencies = [
  "anyhow",
  "ash",
@@ -1791,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "recalld"
-version = "0.11.0"
+version = "0.11.2"
 dependencies = [
  "anyhow",
  "bzip2",

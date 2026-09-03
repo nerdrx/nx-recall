@@ -394,6 +394,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.10.3 | +102h | the caption bar honours the translation display and crosses screens: drag it past the edge and it re-makes itself on the next monitor; a Screen selector on the card |
 | 0.11.0 | +106h | Japanese: the audio identifier hears it with zero false alarms and a Japanese decoder reads it; grounded answers with citations that refuse 12 of 12 traps; live translation within seconds and short-line detection for eighteen languages; learned identity ships its mechanism with nothing installed yet, honestly; streaming captions measured at seven times the CPU and shipped off |
 | 0.11.1 | +108h | NLLB-200 becomes the translator after beating the 3B prompt on 13 of 13 language pairs; translation no longer needs the graph model; the 3B echoed a third of Finnish lines back untranslated, and the metric that would have hidden it is retired |
+| 0.11.2 | +110h | the morning-after check: 658 audio gaps in the night-shift hour, because the whole daemon ran at nice 19 and capture queued behind its own homework; now the process is normal priority and every background pass drops itself into the idle class |
 
 ## Quickstart
 

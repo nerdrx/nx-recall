@@ -661,7 +661,7 @@ pub fn run(
     stats: Arc<TruthStats>,
     stop: Arc<TruthStop>,
 ) {
-    crate::pipeline::deprioritise_current_thread(runtime.inference_nice, &runtime.inference_cpus);
+    crate::pipeline::background_current_thread(runtime.inference_nice, &runtime.inference_cpus);
     let timeout_ns = (cfg.open_span_timeout_s.max(1) as i64) * 1_000_000_000;
     // ---- 0.11.0: learned identity -----------------------------------------
     // When the calibration pass last ran, and on how many rows. Held here

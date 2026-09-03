@@ -568,7 +568,7 @@ pub fn run(
     // The project's rule, applied to this thread too: analysis never wins a
     // scheduling contest against a VR frame. Same nice value and same pinned
     // cores as the inference thread — this worker runs the same models.
-    crate::pipeline::deprioritise_current_thread(runtime.inference_nice, &runtime.inference_cpus);
+    crate::pipeline::background_current_thread(runtime.inference_nice, &runtime.inference_cpus);
     // Both decoders are loaded on demand and dropped the moment there is
     // nothing to do: they are a second copy of an encoder in memory, worth
     // paying for while there is a backlog and not worth paying for overnight.

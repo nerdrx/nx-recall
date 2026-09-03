@@ -198,7 +198,7 @@ pub fn run(
     // contest against a VR frame. The model calls are children that carry the
     // same nice and the same pin from `crate::llm`; this is for the thread that
     // spawns them and does the SQL between.
-    crate::pipeline::deprioritise_current_thread(runtime.inference_nice, &runtime.inference_cpus);
+    crate::pipeline::background_current_thread(runtime.inference_nice, &runtime.inference_cpus);
 
     let mut llm: Option<Llm> = None;
     let mut resolved_for: Option<(String, String)> = None;

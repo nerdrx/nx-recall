@@ -23,7 +23,15 @@ RestartSec=2
 # DESIGN §4: "analysis must never win a scheduling contest against a VR frame."
 # The whole pipeline is under 5% of one core, so this costs nothing and removes
 # the one failure mode measured live on the dev box.
-Nice=19
+# 0.11.2: the PROCESS runs at normal priority and every analysis thread lowers
+# ITSELF (nice 19; background passes in SCHED_IDLE, see pipeline.rs). The unit
+# used to say Nice=19 for the whole daemon, which put the PipeWire capture
+# thread at the same priority as the night shift, the digests and the
+# translator running beside it — and on the first night all four ran, the
+# capture thread missed its deadlines 658 times in one hour (audio gaps,
+# discarded turns). Capture costs under one percent of a core; it must never
+# queue behind the daemon's own homework.
+Nice=0
 
 # CPU placement is deliberately NOT set here. Which cores to avoid is a property
 # of the machine, not of the package: put `inference_cpus` in
