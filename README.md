@@ -256,7 +256,12 @@ defence is layered, each layer measured:
    output actually reads as the target language, captions stripped.
 4. **`recalld lang repair`** — the backlog heals retroactively while its audio
    is still inside the retention window.
-5. **Translation** for everything outside the languages you read, into the
+5. **`recalld lang sweep`** — and the turns captured *before* any of this
+   existed get asked about too, once each, by the same code. It writes a
+   language and never a word: measured over the archive, the re-decoding half
+   was right one time in nine, so it ships off behind a flag with the numbers
+   next to it. A rate that is fine as a tax on a benefit is not a benefit.
+6. **Translation** for everything outside the languages you read, into the
    language you choose, with the translation leading and the original as
    subtext — or the other way round. Three controls on the Memory tab.
 

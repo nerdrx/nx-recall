@@ -3189,3 +3189,107 @@ Consequences, which are contracts and not advice:
   Nothing about the identity or overlap numbers changes.
 - The honest fix is to stop merging the two instances, which is what
   `sessions.instance_key` begins and a plugin that names its call will finish.
+## 0.11.9 — the archive sweep for language
+
+Every language decision is made once, on the way in, by whatever was shipped
+that evening. The spoken-language identifier arrived in 0.11.0, Korean and
+Chinese in 0.11.6, French and a one-second floor in 0.11.8 — and none of it
+reached a row captured before it. On the install this was measured against,
+**7,428 non-deleted rows have `lang: null`**, 4,141 of them at least a second
+long with their audio still on disk.
+
+`recalld lang sweep` walks them, and the same pass runs nightly while
+`[asr].lang_sweep` is on, in the night shift's clock window (`[night].window`
+and `[night].also_when_idle_min`) but **not** behind `[night].enabled` — the
+night shift needs a gigabyte of whisper and a local compile, and this needs a
+13 MB identifier.
+
+#### What it writes
+
+- **`lang_via` gains `"sweep"`** — an eighth value, and it appears in **two
+  shapes**:
+  - with `lang` set to `"de"` or `"en"`, on a row the identifier heard as one
+    of the two languages the routes deliberately never act on. The words are
+    **not** touched: there was nothing to re-decode, so the honest record is
+    the reading and no more.
+  - with `lang` still `null`, on a row the identifier heard as something
+    nothing acts on, or had no opinion about. Nothing is claimed; the mark is
+    there so a bounded, resumable walk does not pay for the same model pass
+    every night. The same shape as `"mismatch"`.
+- It is **not** `"lid"`, and a client must not read it as one: `"lid"` promises
+  that a decoder re-read the turn and its words are on the row, and a `"sweep"`
+  row never had a re-decode.
+- A `"sweep"` stamp is **excluded from the conversational language prior**
+  (`Store::thread_language_stamps`), alongside `"context"`. One second of audio
+  nobody could read, judged by nothing, is not evidence about what language a
+  conversation is in.
+- Rows marked `"mismatch"` are **never** swept: that backlog is
+  `recalld lang repair`'s, and overwriting the mark would silently empty its
+  queue.
+- Rows a person has corrected (`operations` `op: "segments.correct"`) are never
+  swept, the same guard the night shift's queue carries.
+
+#### What it does not write, and why that is the finding
+
+**Off by default, `[asr].lang_sweep_redecode = false`: the sweep does not
+replace transcripts.** With `lang` written and the words left alone there is
+nothing here a client has to re-render.
+
+The routing half was measured and refused (FINDINGS §29). Run over 1,796
+untagged rows at the live operating point, the identifier named a routed
+language for 342 of them — 131 Korean, 67 Chinese, in an archive where nobody
+has ever spoken either — and 44 survived every judge, 36 on voices declared
+German/English-only. That is 2.30% against the **1% of de/en** gate the routes
+shipped under. Asking the identifier over three overlapping windows that must
+agree brings it to 0.97%, inside the gate — and a hand check of all nine
+resulting rewrites says **eight are wrong**. `"Okay."` became `、お疲さ`;
+`"Oh, she has this detected beim sonar."` became a fluent French sentence
+nobody said.
+
+The gate is not wrong, it is being asked the wrong question. On the live path
+the rows that clear these guards are overwhelmingly real foreign turns and the
+false positives are a residue. On an archive of German and English there are
+almost no real foreign turns to be right about, so the residue is the whole
+output. **A 1% false-positive budget is a tax on a benefit, not a substitute
+for one.**
+
+`recalld lang sweep --apply --redecode`, or `[asr].lang_sweep_redecode = true`,
+turns it on. A row it settles is then shaped exactly like a live one:
+`lang_via: "lid"`, `text_via: "lid"`, the decoder's `asr_model_id`, and an
+`operations` row `op: "segments.redecode"` carrying the prior text — because it
+is the same code, called in the same order.
+
+#### The two knobs that make it stricter than the live path
+
+Both are one-directional: an operator may make the sweep stricter than the live
+route and never looser.
+
+- **`[asr].lang_sweep_windows`** (default `3`, live `1`). Three overlapping
+  identifier windows at `lid_min_confidence = 1.0`, so a reading has to survive
+  being asked about three different parts of the same turn. Three model passes
+  at RTF 0.027 is a price a nightly batch can pay and a live turn cannot.
+- **`[asr].lang_sweep_min_s`** (default `1.5`, live `1.0`). Below 1.5 s nothing
+  is ever kept anyway — `[lang].arbiter_min_duration_s` is the replacement floor
+  and both decoders refuse under it — so the 974 archive rows in that band cost
+  a model pass each and produced no rewrites at all.
+
+`[asr].lang_sweep_rows_per_run` (default `400`) bounds a nightly run, and counts
+**rows a model was spent on**, not rows looked at: 2,345 of the 4,141 are
+declined by the text pre-filter for free, and a budget spent walking past those
+would take a fortnight to reach the first row worth asking about.
+
+#### The CLI
+
+```text
+recalld lang                     adds two lines: the sweep bar, and how much
+                                 archive is owed against how much is swept
+recalld lang sweep               preview. Runs the identifier; decodes nothing,
+                                 writes nothing. Prints what it heard and what
+                                 --redecode would have rewritten.
+recalld lang sweep --apply       write the language, never the words
+recalld lang sweep --apply --redecode    also let the decoders rewrite
+```
+
+Bounded (`--limit`, `--batch`), resumable, idle-priority, and safe to run while
+the daemon is capturing: the work list is a query rather than a cursor, and
+every row a model is spent on leaves it.

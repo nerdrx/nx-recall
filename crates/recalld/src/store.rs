@@ -179,6 +179,34 @@ pub mod lang_via {
     ///
     /// Like [`CONTEXT`] it is an inference and the words were not re-decoded.
     pub const GUESSED: &str = "guessed";
+    /// The archive sweep (0.11.9, `crate::sweep`) asked the spoken-language
+    /// identifier about a row nothing could read, and the answer was not one
+    /// the routes act on.
+    ///
+    /// An eighth value rather than a seventh use of [`crate::asr_cjk::
+    /// LANG_VIA_LID`], and the difference is what was *done*: `lid` means a
+    /// decoder re-read the turn and its words are on the row, and this means
+    /// nothing was re-decoded at all. A consumer that treats `lid` as "these
+    /// words came out of a language-specific decoder" would be wrong about
+    /// every one of these rows.
+    ///
+    /// It is written in **two shapes**, and both are on purpose:
+    ///
+    /// * with `lang` set, on a row the identifier heard as `de` or `en` —
+    ///   languages the routes deliberately leave alone, so the honest record is
+    ///   the reading itself and no new words;
+    /// * with `lang` still NULL, on a row the identifier heard as something
+    ///   nothing can act on (or had no opinion about). Nothing is claimed; the
+    ///   mark exists so a bounded, resumable sweep does not pay for the same
+    ///   model pass every night. The same shape, and the same reason, as
+    ///   [`MISMATCH`].
+    ///
+    /// Deliberately **not** counted as evidence by
+    /// [`super::Store::thread_language_stamps`]: one second of audio nobody
+    /// could read is not a fact about the conversation, and letting it vote
+    /// would turn the sweep's own uncertainty into the prior that decides other
+    /// rows.
+    pub const SWEEP: &str = "sweep";
 }
 
 /// Which pass produced a row's words (v10, on the wire as `text_via`).
@@ -422,6 +450,23 @@ pub struct RedecodeCandidate {
     /// Relative to the data dir, and never empty: the query filters those out.
     pub audio_path: String,
     pub text: Option<String>,
+}
+
+/// A row the archive language sweep may look at (0.11.9, `crate::sweep`).
+///
+/// Everything [`crate::asr_cjk::pre_route`] needs and nothing else, so the
+/// cheap half of the decision — is this transcript already readable, is this
+/// voice pinned to one language — can be made without touching the disk.
+#[derive(Debug, Clone)]
+pub struct SweepCandidate {
+    pub id: i64,
+    pub duration_s: f32,
+    /// Relative to the data dir, and never empty: the query filters those out.
+    pub audio_path: String,
+    pub text: Option<String>,
+    /// The speaker's declared languages, resolved through merges exactly as
+    /// [`Store::speaker_languages`] resolves them.
+    pub declared: Option<Vec<String>>,
 }
 
 /// One stored turn's audio, as the window builder sees it.
@@ -2318,6 +2363,11 @@ impl Store {
     ///   query, not new evidence. Counting it would let three real German turns
     ///   inherit their way to a hundred, and the hundredth would look exactly
     ///   as certain as the first.
+    /// * `lang_via != 'sweep'` (0.11.9) — the archive sweep's de/en stamp is
+    ///   one second of audio nobody could read, judged by nothing. It is a
+    ///   record of what the identifier said, not a reading of the words, and
+    ///   the whole point of the conversational prior is that it is built out of
+    ///   turns something actually read.
     pub fn thread_language_stamps(
         &self,
         thread_id: i64,
@@ -2329,11 +2379,18 @@ impl Store {
             .prepare(
                 "SELECT lang FROM segments
                  WHERE thread_id = ?1 AND id != ?2 AND lang IS NOT NULL
-                   AND (lang_via IS NULL OR lang_via != ?3) AND deleted_at IS NULL
+                   AND (lang_via IS NULL OR lang_via NOT IN (?3, ?5))
+                   AND deleted_at IS NULL
                  ORDER BY t_start_ns DESC, id DESC LIMIT ?4",
             )?
             .query_map(
-                params![thread_id, exclude, lang_via::CONTEXT, limit as i64],
+                params![
+                    thread_id,
+                    exclude,
+                    lang_via::CONTEXT,
+                    limit as i64,
+                    lang_via::SWEEP
+                ],
                 |r| r.get(0),
             )?
             .collect::<rusqlite::Result<_>>()?)
@@ -2373,6 +2430,110 @@ impl Store {
             }
         }))
     }
+
+    // ---- the archive sweep (0.11.9, `crate::sweep`) ----------------------
+
+    /// One untagged archive row, with everything
+    /// [`crate::asr_cjk::pre_route`] needs to decide whether to ask about it.
+    ///
+    /// Deliberately not a [`RedecodeCandidate`]: that struct carries the
+    /// session and the timestamps because the quality worker builds a *window*
+    /// out of the clips around a turn, and this pass reads exactly one clip.
+    /// What it needs instead is the speaker's declaration, which is the one
+    /// thing `pre_route` cannot be run without.
+    pub fn segments_for_lang_sweep(
+        &self,
+        min_duration_s: f32,
+        limit: usize,
+    ) -> Result<Vec<SweepCandidate>> {
+        let min_ns = (min_duration_s.max(0.0) as f64 * 1e9) as i64;
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT g.id, g.t_end_ns - g.t_start_ns, g.audio_path, g.text,
+                        (SELECT s.languages FROM speakers s
+                         JOIN speaker_resolved r ON r.canonical_id = s.id
+                         WHERE r.id = g.speaker_id)
+                 FROM segments g
+                 WHERE g.deleted_at IS NULL
+                   AND g.lang IS NULL
+                   AND (g.lang_via IS NULL OR g.lang_via NOT IN (?1, ?2))
+                   AND g.audio_path <> ''
+                   AND g.t_end_ns - g.t_start_ns >= ?3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM operations o
+                       WHERE o.op = 'segments.correct'
+                         AND o.target_ids = '[' || g.id || ']')
+                 ORDER BY g.t_start_ns
+                 LIMIT ?4",
+            )?
+            .query_map(
+                params![
+                    lang_via::SWEEP,
+                    lang_via::MISMATCH,
+                    min_ns,
+                    limit.max(1) as i64
+                ],
+                |r| {
+                    let languages: Option<String> = r.get(4)?;
+                    Ok(SweepCandidate {
+                        id: r.get(0)?,
+                        duration_s: r.get::<_, i64>(1)? as f32 / 1e9,
+                        audio_path: r.get(2)?,
+                        text: r.get(3)?,
+                        declared: crate::lang::parse_languages(languages.as_deref()),
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How much archive the sweep still owes at a given floor, and how much it
+    /// has already been over: `(owed, swept)`.
+    ///
+    /// The first half is [`Self::segments_for_lang_sweep`]'s own filter, so a
+    /// status line can never claim a backlog the walk would not actually visit.
+    /// The second deliberately does **not** carry the `lang IS NULL` test: a
+    /// row the sweep stamped `de` has a language now, and counting it as
+    /// unswept would make a finished sweep look like it had done nothing.
+    pub fn lang_sweep_counts(&self, min_duration_s: f32) -> Result<(i64, i64)> {
+        let min_ns = (min_duration_s.max(0.0) as f64 * 1e9) as i64;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT
+                   SUM(CASE WHEN g.lang IS NULL
+                             AND (g.lang_via IS NULL OR g.lang_via NOT IN (?1, ?2))
+                            THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN g.lang_via = ?1 THEN 1 ELSE 0 END)
+                 FROM segments g
+                 WHERE g.deleted_at IS NULL
+                   AND g.audio_path <> ''
+                   AND g.t_end_ns - g.t_start_ns >= ?3",
+                params![lang_via::SWEEP, lang_via::MISMATCH, min_ns],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .map(|(a, b)| (a.unwrap_or(0), b.unwrap_or(0)))?)
+    }
+
+    /// The sweep has been to this row and had nothing to write on it.
+    ///
+    /// `lang` is left exactly as it was — NULL — because nothing was learned;
+    /// only `lang_via` moves, and only from NULL. The `lang IS NULL` guard in
+    /// the statement is not belt-and-braces: between the gather and the write
+    /// the live pipeline may have settled the very same row, and a mark that
+    /// overwrote a real `lang_via` would hide how that row's language got
+    /// there.
+    pub fn mark_segment_swept(&self, segment_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET lang_via = ?2
+             WHERE id = ?1 AND lang IS NULL AND deleted_at IS NULL",
+            params![segment_id, lang_via::SWEEP],
+        )?;
+        Ok(())
+    }
+
+    // ---- end the archive sweep -------------------------------------------
 
     /// Rows the arbiter could not settle, oldest first — the backlog
     /// `recalld lang repair` walks (0.7.7).
