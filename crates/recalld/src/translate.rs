@@ -893,6 +893,36 @@ pub fn translation_json(translation: Option<&str>, via: Option<&str>, to: &str) 
 }
 
 /// One batch. `Ok(true)` means there was work.
+/// The `translation_via` of a row declined because no backend can read its
+/// source language. Its own value so `accuracy`/status can count it apart from
+/// "the model declined", and so a later backend that CAN read the language
+/// has a row to find.
+pub const DECLINED_UNSUPPORTED: &str = "unsupported-language";
+
+/// Can the NLLB backend translate *from* this tag? A row with no tag, or a
+/// tag outside NLLB's list, is not a question the model can be asked.
+fn nllb_can_read(lang: &str) -> bool {
+    !lang.trim().is_empty() && crate::nllb::code_for(lang.trim()).is_some()
+}
+
+/// Put the guesser's tag on a candidate the column had none for.
+///
+/// Before 0.11.9 only a *confident* guess reached the row, and the candidate
+/// went to the model with `lang == ""`; NLLB refused the empty tag, the error
+/// arm left the row unmarked "so a later pass retries", and "Mon petit chou."
+/// was retried every five minutes for an evening. The database is still only
+/// told about confident guesses (that is a claim on the record); the model is
+/// told the best tag there is, which is what the guess was for.
+fn adopt_guess(
+    mut c: crate::store::TranslateCandidate,
+    g: &lang::OtherLang,
+) -> crate::store::TranslateCandidate {
+    if c.lang.trim().is_empty() {
+        c.lang = g.tag.to_string();
+    }
+    c
+}
+
 pub fn batch(
     store: &Arc<std::sync::Mutex<Store>>,
     control: &Arc<Control>,
@@ -962,7 +992,7 @@ pub fn batch(
             }
         }
     }
-    candidates.extend(guessed.into_iter().map(|(c, _)| c));
+    candidates.extend(guessed.into_iter().map(|(c, g)| adopt_guess(c, &g)));
     if candidates.is_empty() {
         return Ok(false);
     }
@@ -982,12 +1012,24 @@ pub fn batch(
         if stop() || crate::enrich::gate(control, &control.graph()).is_some() {
             break;
         }
+        // A source language NLLB has no code for is not a model that timed
+        // out: it will fail the same way every pass, and until 0.11.9 two
+        // French rows did exactly that every five minutes for an evening.
+        // Declined, with a `via` that says why, so the queue stays finite.
+        if nllb && !nllb_can_read(&c.lang) {
+            let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+            debug!(segment = c.id, lang = %c.lang, "no translator for this language");
+            guard.mark_translation_declined(c.id, DECLINED_UNSUPPORTED)?;
+            worked = true;
+            continue;
+        }
         // ---- ask (no lock) ----
         let asked = if nllb {
             // The row's own language stamp. Every candidate has one by the time
-            // it reaches here — the queue only returns stamped rows, and the
-            // guesser wrote a tag onto the ones it named — so the translator is
-            // never asked to translate *from* a language nobody identified.
+            // it reaches here — the queue only returns stamped rows, and
+            // `adopt_guess` put the guesser's tag on the ones it named — so the
+            // translator is never asked to translate *from* a language nobody
+            // identified.
             ask_nllb(&c.text, &c.lang, &to)
         } else if let Some(llm) = llm {
             let tuned = llm.with_threads(control.graph().llm_threads);
@@ -1849,6 +1891,50 @@ mod tests {
         let row = store.lock().unwrap().segment_row(ids[0]).unwrap().unwrap();
         assert_eq!(row.translation, None);
         assert_eq!(row.translation_via, None, "not even declined");
+    }
+
+    // ---- the unconfident guess (0.11.9) --------------------------------------
+
+    #[test]
+    fn an_unconfident_guess_still_tells_the_model_the_language() {
+        // The two rows from the log: short French the guesser names without
+        // confidence. The column stays NULL (no claim on the record); the
+        // candidate must not go to the model with an empty tag.
+        for line in ["Mon petit chou.", "Je ne sais."] {
+            let g = lang::guess_other(line).expect("the guesser names French");
+            assert_eq!(g.tag, "fr", "{line}");
+            let c = adopt_guess(
+                crate::store::TranslateCandidate {
+                    id: 1,
+                    text: line.into(),
+                    lang: String::new(),
+                },
+                &g,
+            );
+            assert_eq!(c.lang, "fr", "{line}");
+            assert!(nllb_can_read(&c.lang));
+        }
+        // A stamped row keeps its own stamp, whatever the guesser thinks.
+        let g = lang::guess_other("Mon petit chou.").unwrap();
+        let c = adopt_guess(
+            crate::store::TranslateCandidate {
+                id: 2,
+                text: "x".into(),
+                lang: "it".into(),
+            },
+            &g,
+        );
+        assert_eq!(c.lang, "it");
+    }
+
+    #[test]
+    fn a_language_the_model_cannot_read_is_declined_not_retried() {
+        assert!(!nllb_can_read(""));
+        assert!(!nllb_can_read("   "));
+        assert!(!nllb_can_read("xx"));
+        assert!(nllb_can_read("de"));
+        assert!(nllb_can_read("ja"));
+        assert_eq!(DECLINED_UNSUPPORTED, "unsupported-language");
     }
 
     // ---- against the real model --------------------------------------------

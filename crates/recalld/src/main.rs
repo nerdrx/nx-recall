@@ -161,6 +161,23 @@ fn main() -> Result<()> {
             LangAction::Repair { batch, limit, dir } => {
                 cmd_lang_repair(&cfg, &data_dir, dir.as_deref(), batch, limit)
             }
+            // ---- 0.11.9, the archive sweep ------------------------------
+            LangAction::Sweep {
+                apply,
+                redecode,
+                batch,
+                limit,
+                dir,
+            } => cmd_lang_sweep(
+                &cfg,
+                &data_dir,
+                dir.as_deref(),
+                apply,
+                redecode,
+                batch,
+                limit,
+            ),
+            // ---- end 0.11.9 ----------------------------------------------
         },
         // ---- 0.11.0, source-aware identity -----------------------------
         Command::Identity { action } => cmd_identity(&cfg, &data_dir, action),
@@ -560,6 +577,29 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
             .map_err(|e| warn!("no night shift: {e}"))
             .ok()
     };
+    // ---- 0.11.9: the archive language sweep -------------------------------
+    // Its own thread rather than a second pass inside the night shift's, and
+    // the reason is the one gate the two do not share: the night shift needs a
+    // gigabyte of whisper and a local compile before it can do anything at all,
+    // and the CJK half of this needs a 13 MB identifier. Folding it in would
+    // have made `[night].enabled = false` — the shipped default — silently turn
+    // off a feature that has nothing to do with the night shift's model.
+    let sweep_stop = Arc::new(NightStop::default());
+    let sweep_thread = {
+        let store = Arc::clone(&store);
+        let control = Arc::clone(&control);
+        let bus = Arc::clone(&bus);
+        let root = models_root.clone();
+        let dir = data_dir.to_path_buf();
+        let whole = cfg.clone();
+        let stop = Arc::clone(&sweep_stop);
+        std::thread::Builder::new()
+            .name("recalld-sweep".into())
+            .spawn(move || recalld::sweep::run(store, control, bus, root, dir, whole, stop))
+            .map_err(|e| warn!("no archive language sweep: {e}"))
+            .ok()
+    };
+    // ---- end 0.11.9 -------------------------------------------------------
     // ---- 0.9.0, the assistant ------------------------------------------
     // Two threads. The scheduler is a query every thirty seconds and no model
     // at all, so it runs whatever else is switched off; the digest and
@@ -646,6 +686,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     quality_stop.stop();
     truth_stop.stop();
     night_stop.stop();
+    sweep_stop.stop();
     reminder_stop.stop();
     assist_stop.stop();
     if let Some(s) = socket {
@@ -661,6 +702,8 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         quality_thread,
         truth_thread,
         night_thread,
+        // 0.11.9.
+        sweep_thread,
         // 0.9.0.
         reminder_thread,
         assist_thread,
@@ -1787,6 +1830,29 @@ fn cmd_lang_status(cfg: &Config, data_dir: &Path, dir: Option<&Path>) -> Result<
             models::FALLBACK_ASR.note
         );
     }
+    // ---- 0.11.9: the archive sweep ---------------------------------------
+    // Printed before the flagged count and unconditionally, because the two
+    // backlogs are disjoint and an empty one of them says nothing about the
+    // other: `repair` walks rows marked as a disagreement, `sweep` walks rows
+    // nobody ever asked a model about at all.
+    let sweep_cfg = recalld::sweep::routing_cfg(&cfg.asr);
+    let (owed, swept) = store.lang_sweep_counts(sweep_cfg.lid_min_s)?;
+    println!(
+        "{:<20}{:.1} s and {} identifier window(s) that must agree",
+        "sweep bar", sweep_cfg.lid_min_s, sweep_cfg.lid_windows
+    );
+    println!(
+        "{:<20}{owed} never asked about, {swept} already swept",
+        "sweep"
+    );
+    if owed > 0 {
+        if models.lid().present() {
+            println!("`recalld lang sweep` shows what asking would do.");
+        } else {
+            println!("  {}", recalld::lid::how_to_get_it());
+        }
+    }
+    // ---- end 0.11.9 -------------------------------------------------------
     println!("{:<20}{flagged}", "flagged");
     if flagged == 0 {
         println!("nothing to repair.");
@@ -1883,6 +1949,173 @@ fn cmd_lang_repair(
     println!(
         "{after} still flagged{}",
         if report.scanned > 0 && after > 0 && limit.is_some() {
+            " — run it again to continue"
+        } else {
+            ""
+        }
+    );
+    Ok(())
+}
+
+/// `recalld lang sweep [--apply]` — the archive sweep (0.11.9).
+///
+/// In THIS process, like the repair above it and for the same two reasons: it
+/// is a long batch job that has to be niceable and Ctrl-C-able, and it loads
+/// models the daemon may not have resident. It opens its own connection to the
+/// same database, which is safe while the daemon is capturing — SQLite
+/// serialises the writes and each one here is a single row.
+#[allow(clippy::too_many_arguments)]
+fn cmd_lang_sweep(
+    cfg: &Config,
+    data_dir: &Path,
+    dir: Option<&Path>,
+    apply: bool,
+    redecode: bool,
+    batch: usize,
+    limit: Option<usize>,
+) -> Result<()> {
+    use std::sync::{Arc, Mutex};
+
+    let root = fetch::target_dir(dir, &cfg.models, data_dir);
+    let models = ModelSet::resolve_at(root, &cfg.models);
+    if !models.lid().present() {
+        println!("{}", recalld::lid::how_to_get_it());
+        return Ok(());
+    }
+    // Idle priority, no CPU pinning — the semantic backfill's rule and the
+    // repair's: a batch job competing with a live capture never wins a
+    // timeslice from a frame.
+    pipeline::deprioritise_current_thread(19, &[]);
+
+    let store = Arc::new(Mutex::new(Store::open(data_dir)?));
+    let lang_cfg = cfg.lang.clone();
+    // `--redecode` turns the rewriting on for THIS run only; without it the
+    // config decides, and the config ships with it off (FINDINGS §29).
+    let asr_cfg = recalld::config::AsrConfig {
+        lang_sweep_redecode: redecode || cfg.asr.lang_sweep_redecode,
+        ..cfg.asr.clone()
+    };
+    let pass = recalld::sweep::Pass::new(&store, None, data_dir, &asr_cfg, &lang_cfg, apply);
+    // BOTH routers from the pass's own config, never the operator's: the
+    // identifier is built from `lid_windows` once, at construction, and a
+    // router built from the live config would be looser than the pass thinks.
+    let mut cjk = recalld::asr_cjk::Cjk::new(&models, pass.asr_cfg());
+    let mut poly =
+        recalld::polyglot::Polyglot::new(&models, pass.asr_cfg(), &cfg.night, &cfg.runtime);
+    let floor = pass.asr_cfg().lid_min_s;
+    let (owed, swept) = {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        guard.lang_sweep_counts(floor)?
+    };
+    println!(
+        "{owed} untagged turn(s) at or above {floor} s with audio to read; {swept} already swept"
+    );
+    if owed == 0 {
+        return Ok(());
+    }
+    if pass.redecode {
+        if let Some(note) = poly.startup_note(pass.asr_cfg()) {
+            println!("  {note}");
+        }
+    } else {
+        println!(
+            "  transcripts will NOT be replaced — only `lang` is written. \
+             Eight of the nine rewrites this measured were wrong (FINDINGS §29); \
+             `--apply --redecode` turns it on anyway."
+        );
+    }
+    if !apply {
+        println!("previewing — the identifier will run, nothing will be decoded or written.");
+    }
+
+    let started = std::time::Instant::now();
+    let never = || false;
+    let report = recalld::sweep::run_pass(&pass, &mut cjk, &mut poly, batch, limit, &never, |r| {
+        eprint!(
+            "\r  {} scanned, {} asked, {} settled\x1b[K",
+            r.scanned,
+            r.asked,
+            r.settled()
+        );
+    })?;
+    eprintln!();
+
+    println!(
+        "scanned {} in {:.1}s; {} cost a model pass",
+        report.scanned,
+        started.elapsed().as_secs_f64(),
+        report.asked,
+    );
+    if apply {
+        for (tag, n) in &report.routed {
+            println!("  {n:>6}  re-decoded as {tag}");
+        }
+        for (tag, n) in &report.stamped {
+            println!("  {n:>6}  stamped {tag} off the reading alone; the words are untouched");
+        }
+        if report.marked > 0 {
+            println!(
+                "  {:>6}  asked, nothing to act on; marked so they are not asked again",
+                report.marked
+            );
+        }
+    } else {
+        // The preview's two tables: what was heard, and what would have been
+        // acted on. The second is a strict subset of the first and the gap
+        // between them is the point — most of what the identifier says is
+        // something nothing here does anything about.
+        println!("what the identifier heard:");
+        let mut heard: Vec<(&String, &usize)> = report.heard.iter().collect();
+        heard.sort_by(|a, b| b.1.cmp(a.1));
+        for (tag, n) in heard.iter().take(12) {
+            println!("  {n:>6}  {tag}");
+        }
+        println!(
+            "what the routes would re-decode{}:",
+            if pass.redecode {
+                ""
+            } else {
+                ", if --redecode were given"
+            }
+        );
+        if report.would_route.is_empty() {
+            println!("  {:>6}  nothing", 0);
+        }
+        for (tag, n) in &report.would_route {
+            println!("  {n:>6}  {tag}");
+        }
+        let stampable: usize = report
+            .heard
+            .iter()
+            .filter(|(tag, _)| recalld::sweep::STAMPABLE.contains(&tag.as_str()))
+            .map(|(_, n)| *n)
+            .sum();
+        println!("  {stampable:>6}  would be stamped de/en; the rest marked and left alone");
+        println!("`recalld lang sweep --apply` does it.");
+    }
+    for (n, line) in [
+        (
+            report.left_alone,
+            "already readable, or a voice pinned to a language another pass owns — free, and \
+             never marked",
+        ),
+        (
+            report.unavailable,
+            "the identifier would not load; nothing was written, so a later run still has them",
+        ),
+        (report.no_audio, "the audio is gone"),
+    ] {
+        if n > 0 {
+            println!("  {n:>6}  {line}");
+        }
+    }
+    let (left, _) = {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        guard.lang_sweep_counts(floor)?
+    };
+    println!(
+        "{left} still owed{}",
+        if left > 0 && limit.is_some() {
             " — run it again to continue"
         } else {
             ""
@@ -2980,8 +3213,88 @@ fn cmd_truth(
             Ok(())
         }
         TruthAction::Report => cmd_truth_report(cfg, data_dir),
+        // ---- 0.11.9: retro-labelling from ground truth ----------------
+        TruthAction::Label { apply, limit } => cmd_truth_label(data_dir, apply, limit),
+        // ---- end 0.11.9 -----------------------------------------------
     }
 }
+
+// ---- 0.11.9: retro-labelling from ground truth -----------------------------
+
+/// `recalld truth label` — name the blank turns Discord can already name.
+///
+/// Opens the database directly, like `identity repair` beside it and for the
+/// same reason: this is a bulk correction to history rather than a live
+/// decision, and it has to work on a machine where no daemon is running. When
+/// one *is* running the two cannot corrupt each other — every write carries
+/// `AND speaker_id IS NULL`, so whichever of them reaches a row first wins it
+/// and the other simply does not count it.
+fn cmd_truth_label(data_dir: &Path, apply: bool, limit: Option<usize>) -> Result<()> {
+    let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open(data_dir)?));
+    let now = recalld::clock::utc_now_ns();
+    let moved = recalld::truth::label_from_truth(&store, limit.unwrap_or(usize::MAX), apply, now)?;
+    if moved.is_empty() {
+        println!(
+            "Nothing to name. Every turn Discord gave a `single` verdict to, for an\n\
+             account linked to a voice, already has a speaker."
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} turn(s) the voicebank left blank, and Discord can name{}. Each gets\n\
+         `label_via = truth` and no match score — nothing was compared. No prototype\n\
+         is enrolled and no voice is minted, and your own account never names a turn:\n\
+         a Discord stream is the one place your own voice cannot be.\n",
+        moved.len(),
+        if apply { "" } else { " (preview only)" }
+    );
+    let mut by_user: Vec<(String, i64, usize)> = Vec::new();
+    for m in &moved {
+        match by_user
+            .iter_mut()
+            .find(|(u, s, _)| *u == m.user_name && *s == m.speaker_id)
+        {
+            Some((_, _, n)) => *n += 1,
+            None => by_user.push((m.user_name.clone(), m.speaker_id, 1)),
+        }
+    }
+    for (name, speaker_id, n) in &by_user {
+        println!("  {:<24} → voice {speaker_id:<5} {n} turn(s)", name);
+    }
+
+    println!(
+        "\n{:<9} {:<21} {:>7} {:>9}",
+        "SEGMENT", "WHEN", "SECONDS", "COVERAGE"
+    );
+    for m in moved.iter().take(AUDIT_TAIL) {
+        println!(
+            "{:<9} {:<21} {:>7.1} {:>9}",
+            m.segment_id,
+            format_time(m.t_start_ns),
+            m.duration_s,
+            m.coverage
+                .map(|c| format!("{c:.2}"))
+                .unwrap_or_else(|| "—".into()),
+        );
+    }
+    if moved.len() > AUDIT_TAIL {
+        println!("  … and {} more", moved.len() - AUDIT_TAIL);
+    }
+
+    if apply {
+        println!(
+            "\n{} turn(s) named. Logged as `truth.label`, prior state and all.",
+            moved.len()
+        );
+        println!("Restart nothing: the rows are already what every client will read next.");
+    } else {
+        println!("\nNothing written. Add --apply.");
+    }
+    Ok(())
+}
+
+// ---- end 0.11.9 ------------------------------------------------------------
 
 /// `recalld truth report` — the measurement this whole subsystem exists for.
 fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
@@ -3018,6 +3331,36 @@ fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
         ("  unknown", "unknown"),
     ] {
         println!("{label:<20}{}", n(key));
+    }
+
+    // ---- 0.11.9: the two queues ----
+    //
+    // Printed whenever there is something in them, and silent when there is
+    // not. §29's finding was that 137 turns had been queued for an enrolment
+    // pass that was switched off, for as long as the feature had existed, and
+    // no report said so — a switch nobody can see is indistinguishable from a
+    // bug, and the operator spent the evening looking for the bug.
+    let enrol = &a["enrol"];
+    let enrol_waiting = enrol["waiting"].as_i64().unwrap_or(0);
+    if enrol_waiting > 0 || enrol["on"].as_bool().unwrap_or(false) {
+        println!(
+            "\n{:<20}{}",
+            "enrolment from truth",
+            if enrol["on"].as_bool().unwrap_or(false) {
+                "ON"
+            } else {
+                "OFF — `[truth] enrol = true` turns it on"
+            }
+        );
+        println!("{:<20}{enrol_waiting} turn(s) queued", "  waiting");
+    }
+    let retro_waiting = a["retro_label"]["waiting"].as_i64().unwrap_or(0);
+    if retro_waiting > 0 {
+        println!("\n{:<20}{retro_waiting} turn(s)", "blank but nameable");
+        println!(
+            "{:<20}`recalld truth label` lists them; --apply names them",
+            ""
+        );
     }
 
     let id = &a["identity"];
@@ -3214,18 +3557,22 @@ fn cmd_identity(cfg: &Config, data_dir: &Path, action: Option<IdentityAction>) -
         IdentityAction::Audit => cmd_identity_audit(cfg, data_dir),
         IdentityAction::Repair {
             foreign,
+            prototypes,
             apply,
             limit,
-        } => {
-            if !foreign {
+        } => match (foreign, prototypes) {
+            (true, _) => cmd_identity_repair_foreign(cfg, data_dir, apply, limit),
+            (_, true) => cmd_identity_repair_prototypes(data_dir, apply),
+            _ => {
                 println!(
-                    "`identity repair` needs --foreign. It is the only thing it can repair,\n\
-                     and naming it is what keeps it from quietly growing a second mode."
+                    "`identity repair` needs --foreign or --prototypes. Naming what it \
+                     may touch\nis what keeps it from quietly growing a third mode.\n\n  \
+                     --foreign     labels the source prior questions, back to unassigned\n  \
+                     --prototypes  voiceprints whose own turn Discord says was somebody else"
                 );
-                return Ok(());
+                Ok(())
             }
-            cmd_identity_repair(cfg, data_dir, apply, limit)
-        }
+        },
         // ---- 0.11.0: learned identity ---------------------------------
         IdentityAction::Calibrate { apply, reset } => {
             cmd_identity_calibrate(cfg, data_dir, apply, reset)
@@ -3248,9 +3595,10 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
     if reset {
         let (cleared, dropped) = recalld::identity_learn::reset(&store, now)?;
         println!(
-            "{cleared} voice(s) back on the global operating point{}.",
+            "{cleared} voice(s) back on the global operating point{}, and a voice is \
+             scored on its best prototype again.",
             if dropped {
-                ", and the learned space dropped"
+                ", the learned space dropped"
             } else {
                 ""
             }
@@ -3353,13 +3701,19 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
         "  {:<28}{:>5}{:>9}{:>7}{:>10}{:>11}{:>9}{:>8}",
         "arm", "n", "correct", "wrong", "declined", "precision", "recall", "F-0.5"
     );
-    row("the globals", &report.baseline);
+    row(
+        &format!("the globals ({})", report.aggregate_installed.as_str()),
+        &report.baseline,
+    );
     row("+ per-voice thresholds", &report.candidate);
     if let Some((w, s)) = &report.projection {
         row(
             &format!("+ learned space (p{:.2}/s{:.2})", w.power, w.shrinkage),
             s,
         );
+    }
+    if let Some((a, s)) = &report.aggregate {
+        row(&format!("+ scoring a voice by {}", a.as_str()), s);
     }
     println!(
         "\n  thresholds: {}",
@@ -3372,6 +3726,19 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
             Some(_) => verdict_line(report.projection_swap, &false),
         }
     );
+    println!(
+        "  scoring:    {}",
+        match &report.aggregate {
+            None => "no other rule to compare against".into(),
+            Some(_) => verdict_line(report.aggregate_swap, &false),
+        }
+    );
+    if report.projection_cleared {
+        println!(
+            "  the learned space installed on an earlier evening was TAKEN BACK: this \
+             run's\n              own held-out numbers do not re-earn it."
+        );
+    }
 
     println!("\nthe overlap gate, held out");
     println!(
@@ -3418,12 +3785,99 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
 
     if apply {
         println!(
-            "\nwrote {} threshold(s), cleared {}.",
-            report.written, report.cleared
+            "\nwrote {} threshold(s), cleared {}{}{}.",
+            report.written,
+            report.cleared,
+            if report.projection_cleared {
+                ", dropped a learned space nothing re-earned"
+            } else {
+                ""
+            },
+            match (&report.aggregate, report.aggregate_swap) {
+                (Some((a, _)), true) => format!(", a voice is now scored by {}", a.as_str()),
+                _ => String::new(),
+            }
         );
     } else {
         println!(
             "\nNothing was written. `recalld identity calibrate --apply` installs what cleared the gate."
+        );
+    }
+    Ok(())
+}
+
+// ---- 0.11.9: `recalld identity repair --prototypes` ------------------------
+
+/// The one repair that is a correctness fix rather than an operating point:
+/// throwing out a prototype that is a recording of somebody else.
+fn cmd_identity_repair_prototypes(data_dir: &Path, apply: bool) -> Result<()> {
+    let store = Store::open(data_dir)?;
+    let now = recalld::clock::utc_now_ns();
+    let report = recalld::identity_learn::repair_prototypes(&store, apply, now)?;
+
+    if let Some(note) = &report.note {
+        println!("{note}.");
+    }
+    if report.condemned.is_empty() {
+        println!(
+            "No prototype in the bank contradicts Discord's own verdict about the turn \
+             it came from."
+        );
+        return Ok(());
+    }
+    println!(
+        "{} prototype(s) whose own turn Discord says was somebody else:\n",
+        report.condemned.len()
+    );
+    for c in &report.condemned {
+        let owner = format!("{} ({})", c.owner_name, c.owner);
+        let said = format!("{} ({})", c.truth_name, c.truth_speaker);
+        println!(
+            "  prototype {:<6} filed under {owner:<22} but segment {} was {said} \
+             ({:.0}% of it)",
+            c.prototype_id,
+            c.source_segment_id,
+            c.coverage * 100.0
+        );
+    }
+
+    if let Some((before, after)) = &report.measured {
+        let pct = |v: f64| {
+            if v.is_nan() {
+                "—".to_string()
+            } else {
+                format!("{:.1}%", v * 100.0)
+            }
+        };
+        let row = |what: &str, s: &recalld::calib::Score| {
+            println!(
+                "  {:<28}{:>5}{:>9}{:>7}{:>10}{:>11}{:>9}{:>8.3}",
+                what,
+                s.n,
+                s.correct,
+                s.wrong,
+                s.declined,
+                pct(s.precision()),
+                pct(s.recall()),
+                s.f_beta(recalld::calib::BETA)
+            );
+        };
+        println!(
+            "\nheld out, on the rows whose own verdict this did NOT read\n  {:<28}{:>5}\
+             {:>9}{:>7}{:>10}{:>11}{:>9}{:>8}",
+            "arm", "n", "correct", "wrong", "declined", "precision", "recall", "F-0.5"
+        );
+        row("the bank as it is", before);
+        row("with these removed", after);
+    }
+
+    if apply {
+        println!("\nRemoved {}.", report.deleted);
+    } else {
+        println!(
+            "\nNothing was removed. `recalld identity repair --prototypes --apply` \
+             deletes them.\nDeleting a prototype is permanent; the segments and their \
+             transcripts are untouched."
         );
     }
     Ok(())
@@ -3561,7 +4015,7 @@ fn cmd_identity_audit(cfg: &Config, data_dir: &Path) -> Result<()> {
 /// the audio came from — which argues against the name the row has and for no
 /// other name at all. A sweep that guessed again in bulk would take one wrong
 /// label and make a hundred, with no human anywhere in it.
-fn cmd_identity_repair(
+fn cmd_identity_repair_foreign(
     cfg: &Config,
     data_dir: &Path,
     apply: bool,

@@ -80,6 +80,16 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // verdicts already on disk — but only where the speaking spans survive, since
 // a purged span and a quiet turn would otherwise both read 0.0.
 //
+// ---- 0.11.9 (schema v14): which instance a session was ---------------------
+// v14 adds `sessions.instance_key`: which *copy* of an application opened the
+// session, from `object.serial` or `application.process.id`. Two Vesktop
+// clients share one `sources` row because the key is the process binary, and
+// §29 is what that costs when only one of them carries the ground-truth
+// plugin. Nullable, no backfill — for a session already on disk the answer is
+// unknown and NULL is the only honest way to say so. See
+// `Store::begin_session_for`, including why the discriminator is not allowed
+// anywhere near `match_key`.
+//
 // ---- 0.11.9 (schema v15): highlighted people ------------------------------
 // v15 adds `speakers.colour` and `speakers.icon`: a palette token and a short
 // emoji a person pins to a voice so it can be picked out of a wall of names.
@@ -131,6 +141,20 @@ pub mod label_via {
     pub const PROXIMITY: &str = "proximity";
     /// A person said so.
     pub const MANUAL: &str = "manual";
+    // ---- 0.11.9: retro-labelling from ground truth -------------------------
+    /// Discord said so (0.11.9). The segment carries a `single` verdict, the
+    /// Discord user who owned it is linked to a voice, and the voicebank had
+    /// declined to name the row at all.
+    ///
+    /// It is deliberately **not** `MATCH`: nothing was compared, so
+    /// `match_score` stays NULL for the same reason [`PROXIMITY`]'s does, and a
+    /// client that renders provenance must be able to say where the name came
+    /// from. It is deliberately not `MANUAL` either — a person did not look at
+    /// this row, and `MANUAL` is the one value the auto-linker is forbidden to
+    /// overwrite (see `truth::link_batch`). Giving Discord its own value keeps
+    /// that promise intact and keeps this pass reversible as a class.
+    pub const TRUTH: &str = "truth";
+    // ---- end 0.11.9 --------------------------------------------------------
 }
 
 /// `segments.lang_via` — how this row's *language* came to be what it is (v5).
@@ -165,6 +189,34 @@ pub mod lang_via {
     ///
     /// Like [`CONTEXT`] it is an inference and the words were not re-decoded.
     pub const GUESSED: &str = "guessed";
+    /// The archive sweep (0.11.9, `crate::sweep`) asked the spoken-language
+    /// identifier about a row nothing could read, and the answer was not one
+    /// the routes act on.
+    ///
+    /// An eighth value rather than a seventh use of [`crate::asr_cjk::
+    /// LANG_VIA_LID`], and the difference is what was *done*: `lid` means a
+    /// decoder re-read the turn and its words are on the row, and this means
+    /// nothing was re-decoded at all. A consumer that treats `lid` as "these
+    /// words came out of a language-specific decoder" would be wrong about
+    /// every one of these rows.
+    ///
+    /// It is written in **two shapes**, and both are on purpose:
+    ///
+    /// * with `lang` set, on a row the identifier heard as `de` or `en` —
+    ///   languages the routes deliberately leave alone, so the honest record is
+    ///   the reading itself and no new words;
+    /// * with `lang` still NULL, on a row the identifier heard as something
+    ///   nothing can act on (or had no opinion about). Nothing is claimed; the
+    ///   mark exists so a bounded, resumable sweep does not pay for the same
+    ///   model pass every night. The same shape, and the same reason, as
+    ///   [`MISMATCH`].
+    ///
+    /// Deliberately **not** counted as evidence by
+    /// [`super::Store::thread_language_stamps`]: one second of audio nobody
+    /// could read is not a fact about the conversation, and letting it vote
+    /// would turn the sweep's own uncertainty into the prior that decides other
+    /// rows.
+    pub const SWEEP: &str = "sweep";
 }
 
 /// Which pass produced a row's words (v10, on the wire as `text_via`).
@@ -262,8 +314,28 @@ pub mod truth_via {
     // ---- end 0.11.0 -------------------------------------------------------
 }
 
+// ---- 0.11.9: retro-labelling from ground truth -----------------------------
+
+/// A turn Discord can name that the voicebank left blank.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TruthLabelCandidate {
+    pub id: i64,
+    pub user_id: String,
+    pub user_name: String,
+    pub speaker_id: i64,
+    pub t_start_ns: i64,
+    pub t_end_ns: i64,
+    pub coverage: Option<f64>,
+}
+
+// ---- end 0.11.9 -----------------------------------------------------------
+
 /// `settings` key holding the id of the pinned "You" speaker.
 pub const YOU_SPEAKER_KEY: &str = "you_speaker_id";
+
+/// `settings` key for the learned prototype aggregate (0.11.9). Absent means
+/// [`crate::calib::Aggregate::Max`], which is what every earlier version did.
+pub const AGGREGATE_KEY: &str = "identity_aggregate";
 /// The generated label the pinned speaker is minted with. It survives a rename
 /// (the user may call themselves anything), so it is also how a database that
 /// somehow lost its settings row re-adopts the existing voice instead of
@@ -414,6 +486,23 @@ pub struct RedecodeCandidate {
     /// Relative to the data dir, and never empty: the query filters those out.
     pub audio_path: String,
     pub text: Option<String>,
+}
+
+/// A row the archive language sweep may look at (0.11.9, `crate::sweep`).
+///
+/// Everything [`crate::asr_cjk::pre_route`] needs and nothing else, so the
+/// cheap half of the decision — is this transcript already readable, is this
+/// voice pinned to one language — can be made without touching the disk.
+#[derive(Debug, Clone)]
+pub struct SweepCandidate {
+    pub id: i64,
+    pub duration_s: f32,
+    /// Relative to the data dir, and never empty: the query filters those out.
+    pub audio_path: String,
+    pub text: Option<String>,
+    /// The speaker's declared languages, resolved through merges exactly as
+    /// [`Store::speaker_languages`] resolves them.
+    pub declared: Option<Vec<String>>,
 }
 
 /// One stored turn's audio, as the window builder sees it.
@@ -1041,10 +1130,21 @@ impl Store {
         self.apply_digest_names()?;
         // ---- end 0.11.6 ---------------------------------------------------
 
+        // ---- 0.11.9 (schema v14): which instance a session was -------------
+        // One nullable column on `sessions`, no backfill: for every session
+        // that already exists the answer is genuinely unknown, and NULL is the
+        // only honest way to say so. See `apply_session_instance`.
+        self.apply_session_instance()?;
+
         // ---- 0.11.9 (schema v15): highlighted people ----------------------
         // Two nullable columns on `speakers`. Additive, idempotent, no
         // backfill: NULL is exactly "this voice is not highlighted", which is
         // true of every voice that predates the feature.
+        //
+        // After v14 and not before: both are additive and neither reads what
+        // the other writes, but the order the calls are written in is the
+        // order the chain is documented in, and a reader tracing v13 → v14 →
+        // v15 should find them in that order.
         self.apply_v15()?;
         // ---- end 0.11.9 ---------------------------------------------------
 
@@ -1697,12 +1797,73 @@ impl Store {
     }
 
     pub fn begin_session(&self, source_id: i64, started_at_utc_ns: i64) -> Result<i64> {
+        self.begin_session_for(source_id, started_at_utc_ns, None)
+    }
+
+    // ---- 0.11.9: which instance a session was ------------------------------
+
+    /// `begin_session`, remembering *which copy of the application* opened it.
+    ///
+    /// ## The failure this exists to end
+    ///
+    /// `sources.match_key` is derived from `application.process.binary`, so two
+    /// simultaneously-running copies of one app — two Vesktop clients signed
+    /// into two Discord accounts — collapse into a single `sources` row and a
+    /// single name on every turn. §29 is the bill for that: one account's call
+    /// carried the RecallBridge plugin and one did not, both landed under
+    /// `"vesktop"`, and Discord's ground truth was therefore asked about turns
+    /// it had never been able to see. It answered `nobody`, correctly and
+    /// uselessly, 190 times, and four real people came within one `--apply` of
+    /// having their labels stripped on the strength of it.
+    ///
+    /// ## Why the discriminator goes here and not on the source
+    ///
+    /// The obvious fix — suffix `match_key` with the pid — is a trap, and the
+    /// blast radius is worth writing down because it is not obvious:
+    /// `allowlist::decide` looks the key up in the `[rules]` table by exact
+    /// string, so `"vesktop#4711"` matches no rule, falls through to
+    /// default-deny, and **capture silently stops for an app the user allowed**.
+    /// Every `[rules.X]` entry, `recalld allow <KEY>`, the GUI's source card and
+    /// its per-source search filter are keyed the same way.
+    ///
+    /// A session is already per-PipeWire-node — `Shared::captures` is keyed by
+    /// `node_id`, so two instances already open two concurrent `sessions` rows
+    /// against the one source. The instance identity was in `NodeInfo` at that
+    /// exact call site and was thrown away. This column stops throwing it away.
+    /// Nothing keyed on `match_key` changes, so nothing above breaks.
+    ///
+    /// ## What it is, and what it deliberately is not
+    ///
+    /// `object.serial` where PipeWire gave one — never reused within a boot —
+    /// else `application.process.id`. It identifies a *stream*, not an account:
+    /// it cannot say which instance is the bridge's, and it must not be read as
+    /// if it could. Deciding that needs the plugin to name the call it is
+    /// watching, which is a wire change and is not in this round. What the
+    /// column buys today is that the question becomes *answerable* from data
+    /// the daemon is already collecting, where before tonight it was not.
+    ///
+    /// NULL means a session recorded before this column existed, or one opened
+    /// by a node that carried neither property. NULL is not "one instance".
+    pub fn begin_session_for(
+        &self,
+        source_id: i64,
+        started_at_utc_ns: i64,
+        instance_key: Option<&str>,
+    ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO sessions (source_id, started_at_utc_ns) VALUES (?1, ?2)",
-            params![source_id, started_at_utc_ns],
+            "INSERT INTO sessions (source_id, started_at_utc_ns, instance_key)
+             VALUES (?1, ?2, ?3)",
+            params![source_id, started_at_utc_ns, instance_key],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
+
+    fn apply_session_instance(&self) -> Result<()> {
+        self.add_column_if_missing("sessions", "instance_key", "TEXT")?;
+        Ok(())
+    }
+
+    // ---- end 0.11.9 --------------------------------------------------------
 
     pub fn end_session(&self, session_id: i64, ended_at_utc_ns: i64) -> Result<()> {
         self.conn.execute(
@@ -2258,6 +2419,11 @@ impl Store {
     ///   query, not new evidence. Counting it would let three real German turns
     ///   inherit their way to a hundred, and the hundredth would look exactly
     ///   as certain as the first.
+    /// * `lang_via != 'sweep'` (0.11.9) — the archive sweep's de/en stamp is
+    ///   one second of audio nobody could read, judged by nothing. It is a
+    ///   record of what the identifier said, not a reading of the words, and
+    ///   the whole point of the conversational prior is that it is built out of
+    ///   turns something actually read.
     pub fn thread_language_stamps(
         &self,
         thread_id: i64,
@@ -2269,11 +2435,18 @@ impl Store {
             .prepare(
                 "SELECT lang FROM segments
                  WHERE thread_id = ?1 AND id != ?2 AND lang IS NOT NULL
-                   AND (lang_via IS NULL OR lang_via != ?3) AND deleted_at IS NULL
+                   AND (lang_via IS NULL OR lang_via NOT IN (?3, ?5))
+                   AND deleted_at IS NULL
                  ORDER BY t_start_ns DESC, id DESC LIMIT ?4",
             )?
             .query_map(
-                params![thread_id, exclude, lang_via::CONTEXT, limit as i64],
+                params![
+                    thread_id,
+                    exclude,
+                    lang_via::CONTEXT,
+                    limit as i64,
+                    lang_via::SWEEP
+                ],
                 |r| r.get(0),
             )?
             .collect::<rusqlite::Result<_>>()?)
@@ -2313,6 +2486,110 @@ impl Store {
             }
         }))
     }
+
+    // ---- the archive sweep (0.11.9, `crate::sweep`) ----------------------
+
+    /// One untagged archive row, with everything
+    /// [`crate::asr_cjk::pre_route`] needs to decide whether to ask about it.
+    ///
+    /// Deliberately not a [`RedecodeCandidate`]: that struct carries the
+    /// session and the timestamps because the quality worker builds a *window*
+    /// out of the clips around a turn, and this pass reads exactly one clip.
+    /// What it needs instead is the speaker's declaration, which is the one
+    /// thing `pre_route` cannot be run without.
+    pub fn segments_for_lang_sweep(
+        &self,
+        min_duration_s: f32,
+        limit: usize,
+    ) -> Result<Vec<SweepCandidate>> {
+        let min_ns = (min_duration_s.max(0.0) as f64 * 1e9) as i64;
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT g.id, g.t_end_ns - g.t_start_ns, g.audio_path, g.text,
+                        (SELECT s.languages FROM speakers s
+                         JOIN speaker_resolved r ON r.canonical_id = s.id
+                         WHERE r.id = g.speaker_id)
+                 FROM segments g
+                 WHERE g.deleted_at IS NULL
+                   AND g.lang IS NULL
+                   AND (g.lang_via IS NULL OR g.lang_via NOT IN (?1, ?2))
+                   AND g.audio_path <> ''
+                   AND g.t_end_ns - g.t_start_ns >= ?3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM operations o
+                       WHERE o.op = 'segments.correct'
+                         AND o.target_ids = '[' || g.id || ']')
+                 ORDER BY g.t_start_ns
+                 LIMIT ?4",
+            )?
+            .query_map(
+                params![
+                    lang_via::SWEEP,
+                    lang_via::MISMATCH,
+                    min_ns,
+                    limit.max(1) as i64
+                ],
+                |r| {
+                    let languages: Option<String> = r.get(4)?;
+                    Ok(SweepCandidate {
+                        id: r.get(0)?,
+                        duration_s: r.get::<_, i64>(1)? as f32 / 1e9,
+                        audio_path: r.get(2)?,
+                        text: r.get(3)?,
+                        declared: crate::lang::parse_languages(languages.as_deref()),
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How much archive the sweep still owes at a given floor, and how much it
+    /// has already been over: `(owed, swept)`.
+    ///
+    /// The first half is [`Self::segments_for_lang_sweep`]'s own filter, so a
+    /// status line can never claim a backlog the walk would not actually visit.
+    /// The second deliberately does **not** carry the `lang IS NULL` test: a
+    /// row the sweep stamped `de` has a language now, and counting it as
+    /// unswept would make a finished sweep look like it had done nothing.
+    pub fn lang_sweep_counts(&self, min_duration_s: f32) -> Result<(i64, i64)> {
+        let min_ns = (min_duration_s.max(0.0) as f64 * 1e9) as i64;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT
+                   SUM(CASE WHEN g.lang IS NULL
+                             AND (g.lang_via IS NULL OR g.lang_via NOT IN (?1, ?2))
+                            THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN g.lang_via = ?1 THEN 1 ELSE 0 END)
+                 FROM segments g
+                 WHERE g.deleted_at IS NULL
+                   AND g.audio_path <> ''
+                   AND g.t_end_ns - g.t_start_ns >= ?3",
+                params![lang_via::SWEEP, lang_via::MISMATCH, min_ns],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .map(|(a, b)| (a.unwrap_or(0), b.unwrap_or(0)))?)
+    }
+
+    /// The sweep has been to this row and had nothing to write on it.
+    ///
+    /// `lang` is left exactly as it was — NULL — because nothing was learned;
+    /// only `lang_via` moves, and only from NULL. The `lang IS NULL` guard in
+    /// the statement is not belt-and-braces: between the gather and the write
+    /// the live pipeline may have settled the very same row, and a mark that
+    /// overwrote a real `lang_via` would hide how that row's language got
+    /// there.
+    pub fn mark_segment_swept(&self, segment_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET lang_via = ?2
+             WHERE id = ?1 AND lang IS NULL AND deleted_at IS NULL",
+            params![segment_id, lang_via::SWEEP],
+        )?;
+        Ok(())
+    }
+
+    // ---- end the archive sweep -------------------------------------------
 
     /// Rows the arbiter could not settle, oldest first — the backlog
     /// `recalld lang repair` walks (0.7.7).
@@ -2428,7 +2705,7 @@ impl Store {
             .collect()
     }
 
-    fn speaker_prototypes(
+    pub(crate) fn speaker_prototypes(
         &self,
         speaker_id: i64,
         embed_model_id: &str,
@@ -5819,6 +6096,116 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    // ---- 0.11.9: retro-labelling from ground truth -------------------------
+
+    /// How many turns would enrol if `[truth] enrol` were on, and never will
+    /// while it is off.
+    ///
+    /// The same `WHERE` as [`Self::segments_for_truth_enrol`] with the `LIMIT`
+    /// and the column list taken off. It exists because §29 found the enrolment
+    /// pass had never fired on an install with 137 turns queued for it, and the
+    /// reason was neither a bug nor a bar the data could not reach: the feature
+    /// was simply off, and nothing anybody could run said so. A count in
+    /// `truth.summary` is the cheapest possible cure — the operator sees the
+    /// queue and the switch in the same report.
+    pub fn truth_enrol_waiting(&self, min_duration_s: f64, min_coverage: f64) -> Result<i64> {
+        let min_ns = (min_duration_s * 1e9) as i64;
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*)
+               FROM segments g
+               JOIN discord_users d ON d.user_id = g.truth_user_id
+              WHERE g.deleted_at IS NULL
+                AND g.truth_verdict = ?1
+                AND g.truth_enrol_ns IS NULL
+                AND d.speaker_id IS NOT NULL
+                AND g.truth_coverage >= ?2
+                AND (g.t_end_ns - g.t_start_ns) >= ?3",
+            params![truth_verdict::SINGLE, min_coverage, min_ns],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Turns Discord can name and the voicebank could not: `single` verdict, a
+    /// linked user, and no speaker at all.
+    ///
+    /// No duration bar, deliberately, and it is the one place in this file that
+    /// does not have one. Every other truth pass filters short turns because it
+    /// is *measuring* the voicebank, and a sub-second grunt the embedder refused
+    /// would measure the floor rather than the model
+    /// (`truth::MIN_SCORE_DURATION_S`). This pass measures nothing. It copies a
+    /// name Discord already wrote onto a row that has none, and Discord's word
+    /// about a one-second turn is exactly as good as its word about a ten-second
+    /// one — the ring was drawn from the same flux event. Refusing the short
+    /// ones would leave the shortest turns, which are the hardest to label by
+    /// any other route, permanently anonymous for no reason anybody could state.
+    ///
+    /// Ordered oldest-first so a `--limit` run takes the backlog in the order it
+    /// happened rather than a random slice of it.
+    ///
+    /// `you` is the pinned "You" voice and is **excluded**, which is not a
+    /// nicety — it is the difference between this pass helping and quietly
+    /// corrupting the archive. 0.10.1 already established the fact
+    /// (`truth::summary`, FINDINGS §17): a Discord client never plays your own
+    /// microphone back to you, so yours is the one voice a turn captured from
+    /// that client's output *cannot* contain. A `single` verdict naming your own
+    /// account therefore says "you were talking over this", not "this is you",
+    /// and the scoring path drops those rows for exactly that reason. Writing
+    /// them as labels would put your name on 17 turns of somebody else's voice
+    /// on the install §29 measured — permanently, in the thing you later read
+    /// back as memory. Passing `None` disables the exclusion and is meant for
+    /// tests; the daemon and the CLI both pass `store.you_speaker_id()`.
+    pub fn segments_for_truth_label(
+        &self,
+        you: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TruthLabelCandidate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.truth_user_id, d.name, d.speaker_id, g.t_start_ns, g.t_end_ns,
+                    g.truth_coverage
+               FROM segments g
+               JOIN discord_users d ON d.user_id = g.truth_user_id
+              WHERE g.deleted_at IS NULL
+                AND g.truth_verdict = ?1
+                AND g.speaker_id IS NULL
+                AND d.speaker_id IS NOT NULL
+                AND (?3 IS NULL OR d.speaker_id != ?3)
+              ORDER BY g.t_start_ns ASC, g.id ASC
+              LIMIT ?2",
+        )?;
+        Ok(stmt
+            .query_map(params![truth_verdict::SINGLE, limit as i64, you], |r| {
+                Ok(TruthLabelCandidate {
+                    id: r.get(0)?,
+                    user_id: r.get(1)?,
+                    user_name: r.get(2)?,
+                    speaker_id: r.get(3)?,
+                    t_start_ns: r.get(4)?,
+                    t_end_ns: r.get(5)?,
+                    coverage: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Put Discord's name on a row the voicebank left blank.
+    ///
+    /// `AND speaker_id IS NULL` is repeated here even though the query that
+    /// produced the candidate already required it: the gather and the commit
+    /// happen under two different acquisitions of the store lock, and in between
+    /// them the live ladder may well have labelled the row itself. Losing the
+    /// race is the correct outcome — the live label was made with the audio in
+    /// hand — so the guard is in the `WHERE` and the return value says whether
+    /// the write landed.
+    pub fn label_segment_from_truth(&self, segment_id: i64, speaker_id: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE segments SET speaker_id = ?2, match_score = NULL, label_via = ?3
+              WHERE id = ?1 AND speaker_id IS NULL AND deleted_at IS NULL",
+            params![segment_id, speaker_id, label_via::TRUTH],
+        )? > 0)
+    }
+
+    // ---- end 0.11.9 --------------------------------------------------------
+
     /// Mark an enrolment candidate as considered, whether or not it enrolled.
     /// Without this the pass would re-embed the same refused turn forever.
     pub fn mark_truth_enrol_considered(&self, segment_id: i64, at_ns: i64) -> Result<()> {
@@ -6975,6 +7362,21 @@ pub struct CalibrationRow {
     pub embedding: Embedding,
 }
 
+/// A prototype ground truth says is a recording of somebody else (0.11.9).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CondemnedPrototype {
+    pub prototype_id: i64,
+    /// The voice it is filed under.
+    pub owner: i64,
+    pub owner_name: String,
+    /// The voice Discord's verdict says was actually talking.
+    pub truth_speaker: i64,
+    pub truth_name: String,
+    pub source_segment_id: i64,
+    pub coverage: f64,
+    pub created_at: i64,
+}
+
 impl Store {
     /// Schema v15: a voice can be highlighted.
     ///
@@ -7289,6 +7691,169 @@ impl Store {
             > 0)
     }
 
+    // ---- 0.11.9: the learned aggregate ------------------------------------
+
+    /// How a voice's several prototypes become the one score the ladder
+    /// compares, as this install has learned it.
+    ///
+    /// A `settings` row and not a column, because it is one value for the
+    /// whole install rather than a property of any voice. Absent — or
+    /// unreadable, which a hand-edited or future-version value could be —
+    /// means [`Aggregate::Max`](crate::calib::Aggregate::Max): the rule every
+    /// version before 0.11.9 used. A store that has learned nothing must
+    /// behave exactly as it did before this existed, and a bad value must cost
+    /// the learned rule rather than the label.
+    pub fn learned_aggregate(&self) -> Result<crate::calib::Aggregate> {
+        Ok(self
+            .setting(AGGREGATE_KEY)?
+            .as_deref()
+            .and_then(crate::calib::Aggregate::parse)
+            .unwrap_or_default())
+    }
+
+    pub fn set_learned_aggregate(&self, a: crate::calib::Aggregate) -> Result<()> {
+        self.set_setting(AGGREGATE_KEY, &a.as_str())
+    }
+
+    /// Back to the shipped rule. `true` when there was something to take back.
+    pub fn clear_learned_aggregate(&self) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params![AGGREGATE_KEY],
+        )? > 0)
+    }
+
+    // ---- 0.11.9: prototypes ground truth condemns -------------------------
+
+    /// Every prototype whose **own source segment** Discord says was somebody
+    /// else talking.
+    ///
+    /// This is a consistency check, not a fit: there is no parameter in it and
+    /// nothing is learned. A prototype enrolled from a turn that carries a
+    /// `single` verdict — one linked account covering at least
+    /// [`truth_verdict::SINGLE_MIN`] of the audio — naming a *different* voice
+    /// than the prototype's owner is a recording of that other person filed
+    /// under this one, and it will go on winning turns forever, because a
+    /// wrong prototype is permanent in a way a wrong label is not.
+    ///
+    /// Three exclusions, each of them load-bearing:
+    ///
+    /// * **`partial` and `overlap` verdicts are not evidence.** A `partial`
+    ///   verdict is one account under the coverage bar, which is as easily our
+    ///   segmentation being generous as it is the wrong person; an `overlap`
+    ///   turn has two mouths open and the embedder is captured by one of them
+    ///   ([`crate::identity`]), so the prototype may perfectly well be its
+    ///   owner. Measured: removing the twenty overlap-sourced prototypes on
+    ///   this install *raises* the wrong-label count (§32 step 2).
+    /// * **The user's own account is not evidence.** A `single` verdict naming
+    ///   the user's own Discord account is not ground truth about audio
+    ///   captured from the user's own Discord client — a client does not play
+    ///   your microphone back to you (0.10.1, §17). The same rule that keeps
+    ///   those rows out of every headline keeps them from condemning a
+    ///   prototype, and on this install that rule alone spares twenty-seven.
+    /// * **Golden prototypes are never condemned.** Hand-enrolled audio is the
+    ///   user's own word about who this is, and it outranks a speaking ring.
+    pub fn condemned_prototypes(&self, embed_model_id: &str) -> Result<Vec<CondemnedPrototype>> {
+        let you = self.you_speaker_id()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.speaker_id, own.display_name, d.speaker_id, said.display_name,
+                    g.id, g.truth_coverage, p.created_at
+               FROM speaker_prototypes p
+               JOIN speakers own  ON own.id = p.speaker_id
+               JOIN segments g    ON g.id = p.source_segment_id
+               JOIN discord_users d ON d.user_id = g.truth_user_id
+               JOIN speakers said ON said.id = d.speaker_id
+              WHERE p.embed_model_id = ?1
+                AND p.is_golden = 0
+                AND own.merged_into IS NULL
+                AND said.merged_into IS NULL
+                AND g.deleted_at IS NULL
+                AND g.truth_verdict = ?2
+                AND COALESCE(g.truth_coverage, 0.0) >= ?3
+                AND d.speaker_id <> p.speaker_id
+              ORDER BY p.id",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    embed_model_id,
+                    truth_verdict::SINGLE,
+                    truth_verdict::SINGLE_MIN
+                ],
+                |r| {
+                    Ok(CondemnedPrototype {
+                        prototype_id: r.get(0)?,
+                        owner: r.get(1)?,
+                        owner_name: r.get(2)?,
+                        truth_speaker: r.get(3)?,
+                        truth_name: r.get(4)?,
+                        source_segment_id: r.get(5)?,
+                        coverage: r.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                        created_at: r.get(7)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|c| Some(c.truth_speaker) != you)
+            .collect())
+    }
+
+    /// Which embedding spaces the bank actually holds vectors in. Ordered by
+    /// how many, so the first is the one that matters.
+    pub fn embed_model_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT embed_model_id FROM speaker_prototypes
+             GROUP BY embed_model_id ORDER BY COUNT(*) DESC",
+        )?;
+        let v = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(v)
+    }
+
+    /// [`Self::prototypes_with_source`], minus the named prototypes — the bank
+    /// as it *would* look after a repair, without writing anything.
+    pub fn prototypes_with_source_excluding(
+        &self,
+        embed_model_id: &str,
+        exclude: &[i64],
+    ) -> Result<Vec<(i64, Option<i64>, Embedding)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.speaker_id, p.source_segment_id, p.vector
+             FROM speaker_prototypes p
+             JOIN speakers s ON s.id = p.speaker_id
+             WHERE s.merged_into IS NULL AND p.embed_model_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![embed_model_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .filter(|(id, ..)| !exclude.contains(id))
+            .map(|(_, sp, src, blob)| Ok((sp, src, Embedding::from_blob(embed_model_id, &blob)?)))
+            .collect()
+    }
+
+    /// Remove prototypes by id, reporting how many rows actually went. The
+    /// count is the honest one: an id that was not there is not a deletion.
+    pub fn delete_prototypes(&self, ids: &[i64]) -> Result<usize> {
+        let mut n = 0;
+        for id in ids {
+            n += self
+                .conn
+                .execute("DELETE FROM speaker_prototypes WHERE id = ?1", params![id])?;
+        }
+        Ok(n)
+    }
+
     /// Every truth-labelled turn a calibration fit can use, oldest first.
     ///
     /// The same shape as the bench's query and for the same reasons: a
@@ -7512,6 +8077,65 @@ mod tests {
 
     // ---- Step 1 behaviour, unchanged -------------------------------------
 
+    // ---- 0.11.9 (schema v14): which instance a session was -----------------
+
+    #[test]
+    fn two_copies_of_one_app_share_a_source_and_no_longer_share_an_identity() {
+        let s = store();
+        // What PipeWire gives us: one `application.process.binary`, so one
+        // source row — and that stays true, because the allowlist, the
+        // `[rules]` table and the GUI's source card are all keyed on it.
+        let src = s.upsert_source("vesktop", "Vesktop", 1).unwrap();
+        let a = s.begin_session_for(src, 10, Some("serial:8801")).unwrap();
+        let b = s.begin_session_for(src, 11, Some("serial:8802")).unwrap();
+        let same: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT source_id) FROM sessions WHERE id IN (?1, ?2)",
+                params![a, b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(same, 1, "one app, one source row — unchanged");
+        let keys: Vec<Option<String>> = ["a", "b"]
+            .iter()
+            .zip([a, b])
+            .map(|(_, id)| {
+                s.conn
+                    .query_row(
+                        "SELECT instance_key FROM sessions WHERE id = ?1",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![Some("serial:8801".into()), Some("serial:8802".into())],
+            "…and the two copies are now distinguishable, which is the whole change"
+        );
+    }
+
+    #[test]
+    fn a_session_from_a_node_with_no_instance_property_is_null_not_a_guess() {
+        // NULL has to stay distinguishable from "instance one". A session
+        // recorded before v14, or opened by a node carrying neither
+        // `object.serial` nor `application.process.id`, genuinely does not know.
+        let s = store();
+        let src = s.upsert_source("vesktop", "Vesktop", 1).unwrap();
+        let id = s.begin_session(src, 10).unwrap();
+        let key: Option<String> = s
+            .conn
+            .query_row(
+                "SELECT instance_key FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, None);
+    }
+
     #[test]
     fn schema_version_is_stamped() {
         let s = store();
@@ -7700,7 +8324,6 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(v, 15);
 
         // The note is still there, and it is not a reminder: nothing invented a
         // date for a sentence that never had one.
@@ -10223,6 +10846,122 @@ mod tests {
         assert_eq!(t.for_speaker(a), (0.35, 0.0));
         assert!(t.is_empty());
         assert!(s.installed_projection().unwrap().is_none());
+    }
+
+    // ---- 0.11.9: the learned aggregate, and prototype repair --------------
+
+    #[test]
+    fn a_store_where_nothing_was_learned_scores_a_voice_on_its_best_prototype() {
+        let s = store();
+        assert_eq!(
+            s.learned_aggregate().unwrap(),
+            crate::calib::Aggregate::Max,
+            "an install that has learned nothing must behave exactly as 0.11.8 did"
+        );
+    }
+
+    #[test]
+    fn a_learned_aggregate_round_trips_and_can_be_taken_back() {
+        let s = store();
+        s.set_learned_aggregate(crate::calib::Aggregate::TopK(3))
+            .unwrap();
+        assert_eq!(
+            s.learned_aggregate().unwrap(),
+            crate::calib::Aggregate::TopK(3)
+        );
+        assert!(s.clear_learned_aggregate().unwrap());
+        assert_eq!(s.learned_aggregate().unwrap(), crate::calib::Aggregate::Max);
+        assert!(!s.clear_learned_aggregate().unwrap(), "already gone");
+    }
+
+    #[test]
+    fn a_setting_nothing_wrote_is_not_a_reason_to_stop_labelling() {
+        // A hand-edited or future-version value must not become an error the
+        // ladder has to handle. It falls back to the shipped behaviour.
+        let s = store();
+        s.set_setting(AGGREGATE_KEY, "top-99999999999999999999")
+            .unwrap();
+        assert_eq!(s.learned_aggregate().unwrap(), crate::calib::Aggregate::Max);
+    }
+
+    #[test]
+    fn the_repair_finds_a_prototype_whose_own_turn_was_somebody_else() {
+        let s = store();
+        let src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let mine = s.mint_speaker(0).unwrap();
+        let theirs = s.mint_speaker(0).unwrap();
+        let you = s.mint_speaker(0).unwrap();
+        for (u, sp) in [("them", theirs), ("me", you)] {
+            s.upsert_discord_user(u, u, 0).unwrap();
+            s.set_discord_link(u, Some(sp), Some(truth_via::MANUAL), 0)
+                .unwrap();
+        }
+        s.set_setting(YOU_SPEAKER_KEY, &you.to_string()).unwrap();
+
+        let v = Embedding::new("m@1", vec![1.0, 0.0]);
+        // 1: condemned — Discord says this turn was `theirs`, in full.
+        let bad = s.insert_segment(sess, 10, 20, "a.wav", 0).unwrap();
+        s.set_segment_truth(bad, Some("them"), truth_verdict::SINGLE, Some(0.95))
+            .unwrap();
+        let bad_p = s.add_prototype(mine, &v, Some(bad), false, 20, 0).unwrap();
+        // 2: safe — the verdict agrees with the prototype's owner.
+        let ok = s.insert_segment(sess, 30, 40, "b.wav", 0).unwrap();
+        s.set_segment_truth(ok, Some("them"), truth_verdict::SINGLE, Some(0.95))
+            .unwrap();
+        let ok_p = s.add_prototype(theirs, &v, Some(ok), false, 20, 0).unwrap();
+        // 3: safe — a `partial` verdict is one voice under the bar, not proof.
+        let weak = s.insert_segment(sess, 50, 60, "c.wav", 0).unwrap();
+        s.set_segment_truth(weak, Some("them"), truth_verdict::PARTIAL, Some(0.4))
+            .unwrap();
+        let weak_p = s.add_prototype(mine, &v, Some(weak), false, 20, 0).unwrap();
+        // 4: safe — the verdict names the user's OWN account, and a Discord
+        // client does not play your microphone back to you (§17). The same
+        // rule that keeps those rows out of the headline keeps them from
+        // condemning a prototype.
+        let own = s.insert_segment(sess, 70, 80, "d.wav", 0).unwrap();
+        s.set_segment_truth(own, Some("me"), truth_verdict::SINGLE, Some(0.95))
+            .unwrap();
+        let own_p = s.add_prototype(mine, &v, Some(own), false, 20, 0).unwrap();
+
+        let found = s.condemned_prototypes("m@1").unwrap();
+        let ids: Vec<i64> = found.iter().map(|c| c.prototype_id).collect();
+        assert_eq!(ids, vec![bad_p.unwrap()], "{found:?}");
+        assert_eq!(found[0].owner, mine);
+        assert_eq!(found[0].truth_speaker, theirs);
+        for other in [ok_p, weak_p, own_p] {
+            assert!(!ids.contains(&other.unwrap()));
+        }
+    }
+
+    #[test]
+    fn a_golden_prototype_is_never_condemned_by_a_verdict() {
+        // Hand-enrolled audio is the user's own word about who this is, and it
+        // outranks anything inferred from a Discord speaking ring.
+        let s = store();
+        let src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let mine = s.mint_speaker(0).unwrap();
+        let theirs = s.mint_speaker(0).unwrap();
+        s.upsert_discord_user("them", "them", 0).unwrap();
+        s.set_discord_link("them", Some(theirs), Some(truth_via::MANUAL), 0)
+            .unwrap();
+        let seg = s.insert_segment(sess, 10, 20, "a.wav", 0).unwrap();
+        s.set_segment_truth(seg, Some("them"), truth_verdict::SINGLE, Some(0.95))
+            .unwrap();
+        let g = Embedding::new("m@1", vec![1.0, 0.0]);
+        s.add_prototype(mine, &g, Some(seg), true, 20, 0).unwrap();
+        assert!(s.condemned_prototypes("m@1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_prototypes_reports_what_it_actually_removed() {
+        let s = store();
+        let a = s.mint_speaker(0).unwrap();
+        let v = Embedding::new("m@1", vec![1.0, 0.0]);
+        let p = s.add_prototype(a, &v, None, false, 20, 0).unwrap().unwrap();
+        assert_eq!(s.delete_prototypes(&[p, p + 9_000]).unwrap(), 1);
+        assert!(s.prototypes("m@1").unwrap().is_empty());
     }
 
     #[test]

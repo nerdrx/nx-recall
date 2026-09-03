@@ -1590,7 +1590,13 @@ Three guards, and they are the feature:
 
 A declined turn is **marked** (`translation_via` set, `translation` NULL) so the
 queue stays finite. A re-decode that changes the words clears both, putting the
-row back at the end of the queue.
+row back at the end of the queue. A turn whose source language the translator
+has no code for is declined the same way with `translation_via:
+"unsupported-language"` (0.11.9) rather than left for a retry — it fails
+identically every pass, and before this two French rows the guesser had named
+without confidence went to the model with an empty tag every five minutes for
+an evening. The guesser's tag now reaches the model even when it is not
+confident enough to be written onto the row.
 
 Measured (`spike/translate_bench.py`): 20 FLEURS sentence ids present in both
 `en_us` and `de_de` — FLEURS is parallel, so the German reference is a human's.
@@ -2432,6 +2438,115 @@ Nothing is required. When it wants to:
 
 A client must not present a *proposed* threshold as an installed one:
 `thresholds_swap` is the difference, and it is false far more often than true.
+
+## 0.11.9 — how a voice's prototypes become one score, and a bank that can be repaired
+
+Three changes to identity, all of them measured against this install's own
+ground truth on the same held-out rows (`spike/FINDINGS.md` §32). Two are
+learned and travel through `identity.calibrate`; one is an operator command.
+
+### A third learnable: the scoring rule
+
+A voice has up to twenty prototypes. Until 0.11.9 it scored the **best** of
+them, which answers *could this be them?* and is generous in exactly the wrong
+way: one recording of somebody that happens to sit near another person's turns
+wins those turns forever, and nothing the voice's other nineteen prototypes say
+can outvote it.
+
+The alternative asks whether the voice's record **agrees**: the mean of its k
+best. On this install that one change is worth more than everything 0.11.0
+learned — held out, wrong labels 13 → 7 and F-0.5 0.947 → 0.972, and it wins at
+the *global* threshold with no per-voice fitting at all, so it is the aggregate
+and not a threshold artefact. The mean over *all* prototypes is measured and
+catastrophic (F-0.5 0.774): prototypes are supposed to span a voice's range, so
+averaging the bad ones in measures the spread rather than the match.
+
+Stored as a `settings` row, not a column: it is one rule for the install rather
+than a property of a voice. **Absent means `"max"`** — every version before
+0.11.9, and every install that has learned nothing.
+
+`identity.calibrate` gains three fields:
+
+```jsonc
+{
+  "aggregate": {"rule": "top-3",
+                "score": {"n": 460, "correct": 426, "wrong": 7, "declined": 27,
+                          "precision": 0.984, "recall": 0.926, "f_beta": 0.972}},
+  "aggregate_installed": "max",   // the rule every other arm was measured under
+  "aggregate_swap": true          // did the gate approve it?
+}
+```
+
+`rule` is `"max"` or `"top-<k>"` for k in 1..5. A client that does not know a
+value must fall back to "the best prototype" rather than refuse to render.
+
+**Changing the rule clears every learned threshold.** 0.41 under max cosine and
+0.41 under a top-3 mean are not the same operating point, so a bar fitted
+against the old scale is a number nothing stands behind. One run moves the
+scale; the next calibrates to it. Clients should expect `cleared > 0` with
+`written == 0` on the run that swaps the aggregate, and that is not a bug.
+
+### A projection is now taken back, not merely refused
+
+Through 0.11.8 the pass only ever *wrote* projections. One evening's `--apply`
+installed a whitening; every later run measured it, refused it, and left it in
+the table — and the daemon went on labelling every turn in a space its own
+held-out numbers called worse. On this install that cost twenty-one correct
+labels and 4.5 pp of held-out recall, silently, for two days.
+
+A projection this run's held-out numbers do not re-earn is now dropped, and
+`projection_cleared: true` says so. It only fires when the pass actually
+measured something: a run that could not split has no verdict to refuse with,
+and absence of evidence is not refusal.
+
+### `identity.repair` — prototypes that are somebody else
+
+```jsonc
+// request
+{"method": "identity.repair", "params": {"prototypes": true, "apply": false}}
+```
+
+A prototype enrolled from a turn that carries a `single` verdict — one linked
+account covering at least `SINGLE_MIN` (0.8) of the audio — naming a **different**
+voice than the prototype's owner is a recording of that other person filed
+under this one. It is not a fit and it has no parameter: it is a consistency
+check between the bank and Discord's own word.
+
+```jsonc
+{
+  "condemned": [{"prototype": 2114, "owner": 55, "owner_name": "Speaker_55",
+                 "truth_speaker": 25, "truth_name": "Aspen",
+                 "segment": 17991, "coverage": 0.90}],
+  "deleted": 0,
+  "before": {"n": 458, "correct": 430, "wrong": 7, "…": null},
+  "after":  {"n": 458, "correct": 432, "wrong": 5, "…": null},
+  "note": null
+}
+```
+
+Three kinds of evidence are deliberately **not** used, and a client explaining
+the command should say so:
+
+* **`partial` and `overlap` verdicts.** A `partial` verdict is one account under
+  the coverage bar; an `overlap` turn has two mouths open and the embedder is
+  captured by one of them, so the prototype may perfectly well be its owner.
+  Measured: removing the twenty overlap-sourced prototypes on this install
+  *raises* the wrong-label count.
+* **The user's own account.** A `single` verdict naming the user's own Discord
+  account is not ground truth about audio captured from the user's own client
+  (0.10.1). The same rule that keeps those rows out of every headline keeps them
+  from condemning a prototype — on this install it spares twenty-seven.
+* **Golden prototypes.** Hand-enrolled audio is the user's own word about who
+  this is, and it outranks a speaking ring.
+
+`before` and `after` are measured on the held-out rows **minus** any row whose
+own verdict the repair read. That is the same rule as "no row is scored against
+a prototype it produced itself", one step further out.
+
+Unlike `identity.calibrate` this **never runs itself**. Deleting a prototype is
+permanent, and the gate that stops a six-hourly job churning an operating point
+is not the right gate for a correctness fix an operator asked for. Writes go to
+`operations` as `identity.repair`.
 ## 0.11.0 — live translation and short-line detection
 
 Two changes, one complaint behind both: a French line — "Tu arrêtes
@@ -3197,3 +3312,244 @@ passed.
   `digest rerender`.
 - Additive only. A client that reads `summary` and ignores the rest sees the
   same field it always did, with names in it.
+
+## 0.11.9 — Discord's word, applied; and the second client
+
+Three things, and the third is the reason the other two are shaped the way they
+are. The daemon had 168 turns it could name and had not; it had 137 turns queued
+for an enrolment pass that was switched off with nothing saying so; and it had a
+verdict, `nobody`, that it had been reading as a fact about a *person* when on
+this install it was a fact about *which of two Discord clients the plugin was
+sitting in*. The first two ship. The third ends two features that were designed
+and measured and then refused, and ships the one column that makes the question
+answerable next time.
+
+### `label_via = "truth"` — Discord names the blank turns
+
+A fifth value for `segments.label_via`, beside `match`, `mic`, `proximity` and
+`manual`. It means: the identity ladder declined to name this turn, Discord's
+verdict for it was `single`, and the account that owned it was already linked to
+a voice. `match_score` is NULL, as it is for `proximity`, because nothing was
+compared.
+
+**`recalld truth label`** lists what it would name; `--apply` writes; `--limit N`
+stops after N. Also runs nightly inside the truth worker, after the auto-linker
+and never before it (a user linked tonight has their backlog named tonight).
+
+Four things it will not do, by construction rather than by flag:
+
+- **It never overwrites.** A row that already has a speaker is not a candidate —
+  ladder, person or proximity, it is left alone. So the pass cannot move the
+  identity precision `truth report` prints: every row it writes was counted
+  `unlabelled` before and none was counted `correct`.
+- **It never enrols.** Not one prototype. The enrol bar is deliberately not
+  learned, and a pass that added prototypes on Discord's word would be that bar
+  learning itself through the side door. `[truth] enrol` remains the supervised
+  route.
+- **It never mints.** Only accounts already linked to a voice are read.
+- **It never uses your own account.** A `single` verdict naming *you* is not
+  evidence about audio captured from your own Discord client — that client never
+  plays your microphone back to you, so yours is the one voice the stream cannot
+  contain. 0.10.1 established this for scoring (FINDINGS §17, 73% → 88%); 0.11.9
+  inherits it for labelling, where getting it wrong would have put the user's
+  name on 17 turns of somebody else's voice, permanently.
+
+There is **no duration bar**, which makes it the only truth pass without one.
+Every other one is *measuring* the voicebank, where a sub-second turn measures
+the floor rather than the model. This one measures nothing; it copies a name.
+Discord's word about a one-second turn is as good as its word about a ten-second
+one, and the short turns are the ones no other route can ever name.
+
+Each `--apply` logs one **`truth.label`** operation per 200 rows, carrying every
+segment's prior state in `speakers.split`'s shape, so the pass is reversible as a
+class.
+
+### `truth.summary` — the two queues, said out loud
+
+Two new objects. Additive; a client that ignores them sees 0.11.8's reply.
+
+```json
+{"enrol": {"on": false, "waiting": 137,
+           "min_duration_ms": 3000, "min_coverage": 0.95},
+ "retro_label": {"waiting": 168}}
+```
+
+`enrol.waiting` is the count of turns that *would* be considered if `[truth]
+enrol` were true. It exists because of the shape of §29's investigation: the
+enrolment pass had never once fired, `segments.truth_enrol_ns` was NULL on all
+1,461 `single` rows, and the cause was neither a bug nor a bar the data could not
+reach — the feature was off by default and had never been turned on. Nothing
+anybody could run said so. A switch nobody can see is indistinguishable from a
+bug, and an evening went into telling them apart. `"off"` is a setting;
+`"off, with 137 turns waiting"` is a decision. `recalld truth report` prints both
+queues whenever they are non-empty.
+
+### Schema v14 — `sessions.instance_key`
+
+One nullable column, no backfill: for a session already on disk the answer is
+genuinely unknown, and NULL is the only honest way to say so. NULL is **not**
+"instance one".
+
+It holds `serial:<object.serial>`, or `pid:<application.process.id>` where
+PipeWire gave no serial — both already read by `capture::node_info_from_props`
+and, until now, thrown away at `Shared::attach`.
+
+**Why it is on the session and must never go on the source.** `sources.match_key`
+comes from `application.process.binary`, so two copies of one application share
+one source row. The obvious fix — suffix the key with the pid — is a trap:
+`allowlist::decide` looks that key up in the `[rules]` table by exact string, so
+`"vesktop#4711"` matches no rule, falls through to default-deny, and **capture
+silently stops for an app the user explicitly allowed**. `[rules.X]` would grow
+an entry per launch, `recalld allow <KEY>` would need a number a human cannot
+know, and the GUI's source card and per-source search filter are keyed the same
+way. A session, by contrast, is already per-PipeWire-node — two instances already
+open two concurrent `sessions` rows against the one source — so the identity has
+a home that costs nothing.
+
+What the column does **not** do is say which instance the ground-truth plugin is
+sitting in. That needs the plugin to name the call it is watching, which is a
+wire change and is not in this round.
+
+### The two-client failure mode
+
+Read this before trusting a `nobody` verdict for anything.
+
+`truth_verdict = 'nobody'` means *no account the RecallBridge plugin can see
+reached 20% coverage of this turn, and the plugin was running*. It has always
+been documented as "a real disagreement worth looking at". On an install running
+**two Discord clients** it is frequently not a disagreement at all:
+
+- Both clients are Vesktop, so PipeWire names both nodes `vesktop` and both
+  collapse into one `sources` row and, on the evening §29 measured, into one
+  session.
+- Only one client carries the plugin. The other's call — different account,
+  different channel, different people — arrives through the same source with no
+  speaking spans behind it at all.
+- The plugin's own call is live and noisy, so `truth_spans_between` finds spans
+  within five minutes and the verdict is `nobody` rather than `unknown`.
+
+The result is a confident-looking `nobody` on turns of real people the plugin was
+never able to see. On the measured install that was **190 rows across four
+voices, every one of them a person the user had named by hand within two minutes
+of the voice being minted**. Neither of the two obvious daemon-side repairs
+works, and both were measured before being dropped (§29): a session-level rule
+("a session with no positive verdict is not the bridge's call") rescues 31 of 350
+rows and not one of the 190, because both calls shared session 305; a voice-level
+rule ("a voice that never once got a positive verdict") rescues 20 and not one of
+the 190, because cross-talk from the local user gave all four voices `single`
+verdicts of their own.
+
+Consequences, which are contracts and not advice:
+
+- **`nobody` is not evidence that no human spoke.** Nothing may unassign a label,
+  refuse a mint, or downgrade a voice on the strength of it. 0.11.9 designed both
+  a `identity repair --media` and a mint guard keyed on `nobody`, measured them,
+  and shipped neither; §29 has the numbers and the reasoning.
+- **`nobody` remains excluded from every score,** as it has been since 0.9.0.
+  Nothing about the identity or overlap numbers changes.
+- The honest fix is to stop merging the two instances, which is what
+  `sessions.instance_key` begins and a plugin that names its call will finish.
+## 0.11.9 — the archive sweep for language
+
+Every language decision is made once, on the way in, by whatever was shipped
+that evening. The spoken-language identifier arrived in 0.11.0, Korean and
+Chinese in 0.11.6, French and a one-second floor in 0.11.8 — and none of it
+reached a row captured before it. On the install this was measured against,
+**7,428 non-deleted rows have `lang: null`**, 4,141 of them at least a second
+long with their audio still on disk.
+
+`recalld lang sweep` walks them, and the same pass runs nightly while
+`[asr].lang_sweep` is on, in the night shift's clock window (`[night].window`
+and `[night].also_when_idle_min`) but **not** behind `[night].enabled` — the
+night shift needs a gigabyte of whisper and a local compile, and this needs a
+13 MB identifier.
+
+#### What it writes
+
+- **`lang_via` gains `"sweep"`** — an eighth value, and it appears in **two
+  shapes**:
+  - with `lang` set to `"de"` or `"en"`, on a row the identifier heard as one
+    of the two languages the routes deliberately never act on. The words are
+    **not** touched: there was nothing to re-decode, so the honest record is
+    the reading and no more.
+  - with `lang` still `null`, on a row the identifier heard as something
+    nothing acts on, or had no opinion about. Nothing is claimed; the mark is
+    there so a bounded, resumable walk does not pay for the same model pass
+    every night. The same shape as `"mismatch"`.
+- It is **not** `"lid"`, and a client must not read it as one: `"lid"` promises
+  that a decoder re-read the turn and its words are on the row, and a `"sweep"`
+  row never had a re-decode.
+- A `"sweep"` stamp is **excluded from the conversational language prior**
+  (`Store::thread_language_stamps`), alongside `"context"`. One second of audio
+  nobody could read, judged by nothing, is not evidence about what language a
+  conversation is in.
+- Rows marked `"mismatch"` are **never** swept: that backlog is
+  `recalld lang repair`'s, and overwriting the mark would silently empty its
+  queue.
+- Rows a person has corrected (`operations` `op: "segments.correct"`) are never
+  swept, the same guard the night shift's queue carries.
+
+#### What it does not write, and why that is the finding
+
+**Off by default, `[asr].lang_sweep_redecode = false`: the sweep does not
+replace transcripts.** With `lang` written and the words left alone there is
+nothing here a client has to re-render.
+
+The routing half was measured and refused (FINDINGS §29). Run over 1,796
+untagged rows at the live operating point, the identifier named a routed
+language for 342 of them — 131 Korean, 67 Chinese, in an archive where nobody
+has ever spoken either — and 44 survived every judge, 36 on voices declared
+German/English-only. That is 2.30% against the **1% of de/en** gate the routes
+shipped under. Asking the identifier over three overlapping windows that must
+agree brings it to 0.97%, inside the gate — and a hand check of all nine
+resulting rewrites says **eight are wrong**. `"Okay."` became `、お疲さ`;
+`"Oh, she has this detected beim sonar."` became a fluent French sentence
+nobody said.
+
+The gate is not wrong, it is being asked the wrong question. On the live path
+the rows that clear these guards are overwhelmingly real foreign turns and the
+false positives are a residue. On an archive of German and English there are
+almost no real foreign turns to be right about, so the residue is the whole
+output. **A 1% false-positive budget is a tax on a benefit, not a substitute
+for one.**
+
+`recalld lang sweep --apply --redecode`, or `[asr].lang_sweep_redecode = true`,
+turns it on. A row it settles is then shaped exactly like a live one:
+`lang_via: "lid"`, `text_via: "lid"`, the decoder's `asr_model_id`, and an
+`operations` row `op: "segments.redecode"` carrying the prior text — because it
+is the same code, called in the same order.
+
+#### The two knobs that make it stricter than the live path
+
+Both are one-directional: an operator may make the sweep stricter than the live
+route and never looser.
+
+- **`[asr].lang_sweep_windows`** (default `3`, live `1`). Three overlapping
+  identifier windows at `lid_min_confidence = 1.0`, so a reading has to survive
+  being asked about three different parts of the same turn. Three model passes
+  at RTF 0.027 is a price a nightly batch can pay and a live turn cannot.
+- **`[asr].lang_sweep_min_s`** (default `1.5`, live `1.0`). Below 1.5 s nothing
+  is ever kept anyway — `[lang].arbiter_min_duration_s` is the replacement floor
+  and both decoders refuse under it — so the 974 archive rows in that band cost
+  a model pass each and produced no rewrites at all.
+
+`[asr].lang_sweep_rows_per_run` (default `400`) bounds a nightly run, and counts
+**rows a model was spent on**, not rows looked at: 2,345 of the 4,141 are
+declined by the text pre-filter for free, and a budget spent walking past those
+would take a fortnight to reach the first row worth asking about.
+
+#### The CLI
+
+```text
+recalld lang                     adds two lines: the sweep bar, and how much
+                                 archive is owed against how much is swept
+recalld lang sweep               preview. Runs the identifier; decodes nothing,
+                                 writes nothing. Prints what it heard and what
+                                 --redecode would have rewritten.
+recalld lang sweep --apply       write the language, never the words
+recalld lang sweep --apply --redecode    also let the decoders rewrite
+```
+
+Bounded (`--limit`, `--batch`), resumable, idle-priority, and safe to run while
+the daemon is capturing: the work list is a query rather than a cursor, and
+every row a model is spent on leaves it.

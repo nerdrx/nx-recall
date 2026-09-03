@@ -33,3 +33,6 @@ spike/clips/
 # Editor / OS
 .DS_Store
 *.swp
+
+# agent worktrees (created by the harness, never source)
+.claude/worktrees/

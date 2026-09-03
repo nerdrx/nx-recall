@@ -82,17 +82,37 @@ pub enum Decision {
 /// Prototypes must already be filtered to the probe's `embed_model_id`; the
 /// cosine call enforces it anyway and turns a leak into an error.
 pub fn rank(probe: &Embedding, prototypes: &[(i64, Embedding)]) -> Result<Vec<Candidate>> {
-    let mut best: Vec<Candidate> = Vec::new();
+    rank_with(probe, prototypes, crate::calib::Aggregate::Max)
+}
+
+/// [`rank`], with the rule for turning a voice's several prototypes into one
+/// score looked up instead of assumed (0.11.9).
+///
+/// `rank` is exactly this with [`Aggregate::Max`](crate::calib::Aggregate::Max),
+/// so the pre-0.11.9 behaviour is not a second code path that could drift from
+/// this one.
+pub fn rank_with(
+    probe: &Embedding,
+    prototypes: &[(i64, Embedding)],
+    aggregate: crate::calib::Aggregate,
+) -> Result<Vec<Candidate>> {
+    // Grouped rather than folded, because a top-k mean cannot be accumulated
+    // one prototype at a time — it needs the voice's whole list at once.
+    let mut per_voice: Vec<(i64, Vec<f32>)> = Vec::new();
     for (speaker_id, proto) in prototypes {
         let score = probe.cosine(proto)?;
-        match best.iter_mut().find(|c| c.speaker_id == *speaker_id) {
-            Some(c) => c.score = c.score.max(score),
-            None => best.push(Candidate {
-                speaker_id: *speaker_id,
-                score,
-            }),
+        match per_voice.iter_mut().find(|(id, _)| id == speaker_id) {
+            Some((_, v)) => v.push(score),
+            None => per_voice.push((*speaker_id, vec![score])),
         }
     }
+    let mut best: Vec<Candidate> = per_voice
+        .into_iter()
+        .filter_map(|(speaker_id, mut scores)| {
+            let score = aggregate.of(&mut scores);
+            (!score.is_nan()).then_some(Candidate { speaker_id, score })
+        })
+        .collect();
     best.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -461,6 +481,50 @@ mod tests {
                 enroll: true
             }
         );
+    }
+
+    // ---- how a voice's prototypes become one score (0.11.9) --------------
+
+    #[test]
+    fn top_k_ranking_prefers_the_voice_that_agrees_with_itself() {
+        // Speaker 1 has one prototype that happens to be very close, and two
+        // that are not. Speaker 2 has three that all agree. Under max cosine
+        // speaker 1 wins on its one lucky prototype; under a top-3 mean the
+        // voice whose whole record supports the claim wins. On this install
+        // that difference is most of the Rowan/Aspen confusion (§32).
+        let probe = e(&[1.0, 0.0]);
+        let bank = vec![
+            (1, e(&[0.95, 0.31])),
+            (1, e(&[0.20, 0.98])),
+            (1, e(&[0.10, 0.99])),
+            (2, e(&[0.90, 0.44])),
+            (2, e(&[0.88, 0.47])),
+            (2, e(&[0.89, 0.46])),
+        ];
+        assert_eq!(rank(&probe, &bank).unwrap()[0].speaker_id, 1);
+        let r = rank_with(&probe, &bank, crate::calib::Aggregate::TopK(3)).unwrap();
+        assert_eq!(r[0].speaker_id, 2, "{r:?}");
+    }
+
+    #[test]
+    fn rank_is_rank_with_max_and_not_a_second_code_path() {
+        let probe = e(&[1.0, 0.0]);
+        let bank = vec![
+            (1, e(&[0.9, 0.4])),
+            (1, e(&[0.5, 0.8])),
+            (2, e(&[0.7, 0.7])),
+        ];
+        assert_eq!(
+            rank(&probe, &bank).unwrap(),
+            rank_with(&probe, &bank, crate::calib::Aggregate::Max).unwrap()
+        );
+    }
+
+    #[test]
+    fn top_k_still_refuses_to_compare_across_models() {
+        let probe = Embedding::new("a@1", vec![1.0, 0.0]);
+        let bank = vec![(1, Embedding::new("b@1", vec![1.0, 0.0]))];
+        assert!(rank_with(&probe, &bank, crate::calib::Aggregate::TopK(3)).is_err());
     }
 
     // ---- ranking ---------------------------------------------------------

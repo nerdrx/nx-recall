@@ -107,6 +107,21 @@ impl NodeInfo {
     fn target(&self) -> Option<String> {
         self.serial.clone().or_else(|| self.ident.node_name.clone())
     }
+
+    /// Which *copy* of the application this node belongs to (0.11.9).
+    ///
+    /// `object.serial` first because PipeWire promises never to reuse it within
+    /// a boot, where the registry id at `node_id` is reused as soon as a node
+    /// dies; `application.process.id` second because a pid is what a human
+    /// reading a log can actually match against `ps`. `None` when the node
+    /// carried neither, which is a real case and must stay distinguishable from
+    /// "one instance" — see `Store::begin_session_for`.
+    fn instance_key(&self) -> Option<String> {
+        self.serial
+            .clone()
+            .map(|s| format!("serial:{s}"))
+            .or_else(|| self.ident.process_id.map(|p| format!("pid:{p}")))
+    }
 }
 
 fn ident_from_props(props: &spa::utils::dict::DictRef) -> SourceIdent {
@@ -535,7 +550,10 @@ impl Shared {
                 .store
                 .lock()
                 .map_err(|_| anyhow!("store mutex poisoned"))?;
-            store.begin_session(source_id, utc_now_ns())?
+            // 0.11.9: which copy of the app this is. Already in hand here and
+            // thrown away until now; see `Store::begin_session_for` for what
+            // that cost.
+            store.begin_session_for(source_id, utc_now_ns(), node.instance_key().as_deref())?
         };
         let result = self.attach_stream(core, node, session_id, match_key, display_name);
         if result.is_err()

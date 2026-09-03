@@ -86,6 +86,11 @@ pub mod server;
 pub mod service;
 pub mod split;
 pub mod store;
+// ---- 0.11.9 --------------------------------------------------------------
+/// The archive language sweep: the identifier, over the rows captured before
+/// there was one.
+pub mod sweep;
+// ---- end 0.11.9 ----------------------------------------------------------
 pub mod threads;
 pub mod timeref;
 pub mod translate;

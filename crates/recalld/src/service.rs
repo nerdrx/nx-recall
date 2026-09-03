@@ -474,6 +474,7 @@ impl Service {
             // ---- end 0.9.0 -------------------------------------------------
             // ---- 0.11.0, learned identity ----------------------------------
             "identity.calibrate" => self.identity_calibrate(req),
+            "identity.repair" => self.identity_repair(req),
             // ---- end 0.11.0 ------------------------------------------------
             // ---- 0.9.0, the assistant --------------------------------------
             // One read. Reminders ride on `notes.*` (a reminder is a note with
@@ -4305,6 +4306,25 @@ impl Service {
     }
 
     // ---- end 0.11.0 -------------------------------------------------------
+
+    /// `identity.repair` (0.11.9): throw out prototypes that are recordings of
+    /// somebody else.
+    ///
+    /// `prototypes` is required and spelled out rather than assumed, exactly
+    /// as the CLI flag is: this deletes from the voicebank, and a caller that
+    /// meant to preview must not be able to reach the deletion by omitting a
+    /// field. Nothing runs this on a timer.
+    fn identity_repair(&self, req: &Request) -> Result<Value, Error> {
+        if !req.params["prototypes"].as_bool().unwrap_or(false) {
+            return Err(Error::params(
+                "identity.repair needs `prototypes: true`; it is the only thing it \
+                 can repair, and naming it is what keeps the deletion deliberate",
+            ));
+        }
+        let apply = req.params["apply"].as_bool().unwrap_or(false);
+        let now = crate::clock::utc_now_ns();
+        Ok(crate::identity_learn::repair_prototypes(&self.store(), apply, now)?.to_json())
+    }
     // ---- end 0.9.0 --------------------------------------------------------
 }
 
@@ -8332,7 +8352,7 @@ mod tests {
         let _live = crate::translate::test_guard();
         let r = rig("assist-status");
         let s = call(&r, r#"{"id":1,"method":"status"}"#).unwrap();
-        assert_eq!(s["schema"], json!(15));
+        assert_eq!(s["schema"], json!(crate::store::SCHEMA_VERSION));
         // Shipped defaults: reminders and digests on (both need something else
         // before they do anything), translation off with no guess at a target.
         assert_eq!(s["assist"]["reminders"], json!(true));
