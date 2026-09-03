@@ -47,7 +47,7 @@ NEGATIVES = 200  # per negative language, so 400 in total
 # ---- the tables, verbatim in crates/recalld/src/lang.rs ---------------------
 
 STOPWORDS = {
-    "fr": "le la les des une est ne pas que qui pour dans sur avec aux cette il elle nous vous ils elles mais ou plus sont été être ce".split(),
+    "fr": "le la les des une est ne pas que qui pour dans sur avec aux cette il elle nous vous ils elles mais ou plus sont été être ce je tu mon ma mes ton ta tes sa ses moi toi oui très alors voilà comme aussi encore jamais rien tout quoi ça cela suis sommes êtes ont fait faire chez sans sous vers donc où quand comment pourquoi merci bonjour salut petit".split(),
     "es": "el los las del y en que es un una por para con su como más pero está están fue sus".split(),
     "it": "il lo gli le di della che non è un una per con sono come più anche dei nel alla".split(),
     "pt": "os as do da dos das que não um uma por para com mais mas está são se na no".split(),

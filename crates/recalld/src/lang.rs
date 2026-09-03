@@ -172,7 +172,7 @@ pub struct OtherLang {
 const OTHER_STOPWORDS: &[(&str, &str)] = &[
     (
         "fr",
-        "le la les des une est ne pas que qui pour dans sur avec aux cette il elle nous vous ils elles mais ou plus sont été être ce",
+        "le la les des une est ne pas que qui pour dans sur avec aux cette il elle nous vous ils elles mais ou plus sont été être ce je tu mon ma mes ton ta tes sa ses moi toi oui très alors voilà comme aussi encore jamais rien tout quoi ça cela suis sommes êtes ont fait faire chez sans sous vers donc où quand comment pourquoi merci bonjour salut petit",
     ),
     (
         "es",
@@ -315,7 +315,15 @@ fn guess_by_stopwords(text: &str) -> Option<OtherLang> {
             tied = true;
         }
     }
-    if best < MIN_VOTES || best <= de + en || tied {
+    // 0.11.6: on a line of at most four words, two function words of ONE
+    // language with no German/English vote and no runner-up settle it. "je
+    // suis", "ça va", "mon petit" are conversation, and conversation is what
+    // the daemon hears; FLEURS is read news, which is why the three-vote floor
+    // was tuned where it was. Measured (spike/short_lang_bench.py, variant B):
+    // de/en false positives unchanged at 1 / 2 / 1 / 0 of 800 per length,
+    // recall +0.2 pp overall — the win is off-corpus, in spoken lines.
+    let short_two = ws.len() <= 4 && best == 2 && de + en == 0 && !tied;
+    if (best < MIN_VOTES && !short_two) || best <= de + en || tied {
         return None;
     }
     if !GUESSABLE.contains(&best_tag) {
@@ -1130,5 +1138,33 @@ mod tests {
         assert_eq!(word_count("uh"), 1);
         assert_eq!(word_count("uh huh"), 2);
         assert_eq!(word_count("...!"), 0);
+    }
+}
+
+#[cfg(test)]
+mod conversational_french {
+    //! FLEURS is read news, and the shipped function-word list was tuned on it.
+    //! What the daemon hears is conversation: "je ne sais pas" carries three
+    //! French function words and none of them were in the list until 0.11.6.
+    use super::guess_other;
+
+    #[test]
+    fn a_spoken_french_line_of_function_words_is_french() {
+        assert_eq!(guess_other("Je ne sais pas.").map(|g| g.tag), Some("fr"));
+        assert_eq!(guess_other("Oui, je suis là.").map(|g| g.tag), Some("fr"));
+        // Two function words on a short line are enough (variant B).
+        assert_eq!(guess_other("Je suis là.").map(|g| g.tag), Some("fr"));
+        assert_eq!(guess_other("Merci, toi aussi.").map(|g| g.tag), Some("fr"));
+        // One listed word is not enough, short line or not ("va" is Spanish too).
+        assert_eq!(guess_other("Ça va ?").map(|g| g.tag), None);
+        // …but not when German or English voted, or on a long line.
+        assert_eq!(guess_other("Ich bin da.").map(|g| g.tag), None);
+        assert_eq!(
+            guess_other("mon petit dog is very cute").map(|g| g.tag),
+            None
+        );
+        // German and English conversation must not move.
+        assert_eq!(guess_other("Ich weiß es nicht.").map(|g| g.tag), None);
+        assert_eq!(guess_other("I do not know.").map(|g| g.tag), None);
     }
 }

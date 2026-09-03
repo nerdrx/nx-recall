@@ -55,7 +55,7 @@ NEGATIVES = 400  # per negative language, per length
 # ---- the 0.10.2 tables, verbatim in crates/recalld/src/lang.rs --------------
 
 STOPWORDS = {
-    "fr": "le la les des une est ne pas que qui pour dans sur avec aux cette il elle nous vous ils elles mais ou plus sont été être ce".split(),
+    "fr": "le la les des une est ne pas que qui pour dans sur avec aux cette il elle nous vous ils elles mais ou plus sont été être ce je tu mon ma mes ton ta tes sa ses moi toi oui très alors voilà comme aussi encore jamais rien tout quoi ça cela suis sommes êtes ont fait faire chez sans sous vers donc où quand comment pourquoi merci bonjour salut petit".split(),
     "es": "el los las del y en que es un una por para con su como más pero está están fue sus".split(),
     "it": "il lo gli le di della che non è un una per con sono come più anche dei nel alla".split(),
     "pt": "os as do da dos das que não um uma por para com mais mas está são se na no".split(),
@@ -225,7 +225,12 @@ def stopword_guess(text):
     scores = sorted(((sum(bag[w] for w in sw), tag) for tag, sw in STOPWORDS.items()), reverse=True)
     best, tag = scores[0]
     runner = scores[1][0]
-    if best < MIN_VOTES or best <= de + en or best == runner:
+    # Variant B (measured 2026-09-03): on a line of at most four words, two
+    # function words of ONE language with no German/English vote and no
+    # runner-up settle it — "je suis", "mon petit", "ça va" are conversation,
+    # and conversation is what the daemon hears.
+    short_two = len(ws) <= 4 and best == 2 and de + en == 0 and runner == 0
+    if (best < MIN_VOTES and not short_two) or best <= de + en or best == runner:
         return (None, False)
     if tag not in SHIP:
         return (None, False)
