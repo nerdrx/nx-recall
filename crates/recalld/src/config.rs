@@ -860,6 +860,24 @@ pub struct AssistConfig {
     /// is what stops "main" from being a quotation nobody can check.
     pub translation_display: String,
     // ---- end 0.10.2 -------------------------------------------------------
+
+    // ---- 0.11.0, the translator -------------------------------------------
+    /// Which backend translates: `"qwen"` — the 0.9.0 path, the graph model's
+    /// prompt and grammar — or `"nllb"`, the dedicated translator
+    /// (`crate::nllb`). Anything else reads as the default.
+    ///
+    /// The default is the one `spike/nllb_bench.py` measured as better; see
+    /// FINDINGS §23 for the table and the gate. A backend whose model is not
+    /// installed falls back to the other one rather than switching translation
+    /// off, because a person who turned translation on asked for translation,
+    /// not for a particular model.
+    pub translator: String,
+    /// ONNX intra-op threads for the translator. Four, which is what the bench
+    /// measured; the worker thread already carries `[runtime]`'s nice and CPU
+    /// pin, and the ONNX pool inherits both, so this is a throughput knob and
+    /// not a politeness one.
+    pub translator_threads: i32,
+    // ---- end 0.11.0 -------------------------------------------------------
     /// Rows per batch, for both model passes.
     pub batch: usize,
     /// Seconds between batches, and between re-checks while a gate is closed.
@@ -884,6 +902,8 @@ impl Default for AssistConfig {
             translate_min_words: 3,
             read_languages: vec!["de".to_string(), "en".to_string()],
             translation_display: crate::translate::DISPLAY_MAIN.to_string(),
+            translator: crate::translate::DEFAULT_TRANSLATOR.to_string(),
+            translator_threads: 4,
             batch: 8,
             batch_pause_s: 10,
             max_queue_seconds: 5,

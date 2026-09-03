@@ -746,6 +746,14 @@ pub enum ModelsAction {
         #[arg(long)]
         semantic: bool,
 
+        /// Also install the dedicated translator (~911 MB, 0.11.0):
+        /// NLLB-200-distilled-600M, int8 ONNX, which translates a turn without
+        /// being asked in a prompt not to answer it. Optional — without it
+        /// translation runs on the graph model, which is what 0.9.0 shipped.
+        /// **Licensed CC-BY-NC 4.0: a personal install, not a product.**
+        #[arg(long)]
+        translator: bool,
+
         /// Do not write the resulting directory into config.toml. Without this
         /// the fetch points `[models].dir` at what it just installed, so
         /// `models status` and the daemon agree with it.

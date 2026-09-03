@@ -93,6 +93,10 @@ pub enum Group {
     /// identifier with nothing to hand a Japanese turn to only produces a log
     /// line. `models fetch --japanese` installs the pair or neither.
     Japanese,
+    /// The dedicated translator (0.11.0): NLLB-200-distilled-600M as two int8
+    /// ONNX graphs plus its tokenizer. Optional, and **CC-BY-NC 4.0** — see
+    /// the catalogue entry, which says what that means for anything commercial.
+    Translator,
 }
 
 impl Group {
@@ -129,6 +133,10 @@ impl Group {
                 "optional — a Japanese decoder and the language identifier that \
                  routes to it; without them Japanese turns come back as Latin \
                  nonsense nothing can detect"
+            }
+            Group::Translator => {
+                "optional — the dedicated translator; without it translation \
+                 runs on the graph model's prompt. CC-BY-NC 4.0: personal use only"
             }
         }
     }
@@ -198,6 +206,30 @@ pub const NIGHT_VULKAN_HEADERS_TAG: &str = "v1.4.313";
 pub const NIGHT_SPIRV_HEADERS_TAG: &str = "vulkan-sdk-1.4.313.0";
 /// Where the built runtime goes, under the models root.
 pub const NIGHT_DIR: &str = "whisper";
+
+// ---- the dedicated translator (0.11.0) ------------------------------------
+
+/// `RemoteAsset::role`s for the three translator files, named for the same
+/// reason every other group's are: `models fetch --translator` and
+/// `models status` both pick them out of the catalogue by these strings.
+pub const TRANSLATOR_ROLE: &str = "translator.encoder";
+pub const TRANSLATOR_DECODER_ROLE: &str = "translator.decoder";
+pub const TRANSLATOR_TOKENIZER_ROLE: &str = "translator.tokens";
+
+/// The directory the translator installs into, under the models root. The
+/// stored `translation.via` is derived from this name, exactly as the semantic
+/// model's id is, so it must not drift with whatever upstream calls the export
+/// this year.
+pub const TRANSLATOR_DIR: &str = "nllb-200-distilled-600m-int8";
+pub const TRANSLATOR_ENCODER_FILE: &str = "encoder.onnx";
+pub const TRANSLATOR_DECODER_FILE: &str = "decoder_merged.onnx";
+pub const TRANSLATOR_TOKENIZER_FILE: &str = "tokenizer.json";
+
+/// Bumped when anything about how a translation is produced changes — the
+/// export, the decoding, the language table. `translation.via` carries it, so a
+/// row translated by one contract is never mistaken for a row translated by
+/// another, and the whole lot can be found and re-run.
+pub const TRANSLATOR_CONTRACT_VERSION: u32 = 1;
 
 pub const CONFIDENCE_ROLE: &str = "confidence";
 
@@ -507,6 +539,60 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
             ),
             ("sherpa-onnx-whisper-tiny/tiny-tokens.txt", 816_730),
         ],
+    },
+    // ---- the dedicated translator (0.11.0) --------------------------------
+    //
+    // Optional, and the flag is `models fetch --translator`. Three assets,
+    // ~911 MB together, for a feature that already works without them: with the
+    // translator absent, `[assist] translator` falls back to the graph model's
+    // prompt, which is what 0.9.0 shipped.
+    //
+    // **Licence: CC-BY-NC 4.0.** NLLB-200 is published non-commercially. That
+    // is fine for this daemon, which is one person's private install, and it is
+    // a hard blocker for selling anything that bundles it — which is why this
+    // is a separate opt-in group with the licence written next to the bytes
+    // rather than a file quietly added to the default set.
+    //
+    // Measured (spike/nllb_bench.py, FINDINGS §23): 13 FLEURS directions, 100
+    // parallel sentences each, scored by chrF against the human reference and
+    // by the e5 cosine §16 used, against the shipped qwen2.5-3b prompt on the
+    // same sentences and the same four pinned cores.
+    //
+    // The transformers.js mirror's int8 export, pinned to a commit so a
+    // re-upload to `main` cannot change the catalogued size under us. The
+    // decoder is the **merged** export — one graph carrying both the cache and
+    // no-cache paths — because the alternative is two graphs and 915 MB for the
+    // same thing; `crate::nllb` documents the one non-obvious thing about
+    // driving it.
+    RemoteAsset {
+        role: TRANSLATOR_ROLE,
+        url: "https://huggingface.co/Xenova/nllb-200-distilled-600M/resolve/261c31d1a5732c67cdd16d80e8d6088507c7ccea/onnx/encoder_model_quantized.onnx",
+        download_bytes: 419_120_483,
+        install: Install::File("nllb-200-distilled-600m-int8/encoder.onnx"),
+        group: Group::Translator,
+        files: &[("nllb-200-distilled-600m-int8/encoder.onnx", 419_120_483)],
+    },
+    RemoteAsset {
+        role: TRANSLATOR_DECODER_ROLE,
+        url: "https://huggingface.co/Xenova/nllb-200-distilled-600M/resolve/261c31d1a5732c67cdd16d80e8d6088507c7ccea/onnx/decoder_model_merged_quantized.onnx",
+        download_bytes: 475_505_771,
+        install: Install::File("nllb-200-distilled-600m-int8/decoder_merged.onnx"),
+        group: Group::Translator,
+        files: &[(
+            "nllb-200-distilled-600m-int8/decoder_merged.onnx",
+            475_505_771,
+        )],
+    },
+    // The tokenizer is a third asset rather than part of the first because
+    // upstream ships it separately, and the daemon refuses to load the model
+    // without it: half an install is not a usable one.
+    RemoteAsset {
+        role: TRANSLATOR_TOKENIZER_ROLE,
+        url: "https://huggingface.co/Xenova/nllb-200-distilled-600M/resolve/261c31d1a5732c67cdd16d80e8d6088507c7ccea/tokenizer.json",
+        download_bytes: 17_331_224,
+        install: Install::File("nllb-200-distilled-600m-int8/tokenizer.json"),
+        group: Group::Translator,
+        files: &[("nllb-200-distilled-600m-int8/tokenizer.json", 17_331_224)],
     },
     // ---- the memory graph's Tier 3 (GRAPH.md) -----------------------------
     //
@@ -1289,6 +1375,89 @@ impl SemanticModel {
             crate::fetch::human(semantic_download_bytes())
         )
     }
+}
+
+/// Where the optional translator lives, and whether it is there (0.11.0).
+///
+/// Kept apart from [`ModelSet`] for exactly the reason [`SemanticModel`] is: a
+/// machine that never opted into a 911 MB non-commercially-licensed translator
+/// is not a broken install. Absent, `[assist] translator` falls back to the
+/// graph model's prompt, which is what 0.9.0 shipped and still works.
+#[derive(Debug, Clone)]
+pub struct TranslatorModel {
+    pub root: PathBuf,
+    pub dir: PathBuf,
+    pub encoder: PathBuf,
+    pub decoder: PathBuf,
+    pub tokenizer: PathBuf,
+}
+
+impl TranslatorModel {
+    pub fn resolve(cfg: &ModelsConfig) -> Option<Self> {
+        Some(Self::resolve_at(cfg.dir.clone()?))
+    }
+
+    pub fn resolve_at(root: PathBuf) -> Self {
+        let dir = root.join(TRANSLATOR_DIR);
+        Self {
+            encoder: dir.join(TRANSLATOR_ENCODER_FILE),
+            decoder: dir.join(TRANSLATOR_DECODER_FILE),
+            tokenizer: dir.join(TRANSLATOR_TOKENIZER_FILE),
+            dir,
+            root,
+        }
+    }
+
+    pub fn entries(&self) -> Vec<ModelEntry> {
+        [
+            (TRANSLATOR_ROLE, &self.encoder),
+            (TRANSLATOR_DECODER_ROLE, &self.decoder),
+            (TRANSLATOR_TOKENIZER_ROLE, &self.tokenizer),
+        ]
+        .into_iter()
+        .map(|(role, path)| ModelEntry {
+            role,
+            path: path.clone(),
+            expected: path
+                .strip_prefix(&self.root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .as_deref()
+                .and_then(expected_bytes),
+        })
+        .collect()
+    }
+
+    /// All three files present at exactly the catalogued size. A truncated or
+    /// half-installed translator is *absent*, not broken: translation carries
+    /// on through the other backend.
+    pub fn present(&self) -> bool {
+        self.entries().iter().all(|e| e.ok())
+    }
+
+    /// Stable identity of what produced a translation, stored in
+    /// `translation.via` on every row this backend writes.
+    pub fn model_id(&self) -> String {
+        format!("{}@{TRANSLATOR_CONTRACT_VERSION}", dir_name(&self.dir))
+    }
+
+    pub fn how_to_get_it() -> String {
+        format!(
+            "the dedicated translator is not installed. `recalld models fetch --translator` \
+             installs {TRANSLATOR_DIR} ({}), which is NLLB-200-distilled-600M under \
+             CC-BY-NC 4.0 — free for a personal install, not for anything sold.",
+            crate::fetch::human(translator_download_bytes())
+        )
+    }
+}
+
+/// Bytes `models fetch --translator` has to pull down.
+pub fn translator_download_bytes() -> u64 {
+    REMOTE_ASSETS
+        .iter()
+        .filter(|a| a.group == Group::Translator)
+        .map(|a| a.download_bytes)
+        .sum()
 }
 
 /// Bytes `models fetch --semantic` has to pull down.

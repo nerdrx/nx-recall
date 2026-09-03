@@ -243,8 +243,11 @@ pub fn run(
             && crate::enrich::gate(&control, &graph).is_none()
         {
             resolve(&mut llm, &mut resolved_for);
-            if let Some(llm) = llm.as_ref() {
-                match crate::translate::drain_live(&store, &control, &bus, llm, &stopped) {
+            // 0.11.0: the dedicated translator needs no graph model, so this
+            // runs with `None` when NLLB is selected and the graph model is
+            // absent; the Qwen path inside stands down on its own without one.
+            if llm.is_some() || crate::translate::nllb_selected() {
+                match crate::translate::drain_live(&store, &control, &bus, llm.as_ref(), &stopped) {
                     Ok(did) => worked |= did,
                     Err(e) => warn!("a live translation pass failed: {e:#}"),
                 }
@@ -260,10 +263,23 @@ pub fn run(
                 None => {
                     if !said_unavailable {
                         info!(
-                            "the assistant's digests and translations need the local model — \
+                            "the assistant's digests need the local model — \
                              `recalld models fetch --graph` installs it"
                         );
                         said_unavailable = true;
+                    }
+                    // 0.11.0: translation does not — the dedicated translator
+                    // is its own model. Same batch, no graph model handed in.
+                    if crate::translate::enabled() && crate::translate::nllb_selected() {
+                        match crate::translate::batch(&store, &control, &bus, None, &cfg, &stopped)
+                        {
+                            Ok(did) => worked |= did,
+                            Err(e) => warn!("a translation batch failed: {e:#}"),
+                        }
+                        refresh(&store, &cfg, &stats);
+                        stats
+                            .last_pass_ns
+                            .store(crate::clock::utc_now_ns(), Ordering::Relaxed);
                     }
                 }
                 Some(llm) => {
@@ -280,7 +296,14 @@ pub fn run(
                     // turned on from the Memory view has to start without a
                     // restart — see `translate::LIVE`.
                     if crate::translate::enabled() {
-                        match crate::translate::batch(&store, &control, &bus, llm, &cfg, &stopped) {
+                        match crate::translate::batch(
+                            &store,
+                            &control,
+                            &bus,
+                            Some(llm),
+                            &cfg,
+                            &stopped,
+                        ) {
                             Ok(did) => worked |= did,
                             Err(e) => warn!("a translation batch failed: {e:#}"),
                         }

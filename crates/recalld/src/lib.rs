@@ -63,6 +63,7 @@ pub mod lid;
 pub mod llm;
 pub mod models;
 pub mod night;
+pub mod nllb;
 pub mod notes;
 pub mod overlap;
 pub mod partial;
