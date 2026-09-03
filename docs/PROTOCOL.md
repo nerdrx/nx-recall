@@ -3402,3 +3402,145 @@ recalld lang sweep --apply --redecode    also let the decoders rewrite
 Bounded (`--limit`, `--batch`), resumable, idle-priority, and safe to run while
 the daemon is capturing: the work list is a query rather than a cursor, and
 every row a model is spent on leaves it.
+
+---
+
+## 0.11.10 — the lobby is not FLEURS: three guards on the audio route, and a way back
+
+The spoken-language route (0.11.0 for `ja`, 0.11.6 for `ko`/`zh`, 0.11.8 for
+`fr`) shipped behind a false-positive gate measured on FLEURS: **zero of 400**
+German and English utterances heard as any of the three, at any length. On the
+install this was written for, it had rewritten **45 archive rows** — 32 `ja`,
+12 `zh`, one `fr` — and **37 of them belong to one voice: the user's own
+microphone, declared `["de","en"]**:
+
+```text
+"Mm-hmm."                    3.15 s  ->  うん
+"Okay, yeah."                3.89 s  ->  ok看嗯
+"Right."                     2.32 s  ->  可以嗯
+"Yeah."                      2.38 s  ->  没
+"Yeah, Gott was zu trinken." 2.32 s  ->  よしじゃあ。
+"Uh"                         2.00 s  ->  Au revoir.
+```
+
+Two of the 45 look right. FLEURS is read news; a lobby is people saying
+"Mm-hmm." at each other, and neither the identifier nor the judge had ever been
+asked about that. FINDINGS §31 has the tables.
+
+Nothing on the wire changes shape. `lang_via: "lid"` and `text_via: "lid"` mean
+exactly what 0.11.0 said they mean; there are simply far fewer of them, and one
+new `operations` op for taking the old ones back.
+
+### The three guards
+
+They are all in `asr_cjk::pre_route` and `asr_cjk::judge`, which both routes
+share, so the French arm gets them without a second copy.
+
+1. **A declared set with nothing routable in it is a declaration.** Before
+   0.11.10 only a *sole* declaration stopped the route (`lang::sole_language`),
+   so a voice declared `["de","en"]` fell through to the identifier on every
+   unreadable turn. Now any non-empty declared set that contains no tag either
+   route can decode — `ja`/`ko`/`zh`, or a tag in `[asr].polyglot_languages` —
+   is left alone. **A person who names their languages has answered the
+   question; two answers are still an answer.** The sole-language fast path to a
+   decoder is unchanged, and a set that *does* contain a routable tag
+   (`["en","ja"]`) still falls through, because a Japanese speaker's English
+   turn is not a mistake.
+2. **A back-channel is never worth a second decoder.** A turn whose transcript
+   has fewer than **two** words outside `lang::FILLERS` — `mm`, `mhm`, `uh`,
+   `yeah`, `okay`, `right`, `ja`, `ach`, `genau`, and thirty more built from the
+   prior transcripts of those 45 rows — never reaches the identifier. Two, not
+   three, because the three rows this feature exists for are "Sima Sen Okenki
+   Deska." (4 content words), "Wanky Daska." (2) and "During apartments." (2).
+   A turn with **no words at all** still reaches the identifier: a decoder that
+   gave up entirely is exactly the turn worth re-reading, and both of the two
+   genuine Japanese rows on this install are that shape.
+3. **The script test is necessary and not sufficient.** `うん`, `没`, `嗯嗯`,
+   `フフフフフフフ` and `ok看嗯` are all written in a script only the target
+   languages use, which is all the 0.11.6 judge asked for. A re-decode must now
+   also carry at least 4 letters **and** at least one per second of audio, have
+   more than half its letters distinct (a repetition loop is what these decoders
+   do with noise), not be a bare interjection in the target script, not be more
+   than a third Latin, and not mix hangul with kana. There is no decoder
+   confidence to lean on instead — sherpa's offline result carries `text`,
+   `lang`, `emotion` and `event` and no score.
+
+Rejections are logged with which guard fired.
+
+### `[asr].lid_windows` now defaults to `3`
+
+The identifier is asked about three overlapping windows of the turn and they
+must all agree (`lid_min_confidence` is still `1.0`). Measured on the 45 rows
+plus 200 German/English back-channels from the same voice, with guard 1
+deliberately switched off so the question is about the identifier alone:
+
+| windows | floor | asked | rewrites kept | false positives | rate |
+|--------:|------:|------:|--------------:|----------------:|-----:|
+| 1 | 1.0 s | 94 | 9 | 7 | 7.45% |
+| 1 | 1.5 s | 59 | 9 | 7 | 11.86% |
+| **3** | **1.0 s** | **94** | **2** | **1** | **1.06%** |
+| 3 | 1.5 s | 59 | 2 | 1 | 1.69% |
+
+One window misses the 1% gate by seven times; three windows lands on it. The
+floor moves nothing — it drops rows out of the denominator and none out of the
+numerator. `[asr].lid_min_s` therefore stays at `1.0`, and
+`[asr].lang_sweep_windows` stays a separate field at `3`: the narrowing is
+one-directional, and an operator who lowers `lid_windows` for a machine short of
+cores must not thereby lower it for four hundred archive rows decided at 04:00.
+
+Three passes cost three times one, and what pays for it is guard 1 and guard 2:
+on that same data they take the turns the identifier is asked about at all from
+245 to **one**.
+
+### `operations` gains `segments.unroute`
+
+Written once per row by the repair below. `prior_state` carries the state being
+**discarded**, so the repair is itself undoable:
+
+```json
+{
+  "segment_id": 15045,
+  "text": "うん",
+  "asr_model_id": "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8@1",
+  "text_via": "lid",
+  "lang": "ja",
+  "lang_via": "lid"
+}
+```
+
+The row it is written for goes back to the `text`, `asr_model_id` and
+`text_via` recorded in that row's own `segments.redecode` operation, and its
+`lang` and `lang_via` both go to **null** — not to `"sweep"`. A `"sweep"` mark
+would say "asked, nothing to say", and what happened is that the answer was
+withdrawn; a null puts the row back on the sweep's work list, which is where a
+row nobody has a reading for belongs. `asr_confidence` and any `translation`
+are cleared with the words they were about, exactly as `set_segment_text_via`
+clears them.
+
+A client showing a row that has been unrouted sees the live transcript back,
+`lang: null`, `lang_via: null` — the state it would have been in had the route
+never run.
+
+### `recalld lang unroute`
+
+```text
+recalld lang unroute            what it would put back, row by row, with the
+                                guard that refused each one. Writes nothing.
+recalld lang unroute --apply    do it.
+```
+
+A row goes back when **the code as it stands today would not have written it**:
+the shipped guards are re-run against the speaker's declaration and the words
+the route replaced, and — where the identifier is installed and the clip is
+still on disk — the identifier is re-run over the audio as well. A row the new
+guards still accept is not touched. A row with no recorded `segments.redecode`
+operation is reported and left alone: there is nothing to restore and inventing
+a prior transcript would be worse than the row it was fixing.
+
+Without the identifier the pass still runs on the stored text and durations
+alone, which can only ever put back **fewer** rows, never more.
+
+**Order matters.** The decision reads the database as it is now, so a voice that
+has since declared `ja` clears guard 1 and its rows are then judged on guards 2
+and 3 alone — which on this install keeps ten rewrites, two of them right. Run
+the repair **before** widening a declaration, not after.

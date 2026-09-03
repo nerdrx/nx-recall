@@ -98,6 +98,10 @@ pub mod truth;
 /// The truth ingest's loopback HTTP listener (0.9.0).
 pub mod truthnet;
 // ---- end 0.9.0 -----------------------------------------------------------
+/// Taking back the rows the audio-language route should not have rewritten
+/// (0.11.10).
+pub mod unroute;
+// ---- end 0.11.10 ---------------------------------------------------------
 pub mod turns;
 // ---- 0.10.0, worlds and turn-taking --------------------------------------
 /// Turn-taking statistics: how a person talks (0.10.0).

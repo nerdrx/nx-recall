@@ -261,7 +261,17 @@ defence is layered, each layer measured:
    language and never a word: measured over the archive, the re-decoding half
    was right one time in nine, so it ships off behind a flag with the numbers
    next to it. A rate that is fine as a tax on a benefit is not a benefit.
-6. **Translation** for everything outside the languages you read, into the
+6. **`recalld lang unroute`** — and when a defence turns out to be the
+   problem, it comes back out. The route that re-decodes a turn the audio
+   *sounds* Japanese in had rewritten 45 real rows, and 37 of them were the
+   user's own microphone saying "Mm-hmm." — a voice that had declared German
+   and English, which the router was only checking one tag deep. A person who
+   names their languages has answered the question; two answers are still an
+   answer. Three guards now, a three-window vote instead of one, and one
+   command that re-runs the new rules over the old rows and puts back
+   everything they refuse — reversibly, because the repair is a machine edit
+   too.
+7. **Translation** for everything outside the languages you read, into the
    language you choose, with the translation leading and the original as
    subtext — or the other way round. Three controls on the Memory tab.
 

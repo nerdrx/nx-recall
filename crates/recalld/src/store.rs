@@ -473,6 +473,37 @@ pub struct SweepCandidate {
     pub declared: Option<Vec<String>>,
 }
 
+/// A row the audio-language route already rewrote, and what it wrote over
+/// (0.11.10, `crate::unroute`).
+///
+/// The prior three fields come out of the row's own `segments.redecode`
+/// operation rather than out of a second column, because that operation *is*
+/// the record — `Store::set_segment_text_via` has written it since 0.11.0
+/// exactly so that a machine's edit of a transcript can be compared and undone.
+/// `None` for all three means the row was routed by a build that predates the
+/// operation, or that a person has since deleted it; either way there is
+/// nothing to restore and the repair leaves the row alone.
+#[derive(Debug, Clone)]
+pub struct RoutedRow {
+    pub id: i64,
+    pub duration_s: f32,
+    /// Relative to the data dir. May be empty — retention takes clips and
+    /// leaves rows.
+    pub audio_path: String,
+    /// What the row says now: the decoder's words.
+    pub text: Option<String>,
+    pub lang: Option<String>,
+    /// The speaker's declared languages, resolved through merges.
+    pub declared: Option<Vec<String>>,
+    /// The words the route replaced, and the model and route that had produced
+    /// them.
+    pub prior_text: Option<String>,
+    pub prior_model: Option<String>,
+    pub prior_via: Option<String>,
+    /// Whether the row has a `segments.redecode` operation at all.
+    pub has_prior: bool,
+}
+
 /// One stored turn's audio, as the window builder sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clip {
@@ -2538,6 +2569,145 @@ impl Store {
     }
 
     // ---- end the archive sweep -------------------------------------------
+
+    // ---- undoing a route (0.11.10, `crate::unroute`) ----------------------
+
+    /// Every row the audio-language route settled, oldest first, with the words
+    /// it wrote over.
+    ///
+    /// Keyed on `lang_via = 'lid'` and **not** on `text_via`, and the
+    /// difference is not academic: on this install eight of the 45 routed rows
+    /// carry `text_via = 'arbiter'`, because 0.11.0 wrote the arbiter's value
+    /// before `text_via::LID` existed. The language stamp is the claim this
+    /// pass is undoing, so the language stamp is what it selects on.
+    ///
+    /// The prior state comes from the row's **last** `segments.redecode`
+    /// operation, because that is the state immediately before the words the
+    /// row carries now — which is what "put it back" means. The one way that
+    /// could restore the wrong thing is a pass that rewrote the row *after* the
+    /// route did, whose operation would then be carrying the route's own CJK
+    /// text; that case is excluded by name rather than hoped about, in
+    /// `has_prior` below. On this install all 45 routed rows have exactly one
+    /// such operation and its `text_via` is `live`.
+    pub fn segments_routed_by_lid(&self) -> Result<Vec<RoutedRow>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT g.id, g.t_end_ns - g.t_start_ns, g.audio_path, g.text, g.lang,
+                        (SELECT s.languages FROM speakers s
+                         JOIN speaker_resolved r ON r.canonical_id = s.id
+                         WHERE r.id = g.speaker_id),
+                        (SELECT o.prior_state FROM operations o
+                          WHERE o.op = 'segments.redecode'
+                            AND o.target_ids = '[' || g.id || ']'
+                          ORDER BY o.at_utc_ns DESC, o.id DESC LIMIT 1)
+                 FROM segments g
+                 WHERE g.deleted_at IS NULL AND g.lang_via = ?1
+                 ORDER BY g.t_start_ns, g.id",
+            )?
+            .query_map(params![crate::asr_cjk::LANG_VIA_LID], |r| {
+                let languages: Option<String> = r.get(5)?;
+                let prior: Option<String> = r.get(6)?;
+                let parsed: Option<serde_json::Value> =
+                    prior.as_deref().and_then(|s| serde_json::from_str(s).ok());
+                let field = |key: &str| {
+                    parsed
+                        .as_ref()
+                        .and_then(|v| v.get(key))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                };
+                Ok(RoutedRow {
+                    id: r.get(0)?,
+                    duration_s: r.get::<_, i64>(1)? as f32 / 1e9,
+                    audio_path: r.get(2)?,
+                    text: r.get(3)?,
+                    lang: r.get(4)?,
+                    declared: crate::lang::parse_languages(languages.as_deref()),
+                    prior_text: field("text"),
+                    prior_model: field("asr_model_id"),
+                    prior_via: field("text_via"),
+                    // A recorded prior whose own `text_via` is `lid` is the
+                    // route's output, not the words it replaced: some later
+                    // pass has rewritten this row and the trail no longer
+                    // reaches the live transcript. Reported as "nothing to
+                    // restore" rather than restored wrongly.
+                    has_prior: parsed.is_some() && field("text_via").as_deref() != Some("lid"),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Put a routed row back the way it was, and record what was thrown away.
+    ///
+    /// Three things move together and they have to, because leaving any one of
+    /// them would leave a row making a claim nothing stands behind:
+    ///
+    /// * the **words**, back to `prior_text` with the model and `text_via` that
+    ///   produced them — usually `live`, sometimes `context`;
+    /// * the **language**, back to NULL with `lang_via` NULL. Not
+    ///   [`lang_via::SWEEP`]: a mark would say "asked, nothing to say", and
+    ///   what actually happened is that the answer was withdrawn. A NULL puts
+    ///   the row back on the sweep's work list, which is where a row nobody has
+    ///   a reading for belongs;
+    /// * the **translation and the cross-check flag**, cleared for
+    ///   [`Self::set_segment_text_via`]'s reason: both were computed about
+    ///   words that are no longer on the row. A `fr` translation of `うん` is
+    ///   the exact failure that call documents.
+    ///
+    /// The `operations` row is `segments.unroute` and carries the state being
+    /// discarded — the routed text, its model, its `text_via`, and the language
+    /// stamp — so this pass is undoable in its turn. A repair that is not
+    /// itself reversible is a rewrite.
+    pub fn unroute_segment(&self, row: &RoutedRow, at_utc_ns: i64) -> Result<bool> {
+        /// What the row says now, read back inside the same call rather than
+        /// trusted from the caller's snapshot: the live pipeline may have moved
+        /// the row between the gather and the write.
+        type Now = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let now: Option<Now> = self
+            .conn
+            .query_row(
+                "SELECT text, asr_model_id, text_via, lang FROM segments
+                 WHERE id = ?1 AND deleted_at IS NULL AND lang_via = ?2",
+                params![row.id, crate::asr_cjk::LANG_VIA_LID],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((text, model, via, lang)) = now else {
+            return Ok(false);
+        };
+        self.conn.execute(
+            "UPDATE segments
+             SET text = ?2, asr_model_id = ?3, text_via = ?4,
+                 lang = NULL, lang_via = NULL,
+                 asr_confidence = NULL, confidence_at_ns = NULL
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![row.id, row.prior_text, row.prior_model, row.prior_via],
+        )?;
+        self.clear_segment_translation(row.id)?;
+        self.log_operation(
+            "segments.unroute",
+            &format!("[{}]", row.id),
+            &serde_json::json!({
+                "segment_id": row.id,
+                "text": text,
+                "asr_model_id": model,
+                "text_via": via,
+                "lang": lang,
+                "lang_via": crate::asr_cjk::LANG_VIA_LID,
+            })
+            .to_string(),
+            at_utc_ns,
+        )?;
+        Ok(true)
+    }
+
+    // ---- end undoing a route ----------------------------------------------
 
     /// Rows the arbiter could not settle, oldest first — the backlog
     /// `recalld lang repair` walks (0.7.7).

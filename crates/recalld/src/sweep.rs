@@ -51,14 +51,19 @@
 //! them on voices declared German/English-only, which is **2.3%** against a 1%
 //! gate.
 //!
-//! 1. **`[asr].lang_sweep_windows = 3`**, against the live path's 1.
-//!    [`crate::lid`] documents `lid_windows` as the knob for "a machine that
-//!    hears something this corpus did not", and this is that machine. Three
-//!    overlapping windows that must agree take the routed rows from 342 to 28
-//!    and the de/en rate from 2.3% to **0.97%**, inside the gate. It costs
-//!    three model passes instead of one — a price a nightly batch can pay and
-//!    a live turn cannot, which is why it is a second number and not a change
-//!    to `lid_windows`.
+//! 1. **`[asr].lang_sweep_windows = 3`**, against the live path's 1 *as it was
+//!    when this was written*. [`crate::lid`] documented `lid_windows` as the
+//!    knob for "a machine that hears something this corpus did not", and this
+//!    is that machine. Three overlapping windows that must agree take the
+//!    routed rows from 342 to 28 and the de/en rate from 2.3% to **0.97%**,
+//!    inside the gate, for three model passes instead of one.
+//!
+//!    0.11.10 found the same thing on the *live* rows the route had already
+//!    rewritten (FINDINGS §31) and moved `lid_windows` to 3 as well, so this is
+//!    no longer a difference. The field stays because the narrowing is
+//!    one-directional ([`routing_cfg`]): an operator who lowers `lid_windows`
+//!    for a machine short of cores lowers it for the live turn they are
+//!    watching, and must not thereby lower it for four hundred archive rows.
 //! 2. **`[asr].lang_sweep_min_s = 1.5`**, against the live path's 1.0. Below
 //!    1.5 s nothing is ever *kept*: `[lang].arbiter_min_duration_s` is the
 //!    replacement floor and both decoders refuse under it, so the 974 archive
@@ -300,7 +305,9 @@ pub fn sweep_one(
     // — reused rather than re-derived, because a second copy of this rule is a
     // second rule. A readable transcript or a voice pinned to somebody else's
     // language costs a string scan and no disk.
-    if asr_cjk::pre_route(row.declared.as_ref(), row.text.as_deref()) == Pre::Nothing {
+    if asr_cjk::pre_route(row.declared.as_ref(), row.text.as_deref(), pass.asr_cfg())
+        == Pre::Nothing
+    {
         return Ok(Swept::LeftAlone);
     }
     let samples = match crate::ingest::read_wav(&pass.data_dir.join(&row.audio_path)) {
@@ -758,6 +765,7 @@ mod tests {
         let pinned = candidate(2, 2.0, Some("mumble"), Some(&["de"]));
         let unreadable = candidate(3, 2.0, Some("Sima Sen Okenki Deska."), None);
         let silent = candidate(4, 2.0, None, None);
+        let cfg = AsrConfig::default();
         for (row, want) in [
             (&readable, Pre::Nothing),
             (&pinned, Pre::Nothing),
@@ -765,7 +773,7 @@ mod tests {
             (&silent, Pre::AskLid),
         ] {
             assert_eq!(
-                asr_cjk::pre_route(row.declared.as_ref(), row.text.as_deref()),
+                asr_cjk::pre_route(row.declared.as_ref(), row.text.as_deref(), &cfg),
                 want,
                 "row {}",
                 row.id
@@ -776,7 +784,7 @@ mod tests {
         // well as live.
         let japanese = candidate(5, 2.0, Some("Wanky Daska."), Some(&["ja"]));
         assert_eq!(
-            asr_cjk::pre_route(japanese.declared.as_ref(), japanese.text.as_deref()),
+            asr_cjk::pre_route(japanese.declared.as_ref(), japanese.text.as_deref(), &cfg),
             Pre::Direct("ja")
         );
     }
@@ -875,10 +883,25 @@ mod tests {
             wishful.lid_min_confidence
         );
         assert_eq!(routing_cfg(&wishful).japanese, wishful.japanese);
-        // The shipped pair, and the reason the two exist at all.
+        // The shipped pair, and the reason the two exist at all. The floor is
+        // still strictly stricter; the window count is only *no looser* since
+        // 0.11.10, when the live path moved to three windows on the same
+        // evidence this pass did (FINDINGS §31). The field stays because the
+        // narrowing is one-directional: an operator who lowers `lid_windows`
+        // for a machine short of cores must not thereby lower it for four
+        // hundred archive rows decided at 04:00.
         let shipped = AsrConfig::default();
         assert!(shipped.lang_sweep_min_s > shipped.lid_min_s);
-        assert!(shipped.lang_sweep_windows > shipped.lid_windows);
+        assert!(shipped.lang_sweep_windows >= shipped.lid_windows);
+        let thrifty = AsrConfig {
+            lid_windows: 1,
+            ..AsrConfig::default()
+        };
+        assert_eq!(
+            routing_cfg(&thrifty).lid_windows,
+            3,
+            "the sweep keeps three"
+        );
     }
 
     #[test]
