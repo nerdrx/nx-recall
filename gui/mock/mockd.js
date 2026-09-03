@@ -1901,7 +1901,10 @@ export function startMock({
 
   // --- 0.11.0: is this a question? -----------------------------------------
 
-  const INTERROGATIVES = /^(was|wer|wen|wem|wessen|wann|wo|wohin|woher|wie|warum|wieso|weshalb|welche[rsn]?|what|who|whom|whose|when|where|why|how|which)\b/i;
+  // Kept character-for-character in step with the daemon (`ask::is_question`)
+  // and with the renderer's copy — see `search.js`. Three copies of one list is
+  // how a query becomes a question to the client and not to the daemon.
+  const INTERROGATIVES = /^(was|wer|wen|wem|wessen|wann|wo|wohin|woher|wie|warum|wieso|weshalb|wor(?:\u00fc|ue)ber|worum|wovon|welche[rsn]?|what|who|whom|whose|when|where|why|how|which)(?![\w'\u2019])/i;
 
   // The two questions this fixture can answer, and what it answers with.
   // `cite` is how many of the hits the sentence came from — the ids themselves
@@ -1914,7 +1917,8 @@ export function startMock({
 
   function isQuestion(q) {
     const s = String(q ?? '').trim();
-    return s.endsWith('?') || INTERROGATIVES.test(s);
+    if (s.endsWith('?')) return true;
+    return INTERROGATIVES.test(s.replace(/^[^\p{L}\p{N}]+/u, ''));
   }
 
   function statusPayload() {

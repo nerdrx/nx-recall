@@ -891,6 +891,12 @@ pub fn is_question(question: &str) -> bool {
         .is_some_and(|t| INTERROGATIVES.contains(&t.folded.as_str()))
 }
 
+/// The interrogative list, for the guard that holds the client's copy to it.
+#[cfg(test)]
+pub(crate) fn interrogatives() -> &'static [&'static str] {
+    INTERROGATIVES
+}
+
 // ---- end 0.11.0 ------------------------------------------------------------
 
 #[cfg(test)]
@@ -1240,6 +1246,29 @@ mod tests {
         ] {
             assert!(!is_question(q), "{q:?} is not a question");
         }
+    }
+
+    /// The three cases where the client's copy of this list disagreed with it.
+    ///
+    /// The client picks the method — `search.answer` or `search.ask` — before
+    /// the round trip, off its own copy. An interrogative the daemon knows and
+    /// the client does not is a question that silently gets no answer and no
+    /// line saying why: the client never called the method that could refuse.
+    /// The list itself is held to the client's by `gui/test/answer.test.js`,
+    /// which can actually run the regex.
+    #[test]
+    fn the_interrogatives_the_clients_copy_used_to_miss() {
+        // `wor-` compounds: in this list since 0.11.0 and in neither JS copy.
+        assert!(is_question("worum ging es gestern Abend"));
+        assert!(is_question("wovon hat Aspen geredet"));
+        assert!(is_question("worüber habt ihr gesprochen"));
+        // An apostrophe is a word character here, so this is one token and it
+        // is not an interrogative. The client's `\b` fired inside it.
+        assert!(!is_question("wie's gelaufen ist"));
+        // Opening punctuation is walked past, which the anchored regex did not
+        // do until the client's copy learned to strip it.
+        assert!(is_question("„was hat Aspen gesagt"));
+        assert!(is_question("- wann war das"));
     }
 
     #[test]

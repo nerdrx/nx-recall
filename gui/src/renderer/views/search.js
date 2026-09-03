@@ -519,11 +519,18 @@ export function mount(root, ctx, arg) {
    * talking over them.
    */
   const INTERROGATIVES =
-    /^(was|wer|wen|wem|wessen|wann|wo|wohin|woher|wie|warum|wieso|weshalb|welche[rsn]?|what|who|whom|whose|when|where|why|how|which)\b/i;
+    /^(was|wer|wen|wem|wessen|wann|wo|wohin|woher|wie|warum|wieso|weshalb|wor(?:ü|ue)ber|worum|wovon|welche[rsn]?|what|who|whom|whose|when|where|why|how|which)(?![\w'’])/i;
 
   function looksLikeAQuestion(q) {
     const s = String(q ?? '').trim();
-    return s.endsWith('?') || INTERROGATIVES.test(s);
+    if (s.endsWith('?')) return true;
+    // The daemon tokenises, and tokenising walks past opening punctuation; an
+    // anchored regex does not. `„was hat Aspen gesagt` was a question to one
+    // copy and not to the other, and the copy that loses is always the one
+    // that picked the method — so the round trip never happened and the person
+    // got neither an answer nor a line saying why.
+    const head = s.replace(/^[^\p{L}\p{N}]+/u, '');
+    return INTERROGATIVES.test(head);
   }
 
   /** The hit row for one segment id, if it is on screen. */
@@ -614,6 +621,18 @@ export function mount(root, ctx, arg) {
     if (reason === 'there is nothing in the archive about that') return 'Nothing in the transcript is about that.';
     if (reason === 'the local model is switched off') return 'Answers need the local model, which is switched off.';
     if (String(reason ?? '').startsWith('answers need the local model')) return 'Answers need the local model, which is not installed.';
+    // Two reasons that are about the MACHINE and not about the archive, and
+    // both used to fall through to the sentence below. A model that timed out
+    // or was killed learned nothing about this transcript, and telling a
+    // person "The transcript does not say." on its behalf is the app making a
+    // claim about their own recordings out of a crash. Same for the feature
+    // being switched off at the build level.
+    if (reason === 'the model did not answer') return 'The model did not answer. The results below are unfiltered.';
+    if (reason === 'answers are off until the bench passes') return 'Answers are switched off in this build.';
+    // A post-check failure is also not a statement about the archive: there
+    // WAS a sentence and it was thrown away for not coming off the rows.
+    if (reason === "the model's answer did not come from the cited turns")
+      return 'The model wrote an answer that was not in the cited turns, so it was discarded.';
     return 'The transcript does not say.';
   }
 

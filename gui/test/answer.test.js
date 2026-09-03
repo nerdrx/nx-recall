@@ -107,3 +107,76 @@ test('the daemon says whether it read the query as a question', async () => {
     mock.close();
   }
 });
+
+// --- 0.11.x: the three copies of one interrogative list ---------------------
+//
+// The client picks the METHOD — `search.answer` or `search.ask` — before the
+// round trip, off its own copy of the daemon's interrogative list. So a word
+// the daemon calls interrogative and the client does not is not a wrong
+// answer, it is no answer and no line saying why: the client called
+// `search.ask`, which has nothing to refuse with. There are three copies (the
+// daemon's, the renderer's and this fixture's) and the only thing that can
+// hold them together is a test that reads all three.
+//
+// The regex is read out of the source and run, rather than compared as a
+// string, because `welche[rsn]?` is four interrogatives spelled as one.
+
+test('the client and the daemon agree on what an interrogative is', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const { fileURLToPath } = await import('node:url');
+  const { dirname, resolve: resolvePath } = await import('node:path');
+  const here = dirname(fileURLToPath(import.meta.url));
+  const root = resolvePath(here, '..', '..');
+
+  // The daemon's list, out of the daemon's source.
+  const ask = await readFile(resolvePath(root, 'crates/recalld/src/ask.rs'), 'utf8');
+  const block = ask.slice(ask.indexOf('const INTERROGATIVES'));
+  const words = [...block.slice(0, block.indexOf('];')).matchAll(/"([a-z]+)"/g)].map((m) => m[1]);
+  assert.ok(words.length >= 25, `found only ${words.length} interrogatives in ask.rs`);
+  assert.ok(words.includes('worum') && words.includes('wovon'));
+
+  // …and each client copy's regex, out of its own source.
+  for (const file of ['gui/src/renderer/views/search.js', 'gui/mock/mockd.js']) {
+    const src = await readFile(resolvePath(root, file), 'utf8');
+    const at = src.indexOf('const INTERROGATIVES');
+    assert.notEqual(at, -1, `${file} has no interrogative list`);
+    const decl = src.slice(at, src.indexOf(';', at));
+    const body = decl.slice(decl.indexOf('/') + 1, decl.lastIndexOf('/'));
+    const flags = decl.slice(decl.lastIndexOf('/') + 1).trim();
+    const re = new RegExp(body, flags);
+    for (const word of words) {
+      // `worueber` is the FOLDED spelling the daemon compares against — ü
+      // becomes ue there. The client sees what was typed.
+      const typed = word === 'worueber' ? 'worüber' : word;
+      assert.ok(re.test(`${typed} war das`), `${file} does not know ${JSON.stringify(typed)}`);
+    }
+    // An interrogative in the middle is still not a question.
+    assert.equal(re.test('the world where we met'), false, file);
+    // …and an apostrophe is not a word boundary: `wie's gelaufen ist` is one
+    // token to the daemon and is not a question, so it must not be one here.
+    assert.equal(re.test("wie's gelaufen ist"), false, file);
+  }
+});
+
+test('the mock reads a question the same way the daemon would', async () => {
+  const { mock, client } = await connected();
+  try {
+    for (const [q, want] of [
+      // The `wor-` compounds, which no client copy knew.
+      ['worum ging es gestern Abend', true],
+      ['wovon hat Aspen geredet', true],
+      ['worüber habt ihr gesprochen', true],
+      // Opening punctuation is walked past, as the daemon's tokeniser does.
+      ['„was hat Aspen gesagt', true],
+      ['- wann war das', true],
+      // …and the apostrophe case, which the old `\b` made a question.
+      ["wie's gelaufen ist", false],
+    ]) {
+      const res = await client.request('search.ask', { q });
+      assert.equal(res.interpretation.is_question, want, `is_question of ${JSON.stringify(q)}`);
+    }
+  } finally {
+    client.close();
+    mock.close();
+  }
+});
