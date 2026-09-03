@@ -120,10 +120,10 @@ impl Rig {
 #[test]
 fn the_v11_migration_is_idempotent_and_keeps_what_it_wrote() {
     // 0.9.0 wrote v11; 0.10.0's worlds took it to v12, 0.11.6's simultaneous
-    // fraction to v13, and 0.11.9's `sessions.instance_key` to v14. The number
+    // fraction to v13, and 0.12.0's `sessions.instance_key` to v14. The number
     // moves, and what this test is really about does not: re-opening must be a
     // no-op.
-    assert_eq!(SCHEMA_VERSION, 14, "0.11.9 is schema v14");
+    assert_eq!(SCHEMA_VERSION, 14, "0.12.0 is schema v14");
     let dir = temp_dir("schema");
     let mut seg = 0i64;
     // Three opens: the first migrates, the second and third must be no-ops
