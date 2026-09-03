@@ -1329,11 +1329,32 @@ is not one is refused rather than silently matching nothing. Each digest is:
 
 ```json
 {"thread_id": 12, "day": "2026-09-02", "lang": "de",
- "summary": "…one paragraph…", "open": ["B schickt A morgen den Link"],
+ "summary": "Aspen fragt nach dem Shader. Kira schickt morgen den Link.",
+ "summary_raw": "…what the model wrote…",
+ "open": ["Kira schickt Aspen morgen den Link"],
+ "open_raw": ["…what the model wrote…"], "rendered": "names",
  "participants": [{"speaker_id": 3, "label": "Aspen"}],
  "started_ms": …, "started_ns": "…", "ended_ms": …, "ended_ns": "…",
  "turns": 12, "model_id": "qwen2.5-3b-instruct-q4_k_m@1", "created_ms": …}
 ```
+
+**A digest says people's names** (0.11.6). `summary` and `open` are prose about
+`Aspen` and `Speaker 07` and `You`, in the same words `participants[].label`
+uses — the name the user gave the voice, else its auto label written as a name
+(`Speaker 07`, not `Speaker_07`), and `You` for the microphone. The model is
+handed those labels in the summary call and writes them back; the **verdict**
+call still sees letters, byte for byte what its six traps were measured on.
+
+`summary_raw` / `open_raw` are what the model wrote, so nothing is lost, and
+`rendered` says how the prose was arrived at:
+
+| `rendered` | |
+|---|---|
+| `names` | the model was given the labels and wrote them. |
+| `legacy` | written before 0.11.6, with letters. The daemon substitutes names on the way out, from the conversation's own roster — only assigned letters, only standalone, and never a sentence-initial English `A` before a lowercase word, so `A meetup at eight` stays an article. No model is asked anything about an old row, which is also why there is no `digest rerender`: an old row has no `summary_raw` to re-render from. |
+
+Rendering happens **on read**, so a rename moves the paragraph the same way it
+already moves the participant chips.
 
 New event **`digest`** (topic `segments`) carries the same object. It is only
 ever new — one digest per conversation, ever — so a client unshifts rather than
@@ -1372,6 +1393,21 @@ one long one, so the split is also cheaper (3.4 s against 11.7 s).
 
 The one language miss is the deliberately bilingual conversation, where the
 daemon asks for the reader's language and the model answers in the dialogue's.
+
+0.11.6 added two numbers to the same ten cases — summaries in which **every**
+participant is called by their label, and summaries containing a name nobody in
+the room has — and measured both ways of getting a name into the paragraph:
+
+| design | traps | summarised | everyone named | invented names | language |
+|---|---:|---:|---:|---:|---:|
+| (a) letters in the prompt, substituted in the daemon | 6/6 | 4/4 | 3/4 | 0 | 3/4 |
+| **(b) the labels in the summary prompt** | **6/6** | **4/4** | **4/4** | **0** | 3/4 |
+
+(b) ships. (a)'s loss is English: *"A asked for the recording"* has the same
+shape as *"A meetup at eight"*, and a substitution rule that refuses the second
+must refuse the first. Neither design can move the traps, because neither
+touches the verdict call — and the run confirms it rather than assuming it.
+(a)'s rule survives as the read-time renderer for `rendered: "legacy"` rows.
 
 ### Translation for turns you cannot read
 
@@ -2890,3 +2926,17 @@ passed.
   the cross-check verdict about the old words is cleared (`asr_confidence:
   null` until the pass looks again); and any translation of the old words is
   dropped. Up to 0.11.3 this path did none of the three.
+
+## 0.11.6 — a digest names people
+
+- **`digest.list` rows and the `digest` event** carry the paragraph as prose
+  about people: `summary` and `open` say `Aspen`, `Speaker 07`, `You` — the
+  same words `participants[].label` uses, which now renders a generated label
+  the way a sentence has to (`Speaker 07`, not `Speaker_07`). Three new
+  fields: **`summary_raw`** and **`open_raw`** (what the model wrote, so
+  nothing is lost) and **`rendered`** — `"names"` for a digest written since
+  this change, `"legacy"` for one written before it. See the digest section
+  for the substitution rule the legacy path uses and why there is no
+  `digest rerender`.
+- Additive only. A client that reads `summary` and ignores the rest sees the
+  same field it always did, with names in it.

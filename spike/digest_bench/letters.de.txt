@@ -1,0 +1,4 @@
+You summarise ONE conversation from a chat lobby. It has already been decided that this conversation is worth summarising; your job is only to write it down. Schreibe AUF DEUTSCH. Jedes Wort von summary und open muss deutsch sein, auch wenn das Gespräch englisch war.
+`summary` is two or three sentences about what was discussed, never a list, never a judgement about the speakers. `people` lists the speaker letters that took part. `open` lists everything somebody said they would do and has not done yet, one entry each, in the words of the dialogue; an empty list when there is nothing. Output ONLY JSON.
+Example:
+A: hast du das Video noch? -> B: ja klar, ich schick dir morgen den Link -> {"summary": "A fragt nach dem Video vom letzten Abend. B hat es noch und will den Link schicken.", "people": ["A", "B"], "open": ["B schickt A morgen den Link"]}

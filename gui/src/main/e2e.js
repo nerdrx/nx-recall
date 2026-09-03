@@ -2221,6 +2221,25 @@ export function runE2E(deps) {
           assert(row.people.length >= 1, `digest ${row.thread} names nobody`);
         }
         assert(/summarised/.test(a.digests.sub), `the card's sub reads "${a.digests.sub}"`);
+        // 0.11.6 — the paragraph is about PEOPLE. Read off the rendered card
+        // rather than the payload: the chips and the sentence beside them
+        // have to be calling the same person the same thing, and a digest
+        // that still says "A und B" is the bug this round closed.
+        const named = await js(`[...document.querySelectorAll('.digest-row')].map((r) => ({
+          thread: Number(r.dataset.digest),
+          summary: r.querySelector('.digest-text')?.textContent ?? '',
+          chips: [...r.querySelectorAll('.chip.person')].map((c) => c.textContent.trim()),
+        }))`);
+        for (const row of named) {
+          assert(
+            row.chips.some((name) => name && row.summary.includes(name)),
+            `digest ${row.thread} names none of ${JSON.stringify(row.chips)}: "${row.summary}"`
+          );
+          assert(
+            !/(^|[^\wÄÖÜäöüß])[AB]([^\wÄÖÜäöüß]|$)/.test(row.summary),
+            `digest ${row.thread} still calls somebody by a letter: "${row.summary}"`
+          );
+        }
         await js('document.getElementById("digest-card").scrollIntoView({ block: "start" })');
         const file = await shot('memory-yesterday');
         return { rows: a.digests.rows.length, groups: a.digests.groups, file };

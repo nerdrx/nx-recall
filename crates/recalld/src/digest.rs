@@ -67,6 +67,50 @@
 //! [`crate::enrich`]'s, unchanged and for the reason written there in blood on
 //! 2026-09-02: gather under the store lock, ask the model without it, commit
 //! under it again. **Model time and store-lock time never overlap.**
+//!
+//! ### Whose name is in the paragraph (0.11.6)
+//!
+//! The model is handed speaker LETTERS ([`crate::llm::transcript`]) and it
+//! writes them back: *"A und B reden über etwas, das sie miteinander teilen
+//! möchten"*. That is a paragraph about a seating chart. A digest is the one
+//! output the daemon volunteers, so it has to read like the user's own
+//! sentence about their own evening — **Kira und Speaker 38**, "You" for the
+//! voice on the microphone.
+//!
+//! Two designs, and `spike/digest_bench` picked between them on the same ten
+//! cases and the same model. The verdict call is identical in both — same
+//! prompt, same letters, same grammar — so the six traps cannot regress:
+//!
+//! | | traps | everyone named | invented names |
+//! |---|---:|---:|---:|
+//! | (a) letters in the prompt, substituted afterwards | 6/6 | 3/4 | 0 |
+//! | (b) the labels themselves in the summary prompt | 6/6 | 4/4 | 0 |
+//!
+//! **(b) ships.** (a)'s one loss is the reason the choice was worth measuring
+//! rather than assuming: an English summary opens *"A asked for the
+//! recording"*, and the rule that keeps *"A meetup at eight"* from becoming
+//! *"Kira meetup at eight"* — never a sentence-initial `A` before a lowercase
+//! word — cannot tell those two apart. In German there is no article to
+//! collide with and (a) is clean; English is half the digests.
+//!
+//! (a) is not thrown away. It is [`render_letters`], and it is what renders
+//! the digests already in the store: those rows were written with letters,
+//! they have no [`crate::store::DigestRow::summary_raw`], and re-asking the
+//! model about somebody's evening from three weeks ago to fix a pronoun is not
+//! a trade worth making. They are rendered at **read time** from the roster
+//! the conversation still has, and marked `rendered: "legacy"` so a client can
+//! see which paragraph came from where.
+//!
+//! ### The row keeps both
+//!
+//! `summary` is the prose the user reads; `summary_raw` is what the model
+//! wrote, so nothing is lost and a re-render never has to guess. `roster_json`
+//! is who the letters were — **ids and the labels of the day** — so a rename
+//! moves the paragraph the same way it already moves the participant chips.
+//! Rendering therefore happens on the way OUT ([`digest_json`]), from the raw
+//! and the roster, every time; the stored `summary` is what it rendered to on
+//! the night, kept so that anything reading the database directly sees what
+//! the user saw.
 
 use std::sync::Arc;
 
@@ -123,18 +167,28 @@ pub const VERDICT_SYSTEM: &str = concat!(
 /// The language instruction is here and not in the input, and it is written in
 /// the language it asks for with the worked example in that language too. See
 /// the module note: as an input line it was obeyed once in four.
+///
+/// 0.11.6: the worked example is written with **names** rather than letters,
+/// and the speakers in the input carry names too ([`named_transcript`]). The
+/// naming clause sits in this prompt and not in the verdict's, which is why
+/// the traps could not move — see the module note's table.
 pub fn summary_system(tag: &str) -> String {
     // Raw strings, because both halves are JSON with quotes all through them
     // and a prompt that is a measured artefact must be readable as itself.
+    //
+    // "Nadia" and "Timo" are in no roster this daemon can produce and in no
+    // case of the bench, on purpose: a name copied out of this example into a
+    // real digest is then a countable event rather than a coincidence.
     let (order, example) = if tag == "de" {
         (
             "Schreibe AUF DEUTSCH. Jedes Wort von summary und open muss \
              deutsch sein, auch wenn das Gespräch englisch war.",
             concat!(
-                "A: hast du das Video noch? -> B: ja klar, ich schick dir ",
-                r#"morgen den Link -> {"summary": "A fragt nach dem Video vom "#,
-                r#"letzten Abend. B hat es noch und will den Link schicken.", "#,
-                r#""people": ["A", "B"], "open": ["B schickt A morgen den Link"]}"#,
+                "Nadia: hast du das Video noch? -> Timo: ja klar, ich schick ",
+                r#"dir morgen den Link -> {"summary": "Nadia fragt nach dem "#,
+                r#"Video vom letzten Abend. Timo hat es noch und will den Link "#,
+                r#"schicken.", "people": ["Nadia", "Timo"], "open": ["Timo "#,
+                r#"schickt Nadia morgen den Link"]}"#,
             ),
         )
     } else {
@@ -142,11 +196,11 @@ pub fn summary_system(tag: &str) -> String {
             "Write in ENGLISH. Every word of summary and open must be \
              English, even if the conversation was not.",
             concat!(
-                "A: can I get the recording? -> B: sure, I will cut it and ",
-                r#"send it over -> {"summary": "A asked for the recording of "#,
-                r#"the meetup. B still has it and offered to cut it down "#,
-                r#"first.", "people": ["A", "B"], "open": ["B cuts the "#,
-                r#"recording and sends it to A"]}"#,
+                "Nadia: can I get the recording? -> Timo: sure, I will cut it ",
+                r#"and send it over -> {"summary": "Nadia asked for the "#,
+                r#"recording of the meetup. Timo still has it and offered to "#,
+                r#"cut it down first.", "people": ["Nadia", "Timo"], "open": "#,
+                r#"["Timo cuts the recording and sends it to Nadia"]}"#,
             ),
         )
     };
@@ -155,12 +209,34 @@ pub fn summary_system(tag: &str) -> String {
          decided that this conversation is worth summarising; your job is only \
          to write it down. {order}\n\
          `summary` is two or three sentences about what was discussed, never a \
-         list, never a judgement about the speakers. `people` lists the \
-         speaker letters that took part. `open` lists everything somebody said \
-         they would do and has not done yet, one entry each, in the words of \
-         the dialogue; an empty list when there is nothing. Output ONLY \
-         JSON.\nExample:\n{example}"
+         list, never a judgement about the speakers. Call every speaker by the \
+         exact name that stands in front of their lines, and never by any \
+         other name. `people` lists the names of the speakers that took part, \
+         spelled exactly as the dialogue spells them. `open` lists everything \
+         somebody said they would do and has not done yet, one entry each, in \
+         the words of the dialogue; an empty list when there is nothing. \
+         Output ONLY JSON.\nExample:\n{example}"
     )
+}
+
+/// The summary call's input: `Kira: …` / `Speaker 38: …`, the same shape
+/// [`crate::llm::transcript`] produces but with the roster's own labels in
+/// front of the lines instead of letters.
+///
+/// Its own function rather than a flag on `transcript`, because the verdict
+/// call still gets letters and must keep getting exactly the bytes it was
+/// measured on. Turns nobody could place are dropped for the same reason as
+/// there: an anonymous line is not a party to anything.
+pub fn named_transcript(window: &[Line], roster: &[i64], labels: &[String]) -> String {
+    window
+        .iter()
+        .filter_map(|line| {
+            let id = line.speaker_id?;
+            let i = roster.iter().position(|s| *s == id)?;
+            Some(format!("{}: {}", labels.get(i)?, line.text.trim()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Tokens the verdict may take. It is one boolean.
@@ -179,9 +255,11 @@ const MAX_OPEN_LEN: usize = 160;
 /// What the model made of one conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Digest {
+    /// What the model wrote, with the roster's own labels in it. The rendering
+    /// on the wire is a re-render of this against today's names.
     pub summary: String,
-    /// Speaker letters, decoded to roster positions — the same alphabet
-    /// [`crate::llm::transcript`] hands out, so `people[i]` indexes the roster.
+    /// Roster positions, decoded from the names the model listed by exact
+    /// match — so `people[i]` indexes the roster, as it always did.
     pub people: Vec<usize>,
     pub open: Vec<String>,
 }
@@ -215,14 +293,17 @@ pub fn worth_summarising(llm: &Llm, lines: &[Line]) -> Result<bool> {
 ///
 /// Two calls, the second only if the first said yes. No store handle is in
 /// scope, which is what enforces the lock split.
-pub fn judge(llm: &Llm, lines: &[Line], lang: &str) -> Result<Option<Digest>> {
+pub fn judge(llm: &Llm, lines: &[Line], lang: &str, labels: &[String]) -> Result<Option<Digest>> {
     if !worth_summarising(llm, lines)? {
         return Ok(None);
     }
     let roster = crate::llm::roster(lines);
+    // The verdict above ran on letters, byte for byte what it was measured on.
+    // The summary runs on names — and only the summary, which is why the traps
+    // are the same six refusals they were.
     let out = llm.ask(
         &summary_system(lang),
-        &crate::llm::transcript(lines, &roster),
+        &named_transcript(lines, &roster, labels),
         SUMMARY_GBNF,
         DIGEST_TOKENS,
     )?;
@@ -242,10 +323,12 @@ pub fn judge(llm: &Llm, lines: &[Line], lang: &str) -> Result<Option<Digest>> {
         warn!("the model said a conversation was worth summarising and then said nothing");
         return Ok(None);
     };
+    // Decoded by **exact label match**, and anything else is dropped. A name
+    // the model made up is not a person in this room, and the one thing worse
+    // than a digest that says "A" is a digest that credits the wrong voice.
     let people = strings(value.get("people"))
         .iter()
-        .filter_map(|s| letter_index(s))
-        .filter(|i| *i < roster.len())
+        .filter_map(|s| labels.iter().position(|l| l == s.trim()))
         .collect::<Vec<_>>();
     let open = strings(value.get("open"))
         .into_iter()
@@ -258,6 +341,170 @@ pub fn judge(llm: &Llm, lines: &[Line], lang: &str) -> Result<Option<Digest>> {
         people,
         open,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// names
+// ---------------------------------------------------------------------------
+
+/// What this daemon calls one voice, in the words the user sees everywhere
+/// else: the name they gave it, else the auto label, else — for a voice whose
+/// row has gone — the id.
+///
+/// The auto label is stored as `Speaker_38` because it is an identifier; in a
+/// sentence it is a name, and a name does not have an underscore in it. Only
+/// the generated shape is rewritten, so a person who calls themselves
+/// `moon_child` keeps their underscore.
+pub fn label(store: &Store, speaker_id: i64) -> String {
+    store
+        .speaker_name(speaker_id)
+        .ok()
+        .flatten()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .map(|n| match n.strip_prefix("Speaker_") {
+            Some(rest) if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) => {
+                format!("Speaker {rest}")
+            }
+            _ => n,
+        })
+        .unwrap_or_else(|| format!("Speaker {speaker_id}"))
+}
+
+/// One entry of `roster_json`: the voice a letter stood for, and what that
+/// voice was called on the night. The id is what a re-render follows.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RosterEntry {
+    pub id: i64,
+    pub label: String,
+}
+
+/// The roster of one conversation as it is now, in letter order — `A` first.
+///
+/// Recomputed from the turns rather than remembered, which is what makes a row
+/// written before 0.11.6 renderable at all: [`crate::llm::roster`] is
+/// first-appearance order over the same query, so it hands out the same letters
+/// it handed out then. A window that was truncated at `digest_max_turns` can
+/// gain a trailing letter here that the model was never given, which is
+/// harmless — that letter is in no summary.
+pub fn thread_roster(store: &Store, thread_id: i64) -> Vec<RosterEntry> {
+    let lines: Vec<Line> = store
+        .thread_lines(thread_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|l| Line {
+            segment_id: l.segment_id,
+            speaker_id: l.speaker_id,
+            t_start_ns: l.t_start_ns,
+            text: l.text,
+        })
+        .collect();
+    crate::llm::roster(&lines)
+        .into_iter()
+        .map(|id| RosterEntry {
+            id,
+            label: label(store, id),
+        })
+        .collect()
+}
+
+/// Design (a): a speaker letter in the model's prose becomes a person's name.
+///
+/// This is what renders the digests written before 0.11.6, and the whole of
+/// its design is the three conditions it refuses on:
+///
+/// * **only letters that were assigned.** `roster.len()` is the alphabet; `C`
+///   in a two-voice conversation is a letter the model invented and is left
+///   exactly where it is.
+/// * **only standalone tokens.** A letter with a word character on either side
+///   is part of a word — `AB`, `A4`, `Grad_A` — not a person.
+/// * **never an English article.** `A` is a word in English, and *"A meetup at
+///   eight"* must not become *"Kira meetup at eight"*. Sentence-initial `A`
+///   followed by a lowercase word is an article and is left alone. This is
+///   conservative on purpose and it costs: *"A asked for the recording"* is
+///   the same shape and is also left alone, which is exactly why design (a)
+///   lost the bench and is not what writes new digests. German has no such
+///   collision, so German text is rendered whole.
+pub fn render_letters(text: &str, lang: &str, roster: &[RosterEntry]) -> String {
+    if roster.is_empty() {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let wordish = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric() || *c == '_');
+    let mut out = String::with_capacity(text.len());
+    for (i, c) in chars.iter().enumerate() {
+        let idx = (*c as u32).checked_sub('A' as u32).map(|d| d as usize);
+        let entry = idx
+            .filter(|_| c.is_ascii_uppercase())
+            .and_then(|d| roster.get(d));
+        let standalone =
+            !wordish(i.checked_sub(1).and_then(|p| chars.get(p))) && !wordish(chars.get(i + 1));
+        match entry {
+            Some(e) if standalone && !(lang == "en" && *c == 'A' && english_article(&chars, i)) => {
+                out.push_str(&e.label)
+            }
+            _ => out.push(*c),
+        }
+    }
+    out
+}
+
+/// Is the `A` at `i` an English article — sentence-initial, and followed by a
+/// lowercase word?
+fn english_article(chars: &[char], i: usize) -> bool {
+    let mut back = i;
+    while back > 0 && matches!(chars[back - 1], ' ' | '\t') {
+        back -= 1;
+    }
+    let initial = back == 0 || matches!(chars[back - 1], '.' | '!' | '?' | '\n');
+    let mut fwd = i + 1;
+    while fwd < chars.len() && matches!(chars[fwd], ' ' | '\t' | '\n') {
+        fwd += 1;
+    }
+    let lower = chars
+        .get(fwd)
+        .is_some_and(|c| c.is_alphabetic() && c.is_lowercase());
+    initial && lower
+}
+
+/// Design (b): the labels the model was given become the labels the voices
+/// have now, so a rename moves a paragraph that was written weeks ago.
+///
+/// Exact standalone-token match against the roster's stored labels, longest
+/// first so `Speaker 3` cannot eat the front of `Speaker 38`. A label that has
+/// not changed is replaced with itself, which is why this is unconditional.
+///
+/// Two voices the user has given the *same* name are indistinguishable here
+/// and the first one in the roster wins. That is the honest outcome: the
+/// paragraph was written about two people called the same thing, and nothing
+/// in the text says which sentence belongs to which.
+pub fn render_labels(text: &str, roster: &[RosterEntry], now: &[String]) -> String {
+    let mut pairs: Vec<(&str, &str)> = roster
+        .iter()
+        .zip(now)
+        .filter(|(e, _)| !e.label.trim().is_empty())
+        .map(|(e, n)| (e.label.as_str(), n.as_str()))
+        .collect();
+    pairs.sort_by_key(|(old, _)| std::cmp::Reverse(old.chars().count()));
+    let chars: Vec<char> = text.chars().collect();
+    let wordish = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric() || *c == '_');
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    'outer: while i < chars.len() {
+        if !wordish(i.checked_sub(1).and_then(|p| chars.get(p))) {
+            for (old, new) in &pairs {
+                let want: Vec<char> = old.chars().collect();
+                if chars[i..].starts_with(&want[..]) && !wordish(chars.get(i + want.len())) {
+                    out.push_str(new);
+                    i += want.len();
+                    continue 'outer;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// The language a conversation's digest is written in.
@@ -313,6 +560,45 @@ pub fn local_day(utc_ns: i64) -> String {
 /// from one function, so the two cannot drift.
 pub fn digest_json(store: &Store, row: &DigestRow) -> Value {
     let summary = store.thread_summary(row.thread_id).ok().flatten();
+    // 0.11.6: the paragraph is rendered on the way OUT, from what the model
+    // wrote and from who the voices are *now* — so a rename moves the prose
+    // the same way it already moves the participant chips below it.
+    //
+    // A row from before 0.11.6 has neither a raw nor a roster: its stored
+    // summary IS the raw, still full of letters, and the roster is recomputed
+    // from the conversation's own turns (`thread_roster`, which hands out the
+    // same letters it handed out then). No model call, ever, for an old row.
+    let legacy = row.summary_raw.is_none();
+    let written: Vec<RosterEntry> = row
+        .roster_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<RosterEntry>>(s).ok())
+        .unwrap_or_else(|| thread_roster(store, row.thread_id));
+    let now: Vec<String> = written.iter().map(|e| label(store, e.id)).collect();
+    let mode = if legacy {
+        "legacy"
+    } else {
+        row.rendered.as_deref().unwrap_or("names")
+    };
+    let current: Vec<RosterEntry> = written
+        .iter()
+        .zip(&now)
+        .map(|(e, n)| RosterEntry {
+            id: e.id,
+            label: n.clone(),
+        })
+        .collect();
+    let render = |text: &str| match mode {
+        "names" => render_labels(text, &written, &now),
+        // "letters" and "legacy" are the same substitution; they differ only
+        // in whether the raw was kept on the row or is the summary itself.
+        _ => render_letters(text, &row.lang, &current),
+    };
+    let raw_summary = row
+        .summary_raw
+        .clone()
+        .unwrap_or_else(|| row.summary.clone());
+    let raw_open: Vec<String> = serde_json::from_str(&row.open_json).unwrap_or_else(|_| Vec::new());
     // 0.10.0: who did the talking. Attached to the participant rather than
     // offered as a second list, because a share is a property OF a person in
     // a conversation and a client that has to join two arrays to draw one bar
@@ -334,8 +620,11 @@ pub fn digest_json(store: &Store, row: &DigestRow) -> Value {
             json!({
                 "speaker_id": id,
                 // The name as the voicebank spells it now, so a rename moves
-                // every digest that quoted them without a re-derivation.
-                "label": store.speaker_name(id).ok().flatten(),
+                // every digest that quoted them without a re-derivation —
+                // and through the same [`label`] the paragraph above the
+                // chips went through, because a chip that says `Speaker_07`
+                // beside a sentence about "Speaker 07" reads as two people.
+                "label": label(store, id),
                 "share": shares.get(&id).map(|s| s.share),
                 "turns": shares.get(&id).map(|s| s.turns),
             })
@@ -345,8 +634,14 @@ pub fn digest_json(store: &Store, row: &DigestRow) -> Value {
         "thread_id": row.thread_id,
         "day": row.day,
         "lang": row.lang,
-        "summary": row.summary,
-        "open": serde_json::from_str::<Value>(&row.open_json).unwrap_or_else(|_| json!([])),
+        // The prose, with people's names in it. `*_raw` is what the model
+        // wrote — kept on the wire as well as on the row, so a client that
+        // wants to show the letters can and nothing is lost.
+        "summary": render(&raw_summary),
+        "summary_raw": raw_summary,
+        "open": raw_open.iter().map(|o| render(o)).collect::<Vec<_>>(),
+        "open_raw": raw_open,
+        "rendered": mode,
         "participants": participants,
         // Both forms, as everywhere else.
         "started_ms": summary.as_ref().map(|s| ns_to_ms(s.started_ns)),
@@ -394,7 +689,7 @@ pub fn batch(
             break;
         }
         // ---- gather (lock held, no model) ----
-        let (lines, lang) = {
+        let (lines, lang, written) = {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
             let lines: Vec<Line> = guard
                 .thread_lines(candidate.thread_id)?
@@ -408,16 +703,27 @@ pub fn batch(
                 })
                 .collect();
             let lang = language_of(&guard, &control.lang, candidate.thread_id);
-            (lines, lang)
+            // 0.11.6: what these voices are called, read under the same lock
+            // as the turns. The model is given these names and writes them
+            // back, so they are gathered here rather than after the call.
+            let written: Vec<RosterEntry> = crate::llm::roster(&lines)
+                .into_iter()
+                .map(|id| RosterEntry {
+                    id,
+                    label: label(&guard, id),
+                })
+                .collect();
+            (lines, lang, written)
         };
         if lines.is_empty() {
             continue;
         }
+        let labels: Vec<String> = written.iter().map(|e| e.label.clone()).collect();
         let at = crate::clock::utc_now_ns();
 
         // ---- judge (no lock) ----
         let tuned = llm.with_threads(control.graph().llm_threads);
-        let verdict = match judge(&tuned, &lines, &lang) {
+        let verdict = match judge(&tuned, &lines, &lang, &labels) {
             Ok(v) => v,
             Err(e) => {
                 // The conversation is left unmarked, so a later pass retries
@@ -451,9 +757,15 @@ pub fn batch(
                         thread_id: candidate.thread_id,
                         day: local_day(candidate.started_ns),
                         lang: lang.clone(),
-                        summary: d.summary,
+                        // What the user would have read tonight. The wire
+                        // renders again from the raw every time it is asked,
+                        // so this is a record and not the source of truth.
+                        summary: render_labels(&d.summary, &written, &labels),
                         people_json: serde_json::to_string(&people)?,
                         open_json: serde_json::to_string(&d.open)?,
+                        summary_raw: Some(d.summary),
+                        roster_json: Some(serde_json::to_string(&written)?),
+                        rendered: Some("names".into()),
                         model_id: tuned.model_id().to_string(),
                         created_ns: at,
                     };
@@ -481,11 +793,6 @@ fn strings(v: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn letter_index(s: &str) -> Option<usize> {
-    let c = s.trim().chars().next()?.to_ascii_uppercase();
-    c.is_ascii_uppercase().then(|| (c as u8 - b'A') as usize)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -613,17 +920,223 @@ mod tests {
         let de = summary_system("de");
         assert!(de.contains("Schreibe AUF DEUTSCH"), "{de}");
         assert!(
-            de.contains("A fragt nach dem Video"),
+            de.contains("Nadia fragt nach dem Video"),
             "the example is German"
         );
         assert!(!de.contains("Write in ENGLISH"));
         let en = summary_system("en");
         assert!(en.contains("Write in ENGLISH"), "{en}");
-        assert!(en.contains("A asked for the recording"));
+        assert!(en.contains("Nadia asked for the recording"));
         assert_eq!(summary_system("fr"), en, "English is the fallback");
         // It never re-litigates the verdict: that call has already happened.
         assert!(de.contains("already been decided"));
         assert!(!de.contains("worth_summarising"));
+    }
+
+    /// 0.11.6: the summary prompt asks for names and shows names, and the
+    /// example's names are ones no roster can produce — so a name copied out
+    /// of the prompt is countable rather than deniable.
+    #[test]
+    fn the_summary_prompt_asks_for_names_and_the_verdict_never_hears_about_them() {
+        for tag in ["de", "en"] {
+            let s = summary_system(tag);
+            assert!(
+                s.contains(
+                    "Call every speaker by the exact name that stands in front of their lines"
+                ),
+                "{s}"
+            );
+            assert!(s.contains("Nadia") && s.contains("Timo"), "{s}");
+            // The letters are gone from the example: the input has names in
+            // it now, and an example in a different shape from the input is
+            // what §19 measured a loss on.
+            for letters in ["A:", "B:", "\"A\"", "\"B\""] {
+                assert!(!s.contains(letters), "{letters:?} is still in {tag}: {s}");
+            }
+        }
+        // …and none of it reached the verdict, which is why the six traps are
+        // the same six refusals. See the module note's table.
+        for leak in ["Nadia", "Timo", "name"] {
+            assert!(
+                !VERDICT_SYSTEM.contains(leak),
+                "{leak:?} leaked into the verdict prompt"
+            );
+        }
+    }
+
+    /// The input the summary call actually gets: the roster's own labels in
+    /// front of the lines, and a turn nobody could place dropped rather than
+    /// given a name.
+    #[test]
+    fn the_summary_reads_names_where_the_verdict_reads_letters() {
+        let lines = vec![
+            line(0, 7, "hast du den Shader noch?"),
+            line(1, 9, "ja, ich schick dir den Link"),
+            Line {
+                segment_id: 2,
+                speaker_id: None,
+                t_start_ns: 2 * SEC,
+                text: "irgendwer im Hintergrund".into(),
+            },
+        ];
+        let roster = crate::llm::roster(&lines);
+        let labels = ["Kira".to_string(), "Speaker 38".to_string()];
+        let named = named_transcript(&lines, &roster, &labels);
+        assert_eq!(
+            named,
+            "Kira: hast du den Shader noch?\nSpeaker 38: ja, ich schick dir den Link"
+        );
+        // The verdict's input is untouched, byte for byte what it was measured
+        // on — which is the whole reason the traps could not move.
+        assert!(crate::llm::transcript(&lines, &roster).starts_with("A: hast du"));
+    }
+
+    // ---- rendering ---------------------------------------------------------
+
+    fn roster_of(labels: &[&str]) -> Vec<RosterEntry> {
+        labels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| RosterEntry {
+                id: i as i64 + 1,
+                label: (*l).to_string(),
+            })
+            .collect()
+    }
+
+    /// Design (a)'s rule, which is what renders every digest written before
+    /// 0.11.6. Each case here is one of the three conditions it refuses on.
+    #[test]
+    fn a_letter_becomes_a_name_only_where_it_is_certainly_a_speaker() {
+        let two = roster_of(&["Kira", "Speaker 38"]);
+        // The ordinary case, in German, where there is no article to collide
+        // with and the substitution is total.
+        assert_eq!(
+            render_letters(
+                "A und B reden über den Shader. B schickt A den Link.",
+                "de",
+                &two
+            ),
+            "Kira und Speaker 38 reden über den Shader. Speaker 38 schickt Kira den Link."
+        );
+        // Only letters that were assigned: C is a letter the model invented
+        // in a two-voice conversation and is left exactly where it is.
+        assert_eq!(render_letters("A und C", "de", &two), "Kira und C");
+        // Only standalone tokens.
+        assert_eq!(
+            render_letters("AB, A4 und Grad_A bleiben", "de", &two),
+            "AB, A4 und Grad_A bleiben"
+        );
+        // Never an English article — and the cost of that, in the same
+        // string: the meetup survives, and so does the "A asked" the bench
+        // counted as design (a)'s one loss.
+        assert_eq!(
+            render_letters("A meetup at eight. A asked B for it.", "en", &two),
+            "A meetup at eight. A asked Speaker 38 for it."
+        );
+        // The same sentence in German renders whole: there is no German
+        // article that is a bare "A".
+        assert_eq!(
+            render_letters("A fragt B danach.", "de", &two),
+            "Kira fragt Speaker 38 danach."
+        );
+        // Mid-sentence in English is not an article shape, so it renders.
+        assert_eq!(
+            render_letters("The link B sent A works.", "en", &two),
+            "The link Speaker 38 sent Kira works."
+        );
+        // Nobody in the room, nothing to do.
+        assert_eq!(render_letters("A und B", "de", &[]), "A und B");
+    }
+
+    /// Design (b)'s: the names the model was given become the names the voices
+    /// have now, so a rename moves a paragraph written weeks ago.
+    #[test]
+    fn a_rename_moves_the_paragraph_it_was_written_into() {
+        let written = roster_of(&["Speaker 3", "Speaker 38"]);
+        let now = ["Kira".to_string(), "Speaker 38".to_string()];
+        // Longest first, so "Speaker 3" cannot eat the front of "Speaker 38".
+        assert_eq!(
+            render_labels(
+                "Speaker 38 schickt Speaker 3 den Link, Speaker 3 baut es nach.",
+                &written,
+                &now
+            ),
+            "Speaker 38 schickt Kira den Link, Kira baut es nach."
+        );
+        // A name inside a word is not that person.
+        assert_eq!(
+            render_labels("Speaker 3000 ist niemand", &written, &now),
+            "Speaker 3000 ist niemand"
+        );
+    }
+
+    /// A name is what the user sees everywhere else, and a generated label is
+    /// an identifier until it has to stand in a sentence.
+    #[test]
+    fn a_voice_is_called_what_the_user_calls_it() {
+        let store = Store::open_in_memory().unwrap();
+        let named = store.create_speaker("Aspen", 0).unwrap();
+        store.rename_speaker(named, "Aspen", 0).unwrap();
+        assert_eq!(label(&store, named), "Aspen");
+        // The auto label loses its underscore, because a sentence is not a
+        // symbol table.
+        let auto = store.create_speaker("Speaker_38", 0).unwrap();
+        assert_eq!(label(&store, auto), "Speaker 38");
+        // …but only the generated shape does.
+        let odd = store.create_speaker("moon_child", 0).unwrap();
+        assert_eq!(label(&store, odd), "moon_child");
+        // The microphone's voice is "You" already, and stays it.
+        let you = store.ensure_you_speaker(0).unwrap();
+        assert_eq!(label(&store, you), "You");
+    }
+
+    /// Requirement 4, and the reason there is no `digest rerender`: a row
+    /// written before 0.11.6 has no raw to re-render FROM. It is rendered on
+    /// the way out from the roster the conversation still has, marked
+    /// `legacy`, and no model is asked anything about it.
+    #[test]
+    fn a_digest_written_before_this_change_is_rendered_at_read_time() {
+        let r = rig();
+        let thread = a_conversation(&r, 0, 8, "das ist der einzige weg");
+        r.store
+            .upsert_digest(&DigestRow {
+                thread_id: thread,
+                day: "2026-09-02".into(),
+                lang: "de".into(),
+                summary: "A und B reden über den Shader. B schickt A den Link.".into(),
+                people_json: format!("[{},{}]", r.a, r.b),
+                open_json: "[\"B schickt A morgen den Link\"]".into(),
+                // What 0.11.5 wrote: none of the three.
+                summary_raw: None,
+                roster_json: None,
+                rendered: None,
+                model_id: "m@1".into(),
+                created_ns: 2,
+            })
+            .unwrap();
+        let rows = r.store.digest_rows(None, 50).unwrap();
+        let v = digest_json(&r.store, &rows[0]);
+        assert_eq!(v["rendered"], json!("legacy"));
+        assert_eq!(
+            v["summary"],
+            json!("Aspen und Kira reden über den Shader. Kira schickt Aspen den Link.")
+        );
+        assert_eq!(v["open"], json!(["Kira schickt Aspen morgen den Link"]));
+        // Nothing is lost: the letters are still on the wire.
+        assert_eq!(
+            v["summary_raw"],
+            json!("A und B reden über den Shader. B schickt A den Link.")
+        );
+        assert_eq!(v["open_raw"], json!(["B schickt A morgen den Link"]));
+        // …and a rename moves it, because the roster is recomputed from the
+        // conversation every time it is read.
+        r.store.rename_speaker(r.b, "Wren", 1).unwrap();
+        let v = digest_json(&r.store, &r.store.digest_rows(None, 50).unwrap()[0]);
+        assert_eq!(
+            v["summary"],
+            json!("Aspen und Wren reden über den Shader. Wren schickt Aspen den Link.")
+        );
     }
 
     #[test]
@@ -746,7 +1259,13 @@ mod tests {
                 lang: "de".into(),
                 summary: "Es ging um den Shader.".into(),
                 people_json: format!("[{},{}]", r.a, r.b),
-                open_json: "[\"B schickt den Link\"]".into(),
+                open_json: "[\"Kira schickt den Link\"]".into(),
+                summary_raw: Some("Es ging um den Shader.".into()),
+                roster_json: Some(format!(
+                    "[{{\"id\":{},\"label\":\"Aspen\"}},{{\"id\":{},\"label\":\"Kira\"}}]",
+                    r.a, r.b
+                )),
+                rendered: Some("names".into()),
                 model_id: "m@1".into(),
                 created_ns: 2,
             })
@@ -766,7 +1285,8 @@ mod tests {
         let v = digest_json(&r.store, &rows[0]);
         assert_eq!(v["thread_id"], json!(thread));
         assert_eq!(v["day"], json!("2026-09-02"));
-        assert_eq!(v["open"], json!(["B schickt den Link"]));
+        assert_eq!(v["open"], json!(["Kira schickt den Link"]));
+        assert_eq!(v["rendered"], json!("names"));
         let people = v["participants"].as_array().unwrap();
         assert_eq!(people.len(), 2);
         let names: Vec<&str> = people
@@ -794,6 +1314,9 @@ mod tests {
                     summary: format!("about {day}"),
                     people_json: "[]".into(),
                     open_json: "[]".into(),
+                    summary_raw: None,
+                    roster_json: None,
+                    rendered: None,
                     model_id: "m@1".into(),
                     created_ns: 1,
                 })
@@ -867,8 +1390,9 @@ mod tests {
             .enumerate()
             .map(|(i, t)| line(i as i64, if i % 2 == 0 { 7 } else { 9 }, t))
             .collect();
+        let labels = ["Kira".to_string(), "Speaker 38".to_string()];
         assert_eq!(
-            judge(&llm, &trap, "de").expect("the runner ran"),
+            judge(&llm, &trap, "de", &labels).expect("the runner ran"),
             None,
             "the model wrote a paragraph about eight turns of nothing"
         );
@@ -883,7 +1407,7 @@ mod tests {
             line(6, 7, "ich bau eh nur für PC"),
             line(7, 9, "dann geht das klar"),
         ];
-        let d = judge(&llm, &real, "de")
+        let d = judge(&llm, &real, "de", &labels)
             .expect("the runner ran")
             .expect("a conversation with a subject");
         eprintln!("digest: {d:?}");
@@ -897,5 +1421,19 @@ mod tests {
             .filter(|w| d.summary.to_lowercase().contains(*w))
             .count();
         assert!(de >= 2, "the summary is not German: {:?}", d.summary);
+        // 0.11.6, and the whole point of it: the paragraph says who, by the
+        // name this daemon would put on a chip. No letters left standing.
+        assert!(
+            labels.iter().any(|l| d.summary.contains(l.as_str())),
+            "nobody is named in {:?}",
+            d.summary
+        );
+        for stray in [" A ", " B ", "A ist", "B ist"] {
+            assert!(
+                !d.summary.contains(stray),
+                "a letter survived into {:?}",
+                d.summary
+            );
+        }
     }
 }

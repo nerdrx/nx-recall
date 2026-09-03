@@ -7705,6 +7705,11 @@ mod tests {
                     summary: "Es ging um den Shader.".into(),
                     people_json: format!("[{aspen}]"),
                     open_json: "[\"B schickt den Link\"]".into(),
+                    // A row in the shape 0.11.5 wrote them: letters, no raw
+                    // and no roster. `digest.list` renders it at read time.
+                    summary_raw: None,
+                    roster_json: None,
+                    rendered: None,
                     model_id: "qwen2.5-3b@1".into(),
                     created_ns: 9,
                 })
