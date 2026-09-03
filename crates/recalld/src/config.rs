@@ -636,6 +636,73 @@ pub struct AsrConfig {
     /// has — 0.019 RTF at 3 s, which is what makes asking on every unclear
     /// turn affordable at all.
     pub lid_windows: usize,
+    // ---- the other languages (0.11.8, `crate::polyglot`) -------------------
+    /// How long a turn must be before the spoken-language identifier is asked
+    /// about it at all.
+    ///
+    /// Its own knob since 0.11.6, and separate from
+    /// `[lang].arbiter_min_duration_s` because the two answer different
+    /// questions. The arbiter floor is about **replacement**: below 1.5 s the
+    /// arbiter's own words were measured to be in the reference only 28% of the
+    /// time, so swapping one wrong transcript for a differently wrong one is
+    /// not a correction (FINDINGS §7). This is about **identification**, and a
+    /// model can know what language it is hearing on audio too short to
+    /// transcribe usefully.
+    ///
+    /// Keeping them fused cost real turns. All three rows that prompted 0.11.6
+    /// were under 1.5 s — "Mon petit chou." at 1.01 s, "During apartments." at
+    /// 1.20 s and the Japanese "Wanky Daska." at 1.30 s — and none of them
+    /// reached the identifier, so nothing downstream ever had the chance to
+    /// refuse them.
+    ///
+    /// **1.0**, and the number is a false-positive budget rather than a recall
+    /// choice (FINDINGS §28). whisper-tiny's recall falls all the way down —
+    /// French 84.0/71.5/60.0% at 1.5/1.25/1.0 s — so every step down buys
+    /// fewer turns than the last. What would stop it is the other column, and
+    /// the raw one looks alarming: German heard as French runs 2.0/3.0/4.5%
+    /// over the same lengths, well over a 1% budget even at the floor 0.11.0
+    /// already shipped.
+    ///
+    /// The raw column is the wrong one. Measured through the whole live route
+    /// — a turn is only asked about when its transcript is already unreadable,
+    /// and a re-decode is only kept when the judge accepts it — **one** German
+    /// utterance in 900 survived every guard, at 1.0 s, and none at 1.5 or
+    /// 2.5 s. English contributed nothing at any length. 1.0 s is where all
+    /// three of the rows that prompted 0.11.6 become reachable (1.01, 1.20 and
+    /// 1.30 s) at a conditioned false-positive rate of 0.11%.
+    pub lid_min_s: f32,
+    /// Re-decode a turn the identifier heard as French, Spanish, Italian,
+    /// Portuguese, Dutch or Polish with a decoder forced to that language.
+    ///
+    /// **On**, and like `japanese` that costs nothing on a machine which has
+    /// not opted in: the decoder is the night shift's whisper-large-v3 on the
+    /// GPU (`models fetch --night` **and** `models build-night`), so "on" means
+    /// "use it if it is there".
+    ///
+    /// Unlike the Japanese route this one is *not* fixing a language the
+    /// decoder cannot speak — Parakeet-TDT-0.6b-v3 speaks all six. It is fixing
+    /// the flip: on a one-second fragment the multilingual model does not
+    /// hedge, it commits to English. That is also why the backend is the
+    /// expensive one. The cheap candidate — the German arbiter's whisper-base,
+    /// already on disk — was measured and is *worse than doing nothing*,
+    /// because an arbiter here has to beat v3 speaking French rather than beat
+    /// a decoder that cannot spell Japanese. See [`crate::polyglot`].
+    pub polyglot: bool,
+    /// Which languages the route may re-decode into.
+    ///
+    /// A tag here does nothing unless the route also knows it
+    /// (`crate::polyglot::ROUTABLE`) — this list is what the operator wants,
+    /// not a claim about what exists.
+    ///
+    /// It ships as `crate::polyglot::MEASURED`, which is **shorter** than
+    /// `ROUTABLE` and deliberately so: `fr` is the one tag with a WER gate
+    /// behind it. `es` and `it` have the identification and false-positive
+    /// halves of the same measurement and not the half that says the new words
+    /// beat the old, and `pt`/`nl`/`pl` have nothing. All six are reachable by
+    /// naming them here, and the honest thing is that the last five are
+    /// unmeasured rather than unavailable.
+    pub polyglot_languages: Vec<String>,
+    // ---- end 0.11.6 ---------------------------------------------------------
     // ---- 0.11.0, partial turns (`crate::partial`) --------------------------
     /// Publish provisional `partial` events while a turn is still open, so a
     /// caption bar can show words before the person has stopped talking.
@@ -679,6 +746,14 @@ impl Default for AsrConfig {
             cjk: true,
             lid_min_confidence: 1.0,
             lid_windows: 1,
+            // ---- the other languages (0.11.8) -----------------------------
+            lid_min_s: 1.0,
+            polyglot: true,
+            polyglot_languages: crate::polyglot::MEASURED
+                .iter()
+                .map(|l| l.to_string())
+                .collect(),
+            // ---- end 0.11.6 -----------------------------------------------
             // ---- 0.11.0, partial turns ------------------------------------
             // OFF, and the reason is measured (FINDINGS §20). Convergence
             // passed handsomely — 96.4% of the last partial's words survive

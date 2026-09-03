@@ -1,7 +1,7 @@
 {
   "name": "nx-recall-gui",
   "productName": "NX Recall",
-  "version": "0.11.7",
+  "version": "0.11.8",
   "description": "NX Recall — desktop client for recalld: live transcript, speakers, search, sources, and the pause switch",
   "main": "src/main/index.js",
   "type": "module",

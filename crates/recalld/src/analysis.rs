@@ -87,6 +87,13 @@ pub struct Outcome {
     /// what the decoder's *script* turned out to be, not what the identifier
     /// said — see `crate::asr_cjk::judge`.
     pub routed_cjk: Option<crate::asr_cjk::Routed>,
+    /// The turn was re-decoded by a decoder forced to the language the
+    /// identifier named — French, Spanish, Italian, Portuguese, Dutch or
+    /// Polish (0.11.8, `crate::polyglot`). Its own field beside `routed_cjk`
+    /// rather than folded into it because the two carry different claims: that
+    /// one means "the decoder could not spell this language", this one means
+    /// "the decoder heard the wrong one".
+    pub routed_other: Option<crate::polyglot::Routed>,
 }
 
 /// Everything the microphone leg needs that the matching leg does not: who the
@@ -157,6 +164,11 @@ pub struct Analyzer {
     /// `lang_cfg`, and set from the running config by [`Analyzer::
     /// set_asr_config`].
     asr_cfg: crate::config::AsrConfig,
+    // ---- the other languages (0.11.8, `crate::polyglot`) -------------------
+    /// The forced decoders for every other language the identifier can name,
+    /// each loaded the first time a turn needs it. Holds no identifier of its
+    /// own: it reads the one `japanese` above already ran.
+    polyglot: crate::polyglot::Polyglot,
 }
 
 impl Analyzer {
@@ -180,6 +192,12 @@ impl Analyzer {
             truth_cfg: TruthConfig::default(),
             cjk: crate::asr_cjk::Cjk::new(models, &crate::config::AsrConfig::default()),
             asr_cfg: crate::config::AsrConfig::default(),
+            polyglot: crate::polyglot::Polyglot::new(
+                models,
+                &crate::config::AsrConfig::default(),
+                &crate::config::NightConfig::default(),
+                &crate::config::RuntimeConfig::default(),
+            ),
         })
     }
 
@@ -204,13 +222,30 @@ impl Analyzer {
     }
 
     // ---- Japanese (0.11.0) -----------------------------------------------
-    /// Point the Japanese router at the running config. Set once, in the same
-    /// place and for the same reason as [`Analyzer::set_lang_config`] —
-    /// **before** the inference thread starts, because it rebuilds the router
-    /// and the router owns two lazily loaded models.
-    pub fn set_asr_config(&mut self, models: &ModelSet, cfg: &crate::config::AsrConfig) {
+    /// Point both audio-language routers at the running config. Set once, in
+    /// the same place and for the same reason as [`Analyzer::set_lang_config`]
+    /// — **before** the inference thread starts, because it rebuilds them and
+    /// they own lazily loaded models.
+    ///
+    /// `night` and `runtime` are here for the polyglot route (0.11.8), whose
+    /// only measured decoder is the night shift's — see [`crate::polyglot`] for
+    /// why the cheap local one was rejected.
+    pub fn set_asr_config(
+        &mut self,
+        models: &ModelSet,
+        cfg: &crate::config::AsrConfig,
+        night: &crate::config::NightConfig,
+        runtime: &crate::config::RuntimeConfig,
+    ) {
         self.cjk = crate::asr_cjk::Cjk::new(models, cfg);
+        self.polyglot = crate::polyglot::Polyglot::new(models, cfg, night, runtime);
         self.asr_cfg = cfg.clone();
+    }
+
+    /// The line the daemon logs once at start-up about the other languages
+    /// (0.11.6), `None` when there is nothing worth saying.
+    pub fn polyglot_note(&self) -> Option<String> {
+        self.polyglot.startup_note(&self.asr_cfg)
     }
 
     /// The line the daemon logs once at start-up about Japanese, `None` when
@@ -317,6 +352,7 @@ impl Analyzer {
                 return Ok(Outcome {
                     lid_checked: false,
                     routed_cjk: None,
+                    routed_other: None,
                     overlap_frac,
                     text,
                     decision: Decision::Refused(refusal),
@@ -441,6 +477,7 @@ impl Analyzer {
             also_changed: Vec::new(),
             lid_checked: false,
             routed_cjk: None,
+            routed_other: None,
         })
     }
 
@@ -553,6 +590,7 @@ impl Analyzer {
             also_changed: Vec::new(),
             lid_checked: false,
             routed_cjk: None,
+            routed_other: None,
         })
     }
 
@@ -584,6 +622,8 @@ impl Analyzer {
         // Best-effort like every other correction here: a language nobody
         // could settle never costs a recording.
         let mut settled_cjk = false;
+        // The identifier's answer, kept for the polyglot route below (0.11.8).
+        let mut lid_heard = None;
         match crate::asr_cjk::route_segment(
             &mut self.cjk,
             store,
@@ -602,6 +642,7 @@ impl Analyzer {
         ) {
             Ok(checked) => {
                 outcome.lid_checked = checked.lid_checked;
+                lid_heard = checked.heard;
                 if let Some(routed) = checked.routed {
                     outcome.text = Some(routed.text.clone());
                     outcome.routed_cjk = Some(routed);
@@ -611,6 +652,45 @@ impl Analyzer {
             Err(e) => warn!(segment_id, "the CJK route failed: {e:#}"),
         }
         // ---- end Japanese, Korean, Chinese --------------------------------
+
+        // ---- the other languages (0.11.8, `crate::polyglot`) --------------
+        //
+        // SECOND, and only on a turn the CJK route left alone. It reuses
+        // that route's LID reading rather than asking again — the identifier
+        // is the only cost either feature has — which is why this reads
+        // `heard` off the `Checked` above instead of holding an identifier of
+        // its own. `post_route` refuses `ja`, so the two cannot both fire.
+        //
+        // Best-effort, like everything else in this function: a language
+        // nobody could settle never costs a recording.
+        if !settled_cjk && let Some(heard) = lid_heard.as_ref() {
+            match crate::polyglot::route_segment(
+                &mut self.polyglot,
+                store,
+                crate::polyglot::Turn {
+                    segment_id,
+                    text: outcome.text.as_deref(),
+                    samples,
+                    heard: Some(heard),
+                    lang_cfg: &self.lang_cfg,
+                    asr_cfg: &self.asr_cfg,
+                },
+                crate::clock::utc_now_ns(),
+            ) {
+                Ok(Some(routed)) => {
+                    outcome.text = Some(routed.text.clone());
+                    outcome.routed_other = Some(routed);
+                    // `settled_cjk` is misnamed as of this branch and is left
+                    // alone deliberately: what it actually gates is "this row's
+                    // language was settled by ear, so the declaration check
+                    // must not decide it again", which is exactly as true here.
+                    settled_cjk = true;
+                }
+                Ok(None) => {}
+                Err(e) => warn!(segment_id, "the polyglot route failed: {e:#}"),
+            }
+        }
+        // ---- end the other languages ---------------------------------------
 
         if let Some(speaker_id) = outcome.speaker_id.filter(|_| !settled_cjk) {
             match self.correct_language(
@@ -967,6 +1047,20 @@ pub struct AnalysisStats {
     pub routed_ja: std::sync::atomic::AtomicU64,
     pub routed_ko: std::sync::atomic::AtomicU64,
     pub routed_zh: std::sync::atomic::AtomicU64,
+    // ---- the other languages (0.11.8, `crate::polyglot`) -------------------
+    /// Turns re-decoded by a decoder forced to the language the identifier
+    /// named, over all of fr/es/it/pt/nl/pl.
+    pub routed_other: std::sync::atomic::AtomicU64,
+    /// The same, split by language and **positionally aligned with
+    /// [`crate::polyglot::ROUTABLE`]** — slot `i` counts
+    /// `ROUTABLE[i]`.
+    ///
+    /// An array rather than a map behind a lock: the set is known at compile
+    /// time, and this is incremented on the inference thread where a mutex for
+    /// six counters would be the most expensive thing about the feature. Read
+    /// it through [`AnalysisStats::routed_other_counts`], which pairs the slots
+    /// back up with their tags so no caller has to know the ordering.
+    pub routed_other_by_lang: [std::sync::atomic::AtomicU64; crate::polyglot::ROUTABLE.len()],
 }
 
 impl AnalysisStats {
@@ -1059,6 +1153,31 @@ impl AnalysisStats {
             Some(crate::asr_cjk::ZH) => self.routed_zh.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
+        // …and what the other half of the same route did (0.11.8).
+        if let Some(routed) = outcome.routed_other.as_ref() {
+            self.routed_other.fetch_add(1, Ordering::Relaxed);
+            if let Some(i) = crate::polyglot::ROUTABLE
+                .iter()
+                .position(|t| *t == routed.lang)
+            {
+                self.routed_other_by_lang[i].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The per-language counts, paired back up with their tags.
+    ///
+    /// The one way anything outside this module should read
+    /// `routed_other_by_lang`: the array is positional, and a caller that
+    /// indexed it itself would silently report French numbers under Spanish
+    /// the first time a language is added to the catalogue.
+    pub fn routed_other_counts(&self) -> Vec<(&'static str, u64)> {
+        crate::polyglot::ROUTABLE
+            .iter()
+            .zip(self.routed_other_by_lang.iter())
+            .map(|(t, n)| (*t, n.load(Ordering::Relaxed)))
+            .filter(|(_, n)| *n > 0)
+            .collect()
     }
 }
 

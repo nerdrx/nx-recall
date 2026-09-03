@@ -68,6 +68,7 @@ pub mod notes;
 pub mod overlap;
 pub mod partial;
 pub mod pipeline;
+pub mod polyglot;
 pub mod proto;
 pub mod proximity;
 pub mod quality;

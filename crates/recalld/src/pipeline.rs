@@ -347,7 +347,7 @@ impl Pipeline {
                     // point. Set here rather than in `load` because it owns
                     // two lazily loaded models and must be built once, before
                     // the inference thread starts.
-                    analyzer.set_asr_config(&models, &cfg.asr);
+                    analyzer.set_asr_config(&models, &cfg.asr, &cfg.night, &cfg.runtime);
                     // 0.11.0: which capture sources count as Discord, so the
                     // source prior's hard presence rule knows where it applies.
                     analyzer.set_truth_config(&cfg.truth);
@@ -380,6 +380,12 @@ impl Pipeline {
                         info!("{note}");
                     } else {
                         info!("Japanese turns will be detected and re-decoded");
+                    }
+                    // 0.11.6: and which OTHER languages it can re-decode into.
+                    // Same reasoning again — a flip that is never corrected
+                    // leaves no trace saying so.
+                    if let Some(note) = analyzer.polyglot_note() {
+                        info!("{note}");
                     }
                     Some(analyzer)
                 } else {

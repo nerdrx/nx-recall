@@ -403,6 +403,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.11.5 | +114h | Japanese questions in grounded answers: 3 of 3 traps refused, 3 of 3 answered with correct citations, the German and English set unchanged |
 | 0.11.6 | +121h | conversation is not news: the French detector learns the spoken words it never saw in FLEURS, and two function words settle a short line, with the false-positive line unchanged |
 | 0.11.7 | +123h | Korean and Chinese join Japanese on the audio route (SenseVoice, under 10% character error on three-second turns; Japanese stays on the Parakeet it beats); digests name people instead of A and B; the overlap gate measured against Discord's word and left alone, with the reason written down |
+| 0.11.8 | +125h | the identifier is asked about one-second turns (its own knob, split from the arbiter's floor); a turn it hears as French is re-read by the night shift's decoder forced to French, +62% at one second with nothing made worse; the cheap local backend measured worse than doing nothing on every language and rejected; Spanish and Italian routable but off until their rows are collected; the Discord ingest's 413 now reaches the client instead of a reset |
 
 ## Quickstart
 

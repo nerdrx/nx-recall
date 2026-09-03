@@ -346,9 +346,26 @@ fn serve_one(
     }
     if length > MAX_BODY {
         stats.rejected.fetch_add(1, Ordering::Relaxed);
-        // The body is deliberately NOT drained: it is over the limit by
-        // definition, and reading it to be polite is the denial of service.
-        return respond(&mut out, Reply::TooLarge, None);
+        respond(&mut out, Reply::TooLarge, None)?;
+        // Closing with the body still arriving makes the kernel answer the
+        // rest of it with RST, and a reset discards the 413 sitting in the
+        // client's receive buffer — so the client saw a dropped connection,
+        // not a refusal (the test for this failed one run in three). Say
+        // "done writing" first, then discard what is in flight, bounded: a
+        // few times the limit is what a client that stops on EOF can still
+        // have in the pipe, and past that it is not a client and gets the
+        // reset after all. Reading it all "to be polite" would be the denial
+        // of service.
+        let _ = out.shutdown(std::net::Shutdown::Write);
+        let mut sink = [0u8; 64 * 1024];
+        let mut drained = 0usize;
+        while drained < 4 * MAX_BODY {
+            match reader.read(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drained += n,
+            }
+        }
+        return Ok(());
     }
 
     let mut body = vec![0u8; length];

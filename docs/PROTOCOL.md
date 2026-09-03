@@ -2505,7 +2505,19 @@ that is the world's knowledge and not the transcript's), 3/3 answered with
 correct citations**, 10.5 s median — about twice a de/en case, which is the
 tokeniser.
 
-## 0.11.0 — Japanese
+## 0.11.0 — audio-language routing
+
+Two failures, one mechanism. Both are turns whose language the transcript
+cannot reveal, so both are settled by a model that **listens**; they differ in
+what is wrong with the decoder that produced the words in the first place, and
+therefore in what it takes to replace them.
+
+* **0.11.0, Japanese** — the decoder does not speak the language and does not
+  say so. Below.
+* **0.11.8, the other languages** — the decoder speaks the language perfectly
+  well and, on a one-second fragment, hears a different one. Further down.
+
+### The Japanese half
 
 A turn spoken in Japanese did not come back wrong-looking. It came back
 **wrong-looking-like-English**: Parakeet-TDT-0.6b-v3 covers 25 European
@@ -2713,6 +2725,100 @@ Japanese Parakeet, and turning Japanese off must not silently take Korean with
 it.
 
 Numbers in `spike/FINDINGS.md` §27.
+utterances as Japanese at any length. Numbers in `spike/FINDINGS.md` §22–§24,
+which also record what this does *not* cover — Korean and Chinese have the same
+failure and no catalogued decoder yet.
+
+## 0.11.8 — the other languages
+
+Three rows from one evening, all from the user's own microphone:
+
+```
+"Mon petit chou."      1.01 s
+"During apartments."   1.20 s   — French
+"Wanky Daska."         1.30 s   — Japanese, "genki desu ka"
+```
+
+None of them reached the identifier, and the middle one would not have been
+fixed if it had. Two separate gaps.
+
+**Gap one: the floor.** The identifier was only asked about turns clearing
+`[lang].arbiter_min_duration_s` (1.5 s). That number was measured for a
+*replacement* — below it the German arbiter's own words are in the reference
+only 28% of the time — and was reused for an *identification*, which is a
+different question: a model can know what language it is hearing on audio too
+short to transcribe usefully. **`[asr].lid_min_s` (new, default `1.0`)** is now
+the floor for asking, and it governs the Japanese route too, which is what makes
+"Wanky Daska." reachable.
+
+**Gap two: French is not Japanese.** Parakeet-TDT-0.6b-v3 covers French — it
+decodes FLEURS French at 18–22% WER. It did not fail to spell the language; on
+a 1.2-second fragment it **committed to the wrong one**, which is the flip
+`crate::arbiter` has handled for German since 0.7.7. The German arbiter never
+saw this turn because it is reached from *text*, and "During apartments." is two
+ordinary English words.
+
+#### When it fires
+
+After the Japanese route and only on a turn it left alone. It re-uses that
+route's identifier reading rather than asking again — LID is the only cost
+either feature has — so the pre-filter is identical: a transcript that already
+reads as German, English, or anything `guess_other` is confident about is never
+asked about at all.
+
+If the reading names a language in `[asr].polyglot_languages` (default `fr`,
+the one language with a WER gate behind it; `es` and `it` had their
+identification half measured and their benefit half not, and join by being
+named, as do `pt`, `nl` and `pl`, which were not measured at all) the turn is
+re-decoded with the decoder forced to that language, and the result is judged
+before it may overwrite anything. It must be:
+
+1. caption-stripped and at least `[lang].arbiter_min_words` long;
+2. **not an echo** of the words already on the row — an arbiter whose correction
+   is the existing transcript has found nothing;
+3. **confidently readable as the language the identifier named**, by
+   `guess_other` — the bar `segments.lang` is written at, not the looser one
+   that only queues a translation.
+
+Guard 3 is what stands in for the Japanese route's kana test, and it is weaker
+by nature: Whisper forced to French over German audio produces real French
+words, and there is no script to appeal to. The safety therefore comes from all
+three narrowings together. Measured end to end over 900 German and English
+FLEURS cuts at 1.0/1.5/2.5 s, **one** survived every guard — 0.11%, all of it
+German, all of it at 1.0 s (FINDINGS §28).
+
+A row it settles is shaped exactly like a Japanese one: `lang_via: "lid"`,
+`text_via: "lid"`, an `operations` row with op `segments.redecode` carrying the
+prior text, and `lang` set to the code the identifier named — after which the
+live translation queue picks it up with no knowledge that this route exists.
+
+#### The decoder is the night shift's, and that is the finding
+
+`whisper-large-v3-q5_0` on the GPU, one `whisper-cli` per turn, forced to the
+language. The route is therefore **conditional on `models fetch --night` *and*
+`models build-night`**, and on the GPU being under `[night].gpu_busy_max_pct`
+at that moment; without either it does nothing and the turn keeps the words it
+has.
+
+That dependency was not the plan. The intended backend was the German arbiter's
+whisper-base, already on disk, which would have cost zero new bytes — and it is
+**worse than doing nothing**. On the turns this route actually hands it, base
+moved WER by −54.7% (fr, 1.0 s), −63.7% (fr, 1.5 s), −195.0% (es, 1.5 s) and
+−84.4% (it, 1.5 s), making 10–83% of touched rows worse. large-v3 moved it
++62.4% and +31.2% on French at 1.0 and 1.5 s, with **0%** made worse.
+
+The sign flip is the difference between the two halves of this section. The
+Japanese arbiter competes against a decoder that cannot spell the language at
+all, so any kana wins. This one competes against v3 speaking good French, so an
+arbiter has to beat a strong decoder having a bad second — and only the large
+model does.
+
+#### Status counters
+
+`status` gains `routed_other` (turns re-decoded by this route) and a
+per-language split beside it. `lid_checked` is unchanged and now covers both
+halves: it is still what the identifier costs.
+
 ## 0.11.0 — partial turns
 
 Provisional words on the glass while somebody is **still talking**. One new event,
