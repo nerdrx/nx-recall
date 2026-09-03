@@ -6,7 +6,7 @@
 // who are they?" with the names right there to type.
 
 import { h, clear, fmtBytes, fmtDur, fmtFirstSeen, heardOnChips } from '../lib/dom.js';
-// 0.11.9 — per-person highlights. The picker itself lives on the person page
+// 0.12.0 — per-person highlights. The picker itself lives on the person page
 // and in the transcript's segment sheet, not here: this list is where you find
 // out WHO a voice is, and a colour is something you pin once you already know.
 // What this view owes the feature is showing the mark on every row.

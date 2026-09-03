@@ -23,7 +23,7 @@
 
 import { h, clear, fmtDate, fmtClock, fmtDayLabel, fmtDur } from '../lib/dom.js';
 import { store, speakerLabel, ask, applyAssist } from '../lib/store.js';
-// 0.11.9 — per-person highlights. Every graph row here (digest participants,
+// 0.12.0 — per-person highlights. Every graph row here (digest participants,
 // a commitment's two sides, a world's people) carries `colour`/`icon`, which is
 // what `lookOn` reads; `lookOf` is for the accuracy table, whose rows carry a
 // speaker id and nothing else.

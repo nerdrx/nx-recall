@@ -464,7 +464,7 @@ pub struct TruthStats {
     pub linked: AtomicU64,
     pub enrolled: AtomicU64,
     pub closed_stale: AtomicU64,
-    /// 0.11.9: turns named from a `single` verdict that the ladder left blank.
+    /// 0.12.0: turns named from a `single` verdict that the ladder left blank.
     pub retro_labelled: AtomicU64,
 }
 
@@ -631,7 +631,7 @@ pub fn truth_link_json(
     })
 }
 
-// ---- 0.11.9: retro-labelling from ground truth -----------------------------
+// ---- 0.12.0: retro-labelling from ground truth -----------------------------
 
 /// How many rows one `truth label` pass will move at most.
 ///
@@ -792,7 +792,7 @@ fn label_from_truth_pass(store: &Arc<std::sync::Mutex<Store>>, stats: &TruthStat
     }
 }
 
-// ---- end 0.11.9 ------------------------------------------------------------
+// ---- end 0.12.0 ------------------------------------------------------------
 
 /// Enrol the cleanest of a linked user's turns into that voice's bank.
 ///
@@ -1044,7 +1044,7 @@ pub fn run(
                 if let Err(e) = link_batch(&store, &bus, &stats) {
                     warn!("the ground-truth auto-linker failed: {e:#}");
                 }
-                // ---- 0.11.9: retro-labelling -----------------------------
+                // ---- 0.12.0: retro-labelling -----------------------------
                 // After the linker and never before it: the pass can only act
                 // on users that are already linked, so running it first would
                 // do nothing on the evening a link is made and leave the
@@ -1052,7 +1052,7 @@ pub fn run(
                 if let Err(e) = label_from_truth_pass(&store, &stats) {
                     warn!("the ground-truth retro-labelling pass failed: {e:#}");
                 }
-                // ---- end 0.11.9 ------------------------------------------
+                // ---- end 0.12.0 ------------------------------------------
                 if cfg.enrol
                     && let Err(e) = enrol_batch(&store, &control, &cfg, &identity, &stats, &stop)
                 {
@@ -1181,7 +1181,7 @@ pub fn summary(store: &Store, identity: &IdentityConfig, cfg: &TruthConfig) -> R
 
     Ok(json!({
         "segments_labelled": labelled,
-        // ---- 0.11.9: the two queues, said out loud ----
+        // ---- 0.12.0: the two queues, said out loud ----
         //
         // §29 went looking for a bug in `enrol_batch` and found an off switch:
         // `segments.truth_enrol_ns` was NULL on all 1,461 `single` rows because
@@ -1201,7 +1201,7 @@ pub fn summary(store: &Store, identity: &IdentityConfig, cfg: &TruthConfig) -> R
                 .segments_for_truth_label(store.you_speaker_id()?, usize::MAX)?
                 .len() as i64,
         },
-        // ---- end 0.11.9 ----
+        // ---- end 0.12.0 ----
         "single": count_of(truth_verdict::SINGLE),
         "overlap": count_of(truth_verdict::OVERLAP),
         "partial": count_of(truth_verdict::PARTIAL),
@@ -1699,7 +1699,7 @@ mod tests {
         assert_eq!(last.map(|(_, n)| n), Some(seen));
     }
 
-    // ---- 0.11.9: retro-labelling from ground truth -------------------------
+    // ---- 0.12.0: retro-labelling from ground truth -------------------------
 
     /// A store with one linked user and one unlinked one, four `single` turns
     /// each, and every turn left unlabelled by the ladder.

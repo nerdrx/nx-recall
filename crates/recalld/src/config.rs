@@ -619,22 +619,52 @@ pub struct AsrConfig {
     /// Share of the identifier's windows that must agree before a turn is
     /// handed to a CJK decoder.
     ///
-    /// **Measured** (`spike/lid_bench.py`, 200 FLEURS utterances per
-    /// language): whisper-tiny heard **zero of 400** German and English
-    /// utterances as Japanese, at full length, at 3 s and at 1.5 s. With
-    /// `lid_windows = 1` the confidence is always 1.0, so at the shipped
-    /// defaults this is a "did it say Japanese at all" test — which is what
-    /// the measurement supports and what the operating point was chosen to be.
-    /// Both halves of the knob are here for a machine that hears something
-    /// that corpus did not.
+    /// **1.0 — all of them.** With `lid_windows = 3` (0.12.0, below) that is
+    /// the whole of the vote: a reading has to survive being asked about three
+    /// different parts of the same turn. It was also 1.0 when `lid_windows`
+    /// was 1, where it meant "did it name the language at all"; the number did
+    /// not move and what it buys did.
     pub lid_min_confidence: f32,
     /// How many windows of a turn the identifier is asked about.
     ///
-    /// One, and that is the measurement rather than a shrug: at zero false
-    /// positives in 400 negatives there is nothing for a second window to rule
-    /// out, and a three-window vote would triple the only cost this feature
-    /// has — 0.019 RTF at 3 s, which is what makes asking on every unclear
-    /// turn affordable at all.
+    /// **Three since 0.12.0, and it was one until then.** The old default's
+    /// note said "at zero false positives in 400 negatives there is nothing
+    /// for a second window to rule out", and the FLEURS number behind it
+    /// (`spike/lid_bench.py`) is not in dispute — **zero of 400** German and
+    /// English utterances were heard as Japanese, at any length. What was
+    /// wrong is the inference. FLEURS is read news; a lobby is people saying
+    /// "Mm-hmm." at each other, and whisper-tiny given a grunt does not
+    /// abstain, it picks.
+    ///
+    /// Measured on this install's own rows — the 45 the route rewrote plus 200
+    /// German/English back-channels from the same voice, through the real
+    /// identifier and the real decoders, with the declaration guard
+    /// deliberately off so the question is about the identifier alone
+    /// (`examples/lang_route_bench.rs`, FINDINGS §31):
+    ///
+    /// | windows | floor | asked | kept | false positives | rate |
+    /// |--------:|------:|------:|-----:|----------------:|-----:|
+    /// | 1       | 1.0 s | 94    | 9    | 7               | 7.45% |
+    /// | 1       | 1.5 s | 59    | 9    | 7               | 11.86% |
+    /// | **3**   | **1.0 s** | **94** | **2** | **1**      | **1.06%** |
+    /// | 3       | 1.5 s | 59    | 2    | 1               | 1.69% |
+    ///
+    /// Against the ≤ 1% gate §22 and §28 shipped under, one window misses by
+    /// seven times and three windows lands on it. The floor moves nothing in
+    /// either arm — it drops rows out of the denominator and none out of the
+    /// numerator, which is §30's finding restated on live rows.
+    ///
+    /// The cost objection the old note raised is real and is answered by the
+    /// other half of the round rather than argued away: three passes at RTF
+    /// 0.027 each is three times more per turn, over a population the new
+    /// [`crate::asr_cjk::pre_route`] guards cut from 245 turns to **one** on
+    /// this same data. Tripling the price of a question nobody is asking any
+    /// more is affordable.
+    ///
+    /// What this costs is recall, and honestly: of the two rows on this
+    /// install that look like genuine Japanese, three windows keeps one. Two
+    /// rows are not a corpus, and FLEURS recall at three windows was not
+    /// re-measured — see FINDINGS §31's "what is NOT measured".
     pub lid_windows: usize,
     // ---- the other languages (0.11.8, `crate::polyglot`) -------------------
     /// How long a turn must be before the spoken-language identifier is asked
@@ -703,7 +733,7 @@ pub struct AsrConfig {
     /// unmeasured rather than unavailable.
     pub polyglot_languages: Vec<String>,
     // ---- end 0.11.6 ---------------------------------------------------------
-    // ---- 0.11.9, the archive sweep (`crate::sweep`) -------------------------
+    // ---- 0.12.0, the archive sweep (`crate::sweep`) -------------------------
     /// Walk the rows captured before the routes existed — and before 0.11.8
     /// lowered the floor — asking the identifier about each one once.
     ///
@@ -737,18 +767,20 @@ pub struct AsrConfig {
     pub lang_sweep_min_s: f32,
     /// How many identifier windows the **sweep** asks for, at least.
     ///
-    /// **3**, against the live path's 1, and this is the narrowing that
-    /// actually carries the round (FINDINGS §30). `crate::lid` documents
-    /// `lid_windows` as "the knob a machine that hears something the corpus did
-    /// not can turn", and this archive is exactly that machine: at one window
-    /// the sweep rewrites de/en-declared rows at 2.3%, over the 1% gate the
-    /// routes shipped under. Three overlapping windows at
-    /// `lid_min_confidence = 1.0` means a reading has to survive being asked
-    /// about three different parts of the same turn.
+    /// **3**, and since 0.12.0 that is no longer a number the sweep has to
+    /// itself: the live path moved to three windows on the same evidence
+    /// (FINDINGS §31), so this knob now says "and never fewer than the live
+    /// path" rather than "and unlike the live path".
     ///
-    /// It costs three model passes instead of one, at RTF 0.027 — which is a
-    /// price a nightly batch can pay and a live turn cannot, and is the whole
-    /// reason this is a separate number rather than a change to `lid_windows`.
+    /// It stays as its own field anyway, and not out of sentiment. The
+    /// narrowing is one-directional (`crate::sweep::routing_cfg`): an operator
+    /// who lowers `[asr].lid_windows` for a machine that is short of cores
+    /// lowers it for the live turn they are watching, and must not thereby
+    /// lower it for four hundred archive rows decided at 04:00 by nobody.
+    ///
+    /// The measurement that first set it (FINDINGS §30): at one window the
+    /// sweep rewrote de/en-declared rows at 2.3% against a 1% gate; three
+    /// overlapping windows that must all agree took that to 0.97%.
     pub lang_sweep_windows: usize,
     /// Rows the sweep will *spend a model on* in one nightly run.
     ///
@@ -786,7 +818,7 @@ pub struct AsrConfig {
     /// --apply --redecode` does for one run, and should be preceded by reading
     /// what `recalld lang sweep` says it would rewrite.
     pub lang_sweep_redecode: bool,
-    // ---- end 0.11.9 ---------------------------------------------------------
+    // ---- end 0.12.0 ---------------------------------------------------------
     // ---- 0.11.0, partial turns (`crate::partial`) --------------------------
     /// Publish provisional `partial` events while a turn is still open, so a
     /// caption bar can show words before the person has stopped talking.
@@ -829,7 +861,9 @@ impl Default for AsrConfig {
             japanese: true,
             cjk: true,
             lid_min_confidence: 1.0,
-            lid_windows: 1,
+            // 0.12.0: was 1, on a FLEURS measurement that did not transfer to
+            // a lobby. See the note above.
+            lid_windows: 3,
             // ---- the other languages (0.11.8) -----------------------------
             lid_min_s: 1.0,
             polyglot: true,
@@ -838,13 +872,13 @@ impl Default for AsrConfig {
                 .map(|l| l.to_string())
                 .collect(),
             // ---- end 0.11.6 -----------------------------------------------
-            // ---- 0.11.9, the archive sweep --------------------------------
+            // ---- 0.12.0, the archive sweep --------------------------------
             lang_sweep: true,
             lang_sweep_min_s: 1.5,
             lang_sweep_windows: 3,
             lang_sweep_rows_per_run: 400,
             lang_sweep_redecode: false,
-            // ---- end 0.11.9 -----------------------------------------------
+            // ---- end 0.12.0 -----------------------------------------------
             // ---- 0.11.0, partial turns ------------------------------------
             // OFF, and the reason is measured (FINDINGS §20). Convergence
             // passed handsomely — 96.4% of the last partial's words survive

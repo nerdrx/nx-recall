@@ -109,6 +109,35 @@
 //! identifier still chooses the *decoder*; the writing system chooses the tag,
 //! and it cannot be wrong about a sentence in a script only one of them uses.
 //!
+//! ## What this got wrong, and the three guards that answer it (0.12.0)
+//!
+//! Everything above is true and none of it was enough. Measured on the user's
+//! own database a day after 0.12.0 (FINDINGS §31), this route had rewritten
+//! **45 archive rows** and **two of them are right**. 37 belong to one voice:
+//! the user's own microphone, declared `["de","en"]`, saying "Mm-hmm." and
+//! getting `うん` back.
+//!
+//! Each of the three failures is a place where a rule that is correct about
+//! FLEURS is wrong about a room:
+//!
+//! 1. [`pre_route`] short-circuited only on a **sole** declared language, so a
+//!    voice that declared two fell through to the identifier on every
+//!    unreadable turn. A person who names their languages has answered the
+//!    question — two answers are still an answer.
+//! 2. A back-channel is `Unclear` to every text rule in this daemon, so "Uh"
+//!    and "Okay, yeah." reached the identifier all evening. Re-decoding a grunt
+//!    has no value even when the language is right; see [`MIN_CONTENT_WORDS`].
+//! 3. The script test in [`judge`] is exact and it is not *evidence*: `うん`,
+//!    `没` and `フフフフフフフ` are all written in a script only these three
+//!    languages use. See [`weak_output`].
+//!
+//! And [`crate::lid`]'s window vote became the live default on the same data:
+//! one window keeps seven false positives on these rows where three keeps one.
+//! That is affordable precisely because guards 1 and 2 took the turns asked
+//! about at all from 245 to one.
+//!
+//! `crate::unroute` is what happens to the rows written before any of this.
+//!
 //! ## The tags SenseVoice emits
 //!
 //! SenseVoice does not produce a transcript, it produces a transcript wrapped
@@ -228,10 +257,40 @@ pub enum Pre {
     Nothing,
 }
 
+/// Content words a transcript must have before the identifier is asked about
+/// it at all (0.12.0, FINDINGS §31).
+///
+/// **Two**, and the number is bounded from both ends by measurement rather than
+/// chosen. From below: 22 of the 45 rows the route wrongly rewrote on this
+/// install had **zero** content words — "Mm-hmm.", "Uh", "Okay, yeah." — and
+/// another six had one. From above: the three rows this whole feature exists
+/// for are "Sima Sen Okenki Deska." (4), "Wanky Daska." (2) and "During
+/// apartments." (2), so three would have thrown away the founding cases. Two is
+/// the only value that removes the back-channels and keeps them.
+///
+/// It is also the bar [`crate::lang::word_count`] already sets for minting a
+/// voice, for the same reason written down in DESIGN §5: a grunt is not a
+/// voice, and — this round's addition — a grunt is not a sentence in another
+/// language either.
+pub const MIN_CONTENT_WORDS: usize = 2;
+
+/// Does *anything* in this daemon re-decode `tag` off a reading of the audio?
+///
+/// The union of the two audio routes, because [`pre_route`] gates both of them:
+/// [`crate::asr_cjk`]'s three, and whatever `[asr].polyglot_languages` has
+/// turned on for [`crate::polyglot`]. A caller that asked only about this
+/// module's three would let a turn through to LID that only the other route
+/// could ever act on — and, worse, would refuse one it could.
+fn routed_anywhere(tag: &str, cfg: &AsrConfig) -> bool {
+    CJK.contains(&tag) || crate::polyglot::routable(tag, cfg)
+}
+
 /// Step one: is this turn worth asking about, and does it even need asking?
 ///
 /// `declared` is the speaker's language tags, `text` the transcript the live
-/// decoder produced.
+/// decoder produced, `cfg` the routes' config — read for
+/// `[asr].polyglot_languages`, which is half of what "a language we could act
+/// on" means (see [`routed_anywhere`]).
 ///
 /// The rule, in order:
 ///
@@ -243,19 +302,41 @@ pub enum Pre {
 ///    business ([`crate::analysis::Analyzer::correct_language`]) and is left
 ///    alone. Deciding a row twice is how two features start fighting over one
 ///    column.
-/// 3. A transcript that already reads as **something** — German, English, or
+/// 3. **A declared set containing nothing either route can decode is a
+///    declaration** (0.12.0). This is rule 2 stated for the case it was
+///    written too narrowly for, and the gap was expensive: the user's own
+///    microphone voice is declared `["de", "en"]`, `sole_language` says `None`
+///    of two tags, and every unreadable grunt from it fell through to `AskLid`.
+///    37 of the 45 rows the route wrongly rewrote on this install are that
+///    voice (FINDINGS §31). A person who names their languages has answered the
+///    question this route exists to ask; two answers are still an answer.
+/// 4. A transcript that already reads as **something** — German, English, or
 ///    any script or stopword majority [`crate::lang::guess_other`] is
 ///    confident about, these three included — is not the transliteration
 ///    failure. Nothing to do.
-/// 4. What is left is `Unclear` or `Empty`: words nobody can read, or no words
-///    at all. Both are what a CJK turn looks like coming out of a decoder that
-///    cannot spell it. Ask.
-pub fn pre_route(declared: Option<&Vec<String>>, text: Option<&str>) -> Pre {
+/// 5. **A turn that is nothing but back-channel is not worth a decoder**
+///    (0.12.0). Fewer than [`MIN_CONTENT_WORDS`] words that are not in
+///    [`crate::lang::FILLERS`] and the row is left alone: re-decoding a grunt
+///    has no value even when the language is right, and "Mm-hmm." is
+///    `Unclear` to every text rule this daemon has, so without this guard it
+///    reaches the identifier on every single turn of every evening.
+/// 6. What is left is `Unclear` or `Empty` with real words behind it, or **no
+///    words at all**. Both are what a CJK turn looks like coming out of a
+///    decoder that cannot spell it — an empty transcript deliberately still
+///    asks, because a decoder that gave up entirely is exactly the turn worth
+///    re-reading, and the two genuine Japanese rows on this install
+///    ("すいません", "聞いてみますかねちょっと") are both of that shape.
+pub fn pre_route(declared: Option<&Vec<String>>, text: Option<&str>, cfg: &AsrConfig) -> Pre {
     if let Some(sole) = lang::sole_language(declared) {
         return match canonical(sole) {
             Some(tag) => Pre::Direct(tag),
             None => Pre::Nothing,
         };
+    }
+    // Rule 3. `parse_languages` normalises an empty array to `None`, so a
+    // `Some` here is always a real declaration.
+    if declared.is_some_and(|tags| !tags.iter().any(|t| routed_anywhere(t, cfg))) {
+        return Pre::Nothing;
     }
     let text = text.unwrap_or("");
     // No words at all is a fair question for the identifier — the decode that
@@ -270,6 +351,10 @@ pub fn pre_route(declared: Option<&Vec<String>>, text: Option<&str>) -> Pre {
             // fix.
             _ if lang::guess_other(text).is_some_and(|g| g.confident) => return Pre::Nothing,
             _ => {}
+        }
+        // Rule 5.
+        if lang::content_word_count(text) < MIN_CONTENT_WORDS {
+            return Pre::Nothing;
         }
     }
     Pre::AskLid
@@ -313,12 +398,15 @@ pub enum Rerouted {
     /// No decoder for this language is installed, or its switch is off. Said
     /// once per daemon, not per turn.
     Unavailable,
-    /// It ran and the answer failed a guard — empty, or in a script none of
-    /// the languages this decoder speaks is written in, which means it did not
-    /// decode what it was asked for whatever it decoded.
+    /// It ran and the answer failed a guard — empty, in a script none of the
+    /// languages this decoder speaks is written in, or (0.12.0) not enough of
+    /// an answer to be evidence of anything.
     Rejected {
         words: usize,
         script: Option<String>,
+        /// Which guard, in words, for the log line and for a test that wants to
+        /// assert *why* rather than merely that.
+        why: &'static str,
     },
 }
 
@@ -370,7 +458,42 @@ pub fn strip_tags(text: &str) -> String {
 /// Japanese and Chinese have none, so a whole sentence is one "word" and a
 /// two-word floor would reject every correct answer those decoders can give.
 /// The bar it replaces the word count with is stricter, not looser.
-pub fn judge(raw: &str, decoder: Decoder) -> Result<(String, &'static str), Rerouted> {
+///
+/// ## The script test is necessary and it is not sufficient (0.12.0)
+///
+/// Everything above was written when the only thing the script test had to rule
+/// out was a German transcript, and against that it is exact. What it is not is
+/// *evidence*, and the 45 rows this route rewrote on a real install
+/// (FINDINGS §31) are what that distinction costs: `うん`, `没`, `嗯嗯`,
+/// `龙龙龙龙` and `ok看嗯` are all written in a script only the target languages
+/// use, so all of them won. A back-channel decoded as a back-channel in the
+/// wrong language is a wrong transcript with a perfect script test behind it.
+///
+/// So four more tests, all on the decoder's own output and all measured on
+/// those rows:
+///
+/// * **[`MIN_OUTPUT_CHARS`] letters, and at least [`MIN_CHARS_PER_S`] of them
+///   per second of audio.** A 5.3 s turn that comes back as two characters did
+///   not have five seconds of Japanese in it.
+/// * **Not a repetition loop** — [`MIN_DISTINCT_SHARE`] of the letters must be
+///   distinct. `フフフフフフフ` and `没没没不是说说说说…` are what these decoders
+///   do with noise.
+/// * **Not pure interjection** in the target script ([`INTERJECTIONS`]): the
+///   same rule [`crate::lang::FILLERS`] applies to the *input*, applied to the
+///   output, because a route that turns "Mm-hmm." into `うん` has translated a
+///   grunt rather than recovered a sentence.
+/// * **One writing system, and not mostly Latin.** `오빠どなか` is hangul and
+///   kana in five characters and is not a sentence in either; `そ be丈夫` and
+///   `ok看嗯` are the same failure with the Latin alphabet.
+///
+/// There is no decoder confidence to lean on instead: sherpa's offline result
+/// struct carries `text`, `lang`, `emotion` and `event` and no score at all —
+/// the same absence [`crate::lid`] works around with a window vote.
+pub fn judge(
+    raw: &str,
+    decoder: Decoder,
+    duration_s: f32,
+) -> Result<(String, &'static str), Rerouted> {
     // The tags first: everything after this reads a string, and a `<|ja|>` left
     // on the front is Latin text in front of a language test.
     let untagged = strip_tags(raw);
@@ -383,13 +506,147 @@ pub fn judge(raw: &str, decoder: Decoder) -> Result<(String, &'static str), Rero
     // Reported, not tested against a floor — see the note above. It is in the
     // rejection so a log line can say what came back instead.
     let words = normalise_words(&text).len();
-    match script.filter(|tag| decoder.writes().contains(tag)) {
-        Some(tag) if !text.trim().is_empty() => Ok((text, tag)),
-        _ => Err(Rerouted::Rejected {
+    let reject = |why: &'static str| {
+        Err(Rerouted::Rejected {
             words,
             script: script.map(str::to_string),
-        }),
+            why,
+        })
+    };
+    let Some(tag) = script.filter(|tag| decoder.writes().contains(tag)) else {
+        return reject("not a script this decoder writes");
+    };
+    if text.trim().is_empty() {
+        return reject("nothing came back");
     }
+    if let Some(why) = weak_output(&text, duration_s) {
+        return reject(why);
+    }
+    Ok((text, tag))
+}
+
+/// Letters a re-decode must carry before it is evidence of anything.
+///
+/// **Four.** Of the 45 wrongly rewritten rows, 17 are under it — every `うん`,
+/// `没`, `嗯嗯`, `啊 嗯`, `哎呀` and `あっ` on the list — and the two that look
+/// genuine (`すいません`, 5, and `聞いてみますかねちょっと`, 12) are both clear of
+/// it. It is an absolute floor under the rate below, so that a 1.5 s turn
+/// cannot buy its way past on brevity.
+pub const MIN_OUTPUT_CHARS: usize = 4;
+
+/// …and per second of the audio it claims to be a transcript of.
+///
+/// **1.0.** Japanese and Chinese are written at 5–8 characters a second in the
+/// rows here that are right; the floor is set five times lower than that
+/// because it is guarding against *silence being transcribed*, not against
+/// terseness. It is what catches the long ones the absolute floor cannot:
+/// `うん` over 5.26 s, `そうしました` over 6.67 s.
+pub const MIN_CHARS_PER_S: f32 = 1.0;
+
+/// Share of a re-decode's letters that must be distinct, at
+/// [`MIN_OUTPUT_CHARS`] or more.
+///
+/// **Above one half.** A decoder given noise in a language it speaks emits the
+/// same character over and over — `フフフフフフフ` (1 distinct in 7),
+/// `没没没不是说说说说说说说说说说说没没没没没` (4 in 21), `あまたタ待タ待タ待タ`
+/// (5 in 10) — and a real sentence essentially never does. Measured on these
+/// rows the rule costs nothing: both genuine transcripts are 100% distinct.
+pub const MIN_DISTINCT_SHARE: f32 = 0.5;
+
+/// …and the share of letters that may be Latin before the answer reads as two
+/// decoders arguing rather than one transcript.
+///
+/// **One third.** Japanese does write Latin — `PC`, `OK` — so this is a
+/// dominance test and not a presence one, the same shape and the same reasoning
+/// as [`crate::lang::guess_other`]'s script rule.
+pub const MAX_LATIN_SHARE: f32 = 1.0 / 3.0;
+
+/// Back-channels in the three target scripts: the output-side twin of
+/// [`crate::lang::FILLERS`], and built the same way — off the transcripts the
+/// route actually produced.
+///
+/// Matched whole, over the whole output with its punctuation and spaces
+/// removed, so `うん` is refused and `うんそれ` is not.
+pub const INTERJECTIONS: &[&str] = &[
+    "ん",
+    "うん",
+    "ううん",
+    "うーん",
+    "うんうん",
+    "ええ",
+    "えー",
+    "えっ",
+    "あっ",
+    "あー",
+    "あぁ",
+    "おー",
+    "おお",
+    "はー",
+    "ふー",
+    "へー",
+    "嗯",
+    "嗯嗯",
+    "嗯嗯嗯",
+    "啊",
+    "啊啊",
+    "哦",
+    "呃",
+    "哎",
+    "哎呀",
+    "唉",
+    "诶",
+    "어",
+    "음",
+    "아",
+    "으음",
+];
+
+/// Why this re-decode is not evidence, or `None` when it is.
+///
+/// Pure and separate from [`judge`] for [`judge`]'s own reason: the whole rule
+/// can then be run over a table of strings — which is exactly what
+/// `examples/lang_route_bench.rs` does over this install's 45 rows — without a
+/// decoder in the process.
+pub fn weak_output(text: &str, duration_s: f32) -> Option<&'static str> {
+    let letters: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
+    let n = letters.len();
+    if n < MIN_OUTPUT_CHARS {
+        return Some("too few characters to be a sentence");
+    }
+    if (n as f32) < MIN_CHARS_PER_S * duration_s.max(0.0) {
+        return Some("too little text for the length of the audio");
+    }
+    let distinct = {
+        let mut seen: Vec<char> = letters.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        seen.len()
+    };
+    if (distinct as f32) <= MIN_DISTINCT_SHARE * n as f32 {
+        return Some("a repetition loop");
+    }
+    let bare: String = letters.iter().collect();
+    if INTERJECTIONS.contains(&bare.as_str()) {
+        return Some("an interjection, in the right script");
+    }
+    let latin = letters
+        .iter()
+        .filter(|c| matches!(**c as u32, 0x41..=0x5A | 0x61..=0x7A | 0xC0..=0x24F))
+        .count();
+    if (latin as f32) > MAX_LATIN_SHARE * n as f32 {
+        return Some("mostly Latin letters");
+    }
+    let (kana, hangul) = letters
+        .iter()
+        .fold((0usize, 0usize), |(k, h), c| match *c as u32 {
+            0x3040..=0x30FF | 0x31F0..=0x31FF | 0xFF66..=0xFF9D => (k + 1, h),
+            0x1100..=0x11FF | 0x3130..=0x318F | 0xAC00..=0xD7A3 => (k, h + 1),
+            _ => (k, h),
+        });
+    if kana > 0 && hangul > 0 {
+        return Some("two writing systems at once");
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -720,7 +977,7 @@ impl Cjk {
             }
             None => return Rerouted::Unavailable,
         };
-        match judge(&raw, decoder) {
+        match judge(&raw, decoder, duration_s) {
             Ok((text, tag)) => Rerouted::Replaced {
                 text,
                 model_id,
@@ -807,7 +1064,7 @@ pub fn route_segment(
         return Ok(Checked::default());
     }
     let mut checked = Checked::default();
-    let (want, via) = match pre_route(declared, text) {
+    let (want, via) = match pre_route(declared, text, asr_cfg) {
         Pre::Nothing => return Ok(checked),
         Pre::Direct(lang) => (lang, "declared"),
         Pre::AskLid => {
@@ -1054,58 +1311,62 @@ mod tests {
 
     #[test]
     fn a_speaker_declared_one_of_the_three_goes_straight_to_its_decoder() {
+        let cfg = AsrConfig::default();
         // No LID call: a declaration outranks a reading of one turn's audio,
         // and asking would cost a model pass to be told what we were told.
         assert_eq!(
-            pre_route(Some(&tags(&["ja"])), Some("Sima Sen Okenki Deska.")),
+            pre_route(Some(&tags(&["ja"])), Some("Sima Sen Okenki Deska."), &cfg),
             Pre::Direct(JA)
         );
         assert_eq!(
-            pre_route(Some(&tags(&["ko"])), Some("mumble")),
+            pre_route(Some(&tags(&["ko"])), Some("mumble"), &cfg),
             Pre::Direct(KO)
         );
         assert_eq!(
-            pre_route(Some(&tags(&["zh"])), Some("mumble")),
+            pre_route(Some(&tags(&["zh"])), Some("mumble"), &cfg),
             Pre::Direct(ZH)
         );
         // Even when the transliteration happens to read as English: the tag is
         // the whole point of the direct path.
         assert_eq!(
-            pre_route(Some(&tags(&["ja"])), Some("i think that is so")),
+            pre_route(Some(&tags(&["ja"])), Some("i think that is so"), &cfg),
             Pre::Direct(JA)
         );
     }
 
     #[test]
     fn a_bilingual_speaker_is_not_pinned_to_anything() {
+        let cfg = AsrConfig::default();
         // A Japanese speaker's English turn is not a mistake, so two tags mean
         // the same as none: fall through to the audio.
         assert_eq!(
-            pre_route(Some(&tags(&["en", "ja"])), Some("mumble")),
+            pre_route(Some(&tags(&["en", "ja"])), Some("mumble mumble"), &cfg),
             Pre::AskLid
         );
         assert_eq!(
-            pre_route(Some(&tags(&["ko", "zh"])), Some("mumble")),
+            pre_route(Some(&tags(&["ko", "zh"])), Some("mumble mumble"), &cfg),
             Pre::AskLid
         );
     }
 
     #[test]
     fn a_speaker_declared_something_else_is_the_other_features_business() {
+        let cfg = AsrConfig::default();
         // `correct_language` owns this row. Deciding it twice is how two
         // features start fighting over one column.
         assert_eq!(
-            pre_route(Some(&tags(&["de"])), Some("Sima Sen Okenki Deska.")),
+            pre_route(Some(&tags(&["de"])), Some("Sima Sen Okenki Deska."), &cfg),
             Pre::Nothing
         );
         assert_eq!(
-            pre_route(Some(&tags(&["en"])), Some("mumble")),
+            pre_route(Some(&tags(&["en"])), Some("mumble"), &cfg),
             Pre::Nothing
         );
     }
 
     #[test]
     fn the_transliteration_failure_is_what_reaches_the_identifier() {
+        let cfg = AsrConfig::default();
         // THE case. Latin letters, English-shaped, no German stopwords, no
         // kana for the script rule — `Unclear`, and invisible to every text
         // mechanism this daemon had before 0.11.0.
@@ -1114,42 +1375,54 @@ mod tests {
             lang::Lang::Unclear
         );
         assert_eq!(lang::guess_other("Sima Sen Okenki Deska."), None);
-        assert_eq!(pre_route(None, Some("Sima Sen Okenki Deska.")), Pre::AskLid);
+        assert_eq!(
+            pre_route(None, Some("Sima Sen Okenki Deska."), &cfg),
+            Pre::AskLid
+        );
         // No words at all is the same failure with the volume turned down.
-        assert_eq!(pre_route(None, None), Pre::AskLid);
-        assert_eq!(pre_route(None, Some("   ")), Pre::AskLid);
+        assert_eq!(pre_route(None, None, &cfg), Pre::AskLid);
+        assert_eq!(pre_route(None, Some("   "), &cfg), Pre::AskLid);
     }
 
     #[test]
     fn clear_german_text_never_costs_a_lid_call() {
+        let cfg = AsrConfig::default();
         // The cost this whole two-step split exists to avoid: 20 ms per turn
         // on an evening of German that was never going to be Japanese.
         assert_eq!(
-            pre_route(None, Some("ich glaube das ist der einzige weg")),
+            pre_route(None, Some("ich glaube das ist der einzige weg"), &cfg),
             Pre::Nothing
         );
         assert_eq!(
-            pre_route(None, Some("i think that is the only way")),
+            pre_route(None, Some("i think that is the only way"), &cfg),
             Pre::Nothing
         );
     }
 
     #[test]
     fn a_transcript_that_already_reads_as_something_is_left_alone() {
+        let cfg = AsrConfig::default();
         // Kana, hangul or Han in the transcript means some decoder already got
         // it right.
         assert_eq!(
-            pre_route(None, Some("すみません、お元気ですか")),
+            pre_route(None, Some("すみません、お元気ですか"), &cfg),
             Pre::Nothing
         );
-        assert_eq!(pre_route(None, Some("안녕하세요 반갑습니다")), Pre::Nothing);
         assert_eq!(
-            pre_route(None, Some("这是区分某些动词的方法")),
+            pre_route(None, Some("안녕하세요 반갑습니다"), &cfg),
+            Pre::Nothing
+        );
+        assert_eq!(
+            pre_route(None, Some("这是区分某些动词的方法"), &cfg),
             Pre::Nothing
         );
         // And a confident third-language guess is a real reading of the words.
         assert_eq!(
-            pre_route(None, Some("le la les des une est ne pas que qui pour dans")),
+            pre_route(
+                None,
+                Some("le la les des une est ne pas que qui pour dans"),
+                &cfg
+            ),
             Pre::Nothing
         );
     }
@@ -1213,7 +1486,7 @@ mod tests {
         assert_eq!(strip_tags("元気ですか"), "元気ですか");
         // And a stripped string that is nothing but tags is empty, which the
         // judge rejects rather than storing.
-        assert!(judge("<|en|><|NEUTRAL|><|Speech|>", Decoder::SenseVoice).is_err());
+        assert!(judge("<|en|><|NEUTRAL|><|Speech|>", Decoder::SenseVoice, 3.0).is_err());
     }
 
     #[test]
@@ -1222,40 +1495,44 @@ mod tests {
         // is cheap: whatever either decoder makes of German audio, it is not
         // kana, hangul or Han, so it overwrites nothing.
         assert!(matches!(
-            judge("ich glaube das schon", Decoder::Japanese),
+            judge("ich glaube das schon", Decoder::Japanese, 3.0),
             Err(Rerouted::Rejected { .. })
         ));
-        assert!(judge("ich glaube das schon", Decoder::SenseVoice).is_err());
-        assert!(judge("", Decoder::Japanese).is_err());
-        assert!(judge("   ...  ", Decoder::SenseVoice).is_err());
+        assert!(judge("ich glaube das schon", Decoder::SenseVoice, 3.0).is_err());
+        assert!(judge("", Decoder::Japanese, 3.0).is_err());
+        assert!(judge("   ...  ", Decoder::SenseVoice, 3.0).is_err());
         // Kanji with no kana is not proof of Japanese — it is the script
         // Chinese writes in too, which is exactly why `guess_other` checks
         // kana by presence rather than Han by dominance. The Parakeet, which
         // speaks only Japanese, must not have that accepted as Japanese.
-        assert!(judge("技術決定論", Decoder::Japanese).is_err());
+        assert!(judge("技術決定論", Decoder::Japanese, 3.0).is_err());
         // A caption is stripped before anything judges it, the same as the
         // German arbiter — and what is left is nothing.
-        assert!(judge("(music)", Decoder::Japanese).is_err());
+        assert!(judge("(music)", Decoder::Japanese, 3.0).is_err());
 
         // What passes, and with which tag.
         assert_eq!(
-            judge("すみません、お元気ですか", Decoder::Japanese).unwrap(),
+            judge("すみません、お元気ですか", Decoder::Japanese, 3.0).unwrap(),
             ("すみません、お元気ですか".to_string(), JA)
         );
         assert_eq!(
-            judge("[音楽] 元気ですか", Decoder::Japanese).unwrap(),
+            judge("[音楽] 元気ですか", Decoder::Japanese, 3.0).unwrap(),
             ("元気ですか".to_string(), JA)
         );
         assert_eq!(
-            judge("안녕하세요 반갑습니다", Decoder::SenseVoice)
+            judge("안녕하세요 반갑습니다", Decoder::SenseVoice, 3.0)
                 .unwrap()
                 .1,
             KO
         );
         assert_eq!(
-            judge("这是区分某些动词和宾语的一个重要方法", Decoder::SenseVoice)
-                .unwrap()
-                .1,
+            judge(
+                "这是区分某些动词和宾语的一个重要方法",
+                Decoder::SenseVoice,
+                3.0
+            )
+            .unwrap()
+            .1,
             ZH
         );
     }
@@ -1268,7 +1545,7 @@ mod tests {
         // writes kana, and reading the script recovers both the transcript and
         // the right tag where trusting the reading would have thrown away both.
         assert_eq!(
-            judge("すみません、お元気ですか", Decoder::SenseVoice)
+            judge("すみません、お元気ですか", Decoder::SenseVoice, 3.0)
                 .unwrap()
                 .1,
             JA,
@@ -1277,7 +1554,7 @@ mod tests {
         // The guard is not loosened by that: a language this decoder does not
         // write is still rejected however confidently the script reads.
         assert!(matches!(
-            judge("Здравствуйте как дела сегодня", Decoder::SenseVoice),
+            judge("Здравствуйте как дела сегодня", Decoder::SenseVoice, 3.0),
             Err(Rerouted::Rejected {
                 script: Some(_),
                 ..
@@ -1297,6 +1574,215 @@ mod tests {
         for tag in CJK {
             assert!(lang::KNOWN.contains(tag), "{tag} is routable but not KNOWN");
         }
+    }
+
+    // ---- 0.12.0: the lobby is not FLEURS (FINDINGS §31) -------------------
+
+    #[test]
+    fn a_voice_that_declared_two_languages_has_still_declared_them() {
+        // THE failure of this round, from the live database: speaker 26 is the
+        // user's own microphone, `languages = ["de","en"]`, and **37 of the 45
+        // rows this route wrongly rewrote are that voice**. `sole_language`
+        // answers `None` to two tags, so every unreadable grunt from the person
+        // whose languages we know fell through to the identifier.
+        let cfg = AsrConfig::default();
+        assert_eq!(
+            pre_route(Some(&tags(&["de", "en"])), Some("Mm-hmm."), &cfg),
+            Pre::Nothing
+        );
+        assert_eq!(
+            pre_route(
+                Some(&tags(&["de", "en"])),
+                Some("Yeah, Gott was zu trinken."),
+                &cfg
+            ),
+            Pre::Nothing,
+            "the row that became よしじゃあ。"
+        );
+        // …including with no words at all, which is the shape three of the
+        // wrong rewrites had.
+        assert_eq!(
+            pre_route(Some(&tags(&["de", "en"])), None, &cfg),
+            Pre::Nothing
+        );
+        // A declared set that DOES contain something a route can decode still
+        // falls through: a Japanese speaker's English turn is not a mistake and
+        // that reasoning is untouched.
+        assert_eq!(
+            pre_route(Some(&tags(&["en", "ja"])), Some("Sima Sen Deska"), &cfg),
+            Pre::AskLid
+        );
+        // And so does an undeclared voice — most of a lobby.
+        assert_eq!(
+            pre_route(None, Some("Sima Sen Okenki Deska."), &cfg),
+            Pre::AskLid
+        );
+        // The set is the union of BOTH routes, so a French-only allowlist and a
+        // French-only declaration still meet. `de`+`fr` is not a set a client
+        // can currently send (`lang::KNOWN` is narrower), which is exactly why
+        // the rule is written against the config rather than against `KNOWN` —
+        // the day `fr` becomes declarable it must not silently start refusing.
+        let de_fr = tags(&["de", "fr"]);
+        assert_eq!(
+            pre_route(Some(&de_fr), Some("mumble mumble"), &cfg),
+            Pre::AskLid
+        );
+        let no_french = AsrConfig {
+            polyglot_languages: vec![],
+            ..AsrConfig::default()
+        };
+        assert_eq!(
+            pre_route(Some(&de_fr), Some("mumble mumble"), &no_french),
+            Pre::Nothing
+        );
+    }
+
+    #[test]
+    fn a_back_channel_is_never_worth_a_second_decoder() {
+        // The 22 rows with no content word at all, verbatim from the live
+        // database, and what the route made of each.
+        let cfg = AsrConfig::default();
+        for grunt in [
+            "Mm-hmm.",     // → うん, four separate times
+            "Mm.",         // → うん
+            "Uh",          // → いただきります
+            "Uh.",         // → 啊 嗯
+            "Oh",          // → あっ
+            "Ah.",         // → なるほどあっ
+            "Yeah.",       // → 没
+            "Okay, yeah.", // → ok看嗯
+            "Right.",      // → 可以嗯
+            "Mm, mm-hmm.", // → 嗯嗯嗯来
+            "Uh yeah.",    // → 嗯嗯
+            "Um",          // → ガンとあたって
+        ] {
+            assert_eq!(
+                pre_route(None, Some(grunt), &cfg),
+                Pre::Nothing,
+                "{grunt:?} reached the identifier"
+            );
+            assert_eq!(lang::content_word_count(grunt), 0, "{grunt:?}");
+        }
+        // One content word is not two: "Uh special.", "Katastro.", "H",
+        // "Mm s.", "Uh Alter.", "Oh my ooh ooh oh okay." are the other six.
+        for thin in ["Uh special.", "Katastro.", "Oh my ooh ooh oh okay."] {
+            assert_eq!(pre_route(None, Some(thin), &cfg), Pre::Nothing, "{thin:?}");
+        }
+
+        // …and the bar is where it is because of what is on the other side of
+        // it. All three rows this feature was built for clear it, and two of
+        // them clear it exactly.
+        for founding in [
+            "Sima Sen Okenki Deska.",
+            "Wanky Daska.",
+            "During apartments.",
+        ] {
+            assert!(lang::content_word_count(founding) >= MIN_CONTENT_WORDS);
+            assert_eq!(
+                pre_route(None, Some(founding), &cfg),
+                Pre::AskLid,
+                "{founding:?}"
+            );
+        }
+        assert_eq!(lang::content_word_count("Wanky Daska."), 2);
+        assert_eq!(
+            MIN_CONTENT_WORDS, 2,
+            "three would have lost the founding rows"
+        );
+
+        // A turn with NO words is still asked about: a decoder that gave up
+        // entirely is the one worth re-reading, and both of this install's
+        // genuine Japanese rows are that shape.
+        assert_eq!(pre_route(None, None, &cfg), Pre::AskLid);
+        assert_eq!(pre_route(None, Some("  "), &cfg), Pre::AskLid);
+    }
+
+    #[test]
+    fn the_script_test_is_not_evidence_and_these_rows_are_why() {
+        // Every one of these is a real re-decode from the live database, in a
+        // script only the target languages use, which is all the 0.11.6 judge
+        // ever asked for. `(text, seconds)`.
+        let junk: &[(&str, f32)] = &[
+            ("うん", 1.78),  // ← "Mm-hmm."
+            ("うん", 5.26),  // ← "Mm-hmm.", over five seconds of audio
+            ("没", 2.38),    // ← "Yeah."
+            ("あっ", 2.26),  // ← "Oh"
+            ("嗯嗯", 1.68),  // ← "Uh yeah."
+            ("哎呀", 1.78),  // ← "Uh Alter."
+            ("啊 嗯", 1.81), // ← "Uh."
+            ("フフフフフフフ", 1.74),
+            ("没没没不是说说说说说说说说说说说没没没没没", 4.94),
+            ("あまたタ待タ待タ待タ。", 1.84),
+            ("ok看嗯", 3.89), // ← "Okay, yeah."
+            ("そ be丈夫", 1.74),
+            ("오빠どなか", 3.41), // ← "Hopp! Oh danke!", hangul AND kana
+            ("そうしました", 6.67),
+            ("可以嗯", 2.32), // ← "Right."
+        ];
+        for (text, duration_s) in junk {
+            assert!(
+                weak_output(text, *duration_s).is_some(),
+                "{text:?} at {duration_s} s passed as evidence"
+            );
+            // …and the whole judge refuses it, not merely the helper.
+            assert!(
+                judge(text, Decoder::SenseVoice, *duration_s).is_err(),
+                "{text:?}"
+            );
+        }
+
+        // The two rows on this install that look genuine survive all of it,
+        // and so does an ordinary sentence.
+        for (text, duration_s) in [
+            ("すいません", 3.79f32),
+            ("聞いてみますかねちょっと", 1.55),
+            ("すみません、お元気ですか", 3.0),
+        ] {
+            assert_eq!(weak_output(text, duration_s), None, "{text:?}");
+            assert!(
+                judge(text, Decoder::Japanese, duration_s).is_ok(),
+                "{text:?}"
+            );
+        }
+
+        // And the rejection says which guard, so a log line is worth reading.
+        assert!(matches!(
+            judge("うん", Decoder::Japanese, 5.26),
+            Err(Rerouted::Rejected {
+                why: "too few characters to be a sentence",
+                ..
+            })
+        ));
+        assert!(matches!(
+            judge("フフフフフフフ", Decoder::Japanese, 1.74),
+            Err(Rerouted::Rejected {
+                why: "a repetition loop",
+                ..
+            })
+        ));
+        assert!(matches!(
+            judge("そうしました", Decoder::Japanese, 6.67),
+            Err(Rerouted::Rejected {
+                why: "too little text for the length of the audio",
+                ..
+            })
+        ));
+        assert!(matches!(
+            judge("오빠どなか", Decoder::SenseVoice, 3.41),
+            Err(Rerouted::Rejected {
+                why: "two writing systems at once",
+                ..
+            })
+        ));
+        // A German re-decode is still refused by the script test first, which
+        // is the guard that has not changed.
+        assert!(matches!(
+            judge("ich glaube das schon", Decoder::Japanese, 3.0),
+            Err(Rerouted::Rejected {
+                why: "not a script this decoder writes",
+                ..
+            })
+        ));
     }
 
     /// Every model, on real audio, through the real FFI.
@@ -1372,8 +1858,8 @@ mod tests {
         let mut asr = CjkAsr::load(&model, 4).expect("loading the decoder");
         let text = asr.transcribe(&samples);
         assert!(!text.is_empty(), "the decoder returned nothing");
-        let (kept, heard) =
-            judge(&text, decoder).unwrap_or_else(|e| panic!("judged {text:?} as {e:?}"));
+        let (kept, heard) = judge(&text, decoder, samples.len() as f32 / SAMPLE_RATE as f32)
+            .unwrap_or_else(|e| panic!("judged {text:?} as {e:?}"));
         assert_eq!(heard, tag);
         println!("decoded: {kept}");
     }

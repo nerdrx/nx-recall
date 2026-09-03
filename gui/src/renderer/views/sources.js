@@ -8,7 +8,7 @@
 // it ever makes a sound (DESIGN §3).
 
 import { h, svg, clear, fmtDate, fmtBytes, speakerHue } from '../lib/dom.js';
-// 0.11.9 — per-person highlights. Only `iconOf` is wanted in this view: the one
+// 0.12.0 — per-person highlights. Only `iconOf` is wanted in this view: the one
 // place a speaker is named here is inside a native <option>, which cannot be
 // coloured. See `truthRow`.
 import { iconOf } from '../lib/palette.js';
@@ -478,7 +478,7 @@ export function mount(root, ctx) {
         onchange: (e) => setTruthLink(u, e.target.value),
       },
       h('option', { value: '', selected: u.speaker == null, text: 'Link…' }),
-      // 0.11.9 — the icon, and only the icon. An `<option>` is drawn by the
+      // 0.12.0 — the icon, and only the icon. An `<option>` is drawn by the
       // platform, not by us: Chromium ignores every colour we could put on one
       // (tokens.css says as much about `color-scheme` and native popups), so a
       // highlight's colour has nowhere to go here. The emoji renders fine, and

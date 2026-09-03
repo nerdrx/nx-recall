@@ -23,7 +23,7 @@ this **run** of the daemon:
 ```
 
 `schema` is the **database** version, not the protocol one, and it moves far more
-often: `proto` is still 1 while `schema` has reached **15** (0.11.9, the
+often: `proto` is still 1 while `schema` has reached **15** (0.12.0, the
 highlight — see "Highlighting a person" below). A client must not gate on it. It
 is there so a person reading a bug report can tell which shape the rows on that
 machine have, and so a client that knows about a specific migration can say
@@ -63,7 +63,7 @@ Methods (initial set):
 | `speakers.list` | | id, name, counts, total time, `languages`, `colour`/`icon` |
 | `speakers.name` | `{id, name}` | retroactive; broadcasts `relabel`. On a **merge tombstone**: `err:conflict` naming the canonical voice (0.7.5) — it holds no rows, so the write would land nowhere while the reply and the event claimed otherwise |
 | `speakers.set_languages` | `{id, languages}` | which languages this voice speaks; broadcasts `relabel`. Same `err:conflict` on a tombstone (0.7.5), and for a sharper reason: the read resolved through the tombstone while the write did not |
-| `speakers.set` | `{id, colour?, icon?}` | pin a highlight to a voice (0.11.9, schema 15) — a palette **token** and a short emoji; broadcasts `relabel` carrying both plus the name. An **omitted** key leaves that half alone, an explicit `null` clears it; neither key is `err:params`, not "clear both". Same `err:conflict` on a tombstone, for the same sharper reason as `speakers.set_languages` |
+| `speakers.set` | `{id, colour?, icon?}` | pin a highlight to a voice (0.12.0, schema 15) — a palette **token** and a short emoji; broadcasts `relabel` carrying both plus the name. An **omitted** key leaves that half alone, an explicit `null` clears it; neither key is `err:params`, not "clear both". Same `err:conflict` on a tombstone, for the same sharper reason as `speakers.set_languages` |
 | `speakers.palette` | | the ten accent tokens this daemon paints: `{palette: [{token, hue, hex}]}`. Served rather than assumed, so an eleventh colour does not need a matching client release |
 | `speakers.prune` | `{apply?}` | list (default) or sweep the one-off voices. With `apply`, `voices` is what was **removed** (0.7.5) — it used to repeat the preview, which the client had already shown in its own confirmation |
 | `speakers.delete` | `{id, keep_voiceprint?}` | delete one voice: its conversations always, its voiceprint unless kept. Works on a voice with **no segments left** — see below |
@@ -224,7 +224,7 @@ client rendering a "capturing now" light should believe `state`.
   Clients dedupe by seq, so stream re-push is tolerated but the batch is canonical.
 - `speakers.list` rows: `auto` (generated "Speaker_NN" label) alongside `name`
   (null until the user names them).
-- `speakers.list` rows also carry **`colour`** and **`icon`** (0.11.9, schema 15):
+- `speakers.list` rows also carry **`colour`** and **`icon`** (0.12.0, schema 15):
   the highlight a person pinned to that voice, or `null` — which is nearly every
   voice, and is the whole of "not highlighted". `colour` is a palette **token**
   (`"violet"`, `"teal"`, …), never a hex; see "Highlighting a person" for why. Both keys
@@ -403,7 +403,7 @@ only *what*.
   `started_at_utc_ns` is a **string**, like every nanosecond value on the wire.
   `null` means "not swept yet"; zeroes would claim a clean sweep that never ran.
 
-### Highlighting a person (schema 15, 0.11.9)
+### Highlighting a person (schema 15, 0.12.0)
 
 Two nullable columns on a voice — `colour` and `icon` — and a method that sets
 them. A person picks somebody out of a wall of names; every surface that draws
@@ -619,7 +619,7 @@ the instant it is deleted.
   - `name` is `null` until a person names the voice; `auto` is the generated
     label and is always present. Same split as `speakers.list`, in every place a
     person appears here — edges and thread participants included, so a client
-    can render a voice it has never queried. Since 0.11.9 the rule covers
+    can render a voice it has never queried. Since 0.12.0 the rule covers
     **`colour` and `icon`** too: they ride beside `name` and `auto` on the
     `speaker` block, on every edge and on every thread participant, for exactly
     the same reason. A highlight is read *on a name*, so a place that shows a
@@ -1592,7 +1592,7 @@ A declined turn is **marked** (`translation_via` set, `translation` NULL) so the
 queue stays finite. A re-decode that changes the words clears both, putting the
 row back at the end of the queue. A turn whose source language the translator
 has no code for is declined the same way with `translation_via:
-"unsupported-language"` (0.11.9) rather than left for a retry — it fails
+"unsupported-language"` (0.12.0) rather than left for a retry — it fails
 identically every pass, and before this two French rows the guesser had named
 without confidence went to the model with an empty tag every five minutes for
 an evening. The guesser's tag now reaches the model even when it is not
@@ -2439,7 +2439,7 @@ Nothing is required. When it wants to:
 A client must not present a *proposed* threshold as an installed one:
 `thresholds_swap` is the difference, and it is false far more often than true.
 
-## 0.11.9 — how a voice's prototypes become one score, and a bank that can be repaired
+## 0.12.0 — how a voice's prototypes become one score, and a bank that can be repaired
 
 Three changes to identity, all of them measured against this install's own
 ground truth on the same held-out rows (`spike/FINDINGS.md` §32). Two are
@@ -2447,7 +2447,7 @@ learned and travel through `identity.calibrate`; one is an operator command.
 
 ### A third learnable: the scoring rule
 
-A voice has up to twenty prototypes. Until 0.11.9 it scored the **best** of
+A voice has up to twenty prototypes. Until 0.12.0 it scored the **best** of
 them, which answers *could this be them?* and is generous in exactly the wrong
 way: one recording of somebody that happens to sit near another person's turns
 wins those turns forever, and nothing the voice's other nineteen prototypes say
@@ -2463,7 +2463,7 @@ averaging the bad ones in measures the spread rather than the match.
 
 Stored as a `settings` row, not a column: it is one rule for the install rather
 than a property of a voice. **Absent means `"max"`** — every version before
-0.11.9, and every install that has learned nothing.
+0.12.0, and every install that has learned nothing.
 
 `identity.calibrate` gains three fields:
 
@@ -3161,7 +3161,7 @@ and both are decided over the completed audio. So:
 A client MUST render a proximity speaker as uncertain. It is the cheapest true thing
 available, not a reading of the voice.
 
-A partial carries no `speaker_name`, and since 0.11.9 it carries no `colour`/`icon`
+A partial carries no `speaker_name`, and since 0.12.0 it carries no `colour`/`icon`
 either: a client resolves both from `speakers.list` against the `speaker` id. See
 "One deliberate exception: `partial`" in the highlight section for why.
 
@@ -3313,7 +3313,7 @@ passed.
 - Additive only. A client that reads `summary` and ignores the rest sees the
   same field it always did, with names in it.
 
-## 0.11.9 — Discord's word, applied; and the second client
+## 0.12.0 — Discord's word, applied; and the second client
 
 Three things, and the third is the reason the other two are shaped the way they
 are. The daemon had 168 turns it could name and had not; it had 137 turns queued
@@ -3350,7 +3350,7 @@ Four things it will not do, by construction rather than by flag:
 - **It never uses your own account.** A `single` verdict naming *you* is not
   evidence about audio captured from your own Discord client — that client never
   plays your microphone back to you, so yours is the one voice the stream cannot
-  contain. 0.10.1 established this for scoring (FINDINGS §17, 73% → 88%); 0.11.9
+  contain. 0.10.1 established this for scoring (FINDINGS §17, 73% → 88%); 0.12.0
   inherits it for labelling, where getting it wrong would have put the user's
   name on 17 turns of somebody else's voice, permanently.
 
@@ -3442,14 +3442,14 @@ verdicts of their own.
 Consequences, which are contracts and not advice:
 
 - **`nobody` is not evidence that no human spoke.** Nothing may unassign a label,
-  refuse a mint, or downgrade a voice on the strength of it. 0.11.9 designed both
+  refuse a mint, or downgrade a voice on the strength of it. 0.12.0 designed both
   a `identity repair --media` and a mint guard keyed on `nobody`, measured them,
   and shipped neither; §29 has the numbers and the reasoning.
 - **`nobody` remains excluded from every score,** as it has been since 0.9.0.
   Nothing about the identity or overlap numbers changes.
 - The honest fix is to stop merging the two instances, which is what
   `sessions.instance_key` begins and a plugin that names its call will finish.
-## 0.11.9 — the archive sweep for language
+## 0.12.0 — the archive sweep for language
 
 Every language decision is made once, on the way in, by whatever was shipped
 that evening. The spoken-language identifier arrived in 0.11.0, Korean and
@@ -3553,3 +3553,145 @@ recalld lang sweep --apply --redecode    also let the decoders rewrite
 Bounded (`--limit`, `--batch`), resumable, idle-priority, and safe to run while
 the daemon is capturing: the work list is a query rather than a cursor, and
 every row a model is spent on leaves it.
+
+---
+
+## 0.12.0 — the lobby is not FLEURS: three guards on the audio route, and a way back
+
+The spoken-language route (0.11.0 for `ja`, 0.11.6 for `ko`/`zh`, 0.11.8 for
+`fr`) shipped behind a false-positive gate measured on FLEURS: **zero of 400**
+German and English utterances heard as any of the three, at any length. On the
+install this was written for, it had rewritten **45 archive rows** — 32 `ja`,
+12 `zh`, one `fr` — and **37 of them belong to one voice: the user's own
+microphone, declared `["de","en"]**:
+
+```text
+"Mm-hmm."                    3.15 s  ->  うん
+"Okay, yeah."                3.89 s  ->  ok看嗯
+"Right."                     2.32 s  ->  可以嗯
+"Yeah."                      2.38 s  ->  没
+"Yeah, Gott was zu trinken." 2.32 s  ->  よしじゃあ。
+"Uh"                         2.00 s  ->  Au revoir.
+```
+
+Two of the 45 look right. FLEURS is read news; a lobby is people saying
+"Mm-hmm." at each other, and neither the identifier nor the judge had ever been
+asked about that. FINDINGS §31 has the tables.
+
+Nothing on the wire changes shape. `lang_via: "lid"` and `text_via: "lid"` mean
+exactly what 0.11.0 said they mean; there are simply far fewer of them, and one
+new `operations` op for taking the old ones back.
+
+### The three guards
+
+They are all in `asr_cjk::pre_route` and `asr_cjk::judge`, which both routes
+share, so the French arm gets them without a second copy.
+
+1. **A declared set with nothing routable in it is a declaration.** Before
+   0.12.0 only a *sole* declaration stopped the route (`lang::sole_language`),
+   so a voice declared `["de","en"]` fell through to the identifier on every
+   unreadable turn. Now any non-empty declared set that contains no tag either
+   route can decode — `ja`/`ko`/`zh`, or a tag in `[asr].polyglot_languages` —
+   is left alone. **A person who names their languages has answered the
+   question; two answers are still an answer.** The sole-language fast path to a
+   decoder is unchanged, and a set that *does* contain a routable tag
+   (`["en","ja"]`) still falls through, because a Japanese speaker's English
+   turn is not a mistake.
+2. **A back-channel is never worth a second decoder.** A turn whose transcript
+   has fewer than **two** words outside `lang::FILLERS` — `mm`, `mhm`, `uh`,
+   `yeah`, `okay`, `right`, `ja`, `ach`, `genau`, and thirty more built from the
+   prior transcripts of those 45 rows — never reaches the identifier. Two, not
+   three, because the three rows this feature exists for are "Sima Sen Okenki
+   Deska." (4 content words), "Wanky Daska." (2) and "During apartments." (2).
+   A turn with **no words at all** still reaches the identifier: a decoder that
+   gave up entirely is exactly the turn worth re-reading, and both of the two
+   genuine Japanese rows on this install are that shape.
+3. **The script test is necessary and not sufficient.** `うん`, `没`, `嗯嗯`,
+   `フフフフフフフ` and `ok看嗯` are all written in a script only the target
+   languages use, which is all the 0.11.6 judge asked for. A re-decode must now
+   also carry at least 4 letters **and** at least one per second of audio, have
+   more than half its letters distinct (a repetition loop is what these decoders
+   do with noise), not be a bare interjection in the target script, not be more
+   than a third Latin, and not mix hangul with kana. There is no decoder
+   confidence to lean on instead — sherpa's offline result carries `text`,
+   `lang`, `emotion` and `event` and no score.
+
+Rejections are logged with which guard fired.
+
+### `[asr].lid_windows` now defaults to `3`
+
+The identifier is asked about three overlapping windows of the turn and they
+must all agree (`lid_min_confidence` is still `1.0`). Measured on the 45 rows
+plus 200 German/English back-channels from the same voice, with guard 1
+deliberately switched off so the question is about the identifier alone:
+
+| windows | floor | asked | rewrites kept | false positives | rate |
+|--------:|------:|------:|--------------:|----------------:|-----:|
+| 1 | 1.0 s | 94 | 9 | 7 | 7.45% |
+| 1 | 1.5 s | 59 | 9 | 7 | 11.86% |
+| **3** | **1.0 s** | **94** | **2** | **1** | **1.06%** |
+| 3 | 1.5 s | 59 | 2 | 1 | 1.69% |
+
+One window misses the 1% gate by seven times; three windows lands on it. The
+floor moves nothing — it drops rows out of the denominator and none out of the
+numerator. `[asr].lid_min_s` therefore stays at `1.0`, and
+`[asr].lang_sweep_windows` stays a separate field at `3`: the narrowing is
+one-directional, and an operator who lowers `lid_windows` for a machine short of
+cores must not thereby lower it for four hundred archive rows decided at 04:00.
+
+Three passes cost three times one, and what pays for it is guard 1 and guard 2:
+on that same data they take the turns the identifier is asked about at all from
+245 to **one**.
+
+### `operations` gains `segments.unroute`
+
+Written once per row by the repair below. `prior_state` carries the state being
+**discarded**, so the repair is itself undoable:
+
+```json
+{
+  "segment_id": 15045,
+  "text": "うん",
+  "asr_model_id": "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8@1",
+  "text_via": "lid",
+  "lang": "ja",
+  "lang_via": "lid"
+}
+```
+
+The row it is written for goes back to the `text`, `asr_model_id` and
+`text_via` recorded in that row's own `segments.redecode` operation, and its
+`lang` and `lang_via` both go to **null** — not to `"sweep"`. A `"sweep"` mark
+would say "asked, nothing to say", and what happened is that the answer was
+withdrawn; a null puts the row back on the sweep's work list, which is where a
+row nobody has a reading for belongs. `asr_confidence` and any `translation`
+are cleared with the words they were about, exactly as `set_segment_text_via`
+clears them.
+
+A client showing a row that has been unrouted sees the live transcript back,
+`lang: null`, `lang_via: null` — the state it would have been in had the route
+never run.
+
+### `recalld lang unroute`
+
+```text
+recalld lang unroute            what it would put back, row by row, with the
+                                guard that refused each one. Writes nothing.
+recalld lang unroute --apply    do it.
+```
+
+A row goes back when **the code as it stands today would not have written it**:
+the shipped guards are re-run against the speaker's declaration and the words
+the route replaced, and — where the identifier is installed and the clip is
+still on disk — the identifier is re-run over the audio as well. A row the new
+guards still accept is not touched. A row with no recorded `segments.redecode`
+operation is reported and left alone: there is nothing to restore and inventing
+a prior transcript would be worse than the row it was fixing.
+
+Without the identifier the pass still runs on the stored text and durations
+alone, which can only ever put back **fewer** rows, never more.
+
+**Order matters.** The decision reads the database as it is now, so a voice that
+has since declared `ja` clears guard 1 and its rows are then judged on guards 2
+and 3 alone — which on this install keeps ten rewrites, two of them right. Run
+the repair **before** widening a declaration, not after.

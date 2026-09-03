@@ -86,10 +86,10 @@ pub fn rank(probe: &Embedding, prototypes: &[(i64, Embedding)]) -> Result<Vec<Ca
 }
 
 /// [`rank`], with the rule for turning a voice's several prototypes into one
-/// score looked up instead of assumed (0.11.9).
+/// score looked up instead of assumed (0.12.0).
 ///
 /// `rank` is exactly this with [`Aggregate::Max`](crate::calib::Aggregate::Max),
-/// so the pre-0.11.9 behaviour is not a second code path that could drift from
+/// so the pre-0.12.0 behaviour is not a second code path that could drift from
 /// this one.
 pub fn rank_with(
     probe: &Embedding,
@@ -483,7 +483,7 @@ mod tests {
         );
     }
 
-    // ---- how a voice's prototypes become one score (0.11.9) --------------
+    // ---- how a voice's prototypes become one score (0.12.0) --------------
 
     #[test]
     fn top_k_ranking_prefers_the_voice_that_agrees_with_itself() {

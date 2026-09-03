@@ -215,7 +215,9 @@ kept and the row is flagged instead.
   recalld lang              how many turns are flagged, and what can settle them
   recalld lang repair       re-read the flagged ones from their audio
   recalld lang sweep        ask the identifier about the turns captured before
-                            there was one (0.11.9; previews unless `--apply`)
+                            there was one (0.12.0; previews unless `--apply`)
+  recalld lang unroute      put back the turns that route should not have
+                            rewritten (0.12.0; previews unless `--apply`)
 
 Repair is bounded, resumable and runs at idle priority: it is safe to run while
 the daemon is capturing, and a run that is interrupted loses nothing.
@@ -517,7 +519,7 @@ pub enum TruthAction {
     },
     /// How right the voicebank was, marked by Discord.
     Report,
-    // ---- 0.11.9: retro-labelling from ground truth ------------------------
+    // ---- 0.12.0: retro-labelling from ground truth ------------------------
     /// Name the turns the voicebank left blank, on Discord's word. Previews
     /// unless `--apply`.
     #[command(long_about = "\
@@ -552,7 +554,7 @@ segment's prior state, so the pass is reversible as a class.
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
     },
-    // ---- end 0.11.9 -------------------------------------------------------
+    // ---- end 0.12.0 -------------------------------------------------------
 }
 
 #[derive(Subcommand, Debug)]
@@ -589,7 +591,7 @@ pub enum IdentityAction {
         #[arg(long)]
         foreign: bool,
         /// Prototypes whose OWN source turn Discord says was somebody else
-        /// (0.11.9). Spelled out rather than assumed, because it deletes from
+        /// (0.12.0). Spelled out rather than assumed, because it deletes from
         /// the voicebank.
         #[arg(long, conflicts_with = "foreign")]
         prototypes: bool,
@@ -918,7 +920,7 @@ Bounded, resumable and idle-priority: the work list is a query, not a cursor.")]
         dir: Option<PathBuf>,
     },
 
-    // ---- 0.11.9: the archive sweep ---------------------------------------
+    // ---- 0.12.0: the archive sweep ---------------------------------------
     /// Ask the spoken-language identifier about the turns it was never asked
     /// about. Previews unless `--apply`.
     // Verbatim: the operating model is four paragraphs and clap would fuse them.
@@ -988,7 +990,51 @@ and `models build-night`) and an idle GPU, and does nothing without them.")]
         #[arg(long, value_name = "PATH")]
         dir: Option<PathBuf>,
     },
-    // ---- end 0.11.9 -------------------------------------------------------
+    // ---- end 0.12.0 -------------------------------------------------------
+
+    // ---- 0.12.0: taking a route back -------------------------------------
+    /// Put back the turns the spoken-language route should never have
+    /// rewritten. Previews unless `--apply`.
+    // Verbatim: the operating model is four paragraphs and clap would fuse them.
+    #[command(long_about = "\
+Put back the turns the spoken-language route should never have rewritten.
+
+The route re-decodes a turn the identifier heard as Japanese, Korean, Chinese
+or French. On this install it rewrote 45 archive rows and nearly all of them
+were wrong: `Mm-hmm.` became `\u{3046}\u{3093}`, `Okay, yeah.` became
+`ok\u{770b}\u{55ef}`, `Uh` became `Au revoir.` — back-channels from a voice
+that had declared German and English, handed to a decoder that speaks neither
+(FINDINGS \u{00a7}31).
+
+0.12.0 added three guards and this walks the rows written before them. A row
+goes back when the code AS IT STANDS TODAY would not have written it: the
+guards are re-run against the speaker\u{2019}s declaration and the words the
+route replaced, and — where the identifier is installed and the clip is still
+on disk — against the audio as well. A row the new guards still accept is not
+touched.
+
+  recalld lang unroute            what it would put back, row by row.
+  recalld lang unroute --apply    do it.
+
+It is reversible: every row it restores writes a `segments.unroute` operation
+carrying the decoded text and the language stamp it discarded.
+
+ORDER MATTERS. The decision reads the database as it is now, so a voice that
+has since declared `ja` clears the first guard and its rows are judged on the
+evidence alone — which on this install keeps thirteen wrong rewrites. Run this
+BEFORE widening a declaration, not after.")]
+    Unroute {
+        /// Actually write. Without it the command only reports.
+        #[arg(long)]
+        apply: bool,
+
+        /// Use this models directory instead of `[models].dir`. Without the
+        /// identifier the pass still runs; it simply does not add the audio
+        /// test, which can only ever put MORE rows back.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+    },
+    // ---- end 0.12.0 ------------------------------------------------------
 }
 
 #[derive(Subcommand, Debug)]

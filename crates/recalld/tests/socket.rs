@@ -446,7 +446,7 @@ fn a_rename_is_broadcast_to_every_connected_client_with_one_seq() {
 }
 
 /// A highlight is set over the socket, broadcast to every client, and worn by
-/// the transcript rows that were already fetched (0.11.9, schema v15).
+/// the transcript rows that were already fetched (0.12.0, schema v15).
 ///
 /// The same shape as the rename above, because it is the same promise: a
 /// property of a VOICE changes once and every view of that voice changes with

@@ -40,7 +40,7 @@ import {
   followTail,
   HARD_MAX,
 } from '../lib/store.js';
-// 0.11.9 — per-person highlights. `look()` answers "what colour and what icon
+// 0.12.0 — per-person highlights. `look()` answers "what colour and what icon
 // does this row wear", preferring the store and falling back to the row's own
 // `speaker_colour`/`speaker_icon` for a voice this client has not listed yet;
 // `markRow` is the quiet accent on a highlighted row. All three live in one
@@ -1345,7 +1345,7 @@ export function openSegmentSheet(seg, ctx) {
       if (sp) nameRow.querySelector('#name-voice-hint').textContent = `${speakerLabel(sp.id)} has no name yet.`;
     }
     // ------------------------------------------------------------------
-    // Highlighting the picked voice, here (0.11.9)
+    // Highlighting the picked voice, here (0.12.0)
     //
     // The naming row above is hidden for a voice that already has a name,
     // because renaming is a rarer act with consequences that belong on the

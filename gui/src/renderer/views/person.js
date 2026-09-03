@@ -14,7 +14,7 @@
 
 import { h, clear, fmtDur, fmtDate, heardOnChips } from '../lib/dom.js';
 import { store, speakerLabel, isYou, ask } from '../lib/store.js';
-// 0.11.9 — per-person highlights. This page is where one is most often SET
+// 0.12.0 — per-person highlights. This page is where one is most often SET
 // (the picker lives in the identity block) and it is also the page with the
 // most other people's names on it, so it reads the same helpers everywhere.
 import { lookOn, iconSpan, highlightPicker } from './highlight.js';
@@ -167,7 +167,7 @@ export function mount(root, ctx, arg) {
             // and 3 in VRChat is a person you know from one place.
             heardOnChips(page?.sources, { withCounts: true })
           ),
-          // 0.11.9 — the highlight, set where the person is. This is the page
+          // 0.12.0 — the highlight, set where the person is. This is the page
           // that answers "who is this", so it is also the honest place to say
           // "and this is how I want to spot them"; the transcript's segment
           // sheet has the same control for the moment you are already reading

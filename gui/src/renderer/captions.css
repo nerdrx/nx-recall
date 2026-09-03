@@ -93,7 +93,7 @@
   flex: none;
 }
 
-/* 0.11.9 — a highlighted voice's emoji, in front of the name. `.cap-who` is
+/* 0.12.0 — a highlighted voice's emoji, in front of the name. `.cap-who` is
    already a flex row with an 8px gap, so the icon needs nothing but a refusal
    to shrink: the name column here is `auto`-sized and the words next to it are
    what gives, exactly as in the transcript. Rendered only when there IS one

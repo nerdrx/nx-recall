@@ -59,7 +59,7 @@ pub const THRESHOLD_BOUNDS: (f32, f32) = (0.30, 0.60);
 /// fitted rather than inherited from the global operating point.
 pub const MIN_ROWS_PER_VOICE: usize = 30;
 
-// ---- 0.11.9: how a voice's prototypes become one score ----------------------
+// ---- 0.12.0: how a voice's prototypes become one score ----------------------
 
 /// How the several cosines a voice's prototypes produce collapse into the one
 /// number the ladder compares.
@@ -948,7 +948,7 @@ pub fn overlap_grid() -> Vec<f32> {
 mod tests {
     use super::*;
 
-    // ---- how a voice's prototypes become one score (0.11.9) --------------
+    // ---- how a voice's prototypes become one score (0.12.0) --------------
 
     #[test]
     fn max_is_the_highest_single_prototype() {

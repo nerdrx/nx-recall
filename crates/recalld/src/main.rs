@@ -161,7 +161,7 @@ fn main() -> Result<()> {
             LangAction::Repair { batch, limit, dir } => {
                 cmd_lang_repair(&cfg, &data_dir, dir.as_deref(), batch, limit)
             }
-            // ---- 0.11.9, the archive sweep ------------------------------
+            // ---- 0.12.0, the archive sweep ------------------------------
             LangAction::Sweep {
                 apply,
                 redecode,
@@ -177,7 +177,11 @@ fn main() -> Result<()> {
                 batch,
                 limit,
             ),
-            // ---- end 0.11.9 ----------------------------------------------
+            // ---- end 0.12.0 ----------------------------------------------
+            // ---- 0.12.0, taking a route back ----------------------------
+            LangAction::Unroute { apply, dir } => {
+                cmd_lang_unroute(&cfg, &data_dir, dir.as_deref(), apply)
+            } // ---- end 0.12.0 ---------------------------------------------
         },
         // ---- 0.11.0, source-aware identity -----------------------------
         Command::Identity { action } => cmd_identity(&cfg, &data_dir, action),
@@ -577,7 +581,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
             .map_err(|e| warn!("no night shift: {e}"))
             .ok()
     };
-    // ---- 0.11.9: the archive language sweep -------------------------------
+    // ---- 0.12.0: the archive language sweep -------------------------------
     // Its own thread rather than a second pass inside the night shift's, and
     // the reason is the one gate the two do not share: the night shift needs a
     // gigabyte of whisper and a local compile before it can do anything at all,
@@ -599,7 +603,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
             .map_err(|e| warn!("no archive language sweep: {e}"))
             .ok()
     };
-    // ---- end 0.11.9 -------------------------------------------------------
+    // ---- end 0.12.0 -------------------------------------------------------
     // ---- 0.9.0, the assistant ------------------------------------------
     // Two threads. The scheduler is a query every thirty seconds and no model
     // at all, so it runs whatever else is switched off; the digest and
@@ -702,7 +706,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         quality_thread,
         truth_thread,
         night_thread,
-        // 0.11.9.
+        // 0.12.0.
         sweep_thread,
         // 0.9.0.
         reminder_thread,
@@ -1830,7 +1834,7 @@ fn cmd_lang_status(cfg: &Config, data_dir: &Path, dir: Option<&Path>) -> Result<
             models::FALLBACK_ASR.note
         );
     }
-    // ---- 0.11.9: the archive sweep ---------------------------------------
+    // ---- 0.12.0: the archive sweep ---------------------------------------
     // Printed before the flagged count and unconditionally, because the two
     // backlogs are disjoint and an empty one of them says nothing about the
     // other: `repair` walks rows marked as a disagreement, `sweep` walks rows
@@ -1852,7 +1856,7 @@ fn cmd_lang_status(cfg: &Config, data_dir: &Path, dir: Option<&Path>) -> Result<
             println!("  {}", recalld::lid::how_to_get_it());
         }
     }
-    // ---- end 0.11.9 -------------------------------------------------------
+    // ---- end 0.12.0 -------------------------------------------------------
     println!("{:<20}{flagged}", "flagged");
     if flagged == 0 {
         println!("nothing to repair.");
@@ -1957,7 +1961,7 @@ fn cmd_lang_repair(
     Ok(())
 }
 
-/// `recalld lang sweep [--apply]` — the archive sweep (0.11.9).
+/// `recalld lang sweep [--apply]` — the archive sweep (0.12.0).
 ///
 /// In THIS process, like the repair above it and for the same two reasons: it
 /// is a long batch job that has to be niceable and Ctrl-C-able, and it loads
@@ -2123,6 +2127,86 @@ fn cmd_lang_sweep(
     );
     Ok(())
 }
+
+/// `recalld lang unroute [--apply]` — put back the rows the audio route should
+/// never have rewritten (0.12.0, `crate::unroute`).
+///
+/// In this process rather than through the daemon, for `cmd_lang_sweep`'s
+/// reasons: it is a batch over the whole archive, it wants to be niceable and
+/// interruptible, and with the identifier installed it loads a model the daemon
+/// may not have resident.
+fn cmd_lang_unroute(cfg: &Config, data_dir: &Path, dir: Option<&Path>, apply: bool) -> Result<()> {
+    use recalld::unroute::Verdict;
+
+    pipeline::deprioritise_current_thread(19, &[]);
+    let store = Store::open(data_dir)?;
+    // The identifier is optional and its absence is not an error: the audio
+    // test can only ever put MORE rows back, so a run without it is a strict
+    // subset of a run with it.
+    let root = fetch::target_dir(dir, &cfg.models, data_dir);
+    let models = ModelSet::resolve_at(root, &cfg.models);
+    let mut cjk = recalld::asr_cjk::Cjk::new(&models, &cfg.asr);
+    let with_audio = models.lid().present() && cjk.lid_ready();
+    if !with_audio {
+        println!(
+            "the identifier is not installed, so the guards are re-run on the stored text and \
+             durations only — which can only put back FEWER rows, never more."
+        );
+    }
+
+    let report = recalld::unroute::run(
+        &store,
+        with_audio.then_some(&mut cjk),
+        data_dir,
+        &cfg.asr,
+        apply,
+        recalld::clock::utc_now_ns(),
+    )?;
+    if report.looked_at() == 0 {
+        println!("no turn on this install was settled by the spoken-language route.");
+        return Ok(());
+    }
+    println!(
+        "{} turn(s) were settled by the spoken-language route.\n",
+        report.looked_at()
+    );
+    for row in &report.rows {
+        let (mark, why) = match &row.verdict {
+            Verdict::Revert(why) => ("<-", *why),
+            Verdict::Keep => ("  ", "the guards still accept it"),
+            Verdict::NoPrior => ("??", "no prior transcript was recorded; nothing to restore"),
+        };
+        println!(
+            "{mark} {:>7}  {:>5.2}s  {}  {:?}",
+            row.id, row.duration_s, row.lang, row.now
+        );
+        println!(
+            "            {} {:?}  ({why}{})",
+            if matches!(row.verdict, Verdict::Revert(_)) {
+                "back to"
+            } else {
+                "was"
+            },
+            row.before,
+            if row.by_audio { ", by the audio" } else { "" }
+        );
+    }
+    println!();
+    println!(
+        "{} to put back, {} left alone, {} with no recorded prior.",
+        report.reverted, report.kept, report.no_prior
+    );
+    if apply {
+        println!(
+            "done. Each one wrote a `segments.unroute` operation carrying what it discarded, so \
+             this is undoable in its turn."
+        );
+    } else {
+        println!("`recalld lang unroute --apply` does it.");
+    }
+    Ok(())
+}
+// ---- end 0.12.0 -----------------------------------------------------------
 
 /// `recalld speakers prune [--apply]` — the one-off voice sweep.
 fn cmd_prune(cfg: &Config, data_dir: &Path, apply: bool) -> Result<()> {
@@ -3213,13 +3297,13 @@ fn cmd_truth(
             Ok(())
         }
         TruthAction::Report => cmd_truth_report(cfg, data_dir),
-        // ---- 0.11.9: retro-labelling from ground truth ----------------
+        // ---- 0.12.0: retro-labelling from ground truth ----------------
         TruthAction::Label { apply, limit } => cmd_truth_label(data_dir, apply, limit),
-        // ---- end 0.11.9 -----------------------------------------------
+        // ---- end 0.12.0 -----------------------------------------------
     }
 }
 
-// ---- 0.11.9: retro-labelling from ground truth -----------------------------
+// ---- 0.12.0: retro-labelling from ground truth -----------------------------
 
 /// `recalld truth label` — name the blank turns Discord can already name.
 ///
@@ -3294,7 +3378,7 @@ fn cmd_truth_label(data_dir: &Path, apply: bool, limit: Option<usize>) -> Result
     Ok(())
 }
 
-// ---- end 0.11.9 ------------------------------------------------------------
+// ---- end 0.12.0 ------------------------------------------------------------
 
 /// `recalld truth report` — the measurement this whole subsystem exists for.
 fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
@@ -3333,7 +3417,7 @@ fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
         println!("{label:<20}{}", n(key));
     }
 
-    // ---- 0.11.9: the two queues ----
+    // ---- 0.12.0: the two queues ----
     //
     // Printed whenever there is something in them, and silent when there is
     // not. §29's finding was that 137 turns had been queued for an enrolment
@@ -3806,7 +3890,7 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
     Ok(())
 }
 
-// ---- 0.11.9: `recalld identity repair --prototypes` ------------------------
+// ---- 0.12.0: `recalld identity repair --prototypes` ------------------------
 
 /// The one repair that is a correctness fix rather than an operating point:
 /// throwing out a prototype that is a recording of somebody else.

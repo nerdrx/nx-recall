@@ -652,6 +652,56 @@ pub fn word_count(text: &str) -> usize {
     crate::asr::normalise_words(text).len()
 }
 
+// ---- 0.12.0, the back-channel -------------------------------------------
+
+/// The words a lobby says instead of words: back-channels, hesitations and
+/// one-syllable agreements, in German and English together.
+///
+/// **Built from the data rather than from intuition** — every token below that
+/// is not obvious came off the prior transcripts of the 45 rows the audio route
+/// rewrote on this install (FINDINGS §31), which is the only corpus anybody has
+/// of what the router was actually being asked about. The list is deliberately
+/// aggressive about words that are real words in one of the two languages —
+/// `no`, `right`, `well`, `so`, `ja`, `doch` — because [`content_words`] has
+/// exactly one job: decide whether a turn is worth handing to a **second
+/// decoder**. A two-word English turn is never worth that, so a filler list
+/// that eats one is costing nothing; a filler list that misses one costs a
+/// wrong transcript.
+///
+/// Lower-case, and matched against [`words`]'s tokens — which split on
+/// non-letters, so `mm-hmm` arrives here as `mm` and `hmm` and both have to be
+/// in the list for the turn to read as filler.
+pub const FILLERS: &[&str] = &[
+    "ach", "achso", "aha", "ah", "ahh", "aehm", "boah", "doch", "eben", "eh", "er", "err", "gell",
+    "genau", "hah", "haha", "heh", "hehe", "hey", "hm", "hmm", "hmmm", "huh", "ja", "jaa", "jo",
+    "kay", "mhm", "mhmm", "mm", "mmm", "na", "nah", "naja", "nee", "ne", "no", "nope", "oh", "ohh",
+    "oi", "ok", "okay", "ooh", "right", "so", "sure", "tja", "uh", "uhh", "uhm", "um", "umm",
+    "well", "wow", "yeah", "yea", "yeh", "yep", "yes", "yup", "äh", "ähm", "öh", "nö",
+];
+
+/// Is this one token a back-channel rather than a word?
+pub fn is_filler(word: &str) -> bool {
+    let low: String = word.chars().flat_map(char::to_lowercase).collect();
+    FILLERS.contains(&low.as_str())
+}
+
+/// The transcript's words with the back-channels taken out.
+///
+/// What the audio-language route counts before it spends a model on a turn
+/// (`crate::asr_cjk::pre_route`). "Mm-hmm." has none of these, "Yeah, Gott was
+/// zu trinken." has four, and only the second is a sentence somebody might
+/// have said in another language.
+pub fn content_words(text: &str) -> Vec<String> {
+    words(text).into_iter().filter(|w| !is_filler(w)).collect()
+}
+
+/// [`content_words`]'s length, which is all every caller wants.
+pub fn content_word_count(text: &str) -> usize {
+    content_words(text).len()
+}
+
+// ---- end 0.12.0 ----------------------------------------------------------
+
 /// Parse a stored `speakers.languages` value: a JSON array of tags.
 ///
 /// `None` — the column is NULL — means *any language*, which is the default and
@@ -733,6 +783,52 @@ mod tests {
         // Content words only: nothing votes.
         assert_eq!(classify("Marseille Rotterdam"), Lang::Unclear);
         assert_eq!(classify("okay"), Lang::Unclear);
+    }
+
+    #[test]
+    fn a_back_channel_has_no_content_words() {
+        // Verbatim from the prior transcripts of the 45 rows the audio route
+        // rewrote on the live install (FINDINGS §31). Each of these was handed
+        // to a Japanese or Chinese decoder because no text rule could read it.
+        for grunt in [
+            "Mm-hmm.",
+            "Mm.",
+            "Mm, mm-hmm.",
+            "Uh",
+            "Uh.",
+            "Uh yeah.",
+            "Oh",
+            "Ah.",
+            "Um",
+            "Yeah.",
+            "Yeah, yeah.",
+            "Okay, yeah.",
+            "Right.",
+            "Ach so",
+            "Genau.",
+            "Naja",
+        ] {
+            assert_eq!(content_word_count(grunt), 0, "{grunt:?}");
+        }
+        // A hyphenated back-channel is two tokens and both have to be listed,
+        // which is why `mm` and `hmm` are both in the table.
+        assert!(is_filler("mm") && is_filler("hmm") && is_filler("HMM"));
+        // Real words are not fillers, however short.
+        for real in ["gott", "danke", "trinken", "sonar", "minus", "hunt"] {
+            assert!(!is_filler(real), "{real}");
+        }
+        assert_eq!(content_word_count("Yeah, Gott was zu trinken."), 4);
+        assert_eq!(content_words("Oh my ooh ooh oh okay."), vec!["my"]);
+        // Digits are not words here either — `words` already drops them — so
+        // "2019" cannot buy a turn past the router's floor.
+        assert_eq!(content_word_count("uh 2019"), 0);
+        // And no token is in the table twice.
+        let mut sorted = FILLERS.to_vec();
+        sorted.sort_unstable();
+        let n = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), n, "a filler is listed twice");
+        assert!(FILLERS.iter().all(|f| *f == f.to_lowercase()));
     }
 
     #[test]

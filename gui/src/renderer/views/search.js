@@ -8,7 +8,7 @@
 import { h, clear, fmtClock, fmtDay, fmtDayLabel, fmtDate } from '../lib/dom.js';
 import { store, speakerLabel, segmentSpeakerLabel, isUncertain, isShaky, ask } from '../lib/store.js';
 import { shakyMark, translationCell } from '../lib/marks.js';
-// 0.11.9 — per-person highlights. The same three helpers the transcript uses,
+// 0.12.0 — per-person highlights. The same three helpers the transcript uses,
 // because a hit and the row it takes you to must not disagree about a colour.
 import { look, lookOf, iconSpan, markRow } from './highlight.js';
 import { toast } from '../lib/sheets.js';

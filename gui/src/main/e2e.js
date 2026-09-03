@@ -2652,7 +2652,7 @@ export function runE2E(deps) {
 
     await step('shot-transcript-renamed', async () => ({ file: await shot('transcript-renamed') }));
 
-    // 7b — per-person highlights (0.11.9). Set a colour and an emoji through
+    // 7b — per-person highlights (0.12.0). Set a colour and an emoji through
     // the real picker, see them on the transcript row and the person page,
     // clear them, and see them GO. The last half is the point: a highlight
     // that can be set and not unset is a decoration somebody is stuck with.

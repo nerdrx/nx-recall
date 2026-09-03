@@ -80,7 +80,7 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // verdicts already on disk — but only where the speaking spans survive, since
 // a purged span and a quiet turn would otherwise both read 0.0.
 //
-// ---- 0.11.9 (schema v14): which instance a session was ---------------------
+// ---- 0.12.0 (schema v14): which instance a session was ---------------------
 // v14 adds `sessions.instance_key`: which *copy* of an application opened the
 // session, from `object.serial` or `application.process.id`. Two Vesktop
 // clients share one `sources` row because the key is the process binary, and
@@ -90,7 +90,7 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // `Store::begin_session_for`, including why the discriminator is not allowed
 // anywhere near `match_key`.
 //
-// ---- 0.11.9 (schema v15): highlighted people ------------------------------
+// ---- 0.12.0 (schema v15): highlighted people ------------------------------
 // v15 adds `speakers.colour` and `speakers.icon`: a palette token and a short
 // emoji a person pins to a voice so it can be picked out of a wall of names.
 // Both nullable, both NULL for every voice that exists today, and NULL is the
@@ -141,8 +141,8 @@ pub mod label_via {
     pub const PROXIMITY: &str = "proximity";
     /// A person said so.
     pub const MANUAL: &str = "manual";
-    // ---- 0.11.9: retro-labelling from ground truth -------------------------
-    /// Discord said so (0.11.9). The segment carries a `single` verdict, the
+    // ---- 0.12.0: retro-labelling from ground truth -------------------------
+    /// Discord said so (0.12.0). The segment carries a `single` verdict, the
     /// Discord user who owned it is linked to a voice, and the voicebank had
     /// declined to name the row at all.
     ///
@@ -154,7 +154,7 @@ pub mod label_via {
     /// overwrite (see `truth::link_batch`). Giving Discord its own value keeps
     /// that promise intact and keeps this pass reversible as a class.
     pub const TRUTH: &str = "truth";
-    // ---- end 0.11.9 --------------------------------------------------------
+    // ---- end 0.12.0 --------------------------------------------------------
 }
 
 /// `segments.lang_via` — how this row's *language* came to be what it is (v5).
@@ -189,7 +189,7 @@ pub mod lang_via {
     ///
     /// Like [`CONTEXT`] it is an inference and the words were not re-decoded.
     pub const GUESSED: &str = "guessed";
-    /// The archive sweep (0.11.9, `crate::sweep`) asked the spoken-language
+    /// The archive sweep (0.12.0, `crate::sweep`) asked the spoken-language
     /// identifier about a row nothing could read, and the answer was not one
     /// the routes act on.
     ///
@@ -314,7 +314,7 @@ pub mod truth_via {
     // ---- end 0.11.0 -------------------------------------------------------
 }
 
-// ---- 0.11.9: retro-labelling from ground truth -----------------------------
+// ---- 0.12.0: retro-labelling from ground truth -----------------------------
 
 /// A turn Discord can name that the voicebank left blank.
 #[derive(Debug, Clone, PartialEq)]
@@ -328,12 +328,12 @@ pub struct TruthLabelCandidate {
     pub coverage: Option<f64>,
 }
 
-// ---- end 0.11.9 -----------------------------------------------------------
+// ---- end 0.12.0 -----------------------------------------------------------
 
 /// `settings` key holding the id of the pinned "You" speaker.
 pub const YOU_SPEAKER_KEY: &str = "you_speaker_id";
 
-/// `settings` key for the learned prototype aggregate (0.11.9). Absent means
+/// `settings` key for the learned prototype aggregate (0.12.0). Absent means
 /// [`crate::calib::Aggregate::Max`], which is what every earlier version did.
 pub const AGGREGATE_KEY: &str = "identity_aggregate";
 /// The generated label the pinned speaker is minted with. It survives a rename
@@ -488,7 +488,7 @@ pub struct RedecodeCandidate {
     pub text: Option<String>,
 }
 
-/// A row the archive language sweep may look at (0.11.9, `crate::sweep`).
+/// A row the archive language sweep may look at (0.12.0, `crate::sweep`).
 ///
 /// Everything [`crate::asr_cjk::pre_route`] needs and nothing else, so the
 /// cheap half of the decision — is this transcript already readable, is this
@@ -503,6 +503,37 @@ pub struct SweepCandidate {
     /// The speaker's declared languages, resolved through merges exactly as
     /// [`Store::speaker_languages`] resolves them.
     pub declared: Option<Vec<String>>,
+}
+
+/// A row the audio-language route already rewrote, and what it wrote over
+/// (0.12.0, `crate::unroute`).
+///
+/// The prior three fields come out of the row's own `segments.redecode`
+/// operation rather than out of a second column, because that operation *is*
+/// the record — `Store::set_segment_text_via` has written it since 0.11.0
+/// exactly so that a machine's edit of a transcript can be compared and undone.
+/// `None` for all three means the row was routed by a build that predates the
+/// operation, or that a person has since deleted it; either way there is
+/// nothing to restore and the repair leaves the row alone.
+#[derive(Debug, Clone)]
+pub struct RoutedRow {
+    pub id: i64,
+    pub duration_s: f32,
+    /// Relative to the data dir. May be empty — retention takes clips and
+    /// leaves rows.
+    pub audio_path: String,
+    /// What the row says now: the decoder's words.
+    pub text: Option<String>,
+    pub lang: Option<String>,
+    /// The speaker's declared languages, resolved through merges.
+    pub declared: Option<Vec<String>>,
+    /// The words the route replaced, and the model and route that had produced
+    /// them.
+    pub prior_text: Option<String>,
+    pub prior_model: Option<String>,
+    pub prior_via: Option<String>,
+    /// Whether the row has a `segments.redecode` operation at all.
+    pub has_prior: bool,
 }
 
 /// One stored turn's audio, as the window builder sees it.
@@ -1130,13 +1161,13 @@ impl Store {
         self.apply_digest_names()?;
         // ---- end 0.11.6 ---------------------------------------------------
 
-        // ---- 0.11.9 (schema v14): which instance a session was -------------
+        // ---- 0.12.0 (schema v14): which instance a session was -------------
         // One nullable column on `sessions`, no backfill: for every session
         // that already exists the answer is genuinely unknown, and NULL is the
         // only honest way to say so. See `apply_session_instance`.
         self.apply_session_instance()?;
 
-        // ---- 0.11.9 (schema v15): highlighted people ----------------------
+        // ---- 0.12.0 (schema v15): highlighted people ----------------------
         // Two nullable columns on `speakers`. Additive, idempotent, no
         // backfill: NULL is exactly "this voice is not highlighted", which is
         // true of every voice that predates the feature.
@@ -1146,7 +1177,7 @@ impl Store {
         // order the chain is documented in, and a reader tracing v13 → v14 →
         // v15 should find them in that order.
         self.apply_v15()?;
-        // ---- end 0.11.9 ---------------------------------------------------
+        // ---- end 0.12.0 ---------------------------------------------------
 
         match current {
             None => {
@@ -1800,7 +1831,7 @@ impl Store {
         self.begin_session_for(source_id, started_at_utc_ns, None)
     }
 
-    // ---- 0.11.9: which instance a session was ------------------------------
+    // ---- 0.12.0: which instance a session was ------------------------------
 
     /// `begin_session`, remembering *which copy of the application* opened it.
     ///
@@ -1863,7 +1894,7 @@ impl Store {
         Ok(())
     }
 
-    // ---- end 0.11.9 --------------------------------------------------------
+    // ---- end 0.12.0 --------------------------------------------------------
 
     pub fn end_session(&self, session_id: i64, ended_at_utc_ns: i64) -> Result<()> {
         self.conn.execute(
@@ -2419,7 +2450,7 @@ impl Store {
     ///   query, not new evidence. Counting it would let three real German turns
     ///   inherit their way to a hundred, and the hundredth would look exactly
     ///   as certain as the first.
-    /// * `lang_via != 'sweep'` (0.11.9) — the archive sweep's de/en stamp is
+    /// * `lang_via != 'sweep'` (0.12.0) — the archive sweep's de/en stamp is
     ///   one second of audio nobody could read, judged by nothing. It is a
     ///   record of what the identifier said, not a reading of the words, and
     ///   the whole point of the conversational prior is that it is built out of
@@ -2487,7 +2518,7 @@ impl Store {
         }))
     }
 
-    // ---- the archive sweep (0.11.9, `crate::sweep`) ----------------------
+    // ---- the archive sweep (0.12.0, `crate::sweep`) ----------------------
 
     /// One untagged archive row, with everything
     /// [`crate::asr_cjk::pre_route`] needs to decide whether to ask about it.
@@ -2590,6 +2621,145 @@ impl Store {
     }
 
     // ---- end the archive sweep -------------------------------------------
+
+    // ---- undoing a route (0.12.0, `crate::unroute`) ----------------------
+
+    /// Every row the audio-language route settled, oldest first, with the words
+    /// it wrote over.
+    ///
+    /// Keyed on `lang_via = 'lid'` and **not** on `text_via`, and the
+    /// difference is not academic: on this install eight of the 45 routed rows
+    /// carry `text_via = 'arbiter'`, because 0.11.0 wrote the arbiter's value
+    /// before `text_via::LID` existed. The language stamp is the claim this
+    /// pass is undoing, so the language stamp is what it selects on.
+    ///
+    /// The prior state comes from the row's **last** `segments.redecode`
+    /// operation, because that is the state immediately before the words the
+    /// row carries now — which is what "put it back" means. The one way that
+    /// could restore the wrong thing is a pass that rewrote the row *after* the
+    /// route did, whose operation would then be carrying the route's own CJK
+    /// text; that case is excluded by name rather than hoped about, in
+    /// `has_prior` below. On this install all 45 routed rows have exactly one
+    /// such operation and its `text_via` is `live`.
+    pub fn segments_routed_by_lid(&self) -> Result<Vec<RoutedRow>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT g.id, g.t_end_ns - g.t_start_ns, g.audio_path, g.text, g.lang,
+                        (SELECT s.languages FROM speakers s
+                         JOIN speaker_resolved r ON r.canonical_id = s.id
+                         WHERE r.id = g.speaker_id),
+                        (SELECT o.prior_state FROM operations o
+                          WHERE o.op = 'segments.redecode'
+                            AND o.target_ids = '[' || g.id || ']'
+                          ORDER BY o.at_utc_ns DESC, o.id DESC LIMIT 1)
+                 FROM segments g
+                 WHERE g.deleted_at IS NULL AND g.lang_via = ?1
+                 ORDER BY g.t_start_ns, g.id",
+            )?
+            .query_map(params![crate::asr_cjk::LANG_VIA_LID], |r| {
+                let languages: Option<String> = r.get(5)?;
+                let prior: Option<String> = r.get(6)?;
+                let parsed: Option<serde_json::Value> =
+                    prior.as_deref().and_then(|s| serde_json::from_str(s).ok());
+                let field = |key: &str| {
+                    parsed
+                        .as_ref()
+                        .and_then(|v| v.get(key))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                };
+                Ok(RoutedRow {
+                    id: r.get(0)?,
+                    duration_s: r.get::<_, i64>(1)? as f32 / 1e9,
+                    audio_path: r.get(2)?,
+                    text: r.get(3)?,
+                    lang: r.get(4)?,
+                    declared: crate::lang::parse_languages(languages.as_deref()),
+                    prior_text: field("text"),
+                    prior_model: field("asr_model_id"),
+                    prior_via: field("text_via"),
+                    // A recorded prior whose own `text_via` is `lid` is the
+                    // route's output, not the words it replaced: some later
+                    // pass has rewritten this row and the trail no longer
+                    // reaches the live transcript. Reported as "nothing to
+                    // restore" rather than restored wrongly.
+                    has_prior: parsed.is_some() && field("text_via").as_deref() != Some("lid"),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Put a routed row back the way it was, and record what was thrown away.
+    ///
+    /// Three things move together and they have to, because leaving any one of
+    /// them would leave a row making a claim nothing stands behind:
+    ///
+    /// * the **words**, back to `prior_text` with the model and `text_via` that
+    ///   produced them — usually `live`, sometimes `context`;
+    /// * the **language**, back to NULL with `lang_via` NULL. Not
+    ///   [`lang_via::SWEEP`]: a mark would say "asked, nothing to say", and
+    ///   what actually happened is that the answer was withdrawn. A NULL puts
+    ///   the row back on the sweep's work list, which is where a row nobody has
+    ///   a reading for belongs;
+    /// * the **translation and the cross-check flag**, cleared for
+    ///   [`Self::set_segment_text_via`]'s reason: both were computed about
+    ///   words that are no longer on the row. A `fr` translation of `うん` is
+    ///   the exact failure that call documents.
+    ///
+    /// The `operations` row is `segments.unroute` and carries the state being
+    /// discarded — the routed text, its model, its `text_via`, and the language
+    /// stamp — so this pass is undoable in its turn. A repair that is not
+    /// itself reversible is a rewrite.
+    pub fn unroute_segment(&self, row: &RoutedRow, at_utc_ns: i64) -> Result<bool> {
+        /// What the row says now, read back inside the same call rather than
+        /// trusted from the caller's snapshot: the live pipeline may have moved
+        /// the row between the gather and the write.
+        type Now = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let now: Option<Now> = self
+            .conn
+            .query_row(
+                "SELECT text, asr_model_id, text_via, lang FROM segments
+                 WHERE id = ?1 AND deleted_at IS NULL AND lang_via = ?2",
+                params![row.id, crate::asr_cjk::LANG_VIA_LID],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((text, model, via, lang)) = now else {
+            return Ok(false);
+        };
+        self.conn.execute(
+            "UPDATE segments
+             SET text = ?2, asr_model_id = ?3, text_via = ?4,
+                 lang = NULL, lang_via = NULL,
+                 asr_confidence = NULL, confidence_at_ns = NULL
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![row.id, row.prior_text, row.prior_model, row.prior_via],
+        )?;
+        self.clear_segment_translation(row.id)?;
+        self.log_operation(
+            "segments.unroute",
+            &format!("[{}]", row.id),
+            &serde_json::json!({
+                "segment_id": row.id,
+                "text": text,
+                "asr_model_id": model,
+                "text_via": via,
+                "lang": lang,
+                "lang_via": crate::asr_cjk::LANG_VIA_LID,
+            })
+            .to_string(),
+            at_utc_ns,
+        )?;
+        Ok(true)
+    }
+
+    // ---- end undoing a route ----------------------------------------------
 
     /// Rows the arbiter could not settle, oldest first — the backlog
     /// `recalld lang repair` walks (0.7.7).
@@ -3433,7 +3603,7 @@ impl Store {
             // 0.9.0 (v11), the assistant.
             translation: r.get(18)?,
             translation_via: r.get(19)?,
-            // 0.11.9 (v15), the highlight. Resolved through the tombstone view
+            // 0.12.0 (v15), the highlight. Resolved through the tombstone view
             // like the name beside it, so a merged-away voice wears the
             // surviving one's colour rather than the one it had before somebody
             // decided the two were the same person.
@@ -6096,7 +6266,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    // ---- 0.11.9: retro-labelling from ground truth -------------------------
+    // ---- 0.12.0: retro-labelling from ground truth -------------------------
 
     /// How many turns would enrol if `[truth] enrol` were on, and never will
     /// while it is off.
@@ -6204,7 +6374,7 @@ impl Store {
         )? > 0)
     }
 
-    // ---- end 0.11.9 --------------------------------------------------------
+    // ---- end 0.12.0 --------------------------------------------------------
 
     /// Mark an enrolment candidate as considered, whether or not it enrolled.
     /// Without this the pass would re-embed the same refused turn forever.
@@ -7362,7 +7532,7 @@ pub struct CalibrationRow {
     pub embedding: Embedding,
 }
 
-/// A prototype ground truth says is a recording of somebody else (0.11.9).
+/// A prototype ground truth says is a recording of somebody else (0.12.0).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CondemnedPrototype {
     pub prototype_id: i64,
@@ -7691,7 +7861,7 @@ impl Store {
             > 0)
     }
 
-    // ---- 0.11.9: the learned aggregate ------------------------------------
+    // ---- 0.12.0: the learned aggregate ------------------------------------
 
     /// How a voice's several prototypes become the one score the ladder
     /// compares, as this install has learned it.
@@ -7700,7 +7870,7 @@ impl Store {
     /// whole install rather than a property of any voice. Absent — or
     /// unreadable, which a hand-edited or future-version value could be —
     /// means [`Aggregate::Max`](crate::calib::Aggregate::Max): the rule every
-    /// version before 0.11.9 used. A store that has learned nothing must
+    /// version before 0.12.0 used. A store that has learned nothing must
     /// behave exactly as it did before this existed, and a bad value must cost
     /// the learned rule rather than the label.
     pub fn learned_aggregate(&self) -> Result<crate::calib::Aggregate> {
@@ -7723,7 +7893,7 @@ impl Store {
         )? > 0)
     }
 
-    // ---- 0.11.9: prototypes ground truth condemns -------------------------
+    // ---- 0.12.0: prototypes ground truth condemns -------------------------
 
     /// Every prototype whose **own source segment** Discord says was somebody
     /// else talking.
@@ -8077,7 +8247,7 @@ mod tests {
 
     // ---- Step 1 behaviour, unchanged -------------------------------------
 
-    // ---- 0.11.9 (schema v14): which instance a session was -----------------
+    // ---- 0.12.0 (schema v14): which instance a session was -----------------
 
     #[test]
     fn two_copies_of_one_app_share_a_source_and_no_longer_share_an_identity() {
@@ -8349,7 +8519,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 0.11.9 (v15). Two nullable columns is the easy half; the half that can
+    /// 0.12.0 (v15). Two nullable columns is the easy half; the half that can
     /// actually break is the **view**.
     ///
     /// `speaker_resolved` has existed since v2 and every read path in this file
@@ -9810,7 +9980,7 @@ mod tests {
         );
     }
 
-    // ---- v15: highlighted people (0.11.9) --------------------------------
+    // ---- v15: highlighted people (0.12.0) --------------------------------
 
     #[test]
     fn a_voice_is_unhighlighted_until_somebody_picks_it_out() {
@@ -10848,7 +11018,7 @@ mod tests {
         assert!(s.installed_projection().unwrap().is_none());
     }
 
-    // ---- 0.11.9: the learned aggregate, and prototype repair --------------
+    // ---- 0.12.0: the learned aggregate, and prototype repair --------------
 
     #[test]
     fn a_store_where_nothing_was_learned_scores_a_voice_on_its_best_prototype() {

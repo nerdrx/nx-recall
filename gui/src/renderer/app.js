@@ -22,7 +22,7 @@ import {
   ask,
 } from './lib/store.js';
 import { patchSpeakerLabels } from './lib/labels.js';
-// 0.11.9 — the half of a relabel lib/labels.js does not know about, and the
+// 0.12.0 — the half of a relabel lib/labels.js does not know about, and the
 // look-up the roster brief needs for the voice that just walked in.
 import { lookOf, iconSpan, paintHighlights } from './views/highlight.js';
 import { toast } from './lib/sheets.js';

@@ -16,7 +16,7 @@
 // no way to scroll into any.
 
 import { h, clear, speakerColor } from './lib/dom.js';
-// 0.11.9 — per-person highlights. This window deliberately does NOT import
+// 0.12.0 — per-person highlights. This window deliberately does NOT import
 // views/highlight.js: that module owns the picker, which pulls in lib/sheets.js
 // and a sheet root this document does not have. All it needs is the same two
 // answers, and both are plain store selectors.

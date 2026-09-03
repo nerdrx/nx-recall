@@ -1,4 +1,4 @@
-//! What is in the archive that the live route never saw? (0.11.9)
+//! What is in the archive that the live route never saw? (0.12.0)
 //!
 //! Run against a **copy** of a real database — never the live one:
 //!
@@ -163,7 +163,7 @@ fn main() -> Result<()> {
     let mut asked: Vec<&Row> = Vec::new();
     let mut pre: BTreeMap<(&str, &str), usize> = BTreeMap::new();
     for row in &rows {
-        let p = asr_cjk::pre_route(row.declared.as_ref(), row.text.as_deref());
+        let p = asr_cjk::pre_route(row.declared.as_ref(), row.text.as_deref(), &asr_cfg);
         let name = match p {
             Pre::Nothing => "nothing",
             Pre::Direct(_) => "declared",

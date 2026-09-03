@@ -1,4 +1,4 @@
-// Per-person highlights, renderer side (0.11.9).
+// Per-person highlights, renderer side (0.12.0).
 //
 // A person may pin one palette TOKEN and one short emoji to a voice, and both
 // then follow that voice everywhere a name is drawn — the transcript, search,

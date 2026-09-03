@@ -305,7 +305,7 @@ select.input option, select.input optgroup {
 .seg .who { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .seg .who .dot { width: 8px; height: 8px; }
 /* `min-width: 0` is what actually buys the ellipsis. A flex item's floor is
-   `auto` — its longest unbreakable run — so before 0.11.9 the name column got
+   `auto` — its longest unbreakable run — so before 0.12.0 the name column got
    away with it only because the dot is 8px and there was nothing else in the
    row to compete. An emoji in front of the name (`.sp-icon`) is a second
    `flex: none` item eating that 148px, and without this the name would push
@@ -342,7 +342,7 @@ select.input option, select.input optgroup {
    THE NEXT TWO RULES DELIBERATELY OVERRIDE THE INLINE SPEAKER COLOUR, and that
    is load-bearing rather than incidental. `segRow` writes `color:` straight
    onto `.nm`; these win because they are more specific, and they have to: a row
-   whose speaker is a GUESS must not be painted as a confident identity. 0.11.9
+   whose speaker is a GUESS must not be painted as a confident identity. 0.12.0
    made that matter twice over — a person's chosen highlight is the most
    confident-looking thing this app can put on a name, and pinning one to a
    voice must never make a doubted row look certain. That is also why
@@ -368,7 +368,7 @@ select.input option, select.input optgroup {
 .seg.you .who .nm:not(.reasoned):hover { border-bottom-color: currentColor; }
 
 /* ------------------------------------------------- per-person highlights -- */
-/* 0.11.9. A person pins a palette token and an emoji to a voice and both then
+/* 0.12.0. A person pins a palette token and an emoji to a voice and both then
    follow it everywhere a name is drawn. Two rules do the whole visual job; the
    arithmetic is in lib/palette.js and the decision of WHICH rows wear it is in
    views/highlight.js (`markRow`).

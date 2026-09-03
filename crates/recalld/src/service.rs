@@ -4307,7 +4307,7 @@ impl Service {
 
     // ---- end 0.11.0 -------------------------------------------------------
 
-    /// `identity.repair` (0.11.9): throw out prototypes that are recordings of
+    /// `identity.repair` (0.12.0): throw out prototypes that are recordings of
     /// somebody else.
     ///
     /// `prototypes` is required and spelled out rather than assumed, exactly
@@ -5893,7 +5893,7 @@ mod tests {
         );
     }
 
-    // ---- 0.11.9 (schema 15): highlighted people --------------------------
+    // ---- 0.12.0 (schema 15): highlighted people --------------------------
 
     /// Set both halves, and check the highlight arrives everywhere a name does.
     /// Shaped after `a_voices_languages_are_set_listed_and_broadcast`, because
