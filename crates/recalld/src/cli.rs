@@ -515,6 +515,42 @@ pub enum TruthAction {
     },
     /// How right the voicebank was, marked by Discord.
     Report,
+    // ---- 0.11.9: retro-labelling from ground truth ------------------------
+    /// Name the turns the voicebank left blank, on Discord's word. Previews
+    /// unless `--apply`.
+    #[command(long_about = "\
+Name the turns the voicebank left blank, on Discord's word.
+
+A turn qualifies only when three things are already true and none of them is
+decided here: Discord's verdict for it is `single` (one account covered at
+least 80% of it and nobody else reached 20%), that account is already linked to
+a voice, and the identity ladder gave the turn no speaker at all. The label is
+written with `label_via = \"truth\"` and no `match_score`, because nothing was
+compared — the same shape a proximity inheritance carries.
+
+What it will not do, by construction rather than by flag:
+
+  never overwrites   a row that already has a speaker is not a candidate,
+                     whether the ladder, a person or proximity named it
+  never enrols       not one prototype comes out of this. The enrol bar is
+                     deliberately not learned, and `[truth] enrol` is the
+                     supervised route
+  never mints        only accounts already linked to a voice are read
+
+Each `--apply` run logs one `truth.label` operation per 200 rows carrying every
+segment's prior state, so the pass is reversible as a class.
+
+  (no flag)    list what it would name. Writes nothing.
+  --apply      write the labels and log the operation.")]
+    Label {
+        /// Actually write. Without it the command only lists.
+        #[arg(long)]
+        apply: bool,
+        /// Stop after this many rows.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+    },
+    // ---- end 0.11.9 -------------------------------------------------------
 }
 
 #[derive(Subcommand, Debug)]
