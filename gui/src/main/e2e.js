@@ -2981,7 +2981,17 @@ export function runE2E(deps) {
         document.getElementById('search-go').click();
         return true;
       })()`);
-      await waitFor('the pills to clear', async () => js('!window.__recallDebug.ask().shown'));
+      try {
+        await waitFor('the pills to clear', async () => ((await js('!window.__recallDebug.ask().shown')) ? true : null));
+      } catch (e) {
+        // Say WHAT is still up: the element, its hidden flag, the mounted view
+        // and the pills' text — a bare `false` cost an hour.
+        const dump = await js(`(() => {
+          const p = document.getElementById('ask-pills');
+          return JSON.stringify({ has: !!p, hidden: p?.hidden, view: window.__recallDebug.view(), pills: [...(p?.querySelectorAll('.ask-pill') ?? [])].map((x) => x.textContent), q: document.getElementById('search-q')?.value });
+        })()`);
+        throw new Error(`${e.message} · ${dump}`);
+      }
       return { facets, hits: `${before} → ${wider.hits}`, shakyHits: marked, file };
     });
 
@@ -3082,7 +3092,17 @@ export function runE2E(deps) {
         document.getElementById('search-go').click();
         return true;
       })()`);
-      await waitFor('the pills to clear', async () => js('!window.__recallDebug.ask().shown'));
+      try {
+        await waitFor('the pills to clear', async () => ((await js('!window.__recallDebug.ask().shown')) ? true : null));
+      } catch (e) {
+        // Say WHAT is still up: the element, its hidden flag, the mounted view
+        // and the pills' text — a bare `false` cost an hour.
+        const dump = await js(`(() => {
+          const p = document.getElementById('ask-pills');
+          return JSON.stringify({ has: !!p, hidden: p?.hidden, view: window.__recallDebug.view(), pills: [...(p?.querySelectorAll('.ask-pill') ?? [])].map((x) => x.textContent), q: document.getElementById('search-q')?.value });
+        })()`);
+        throw new Error(`${e.message} · ${dump}`);
+      }
       return { cites: card.cites.map((c) => c.text).join(', '), file };
     });
 
