@@ -214,6 +214,8 @@ kept and the row is flagged instead.
 
   recalld lang              how many turns are flagged, and what can settle them
   recalld lang repair       re-read the flagged ones from their audio
+  recalld lang sweep        ask the identifier about the turns captured before
+                            there was one (0.11.9; previews unless `--apply`)
 
 Repair is bounded, resumable and runs at idle priority: it is safe to run while
 the daemon is capturing, and a run that is interrupted loses nothing.
@@ -866,6 +868,78 @@ Bounded, resumable and idle-priority: the work list is a query, not a cursor.")]
         #[arg(long, value_name = "PATH")]
         dir: Option<PathBuf>,
     },
+
+    // ---- 0.11.9: the archive sweep ---------------------------------------
+    /// Ask the spoken-language identifier about the turns it was never asked
+    /// about. Previews unless `--apply`.
+    // Verbatim: the operating model is four paragraphs and clap would fuse them.
+    #[command(long_about = "\
+Ask the spoken-language identifier about the turns it was never asked about.
+
+Every language decision is made once, on the way in, by whatever was shipped
+that evening. The identifier arrived in 0.11.0, Korean and Chinese in 0.11.6,
+French and a one-second floor in 0.11.8 — and none of that reached a row
+captured before it. This walks the rows with no language, whose audio is still
+on disk, and hands each one to EXACTLY the code the live path uses: the same
+pre-filter, the same identifier, the same decoders, the same judges. A row it
+settles is indistinguishable from one the pipeline got right the first time.
+
+It is stricter than the live path in two places, and both are measured
+(FINDINGS §29). The floor is 1.5 s rather than 1.0 s, because below that the
+decoders refuse to replace anything anyway. And the identifier is asked over
+three overlapping windows rather than one, and must say the same thing all
+three times: at one window this archive's short grunts route to Korean and
+Chinese often enough to miss the 1%-of-de/en gate the routes shipped under.
+
+  recalld lang sweep            what it would do. Runs the identifier, decodes
+                                nothing, writes nothing.
+  recalld lang sweep --apply    do it: write the language, never the words.
+
+By default it does NOT replace transcripts, and that is a measurement rather
+than caution. On a German and English archive there are almost no real foreign
+turns to be right about, so the routes' small false-positive rate is nearly all
+of their output: nine rows were rewritten in the measured run and eight of the
+nine were wrong -- `Okay.` came back as a Japanese sentence. What the sweep
+writes instead is `lang`: de or en where the identifier heard one, and a mark
+meaning `asked, nothing to say` everywhere else. `--apply --redecode` turns the
+rewriting on for one run, and `[asr].lang_sweep_redecode` for good.
+
+Bounded, resumable and idle-priority: the work list is a query, not a cursor,
+and every row a model is spent on leaves it — so an interrupted run loses at
+most one row and a second run does not pay for the first one's answers again.
+The same pass runs nightly on its own while `[asr].lang_sweep` is on.
+
+`recalld models fetch --japanese` installs the identifier and the Japanese
+decoder (~605 MB); `--cjk` adds Korean and Chinese (~1.6 GB in total). The
+French half also needs the night shift's GPU decoder (`models fetch --night`
+and `models build-night`) and an idle GPU, and does nothing without them.")]
+    Sweep {
+        /// Actually write. Without it the command only reports.
+        #[arg(long)]
+        apply: bool,
+
+        /// Also let the decoders REPLACE transcripts, not just write a
+        /// language. Off by default and measured to be wrong eight times in
+        /// nine on this kind of archive (FINDINGS §29) — read what a plain
+        /// `recalld lang sweep` says it would rewrite before asking for this.
+        #[arg(long, requires = "apply")]
+        redecode: bool,
+
+        /// Rows per batch. Progress is reported once per batch.
+        #[arg(long, value_name = "N", default_value_t = 32)]
+        batch: usize,
+
+        /// Stop after this many rows have cost a MODEL — not rows looked at.
+        /// A row whose transcript is already readable is free and does not
+        /// count. Without it the walk runs to completion.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+
+        /// Use this models directory instead of `[models].dir`.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+    },
+    // ---- end 0.11.9 -------------------------------------------------------
 }
 
 #[derive(Subcommand, Debug)]

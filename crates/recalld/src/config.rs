@@ -703,6 +703,90 @@ pub struct AsrConfig {
     /// unmeasured rather than unavailable.
     pub polyglot_languages: Vec<String>,
     // ---- end 0.11.6 ---------------------------------------------------------
+    // ---- 0.11.9, the archive sweep (`crate::sweep`) -------------------------
+    /// Walk the rows captured before the routes existed — and before 0.11.8
+    /// lowered the floor — asking the identifier about each one once.
+    ///
+    /// **On**, and like every switch above it that costs nothing on a machine
+    /// which has not opted in: without `models fetch --japanese` there is no
+    /// identifier, and the pass writes nothing at all. It runs in the night
+    /// shift's clock window (see `crate::sweep::gate`) and is bounded by
+    /// `lang_sweep_rows_per_run`, so an install with ten thousand old rows
+    /// catches up over a fortnight of nights rather than in one long morning.
+    ///
+    /// `recalld lang sweep` is the same pass on demand, and previews by
+    /// default.
+    pub lang_sweep: bool,
+    /// The sweep's own identifier floor, and it may only ever be **higher**
+    /// than `lid_min_s` (`crate::sweep::routing_cfg`).
+    ///
+    /// **1.5**, against the live path's 1.0, and the gap is a measurement
+    /// (FINDINGS §29). Two independent reasons, and the second is the one that
+    /// decided the number:
+    ///
+    /// * Below 1.5 s nothing is ever *kept*. `[lang].arbiter_min_duration_s` is
+    ///   the replacement floor and the decoders refuse under it, so the 974
+    ///   archive rows between 1.0 and 1.5 s cost a model pass each and produced
+    ///   zero rewrites in the measured run. On the live path that call is still
+    ///   worth making — the row's own future translation reads `lang` — but a
+    ///   sweep paying it thousands of times for nothing is not.
+    /// * §28's 0.11% false-positive rate was measured on FLEURS, which is read
+    ///   speech. This archive is a lobby, and grunts are not read speech: a
+    ///   1.6 s "Yeah." comes back from the Japanese decoder as `びや。`, which
+    ///   is kana, which is all the script test can ask for.
+    pub lang_sweep_min_s: f32,
+    /// How many identifier windows the **sweep** asks for, at least.
+    ///
+    /// **3**, against the live path's 1, and this is the narrowing that
+    /// actually carries the round (FINDINGS §29). `crate::lid` documents
+    /// `lid_windows` as "the knob a machine that hears something the corpus did
+    /// not can turn", and this archive is exactly that machine: at one window
+    /// the sweep rewrites de/en-declared rows at 2.3%, over the 1% gate the
+    /// routes shipped under. Three overlapping windows at
+    /// `lid_min_confidence = 1.0` means a reading has to survive being asked
+    /// about three different parts of the same turn.
+    ///
+    /// It costs three model passes instead of one, at RTF 0.027 — which is a
+    /// price a nightly batch can pay and a live turn cannot, and is the whole
+    /// reason this is a separate number rather than a change to `lid_windows`.
+    pub lang_sweep_windows: usize,
+    /// Rows the sweep will *spend a model on* in one nightly run.
+    ///
+    /// Not rows scanned: a row `pre_route` declines costs a string compare, and
+    /// counting those would let an archive full of readable German starve the
+    /// pass that has to walk past them.
+    pub lang_sweep_rows_per_run: usize,
+    /// May the sweep **replace a transcript**, or only write a language?
+    ///
+    /// **False**, and this is the round's finding rather than caution
+    /// (FINDINGS §29). With every narrowing above in place, the sweep's routes
+    /// rewrote 9 rows of this archive and a hand check of all nine says **eight
+    /// of them are wrong**:
+    ///
+    /// ```text
+    /// "Yeah, uh"                      → 別に住めや
+    /// "Okay."                         → 、お疲さ
+    /// "Long, long, long, long, long." → 龙龙龙龙龙
+    /// "Oh, she has this detected      → "Je ne sais pas. Je ne sais pas si
+    ///  beim sonar."                      c'est ça que tu peux me donner."
+    /// ```
+    ///
+    /// The de/en false-positive rate is 0.97%, inside the 1% gate §22 and §28
+    /// shipped under — and that gate is not sufficient here, which is the thing
+    /// worth writing down. It was written for a *live* route, where the rows
+    /// that clear it are overwhelmingly real foreign turns and the false
+    /// positives are the residue. On an archive of German and English lobby
+    /// audio there are almost no real foreign turns to be right about, so the
+    /// same rate is nearly the whole of the output: **precision among rewrites
+    /// is 1 in 9.** A rate that is fine as a tax on a benefit is not fine as a
+    /// substitute for one.
+    ///
+    /// So the sweep ships doing the half that cannot lie: it writes `lang` and
+    /// never a word. Turning this on is supported, is what `recalld lang sweep
+    /// --apply --redecode` does for one run, and should be preceded by reading
+    /// what `recalld lang sweep` says it would rewrite.
+    pub lang_sweep_redecode: bool,
+    // ---- end 0.11.9 ---------------------------------------------------------
     // ---- 0.11.0, partial turns (`crate::partial`) --------------------------
     /// Publish provisional `partial` events while a turn is still open, so a
     /// caption bar can show words before the person has stopped talking.
@@ -754,6 +838,13 @@ impl Default for AsrConfig {
                 .map(|l| l.to_string())
                 .collect(),
             // ---- end 0.11.6 -----------------------------------------------
+            // ---- 0.11.9, the archive sweep --------------------------------
+            lang_sweep: true,
+            lang_sweep_min_s: 1.5,
+            lang_sweep_windows: 3,
+            lang_sweep_rows_per_run: 400,
+            lang_sweep_redecode: false,
+            // ---- end 0.11.9 -----------------------------------------------
             // ---- 0.11.0, partial turns ------------------------------------
             // OFF, and the reason is measured (FINDINGS §20). Convergence
             // passed handsomely — 96.4% of the last partial's words survive

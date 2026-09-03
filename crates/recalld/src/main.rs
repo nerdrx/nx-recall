@@ -161,6 +161,23 @@ fn main() -> Result<()> {
             LangAction::Repair { batch, limit, dir } => {
                 cmd_lang_repair(&cfg, &data_dir, dir.as_deref(), batch, limit)
             }
+            // ---- 0.11.9, the archive sweep ------------------------------
+            LangAction::Sweep {
+                apply,
+                redecode,
+                batch,
+                limit,
+                dir,
+            } => cmd_lang_sweep(
+                &cfg,
+                &data_dir,
+                dir.as_deref(),
+                apply,
+                redecode,
+                batch,
+                limit,
+            ),
+            // ---- end 0.11.9 ----------------------------------------------
         },
         // ---- 0.11.0, source-aware identity -----------------------------
         Command::Identity { action } => cmd_identity(&cfg, &data_dir, action),
@@ -560,6 +577,29 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
             .map_err(|e| warn!("no night shift: {e}"))
             .ok()
     };
+    // ---- 0.11.9: the archive language sweep -------------------------------
+    // Its own thread rather than a second pass inside the night shift's, and
+    // the reason is the one gate the two do not share: the night shift needs a
+    // gigabyte of whisper and a local compile before it can do anything at all,
+    // and the CJK half of this needs a 13 MB identifier. Folding it in would
+    // have made `[night].enabled = false` — the shipped default — silently turn
+    // off a feature that has nothing to do with the night shift's model.
+    let sweep_stop = Arc::new(NightStop::default());
+    let sweep_thread = {
+        let store = Arc::clone(&store);
+        let control = Arc::clone(&control);
+        let bus = Arc::clone(&bus);
+        let root = models_root.clone();
+        let dir = data_dir.to_path_buf();
+        let whole = cfg.clone();
+        let stop = Arc::clone(&sweep_stop);
+        std::thread::Builder::new()
+            .name("recalld-sweep".into())
+            .spawn(move || recalld::sweep::run(store, control, bus, root, dir, whole, stop))
+            .map_err(|e| warn!("no archive language sweep: {e}"))
+            .ok()
+    };
+    // ---- end 0.11.9 -------------------------------------------------------
     // ---- 0.9.0, the assistant ------------------------------------------
     // Two threads. The scheduler is a query every thirty seconds and no model
     // at all, so it runs whatever else is switched off; the digest and
@@ -646,6 +686,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     quality_stop.stop();
     truth_stop.stop();
     night_stop.stop();
+    sweep_stop.stop();
     reminder_stop.stop();
     assist_stop.stop();
     if let Some(s) = socket {
@@ -661,6 +702,8 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         quality_thread,
         truth_thread,
         night_thread,
+        // 0.11.9.
+        sweep_thread,
         // 0.9.0.
         reminder_thread,
         assist_thread,
@@ -1787,6 +1830,29 @@ fn cmd_lang_status(cfg: &Config, data_dir: &Path, dir: Option<&Path>) -> Result<
             models::FALLBACK_ASR.note
         );
     }
+    // ---- 0.11.9: the archive sweep ---------------------------------------
+    // Printed before the flagged count and unconditionally, because the two
+    // backlogs are disjoint and an empty one of them says nothing about the
+    // other: `repair` walks rows marked as a disagreement, `sweep` walks rows
+    // nobody ever asked a model about at all.
+    let sweep_cfg = recalld::sweep::routing_cfg(&cfg.asr);
+    let (owed, swept) = store.lang_sweep_counts(sweep_cfg.lid_min_s)?;
+    println!(
+        "{:<20}{:.1} s and {} identifier window(s) that must agree",
+        "sweep bar", sweep_cfg.lid_min_s, sweep_cfg.lid_windows
+    );
+    println!(
+        "{:<20}{owed} never asked about, {swept} already swept",
+        "sweep"
+    );
+    if owed > 0 {
+        if models.lid().present() {
+            println!("`recalld lang sweep` shows what asking would do.");
+        } else {
+            println!("  {}", recalld::lid::how_to_get_it());
+        }
+    }
+    // ---- end 0.11.9 -------------------------------------------------------
     println!("{:<20}{flagged}", "flagged");
     if flagged == 0 {
         println!("nothing to repair.");
@@ -1883,6 +1949,173 @@ fn cmd_lang_repair(
     println!(
         "{after} still flagged{}",
         if report.scanned > 0 && after > 0 && limit.is_some() {
+            " — run it again to continue"
+        } else {
+            ""
+        }
+    );
+    Ok(())
+}
+
+/// `recalld lang sweep [--apply]` — the archive sweep (0.11.9).
+///
+/// In THIS process, like the repair above it and for the same two reasons: it
+/// is a long batch job that has to be niceable and Ctrl-C-able, and it loads
+/// models the daemon may not have resident. It opens its own connection to the
+/// same database, which is safe while the daemon is capturing — SQLite
+/// serialises the writes and each one here is a single row.
+#[allow(clippy::too_many_arguments)]
+fn cmd_lang_sweep(
+    cfg: &Config,
+    data_dir: &Path,
+    dir: Option<&Path>,
+    apply: bool,
+    redecode: bool,
+    batch: usize,
+    limit: Option<usize>,
+) -> Result<()> {
+    use std::sync::{Arc, Mutex};
+
+    let root = fetch::target_dir(dir, &cfg.models, data_dir);
+    let models = ModelSet::resolve_at(root, &cfg.models);
+    if !models.lid().present() {
+        println!("{}", recalld::lid::how_to_get_it());
+        return Ok(());
+    }
+    // Idle priority, no CPU pinning — the semantic backfill's rule and the
+    // repair's: a batch job competing with a live capture never wins a
+    // timeslice from a frame.
+    pipeline::deprioritise_current_thread(19, &[]);
+
+    let store = Arc::new(Mutex::new(Store::open(data_dir)?));
+    let lang_cfg = cfg.lang.clone();
+    // `--redecode` turns the rewriting on for THIS run only; without it the
+    // config decides, and the config ships with it off (FINDINGS §29).
+    let asr_cfg = recalld::config::AsrConfig {
+        lang_sweep_redecode: redecode || cfg.asr.lang_sweep_redecode,
+        ..cfg.asr.clone()
+    };
+    let pass = recalld::sweep::Pass::new(&store, None, data_dir, &asr_cfg, &lang_cfg, apply);
+    // BOTH routers from the pass's own config, never the operator's: the
+    // identifier is built from `lid_windows` once, at construction, and a
+    // router built from the live config would be looser than the pass thinks.
+    let mut cjk = recalld::asr_cjk::Cjk::new(&models, pass.asr_cfg());
+    let mut poly =
+        recalld::polyglot::Polyglot::new(&models, pass.asr_cfg(), &cfg.night, &cfg.runtime);
+    let floor = pass.asr_cfg().lid_min_s;
+    let (owed, swept) = {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        guard.lang_sweep_counts(floor)?
+    };
+    println!(
+        "{owed} untagged turn(s) at or above {floor} s with audio to read; {swept} already swept"
+    );
+    if owed == 0 {
+        return Ok(());
+    }
+    if pass.redecode {
+        if let Some(note) = poly.startup_note(pass.asr_cfg()) {
+            println!("  {note}");
+        }
+    } else {
+        println!(
+            "  transcripts will NOT be replaced — only `lang` is written. \
+             Eight of the nine rewrites this measured were wrong (FINDINGS §29); \
+             `--apply --redecode` turns it on anyway."
+        );
+    }
+    if !apply {
+        println!("previewing — the identifier will run, nothing will be decoded or written.");
+    }
+
+    let started = std::time::Instant::now();
+    let never = || false;
+    let report = recalld::sweep::run_pass(&pass, &mut cjk, &mut poly, batch, limit, &never, |r| {
+        eprint!(
+            "\r  {} scanned, {} asked, {} settled\x1b[K",
+            r.scanned,
+            r.asked,
+            r.settled()
+        );
+    })?;
+    eprintln!();
+
+    println!(
+        "scanned {} in {:.1}s; {} cost a model pass",
+        report.scanned,
+        started.elapsed().as_secs_f64(),
+        report.asked,
+    );
+    if apply {
+        for (tag, n) in &report.routed {
+            println!("  {n:>6}  re-decoded as {tag}");
+        }
+        for (tag, n) in &report.stamped {
+            println!("  {n:>6}  stamped {tag} off the reading alone; the words are untouched");
+        }
+        if report.marked > 0 {
+            println!(
+                "  {:>6}  asked, nothing to act on; marked so they are not asked again",
+                report.marked
+            );
+        }
+    } else {
+        // The preview's two tables: what was heard, and what would have been
+        // acted on. The second is a strict subset of the first and the gap
+        // between them is the point — most of what the identifier says is
+        // something nothing here does anything about.
+        println!("what the identifier heard:");
+        let mut heard: Vec<(&String, &usize)> = report.heard.iter().collect();
+        heard.sort_by(|a, b| b.1.cmp(a.1));
+        for (tag, n) in heard.iter().take(12) {
+            println!("  {n:>6}  {tag}");
+        }
+        println!(
+            "what the routes would re-decode{}:",
+            if pass.redecode {
+                ""
+            } else {
+                ", if --redecode were given"
+            }
+        );
+        if report.would_route.is_empty() {
+            println!("  {:>6}  nothing", 0);
+        }
+        for (tag, n) in &report.would_route {
+            println!("  {n:>6}  {tag}");
+        }
+        let stampable: usize = report
+            .heard
+            .iter()
+            .filter(|(tag, _)| recalld::sweep::STAMPABLE.contains(&tag.as_str()))
+            .map(|(_, n)| *n)
+            .sum();
+        println!("  {stampable:>6}  would be stamped de/en; the rest marked and left alone");
+        println!("`recalld lang sweep --apply` does it.");
+    }
+    for (n, line) in [
+        (
+            report.left_alone,
+            "already readable, or a voice pinned to a language another pass owns — free, and \
+             never marked",
+        ),
+        (
+            report.unavailable,
+            "the identifier would not load; nothing was written, so a later run still has them",
+        ),
+        (report.no_audio, "the audio is gone"),
+    ] {
+        if n > 0 {
+            println!("  {n:>6}  {line}");
+        }
+    }
+    let (left, _) = {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        guard.lang_sweep_counts(floor)?
+    };
+    println!(
+        "{left} still owed{}",
+        if left > 0 && limit.is_some() {
             " — run it again to continue"
         } else {
             ""
