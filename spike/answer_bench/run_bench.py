@@ -25,6 +25,15 @@ wrong, which is why `must_cite` is in the case file and is checked.
 
     chrt -i 0 taskset -c 28-31 nice -n 19 python3 spike/answer_bench/run_bench.py
 
+The Japanese cases (0.11.x) are their own run and their own gate — 3/3 traps
+and >= 2/3 right citations, over `c11_ja` — because they measure a different
+question: not "will it refuse" but "can this model do the language at all".
+Bare, the runner is the de/en set it has always been.
+
+    ... python3 spike/answer_bench/run_bench.py --lang ja
+
+`NXR_BENCH_CORES` picks the cores; 28-31 by default, as before.
+
 The prompts, the grammars and the stopword list are NOT restated here. They are
 exported from the Rust constants by
 `answer::tests::the_bench_runs_the_prompts_this_daemon_ships`, which fails if
@@ -35,6 +44,7 @@ what ships, and cannot quietly become a measurement of something else.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -51,6 +61,7 @@ VERDICT_CHECK = (HERE / "answerable.check.txt").read_text()
 ANSWER_SYS = {
     "de": (HERE / "answer.de.txt").read_text(),
     "en": (HERE / "answer.en.txt").read_text(),
+    "ja": (HERE / "answer.ja.txt").read_text(),
 }
 ANSWER_TMPL = (HERE / "answer.gbnf.tmpl").read_text()
 SCAFFOLDING = set((HERE / "scaffolding.txt").read_text().split())
@@ -58,7 +69,14 @@ SCAFFOLDING = set((HERE / "scaffolding.txt").read_text().split())
 VERDICT_TOKENS = 24
 ANSWER_TOKENS = 200
 MIN_OVERLAP = 2
+# `crate::answer::MIN_OVERLAP_CJK`. A Japanese sentence split on whitespace is
+# one token, so the word check has no teeth on it; the unit is a character
+# bigram and the threshold is three.
+MIN_OVERLAP_CJK = 3
 MAX_ROW_CHARS = 320
+
+# Which cores. The machine this runs on is not always free on 28-31.
+CORES = os.environ.get("NXR_BENCH_CORES", "28-31")
 
 # The transcript, flattened to id -> row, exactly as `crate::answer::Row`.
 DOC = json.loads((HERE / "transcript.json").read_text())
@@ -87,7 +105,7 @@ def _call(system: str, prompt: str, grammar: str, tokens: int):
     """One llama-cli invocation, argument for argument what `crate::llm` runs."""
     gpath = HERE / ".grammar.tmp"
     gpath.write_text(grammar)
-    cmd = ["chrt", "-i", "0", "taskset", "-c", "28-31", "nice", "-n", "19",
+    cmd = ["chrt", "-i", "0", "taskset", "-c", CORES, "nice", "-n", "19",
            str(CLI), "-m", str(MODEL), "-t", "4", "--temp", "0",
            "-n", str(tokens), "--single-turn",
            "--grammar-file", str(gpath),
@@ -112,6 +130,37 @@ def fold(w: str) -> str:
     for a, b in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
         w = w.replace(a, b)
     return w
+
+
+def is_japanese(text: str) -> bool:
+    """`crate::ask::is_japanese_text`."""
+    kana = han = latin = 0
+    for ch in text:
+        n = ord(ch)
+        if 0x3040 <= n <= 0x30FF or 0x31F0 <= n <= 0x31FF or 0xFF66 <= n <= 0xFF9D:
+            kana += 1
+        elif 0x3400 <= n <= 0x4DBF or 0x4E00 <= n <= 0x9FFF or 0xF900 <= n <= 0xFAFF:
+            han += 1
+        elif ch.isalpha():
+            latin += 1
+    return kana >= 2 or (kana >= 1 and han >= 1) or (han >= 1 and latin == 0 and kana == 0)
+
+
+def bigrams(text: str) -> set[str]:
+    """`crate::answer::bigrams`: NFKC, then every adjacent pair of characters
+    inside each run of letters and digits. Punctuation is a boundary."""
+    out = set()
+    run = ""
+    for ch in unicodedata.normalize("NFKC", text).lower() + " ":
+        if ch.isalnum():
+            run += ch
+            continue
+        if len(run) == 1:
+            out.add(run)
+        for i in range(len(run) - 1):
+            out.add(run[i:i + 2])
+        run = ""
+    return out
 
 
 def content_words(text: str) -> set[str]:
@@ -145,9 +194,14 @@ def check(value: dict, ids: list[int]) -> tuple[str | None, list[int], str]:
     if not cites:
         return None, [], "no citations"
     cited = " ".join(ROWS[i]["text"] for i in cites)
-    shared = content_words(text) & content_words(cited)
-    if len(shared) < MIN_OVERLAP:
-        return None, cites, f"only {len(shared)} content word(s) in common with the cited rows"
+    if is_japanese(text):
+        shared = bigrams(text) & bigrams(cited)
+        floor, unit = MIN_OVERLAP_CJK, "bigram"
+    else:
+        shared = content_words(text) & content_words(cited)
+        floor, unit = MIN_OVERLAP, "content word"
+    if len(shared) < floor:
+        return None, cites, f"only {len(shared)} {unit}(s) in common with the cited rows"
     return text, cites, ""
 
 
@@ -168,7 +222,7 @@ def run_case(case) -> tuple[dict, float]:
         return {"refused": "the transcript does not say"}, dt
 
     tag = case["lang"]
-    label = "Frage" if tag == "de" else "Question"
+    label = {"de": "Frage", "ja": "質問"}.get(tag, "Question")
     grammar = ANSWER_TMPL.replace("%IDS%", " | ".join(f'"{i}"' for i in ids))
     body, dt2, raw2 = _call(ANSWER_SYS[tag], f"{label}: {case['q']}\n\n{page}",
                             grammar, ANSWER_TOKENS)
@@ -181,8 +235,22 @@ def run_case(case) -> tuple[dict, float]:
     return {"answer": text, "citations": cites}, dt + dt2
 
 
+# (traps needed, right-citation positives needed) per subset.
+GATES = {None: (11, 9), "ja": (3, 2)}
+
+
 def main() -> int:
+    only = None
+    if "--lang" in sys.argv:
+        only = sys.argv[sys.argv.index("--lang") + 1]
     gold = json.loads((HERE / "cases.json").read_text())["cases"]
+    if only:
+        gold = [c for c in gold if c["lang"] == only]
+    elif "ja" in {c["lang"] for c in gold}:
+        # The de/en gate is a measurement of the de/en set; the Japanese cases
+        # have their own gate and are run with `--lang ja`.
+        gold = [c for c in gold if c["lang"] != "ja"]
+    need_traps, need_cites = GATES[only if only in GATES else None]
     if not CLI.is_file() or not MODEL.is_file():
         print(f"missing {CLI} or {MODEL}")
         return 2
@@ -233,11 +301,11 @@ def main() -> int:
         print(line)
 
     n = len(gold)
-    print(f"\n  traps refused          : {traps_ok}/{traps_n}   <- the gate (>= 11)")
+    print(f"\n  traps refused          : {traps_ok}/{traps_n}   <- the gate (>= {need_traps})")
     print(f"  answerable answered    : {pos_ok}/{pos_n}")
-    print(f"  ...with right citations: {cite_ok}/{pos_n}   <- the gate (>= 9)")
+    print(f"  ...with right citations: {cite_ok}/{pos_n}   <- the gate (>= {need_cites})")
     print(f"  sec/case               : median {sorted(times)[n // 2]:.1f}  max {max(times):.1f}")
-    passed = traps_ok >= 11 and cite_ok >= 9
+    passed = traps_ok >= need_traps and cite_ok >= need_cites
     print(f"\n  GATE: {'PASS' if passed else 'FAIL'}")
     return 0 if passed else 1
 
