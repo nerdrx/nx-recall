@@ -98,7 +98,7 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // undo. `colour` is a token from `crate::palette`, not a hex, so the same
 // highlight is legible on both of NX Clear's grounds and in the headset
 // overlay, which has no CSS to resolve one with. See `apply_v15`.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -189,9 +189,10 @@ pub mod lang_via {
     ///
     /// Like [`CONTEXT`] it is an inference and the words were not re-decoded.
     pub const GUESSED: &str = "guessed";
-    /// The archive sweep (0.12.0, `crate::sweep`) asked the spoken-language
-    /// identifier about a row nothing could read, and the answer was not one
-    /// the routes act on.
+    /// The archive sweep (0.12.0, `crate::sweep`) heard `de` or `en` on a row
+    /// whose words nobody could read — the two languages the routes
+    /// deliberately leave alone, so the honest record is the reading itself and
+    /// no new words.
     ///
     /// An eighth value rather than a seventh use of [`crate::asr_cjk::
     /// LANG_VIA_LID`], and the difference is what was *done*: `lid` means a
@@ -200,16 +201,14 @@ pub mod lang_via {
     /// words came out of a language-specific decoder" would be wrong about
     /// every one of these rows.
     ///
-    /// It is written in **two shapes**, and both are on purpose:
-    ///
-    /// * with `lang` set, on a row the identifier heard as `de` or `en` —
-    ///   languages the routes deliberately leave alone, so the honest record is
-    ///   the reading itself and no new words;
-    /// * with `lang` still NULL, on a row the identifier heard as something
-    ///   nothing can act on (or had no opinion about). Nothing is claimed; the
-    ///   mark exists so a bounded, resumable sweep does not pay for the same
-    ///   model pass every night. The same shape, and the same reason, as
-    ///   [`MISMATCH`].
+    /// **Always with `lang` set.** 0.11.9 also wrote it bare, with `lang` still
+    /// NULL, as an "asked, nothing to say" mark — and that second shape is why
+    /// the sweep could not finish: a `lang_via` cannot say both "this is how
+    /// the language got here" and "this pass has been here", and the rows that
+    /// needed only the second answer got neither. Schema v16 moved the
+    /// bookkeeping to `segments.sweep_at_ns` and renamed the existing bare
+    /// marks into it (`Store::apply_v16`), leaving this value meaning one
+    /// thing.
     ///
     /// Deliberately **not** counted as evidence by
     /// [`super::Store::thread_language_stamps`]: one second of audio nobody
@@ -1177,6 +1176,11 @@ impl Store {
         // order the chain is documented in, and a reader tracing v13 → v14 →
         // v15 should find them in that order.
         self.apply_v15()?;
+
+        // ---- 0.12.1 (schema v16): when the language sweep was last here ----
+        // One nullable column on `segments`, and a backfill that is a rename
+        // rather than a computation. See `apply_v16`.
+        self.apply_v16()?;
         // ---- end 0.12.0 ---------------------------------------------------
 
         match current {
@@ -1942,10 +1946,16 @@ impl Store {
     // ---- analysis --------------------------------------------------------
 
     pub fn set_segment_analysis(&self, segment_id: i64, a: &SegmentAnalysis) -> Result<()> {
+        // `sweep_at_ns = NULL` for [`Self::clear_segment_sweep`]'s reason: the
+        // archive sweep's pre-filter reads this text, so a row whose words have
+        // just been written is a row nobody has pre-filtered. Almost always a
+        // no-op — a segment normally reaches this call once, before any sweep
+        // has been near it — and it is here so that the invariant holds on the
+        // one path where it does not: a row re-analysed after `replay`.
         self.conn.execute(
             "UPDATE segments
              SET text = ?2, lang = ?3, lang_via = ?4, asr_model_id = ?5, overlap_frac = ?6,
-                 text_via = 'live'
+                 text_via = 'live', sweep_at_ns = NULL
              WHERE id = ?1",
             params![
                 segment_id,
@@ -2155,10 +2165,17 @@ impl Store {
         // flag on a transcript that has since been replaced is a claim nobody
         // ever checked. The confidence pass picks the row up again on its next
         // walk, against the new text.
+        // `sweep_at_ns` goes with them, and for the third version of the same
+        // reason (0.12.1). The archive sweep's cheapest decision is a read of
+        // this very text — `pre_route` declines a row whose transcript already
+        // reads as something — so a row whose words have just changed is a row
+        // nobody has pre-filtered. Left set, a turn re-decoded into readable
+        // German would be declined for ever on the strength of the unreadable
+        // mumble it used to be.
         self.conn.execute(
             "UPDATE segments
              SET text = ?2, asr_model_id = ?3, text_via = ?4, redecode_at_ns = ?5,
-                 asr_confidence = NULL, confidence_at_ns = NULL
+                 asr_confidence = NULL, confidence_at_ns = NULL, sweep_at_ns = NULL
              WHERE id = ?1 AND deleted_at IS NULL",
             params![segment_id, text, asr_model_id, via, at_utc_ns],
         )?;
@@ -2544,23 +2561,19 @@ impl Store {
                  FROM segments g
                  WHERE g.deleted_at IS NULL
                    AND g.lang IS NULL
-                   AND (g.lang_via IS NULL OR g.lang_via NOT IN (?1, ?2))
+                   AND g.sweep_at_ns IS NULL
+                   AND (g.lang_via IS NULL OR g.lang_via != ?1)
                    AND g.audio_path <> ''
-                   AND g.t_end_ns - g.t_start_ns >= ?3
+                   AND g.t_end_ns - g.t_start_ns >= ?2
                    AND NOT EXISTS (
                        SELECT 1 FROM operations o
                        WHERE o.op = 'segments.correct'
                          AND o.target_ids = '[' || g.id || ']')
                  ORDER BY g.t_start_ns
-                 LIMIT ?4",
+                 LIMIT ?3",
             )?
             .query_map(
-                params![
-                    lang_via::SWEEP,
-                    lang_via::MISMATCH,
-                    min_ns,
-                    limit.max(1) as i64
-                ],
+                params![lang_via::MISMATCH, min_ns, limit.max(1) as i64],
                 |r| {
                     let languages: Option<String> = r.get(4)?;
                     Ok(SweepCandidate {
@@ -2578,11 +2591,17 @@ impl Store {
     /// How much archive the sweep still owes at a given floor, and how much it
     /// has already been over: `(owed, swept)`.
     ///
-    /// The first half is [`Self::segments_for_lang_sweep`]'s own filter, so a
-    /// status line can never claim a backlog the walk would not actually visit.
-    /// The second deliberately does **not** carry the `lang IS NULL` test: a
-    /// row the sweep stamped `de` has a language now, and counting it as
-    /// unswept would make a finished sweep look like it had done nothing.
+    /// The first half is [`Self::segments_for_lang_sweep`]'s own filter, term
+    /// for term, so a status line can never claim a backlog the walk would not
+    /// actually visit — and, since 0.12.1, so that "0 owed" is reachable at
+    /// all. Up to 0.12.0 this counted every row the pass had *declined for
+    /// free*, which on the live install was 1,729 of 1,782: the same number was
+    /// printed after every run, and there was no way to tell a sweep that had
+    /// finished from one that had not started.
+    ///
+    /// The second half counts visits, not stamps, and deliberately carries no
+    /// `lang IS NULL` test: a row the sweep stamped `de` has a language now,
+    /// and counting it as unswept would make a finished sweep look idle.
     pub fn lang_sweep_counts(&self, min_duration_s: f32) -> Result<(i64, i64)> {
         let min_ns = (min_duration_s.max(0.0) as f64 * 1e9) as i64;
         Ok(self
@@ -2590,34 +2609,79 @@ impl Store {
             .query_row(
                 "SELECT
                    SUM(CASE WHEN g.lang IS NULL
-                             AND (g.lang_via IS NULL OR g.lang_via NOT IN (?1, ?2))
+                             AND g.sweep_at_ns IS NULL
+                             AND (g.lang_via IS NULL OR g.lang_via != ?1)
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM operations o
+                                 WHERE o.op = 'segments.correct'
+                                   AND o.target_ids = '[' || g.id || ']')
                             THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN g.lang_via = ?1 THEN 1 ELSE 0 END)
+                   SUM(CASE WHEN g.sweep_at_ns IS NOT NULL THEN 1 ELSE 0 END)
                  FROM segments g
                  WHERE g.deleted_at IS NULL
                    AND g.audio_path <> ''
-                   AND g.t_end_ns - g.t_start_ns >= ?3",
-                params![lang_via::SWEEP, lang_via::MISMATCH, min_ns],
+                   AND g.t_end_ns - g.t_start_ns >= ?2",
+                params![lang_via::MISMATCH, min_ns],
                 |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
             )
             .map(|(a, b)| (a.unwrap_or(0), b.unwrap_or(0)))?)
     }
 
-    /// The sweep has been to this row and had nothing to write on it.
+    /// The sweep has been to this row — **whatever** it concluded.
     ///
-    /// `lang` is left exactly as it was — NULL — because nothing was learned;
-    /// only `lang_via` moves, and only from NULL. The `lang IS NULL` guard in
-    /// the statement is not belt-and-braces: between the gather and the write
-    /// the live pipeline may have settled the very same row, and a mark that
-    /// overwrote a real `lang_via` would hide how that row's language got
-    /// there.
-    pub fn mark_segment_swept(&self, segment_id: i64) -> Result<()> {
+    /// Written for every outcome, including the free one where the text
+    /// pre-filter declined the row without opening its audio, because that is
+    /// the outcome the 0.12.0 bookkeeping lost: a row nothing can be done about
+    /// today is not a row the sweep owes today.
+    ///
+    /// It touches `sweep_at_ns` and nothing else. That is the property that
+    /// makes marking a declined row safe, and it is the answer to the reason
+    /// 0.11.9 refused to mark them at all: no other pass reads this column, so
+    /// a mark blocks no future decision about the row, and the mark is cleared
+    /// the moment either thing [`crate::asr_cjk::pre_route`] reads actually
+    /// moves — see [`Self::clear_segment_sweep`] and
+    /// [`Self::clear_speaker_sweep`].
+    pub fn mark_segment_swept(&self, segment_id: i64, at_utc_ns: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE segments SET lang_via = ?2
-             WHERE id = ?1 AND lang IS NULL AND deleted_at IS NULL",
-            params![segment_id, lang_via::SWEEP],
+            "UPDATE segments SET sweep_at_ns = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            params![segment_id, at_utc_ns],
         )?;
         Ok(())
+    }
+
+    /// This row is owed a sweep again: something [`crate::asr_cjk::pre_route`]
+    /// reads has changed.
+    ///
+    /// Called from the two writes that can change it — the transcript
+    /// ([`Self::set_segment_text_via`], [`Self::set_segment_analysis`]) and the
+    /// row's voice ([`Self::set_segment_speaker_via`]) — rather than from the
+    /// sweep, which is the only way a mark can be safe: the pass that
+    /// invalidates the answer is the pass that knows it did.
+    ///
+    /// Cheap enough to call unconditionally. It is one indexed `UPDATE` against
+    /// a column almost every row has as NULL already.
+    pub fn clear_segment_sweep(&self, segment_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET sweep_at_ns = NULL WHERE id = ?1",
+            params![segment_id],
+        )?;
+        Ok(())
+    }
+
+    /// The same, for every row belonging to one voice, because the voice's
+    /// **declared languages** are the other half of what `pre_route` reads.
+    ///
+    /// Resolved through `speaker_resolved` for [`Self::speaker_languages`]'s
+    /// reason: a row still pointing at a merged-away voice is declared whatever
+    /// the surviving voice is declared, so it is that voice's declaration
+    /// changing that owes it a second look.
+    pub fn clear_speaker_sweep(&self, speaker_id: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE segments SET sweep_at_ns = NULL
+             WHERE sweep_at_ns IS NOT NULL
+               AND speaker_id IN (SELECT id FROM speaker_resolved WHERE canonical_id = ?1)",
+            params![speaker_id],
+        )?)
     }
 
     // ---- end the archive sweep -------------------------------------------
@@ -2817,8 +2881,14 @@ impl Store {
         match_score: Option<f32>,
         label_via: Option<&str>,
     ) -> Result<()> {
+        // …and the archive sweep owes this row again (0.12.1). Its pre-filter
+        // reads the speaker's *declared* languages, so a row that changes hands
+        // — or loses its label altogether — has had the other half of that
+        // decision replaced under it.
         self.conn.execute(
-            "UPDATE segments SET speaker_id = ?2, match_score = ?3, label_via = ?4 WHERE id = ?1",
+            "UPDATE segments
+             SET speaker_id = ?2, match_score = ?3, label_via = ?4, sweep_at_ns = NULL
+             WHERE id = ?1",
             params![
                 segment_id,
                 speaker_id,
@@ -3167,8 +3237,11 @@ impl Store {
         }
 
         let tx = self.conn.unchecked_transaction()?;
+        // `sweep_at_ns` is cleared with the re-point, in the same statement:
+        // these rows are declared whatever the surviving voice is declared, and
+        // the archive sweep's pre-filter reads that (0.12.1).
         let segments = tx.execute(
-            "UPDATE segments SET speaker_id = ?2 WHERE speaker_id = ?1",
+            "UPDATE segments SET speaker_id = ?2, sweep_at_ns = NULL WHERE speaker_id = ?1",
             params![from, into],
         )?;
         let prototypes = tx.execute(
@@ -3493,6 +3566,12 @@ impl Store {
         if n == 0 {
             bail!("no speaker with id {speaker_id}");
         }
+        // Every turn this voice has ever spoken is owed a second look by the
+        // archive sweep (0.12.1): its pre-filter hands a row pinned to one
+        // language to `correct_language` and declines it, and that is now a
+        // different answer. This is the retroactive half of `recalld languages`
+        // that `lang repair` has always had and the sweep did not.
+        self.clear_speaker_sweep(speaker_id)?;
         Ok(())
     }
 
@@ -7591,6 +7670,54 @@ impl Store {
         Ok(())
     }
 
+    /// Schema v16: when the archive language sweep was last at a row.
+    ///
+    /// One nullable column, and it exists because 0.11.9 tried to answer two
+    /// questions with one: `lang_via = 'sweep'` was written both as a real
+    /// provenance (with `lang` set to `de`/`en`) and as a bare "asked, nothing
+    /// to say" mark with `lang` still NULL — and the rows the *text* pre-filter
+    /// declined got neither, deliberately, so that a declaration added tomorrow
+    /// could still reach them.
+    ///
+    /// On the live install that made the sweep unfinishable. 1,729 of 1,782
+    /// rows are declined by the pre-filter for free, and with nothing written
+    /// about them they were owed again on every run: `recalld lang sweep
+    /// --apply` printed the same "1730 still owed" every time and the nightly
+    /// pass re-walked all of them every night. The bookkeeping question ("has
+    /// this pass been here") and the provenance question ("how did this row get
+    /// its language") are not the same question, and this column is the first
+    /// one — the same shape, and the same name, as `night_at_ns`,
+    /// `confidence_at_ns` and `redecode_at_ns`, which are the three other
+    /// passes that had to answer it.
+    ///
+    /// Nothing but `crate::sweep` reads it, which is the property that lets it
+    /// mark a row without blocking any future decision about that row: the
+    /// live path never looks, and the mark is cleared the moment either input
+    /// to the pre-filter moves (see [`Self::clear_segment_sweep`] and
+    /// [`Self::clear_speaker_sweep`]).
+    ///
+    /// **The backfill is a rename.** Every row carrying the bare mark — the
+    /// `lang_via = 'sweep'` with a NULL `lang` that 0.11.9 wrote — is exactly a
+    /// row this column is now for, so it gets a timestamp and gives the
+    /// `lang_via` back. Zero is used rather than "now": the honest answer to
+    /// *when* is "before this migration", and a real clock reading would claim
+    /// the sweep ran at upgrade time. Rows with the stamp shape (`lang` set)
+    /// keep their `lang_via` untouched — that one is a provenance and always
+    /// was.
+    fn apply_v16(&self) -> Result<()> {
+        self.add_column_if_missing("segments", "sweep_at_ns", "INTEGER")?;
+        self.conn.execute(
+            "UPDATE segments SET sweep_at_ns = 0, lang_via = NULL
+             WHERE lang_via = ?1 AND lang IS NULL",
+            params![lang_via::SWEEP],
+        )?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_segments_sweep
+                 ON segments(sweep_at_ns, lang, t_start_ns);",
+        )?;
+        Ok(())
+    }
+
     /// Set or clear one voice's highlight.
     ///
     /// `None` clears; `Some` sets. The caller decides which of those an absent
@@ -8587,7 +8714,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(v, 15);
+        assert_eq!(v, 16);
 
         // The columns are back…
         let columns = |table: &str| -> Vec<String> {
@@ -8634,6 +8761,89 @@ mod tests {
         let seg_row = s.segment_row(seg).unwrap().unwrap();
         assert_eq!(seg_row.speaker_colour.as_deref(), Some("violet"));
         assert_eq!(seg_row.speaker_icon.as_deref(), Some("\u{1f319}"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweeps_bare_mark_becomes_a_visit_and_gives_the_lang_via_back() {
+        // Schema v16's backfill, which is a rename rather than a computation.
+        //
+        // 0.11.9 wrote `lang_via = 'sweep'` in two shapes — with a language, as
+        // a provenance, and with a NULL language, as an "asked, nothing to say"
+        // mark. The second shape is exactly what `sweep_at_ns` is now for, so
+        // it moves; the first is a provenance and must not be touched. Getting
+        // this backwards would either lose the stamps or leave the marks
+        // invisible to a column nothing else reads.
+        let dir = std::env::temp_dir().join(format!("nxr-v16-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (marked, stamped, untouched) = {
+            let s = Store::open(&dir).unwrap();
+            let src = s.upsert_source("VRChat.exe", "VRChat.exe", 1).unwrap();
+            let sess = s.begin_session(src, 0).unwrap();
+            let id = || {
+                s.insert_segment(sess, 0, 2_000_000_000, "a.wav", 0)
+                    .unwrap()
+            };
+            let (marked, stamped, untouched) = (id(), id(), id());
+            // As 0.12.0 left them, written straight to the columns because the
+            // calls that produced these two shapes no longer exist.
+            s.conn
+                .execute(
+                    "UPDATE segments SET lang_via = 'sweep' WHERE id = ?1",
+                    params![marked],
+                )
+                .unwrap();
+            s.conn
+                .execute(
+                    "UPDATE segments SET lang = 'de', lang_via = 'sweep' WHERE id = ?1",
+                    params![stamped],
+                )
+                .unwrap();
+            // The index goes first: SQLite will not drop a column another
+            // object still names, and a real v15 database has neither.
+            s.conn
+                .execute_batch(
+                    "DROP INDEX IF EXISTS idx_segments_sweep;
+                     ALTER TABLE segments DROP COLUMN sweep_at_ns;
+                     UPDATE schema_version SET version = 15;",
+                )
+                .unwrap();
+            (marked, stamped, untouched)
+        };
+
+        let s = Store::open(&dir).unwrap();
+        let read = |id: i64| -> (Option<String>, Option<String>, Option<i64>) {
+            s.conn
+                .query_row(
+                    "SELECT lang, lang_via, sweep_at_ns FROM segments WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        // The bare mark is now a visit, and the `lang_via` it was borrowing is
+        // back to NULL. Zero rather than "now": the honest answer to *when* is
+        // "before this migration", and a clock reading would claim the sweep
+        // ran at upgrade time.
+        assert_eq!(read(marked), (None, None, Some(0)));
+        // The stamp is a provenance and keeps both halves of itself…
+        assert_eq!(
+            read(stamped),
+            (Some("de".into()), Some("sweep".into()), None)
+        );
+        // …and a row nobody had swept is untouched in all three columns.
+        assert_eq!(read(untouched), (None, None, None));
+
+        // The migrated marks really are off the work list, which is the whole
+        // point of moving them.
+        assert!(
+            !s.segments_for_lang_sweep(1.0, 10)
+                .unwrap()
+                .iter()
+                .any(|r| r.id == marked)
+        );
+        assert_eq!(s.lang_sweep_counts(1.0).unwrap(), (1, 1));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

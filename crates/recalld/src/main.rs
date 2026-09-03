@@ -1994,7 +1994,7 @@ fn cmd_lang_sweep(
     let store = Arc::new(Mutex::new(Store::open(data_dir)?));
     let lang_cfg = cfg.lang.clone();
     // `--redecode` turns the rewriting on for THIS run only; without it the
-    // config decides, and the config ships with it off (FINDINGS §29).
+    // config decides, and the config ships with it off (FINDINGS §30).
     let asr_cfg = recalld::config::AsrConfig {
         lang_sweep_redecode: redecode || cfg.asr.lang_sweep_redecode,
         ..cfg.asr.clone()
@@ -2024,7 +2024,7 @@ fn cmd_lang_sweep(
     } else {
         println!(
             "  transcripts will NOT be replaced — only `lang` is written. \
-             Eight of the nine rewrites this measured were wrong (FINDINGS §29); \
+             Eight of the nine rewrites this measured were wrong (FINDINGS §30); \
              `--apply --redecode` turns it on anyway."
         );
     }
@@ -2101,7 +2101,11 @@ fn cmd_lang_sweep(
         (
             report.left_alone,
             "already readable, or a voice pinned to a language another pass owns — free, and \
-             never marked",
+             not owed again until their words or their voice change",
+        ),
+        (
+            report.too_short,
+            "shorter than the sweep's floor; still owed, in case the floor is lowered",
         ),
         (
             report.unavailable,
@@ -2113,16 +2117,27 @@ fn cmd_lang_sweep(
             println!("  {n:>6}  {line}");
         }
     }
-    let (left, _) = {
+    // An `--apply` run has moved the count itself, so the database is the
+    // honest answer. A **preview** writes nothing, so its own count cannot have
+    // fallen and re-reading it would print the number the operator started
+    // with — the shape of the bug this release is fixing. What a preview knows
+    // is how many rows it just resolved, so it subtracts them and says what
+    // `--apply` would leave.
+    let left = {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-        guard.lang_sweep_counts(floor)?
+        let (now, _) = guard.lang_sweep_counts(floor)?;
+        if apply {
+            now
+        } else {
+            now.saturating_sub(report.resolved() as i64)
+        }
     };
     println!(
         "{left} still owed{}",
-        if left > 0 && limit.is_some() {
-            " — run it again to continue"
-        } else {
-            ""
+        match () {
+            _ if left == 0 => " — the archive is swept",
+            _ if limit.is_some() => " — run it again to continue",
+            _ => "",
         }
     );
     Ok(())

@@ -121,10 +121,15 @@ impl Rig {
 fn the_v11_migration_is_idempotent_and_keeps_what_it_wrote() {
     // 0.9.0 wrote v11; 0.10.0's worlds took it to v12, 0.11.6's simultaneous
     // fraction to v13. 0.12.0 moved it twice in one release —
-    // `sessions.instance_key` to v14 and per-person highlights to v15. The
-    // number moves, and what this test is really about does not: re-opening
-    // must be a no-op.
-    assert_eq!(SCHEMA_VERSION, 15, "0.12.0 is schema v15");
+    // `sessions.instance_key` to v14 and per-person highlights to v15 — and
+    // 0.12.1's `segments.sweep_at_ns` to v16. The number moves, and what this
+    // test is really about does not: re-opening must be a no-op.
+    //
+    // v16 is the first of these with a *backfill* in it, which makes the
+    // no-op property load-bearing rather than incidental: the statement that
+    // renames the sweep's bare mark has to find nothing to do on the second
+    // open, and it does, because it selects on the shape it removes.
+    assert_eq!(SCHEMA_VERSION, 16, "0.12.1 is schema v16");
     let dir = temp_dir("schema");
     let mut seg = 0i64;
     // Three opens: the first migrates, the second and third must be no-ops
