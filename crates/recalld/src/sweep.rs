@@ -1,4 +1,4 @@
-//! The archive sweep for language (0.11.9): asking the identifier about the
+//! The archive sweep for language (0.12.0): asking the identifier about the
 //! turns it was never asked about.
 //!
 //! ## Why there is an archive to sweep at all
@@ -58,7 +58,7 @@
 //!    routed rows from 342 to 28 and the de/en rate from 2.3% to **0.97%**,
 //!    inside the gate, for three model passes instead of one.
 //!
-//!    0.11.10 found the same thing on the *live* rows the route had already
+//!    0.12.0 found the same thing on the *live* rows the route had already
 //!    rewritten (FINDINGS §31) and moved `lid_windows` to 3 as well, so this is
 //!    no longer a difference. The field stays because the narrowing is
 //!    one-directional ([`routing_cfg`]): an operator who lowers `lid_windows`
@@ -885,7 +885,7 @@ mod tests {
         assert_eq!(routing_cfg(&wishful).japanese, wishful.japanese);
         // The shipped pair, and the reason the two exist at all. The floor is
         // still strictly stricter; the window count is only *no looser* since
-        // 0.11.10, when the live path moved to three windows on the same
+        // 0.12.0, when the live path moved to three windows on the same
         // evidence this pass did (FINDINGS §31). The field stays because the
         // narrowing is one-directional: an operator who lowers `lid_windows`
         // for a machine short of cores must not thereby lower it for four

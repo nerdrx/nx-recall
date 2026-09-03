@@ -1,9 +1,9 @@
 //! Taking back the rows the audio-language route should never have rewritten
-//! (0.11.10).
+//! (0.12.0).
 //!
 //! ## What there is to take back
 //!
-//! 45 rows, on one real install, measured the night 0.11.9's sweep landed
+//! 45 rows, on one real install, measured the night 0.12.0's sweep landed
 //! (FINDINGS §31). The route had rewritten them as Japanese (32), Chinese (12)
 //! and French (1); **37 of the 45 belong to speaker 26 — the user's own
 //! microphone, a voice declared `["de", "en"]`.** The shape of the damage is

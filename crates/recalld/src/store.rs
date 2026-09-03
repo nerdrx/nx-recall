@@ -79,7 +79,7 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // column lives in `crate::truth::migrate_v13`, which also backfills it for
 // verdicts already on disk — but only where the speaking spans survive, since
 // a purged span and a quiet turn would otherwise both read 0.0.
-// ---- 0.11.9 (schema v14): which instance a session was ---------------------
+// ---- 0.12.0 (schema v14): which instance a session was ---------------------
 // v14 adds `sessions.instance_key`: which *copy* of an application opened the
 // session, from `object.serial` or `application.process.id`. Two Vesktop
 // clients share one `sources` row because the key is the process binary, and
@@ -131,8 +131,8 @@ pub mod label_via {
     pub const PROXIMITY: &str = "proximity";
     /// A person said so.
     pub const MANUAL: &str = "manual";
-    // ---- 0.11.9: retro-labelling from ground truth -------------------------
-    /// Discord said so (0.11.9). The segment carries a `single` verdict, the
+    // ---- 0.12.0: retro-labelling from ground truth -------------------------
+    /// Discord said so (0.12.0). The segment carries a `single` verdict, the
     /// Discord user who owned it is linked to a voice, and the voicebank had
     /// declined to name the row at all.
     ///
@@ -144,7 +144,7 @@ pub mod label_via {
     /// overwrite (see `truth::link_batch`). Giving Discord its own value keeps
     /// that promise intact and keeps this pass reversible as a class.
     pub const TRUTH: &str = "truth";
-    // ---- end 0.11.9 --------------------------------------------------------
+    // ---- end 0.12.0 --------------------------------------------------------
 }
 
 /// `segments.lang_via` — how this row's *language* came to be what it is (v5).
@@ -179,7 +179,7 @@ pub mod lang_via {
     ///
     /// Like [`CONTEXT`] it is an inference and the words were not re-decoded.
     pub const GUESSED: &str = "guessed";
-    /// The archive sweep (0.11.9, `crate::sweep`) asked the spoken-language
+    /// The archive sweep (0.12.0, `crate::sweep`) asked the spoken-language
     /// identifier about a row nothing could read, and the answer was not one
     /// the routes act on.
     ///
@@ -304,7 +304,7 @@ pub mod truth_via {
     // ---- end 0.11.0 -------------------------------------------------------
 }
 
-// ---- 0.11.9: retro-labelling from ground truth -----------------------------
+// ---- 0.12.0: retro-labelling from ground truth -----------------------------
 
 /// A turn Discord can name that the voicebank left blank.
 #[derive(Debug, Clone, PartialEq)]
@@ -318,12 +318,12 @@ pub struct TruthLabelCandidate {
     pub coverage: Option<f64>,
 }
 
-// ---- end 0.11.9 -----------------------------------------------------------
+// ---- end 0.12.0 -----------------------------------------------------------
 
 /// `settings` key holding the id of the pinned "You" speaker.
 pub const YOU_SPEAKER_KEY: &str = "you_speaker_id";
 
-/// `settings` key for the learned prototype aggregate (0.11.9). Absent means
+/// `settings` key for the learned prototype aggregate (0.12.0). Absent means
 /// [`crate::calib::Aggregate::Max`], which is what every earlier version did.
 pub const AGGREGATE_KEY: &str = "identity_aggregate";
 /// The generated label the pinned speaker is minted with. It survives a rename
@@ -456,7 +456,7 @@ pub struct RedecodeCandidate {
     pub text: Option<String>,
 }
 
-/// A row the archive language sweep may look at (0.11.9, `crate::sweep`).
+/// A row the archive language sweep may look at (0.12.0, `crate::sweep`).
 ///
 /// Everything [`crate::asr_cjk::pre_route`] needs and nothing else, so the
 /// cheap half of the decision — is this transcript already readable, is this
@@ -474,7 +474,7 @@ pub struct SweepCandidate {
 }
 
 /// A row the audio-language route already rewrote, and what it wrote over
-/// (0.11.10, `crate::unroute`).
+/// (0.12.0, `crate::unroute`).
 ///
 /// The prior three fields come out of the row's own `segments.redecode`
 /// operation rather than out of a second column, because that operation *is*
@@ -1120,12 +1120,12 @@ impl Store {
         self.apply_digest_names()?;
         // ---- end 0.11.6 ---------------------------------------------------
 
-        // ---- 0.11.9 (schema v14): which instance a session was -------------
+        // ---- 0.12.0 (schema v14): which instance a session was -------------
         // One nullable column on `sessions`, no backfill: for every session
         // that already exists the answer is genuinely unknown, and NULL is the
         // only honest way to say so. See `apply_session_instance`.
         self.apply_session_instance()?;
-        // ---- end 0.11.9 ---------------------------------------------------
+        // ---- end 0.12.0 ---------------------------------------------------
 
         match current {
             None => {
@@ -1779,7 +1779,7 @@ impl Store {
         self.begin_session_for(source_id, started_at_utc_ns, None)
     }
 
-    // ---- 0.11.9: which instance a session was ------------------------------
+    // ---- 0.12.0: which instance a session was ------------------------------
 
     /// `begin_session`, remembering *which copy of the application* opened it.
     ///
@@ -1842,7 +1842,7 @@ impl Store {
         Ok(())
     }
 
-    // ---- end 0.11.9 --------------------------------------------------------
+    // ---- end 0.12.0 --------------------------------------------------------
 
     pub fn end_session(&self, session_id: i64, ended_at_utc_ns: i64) -> Result<()> {
         self.conn.execute(
@@ -2398,7 +2398,7 @@ impl Store {
     ///   query, not new evidence. Counting it would let three real German turns
     ///   inherit their way to a hundred, and the hundredth would look exactly
     ///   as certain as the first.
-    /// * `lang_via != 'sweep'` (0.11.9) — the archive sweep's de/en stamp is
+    /// * `lang_via != 'sweep'` (0.12.0) — the archive sweep's de/en stamp is
     ///   one second of audio nobody could read, judged by nothing. It is a
     ///   record of what the identifier said, not a reading of the words, and
     ///   the whole point of the conversational prior is that it is built out of
@@ -2466,7 +2466,7 @@ impl Store {
         }))
     }
 
-    // ---- the archive sweep (0.11.9, `crate::sweep`) ----------------------
+    // ---- the archive sweep (0.12.0, `crate::sweep`) ----------------------
 
     /// One untagged archive row, with everything
     /// [`crate::asr_cjk::pre_route`] needs to decide whether to ask about it.
@@ -2570,7 +2570,7 @@ impl Store {
 
     // ---- end the archive sweep -------------------------------------------
 
-    // ---- undoing a route (0.11.10, `crate::unroute`) ----------------------
+    // ---- undoing a route (0.12.0, `crate::unroute`) ----------------------
 
     /// Every row the audio-language route settled, oldest first, with the words
     /// it wrote over.
@@ -6181,7 +6181,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    // ---- 0.11.9: retro-labelling from ground truth -------------------------
+    // ---- 0.12.0: retro-labelling from ground truth -------------------------
 
     /// How many turns would enrol if `[truth] enrol` were on, and never will
     /// while it is off.
@@ -6289,7 +6289,7 @@ impl Store {
         )? > 0)
     }
 
-    // ---- end 0.11.9 --------------------------------------------------------
+    // ---- end 0.12.0 --------------------------------------------------------
 
     /// Mark an enrolment candidate as considered, whether or not it enrolled.
     /// Without this the pass would re-embed the same refused turn forever.
@@ -7444,7 +7444,7 @@ pub struct CalibrationRow {
     pub embedding: Embedding,
 }
 
-/// A prototype ground truth says is a recording of somebody else (0.11.9).
+/// A prototype ground truth says is a recording of somebody else (0.12.0).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CondemnedPrototype {
     pub prototype_id: i64,
@@ -7657,7 +7657,7 @@ impl Store {
             > 0)
     }
 
-    // ---- 0.11.9: the learned aggregate ------------------------------------
+    // ---- 0.12.0: the learned aggregate ------------------------------------
 
     /// How a voice's several prototypes become the one score the ladder
     /// compares, as this install has learned it.
@@ -7666,7 +7666,7 @@ impl Store {
     /// whole install rather than a property of any voice. Absent — or
     /// unreadable, which a hand-edited or future-version value could be —
     /// means [`Aggregate::Max`](crate::calib::Aggregate::Max): the rule every
-    /// version before 0.11.9 used. A store that has learned nothing must
+    /// version before 0.12.0 used. A store that has learned nothing must
     /// behave exactly as it did before this existed, and a bad value must cost
     /// the learned rule rather than the label.
     pub fn learned_aggregate(&self) -> Result<crate::calib::Aggregate> {
@@ -7689,7 +7689,7 @@ impl Store {
         )? > 0)
     }
 
-    // ---- 0.11.9: prototypes ground truth condemns -------------------------
+    // ---- 0.12.0: prototypes ground truth condemns -------------------------
 
     /// Every prototype whose **own source segment** Discord says was somebody
     /// else talking.
@@ -8043,7 +8043,7 @@ mod tests {
 
     // ---- Step 1 behaviour, unchanged -------------------------------------
 
-    // ---- 0.11.9 (schema v14): which instance a session was -----------------
+    // ---- 0.12.0 (schema v14): which instance a session was -----------------
 
     #[test]
     fn two_copies_of_one_app_share_a_source_and_no_longer_share_an_identity() {
@@ -10589,7 +10589,7 @@ mod tests {
         assert!(s.installed_projection().unwrap().is_none());
     }
 
-    // ---- 0.11.9: the learned aggregate, and prototype repair --------------
+    // ---- 0.12.0: the learned aggregate, and prototype repair --------------
 
     #[test]
     fn a_store_where_nothing_was_learned_scores_a_voice_on_its_best_prototype() {

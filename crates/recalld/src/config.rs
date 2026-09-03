@@ -619,7 +619,7 @@ pub struct AsrConfig {
     /// Share of the identifier's windows that must agree before a turn is
     /// handed to a CJK decoder.
     ///
-    /// **1.0 — all of them.** With `lid_windows = 3` (0.11.10, below) that is
+    /// **1.0 — all of them.** With `lid_windows = 3` (0.12.0, below) that is
     /// the whole of the vote: a reading has to survive being asked about three
     /// different parts of the same turn. It was also 1.0 when `lid_windows`
     /// was 1, where it meant "did it name the language at all"; the number did
@@ -627,7 +627,7 @@ pub struct AsrConfig {
     pub lid_min_confidence: f32,
     /// How many windows of a turn the identifier is asked about.
     ///
-    /// **Three since 0.11.10, and it was one until then.** The old default's
+    /// **Three since 0.12.0, and it was one until then.** The old default's
     /// note said "at zero false positives in 400 negatives there is nothing
     /// for a second window to rule out", and the FLEURS number behind it
     /// (`spike/lid_bench.py`) is not in dispute — **zero of 400** German and
@@ -733,7 +733,7 @@ pub struct AsrConfig {
     /// unmeasured rather than unavailable.
     pub polyglot_languages: Vec<String>,
     // ---- end 0.11.6 ---------------------------------------------------------
-    // ---- 0.11.9, the archive sweep (`crate::sweep`) -------------------------
+    // ---- 0.12.0, the archive sweep (`crate::sweep`) -------------------------
     /// Walk the rows captured before the routes existed — and before 0.11.8
     /// lowered the floor — asking the identifier about each one once.
     ///
@@ -767,7 +767,7 @@ pub struct AsrConfig {
     pub lang_sweep_min_s: f32,
     /// How many identifier windows the **sweep** asks for, at least.
     ///
-    /// **3**, and since 0.11.10 that is no longer a number the sweep has to
+    /// **3**, and since 0.12.0 that is no longer a number the sweep has to
     /// itself: the live path moved to three windows on the same evidence
     /// (FINDINGS §31), so this knob now says "and never fewer than the live
     /// path" rather than "and unlike the live path".
@@ -818,7 +818,7 @@ pub struct AsrConfig {
     /// --apply --redecode` does for one run, and should be preceded by reading
     /// what `recalld lang sweep` says it would rewrite.
     pub lang_sweep_redecode: bool,
-    // ---- end 0.11.9 ---------------------------------------------------------
+    // ---- end 0.12.0 ---------------------------------------------------------
     // ---- 0.11.0, partial turns (`crate::partial`) --------------------------
     /// Publish provisional `partial` events while a turn is still open, so a
     /// caption bar can show words before the person has stopped talking.
@@ -861,7 +861,7 @@ impl Default for AsrConfig {
             japanese: true,
             cjk: true,
             lid_min_confidence: 1.0,
-            // 0.11.10: was 1, on a FLEURS measurement that did not transfer to
+            // 0.12.0: was 1, on a FLEURS measurement that did not transfer to
             // a lobby. See the note above.
             lid_windows: 3,
             // ---- the other languages (0.11.8) -----------------------------
@@ -872,13 +872,13 @@ impl Default for AsrConfig {
                 .map(|l| l.to_string())
                 .collect(),
             // ---- end 0.11.6 -----------------------------------------------
-            // ---- 0.11.9, the archive sweep --------------------------------
+            // ---- 0.12.0, the archive sweep --------------------------------
             lang_sweep: true,
             lang_sweep_min_s: 1.5,
             lang_sweep_windows: 3,
             lang_sweep_rows_per_run: 400,
             lang_sweep_redecode: false,
-            // ---- end 0.11.9 -----------------------------------------------
+            // ---- end 0.12.0 -----------------------------------------------
             // ---- 0.11.0, partial turns ------------------------------------
             // OFF, and the reason is measured (FINDINGS §20). Convergence
             // passed handsomely — 96.4% of the last partial's words survive

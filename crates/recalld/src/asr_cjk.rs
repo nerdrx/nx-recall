@@ -109,10 +109,10 @@
 //! identifier still chooses the *decoder*; the writing system chooses the tag,
 //! and it cannot be wrong about a sentence in a script only one of them uses.
 //!
-//! ## What this got wrong, and the three guards that answer it (0.11.10)
+//! ## What this got wrong, and the three guards that answer it (0.12.0)
 //!
 //! Everything above is true and none of it was enough. Measured on the user's
-//! own database a day after 0.11.9 (FINDINGS §31), this route had rewritten
+//! own database a day after 0.12.0 (FINDINGS §31), this route had rewritten
 //! **45 archive rows** and **two of them are right**. 37 belong to one voice:
 //! the user's own microphone, declared `["de","en"]`, saying "Mm-hmm." and
 //! getting `うん` back.
@@ -258,7 +258,7 @@ pub enum Pre {
 }
 
 /// Content words a transcript must have before the identifier is asked about
-/// it at all (0.11.10, FINDINGS §31).
+/// it at all (0.12.0, FINDINGS §31).
 ///
 /// **Two**, and the number is bounded from both ends by measurement rather than
 /// chosen. From below: 22 of the 45 rows the route wrongly rewrote on this
@@ -303,7 +303,7 @@ fn routed_anywhere(tag: &str, cfg: &AsrConfig) -> bool {
 ///    alone. Deciding a row twice is how two features start fighting over one
 ///    column.
 /// 3. **A declared set containing nothing either route can decode is a
-///    declaration** (0.11.10). This is rule 2 stated for the case it was
+///    declaration** (0.12.0). This is rule 2 stated for the case it was
 ///    written too narrowly for, and the gap was expensive: the user's own
 ///    microphone voice is declared `["de", "en"]`, `sole_language` says `None`
 ///    of two tags, and every unreadable grunt from it fell through to `AskLid`.
@@ -315,7 +315,7 @@ fn routed_anywhere(tag: &str, cfg: &AsrConfig) -> bool {
 ///    confident about, these three included — is not the transliteration
 ///    failure. Nothing to do.
 /// 5. **A turn that is nothing but back-channel is not worth a decoder**
-///    (0.11.10). Fewer than [`MIN_CONTENT_WORDS`] words that are not in
+///    (0.12.0). Fewer than [`MIN_CONTENT_WORDS`] words that are not in
 ///    [`crate::lang::FILLERS`] and the row is left alone: re-decoding a grunt
 ///    has no value even when the language is right, and "Mm-hmm." is
 ///    `Unclear` to every text rule this daemon has, so without this guard it
@@ -399,7 +399,7 @@ pub enum Rerouted {
     /// once per daemon, not per turn.
     Unavailable,
     /// It ran and the answer failed a guard — empty, in a script none of the
-    /// languages this decoder speaks is written in, or (0.11.10) not enough of
+    /// languages this decoder speaks is written in, or (0.12.0) not enough of
     /// an answer to be evidence of anything.
     Rejected {
         words: usize,
@@ -459,7 +459,7 @@ pub fn strip_tags(text: &str) -> String {
 /// two-word floor would reject every correct answer those decoders can give.
 /// The bar it replaces the word count with is stricter, not looser.
 ///
-/// ## The script test is necessary and it is not sufficient (0.11.10)
+/// ## The script test is necessary and it is not sufficient (0.12.0)
 ///
 /// Everything above was written when the only thing the script test had to rule
 /// out was a German transcript, and against that it is exact. What it is not is
@@ -1576,7 +1576,7 @@ mod tests {
         }
     }
 
-    // ---- 0.11.10: the lobby is not FLEURS (FINDINGS §31) -------------------
+    // ---- 0.12.0: the lobby is not FLEURS (FINDINGS §31) -------------------
 
     #[test]
     fn a_voice_that_declared_two_languages_has_still_declared_them() {

@@ -88,9 +88,9 @@ pub struct Report {
     pub projection: Option<(Whitening, Score)>,
     pub projection_installed: bool,
     /// A projection was installed from an earlier evening and this run's own
-    /// held-out numbers did not re-earn it, so it was taken back (0.11.9).
+    /// held-out numbers did not re-earn it, so it was taken back (0.12.0).
     pub projection_cleared: bool,
-    /// The best prototype-aggregate arm and what it scored held out (0.11.9).
+    /// The best prototype-aggregate arm and what it scored held out (0.12.0).
     pub aggregate: Option<(calib::Aggregate, Score)>,
     pub aggregate_installed: calib::Aggregate,
     pub aggregate_swap: bool,
@@ -436,7 +436,7 @@ pub fn calibrate(
     }
 
     // A projection installed on some earlier evening that TONIGHT's held-out
-    // numbers do not re-earn does not get to stay (0.11.9).
+    // numbers do not re-earn does not get to stay (0.12.0).
     //
     // The pass used only ever to *write* projections, and the asymmetry was a
     // live bug: one evening's `--apply` installed a whitening fitted from 240
@@ -454,7 +454,7 @@ pub fn calibrate(
         report.projection_cleared = store.clear_projection()?;
     }
 
-    // ---- step 4: how a voice's prototypes become one score (0.11.9) --------
+    // ---- step 4: how a voice's prototypes become one score (0.12.0) --------
 
     // Measured last and installed independently, because it is a different
     // kind of claim from the two above: not a number fitted to this install
@@ -548,7 +548,7 @@ pub fn calibrate(
     Ok(report)
 }
 
-// ---- 0.11.9: `recalld identity repair --prototypes` -------------------------
+// ---- 0.12.0: `recalld identity repair --prototypes` -------------------------
 
 /// The `operations` op the repair writes its before/after table under.
 pub const REPAIR_OP: &str = "identity.repair";
@@ -959,7 +959,7 @@ mod tests {
         );
     }
 
-    // ---- 0.11.9 -----------------------------------------------------------
+    // ---- 0.12.0 -----------------------------------------------------------
 
     #[test]
     fn a_projection_tonights_evidence_refuses_does_not_stay_installed() {

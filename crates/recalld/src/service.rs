@@ -4130,7 +4130,7 @@ impl Service {
 
     // ---- end 0.11.0 -------------------------------------------------------
 
-    /// `identity.repair` (0.11.9): throw out prototypes that are recordings of
+    /// `identity.repair` (0.12.0): throw out prototypes that are recordings of
     /// somebody else.
     ///
     /// `prototypes` is required and spelled out rather than assumed, exactly

@@ -652,7 +652,7 @@ pub fn word_count(text: &str) -> usize {
     crate::asr::normalise_words(text).len()
 }
 
-// ---- 0.11.10, the back-channel -------------------------------------------
+// ---- 0.12.0, the back-channel -------------------------------------------
 
 /// The words a lobby says instead of words: back-channels, hesitations and
 /// one-syllable agreements, in German and English together.
@@ -700,7 +700,7 @@ pub fn content_word_count(text: &str) -> usize {
     content_words(text).len()
 }
 
-// ---- end 0.11.10 ----------------------------------------------------------
+// ---- end 0.12.0 ----------------------------------------------------------
 
 /// Parse a stored `speakers.languages` value: a JSON array of tags.
 ///

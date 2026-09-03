@@ -1445,7 +1445,7 @@ A declined turn is **marked** (`translation_via` set, `translation` NULL) so the
 queue stays finite. A re-decode that changes the words clears both, putting the
 row back at the end of the queue. A turn whose source language the translator
 has no code for is declined the same way with `translation_via:
-"unsupported-language"` (0.11.9) rather than left for a retry — it fails
+"unsupported-language"` (0.12.0) rather than left for a retry — it fails
 identically every pass, and before this two French rows the guesser had named
 without confidence went to the model with an empty tag every five minutes for
 an evening. The guesser's tag now reaches the model even when it is not
@@ -2292,7 +2292,7 @@ Nothing is required. When it wants to:
 A client must not present a *proposed* threshold as an installed one:
 `thresholds_swap` is the difference, and it is false far more often than true.
 
-## 0.11.9 — how a voice's prototypes become one score, and a bank that can be repaired
+## 0.12.0 — how a voice's prototypes become one score, and a bank that can be repaired
 
 Three changes to identity, all of them measured against this install's own
 ground truth on the same held-out rows (`spike/FINDINGS.md` §32). Two are
@@ -2300,7 +2300,7 @@ learned and travel through `identity.calibrate`; one is an operator command.
 
 ### A third learnable: the scoring rule
 
-A voice has up to twenty prototypes. Until 0.11.9 it scored the **best** of
+A voice has up to twenty prototypes. Until 0.12.0 it scored the **best** of
 them, which answers *could this be them?* and is generous in exactly the wrong
 way: one recording of somebody that happens to sit near another person's turns
 wins those turns forever, and nothing the voice's other nineteen prototypes say
@@ -2316,7 +2316,7 @@ averaging the bad ones in measures the spread rather than the match.
 
 Stored as a `settings` row, not a column: it is one rule for the install rather
 than a property of a voice. **Absent means `"max"`** — every version before
-0.11.9, and every install that has learned nothing.
+0.12.0, and every install that has learned nothing.
 
 `identity.calibrate` gains three fields:
 
@@ -3162,7 +3162,7 @@ passed.
 - Additive only. A client that reads `summary` and ignores the rest sees the
   same field it always did, with names in it.
 
-## 0.11.9 — Discord's word, applied; and the second client
+## 0.12.0 — Discord's word, applied; and the second client
 
 Three things, and the third is the reason the other two are shaped the way they
 are. The daemon had 168 turns it could name and had not; it had 137 turns queued
@@ -3199,7 +3199,7 @@ Four things it will not do, by construction rather than by flag:
 - **It never uses your own account.** A `single` verdict naming *you* is not
   evidence about audio captured from your own Discord client — that client never
   plays your microphone back to you, so yours is the one voice the stream cannot
-  contain. 0.10.1 established this for scoring (FINDINGS §17, 73% → 88%); 0.11.9
+  contain. 0.10.1 established this for scoring (FINDINGS §17, 73% → 88%); 0.12.0
   inherits it for labelling, where getting it wrong would have put the user's
   name on 17 turns of somebody else's voice, permanently.
 
@@ -3291,14 +3291,14 @@ verdicts of their own.
 Consequences, which are contracts and not advice:
 
 - **`nobody` is not evidence that no human spoke.** Nothing may unassign a label,
-  refuse a mint, or downgrade a voice on the strength of it. 0.11.9 designed both
+  refuse a mint, or downgrade a voice on the strength of it. 0.12.0 designed both
   a `identity repair --media` and a mint guard keyed on `nobody`, measured them,
   and shipped neither; §29 has the numbers and the reasoning.
 - **`nobody` remains excluded from every score,** as it has been since 0.9.0.
   Nothing about the identity or overlap numbers changes.
 - The honest fix is to stop merging the two instances, which is what
   `sessions.instance_key` begins and a plugin that names its call will finish.
-## 0.11.9 — the archive sweep for language
+## 0.12.0 — the archive sweep for language
 
 Every language decision is made once, on the way in, by whatever was shipped
 that evening. The spoken-language identifier arrived in 0.11.0, Korean and
@@ -3405,7 +3405,7 @@ every row a model is spent on leaves it.
 
 ---
 
-## 0.11.10 — the lobby is not FLEURS: three guards on the audio route, and a way back
+## 0.12.0 — the lobby is not FLEURS: three guards on the audio route, and a way back
 
 The spoken-language route (0.11.0 for `ja`, 0.11.6 for `ko`/`zh`, 0.11.8 for
 `fr`) shipped behind a false-positive gate measured on FLEURS: **zero of 400**
@@ -3437,7 +3437,7 @@ They are all in `asr_cjk::pre_route` and `asr_cjk::judge`, which both routes
 share, so the French arm gets them without a second copy.
 
 1. **A declared set with nothing routable in it is a declaration.** Before
-   0.11.10 only a *sole* declaration stopped the route (`lang::sole_language`),
+   0.12.0 only a *sole* declaration stopped the route (`lang::sole_language`),
    so a voice declared `["de","en"]` fell through to the identifier on every
    unreadable turn. Now any non-empty declared set that contains no tag either
    route can decode — `ja`/`ko`/`zh`, or a tag in `[asr].polyglot_languages` —

@@ -1,4 +1,4 @@
-//! The audio-language route against the rows it actually got wrong (0.11.10).
+//! The audio-language route against the rows it actually got wrong (0.12.0).
 //!
 //! Run against a **copy** of a real database — never the live one:
 //!
@@ -110,7 +110,7 @@ fn main() -> Result<()> {
     // says what each guard is FOR rather than only what they do together.
     let live = AsrConfig::default();
     let no_declaration = |row: &Row| asr_cjk::pre_route(None, row.text.as_deref(), &live);
-    // The old gate: everything `pre_route` did before 0.11.10 — a SOLE
+    // The old gate: everything `pre_route` did before 0.12.0 — a SOLE
     // declaration, then the two text readings. Reconstructed by asking the
     // shipped function with the two new tests disarmed: no declaration handed
     // in, and a text padded past the content-word floor so it cannot bite.

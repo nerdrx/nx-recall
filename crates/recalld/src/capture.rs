@@ -108,7 +108,7 @@ impl NodeInfo {
         self.serial.clone().or_else(|| self.ident.node_name.clone())
     }
 
-    /// Which *copy* of the application this node belongs to (0.11.9).
+    /// Which *copy* of the application this node belongs to (0.12.0).
     ///
     /// `object.serial` first because PipeWire promises never to reuse it within
     /// a boot, where the registry id at `node_id` is reused as soon as a node
@@ -550,7 +550,7 @@ impl Shared {
                 .store
                 .lock()
                 .map_err(|_| anyhow!("store mutex poisoned"))?;
-            // 0.11.9: which copy of the app this is. Already in hand here and
+            // 0.12.0: which copy of the app this is. Already in hand here and
             // thrown away until now; see `Store::begin_session_for` for what
             // that cost.
             store.begin_session_for(source_id, utc_now_ns(), node.instance_key().as_deref())?

@@ -85,11 +85,11 @@ pub mod server;
 pub mod service;
 pub mod split;
 pub mod store;
-// ---- 0.11.9 --------------------------------------------------------------
+// ---- 0.12.0 --------------------------------------------------------------
 /// The archive language sweep: the identifier, over the rows captured before
 /// there was one.
 pub mod sweep;
-// ---- end 0.11.9 ----------------------------------------------------------
+// ---- end 0.12.0 ----------------------------------------------------------
 pub mod threads;
 pub mod timeref;
 pub mod translate;
@@ -99,9 +99,9 @@ pub mod truth;
 pub mod truthnet;
 // ---- end 0.9.0 -----------------------------------------------------------
 /// Taking back the rows the audio-language route should not have rewritten
-/// (0.11.10).
+/// (0.12.0).
 pub mod unroute;
-// ---- end 0.11.10 ---------------------------------------------------------
+// ---- end 0.12.0 ---------------------------------------------------------
 pub mod turns;
 // ---- 0.10.0, worlds and turn-taking --------------------------------------
 /// Turn-taking statistics: how a person talks (0.10.0).

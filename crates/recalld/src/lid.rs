@@ -62,7 +62,7 @@
 //! over `windows` slices of the turn and the confidence is the share of them
 //! that said the same thing.
 //!
-//! `windows` defaulted to **1** until 0.11.10, which made the confidence
+//! `windows` defaulted to **1** until 0.12.0, which made the confidence
 //! trivially 1.0, and the argument for it was the FLEURS table above: at zero
 //! false positives in 400 negatives there is nothing for a second window to
 //! rule out, and a vote triples the only cost this feature has.

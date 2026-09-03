@@ -387,9 +387,9 @@ impl Analyzer {
         };
         let thresholds = learned_thresholds(store, &self.cfg);
         // ---- end 0.11.0 -----------------------------------------------
-        // 0.11.9: how a voice's several prototypes become the one score the
+        // 0.12.0: how a voice's several prototypes become the one score the
         // ladder compares. A read failure is not a reason to stop labelling —
-        // the fallback is the rule every version before 0.11.9 used.
+        // the fallback is the rule every version before 0.12.0 used.
         let aggregate = learned_aggregate(store, &self.cfg);
         let ranked = identity::rank_with(&probe, &bank, aggregate)?;
         // The source-aware prior (0.11.0), between ranking and deciding —
@@ -1349,7 +1349,7 @@ fn learned_thresholds(store: &Store, cfg: &IdentityConfig) -> crate::calib::Thre
     }
 }
 
-/// How a voice's several prototypes become one score, as learned (0.11.9).
+/// How a voice's several prototypes become one score, as learned (0.12.0).
 ///
 /// Same shape and same reasoning as [`learned_thresholds`]: it is an
 /// improvement on the shipped rule, not a prerequisite for it, so an

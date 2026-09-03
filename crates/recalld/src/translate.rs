@@ -907,7 +907,7 @@ fn nllb_can_read(lang: &str) -> bool {
 
 /// Put the guesser's tag on a candidate the column had none for.
 ///
-/// Before 0.11.9 only a *confident* guess reached the row, and the candidate
+/// Before 0.12.0 only a *confident* guess reached the row, and the candidate
 /// went to the model with `lang == ""`; NLLB refused the empty tag, the error
 /// arm left the row unmarked "so a later pass retries", and "Mon petit chou."
 /// was retried every five minutes for an evening. The database is still only
@@ -1013,7 +1013,7 @@ pub fn batch(
             break;
         }
         // A source language NLLB has no code for is not a model that timed
-        // out: it will fail the same way every pass, and until 0.11.9 two
+        // out: it will fail the same way every pass, and until 0.12.0 two
         // French rows did exactly that every five minutes for an evening.
         // Declined, with a `via` that says why, so the queue stays finite.
         if nllb && !nllb_can_read(&c.lang) {
@@ -1893,7 +1893,7 @@ mod tests {
         assert_eq!(row.translation_via, None, "not even declined");
     }
 
-    // ---- the unconfident guess (0.11.9) --------------------------------------
+    // ---- the unconfident guess (0.12.0) --------------------------------------
 
     #[test]
     fn an_unconfident_guess_still_tells_the_model_the_language() {
