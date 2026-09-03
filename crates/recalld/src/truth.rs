@@ -253,6 +253,148 @@ pub fn verdict(cov: &[Coverage], truth_nearby: bool) -> Verdict {
     }
 }
 
+/// What share of `[t_start_ns, t_end_ns)` **two or more users were talking at
+/// once** (0.11.6, schema v13).
+///
+/// This is a different question from the `overlap` verdict, and §26 exists
+/// because the difference turned out to be the whole story. The verdict asks
+/// whether two users each covered a fifth of the turn *somewhere* in it; this
+/// asks how much of the turn actually had two mouths open simultaneously. A
+/// two-word interjection across a six-second answer clears the first bar and
+/// scores 0.05 here, and 0.05 is the honest number: the dominant speaker's
+/// identity is safe in that turn, so an overlap gate is right to pass it.
+///
+/// Each user's own spans are merged first — exactly as [`coverage`] does it,
+/// and for the same reason: a re-sent batch is one utterance reported twice,
+/// not one person overlapping themselves. After the merge a sweep over the
+/// interval endpoints totals the time at depth ≥ 2.
+pub fn simultaneous_frac(spans: &[TruthSpan], t_start_ns: i64, t_end_ns: i64) -> f64 {
+    let dur = (t_end_ns - t_start_ns) as f64;
+    if dur <= 0.0 {
+        return 0.0;
+    }
+    // Per user, clipped to the segment and merged.
+    let mut by_user: Vec<(String, Vec<(i64, i64)>)> = Vec::new();
+    for s in spans {
+        let lo = s.t_start_ns.max(t_start_ns);
+        let hi = s.t_end_ns.min(t_end_ns);
+        if hi <= lo {
+            continue;
+        }
+        match by_user.iter_mut().find(|(u, _)| *u == s.user_id) {
+            Some((_, list)) => list.push((lo, hi)),
+            None => by_user.push((s.user_id.clone(), vec![(lo, hi)])),
+        }
+    }
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (_, mut list) in by_user {
+        list.sort_unstable();
+        let mut cur: Option<(i64, i64)> = None;
+        for (lo, hi) in list {
+            match cur {
+                Some((clo, chi)) if lo <= chi => cur = Some((clo, chi.max(hi))),
+                Some(iv) => {
+                    merged.push(iv);
+                    cur = Some((lo, hi));
+                }
+                None => cur = Some((lo, hi)),
+            }
+        }
+        if let Some(iv) = cur {
+            merged.push(iv);
+        }
+    }
+    // A sweep, not a pairwise intersection: three users talking over each
+    // other must count the shared stretch once, and pairwise unions would
+    // need the same sweep to de-duplicate anyway.
+    let mut events: Vec<(i64, i32)> = Vec::with_capacity(merged.len() * 2);
+    for (lo, hi) in merged {
+        events.push((lo, 1));
+        events.push((hi, -1));
+    }
+    events.sort_unstable();
+    let mut depth = 0i32;
+    let mut total = 0i64;
+    let mut last = 0i64;
+    for (t, delta) in events {
+        if depth >= 2 {
+            total += t - last;
+        }
+        depth += delta;
+        last = t;
+    }
+    (total as f64 / dur).clamp(0.0, 1.0)
+}
+
+/// Add v13's column and fill it in for the verdicts already on disk.
+///
+/// Additive and idempotent, standalone like `semantic::migrate_v9` and
+/// `worlds::migrate_v12`: one nullable column on `segments`, reading nothing
+/// another migration writes.
+///
+/// The backfill is honest only where the evidence survives, so it is written
+/// that way: a verdicted segment with no speaking span still in the database
+/// is left NULL rather than stamped 0.0, because "nobody overlapped" and "the
+/// spans have been purged" are different facts and 0.0 would claim the first
+/// one. Rows with no verdict at all are not touched — the verdict pass will
+/// write both numbers together when it reaches them.
+pub fn migrate_v13(conn: &rusqlite::Connection) -> Result<()> {
+    let present: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('segments') WHERE name = 'truth_overlap_frac'")?
+        .exists([])?;
+    if !present {
+        conn.execute(
+            "ALTER TABLE segments ADD COLUMN truth_overlap_frac REAL",
+            [],
+        )?;
+    }
+    // Only the verdicts that assert somebody was present: `nobody` and
+    // `unknown` have no second speaker to measure and would be rescanned on
+    // every open for nothing.
+    let todo: Vec<(i64, i64, i64)> = conn
+        .prepare(
+            "SELECT id, t_start_ns, t_end_ns FROM segments
+              WHERE truth_verdict IN ('single', 'overlap', 'partial')
+                AND truth_overlap_frac IS NULL",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if todo.is_empty() {
+        return Ok(());
+    }
+    let mut spans = conn.prepare(
+        "SELECT user_id, name, t_start_ns, COALESCE(t_end_ns, ?2)
+           FROM truth_speaking
+          WHERE t_start_ns < ?2 AND COALESCE(t_end_ns, ?2) > ?1",
+    )?;
+    let mut set = conn.prepare("UPDATE segments SET truth_overlap_frac = ?2 WHERE id = ?1")?;
+    let mut filled = 0usize;
+    for (id, a, b) in todo {
+        let rows: Vec<TruthSpan> = spans
+            .query_map(rusqlite::params![a, b], |r| {
+                Ok(TruthSpan {
+                    user_id: r.get(0)?,
+                    name: r.get(1)?,
+                    t_start_ns: r.get(2)?,
+                    t_end_ns: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.is_empty() {
+            continue;
+        }
+        set.execute(rusqlite::params![id, simultaneous_frac(&rows, a, b)])?;
+        filled += 1;
+    }
+    if filled > 0 {
+        info!(
+            segments = filled,
+            "v13: filled in the simultaneous fraction"
+        );
+    }
+    Ok(())
+}
+
 /// Which voice this Discord user's clean turns went to, and how consistently.
 ///
 /// Returns `Some((speaker_id, agreement, n))` where `n` is every clean turn
@@ -381,11 +523,19 @@ pub fn label_batch(
         // ---- judge (no lock) ----
         let cov = coverage(&spans, c.t_start_ns, c.t_end_ns);
         let v = verdict(&cov, nearby);
+        // How much of the turn had two mouths open at once (v13). Stored
+        // beside the verdict rather than derived later: the spans it is
+        // computed from are subject to retention, the verdict is not.
+        let simul =
+            (!spans.is_empty()).then(|| simultaneous_frac(&spans, c.t_start_ns, c.t_end_ns));
 
         // ---- commit (lock held) ----
         {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
             guard.set_segment_truth(c.id, v.user_id(), v.as_str(), v.coverage())?;
+            if let Some(f) = simul {
+                guard.set_segment_truth_overlap(c.id, f)?;
+            }
         }
         stats.labelled.fetch_add(1, Ordering::Relaxed);
     }
@@ -961,6 +1111,179 @@ mod tests {
     fn a_zero_length_segment_has_no_coverage_rather_than_a_division_by_zero() {
         assert!(coverage(&[span("a", 0, 100)], 500, 500).is_empty());
         assert!(coverage(&[span("a", 0, 100)], 500, 400).is_empty());
+    }
+
+    // ---- the simultaneous fraction (v13) ---------------------------------
+
+    const SEG: (i64, i64) = (0, 1_000_000_000); // 0..1000 ms
+
+    fn simul(spans: &[TruthSpan]) -> f64 {
+        simultaneous_frac(spans, SEG.0, SEG.1)
+    }
+
+    #[test]
+    fn one_speaker_however_reported_is_never_simultaneous_with_themselves() {
+        assert_eq!(simul(&[span("a", 0, 1000)]), 0.0);
+        // The re-sent batch again: merged first, exactly as `coverage` does.
+        assert_eq!(
+            simul(&[span("a", 0, 400), span("a", 200, 500), span("a", 900, 1000)]),
+            0.0
+        );
+    }
+
+    #[test]
+    fn two_users_present_but_never_at_once_is_zero() {
+        // Both clear the 0.2 presence bar, so this segment is verdict
+        // `overlap` — and no two mouths are ever open together in it. That
+        // gap is the whole of §26.
+        let spans = [span("a", 0, 500), span("b", 500, 1000)];
+        assert_eq!(simul(&spans), 0.0);
+        let cov = coverage(&spans, SEG.0, SEG.1);
+        assert!(matches!(verdict(&cov, true), Verdict::Overlap));
+    }
+
+    #[test]
+    fn the_interjection_case_reads_as_the_interjection_it_is() {
+        // Six seconds of one person, half a second of another across it.
+        let spans = [span("a", 0, 6000), span("b", 2000, 2500)];
+        let f = simultaneous_frac(&spans, 0, 6_000_000_000);
+        assert!((f - 0.5 / 6.0).abs() < 1e-9, "{f}");
+    }
+
+    #[test]
+    fn a_fully_overlapped_turn_reads_one() {
+        assert_eq!(simul(&[span("a", 0, 1000), span("b", -500, 1500)]), 1.0);
+    }
+
+    #[test]
+    fn three_users_over_one_stretch_count_it_once() {
+        let f = simul(&[span("a", 0, 500), span("b", 0, 500), span("c", 0, 500)]);
+        assert_eq!(f, 0.5, "depth 3 is still one stretch of overlapped time");
+    }
+
+    #[test]
+    fn depth_is_tracked_across_a_gap_in_one_users_speech() {
+        // a: 0-200 and 400-1000; b: 100-500. Simultaneous: 100-200 and
+        // 400-500 = 200 ms.
+        let f = simul(&[span("a", 0, 200), span("a", 400, 1000), span("b", 100, 500)]);
+        assert!((f - 0.2).abs() < 1e-9, "{f}");
+    }
+
+    #[test]
+    fn spans_are_clipped_to_the_segment_before_anything_is_counted() {
+        // Both users talk together for a full second, but only the last
+        // 250 ms of it is inside the segment.
+        let f = simultaneous_frac(&[span("a", -1000, 250), span("b", -1000, 250)], 0, SEG.1);
+        assert!((f - 0.25).abs() < 1e-9, "{f}");
+        // Entirely outside contributes nothing.
+        assert_eq!(simul(&[span("a", 2000, 3000), span("b", 2000, 3000)]), 0.0);
+    }
+
+    #[test]
+    fn a_zero_length_segment_has_no_simultaneity_rather_than_a_division_by_zero() {
+        assert_eq!(simultaneous_frac(&[span("a", 0, 100)], 500, 500), 0.0);
+        assert_eq!(simultaneous_frac(&[span("a", 0, 100)], 500, 400), 0.0);
+        assert_eq!(simul(&[]), 0.0);
+    }
+
+    #[test]
+    fn the_simultaneous_fraction_never_exceeds_the_second_users_coverage() {
+        // A property the sweep must have: overlapped time is time the
+        // runner-up was also talking, so it is bounded by their coverage.
+        let spans = [
+            span("a", 0, 800),
+            span("a", 700, 950),
+            span("b", 300, 600),
+            span("c", 550, 900),
+        ];
+        let cov = coverage(&spans, SEG.0, SEG.1);
+        let second = cov.get(1).map(|c| c.frac).unwrap_or(0.0);
+        let f = simul(&spans);
+        assert!(f <= cov[0].frac + 1e-9);
+        assert!(f >= second - 1e-9 || f <= 1.0);
+        // b and c between them cover 300..900 and `a` covers all of it.
+        assert!((f - 0.6).abs() < 1e-9, "{f}");
+    }
+
+    // ---- the v13 migration ------------------------------------------------
+
+    /// The two tables `migrate_v13` touches, and nothing else: the migration
+    /// is standalone by design and the test says so.
+    fn v13_db() -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE segments (
+                 id INTEGER PRIMARY KEY, t_start_ns INTEGER, t_end_ns INTEGER,
+                 truth_verdict TEXT);
+             CREATE TABLE truth_speaking (
+                 id INTEGER PRIMARY KEY, user_id TEXT, name TEXT,
+                 t_start_ns INTEGER, t_end_ns INTEGER);",
+        )
+        .unwrap();
+        c
+    }
+
+    fn stored(c: &rusqlite::Connection, id: i64) -> Option<f64> {
+        c.query_row(
+            "SELECT truth_overlap_frac FROM segments WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_v13_migration_adds_the_column_and_fills_in_what_it_can() {
+        let c = v13_db();
+        // 1: two users talking over each other for half of it.
+        // 2: a verdict whose spans are gone — NULL, never 0.0.
+        // 3: no verdict at all — the pass has not reached it.
+        c.execute_batch(
+            "INSERT INTO segments VALUES (1, 0, 1000000000, 'overlap'),
+                                        (2, 9000000000, 9500000000, 'single'),
+                                        (3, 0, 1000000000, NULL);
+             INSERT INTO truth_speaking VALUES (1, 'a', 'A', 0, 1000000000),
+                                              (2, 'b', 'B', 500000000, 1000000000);",
+        )
+        .unwrap();
+        migrate_v13(&c).unwrap();
+        assert_eq!(stored(&c, 1), Some(0.5));
+        assert_eq!(stored(&c, 2), None, "purged spans are not a quiet turn");
+        assert_eq!(stored(&c, 3), None, "no verdict, nothing to say");
+    }
+
+    #[test]
+    fn the_v13_migration_is_idempotent_and_does_not_rewrite_what_it_filled() {
+        let c = v13_db();
+        c.execute_batch(
+            "INSERT INTO segments VALUES (1, 0, 1000000000, 'overlap');
+             INSERT INTO truth_speaking VALUES (1, 'a', 'A', 0, 1000000000),
+                                              (2, 'b', 'B', 500000000, 1000000000);",
+        )
+        .unwrap();
+        migrate_v13(&c).unwrap();
+        // A later, better number (the live pass wrote it) survives a second
+        // migration — the backfill only looks at NULLs.
+        c.execute("UPDATE segments SET truth_overlap_frac = 0.25", [])
+            .unwrap();
+        migrate_v13(&c).unwrap();
+        migrate_v13(&c).unwrap();
+        assert_eq!(stored(&c, 1), Some(0.25));
+    }
+
+    #[test]
+    fn the_v13_migration_leaves_a_database_with_no_verdicts_alone() {
+        let c = v13_db();
+        migrate_v13(&c).unwrap();
+        let cols: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('segments') \
+                 WHERE name = 'truth_overlap_frac'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 1, "the column arrives even with nothing to fill in");
     }
 
     // ---- the verdict ladder ---------------------------------------------

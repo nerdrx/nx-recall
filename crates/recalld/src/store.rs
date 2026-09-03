@@ -71,7 +71,15 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // neither is backfilled from anything already in the database. The turn-taking
 // half of 0.10.0 adds no schema at all — every number it reports is a query
 // over turns that were already there.
-pub const SCHEMA_VERSION: i64 = 12;
+//
+// ---- 0.11.6 (schema v13): the simultaneous fraction -----------------------
+// v13 adds `segments.truth_overlap_frac`: what share of a turn two or more
+// Discord users were speaking across *at the same time*, as opposed to the
+// `overlap` verdict's "two users each covered a fifth of it somewhere". The
+// column lives in `crate::truth::migrate_v13`, which also backfills it for
+// verdicts already on disk — but only where the speaking spans survive, since
+// a purged span and a quiet turn would otherwise both read 0.0.
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -980,6 +988,13 @@ impl Store {
         // did, so there is no backfill and nothing to undo.
         self.apply_learned_identity()?;
         // ---- end 0.11.0 ---------------------------------------------------
+
+        // ---- 0.11.6 (schema v13): the simultaneous fraction ----------------
+        // One nullable column on `segments`, and a backfill that only writes
+        // where the speaking spans it is computed from are still on disk. See
+        // `crate::truth::migrate_v13`.
+        crate::truth::migrate_v13(&self.conn)?;
+        // ---- end 0.11.6 ---------------------------------------------------
 
         match current {
             None => {
@@ -5777,6 +5792,33 @@ impl Store {
         Ok((labelled, unlabelled))
     }
 
+    /// Stamp how much of a segment had two Discord users talking at once
+    /// (v13, `crate::truth::simultaneous_frac`).
+    ///
+    /// Separate from `set_segment_truth` on purpose: the verdict is written
+    /// for every candidate, this only when speaking spans were actually there
+    /// to measure, and NULL has to keep meaning "nobody looked".
+    pub fn set_segment_truth_overlap(&self, segment_id: i64, frac: f64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET truth_overlap_frac = ?2 WHERE id = ?1",
+            params![segment_id, frac],
+        )?;
+        Ok(())
+    }
+
+    /// What was stamped, or `None` where nothing has measured it.
+    pub fn segment_truth_overlap(&self, segment_id: i64) -> Result<Option<f64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT truth_overlap_frac FROM segments WHERE id = ?1",
+                params![segment_id],
+                |r| r.get::<_, Option<f64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// How many segments carry each verdict.
     pub fn truth_verdict_counts(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
@@ -7411,7 +7453,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(v, 12);
+        assert_eq!(v, 13);
 
         // The note is still there, and it is not a reminder: nothing invented a
         // date for a sentence that never had one.

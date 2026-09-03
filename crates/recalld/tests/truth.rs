@@ -119,9 +119,10 @@ impl Rig {
 
 #[test]
 fn the_v11_migration_is_idempotent_and_keeps_what_it_wrote() {
-    // 0.9.0 wrote v11; 0.10.0's worlds took it to v12. The number moves, and
-    // what this test is really about does not: re-opening must be a no-op.
-    assert_eq!(SCHEMA_VERSION, 12, "0.10.0 is schema v12");
+    // 0.9.0 wrote v11; 0.10.0's worlds took it to v12, and 0.11.6's
+    // simultaneous fraction to v13. The number moves, and what this test is
+    // really about does not: re-opening must be a no-op.
+    assert_eq!(SCHEMA_VERSION, 13, "0.11.6 is schema v13");
     let dir = temp_dir("schema");
     let mut seg = 0i64;
     // Three opens: the first migrates, the second and third must be no-ops
@@ -270,6 +271,20 @@ fn the_labelling_pass_writes_the_verdict_table_onto_real_segments() {
         (Some(truth_verdict::PARTIAL.into()), Some("u1".into()))
     );
     assert_eq!(r.verdict_of(nobody).0, Some(truth_verdict::NOBODY.into()));
+
+    // v13: the pass stamps how much of each turn had two mouths open at once,
+    // beside the verdict and in the same breath. The overlap segment has u1
+    // to 11.7 s and u2 from 11.6 s, so a tenth of it is simultaneous — and
+    // "two users were both present" and "they collided" are visibly not the
+    // same number.
+    let s = r.store();
+    let simul = |id: i64| s.segment_truth_overlap(id).expect("reading it back");
+    assert!((simul(overlap).expect("overlap is measured") - 0.1).abs() < 1e-9);
+    // The `single` turn has u2 flickering across its last 100 ms while u1 is
+    // still going until 10.95 s: 50 ms of collision, 5% of the turn, and a
+    // turn Discord rightly calls single-speaker.
+    assert!((simul(single).expect("single is measured") - 0.05).abs() < 1e-9);
+    assert_eq!(simul(partial), Some(0.0), "one voice cannot collide");
 }
 
 #[test]

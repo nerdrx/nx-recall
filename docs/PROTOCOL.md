@@ -1039,9 +1039,10 @@ above this line changes, and `proto` stays `1`.
   knows is that they were talking when we lost them.
   `discord_users(user_id PRIMARY KEY, name, speaker_id, via, linked_at_ns,
   first_seen_ns, last_seen_ns)`. Four columns on `segments`
-  (`truth_user_id`, `truth_verdict`, `truth_coverage`, `truth_enrol_ns`) and
-  one on `speaker_prototypes` (`via`). Idempotent like every migration, and
-  with no backfill: truth exists from the day the plugin starts sending it.
+  (`truth_user_id`, `truth_verdict`, `truth_coverage`, `truth_enrol_ns`; a
+  fifth, `truth_overlap_frac`, arrives with schema v13 below) and one on
+  `speaker_prototypes` (`via`). Idempotent like every migration, and with no
+  backfill: truth exists from the day the plugin starts sending it.
 
 - **The verdict.** An idle pass (`crate::truth`, the worker/gating/lock
   discipline of `crate::quality` — gather under the store lock, judge with
@@ -1076,6 +1077,20 @@ above this line changes, and `proto` stays `1`.
   - The local user is a Discord user like any other: their own `SPEAKING`
     arrives with their own id. The mic is still a separate source with a
     separate session, and nothing here changes how it is labelled.
+  - **`segments.truth_overlap_frac` (0.11.6, schema v13)** — the same pass
+    also stamps *how much of the turn had two or more users talking at the
+    same time*, which is a different number from the verdict and from
+    `truth_coverage`. The verdict asks whether two users each covered a fifth
+    of the turn somewhere in it; this asks how much of it they overlapped.
+    Each user's own spans are merged first (as coverage does), then a sweep
+    totals the time at depth ≥ 2. The v13 migration backfills it for verdicts
+    already on disk, but **only where the speaking spans survive** — a purged
+    span and a quiet turn would otherwise both read 0.0, so a row it cannot
+    measure stays NULL. `nobody` and `unknown` are never stamped: there is no
+    second speaker in either to measure. Clients may read it; nothing in the
+    daemon gates on it. FINDINGS §26 is what it was added for, and its
+    headline is that Discord's `overlap` really is collision (median 0.47 of
+    the turn) while the segmentation gate is blind to it on this audio.
 
 - **Linking a user to a voice.** `truth.link {user_id, speaker_id}` /
   `truth.unlink {user_id}` → the user row; `truth.users` → `{users: [row]}`,

@@ -72,7 +72,7 @@ impl OverlapDetector {
     /// Classify one window of real audio. The export's time axis is dynamic,
     /// so the length is whatever `analyse` hands over; only the lower bound is
     /// enforced.
-    fn window(&mut self, samples: &[f32]) -> Result<OverlapStats> {
+    fn window_classes(&mut self, samples: &[f32]) -> Result<Vec<u8>> {
         if samples.len() < MIN_SAMPLES {
             bail!(
                 "segmentation window must be at least {MIN_SAMPLES} samples, got {}",
@@ -90,21 +90,11 @@ impl OverlapDetector {
         }
 
         let frames = shape[1] as usize;
-        let mut stats = OverlapStats {
-            speech_frames: 0,
-            overlap_frames: 0,
-        };
+        let mut out = Vec::with_capacity(frames);
         for f in 0..frames {
-            let row = &y[f * CLASSES..(f + 1) * CLASSES];
-            let class = argmax(row);
-            if class != 0 {
-                stats.speech_frames += 1;
-            }
-            if class >= FIRST_OVERLAP_CLASS {
-                stats.overlap_frames += 1;
-            }
+            out.push(argmax(&y[f * CLASSES..(f + 1) * CLASSES]) as u8);
         }
-        Ok(stats)
+        Ok(out)
     }
 
     /// Overlap statistics for a whole segment, however long.
@@ -131,23 +121,26 @@ impl OverlapDetector {
     ///   rather than padded. Re-measuring a few frames costs less than
     ///   distorting the tail.
     pub fn analyse(&mut self, samples: &[f32]) -> Result<OverlapStats> {
+        Ok(stats_of(&self.classes(samples)?))
+    }
+
+    /// [`analyse`](Self::analyse)'s frames, in order, before they are counted.
+    ///
+    /// Same chunking and the same refusal to pad; the chunks are concatenated
+    /// rather than summed, so a caller can aggregate them however it likes.
+    /// The slid tail repeats a few frames of real audio, exactly as the counts
+    /// do — re-measuring beats distorting, and it is the same trade either way.
+    pub fn classes(&mut self, samples: &[f32]) -> Result<Vec<u8>> {
         if samples.is_empty() {
-            return Ok(OverlapStats {
-                speech_frames: 0,
-                overlap_frames: 0,
-            });
+            return Ok(Vec::new());
         }
         if samples.len() < MIN_SAMPLES {
-            return self.window(&tile_to(samples, MIN_SAMPLES));
+            return self.window_classes(&tile_to(samples, MIN_SAMPLES));
         }
         if samples.len() <= WINDOW_SAMPLES {
-            return self.window(samples);
+            return self.window_classes(samples);
         }
-
-        let mut total = OverlapStats {
-            speech_frames: 0,
-            overlap_frames: 0,
-        };
+        let mut out = Vec::new();
         let mut start = 0usize;
         while start < samples.len() {
             let lo = if start + WINDOW_SAMPLES > samples.len() {
@@ -155,17 +148,89 @@ impl OverlapDetector {
             } else {
                 start
             };
-            let s = self.window(&samples[lo..lo + WINDOW_SAMPLES])?;
-            total.speech_frames += s.speech_frames;
-            total.overlap_frames += s.overlap_frames;
+            out.extend(self.window_classes(&samples[lo..lo + WINDOW_SAMPLES])?);
             start += WINDOW_SAMPLES;
         }
-        Ok(total)
+        Ok(out)
     }
 
     pub fn overlap_frac(&mut self, samples: &[f32]) -> Result<f32> {
         Ok(self.analyse(samples)?.frac())
     }
+}
+
+/// Count a run of frames the way the gate has always counted them: the share
+/// of speech frames that are two speakers at once.
+pub fn stats_of(classes: &[u8]) -> OverlapStats {
+    let mut s = OverlapStats {
+        speech_frames: 0,
+        overlap_frames: 0,
+    };
+    for c in classes {
+        if *c != 0 {
+            s.speech_frames += 1;
+        }
+        if *c as usize >= FIRST_OVERLAP_CLASS {
+            s.overlap_frames += 1;
+        }
+    }
+    s
+}
+
+/// The frame step of the export, in seconds: the number the `win` argument of
+/// [`windowed_max_frac`] is worked out from.
+///
+/// Measured off the export rather than assumed — 10 s of input yields 589
+/// frames, so a frame is about 17 ms. Callers that have a real run in hand
+/// should divide its own frame count by its own duration instead; this is for
+/// the ones that only have a target window length.
+pub const FRAME_SECONDS: f32 = 10.0 / 589.0;
+
+/// The **worst second** of a turn rather than its average (0.11.6, §26).
+///
+/// The mean over a turn answers "how overlapped was this turn"; identity wants
+/// "was there a stretch long enough to capture the embedder". A one-second
+/// interjection at the top of a six-second answer is 17% of the mean and 100%
+/// of the second it happens in, and only one of those two numbers is about the
+/// risk of writing down the wrong name.
+///
+/// `win` is the window in frames. Windows with less than half their frames in
+/// speech are skipped — a window that is mostly silence has too little
+/// evidence to be anybody's maximum — and when no window qualifies (a very
+/// short or very quiet turn) the whole-run mean is returned, so this can only
+/// differ from `stats_of(...).frac()` where there was something to see.
+pub fn windowed_max_frac(classes: &[u8], win: usize) -> f32 {
+    let all = stats_of(classes).frac();
+    if win == 0 || classes.len() <= win {
+        return all;
+    }
+    let mut speech = 0usize;
+    let mut over = 0usize;
+    let mut best: Option<f32> = None;
+    for (i, c) in classes.iter().enumerate() {
+        if *c != 0 {
+            speech += 1;
+        }
+        if *c as usize >= FIRST_OVERLAP_CLASS {
+            over += 1;
+        }
+        if i >= win {
+            let gone = classes[i - win];
+            if gone != 0 {
+                speech -= 1;
+            }
+            if gone as usize >= FIRST_OVERLAP_CLASS {
+                over -= 1;
+            }
+        }
+        if i + 1 >= win && speech * 2 >= win {
+            let f = over as f32 / speech as f32;
+            if best.is_none_or(|b| f > b) {
+                best = Some(f);
+            }
+        }
+    }
+    best.unwrap_or(all)
 }
 
 /// Repeat `samples` cyclically until it is at least `target` long. Used only to
@@ -242,6 +307,84 @@ mod tests {
     #[test]
     fn tiling_a_single_sample_terminates() {
         assert_eq!(tile_to(&[0.5], MIN_SAMPLES).len(), MIN_SAMPLES);
+    }
+
+    #[test]
+    fn counting_frames_matches_the_gates_definition() {
+        // 0 silence, 1..=3 one speaker, 4..=6 two.
+        let s = stats_of(&[0, 1, 2, 4, 5, 0, 6, 3]);
+        assert_eq!(s.speech_frames, 6);
+        assert_eq!(s.overlap_frames, 3);
+        assert!((s.frac() - 0.5).abs() < 1e-6);
+        assert_eq!(stats_of(&[]).speech_frames, 0);
+    }
+
+    #[test]
+    fn the_windowed_maximum_finds_a_burst_the_mean_dilutes() {
+        // Four overlapped frames in twenty: a mean of 0.2, but the window
+        // they land in is entirely overlapped.
+        let mut c = vec![1u8; 20];
+        c[8..12].fill(5);
+        assert!((stats_of(&c).frac() - 0.2).abs() < 1e-6);
+        assert!((windowed_max_frac(&c, 4) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_run_no_longer_than_the_window_is_just_the_mean() {
+        let c = [1u8, 4, 1, 4];
+        assert_eq!(windowed_max_frac(&c, 4), stats_of(&c).frac());
+        assert_eq!(windowed_max_frac(&c, 99), stats_of(&c).frac());
+        assert_eq!(windowed_max_frac(&c, 0), stats_of(&c).frac());
+    }
+
+    #[test]
+    fn clean_speech_stays_clean_under_either_aggregation() {
+        let c = vec![2u8; 100];
+        assert_eq!(stats_of(&c).frac(), 0.0);
+        assert_eq!(windowed_max_frac(&c, 60), 0.0);
+    }
+
+    #[test]
+    fn a_window_that_is_mostly_silence_is_not_allowed_to_be_the_maximum() {
+        // One overlapped frame surrounded by silence would read 1.0 if the
+        // evidence bar were not there; the real answer is the run's mean.
+        let mut c = vec![0u8; 40];
+        c[20] = 4;
+        let f = windowed_max_frac(&c, 10);
+        assert!((f - stats_of(&c).frac()).abs() < 1e-6, "{f}");
+        assert!(
+            (f - 1.0).abs() < 1e-6,
+            "one speech frame, and it is overlap"
+        );
+    }
+
+    #[test]
+    fn the_sliding_window_agrees_with_a_naive_scan() {
+        let c: Vec<u8> = (0..97u32).map(|i| ((i * 7 + i / 3) % 7) as u8).collect();
+        for win in [3usize, 10, 59] {
+            let mut want: Option<f32> = None;
+            for w in c.windows(win) {
+                let s = stats_of(w);
+                if s.speech_frames * 2 >= win {
+                    let f = s.frac();
+                    if want.is_none_or(|b| f > b) {
+                        want = Some(f);
+                    }
+                }
+            }
+            let want = want.unwrap_or_else(|| stats_of(&c).frac());
+            assert!(
+                (windowed_max_frac(&c, win) - want).abs() < 1e-6,
+                "win {win}: {} vs {want}",
+                windowed_max_frac(&c, win)
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_is_about_sixty_frames() {
+        let win = (1.0 / FRAME_SECONDS).round() as usize;
+        assert!((55..=62).contains(&win), "{win}");
     }
 
     #[test]

@@ -7791,7 +7791,7 @@ mod tests {
         let _live = crate::translate::test_guard();
         let r = rig("assist-status");
         let s = call(&r, r#"{"id":1,"method":"status"}"#).unwrap();
-        assert_eq!(s["schema"], json!(12));
+        assert_eq!(s["schema"], json!(13));
         // Shipped defaults: reminders and digests on (both need something else
         // before they do anything), translation off with no guess at a target.
         assert_eq!(s["assist"]["reminders"], json!(true));
