@@ -448,6 +448,7 @@ impl Service {
             // ---- end 0.9.0 -------------------------------------------------
             // ---- 0.11.0, learned identity ----------------------------------
             "identity.calibrate" => self.identity_calibrate(req),
+            "identity.repair" => self.identity_repair(req),
             // ---- end 0.11.0 ------------------------------------------------
             // ---- 0.9.0, the assistant --------------------------------------
             // One read. Reminders ride on `notes.*` (a reminder is a note with
@@ -4128,6 +4129,25 @@ impl Service {
     }
 
     // ---- end 0.11.0 -------------------------------------------------------
+
+    /// `identity.repair` (0.11.9): throw out prototypes that are recordings of
+    /// somebody else.
+    ///
+    /// `prototypes` is required and spelled out rather than assumed, exactly
+    /// as the CLI flag is: this deletes from the voicebank, and a caller that
+    /// meant to preview must not be able to reach the deletion by omitting a
+    /// field. Nothing runs this on a timer.
+    fn identity_repair(&self, req: &Request) -> Result<Value, Error> {
+        if !req.params["prototypes"].as_bool().unwrap_or(false) {
+            return Err(Error::params(
+                "identity.repair needs `prototypes: true`; it is the only thing it \
+                 can repair, and naming it is what keeps the deletion deliberate",
+            ));
+        }
+        let apply = req.params["apply"].as_bool().unwrap_or(false);
+        let now = crate::clock::utc_now_ns();
+        Ok(crate::identity_learn::repair_prototypes(&self.store(), apply, now)?.to_json())
+    }
     // ---- end 0.9.0 --------------------------------------------------------
 }
 

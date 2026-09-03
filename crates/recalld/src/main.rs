@@ -3557,18 +3557,22 @@ fn cmd_identity(cfg: &Config, data_dir: &Path, action: Option<IdentityAction>) -
         IdentityAction::Audit => cmd_identity_audit(cfg, data_dir),
         IdentityAction::Repair {
             foreign,
+            prototypes,
             apply,
             limit,
-        } => {
-            if !foreign {
+        } => match (foreign, prototypes) {
+            (true, _) => cmd_identity_repair_foreign(cfg, data_dir, apply, limit),
+            (_, true) => cmd_identity_repair_prototypes(data_dir, apply),
+            _ => {
                 println!(
-                    "`identity repair` needs --foreign. It is the only thing it can repair,\n\
-                     and naming it is what keeps it from quietly growing a second mode."
+                    "`identity repair` needs --foreign or --prototypes. Naming what it \
+                     may touch\nis what keeps it from quietly growing a third mode.\n\n  \
+                     --foreign     labels the source prior questions, back to unassigned\n  \
+                     --prototypes  voiceprints whose own turn Discord says was somebody else"
                 );
-                return Ok(());
+                Ok(())
             }
-            cmd_identity_repair(cfg, data_dir, apply, limit)
-        }
+        },
         // ---- 0.11.0: learned identity ---------------------------------
         IdentityAction::Calibrate { apply, reset } => {
             cmd_identity_calibrate(cfg, data_dir, apply, reset)
@@ -3591,9 +3595,10 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
     if reset {
         let (cleared, dropped) = recalld::identity_learn::reset(&store, now)?;
         println!(
-            "{cleared} voice(s) back on the global operating point{}.",
+            "{cleared} voice(s) back on the global operating point{}, and a voice is \
+             scored on its best prototype again.",
             if dropped {
-                ", and the learned space dropped"
+                ", the learned space dropped"
             } else {
                 ""
             }
@@ -3696,13 +3701,19 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
         "  {:<28}{:>5}{:>9}{:>7}{:>10}{:>11}{:>9}{:>8}",
         "arm", "n", "correct", "wrong", "declined", "precision", "recall", "F-0.5"
     );
-    row("the globals", &report.baseline);
+    row(
+        &format!("the globals ({})", report.aggregate_installed.as_str()),
+        &report.baseline,
+    );
     row("+ per-voice thresholds", &report.candidate);
     if let Some((w, s)) = &report.projection {
         row(
             &format!("+ learned space (p{:.2}/s{:.2})", w.power, w.shrinkage),
             s,
         );
+    }
+    if let Some((a, s)) = &report.aggregate {
+        row(&format!("+ scoring a voice by {}", a.as_str()), s);
     }
     println!(
         "\n  thresholds: {}",
@@ -3715,6 +3726,19 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
             Some(_) => verdict_line(report.projection_swap, &false),
         }
     );
+    println!(
+        "  scoring:    {}",
+        match &report.aggregate {
+            None => "no other rule to compare against".into(),
+            Some(_) => verdict_line(report.aggregate_swap, &false),
+        }
+    );
+    if report.projection_cleared {
+        println!(
+            "  the learned space installed on an earlier evening was TAKEN BACK: this \
+             run's\n              own held-out numbers do not re-earn it."
+        );
+    }
 
     println!("\nthe overlap gate, held out");
     println!(
@@ -3761,12 +3785,99 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
 
     if apply {
         println!(
-            "\nwrote {} threshold(s), cleared {}.",
-            report.written, report.cleared
+            "\nwrote {} threshold(s), cleared {}{}{}.",
+            report.written,
+            report.cleared,
+            if report.projection_cleared {
+                ", dropped a learned space nothing re-earned"
+            } else {
+                ""
+            },
+            match (&report.aggregate, report.aggregate_swap) {
+                (Some((a, _)), true) => format!(", a voice is now scored by {}", a.as_str()),
+                _ => String::new(),
+            }
         );
     } else {
         println!(
             "\nNothing was written. `recalld identity calibrate --apply` installs what cleared the gate."
+        );
+    }
+    Ok(())
+}
+
+// ---- 0.11.9: `recalld identity repair --prototypes` ------------------------
+
+/// The one repair that is a correctness fix rather than an operating point:
+/// throwing out a prototype that is a recording of somebody else.
+fn cmd_identity_repair_prototypes(data_dir: &Path, apply: bool) -> Result<()> {
+    let store = Store::open(data_dir)?;
+    let now = recalld::clock::utc_now_ns();
+    let report = recalld::identity_learn::repair_prototypes(&store, apply, now)?;
+
+    if let Some(note) = &report.note {
+        println!("{note}.");
+    }
+    if report.condemned.is_empty() {
+        println!(
+            "No prototype in the bank contradicts Discord's own verdict about the turn \
+             it came from."
+        );
+        return Ok(());
+    }
+    println!(
+        "{} prototype(s) whose own turn Discord says was somebody else:\n",
+        report.condemned.len()
+    );
+    for c in &report.condemned {
+        let owner = format!("{} ({})", c.owner_name, c.owner);
+        let said = format!("{} ({})", c.truth_name, c.truth_speaker);
+        println!(
+            "  prototype {:<6} filed under {owner:<22} but segment {} was {said} \
+             ({:.0}% of it)",
+            c.prototype_id,
+            c.source_segment_id,
+            c.coverage * 100.0
+        );
+    }
+
+    if let Some((before, after)) = &report.measured {
+        let pct = |v: f64| {
+            if v.is_nan() {
+                "—".to_string()
+            } else {
+                format!("{:.1}%", v * 100.0)
+            }
+        };
+        let row = |what: &str, s: &recalld::calib::Score| {
+            println!(
+                "  {:<28}{:>5}{:>9}{:>7}{:>10}{:>11}{:>9}{:>8.3}",
+                what,
+                s.n,
+                s.correct,
+                s.wrong,
+                s.declined,
+                pct(s.precision()),
+                pct(s.recall()),
+                s.f_beta(recalld::calib::BETA)
+            );
+        };
+        println!(
+            "\nheld out, on the rows whose own verdict this did NOT read\n  {:<28}{:>5}\
+             {:>9}{:>7}{:>10}{:>11}{:>9}{:>8}",
+            "arm", "n", "correct", "wrong", "declined", "precision", "recall", "F-0.5"
+        );
+        row("the bank as it is", before);
+        row("with these removed", after);
+    }
+
+    if apply {
+        println!("\nRemoved {}.", report.deleted);
+    } else {
+        println!(
+            "\nNothing was removed. `recalld identity repair --prototypes --apply` \
+             deletes them.\nDeleting a prototype is permanent; the segments and their \
+             transcripts are untouched."
         );
     }
     Ok(())
@@ -3904,7 +4015,7 @@ fn cmd_identity_audit(cfg: &Config, data_dir: &Path) -> Result<()> {
 /// the audio came from — which argues against the name the row has and for no
 /// other name at all. A sweep that guessed again in bulk would take one wrong
 /// label and make a hundred, with no human anywhere in it.
-fn cmd_identity_repair(
+fn cmd_identity_repair_foreign(
     cfg: &Config,
     data_dir: &Path,
     apply: bool,
