@@ -139,6 +139,9 @@ failed are listed further down with their numbers.
 | Daily digest refusing banter | 6/6 traps refused, 4/4 real conversations summarised, once the verdict got its own grammar |
 | Translation, FLEURS parallel sentences, e5 cosine | 0.948 against the reference (unrelated pairs: 0.79) |
 | Hearing Japanese in the audio (whisper-tiny), 200 utterances per language | **96.5% recall at 3 s, 0 of 400** German or English utterances heard as Japanese — the larger model was more accurate and failed the false-alarm gate |
+| Hearing Korean and Chinese (whisper-tiny) | 97.5% and 100% recall at 3 s, **0 of 400** German or English utterances heard as any of the three; the feared Japanese-Chinese confusion did not appear, the cross-talk is Japanese-Korean at 2% |
+| Reading Korean and Chinese (SenseVoice int8) | 9.6% character error on 3 s turns for both; on Japanese it trails the Parakeet by four points, so Japanese keeps its own decoder |
+| Discord's overlap verdicts against the overlap gate | median 47% simultaneous speech, and the gate reads 0.018 on those turns — Discord flags the sender's mic, we record a mix with the other party already ducked. Left at 0.10, reason recorded |
 | Reading Japanese, character error rate on 3 s turns | Japanese Parakeet 11.3% on the CPU vs whisper-large-v3 11.5% on the GPU at twelve times the cost — the big model's lead exists only on long sentences a lobby never produces |
 | Partial captions while a turn is still open | words 2.4 s sooner and 96% of them survive into the final — at seven times the pipeline's CPU. Shipped off; the number an incremental decoder has to beat is written down |
 | NLLB-200 (600M, int8) against the 3B prompt as translator, 13 FLEURS directions × 100 sentences, chrF | **wins 13 of 13**, mean +9.5 chrF, Finnish +26; 0 echoes against the prompt's 171 — a 3B cannot tell a language it cannot read from English. Licence CC-BY-NC, which is fine here and a wall for anything sold |
@@ -399,6 +402,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.11.4 | +113h | the arbiter's rewrite keeps its prior words, clears the verdict about them and drops their translation like every other machine edit; a Japanese re-read carries its own provenance |
 | 0.11.5 | +114h | Japanese questions in grounded answers: 3 of 3 traps refused, 3 of 3 answered with correct citations, the German and English set unchanged |
 | 0.11.6 | +121h | conversation is not news: the French detector learns the spoken words it never saw in FLEURS, and two function words settle a short line, with the false-positive line unchanged |
+| 0.11.7 | +123h | Korean and Chinese join Japanese on the audio route (SenseVoice, under 10% character error on three-second turns; Japanese stays on the Parakeet it beats); digests name people instead of A and B; the overlap gate measured against Discord's word and left alone, with the reason written down |
 
 ## Quickstart
 
