@@ -3695,3 +3695,67 @@ alone, which can only ever put back **fewer** rows, never more.
 has since declared `ja` clears guard 1 and its rows are then judged on guards 2
 and 3 alone — which on this install keeps ten rewrites, two of them right. Run
 the repair **before** widening a declaration, not after.
+
+## 0.12.1 — the sweep can finish (schema v16)
+
+`recalld lang sweep --apply` never emptied its work list. On the live install it
+printed the same two lines after every run:
+
+```text
+  1729  already readable, or a voice pinned to a language another pass owns
+1730 still owed
+```
+
+The 53 rows that needed the identifier were done on the first pass and stayed
+done. The 1,729 that [`asr_cjk::pre_route`] declines — a transcript that already
+reads as something, or a voice pinned to a language `correct_language` owns —
+were counted as owed every time, so the nightly pass re-walked all of them every
+night and no output could ever say the archive was swept.
+
+0.11.9 left those rows unmarked on purpose: they cost a string compare and no
+model, a declaration can be added tomorrow, and marking them would freeze a
+decision that was free to re-make. That reasoning was right about the future
+decision and wrong about the arithmetic, and the cause of both is that
+`lang_via` was being asked two questions — *how did this row get its language*
+and *has this pass been here* — that only one column can answer at a time.
+
+#### `segments.sweep_at_ns` (new, schema v16)
+
+- **A visit, not a claim.** Nullable; set to the moment the sweep reached a
+  conclusion about the row, whatever the conclusion was: re-decoded, stamped
+  `de`/`en`, asked and nothing to act on, audio gone, **and declined by the
+  pre-filter**. Nothing but `crate::sweep` reads it, which is what makes marking
+  a declined row safe.
+- **The one free outcome that is not a visit** is a clip under
+  `[asr].lang_sweep_min_s`. What would change that answer is configuration, not
+  data, so no write to the row could ever clear the mark; an operator who lowers
+  the floor must get those rows back, and does.
+- **It is cleared whenever something `pre_route` reads changes**, which is the
+  0.11.9 guarantee kept by a different mechanism. The row's words
+  (`set_segment_text_via`, `set_segment_analysis`), its voice
+  (`set_segment_speaker_via`, `merge_speakers`), or that voice's declared
+  languages (`set_speaker_languages`, i.e. `recalld languages`) each hand the
+  rows concerned straight back to the next run. Declaring a voice Japanese now
+  re-opens its whole history to the sweep, which is the retroactive behaviour
+  `recalld lang repair` has always had.
+
+#### `lang_via: "sweep"` now means one thing
+
+It is written **only with `lang` set**, to `de` or `en`. The bare form 0.11.9
+also wrote — `lang_via: "sweep"` with `lang: null`, as an "asked, nothing to
+say" mark — is gone; that was the second question, and it lives in
+`sweep_at_ns` now. **The v16 migration renames the existing ones**: every row
+carrying the bare form gets `sweep_at_ns = 0` (the honest answer to *when* is
+"before this migration") and its `lang_via` back to null. Rows with the stamp
+form are untouched. A client that special-cased the bare form can drop that
+branch; one that reads `lang_via` for provenance sees strictly fewer values.
+
+#### The CLI says when it is done
+
+- `recalld lang sweep` and `--apply` both end in `0 still owed — the archive is
+  swept` once nothing a model pass could change remains. A **preview** writes
+  nothing, so its own count cannot fall; it subtracts the rows it just resolved
+  and reports what `--apply` would leave, rather than printing the number the
+  operator started with.
+- `recalld lang` reports `sweep   N never asked about, M already swept`, where
+  `M` counts visits and therefore includes rows whose language the sweep set.

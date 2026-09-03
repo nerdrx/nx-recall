@@ -936,7 +936,7 @@ pre-filter, the same identifier, the same decoders, the same judges. A row it
 settles is indistinguishable from one the pipeline got right the first time.
 
 It is stricter than the live path in two places, and both are measured
-(FINDINGS §29). The floor is 1.5 s rather than 1.0 s, because below that the
+(FINDINGS §30). The floor is 1.5 s rather than 1.0 s, because below that the
 decoders refuse to replace anything anyway. And the identifier is asked over
 three overlapping windows rather than one, and must say the same thing all
 three times: at one window this archive's short grunts route to Korean and
@@ -951,13 +951,19 @@ than caution. On a German and English archive there are almost no real foreign
 turns to be right about, so the routes' small false-positive rate is nearly all
 of their output: nine rows were rewritten in the measured run and eight of the
 nine were wrong -- `Okay.` came back as a Japanese sentence. What the sweep
-writes instead is `lang`: de or en where the identifier heard one, and a mark
-meaning `asked, nothing to say` everywhere else. `--apply --redecode` turns the
-rewriting on for one run, and `[asr].lang_sweep_redecode` for good.
+writes instead is `lang`: de or en where the identifier heard one, and nothing
+at all everywhere else. `--apply --redecode` turns the rewriting on for one
+run, and `[asr].lang_sweep_redecode` for good.
 
 Bounded, resumable and idle-priority: the work list is a query, not a cursor,
-and every row a model is spent on leaves it — so an interrupted run loses at
-most one row and a second run does not pay for the first one's answers again.
+and every row the pass reaches a conclusion about leaves it — including the
+ones it declines for free, which are most of them. So an interrupted run loses
+at most one row, a second run does not pay for the first one's answers again,
+and `0 still owed` means the archive really is swept.
+
+A declined row comes back the moment its words change or its voice's declared
+languages do, so `recalld languages 7 ja` hands that voice's whole history back
+to the next run.
 The same pass runs nightly on its own while `[asr].lang_sweep` is on.
 
 `recalld models fetch --japanese` installs the identifier and the Japanese
@@ -971,7 +977,7 @@ and `models build-night`) and an idle GPU, and does nothing without them.")]
 
         /// Also let the decoders REPLACE transcripts, not just write a
         /// language. Off by default and measured to be wrong eight times in
-        /// nine on this kind of archive (FINDINGS §29) — read what a plain
+        /// nine on this kind of archive (FINDINGS §30) — read what a plain
         /// `recalld lang sweep` says it would rewrite before asking for this.
         #[arg(long, requires = "apply")]
         redecode: bool,
