@@ -79,6 +79,10 @@ pub fn brief(store: &Store, id: i64) -> Result<Option<Value>> {
             "you": Some(speaker.id) == you,
             "name": speaker.name(),
             "auto": speaker.auto_label,
+            // The highlight (v15), because this IS `person.get`'s speaker
+            // object and a client renders it with the same code.
+            "colour": speaker.colour,
+            "icon": speaker.icon,
             "languages": speaker.languages,
             "first_seen": iso8601(speaker.created_at),
         },

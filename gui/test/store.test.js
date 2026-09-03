@@ -37,6 +37,9 @@ import {
   MAX_SEGMENTS,
   HARD_MAX,
   speakerLabel,
+  speakerColour,
+  speakerIcon,
+  speakerNameColor,
   segmentSpeakerLabel,
   LANGUAGE_CHOICES,
   languageValue,
@@ -46,6 +49,8 @@ import {
   applyAssist,
   translationLeads,
 } from '../src/renderer/lib/store.js';
+import { speakerColor } from '../src/renderer/lib/dom.js';
+import { accentColor } from '../src/renderer/lib/palette.js';
 import { splitOutcome } from '../src/renderer/views/speakers.js';
 
 function reset() {
@@ -470,6 +475,86 @@ test('a relabel carries languages without clobbering the name, and vice versa', 
   applyEvent({ seq: 2, ev: 'relabel', data: { speaker: 1, name: 'Kira Vex' } });
   assert.equal(store.speakers.get(1).name, 'Kira Vex');
   assert.deepEqual(store.speakers.get(1).languages, ['de']);
+});
+
+test('a relabel carries a highlight without clobbering the name, and vice versa', () => {
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', auto: 'Speaker_03', colour: null, icon: null, segments: 0, total_ms: 0 });
+
+  applyEvent({ seq: 1, ev: 'relabel', data: { speaker: 1, name: 'Kira', colour: 'violet', icon: '🌙' } });
+  assert.equal(speakerColour(1), 'violet');
+  assert.equal(speakerIcon(1), '🌙');
+  assert.equal(store.speakers.get(1).name, 'Kira');
+
+  // A plain rename says nothing about the highlight and must not erase it —
+  // the same rule `languages` has, and the same rule the wire has: on
+  // `speakers.set` an omitted key means "leave it alone".
+  applyEvent({ seq: 2, ev: 'relabel', data: { speaker: 1, name: 'Kira Vex' } });
+  assert.equal(store.speakers.get(1).name, 'Kira Vex');
+  assert.equal(speakerColour(1), 'violet');
+  assert.equal(speakerIcon(1), '🌙');
+});
+
+test('a relabel carrying an explicit null clears the highlight it names', () => {
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', auto: 'Speaker_03', colour: 'violet', icon: '🌙', segments: 0, total_ms: 0 });
+
+  // The other half of the omit-vs-null rule, and the half that makes the
+  // "remove colour" control work at all: `null` is an instruction, not an
+  // absence, so it must not be folded in with `??`. The icon is untouched
+  // because this event never mentioned it.
+  applyEvent({ seq: 1, ev: 'relabel', data: { speaker: 1, name: 'Kira', colour: null } });
+  assert.equal(speakerColour(1), null);
+  assert.equal(speakerIcon(1), '🌙');
+
+  applyEvent({ seq: 2, ev: 'relabel', data: { speaker: 1, name: 'Kira', icon: null } });
+  assert.equal(speakerIcon(1), '');
+});
+
+test('a relabel for a voice this client has never seen synthesises its highlight too', () => {
+  reset();
+  // The row is invented here (a client that missed the segment which minted
+  // the voice), and its field set is hardcoded — so a field forgotten in that
+  // literal is a highlight that exists on the wire and nowhere on screen.
+  applyEvent({ seq: 1, ev: 'relabel', data: { speaker: 4, name: 'Ash', colour: 'teal', icon: '✨' } });
+  assert.equal(speakerColour(4), 'teal');
+  assert.equal(speakerIcon(4), '✨');
+});
+
+test('an unhighlighted voice keeps exactly the colour it has always had', () => {
+  reset();
+  store.speakers.set(1, { id: 1, name: 'Kira', auto: 'Speaker_03', colour: null, icon: null, segments: 0, total_ms: 0 });
+
+  // The whole compatibility claim of the feature: nothing about the existing
+  // UI changes until somebody picks a colour, so this has to be the SAME
+  // string dom.js would have produced, not merely a similar-looking one.
+  assert.equal(speakerNameColor(1), speakerColor(1));
+  assert.equal(speakerIcon(1), '');
+
+  // Amber rather than violet, and that is not arbitrary: voice 1's hashed hue
+  // IS 268, so a highlight of violet on this particular row produces the
+  // string it already had and would assert nothing. The palette's band and the
+  // identity band (dom.js: 187–290) overlap by design, which is exactly why
+  // this test has to pick a token from outside it.
+  store.speakers.get(1).colour = 'amber';
+  assert.equal(speakerNameColor(1), accentColor('amber'));
+  assert.equal(speakerNameColor(1), 'hsl(44 var(--sp-s) var(--sp-l))');
+  assert.notEqual(speakerNameColor(1), speakerColor(1));
+});
+
+test('a colour token this build has never heard of is no highlight at all', () => {
+  reset();
+  // A daemon newer than this GUI may name an eleventh colour. Painting
+  // `hsl(undefined …)` would put a black name on a black ground and say
+  // nothing about why; falling back to the hashed hue is legible and honest.
+  store.speakers.set(1, { id: 1, name: 'Kira', auto: 'Speaker_03', colour: 'chartreuse', icon: null, segments: 0, total_ms: 0 });
+  assert.equal(speakerColour(1), null);
+  assert.equal(speakerNameColor(1), speakerColor(1));
+
+  // And a voice nobody has heard of is not a crash either.
+  assert.equal(speakerColour(999), null);
+  assert.equal(speakerIcon(999), '');
+  assert.equal(speakerColour(null), null);
 });
 
 test('a swept voice disappears and its rows go back to nameless', () => {

@@ -46,6 +46,13 @@
 import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
+// The highlight palette, from the renderer's own copy of it rather than a
+// fourth transcription. `speakers.palette` is supposed to be the daemon
+// telling a client which tokens exist, so a mock that carried its own list
+// could drift from the GUI it is serving and the drift would look like a
+// working feature. gui/test/palette.test.js already holds this file to
+// crates/recalld/src/palette.rs, which is the list this stands in for.
+import { PALETTE, accent } from '../src/renderer/lib/palette.js';
 
 const PROTO = 1;
 const DAEMON = 'recalld-mock/0.5';
@@ -139,26 +146,34 @@ const PARTIAL_LINE = 'the door behind the bar goes back into the same instance i
 // `languages` is schema v5: which languages this voice actually speaks, so a
 // wrong-language transcript can be corrected rather than merely noticed. `null`
 // is "any", the default, and is what almost every voice starts as.
+//
+// `colour`/`icon` are the per-person highlight: a palette TOKEN (never a hex —
+// see gui/src/renderer/lib/palette.js) and a short emoji, both null for a
+// voice nobody has decorated. Two of them start highlighted on purpose. A
+// fixture where every row is null would let a view that never reads the fields
+// pass the e2e — the highlight has to be on screen on FIRST paint, before
+// anything has called `speakers.set`, or "does the list render one?" and "does
+// setting one work?" are the same untested question.
 const SPEAKERS = [
-  { id: 1, name: 'Kira', auto: 'Speaker_03', languages: ['de'], first_seen: '2026-07-02T18:24:00Z' },
-  { id: 2, name: null, auto: 'Speaker_07', first_seen: '2026-07-02T18:31:00Z' },
-  { id: 3, name: null, auto: 'Speaker_12', first_seen: '2026-07-11T21:02:00Z' },
-  { id: 4, name: 'Ash', auto: 'Speaker_18', first_seen: '2026-07-19T19:47:00Z' },
-  { id: 5, name: null, auto: 'Speaker_31', first_seen: '2026-08-14T20:50:00Z' },
-  { id: 6, name: null, auto: 'Speaker_44', first_seen: '2026-08-29T20:19:00Z' },
+  { id: 1, name: 'Kira', auto: 'Speaker_03', languages: ['de'], colour: 'violet', icon: '\u{1F319}', first_seen: '2026-07-02T18:24:00Z' },
+  { id: 2, name: null, auto: 'Speaker_07', colour: null, icon: null, first_seen: '2026-07-02T18:31:00Z' },
+  { id: 3, name: null, auto: 'Speaker_12', colour: null, icon: null, first_seen: '2026-07-11T21:02:00Z' },
+  { id: 4, name: 'Ash', auto: 'Speaker_18', colour: 'teal', icon: '\u{2728}', first_seen: '2026-07-19T19:47:00Z' },
+  { id: 5, name: null, auto: 'Speaker_31', colour: null, icon: null, first_seen: '2026-08-14T20:50:00Z' },
+  { id: 6, name: null, auto: 'Speaker_44', colour: null, icon: null, first_seen: '2026-08-29T20:19:00Z' },
   // Unnamed, like any other voice the daemon minted — the difference is where
   // its label comes from, not whether the user has typed one.
-  { id: 8, name: null, auto: 'You', first_seen: '2026-08-29T20:12:00Z' },
+  { id: 8, name: null, auto: 'You', colour: null, icon: null, first_seen: '2026-08-29T20:12:00Z' },
   // A one-off: one grunt, a second of speech, no name. The kind of row the
   // mint bar now prevents and `speakers.prune` sweeps up when it slipped
   // through anyway (0.6.1).
-  { id: 9, name: null, auto: 'Speaker_52', first_seen: '2026-08-31T18:07:00Z' },
+  { id: 9, name: null, auto: 'Speaker_52', colour: null, icon: null, first_seen: '2026-08-31T18:07:00Z' },
   // The 0.6.4 bug, sitting in the fixture where it can be pressed: a voice with
   // NO segments at all. Its words were deleted at some point; the voiceprint
   // stayed and goes on matching. Delete-by-segment matched nothing here, so the
   // ⋯ menu's Delete was a silent no-op for ever — which is why the list has to
   // carry one of these and the e2e has to delete it through the real UI.
-  { id: 10, name: null, auto: 'Speaker_58', first_seen: '2026-08-30T21:41:00Z' },
+  { id: 10, name: null, auto: 'Speaker_58', colour: null, icon: null, first_seen: '2026-08-30T21:41:00Z' },
 ];
 
 /// The commitment state machine. Nothing but a human click moves a row off
@@ -169,6 +184,24 @@ const COMMITMENT_STATES = ['candidate', 'confirmed', 'done', 'dismissed'];
 /// as `[min, max]`. Kept here rather than in the view so the mock refuses the
 /// same values the daemon refuses.
 const GRAPH_THREADS = [1, 32];
+
+/// How long a highlight icon may be, and how "long" is counted.
+///
+/// Grapheme CLUSTERS, mirroring the daemon's own rule, because every other
+/// unit of length lies about emoji: 👩‍🚀 is one thing a person picked, one
+/// cluster, two "characters" by `Intl` if you split it wrong, seven UTF-16
+/// units, and eleven bytes. Two clusters is enough for a pair like 🌙✨ and
+/// short enough that an icon can never crowd a name out of a row.
+const MAX_ICON_GRAPHEMES = 2;
+
+const ICON_SEGMENTER = new Intl.Segmenter('en', { granularity: 'grapheme' });
+function graphemes(s) {
+  return [...ICON_SEGMENTER.segment(s)].length;
+}
+
+/// Whitespace and C0/C1 control characters. Deliberately narrower than
+/// `\p{C}`: U+200D ZERO WIDTH JOINER is `Cf` and every joined emoji needs it.
+const WS_OR_CONTROL = /[\s\p{Cc}]/u;
 
 /// What counts as a one-off voice, matching the daemon's own bar.
 const PRUNE_MAX_SEGMENTS = 1;
@@ -1167,11 +1200,22 @@ export function startMock({
     return state.tombstones.get(seg.speaker) ?? seg.speaker;
   }
 
-  /// The `{name, auto}` pair every place a person appears in the graph, so a
-  /// client can render a voice it has never queried.
+  /// The `{name, auto, colour, icon}` block every place a person appears in
+  /// the graph, so a client can render a voice it has never queried.
+  ///
+  /// The highlight travels with the name for exactly that reason: a
+  /// participant chip, a commitment's "who", an edge in "people they talk
+  /// with" are all drawn from THIS and never from `speakers.list`, so a client
+  /// that had to join the two would paint the memory graph in the hashed
+  /// colours while the transcript beside it used the chosen ones.
   function person(id) {
     const sp = speakerById(id);
-    return { name: sp?.name ?? null, auto: sp?.auto ?? `Speaker_${id}` };
+    return {
+      name: sp?.name ?? null,
+      auto: sp?.auto ?? `Speaker_${id}`,
+      colour: sp?.colour ?? null,
+      icon: sp?.icon ?? null,
+    };
   }
 
   /// One conversation, without its words — the shape both graph methods share.
@@ -1392,6 +1436,11 @@ export function startMock({
       // schema v5: null is "any", which is what a voice speaks until somebody
       // says otherwise.
       languages: s.languages ?? null,
+      // The per-person highlight. A TOKEN, not a colour, and null for almost
+      // everybody — this is the single projection every view reads a voice
+      // out of, so a field missing here is a field missing from the whole app.
+      colour: s.colour ?? null,
+      icon: s.icon ?? null,
       first_seen: s.first_seen,
       segments: c.get(s.id)?.segments ?? 0,
       total_ms: c.get(s.id)?.total_ms ?? 0,
@@ -1438,6 +1487,11 @@ export function startMock({
         id: s.id,
         auto: s.auto,
         name: s.name,
+        // The preview is a list of people about to be deleted, and it is the
+        // one screen where recognising a voice at a glance matters most — so
+        // it gets the same highlight every other list of people carries.
+        colour: s.colour ?? null,
+        icon: s.icon ?? null,
         segments: c.get(s.id)?.segments ?? 0,
         total_ms: c.get(s.id)?.total_ms ?? 0,
       }))
@@ -1844,6 +1898,12 @@ export function startMock({
               const sp = state.speakers.find((s) => s.id === id);
               return sp?.name ?? (sp?.auto ?? '').replace(/^Speaker_(\d+)$/, 'Speaker $1');
             })(),
+            // The highlight beside the label, for the same reason the label is
+            // here at all: the digest card draws its chips from this list and
+            // nothing else, and a chip in the hashed colour next to a
+            // transcript row in the chosen one reads as two different people.
+            colour: person(id).colour,
+            icon: person(id).icon,
             share: sh?.share ?? null,
             turns: sh?.turns ?? null,
           };
@@ -2441,6 +2501,98 @@ export function startMock({
       return { id: sp.id, languages: sp.languages };
     },
 
+    /**
+     * The per-person highlight: a palette token and a small icon.
+     *
+     * The shape of the parameters is the whole contract and it is NOT the
+     * shape `speakers.name` uses. Both keys are optional, and the three cases
+     * are distinct: omitted means "leave this one alone", `null` means "clear
+     * it", a value means "set it". That is why every branch below tests
+     * `!== undefined` rather than truthiness — `{id, colour: null}` has to
+     * clear the colour and leave the icon standing, and a mock that folded
+     * with `??` would quietly make the clear button do nothing.
+     *
+     * Both fields ride out on the existing `relabel` event carrying the name
+     * too, exactly as `set_languages` does, so a client folding one in never
+     * has to choose between the facts.
+     */
+    'speakers.set'(params) {
+      const id = Number(params?.id);
+      const sp = state.speakers.find((s) => s.id === id);
+      if (!sp) {
+        // A tombstone is not a missing voice, and saying "no speaker 3" about
+        // an id that still resolves would send a client looking for a bug it
+        // does not have. Same answer `speakers.delete` gives.
+        const canonical = state.tombstones.get(id);
+        if (canonical != null) throw err('conflict', `speaker ${id} was merged into ${canonical}; highlight ${canonical} instead`);
+        throw err('not_found', `no speaker ${params?.id}`);
+      }
+
+      // Saying nothing at all is not a way to clear a highlight — clearing is
+      // an explicit null, and a request that mentions neither half is a client
+      // bug the daemon would rather name than silently succeed at. `err:params`
+      // is what recalld answers; a mock that shrugged here would let an e2e
+      // pass against a request production refuses.
+      if (params?.colour === undefined && params?.icon === undefined) {
+        throw err('params', 'speakers.set needs colour, icon, or both (null clears one)');
+      }
+
+      if (params?.colour !== undefined) {
+        const raw = params.colour;
+        // `null` clears. An EMPTY STRING does not: it is not a token, and
+        // recalld's `palette::check_colour` refuses it rather than guessing
+        // that somebody meant "none". The icon field is the one where blank
+        // means clear, because a text input is how an icon is typed and
+        // emptying it is how a person says they want none — a colour is picked
+        // from swatches and has a "none" swatch of its own.
+        if (raw === null) {
+          sp.colour = null;
+        } else if (typeof raw !== 'string' || !accent(raw.trim())) {
+          // The closed set is `palette::TOKENS` in the daemon. A token it
+          // cannot resolve is not a colour it can paint, and accepting one
+          // would store a highlight that renders as nothing for ever.
+          throw err('params', `unknown colour ${JSON.stringify(raw)}; this daemon knows ${PALETTE.map((a) => a.token).join(', ')}`);
+        } else {
+          sp.colour = raw.trim();
+        }
+      }
+
+      if (params?.icon !== undefined) {
+        const raw = params.icon;
+        if (raw === null) sp.icon = null;
+        else if (typeof raw !== 'string') throw err('params', 'icon must be a string or null');
+        else {
+          const icon = raw.trim();
+          // Blank after trimming IS a clear, not an error: the daemon stores
+          // NULL for it, so a client that sends back an emptied text field
+          // gets the obvious behaviour rather than a rejection.
+          if (!icon) sp.icon = null;
+          // Whitespace and control characters only. Deliberately NOT the whole
+          // `\p{C}` class: U+200D ZERO WIDTH JOINER is `Cf`, and banning it
+          // would ban every joined emoji — a family or a woman astronaut is
+          // one grapheme cluster and a perfectly ordinary thing to pick.
+          else if (WS_OR_CONTROL.test(icon)) {
+            throw err('params', 'an icon may not contain whitespace or control characters');
+          }
+          // Two grapheme clusters, not two code units: a joined emoji is one
+          // cluster and seven UTF-16 units, so a check that counted .length
+          // would refuse an ordinary pick while happily accepting four flags.
+          else if (graphemes(icon) > MAX_ICON_GRAPHEMES) {
+            throw err('params', `icon is at most ${MAX_ICON_GRAPHEMES} characters, not ${graphemes(icon)}`);
+          } else sp.icon = icon;
+        }
+      }
+
+      emit('relabel', 'relabel', { speaker: sp.id, name: sp.name, colour: sp.colour ?? null, icon: sp.icon ?? null });
+      return { id: sp.id, colour: sp.colour ?? null, icon: sp.icon ?? null };
+    },
+
+    /// The tokens this daemon will accept, with the hue and the canonical hex
+    /// behind each. A READ, and the reason the picker has no list of its own:
+    /// a daemon that grows an eleventh colour grows an eleventh swatch, and a
+    /// GUI older than the daemon simply never offers the one it cannot render.
+    'speakers.palette': () => ({ palette: PALETTE.map((a) => ({ ...a })) }),
+
     // 0.6.1: the one-off voices sweep. Lists by default; `apply` deletes.
     'speakers.prune'(params) {
       const voices = pruneCandidates();
@@ -2654,6 +2806,8 @@ export function startMock({
           name: sp.name,
           auto: sp.auto,
           languages: sp.languages ?? null,
+          colour: sp.colour ?? null,
+          icon: sp.icon ?? null,
           first_seen: sp.first_seen,
         },
         languages: sp.languages ?? null,
@@ -2739,7 +2893,15 @@ export function startMock({
           people: [...spoke.entries()]
             .sort((a, b) => b[1] - a[1])
             .slice(0, 6)
-            .map(([id]) => ({ speaker_id: id, label: person(id).name ?? person(id).auto })),
+            .map(([id]) => ({
+              speaker_id: id,
+              label: person(id).name ?? person(id).auto,
+              // The chips in this card are a row of people, and a row of
+              // people is where a highlight earns its keep — same fields, same
+              // names, as everywhere else a person is serialised.
+              colour: person(id).colour,
+              icon: person(id).icon,
+            })),
           // Tier 2 output: whatever enrichment happened to label these
           // conversations, and an empty list when it labelled none.
           topics: [...new Set(threads.map((t) => state.topics[t]).filter(Boolean))].slice(0, 5),
@@ -2806,6 +2968,12 @@ export function startMock({
             dur_ms: s.dur_ms,
             speaker: s.speaker,
             speaker_name: p ? (p.name ?? p.auto) : null,
+            // Beside the resolved name, and resolved the same way: the player
+            // draws its turn list from these three fields alone and never
+            // consults `speakers.list`, so a highlight that is not here is a
+            // highlight that vanishes the moment replay opens.
+            speaker_colour: p ? p.colour : null,
+            speaker_icon: p ? p.icon : null,
             text: s.text,
             has_audio: who !== NO_AUDIO_SPEAKER,
           };
@@ -3182,6 +3350,8 @@ export function startMock({
           name: sp.name,
           auto: sp.auto,
           languages: sp.languages ?? null,
+          colour: sp.colour ?? null,
+          icon: sp.icon ?? null,
         },
         last_heard_ms: mine.length ? Math.max(...mine.map((s) => s.t_ms)) : null,
         // What THEY owe YOU, and what you owe them. Two lists rather than one

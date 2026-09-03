@@ -25,6 +25,7 @@
 mod desktop;
 mod feed;
 mod layout;
+mod palette;
 mod probe;
 mod raster;
 mod settings;

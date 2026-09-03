@@ -18,6 +18,14 @@ const ALLOWED = new Set([
   'mic.set',
   'speakers.list',
   'speakers.name',
+  // Per-person highlights: a palette token and a small icon, and the list of
+  // tokens the daemon will accept. The read is here as well as the write for
+  // the same reason `assist.get` is — the picker builds its swatches out of
+  // what the daemon offers rather than out of a list of its own, so a daemon
+  // that grows an eleventh colour grows an eleventh swatch without a GUI
+  // release. A method the UI calls and this set forgets is a dead button.
+  'speakers.set',
+  'speakers.palette',
   // Which languages a voice speaks, and the sweep for voices that are not
   // people at all. Both are 0.6.1 and both are reachable from the speakers
   // view, so both belong here — a method the UI calls and this set forgets is

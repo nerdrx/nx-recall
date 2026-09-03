@@ -5,9 +5,12 @@
 // moment and highlights it, because "what did she say about that world?" is
 // answered by the conversation, not by the matching line on its own.
 
-import { h, clear, fmtClock, fmtDay, fmtDayLabel, fmtDate, speakerColor } from '../lib/dom.js';
+import { h, clear, fmtClock, fmtDay, fmtDayLabel, fmtDate } from '../lib/dom.js';
 import { store, speakerLabel, segmentSpeakerLabel, isUncertain, isShaky, ask } from '../lib/store.js';
 import { shakyMark, translationCell } from '../lib/marks.js';
+// 0.12.0 — per-person highlights. The same three helpers the transcript uses,
+// because a hit and the row it takes you to must not disagree about a colour.
+import { look, lookOf, iconSpan, markRow } from './highlight.js';
 import { toast } from '../lib/sheets.js';
 import { defaultMode, modeControl, modeById, requestFor, resultSummary, semanticState, viaBadge } from './semantic.js';
 
@@ -361,10 +364,17 @@ export function mount(root, ctx, arg) {
     pills.hidden = !it && !handWorld;
     if (!it && !handWorld) return;
 
-    const pill = (key, label, title, drop) =>
+    // `icon` is a separate child rather than part of `label` on purpose:
+    // `.ask-pill-text` is READ as the name — the e2e compares it against the
+    // `.nm` on every hit to prove the pill still describes the result set — so
+    // folding an emoji into it would make the pill and the rows disagree about
+    // who this is. Same shape as `.who`, where the icon is a sibling of `.nm`
+    // and never inside it.
+    const pill = (key, label, title, drop, icon) =>
       h(
         'span',
         { class: 'ask-pill', dataset: { facet: key }, title },
+        iconSpan(icon),
         h('span', { class: 'ask-pill-text', text: label }),
         h(
           'button',
@@ -411,11 +421,25 @@ export function mount(root, ctx, arg) {
       );
     }
     if (it.speaker_id != null) {
+      // The pill is the one place on this page that names the voice the whole
+      // result set is about, so the icon goes in FRONT of the label rather than
+      // beside it — it has to read as part of the person's name, the same way
+      // it does on every row below. No colour: the pill is a facet chip with
+      // its own ✕ and its own hairline, and tinting it would make a filter look
+      // like a warning.
+      const pillIcon = lookOf(it.speaker_id).icon;
+      const pillLabel = it.speaker_label || speakerLabel(it.speaker_id);
       pills.append(
-        pill('speaker', it.speaker_label || speakerLabel(it.speaker_id), 'Only this voice — press ✕ to search everybody', () => {
-          delete facetState.asked.speaker_id;
-          delete facetState.asked.speaker_label;
-        })
+        pill(
+          'speaker',
+          pillLabel,
+          'Only this voice — press ✕ to search everybody',
+          () => {
+            delete facetState.asked.speaker_id;
+            delete facetState.asked.speaker_label;
+          },
+          pillIcon
+        )
       );
     }
     if (it.world_id) {
@@ -717,7 +741,11 @@ export function mount(root, ctx, arg) {
   }
 
   function hitRow(seg, modeId = facetState.mode) {
-    const color = speakerColor(seg.speaker);
+    // A hit is very often about a voice the live window has already trimmed, so
+    // the row's own `speaker_colour`/`speaker_icon` matter more here than
+    // anywhere else — `look` prefers the store where it has the voice and falls
+    // back to what the query answered where it does not.
+    const { color, hl, icon } = look(seg);
     const row = h('div', {
       class: `seg${isUncertain(seg) ? ' uncertain' : ''}${isShaky(seg) ? ' shaky' : ''}`,
       dataset: { hit: String(seg.id) },
@@ -731,6 +759,7 @@ export function mount(root, ctx, arg) {
         'span',
         { class: 'who', ...(seg.speaker != null ? { dataset: { sp: String(seg.speaker) } } : {}) },
         h('span', { class: 'dot', style: `color:${color}` }),
+        iconSpan(icon),
         // Same vocabulary as the transcript: a hit with no voice says which
         // kind of nameless it is, not just that a field is empty.
         h('span', {
@@ -786,6 +815,10 @@ export function mount(root, ctx, arg) {
           : null
       )
     );
+    // The same 2px inset the transcript row wears, and refused on the same
+    // grounds: an `uncertain` hit is a guess about who spoke, and styles.css
+    // deliberately overrides the speaker colour on those.
+    markRow(row, hl, { uncertain: isUncertain(seg) });
     const jump = () => ctx.jumpToSegment(seg);
     row.addEventListener('click', jump);
     row.addEventListener('keydown', (e) => {

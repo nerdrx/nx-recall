@@ -619,6 +619,9 @@ pub fn truth_link_json(
         "name": row.name,
         "speaker": row.speaker_id,
         "speaker_name": row.speaker_name,
+        // The highlight (v15), like every other place a voice is named.
+        "speaker_colour": row.speaker_colour,
+        "speaker_icon": row.speaker_icon,
         "via": row.via,
         "linked_ms": row.linked_at_ns.map(ns_to_ms),
         "first_seen_ms": ns_to_ms(row.first_seen_ns),

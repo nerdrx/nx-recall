@@ -2652,6 +2652,176 @@ export function runE2E(deps) {
 
     await step('shot-transcript-renamed', async () => ({ file: await shot('transcript-renamed') }));
 
+    // 7b — per-person highlights (0.12.0). Set a colour and an emoji through
+    // the real picker, see them on the transcript row and the person page,
+    // clear them, and see them GO. The last half is the point: a highlight
+    // that can be set and not unset is a decoration somebody is stuck with.
+    await step('highlight-set-and-clear', async () => {
+      // A voice the fixture leaves unhighlighted, so "it appeared" means this
+      // step put it there rather than the fixture having it all along. Kira (1)
+      // and Ash (4) ship highlighted precisely so the OTHER assertions here —
+      // that a highlight survives a reload and rides the wire — have something
+      // to look at.
+      const target = 2;
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      await waitFor('transcript rows', async () => js('document.querySelectorAll("#seg-list .seg").length > 0'));
+
+      // The fixture's two highlighted people are visible without anybody
+      // touching a control — the "shipped state" half of the check.
+      const fixture = await js(`(() => {
+        const icons = [...document.querySelectorAll('#seg-list [data-sp="1"] .sp-icon')];
+        const rows = [...document.querySelectorAll('#seg-list .seg.person-hl')];
+        return {
+          kiraIcons: icons.length,
+          kiraIcon: icons[0]?.textContent || '',
+          accented: rows.length,
+          accentColour: rows[0]?.style.getPropertyValue('--person-hl') || '',
+        };
+      })()`);
+      assert(fixture.kiraIcons > 0, 'the fixture-highlighted voice shows no icon on the transcript');
+      assert(fixture.kiraIcon === '\u{1F319}', `wrong icon on the fixture voice: ${JSON.stringify(fixture.kiraIcon)}`);
+      assert(fixture.accented > 0, 'no transcript row wears the highlight accent');
+      assert(/^hsl\(268 /.test(fixture.accentColour), `the accent is not the violet token: "${fixture.accentColour}"`);
+
+      // What the unhighlighted voice looks like BEFORE, so "unchanged" is a
+      // measurement rather than a hope.
+      const before = await js(`(() => {
+        const nm = document.querySelector('#seg-list [data-sp="${target}"] .nm');
+        const row = nm?.closest('.seg');
+        return {
+          rows: document.querySelectorAll('#seg-list [data-sp="${target}"]').length,
+          colour: nm?.style.color || '',
+          icons: document.querySelectorAll('#seg-list [data-sp="${target}"] .sp-icon').length,
+          accent: !!row?.classList.contains('person-hl'),
+        };
+      })()`);
+      assert(before.rows > 0, 'the voice under test has no transcript rows');
+      assert(before.icons === 0, 'the unhighlighted voice already had an icon');
+      assert(before.accent === false, 'the unhighlighted voice already had a row accent');
+
+      // Open the segment sheet on one of its rows — this is the transcript's
+      // name row, where naming a voice lives and where the picker now sits.
+      await js(`document.querySelector('#seg-list [data-sp="${target}"]').closest('.seg').click()`);
+      await waitFor('the segment sheet', async () => js('!!document.getElementById("highlight-row")'));
+      const pickerVisible = await js(
+        '(() => { const r = document.getElementById("highlight-row"); return !r.hidden && !!r.querySelector(".hl-sw"); })()'
+      );
+      assert(pickerVisible, 'the highlight picker is not shown for a picked voice');
+
+      // Click a swatch, and type an emoji. Both go through the real controls.
+      await js('document.querySelector(\'#highlight-row .hl-sw[data-hl-colour="amber"]\').click()');
+      await waitFor('the colour to land', async () =>
+        js(`window.__recallDebug.store.speakers.get(${target})?.colour === 'amber'`)
+      );
+      await js(`(() => {
+        const i = document.querySelector('#highlight-row .hl-icon');
+        i.value = '\u{2B50}';
+        i.dispatchEvent(new Event('input', {bubbles: true}));
+        i.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+        return true;
+      })()`);
+      await waitFor('the icon to land', async () =>
+        js(`window.__recallDebug.store.speakers.get(${target})?.icon === '\u{2B50}'`)
+      );
+
+      // The sheet is in the way of the rows it changed. Escape closes it, and
+      // nothing needs saving: a swatch writes through `speakers.set` on click,
+      // the way `startRename` does — there is no draft to lose.
+      await js('document.dispatchEvent(new KeyboardEvent("keydown", {key: "Escape", bubbles: true}))');
+      await waitFor('the sheet to close', async () => js('!document.querySelector(".sheet")'));
+
+      // On the transcript: the name is amber, the icon is in front of it, and
+      // the row wears the thin accent.
+      const after = await js(`(() => {
+        const nm = document.querySelector('#seg-list [data-sp="${target}"] .nm');
+        const row = nm?.closest('.seg');
+        const who = nm?.closest('.who');
+        return {
+          colour: nm?.style.color || '',
+          icon: who?.querySelector('.sp-icon')?.textContent || '',
+          iconFirst: who?.firstElementChild?.classList.contains('dot') &&
+                     who?.children[1]?.classList.contains('sp-icon') &&
+                     who?.children[2]?.classList.contains('nm'),
+          accent: !!row?.classList.contains('person-hl'),
+          accentColour: row?.style.getPropertyValue('--person-hl') || '',
+        };
+      })()`);
+      assert(/^hsl\(44 /.test(after.colour), `the transcript name is not amber: "${after.colour}"`);
+      assert(after.icon === '\u{2B50}', `the transcript row has no icon: ${JSON.stringify(after.icon)}`);
+      assert(after.iconFirst, 'the icon is not between the dot and the name');
+      assert(after.accent, 'the transcript row gained no accent');
+      assert(/^hsl\(44 /.test(after.accentColour), `the row accent is not amber: "${after.accentColour}"`);
+
+      // And on the person page, which is the other place the picker lives.
+      await js(`window.__recallDebug.go('person', { id: ${target} })`);
+      const person = await waitFor('the person page', async () => {
+        const got = await js(`(() => {
+          const n = document.querySelector('.person-name');
+          if (!n) return null;
+          const who = n.closest('.person-who') || n.parentElement;
+          return {
+            colour: n.style.color || '',
+            icon: who?.querySelector('.sp-icon')?.textContent || '',
+            picker: !!document.querySelector('.hl-picker'),
+            pressed: document.querySelector('.hl-sw[data-hl-colour="amber"]')?.getAttribute('aria-pressed') || '',
+          };
+        })()`);
+        return got && got.picker ? got : null;
+      });
+      assert(/^hsl\(44 /.test(person.colour), `the person page name is not amber: "${person.colour}"`);
+      assert(person.icon === '\u{2B50}', 'the person page shows no icon');
+      assert(person.pressed === 'true', 'the person page picker does not show the current colour as pressed');
+
+      // Now take it off. Both halves, through the controls, and both must go.
+      await js('document.querySelector(\'.hl-picker .hl-sw[data-hl-colour="none"]\').click()');
+      await waitFor('the colour to clear', async () =>
+        js(`window.__recallDebug.store.speakers.get(${target})?.colour == null`)
+      );
+      await js('document.querySelector(\'.hl-picker [data-hl-icon-clear]\').click()');
+      await waitFor('the icon to clear', async () =>
+        js(`!window.__recallDebug.store.speakers.get(${target})?.icon`)
+      );
+
+      // Back to the transcript: it must look EXACTLY as it did before, which
+      // is the promise the whole feature is bounded by.
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      await waitFor('transcript rows', async () => js('document.querySelectorAll("#seg-list .seg").length > 0'));
+      const cleared = await waitFor('the highlight to come off the rows', async () => {
+        const got = await js(`(() => {
+          const nm = document.querySelector('#seg-list [data-sp="${target}"] .nm');
+          const row = nm?.closest('.seg');
+          return {
+            colour: nm?.style.color || '',
+            icons: document.querySelectorAll('#seg-list [data-sp="${target}"] .sp-icon').length,
+            accent: !!row?.classList.contains('person-hl'),
+          };
+        })()`);
+        return got && got.icons === 0 && !got.accent ? got : null;
+      });
+      assert(cleared.icons === 0, 'the icon survived being cleared');
+      assert(cleared.accent === false, 'the row accent survived being cleared');
+      assert(
+        cleared.colour === before.colour,
+        `a cleared voice did not go back to its original colour ("${cleared.colour}" vs "${before.colour}")`
+      );
+
+      // The fixture's highlighted people are untouched by all of that — a
+      // highlight belongs to one voice.
+      const others = await js(
+        '[...document.querySelectorAll(\'#seg-list [data-sp="1"] .sp-icon\')].length'
+      );
+      assert(others > 0, 'clearing one voice took another voice\'s highlight with it');
+
+      return {
+        speaker: target,
+        set: { colour: 'amber', icon: '\u{2B50}' },
+        rowsAffected: before.rows,
+        fixtureHighlighted: fixture.accented,
+      };
+    });
+
+    await step('shot-highlights', async () => ({ file: await shot('highlights') }));
+
     // 8 — pause from the TRAY path stops the feed (DESIGN §8, the marquee case)
     await step('tray-pause-stops-feed', async () => {
       await deps.setPaused(true); // exactly what the tray menu item calls

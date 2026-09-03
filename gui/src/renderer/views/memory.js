@@ -21,8 +21,13 @@
 //      size, the core count, when it runs, that it is off by default, and that
 //      nothing leaves the machine — in plain words, next to the switch.
 
-import { h, clear, fmtDate, fmtClock, fmtDayLabel, fmtDur, speakerColor } from '../lib/dom.js';
+import { h, clear, fmtDate, fmtClock, fmtDayLabel, fmtDur } from '../lib/dom.js';
 import { store, speakerLabel, ask, applyAssist } from '../lib/store.js';
+// 0.12.0 — per-person highlights. Every graph row here (digest participants,
+// a commitment's two sides, a world's people) carries `colour`/`icon`, which is
+// what `lookOn` reads; `lookOf` is for the accuracy table, whose rows carry a
+// speaker id and nothing else.
+import { lookOn, lookOf, iconSpan } from './highlight.js';
 import { toast } from '../lib/sheets.js';
 
 export const id = 'memory';
@@ -311,8 +316,12 @@ export function mount(root, ctx) {
         h(
           'span',
           { class: 'digest-people' },
-          ...people.map((p) =>
-            h(
+          ...people.map((p) => {
+            // A digest participant carries its own `colour`/`icon` (PROTOCOL
+            // v15), which is what lets a conversation from July name people
+            // this client has never listed in their own colours.
+            const pl = lookOn(p, p.speaker_id);
+            return h(
               'span',
               {
                 class: 'chip person',
@@ -331,7 +340,8 @@ export function mount(root, ctx) {
                         p.turns ?? 0
                       } turn${p.turns === 1 ? '' : 's'}`,
               },
-              h('span', { class: 'dot', style: `color:${speakerColor(p.speaker_id)}` }),
+              h('span', { class: 'dot', style: `color:${pl.color}` }),
+              iconSpan(pl.icon),
               p.label || speakerLabel(p.speaker_id),
               p.share == null
                 ? null
@@ -340,13 +350,15 @@ export function mount(root, ctx) {
                     { class: 'share-bar' },
                     h('span', {
                       class: 'share-bar-fill',
-                      style: `width:${Math.min(100, Math.max(0, p.share * 100))}%;background:${speakerColor(
-                        p.speaker_id
-                      )}`,
+                      // The bar is the same colour as the dot above it and has
+                      // been since 0.10.0 — it is that person's share, so a
+                      // highlight has to reach it or the chip would carry two
+                      // different colours for one person.
+                      style: `width:${Math.min(100, Math.max(0, p.share * 100))}%;background:${pl.color}`,
                     })
                   )
-            )
-          )
+            );
+          })
         ),
         d.turns ? h('span', { class: 'digest-turns', text: `${d.turns} turns` }) : null
       ),
@@ -465,6 +477,11 @@ export function mount(root, ctx) {
       class: `commit-row state-${c.state}${pending ? ' pending' : ''}`,
       dataset: { commitment: String(c.id), state: c.state, source: c.source },
     });
+    // A commitment's `who` and `to` carry `colour`/`icon` of their own (v15),
+    // so a row about somebody the live window has forgotten still wears their
+    // mark. `to` may be absent entirely — a promise made to the room.
+    const whoLook = lookOn(c.who, c.who?.speaker_id);
+    const toLook = lookOn(c.to, c.to?.speaker_id);
 
     row.append(
       h(
@@ -479,10 +496,27 @@ export function mount(root, ctx) {
         h(
           'span',
           { class: 'commit-who' },
-          h('span', { class: 'dot', style: `color:${speakerColor(c.who?.speaker_id)}` }),
-          h('b', { class: 'commit-name', text: who(c.who) }),
+          h('span', { class: 'dot', style: `color:${whoLook.color}` }),
+          iconSpan(whoLook.icon),
+          // Both sides of the arrow, because "X → Y" is the one line in this app
+          // where two people are named in the same breath and telling them
+          // apart at a glance is the whole job of a highlight. Plain ink unless
+          // there is one: neither name has ever worn the identity hue.
+          h('b', {
+            class: 'commit-name',
+            text: who(c.who),
+            ...(whoLook.hl ? { style: `color:${whoLook.hl}` } : {}),
+          }),
           h('span', { class: 'commit-arrow', text: '→' }),
-          h('span', { class: 'commit-to', text: c.to ? who(c.to) : 'the conversation' }),
+          h(
+            'span',
+            {
+              class: 'commit-to',
+              ...(c.to && toLook.hl ? { style: `color:${toLook.hl}` } : {}),
+            },
+            c.to ? iconSpan(toLook.icon) : null,
+            c.to ? who(c.to) : 'the conversation'
+          ),
           // Rule 2: the claim's provenance sits in the row, not in a tooltip.
           h('span', { class: `chip src ${src.cls}`, title: src.title, text: src.label }),
           c.state !== 'candidate'
@@ -787,7 +821,12 @@ export function mount(root, ctx) {
           : null
       ),
       byRows('by-source', 'By source', (a.by_source ?? []).map((r) => [r.source, r])),
-      byRows('by-speaker', 'By voice', (a.by_speaker ?? []).slice(0, 5).map((r) => [speakerLabel(r.speaker_id), r])),
+      byRows(
+        'by-speaker',
+        'By voice',
+        (a.by_speaker ?? []).slice(0, 5).map((r) => [speakerLabel(r.speaker_id), r]),
+        (r) => r.speaker_id
+      ),
       h('p', {
         class: 'rail-hint',
         id: 'accuracy-note',
@@ -797,15 +836,30 @@ export function mount(root, ctx) {
     );
   }
 
-  function byRows(key, title, rows) {
+  /**
+   * `idOf` is how a table says its rows are about PEOPLE. "By source" rows are
+   * about programs and have no voice behind them, so they pass nothing and get
+   * exactly the plain row they have always had. "By voice" rows do, and this is
+   * the one name surface in the app with no dot next to it — a table of
+   * numbers, where a second column of colour would be noise. So the highlight
+   * lands on the name itself, and only when there is one.
+   */
+  function byRows(key, title, rows, idOf = () => null) {
     if (!rows.length) return null;
     const list = h('div', { class: 'acc-rows', dataset: { acc: key } });
     for (const [label, r] of rows) {
+      const spId = idOf(r);
+      const accLook = spId == null ? null : lookOf(spId);
       list.append(
         h(
           'div',
           { class: 'acc-row', dataset: { accRow: label } },
-          h('span', { class: 'acc-name', text: label }),
+          h(
+            'span',
+            { class: 'acc-name', ...(accLook?.hl ? { style: `color:${accLook.hl}` } : {}) },
+            accLook ? iconSpan(accLook.icon) : null,
+            label
+          ),
           h('span', { class: 'acc-num' }, String(r.corrections ?? 0), h('small', { text: 'fixed' })),
           h('span', { class: 'acc-num' }, pct(r.edit_rate ?? r.estimated_wer), h('small', { text: 'changed' })),
           h(
@@ -1016,14 +1070,20 @@ export function mount(root, ctx) {
             h(
               'span',
               { class: 'world-people' },
-              ...people.map((p) =>
-                h(
+              ...people.map((p) => {
+                // `worlds.list` ships each person's highlight with them (v15),
+                // which matters more here than almost anywhere: a world's
+                // roster is a wall of chips and the colour is what makes one
+                // of them findable.
+                const pl = lookOn(p, p.speaker_id);
+                return h(
                   'span',
                   { class: 'chip person', dataset: { sp: String(p.speaker_id) } },
-                  h('span', { class: 'dot', style: `color:${speakerColor(p.speaker_id)}` }),
+                  h('span', { class: 'dot', style: `color:${pl.color}` }),
+                  iconSpan(pl.icon),
                   p.label || speakerLabel(p.speaker_id)
-                )
-              ),
+                );
+              }),
               people.length ? null : h('span', { class: 'sub', text: 'nobody identified here yet' })
             ),
             // Tier 2 output, and absent on a machine that has never run

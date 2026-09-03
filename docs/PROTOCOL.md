@@ -19,8 +19,16 @@ Daemon replies with its version, the current event sequence number, and the id o
 this **run** of the daemon:
 
 ```json
-{"welcome": {"proto": 1, "daemon": "recalld/0.7", "seq": 41823, "schema": 10, "boot": "18f3c0a1d4b2e900"}}
+{"welcome": {"proto": 1, "daemon": "recalld/0.11", "seq": 41823, "schema": 15, "boot": "18f3c0a1d4b2e900"}}
 ```
+
+`schema` is the **database** version, not the protocol one, and it moves far more
+often: `proto` is still 1 while `schema` has reached **15** (0.12.0, the
+highlight — see "Highlighting a person" below). A client must not gate on it. It
+is there so a person reading a bug report can tell which shape the rows on that
+machine have, and so a client that knows about a specific migration can say
+"this daemon is older than the thing you are asking for" instead of rendering a
+silently missing field as an empty one.
 
 If `proto` is unsupported the daemon replies `{"error": {"code": "proto", ...}}` and
 closes. A client reconnecting after a daemon restart compares `seq`: if it is lower
@@ -52,9 +60,11 @@ Methods (initial set):
 |---|---|---|
 | `sources.list` / `sources.set` | `{match_key, allowed}` | live toggle, no restart. `sources.set` **refuses** `match_key: "mic"` — see `mic.set` |
 | `mic.get` / `mic.set` | `{enabled?, mode?}` | the microphone switch; live, no restart |
-| `speakers.list` | | id, name, counts, total time, `languages` |
+| `speakers.list` | | id, name, counts, total time, `languages`, `colour`/`icon` |
 | `speakers.name` | `{id, name}` | retroactive; broadcasts `relabel`. On a **merge tombstone**: `err:conflict` naming the canonical voice (0.7.5) — it holds no rows, so the write would land nowhere while the reply and the event claimed otherwise |
 | `speakers.set_languages` | `{id, languages}` | which languages this voice speaks; broadcasts `relabel`. Same `err:conflict` on a tombstone (0.7.5), and for a sharper reason: the read resolved through the tombstone while the write did not |
+| `speakers.set` | `{id, colour?, icon?}` | pin a highlight to a voice (0.12.0, schema 15) — a palette **token** and a short emoji; broadcasts `relabel` carrying both plus the name. An **omitted** key leaves that half alone, an explicit `null` clears it; neither key is `err:params`, not "clear both". Same `err:conflict` on a tombstone, for the same sharper reason as `speakers.set_languages` |
+| `speakers.palette` | | the ten accent tokens this daemon paints: `{palette: [{token, hue, hex}]}`. Served rather than assumed, so an eleventh colour does not need a matching client release |
 | `speakers.prune` | `{apply?}` | list (default) or sweep the one-off voices. With `apply`, `voices` is what was **removed** (0.7.5) — it used to repeat the preview, which the client had already shown in its own confirmation |
 | `speakers.delete` | `{id, keep_voiceprint?}` | delete one voice: its conversations always, its voiceprint unless kept. Works on a voice with **no segments left** — see below |
 | `speakers.merge` | `{from, into}` | tombstone, no chains; broadcasts `relabel` |
@@ -214,6 +224,12 @@ client rendering a "capturing now" light should believe `state`.
   Clients dedupe by seq, so stream re-push is tolerated but the batch is canonical.
 - `speakers.list` rows: `auto` (generated "Speaker_NN" label) alongside `name`
   (null until the user names them).
+- `speakers.list` rows also carry **`colour`** and **`icon`** (0.12.0, schema 15):
+  the highlight a person pinned to that voice, or `null` — which is nearly every
+  voice, and is the whole of "not highlighted". `colour` is a palette **token**
+  (`"violet"`, `"teal"`, …), never a hex; see "Highlighting a person" for why. Both keys
+  are always present, so a client spells them unconditionally the way it does for
+  `name`.
 - `relabel` carries `merged_into` when caused by a merge. `delete.run` completion is
   followed by a `purge` event naming removed rows.
 - `sources.list` rows: display name, binary, first_seen, last_seen, active streams.
@@ -387,6 +403,129 @@ only *what*.
   `started_at_utc_ns` is a **string**, like every nanosecond value on the wire.
   `null` means "not swept yet"; zeroes would claim a clean sweep that never ran.
 
+### Highlighting a person (schema 15, 0.12.0)
+
+Two nullable columns on a voice — `colour` and `icon` — and a method that sets
+them. A person picks somebody out of a wall of names; every surface that draws
+that name paints it in their colour and puts their emoji in front of it.
+
+**`speakers.set {id, colour?, icon?}`** → `{id, colour, icon, seq}`. Broadcasts
+`relabel` carrying `{speaker, name, colour, icon}` — the name rides along for the
+same reason `speakers.set_languages` carries it: a client folds one shape into
+its speaker row and must never be made to choose between applying the highlight
+and keeping the name.
+
+**`speakers.palette`** → `{palette: [{token, hue, hex}]}`.
+
+#### Why a token and not a colour
+
+`colour` is one of ten **token names**, never a `#rrggbb`. This is the load-
+bearing decision in the whole feature, and it is about legibility rather than
+tidiness.
+
+A highlight is read on two grounds — NX Clear is light *and* dark (DESIGN §14.1)
+— and in three renderers, one of which is the headset overlay
+(`crates/nx-recall-overlay`), which rasterises glyphs itself and has no CSS, no
+stylesheet and no theme to resolve a colour against. A free-form hex would let
+somebody pin `#111111` to a friend and lose that name entirely on the dark
+ground, and **the daemon could not warn them, because the daemon does not know
+which ground anybody is looking at.**
+
+So what is stored is a token, and each token is one *hue*. Saturation and
+lightness belong to the surface: the desktop spends `--sp-s`/`--sp-l` (72%/28%
+light, 72%/74% dark), which are the same two numbers every *unhighlighted* voice
+is already painted with, and the overlay hard-codes the dark pair because that
+surface is always dark. A highlight therefore changes **which** hue a name wears
+and never how readable it is — it is painted by the same machinery, at the same
+measured contrast, as the automatic colour it replaces.
+
+The ten, in picker order, with the hue each is painted at:
+
+| token | hue | | token | hue |
+|---|---|---|---|---|
+| `violet` | 268 | | `lime` | 92 |
+| `indigo` | 232 | | `amber` | 44 |
+| `cyan` | 192 | | `orange` | 22 |
+| `teal` | 168 | | `rose` | 350 |
+| `green` | 140 | | `magenta` | 312 |
+
+`violet` is the suite's own `#7700FF`. Ten is a deliberate ceiling: these are
+meant to be told apart at a glance in a name column, and past about a dozen hues
+at one saturation the neighbours stop being distinguishable — a palette nobody
+can tell apart is a palette that marks nobody.
+
+The canonical source is `crates/recalld/src/palette.rs`; the list is mirrored in
+`gui/src/renderer/lib/palette.js` and `crates/nx-recall-overlay/src/palette.rs`,
+and `gui/test/palette.test.js` parses all three and fails if they drift. A token
+this build does not know is **not an error anywhere it is read** — it falls back
+to the voice's ordinary hashed hue, because a name in the wrong colour is a far
+better failure than a name that does not draw.
+
+#### The icon
+
+`icon` is a short emoji: **at most two grapheme clusters**, no whitespace, no
+control characters. Two rather than one because a flag is one cluster, so is a
+skin-toned wave, so is a ZWJ family — but `🌙✨` is a perfectly reasonable mark
+for a person and refusing it would be refusing an aesthetic rather than
+enforcing a limit. Three starts to be a word. The count is of *clusters*, not
+code units: a check that counted `.length` would refuse an ordinary pick while
+happily accepting four flags.
+
+An icon that is empty or blank after trimming **clears** it and is stored as
+`NULL`, so there is exactly one representation of "no icon" and every reader can
+test it with `IS NULL`. A colour has no such rule — the empty string is not a
+token and is refused — because a colour is picked from swatches, which have a
+"none" of their own, while an icon is typed into a field and emptying that field
+is how a person says they want none.
+
+The headset overlay draws the icon only if the system font really has the glyph,
+and silently drops it otherwise. That surface is a monochrome coverage
+rasteriser over whatever sans-serif the machine ships, with no colour-emoji path
+to fall back to, and `? Kira` in front of somebody's name is worse than no icon
+at all. The colour half always works, which is what makes this a degradation
+rather than a failure.
+
+#### Omitted is not null
+
+Each parameter is optional, and the two absences mean different things:
+
+- **omitting a key leaves that half unchanged**;
+- **passing it as `null` clears it**;
+- passing **neither** is `err:params` — not "clear both".
+
+The two halves are independent (a colour with no emoji is a normal thing to
+want), so collapsing "say nothing about the icon" into "clear the icon" would
+make it impossible to change one without restating the other. Concretely: a
+picker that sent both fields on every click would delete the emoji somebody set
+a minute earlier the moment they chose a different colour. Clients send only the
+half that changed.
+
+`err:params` also covers an unknown token and an over-long or whitespace-bearing
+icon. A merge tombstone is `err:conflict`, as with `speakers.name` and
+`speakers.set_languages`, and here for the sharper of the two reasons: the read
+resolves through the tombstone to the canonical voice while the write would not,
+so allowing it would report success, change nothing anybody can see, and record
+the wrong voice's prior state in the audit log.
+
+#### Where it appears
+
+Everywhere a voice is named. On `speakers.list` rows; beside `name`/`auto` in
+every place a person appears (`person.get`'s speaker, its edges and thread
+participants, `thread.get` participants, `person.brief`, the `speakers.prune`
+preview, `worlds.list` people, digest participants, both sides of a commitment,
+and Discord truth links); and as **`speaker_colour`/`speaker_icon`** next to
+`speaker_name` on every segment shape — transcript pages, search hits, replay
+turns and the live `segment` event.
+
+It resolves through merge tombstones with the name: a voice merged into a
+highlighted one wears the surviving voice's mark, because after a merge there is
+one person there.
+
+The one exception is the **`partial` event**, which carries no highlight. A
+partial is a provisional caption emitted from the capture path, which does not
+touch the database; it carries `speaker`, and a client resolves the highlight
+from `speakers.list` exactly as it already resolves the name from `speaker_hint`.
+
 ### Deleting a voice (0.6.4)
 
 **`speakers.delete {id, keep_voiceprint?}`** → `{id, name, keep_voiceprint,
@@ -454,6 +593,7 @@ the instant it is deleted.
   ```json
   {"id": 12,
    "speaker": {"id": 12, "you": false, "name": "Kira", "auto": "Speaker_03",
+               "colour": "violet", "icon": "🌙",
                "languages": ["de"], "first_seen": "2026-07-02T18:24:00Z"},
    "languages": ["de"],
    "totals": {"segments": 412, "speech_ms": 1832000, "speech_ns": "1832000000000",
@@ -461,6 +601,7 @@ the instant it is deleted.
               "first_heard_ms": ..., "first_heard_ns": "...",
               "last_heard_ms": ...,  "last_heard_ns": "..."},
    "edges": [{"speaker_id": 4, "name": "Ash", "auto": "Speaker_18",
+              "colour": null, "icon": null,
               "threads": 9, "seconds": 412.5, "speech_ms": 412500,
               "last_ns": "...", "last_ms": ..., "roster_seconds": null}],
    "recent_threads": [{"thread_id": 31, "session": 3,
@@ -468,7 +609,8 @@ the instant it is deleted.
                        "ended_ns": "...", "ended_ms": ...,
                        "segments": 14,
                        "participants": [{"speaker_id": 12, "name": "Kira",
-                                         "auto": "Speaker_03"}],
+                                         "auto": "Speaker_03",
+                                         "colour": "violet", "icon": "🌙"}],
                        "preview": "wait, which portal was it —"}]}
   ```
 
@@ -477,7 +619,12 @@ the instant it is deleted.
   - `name` is `null` until a person names the voice; `auto` is the generated
     label and is always present. Same split as `speakers.list`, in every place a
     person appears here — edges and thread participants included, so a client
-    can render a voice it has never queried.
+    can render a voice it has never queried. Since 0.12.0 the rule covers
+    **`colour` and `icon`** too: they ride beside `name` and `auto` on the
+    `speaker` block, on every edge and on every thread participant, for exactly
+    the same reason. A highlight is read *on a name*, so a place that shows a
+    name and not its highlight would be the one place a person's mark went
+    missing.
   - **An edge means a shared *conversation*, not a shared instance.** A public
     lobby has forty people in it and you spoke to two; edges come from threads,
     which is the whole reason threads exist. `threads` is how many they shared.
@@ -3013,6 +3160,10 @@ and both are decided over the completed audio. So:
 
 A client MUST render a proximity speaker as uncertain. It is the cheapest true thing
 available, not a reading of the voice.
+
+A partial carries no `speaker_name`, and since 0.12.0 it carries no `colour`/`icon`
+either: a client resolves both from `speakers.list` against the `speaker` id. See
+"One deliberate exception: `partial`" in the highlight section for why.
 
 ### Never stored, never replayed
 

@@ -12,8 +12,12 @@
 // trip, because the page is one question and half a person on screen while the
 // other half is still in flight is worse than a moment of nothing.
 
-import { h, clear, fmtDur, fmtDate, heardOnChips, speakerColor } from '../lib/dom.js';
+import { h, clear, fmtDur, fmtDate, heardOnChips } from '../lib/dom.js';
 import { store, speakerLabel, isYou, ask } from '../lib/store.js';
+// 0.12.0 — per-person highlights. This page is where one is most often SET
+// (the picker lives in the identity block) and it is also the page with the
+// most other people's names on it, so it reads the same helpers everywhere.
+import { lookOn, iconSpan, highlightPicker } from './highlight.js';
 import { toast } from '../lib/sheets.js';
 import { playSpeaker, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 
@@ -42,6 +46,8 @@ export function mount(root, ctx, arg) {
   let page = null;
 
   const title = h('h1', { text: speakerLabel(spId) });
+  // See `renderHeader`: one picker for the life of the page.
+  const picker = highlightPicker(spId);
   const sub = h('span', { class: 'sub', id: 'person-sub' });
   const back = h(
     'button',
@@ -117,15 +123,31 @@ export function mount(root, ctx, arg) {
     const name = labelOf(sp, spId);
     title.textContent = name;
     const languages = page?.languages ?? sp?.languages ?? null;
+    // `person.get`'s speaker carries the highlight, so the page paints one for
+    // a voice the live window has long since trimmed. The big dot takes the
+    // colour unconditionally (it has always been the identity hue); the NAME
+    // only takes it when there is an actual highlight — this heading has been
+    // plain ink since 0.9 and putting the hashed hue on it would be a redesign
+    // rather than this feature.
+    const { color, hl, icon } = lookOn(page?.speaker ?? sp, spId);
     header.append(
       h(
         'div',
         { class: 'person-head' },
-        h('span', { class: 'dot big', style: `color:${speakerColor(spId)}` }),
+        h('span', { class: 'dot big', style: `color:${color}` }),
         h(
           'div',
           { class: 'person-who' },
-          h('b', { class: sp?.name ? 'person-name' : 'person-name unnamed', text: name, id: 'person-name' }),
+          h(
+            'b',
+            {
+              class: sp?.name ? 'person-name' : 'person-name unnamed',
+              id: 'person-name',
+              ...(hl ? { style: `color:${hl}` } : {}),
+            },
+            iconSpan(icon, 'sp-icon person-icon'),
+            name
+          ),
           h(
             'div',
             { class: 'person-tags' },
@@ -145,6 +167,18 @@ export function mount(root, ctx, arg) {
             // and 3 in VRChat is a person you know from one place.
             heardOnChips(page?.sources, { withCounts: true })
           ),
+          // 0.12.0 — the highlight, set where the person is. This is the page
+          // that answers "who is this", so it is also the honest place to say
+          // "and this is how I want to spot them"; the transcript's segment
+          // sheet has the same control for the moment you are already reading
+          // them. One implementation, in ./highlight.js.
+          //
+          // Built ONCE per mount and re-appended, not rebuilt: this header is
+          // re-rendered every couple of seconds while the feed moves (finding
+          // #18) and a control rebuilt under a person's fingers would throw
+          // away the emoji they were halfway through typing. The page is about
+          // one voice for its whole life, so one picker is all it can need.
+          picker,
           hint
         ),
         h('div', { class: 'spacer' }),
@@ -399,6 +433,11 @@ export function mount(root, ctx, arg) {
     const anyRoster = list.some((e) => e.roster_seconds != null);
     const rows = h('div', { class: `edge-list${anyRoster ? ' has-roster' : ''}`, id: 'edge-list' });
     for (const e of list) {
+      // Co-presence is a list of OTHER people, and it is the list this feature
+      // is for: "who do I talk to" is exactly the question a colour answers
+      // faster than a name does. Same rule as the heading above — the dot
+      // always carries the identity hue, the name only carries a highlight.
+      const edge = lookOn(e, e.speaker_id);
       rows.append(
         h(
           'button',
@@ -408,8 +447,17 @@ export function mount(root, ctx, arg) {
             title: `Open ${labelOf(e, e.speaker_id)}'s page`,
             onclick: () => ctx.openPerson?.(e.speaker_id),
           },
-          h('span', { class: 'dot', style: `color:${speakerColor(e.speaker_id)}` }),
-          h('span', { class: 'edge-name', text: labelOf(e, e.speaker_id) }),
+          h('span', { class: 'dot', style: `color:${edge.color}` }),
+          // INSIDE `.edge-name`, not beside it. `.edge-row` is a five-column
+          // grid (styles.css) precisely so the numbers line up down the list;
+          // a sixth child would shunt every column one place along and the
+          // table would stop being readable the moment one person got an icon.
+          h(
+            'span',
+            { class: 'edge-name', ...(edge.hl ? { style: `color:${edge.hl}` } : {}) },
+            iconSpan(edge.icon),
+            labelOf(e, e.speaker_id)
+          ),
           h(
             'span',
             { class: 'edge-num' },
@@ -466,7 +514,15 @@ export function mount(root, ctx, arg) {
     }
     const rows = h('div', { class: 'thread-list', id: 'thread-list' });
     for (const t of list) {
-      const names = (t.participants ?? []).map((p) => labelOf(p, p.speaker_id));
+      // One text span holds every participant's name, so there is nowhere to
+      // hang a per-name colour — the row of dots beside it already carries
+      // that. The icon goes into the string instead, which is the half of a
+      // highlight that survives being run together with a "·".
+      const names = (t.participants ?? []).map((p) => {
+        const label = labelOf(p, p.speaker_id);
+        const ic = lookOn(p, p.speaker_id).icon;
+        return ic ? `${ic} ${label}` : label;
+      });
       rows.append(
         h(
           'button',
@@ -489,7 +545,11 @@ export function mount(root, ctx, arg) {
               'span',
               { class: 'thread-who' },
               ...(t.participants ?? []).map((p) =>
-                h('span', { class: 'dot', style: `color:${speakerColor(p.speaker_id)}`, title: labelOf(p, p.speaker_id) })
+                h('span', {
+                  class: 'dot',
+                  style: `color:${lookOn(p, p.speaker_id).color}`,
+                  title: labelOf(p, p.speaker_id),
+                })
               ),
               h('span', { class: 'thread-names', text: names.join(' · ') })
             ),
