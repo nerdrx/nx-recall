@@ -2234,3 +2234,107 @@ Nothing is required. When it wants to:
 
 A client must not present a *proposed* threshold as an installed one:
 `thresholds_swap` is the difference, and it is false far more often than true.
+
+## 0.11.0 — the translator
+
+0.9.0 translated a turn by asking a chat model to. This round gives translation
+a model of its own — **NLLB-200-distilled-600M**, int8 ONNX, in-process through
+the `ort` the daemon already links — and makes the 0.9.0 path the alternative
+rather than the only one.
+
+**Nothing on the wire changes.** `translation` still carries `{lang, text, via}`
+and `via` still names the model that wrote the row; a client that has never
+heard of this round cannot tell which backend answered unless it reads `via`.
+There is no new method, no new event and no new field. The whole of this section
+is a config key, a fetch flag, and one function the live-translation path calls.
+
+### `[assist]`, two keys
+
+| key | default | meaning |
+|---|---|---|
+| `translator` | `"nllb"` | `"nllb"` or `"qwen"` — which backend translates |
+| `translator_threads` | `4` | ONNX intra-op threads for the NLLB backend |
+
+An unrecognised value reads as the default rather than switching the feature
+off: a typo in a config file must not silently stop translating, and it must not
+quietly select something nobody named.
+
+`translator = "nllb"` needs the model. **A backend whose files are not on disk
+is not selected** — the daemon falls back to the other one and logs the fetch
+command once, because a person who turned translation on asked for translation,
+not for a particular model. `translator = "qwen"` reproduces 0.9.0 exactly.
+
+### `recalld models fetch --translator`
+
+Three assets, 911 MB, one opt-in group (`Group::Translator`): an encoder, a
+merged decoder-with-past, and the tokenizer, all pinned to an upstream commit
+and byte-verified like every other catalogue entry.
+
+**Licence: CC-BY-NC 4.0.** NLLB-200 is published non-commercially. That is fine
+for a private personal install and it is a hard blocker for anything sold —
+which is why this is a flag with the licence written next to the bytes rather
+than a file added to the default set. `models status` says the same thing in its
+group note.
+
+### `via`, and what a client should do with it
+
+`translation.via` becomes `nllb-200-distilled-600m-int8@1` for rows this backend
+writes, against `qwen2.5-3b-instruct-q4_k_m` for rows the old one wrote. The
+`@1` is a contract version and is bumped when anything about how a translation
+is produced changes, so a row translated under one contract is never mistaken
+for a row translated under another and the whole lot can be found and re-run.
+
+A client needs no change. One that wants to may show the backend on a row's
+detail; it must not present a row's `via` as a *setting*, because the setting is
+what the next row will use and `via` is what this one did.
+
+### `translate::translate_line(text, src, target) -> Option<Translation>`
+
+The seam the live path calls, and the reason this round is worth having at all.
+
+A translation was an **idle pass**: a worker woke up, took eight rows, and spent
+3.7 seconds a row on a 1.9 GB child process. That is fine for filling in last
+night and useless for a captions window. The NLLB backend translates a
+two-to-five-word turn in a **median 0.85 s** in the same process with no
+launch — measured over 180 short lines, against 2.48 s for the old path — which
+is the difference between "translated eventually" and "translated".
+
+`translate_line` is deliberately the dedicated translator **only**. When
+`translator = "qwen"`, or when the model is not installed, it returns `None` and
+the ordinary idle pass picks the row up later, exactly as 0.9.0 did. Spawning a
+1.9 GB process per line is not a live path and pretending otherwise would make
+the captions window worse, not better.
+
+`src` is the row's language stamp when it has one; `None` asks the classifier,
+and a line **nothing can name a language for is not translated**. That
+asymmetry is the same one 0.10.2 built the third-language queue on: a mumbled
+German turn and a French turn are the same NULL in the column, and the
+difference between them is the only thing that stops "translate what I cannot
+read" from meaning "translate everything".
+
+### The guards are unchanged, plus one
+
+`translate::judge` is shared by both backends: an echo is dropped, an answer
+that reads as the wrong language is dropped, an empty answer is dropped. 0.11.0
+adds a **length sanity check** — an answer longer than three times its source,
+with a floor of twelve words, is `TooLong` and is dropped. A greedy decoder that
+starts repeating itself does so at length, and a paragraph under a two-word row
+reads as something that person said at length.
+
+The length is measured in units that survive a change of script: words, or one
+per six characters, whichever is larger. Japanese has no spaces, so a whole
+sentence of it is one *word*, and a guard built on the word count alone would
+have thrown away every honest translation of a Japanese turn.
+
+### Why, with numbers
+
+FINDINGS §23. 13 FLEURS directions, 100 parallel sentences each, both systems on
+the same four pinned cores: NLLB wins on chrF on **13 of 13** pairs, mean 57.75
+against 48.29, with **no regression anywhere**. The old path echoed its input
+back — untranslated, and therefore dropped by the guard — **171 times in 1300**,
+concentrated in the languages a 3B cannot recognise: 34/100 on Finnish, 36/100
+on French into German. NLLB echoed **none**.
+
+The gate to switch the default was: chrF wins on ≥ 80% of pairs, no pair worse
+by more than 2 chrF, fewer empties and echoes, lower median latency. All five
+passed.

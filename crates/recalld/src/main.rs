@@ -110,6 +110,7 @@ fn main() -> Result<()> {
                 confidence,
                 night,
                 semantic,
+                translator,
                 no_config,
             } => cmd_models_fetch(
                 &cfg,
@@ -124,6 +125,7 @@ fn main() -> Result<()> {
                     arbiter_de,
                     confidence,
                     night,
+                    translator,
                     single_stream: false,
                 },
                 no_config,
@@ -319,6 +321,9 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     // threaded through `segment_json`'s dozen call sites; see `translate::LIVE`.
     // `assist.set` writes the same three, which is what makes them live.
     recalld::translate::adopt(&cfg.assist);
+    // …and where the second backend's files are (0.11.0). Not a setting: the
+    // translator is loaded on first use, and this is the disk it is loaded from.
+    recalld::translate::set_models_root(models_root.clone());
     // The ids clients see must be the ids that will be written on segments, so
     // resolve the ASR fallback here exactly as the pipeline does.
     if let Some(mut models) = ModelSet::resolve(&cfg.models) {

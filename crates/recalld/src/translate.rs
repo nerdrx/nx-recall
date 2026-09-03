@@ -45,6 +45,26 @@
 //! that actually says the feature works is the 0.906 → 0.948 gap — a real
 //! translation beats simply showing the untranslated line.
 //!
+//! ## …and re-measured in 0.11.0, against a translator (FINDINGS §23)
+//!
+//! The 0.948 above is a gate on one direction. `spike/nllb_bench.py` is the
+//! comparison: thirteen FLEURS directions, 100 parallel sentences each, scored
+//! by chrF as well as by that cosine, this prompt against
+//! NLLB-200-distilled-600M ([`crate::nllb`]).
+//!
+//! | | mean chrF | empties | echoes | median |
+//! |---|---:|---:|---:|---:|
+//! | this prompt, qwen2.5-3b | 48.29 | 3 | **171** | 3.69 s |
+//! | **nllb-200-distilled-600M int8** | **57.75** | 0 | **0** | 3.59 s |
+//!
+//! NLLB wins on 13 pairs of 13 with no regression anywhere, so `[assist]
+//! translator` ships `"nllb"` and this path is the alternative. The 171 is the
+//! finding worth carrying: the prompt's "if the line is already {lang}, repeat
+//! it unchanged" clause is correct and a 3B cannot apply it to a language it
+//! cannot read, so it handed Finnish back verbatim 34 times in 100 — every one
+//! of which [`judge`] correctly dropped, leaving a third of those turns with no
+//! translation at all.
+//!
 //! ## Only turns worth the call
 //!
 //! Three words minimum. "ja klar" translated is "yeah sure" and nobody needed
@@ -58,17 +78,19 @@
 //! [`crate::enrich`]'s. Gather under the store lock, call the model without it,
 //! commit under it again. **Model time and store-lock time never overlap.**
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::bus::Bus;
 use crate::config::AssistConfig;
 use crate::control::Control;
 use crate::lang::{self, Lang};
 use crate::llm::{Llm, first_json};
+use crate::nllb::Nllb;
 use crate::store::Store;
 
 /// The bench's grammar, shipped in the crate. One field, no commentary — see
@@ -171,6 +193,12 @@ struct Live {
     to: String,
     read: Vec<String>,
     display: String,
+    /// 0.11.0. Which backend, live for the same reason the target is.
+    translator: String,
+    translator_threads: i32,
+    /// Where the translator's files are. Set once, at start-up, by
+    /// [`set_models_root`] — it is not a setting, it is where the disk is.
+    models_root: Option<PathBuf>,
 }
 
 impl Live {
@@ -179,6 +207,9 @@ impl Live {
             to: String::new(),
             read: Vec::new(),
             display: String::new(),
+            translator: String::new(),
+            translator_threads: 4,
+            models_root: None,
         }
     }
 }
@@ -251,6 +282,10 @@ pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     adopt(&AssistConfig::default());
+    // 0.11.0: and the backend, which is process-wide for the same reason and
+    // would otherwise carry a loaded ONNX session between tests.
+    set_models_root(None);
+    forget_translator();
     guard
 }
 
@@ -259,7 +294,166 @@ pub fn adopt(cfg: &AssistConfig) {
     set_target(&cfg.translate_to);
     set_read_languages(&cfg.read_languages);
     set_display(&cfg.translation_display);
+    set_translator(&cfg.translator, cfg.translator_threads);
 }
+
+// ---- 0.11.0, the second backend -------------------------------------------
+
+/// `[assist] translator`: the 0.9.0 path — the graph model's prompt, its
+/// grammar, and a 1.9 GB child per line.
+pub const TRANSLATOR_QWEN: &str = "qwen";
+/// `[assist] translator`: NLLB-200-distilled-600M in this process
+/// ([`crate::nllb`]).
+pub const TRANSLATOR_NLLB: &str = "nllb";
+/// What ships. See FINDINGS §23 for the numbers that chose it.
+pub const DEFAULT_TRANSLATOR: &str = TRANSLATOR_NLLB;
+
+/// Choose a backend. An unrecognised name is [`DEFAULT_TRANSLATOR`] rather than
+/// an error: a typo in a config file must not switch a feature off silently,
+/// and it must not switch it to something nobody named either.
+pub fn set_translator(name: &str, threads: i32) {
+    let mut live = LIVE.write().unwrap_or_else(|p| p.into_inner());
+    live.translator = match name.trim().to_ascii_lowercase().as_str() {
+        TRANSLATOR_QWEN => TRANSLATOR_QWEN.to_string(),
+        TRANSLATOR_NLLB => TRANSLATOR_NLLB.to_string(),
+        _ => DEFAULT_TRANSLATOR.to_string(),
+    };
+    live.translator_threads = threads.max(1);
+}
+
+/// The backend a person asked for, whether or not its model is on disk.
+pub fn translator() -> String {
+    let name = live().translator;
+    if name.is_empty() {
+        DEFAULT_TRANSLATOR.to_string()
+    } else {
+        name
+    }
+}
+
+/// Where the models are. Start-up only; see [`Live::models_root`].
+pub fn set_models_root(root: Option<PathBuf>) {
+    LIVE.write().unwrap_or_else(|p| p.into_inner()).models_root = root;
+}
+
+/// The translator, loaded on first use and kept.
+///
+/// A `Mutex<Option<..>>` rather than a `OnceLock` because loading can fail, and
+/// a failure must be re-attemptable after somebody runs the fetch — but not
+/// re-attempted on every turn, which is what `tried` is for.
+static NLLB: std::sync::Mutex<Option<Nllb>> = std::sync::Mutex::new(None);
+static NLLB_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run `f` against the loaded translator, or `None` when there is not one.
+///
+/// Absent is an ordinary state: the assets are an opt-in, non-commercially
+/// licensed group and this daemon works without them.
+fn with_nllb<T>(f: impl FnOnce(&mut Nllb) -> T) -> Option<T> {
+    let mut guard = NLLB.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.is_none() {
+        let live = live();
+        let m = crate::models::TranslatorModel::resolve_at(live.models_root?);
+        if !m.present() {
+            if !NLLB_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                info!("{}", crate::models::TranslatorModel::how_to_get_it());
+            }
+            return None;
+        }
+        match Nllb::load(&m, live.translator_threads) {
+            Ok(n) => {
+                info!(model = n.model_id(), "the translator is loaded");
+                *guard = Some(n);
+            }
+            Err(e) => {
+                if !NLLB_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!("the translator would not load, falling back: {e:#}");
+                }
+                return None;
+            }
+        }
+    }
+    guard.as_mut().map(f)
+}
+
+/// Is the dedicated translator both chosen and installed?
+pub fn nllb_selected() -> bool {
+    translator() == TRANSLATOR_NLLB && with_nllb(|_| ()).is_some()
+}
+
+/// One line through the dedicated translator, guards and all.
+pub fn ask_nllb(text: &str, from: &str, to: &str) -> Result<Verdict> {
+    let answer = with_nllb(|n| n.translate(text, from, to))
+        .ok_or_else(|| anyhow::anyhow!("the translator is not installed"))??;
+    Ok(judge(text, Some(&answer), to))
+}
+
+/// What a reader is shown, and who wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Translation {
+    /// The words.
+    pub text: String,
+    /// The language they are in — always the target that was asked for.
+    pub lang: String,
+    /// The model id, as it goes into `translation.via`. A reader never sees
+    /// which backend produced a row unless they look at this.
+    pub via: String,
+}
+
+/// Translate one line **now**, for the live path (0.11.0).
+///
+/// This is the seam the short-line detector calls: a turn has just been
+/// committed, it is two words long, and somebody is watching the captions
+/// window. It is deliberately the *dedicated* translator only. The Qwen path
+/// costs a 1.9 GB process launch per line and measured 4.4 s a sentence on four
+/// cores — that is an idle-pass budget, not a live one — so when the translator
+/// is not installed this returns `None` and the ordinary
+/// [`batch`] pass picks the row up later, which is exactly what 0.9.0 did.
+///
+/// `src` is the row's language stamp when it has one. `None` asks
+/// [`crate::lang`], and a line nothing can name a language for is not
+/// translated: translating a language you did not identify is how a mumble
+/// becomes a quotation.
+pub fn translate_line(text: &str, src: Option<&str>, target: &str) -> Option<Translation> {
+    let to = target.trim().to_ascii_lowercase();
+    if to.is_empty() || text.trim().is_empty() {
+        return None;
+    }
+    let from = match src.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_ascii_lowercase(),
+        None => match lang::classify(text) {
+            Lang::De => "de".to_string(),
+            Lang::En => "en".to_string(),
+            _ => lang::guess_other(text)?.tag.to_string(),
+        },
+    };
+    if from == to || read_languages().contains(&from) {
+        return None;
+    }
+    if translator() != TRANSLATOR_NLLB {
+        return None;
+    }
+    let verdict = ask_nllb(text, &from, &to).ok()?;
+    let Verdict::Translated(words) = verdict else {
+        debug!(?verdict, "no live translation for this line");
+        return None;
+    };
+    let via = with_nllb(|n| n.model_id().to_string())?;
+    Some(Translation {
+        text: words,
+        lang: to,
+        via,
+    })
+}
+
+/// Drop the loaded translator. Tests only: the session is a process-wide
+/// resource and a test that installed one must not leak it into the next.
+#[cfg(test)]
+pub(crate) fn forget_translator() {
+    *NLLB.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    NLLB_SAID.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ---- end 0.11.0 -----------------------------------------------------------
 
 /// What the pass concluded about one turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +467,11 @@ pub enum Verdict {
     /// The model produced nothing the grammar should have allowed, or nothing
     /// at all.
     Empty,
+    /// The answer is far longer than the line it claims to translate (0.11.0).
+    /// A translator that repeats itself does so at length — NLLB's greedy loop
+    /// can fall into a repetition on a two-word turn, and a paragraph under a
+    /// two-word row would read as something that person said at length.
+    TooLong,
 }
 
 /// Judge one answer. Pure, so all three guards are testable without a model —
@@ -330,8 +529,40 @@ pub fn judge(source: &str, answer: Option<&str>, to: &str) -> Verdict {
             }
         }
     }
+    if too_long(source, answer) {
+        return Verdict::TooLong;
+    }
     Verdict::Translated(truncate(answer, MAX_TRANSLATION))
 }
+
+/// Three times the input's length, with a floor.
+///
+/// The ratio alone is unusable at the short end, which is where this feature
+/// spends most of its time: "ja" into English is one word and "na dann"
+/// reasonably becomes "well then, in that case" — four. The floor is what stops
+/// a sensible expansion of a two-word turn from being thrown away, and the
+/// ratio is what catches the failure this guard exists for, which is a decoder
+/// that has started repeating itself.
+fn too_long(source: &str, answer: &str) -> bool {
+    let got = lang::word_count(answer);
+    got > (3 * length_units(source)).max(MIN_LENGTH_ALLOWANCE)
+}
+
+/// How long a line is, in units comparable across scripts.
+///
+/// Words, except that a Japanese sentence has no spaces in it and
+/// [`lang::word_count`] therefore calls a whole paragraph of it *one word*. A
+/// guard built on that alone would throw away every honest translation of a
+/// Japanese turn — which is the one language in this daemon's list where that
+/// mistake is guaranteed rather than possible. Six characters to the unit is
+/// roughly what a Japanese sentence's English translation runs at, and for a
+/// spaced language the word count is the larger of the two and wins.
+fn length_units(s: &str) -> usize {
+    lang::word_count(s).max(s.chars().count() / 6).max(1)
+}
+
+/// Words an answer may always have, however short the line was.
+const MIN_LENGTH_ALLOWANCE: usize = 12;
 
 /// Ask the model for one line. No store handle in scope, which is what enforces
 /// the lock split.
@@ -441,13 +672,26 @@ pub fn batch(
         return Ok(false);
     }
 
+    // 0.11.0. One backend for the whole batch, decided before the loop so a
+    // person turning the setting mid-batch cannot produce a run of rows with
+    // two different `via`s and no way to tell which is which.
+    let nllb = nllb_selected();
     for c in candidates {
         if stop() || crate::enrich::gate(control, &control.graph()).is_some() {
             break;
         }
         // ---- ask (no lock) ----
         let tuned = llm.with_threads(control.graph().llm_threads);
-        let verdict = match ask(&tuned, &c.text, &to) {
+        let asked = if nllb {
+            // The row's own language stamp. Every candidate has one by the time
+            // it reaches here — the queue only returns stamped rows, and the
+            // guesser wrote a tag onto the ones it named — so the translator is
+            // never asked to translate *from* a language nobody identified.
+            ask_nllb(&c.text, &c.lang, &to)
+        } else {
+            ask(&tuned, &c.text, &to)
+        };
+        let verdict = match asked {
             Ok(v) => v,
             Err(e) => {
                 // Unmarked, so a later pass retries: a model that timed out has
@@ -457,19 +701,27 @@ pub fn batch(
             }
         };
 
+        // Whichever model actually wrote it. The reader never sees which
+        // backend produced a row unless they look at this.
+        let via = if nllb {
+            with_nllb(|n| n.model_id().to_string()).unwrap_or_else(|| TRANSLATOR_NLLB.to_string())
+        } else {
+            tuned.model_id().to_string()
+        };
+
         // ---- commit (lock held, no model) ----
         {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
             match &verdict {
                 Verdict::Translated(text) => {
-                    guard.set_segment_translation(c.id, text, tuned.model_id())?;
+                    guard.set_segment_translation(c.id, text, &via)?;
                 }
                 other => {
                     // Marked, not left: `translation_via` set with a NULL
                     // `translation` is "looked at and declined", which is what
                     // keeps the queue finite.
                     debug!(segment = c.id, ?other, "no translation for this turn");
-                    guard.mark_translation_declined(c.id, tuned.model_id())?;
+                    guard.mark_translation_declined(c.id, &via)?;
                 }
             }
         }
@@ -560,6 +812,37 @@ mod tests {
             ja.contains("into Japanese") && !ja.contains("Examples:"),
             "{ja}"
         );
+    }
+
+    /// `spike/nllb_bench.py`'s Qwen leg runs the prompt this daemon ships.
+    ///
+    /// Same discipline as `spike/digest_bench`'s: the bench does not restate
+    /// the prompt, it reads it out of a file this test writes, and this test
+    /// fails if the file and the shipped string have drifted. A comparison
+    /// against NLLB is only worth anything if the thing it is compared against
+    /// is the thing that is running.
+    #[test]
+    fn the_bench_runs_the_prompt_this_daemon_ships() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spike/nllb_bench");
+        let writing = std::env::var("NXR_WRITE_PROMPTS").is_ok_and(|v| !v.is_empty());
+        if writing {
+            std::fs::create_dir_all(&dir).expect("the bench directory");
+        }
+        for to in ["en", "de"] {
+            let path = dir.join(format!("system.{to}.txt"));
+            let want = system_for(to);
+            if writing {
+                std::fs::write(&path, &want).expect("exporting a prompt");
+                continue;
+            }
+            let have = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert_eq!(
+                have, want,
+                "spike/nllb_bench/system.{to}.txt is not the prompt this daemon runs; \
+                 re-export with NXR_WRITE_PROMPTS=1 cargo test the_bench_runs_the_prompt"
+            );
+        }
     }
 
     #[test]
@@ -667,6 +950,152 @@ mod tests {
         // short turns this feature is most useful on. Same rule as `langctx`'s.
         let v = judge("okay cool nice", Some("okay super gut"), "de");
         assert!(matches!(v, Verdict::Translated(_)), "{v:?}");
+    }
+
+    /// 0.11.0. A greedy decoder that starts repeating itself does so at length,
+    /// and a paragraph under a two-word row reads as something that person said
+    /// at length. Three times the input, with a floor so the short end — which
+    /// is where this feature lives — is not punished for expanding.
+    #[test]
+    fn an_answer_far_longer_than_the_line_is_not_a_translation_of_it() {
+        // The failure: NLLB looping on a fragment.
+        assert_eq!(
+            judge(
+                "na dann",
+                Some(
+                    "well then, well then, well then, well then, well then, well then, \
+                     well then, well then"
+                ),
+                "en"
+            ),
+            Verdict::TooLong
+        );
+        // …and the thing that must NOT be caught by it: a two-word turn whose
+        // honest translation is four or five words.
+        let v = judge("na dann", Some("well, in that case then"), "en");
+        assert!(matches!(v, Verdict::Translated(_)), "{v:?}");
+        // German compounds go the other way — one word in, several out — and a
+        // ratio with no floor would have thrown this away.
+        let v = judge(
+            "Geschwindigkeitsbegrenzung",
+            Some("the speed limit on this road"),
+            "en",
+        );
+        assert!(matches!(v, Verdict::Translated(_)), "{v:?}");
+        // A long line may have a long translation; the guard is a ratio.
+        let v = judge(
+            "i think the portal behind the bar is the one that only opens after the \
+             lights go down in the evening",
+            Some(
+                "ich glaube das Portal hinter der Bar ist das eine das erst aufgeht \
+                 wenn abends die Lichter ausgehen",
+            ),
+            "de",
+        );
+        assert!(matches!(v, Verdict::Translated(_)), "{v:?}");
+        // And the trap this guard would otherwise walk straight into: Japanese
+        // has no spaces, so a whole sentence of it is ONE word by the word
+        // count, and every honest English translation of one would have been
+        // thrown away.
+        let ja = "ライオンの群れはオオカミやイヌの群れと似た行動をとり、驚くほど\
+                  ライオンに似た動物で、獲物に対しても同じように致命的です";
+        let v = judge(
+            ja,
+            Some(
+                "Lion prides behave much like wolf or dog packs, animals \
+                 surprisingly similar to lions in behaviour and just as deadly \
+                 to their prey",
+            ),
+            "en",
+        );
+        assert!(matches!(v, Verdict::Translated(_)), "{v:?}");
+        assert!(
+            lang::word_count(ja) <= 1 && length_units(ja) >= 9,
+            "a Japanese sentence is one WORD and must not be one length unit: {} / {}",
+            lang::word_count(ja),
+            length_units(ja)
+        );
+        assert_eq!(length_units("na dann"), 2);
+        assert_eq!(length_units(""), 1, "never zero, so the ratio is defined");
+    }
+
+    // ---- 0.11.0, which backend --------------------------------------------
+
+    #[test]
+    fn the_backend_is_a_live_setting_and_a_typo_is_the_default() {
+        let _live = test_guard();
+        assert_eq!(translator(), DEFAULT_TRANSLATOR, "the shipped value");
+        set_translator("qwen", 4);
+        assert_eq!(translator(), TRANSLATOR_QWEN);
+        set_translator("NLLB", 4);
+        assert_eq!(translator(), TRANSLATOR_NLLB, "case-folded on the way in");
+        // A typo must not switch the feature off, and must not switch it to
+        // something nobody named.
+        set_translator("nllb2", 4);
+        assert_eq!(translator(), DEFAULT_TRANSLATOR);
+        set_translator("", 4);
+        assert_eq!(translator(), DEFAULT_TRANSLATOR);
+        // …and the whole `[assist]` block carries it.
+        adopt(&AssistConfig {
+            translator: TRANSLATOR_QWEN.into(),
+            ..Default::default()
+        });
+        assert_eq!(translator(), TRANSLATOR_QWEN);
+    }
+
+    /// Chosen and *installed* are two different things. A machine that has not
+    /// fetched the 911 MB export keeps translating through the other backend
+    /// rather than stopping.
+    #[test]
+    fn a_backend_whose_model_is_absent_is_not_selected() {
+        let _live = test_guard();
+        set_translator(TRANSLATOR_NLLB, 4);
+        assert_eq!(translator(), TRANSLATOR_NLLB, "it is what was asked for");
+        set_models_root(Some("/definitely/not/here".into()));
+        assert!(!nllb_selected(), "an absent model must not be selected");
+        // …and there is no model root at all on a fresh install.
+        set_models_root(None);
+        assert!(!nllb_selected());
+        let err = ask_nllb("ich schicke dir morgen den Link", "de", "en").unwrap_err();
+        assert!(err.to_string().contains("not installed"), "{err}");
+    }
+
+    #[test]
+    fn the_live_path_declines_what_it_should_not_be_asked() {
+        let _live = test_guard();
+        set_target("en");
+        set_translator(TRANSLATOR_NLLB, 4);
+        // Translation is off.
+        set_target("");
+        assert_eq!(
+            translate_line("hallo zusammen wie geht es euch", None, ""),
+            None
+        );
+        set_target("en");
+        // Nothing to translate.
+        assert_eq!(translate_line("   ", Some("de"), "en"), None);
+        // Already in the target.
+        assert_eq!(
+            translate_line("i think that is the only way", Some("en"), "en"),
+            None
+        );
+        // A language the reader already has.
+        set_read_languages(&["de".to_string(), "en".to_string()]);
+        assert_eq!(
+            translate_line("das ist der einzige weg das zu machen", Some("de"), "en"),
+            None
+        );
+        // A line nothing can name a language for is not translated: translating
+        // a language you did not identify is how a mumble becomes a quotation.
+        set_read_languages(&["en".to_string()]);
+        assert_eq!(translate_line("mmm hmm", None, "en"), None);
+        // And the Qwen backend has no live path at all — a 1.9 GB process per
+        // line is an idle-pass budget, not a live one.
+        set_translator(TRANSLATOR_QWEN, 4);
+        assert_eq!(
+            translate_line("je ne sais pas ce que c'est", Some("fr"), "en"),
+            None
+        );
     }
 
     #[test]
@@ -884,6 +1313,60 @@ mod tests {
     }
 
     // ---- against the real model --------------------------------------------
+
+    /// 0.11.0, the second backend end to end: the settings, the loader, the
+    /// guards and the wire shape, on one German line and one Japanese one.
+    ///
+    /// Gated on `NXR_TRANSLATOR_MODELS`, like every other real-model test here:
+    /// absent, it skips and passes, because the export is a ~911 MB optional
+    /// download and CI does not have one.
+    #[test]
+    fn the_real_translator_reads_a_german_and_a_japanese_line_into_english() {
+        let _live = test_guard();
+        let Some(root) = std::env::var("NXR_TRANSLATOR_MODELS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            eprintln!("skipping the translator round trip: set NXR_TRANSLATOR_MODELS=<models dir>");
+            return;
+        };
+        set_target("en");
+        set_read_languages(&["en".to_string()]);
+        set_translator(TRANSLATOR_NLLB, 4);
+        set_models_root(Some(root.into()));
+        assert!(
+            nllb_selected(),
+            "NXR_TRANSLATOR_MODELS has no {} — `recalld models fetch --translator`",
+            crate::models::TRANSLATOR_DIR
+        );
+
+        let de = translate_line("ich schicke dir morgen den Link", Some("de"), "en")
+            .expect("the German line survived the guards");
+        eprintln!("de -> en: {de:?}");
+        assert_eq!(de.lang, "en");
+        assert!(de.text.to_lowercase().contains("link"), "{de:?}");
+        assert!(
+            de.via.starts_with("nllb-200-distilled-600m"),
+            "the row must say which model wrote it: {de:?}"
+        );
+        assert_eq!(lang::classify(&de.text), Lang::En, "{de:?}");
+
+        // Japanese. The row has no language stamp, so the guesser names it by
+        // script — which is also the case that proves the source-language token
+        // is set by hand rather than by the tokenizer's baked-in `eng_Latn`.
+        let ja = translate_line("明日リンクを送ります", None, "en")
+            .expect("the Japanese line survived the guards");
+        eprintln!("ja -> en: {ja:?}");
+        assert_eq!(ja.lang, "en");
+        assert!(ja.text.is_ascii(), "that is not English: {ja:?}");
+        assert_eq!(ja.via, de.via, "one backend, one id");
+
+        // …and the wire shape a client actually renders.
+        assert_eq!(
+            translation_json(Some(&de.text), Some(&de.via), "en"),
+            Some(serde_json::json!({ "lang": "en", "text": de.text, "via": de.via })),
+        );
+    }
 
     #[test]
     fn the_real_model_translates_a_line_and_does_not_answer_it() {

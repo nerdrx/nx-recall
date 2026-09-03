@@ -98,6 +98,12 @@ pub struct FetchOptions {
     /// compiled by `models build-night` rather than downloaded, because
     /// upstream publishes no such binary for this card.
     pub night: bool,
+    /// Also install the dedicated translator (~911 MB, 0.11.0). Off by
+    /// default, and not only because of the size: NLLB-200 is CC-BY-NC 4.0, so
+    /// this is the one asset in the catalogue a person has to *choose* for a
+    /// licence reason rather than a disk one. Without it translation runs on
+    /// the graph model's prompt, which is what 0.9.0 shipped.
+    pub translator: bool,
     /// Force the single-stream path. Only the test suite sets this; it is how
     /// the fallback is exercised without finding a server that lacks ranges.
     pub single_stream: bool,
@@ -124,6 +130,9 @@ impl FetchOptions {
         }
         if self.night {
             out.push(Group::Night);
+        }
+        if self.translator {
+            out.push(Group::Translator);
         }
         out
     }
@@ -198,6 +207,12 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
     if opts.confidence {
         let conf = crate::models::ConfidenceModel::resolve_at(root.to_path_buf(), 1);
         missing.extend(conf.entries().into_iter().filter(|e| !e.ok()));
+    }
+    // …and for the translator, on the same rule: verified when it was asked
+    // for, invisible otherwise.
+    if opts.translator {
+        let tr = crate::models::TranslatorModel::resolve_at(root.to_path_buf());
+        missing.extend(tr.entries().into_iter().filter(|e| !e.ok()));
     }
     if !missing.is_empty() {
         eprintln!();
@@ -899,12 +914,15 @@ mod tests {
         // — and whisper.cpp's own model repository for the night shift's GGML
         // file (0.9.0). A URL that drifts off this list is a supply-chain
         // change and has to be a visible diff.
-        const HOSTS: [&str; 5] = [
+        const HOSTS: [&str; 6] = [
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/",
             "https://github.com/ggml-org/llama.cpp/releases/download/",
             "https://huggingface.co/bartowski/",
             "https://huggingface.co/Xenova/multilingual-e5-small/resolve/",
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/",
+            // 0.11.0: the transformers.js mirror of NLLB-200-distilled-600M,
+            // pinned to a commit for the same reason the e5 one is.
+            "https://huggingface.co/Xenova/nllb-200-distilled-600M/resolve/",
         ];
         for a in REMOTE_ASSETS {
             assert!(
@@ -914,6 +932,15 @@ mod tests {
                 a.url
             );
             let semantic = a.role == SEMANTIC_ROLE || a.role == SEMANTIC_TOKENIZER_ROLE;
+            if a.group == Group::Translator {
+                assert!(
+                    !a.url.contains("/resolve/main/"),
+                    "{} must be pinned to a commit, not to a branch: {}",
+                    a.role,
+                    a.url
+                );
+                assert!(!a.default(), "the translator is opt-in — and CC-BY-NC");
+            }
             if semantic {
                 assert!(
                     !a.url.contains("/resolve/main/"),
@@ -959,6 +986,50 @@ mod tests {
             .unwrap();
         assert!(en.wants(fb));
         assert!(!sem.wants(fb));
+    }
+
+    /// 0.11.0. Three files, one group, one flag — and the flag is not one of
+    /// anybody else's, because this is the one asset in the catalogue whose
+    /// LICENCE is the reason it is optional rather than its size.
+    #[test]
+    fn the_translator_is_catalogued_at_its_exact_size_behind_its_own_flag() {
+        assert_eq!(
+            expected_bytes("nllb-200-distilled-600m-int8/encoder.onnx"),
+            Some(419_120_483)
+        );
+        assert_eq!(
+            expected_bytes("nllb-200-distilled-600m-int8/decoder_merged.onnx"),
+            Some(475_505_771)
+        );
+        assert_eq!(
+            expected_bytes("nllb-200-distilled-600m-int8/tokenizer.json"),
+            Some(17_331_224)
+        );
+        assert_eq!(
+            crate::models::translator_download_bytes(),
+            419_120_483 + 475_505_771 + 17_331_224
+        );
+        let assets: Vec<&RemoteAsset> = REMOTE_ASSETS
+            .iter()
+            .filter(|a| a.group == Group::Translator)
+            .collect();
+        assert_eq!(assets.len(), 3, "encoder, decoder and tokenizer");
+        let bare = FetchOptions::default();
+        let want = FetchOptions {
+            translator: true,
+            ..FetchOptions::default()
+        };
+        let sem = FetchOptions {
+            semantic: true,
+            ..FetchOptions::default()
+        };
+        for a in &assets {
+            assert!(!bare.wants(a), "a bare fetch must not pull 911 MB");
+            assert!(want.wants(a));
+            assert!(!sem.wants(a), "--semantic must not drag the translator in");
+        }
+        // …and it is not in the default set's budget.
+        assert!(total_download_bytes(&[]) < 700_000_000);
     }
 
     #[test]
