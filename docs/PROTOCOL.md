@@ -2370,7 +2370,18 @@ produce `refused` — never a repaired answer — and the hits are still returne
 `refused.reason` is one of: `there is nothing in the archive about that`, `the
 transcript does not say`, `the model's answer did not come from the cited
 turns`, `the local model is switched off`, `answers need the local model —
-\`recalld models fetch --graph\``.
+\`recalld models fetch --graph\``, `answers are off until the bench passes`,
+`the model did not answer`.
+
+The last two were not written down before 0.11.x, and one of them did not
+exist. **`the model did not answer` is a statement about the model, not about
+the archive** — a timeout, a killed child, a non-zero exit — and a client must
+not render it as a refusal that says anything about what was or was not said.
+It used to be reported as `the model's answer did not come from the cited
+turns`, which claims there was an answer; a client with no branch for that
+string then fell through to whatever its default said, which in this project's
+own GUI was "The transcript does not say." A dead model must never be able to
+make a claim about somebody's transcript.
 
 `answer.via` is the model id, the same string every other Tier 3 row records.
 

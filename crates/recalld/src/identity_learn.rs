@@ -436,7 +436,16 @@ pub fn calibrate(
             }
         }
     }
-    if apply && (report.written > 0 || report.cleared > 0 || report.projection_installed) {
+    // An `operations` row is a record that something CHANGED. The third term
+    // used to be `report.projection_installed`, which is set at the top of this
+    // function from `store.installed_projection()` — "a projection is already
+    // there", a fact about the past. Once any evening had installed one, every
+    // later run logged an operation whose whole content was "nothing was
+    // written, nothing was cleared, nothing was swapped": a six-hourly entry in
+    // the audit trail for a pass that did not touch the database. The term that
+    // means "this run installed a projection" is `projection_swap`, which is
+    // also the condition guarding the `install_projection` call above.
+    if apply && (report.written > 0 || report.cleared > 0 || report.projection_swap) {
         let targets: Vec<i64> = report.proposed.iter().map(|v| v.speaker_id).collect();
         store.log_operation(
             OP,
@@ -560,6 +569,43 @@ mod tests {
         assert!(s.installed_projection().unwrap().is_none());
         // And no operation was logged, because nothing happened.
         assert!(s.operations_of(OP, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_run_that_changes_nothing_logs_nothing_even_after_a_projection_was_installed() {
+        // The state every machine that has ever learned anything ends up in:
+        // a projection sitting in the table from some earlier evening.
+        let s = a_truthful_store(60);
+        let p = crate::calib::Projection::identity("m@1", 3);
+        s.install_projection(&p, 1, 1).unwrap();
+        assert!(s.installed_projection().unwrap().is_some());
+
+        // Tonight's fit has nothing to buy — the fixture's classes sit on
+        // their own prototypes — so nothing is written, nothing is cleared and
+        // no projection is swapped in.
+        let r = calibrate(&s, &IdentityConfig::default(), true, 2).unwrap();
+        assert_eq!(r.written, 0);
+        assert_eq!(r.cleared, 0);
+        assert!(!r.thresholds_swap);
+        assert!(!r.projection_swap);
+        // …and the report still, correctly, reports that one is installed.
+        assert!(r.projection_installed, "there is one, from before");
+
+        // Which must not be mistaken for having installed one tonight. The
+        // pass runs every six hours; logging here writes an `operations` row
+        // per evening recording a change that did not happen.
+        assert!(
+            s.operations_of(OP, 10).unwrap().is_empty(),
+            "a pass that changed nothing must leave no trace in the audit trail"
+        );
+
+        // Twice more, to make the point that it is per-run and not a one-off.
+        calibrate(&s, &IdentityConfig::default(), true, 3).unwrap();
+        calibrate(&s, &IdentityConfig::default(), true, 4).unwrap();
+        assert!(s.operations_of(OP, 10).unwrap().is_empty());
+
+        // And the projection is still there: not logging is not un-installing.
+        assert!(s.installed_projection().unwrap().is_some());
     }
 
     #[test]

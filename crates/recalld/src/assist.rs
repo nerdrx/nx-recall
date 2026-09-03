@@ -136,6 +136,46 @@ pub fn gate(store: &Arc<std::sync::Mutex<Store>>, control: &Arc<Control>) -> Opt
 /// passes while it has work of its own.
 pub const SHARE_EVERY_S: i64 = 300;
 
+/// May translation run right now **without** the graph model?
+///
+/// 0.11.x, and it is the answer to a feature that shipped switched off by
+/// accident. 0.11.0 gave translation a model of its own — NLLB-200, in this
+/// process, `models fetch --translator` — and the release note says so in as
+/// many words: *"translation no longer needs the graph model"*. Both arms of
+/// [`run`] that act on that carry a comment saying the same thing.
+///
+/// Neither could be reached. The live pass was written `if graph.enabled && …`,
+/// and the batch pass sits behind [`gate`], whose first line returns *"the
+/// local model is switched off"* when `graph.enabled` is false. `[graph]
+/// enabled` **ships false** (GRAPH.md: "Off, and off is the default"), so on a
+/// default install the whole of it was: fetch a 911 MB translator, choose a
+/// target in the Memory tab — whose card then reads "into English · everything
+/// you do not read" — and have nothing translated, ever, with one `debug!`
+/// line to say why.
+///
+/// So the graph switch governs the graph model, which is what it is named
+/// after and what its documentation describes (a 1.9 GB GGUF and
+/// `llm_threads` pinned cores). It does not govern a different model that the
+/// user opted into separately, by fetching it and by naming a target. What
+/// still governs this path is every gate that is about the *machine* —
+/// [`crate::enrich::gate`]: capture paused, a transcription backlog — and the
+/// translation switch itself.
+/// `translator_ready` is `translate::enabled() && translate::nllb_selected()`,
+/// passed in rather than read here so the rule can be exercised without a
+/// 911 MB model on disk.
+fn translation_stands_alone(
+    control: &Arc<Control>,
+    graph: &crate::config::GraphConfig,
+    translator_ready: bool,
+) -> bool {
+    !graph.enabled && translator_ready && crate::enrich::gate(control, graph).is_none()
+}
+
+/// Is the dedicated translator both wanted and available right now?
+fn translator_ready() -> bool {
+    crate::translate::enabled() && crate::translate::nllb_selected()
+}
+
 // ---- 0.11.0, waking on demand ----------------------------------------------
 //
 // The worker used to sleep `batch_pause_s` between looks, which is fine for
@@ -237,17 +277,28 @@ pub fn run(
         // is not a caption. So the machine's rules are re-checked here in full,
         // via `enrich::gate` and the same `graph.enabled` switch `gate` reads,
         // and only the fair share is skipped.
-        if graph.enabled
+        // 0.11.x: "no graph model" means the switch as well as the file. See
+        // `translation_stands_alone` — with the graph switch off and the
+        // dedicated translator selected and installed, this is the only pass
+        // that runs, and it runs under the machine's gates alone.
+        let standalone = translation_stands_alone(&control, &graph, translator_ready());
+        if (graph.enabled || standalone)
             && crate::translate::enabled()
             && crate::translate::live_queued() > 0
             && crate::enrich::gate(&control, &graph).is_none()
         {
-            resolve(&mut llm, &mut resolved_for);
+            // The graph model is only resolved when its switch is on: with it
+            // off there is no Qwen fallback to reach for, and looking for one
+            // would be looking for a model the user asked not to run.
+            if graph.enabled {
+                resolve(&mut llm, &mut resolved_for);
+            }
             // 0.11.0: the dedicated translator needs no graph model, so this
             // runs with `None` when NLLB is selected and the graph model is
             // absent; the Qwen path inside stands down on its own without one.
-            if llm.is_some() || crate::translate::nllb_selected() {
-                match crate::translate::drain_live(&store, &control, &bus, llm.as_ref(), &stopped) {
+            let llm_for_live = if graph.enabled { llm.as_ref() } else { None };
+            if llm_for_live.is_some() || crate::translate::nllb_selected() {
+                match crate::translate::drain_live(&store, &control, &bus, llm_for_live, &stopped) {
                     Ok(did) => worked |= did,
                     Err(e) => warn!("a live translation pass failed: {e:#}"),
                 }
@@ -256,7 +307,21 @@ pub fn run(
         }
 
         if let Some(reason) = gate(&store, &control) {
-            debug!("the assistant worker is standing down: {reason}");
+            if standalone {
+                // The graph switch is off and translation does not need it.
+                // Same batch, no graph model handed in; the digest half of
+                // this worker correctly stays where the switch left it.
+                match crate::translate::batch(&store, &control, &bus, None, &cfg, &stopped) {
+                    Ok(did) => worked |= did,
+                    Err(e) => warn!("a translation batch failed: {e:#}"),
+                }
+                refresh(&store, &cfg, &stats);
+                stats
+                    .last_pass_ns
+                    .store(crate::clock::utc_now_ns(), Ordering::Relaxed);
+            } else {
+                debug!("the assistant worker is standing down: {reason}");
+            }
         } else {
             resolve(&mut llm, &mut resolved_for);
             match llm.as_ref() {
@@ -536,6 +601,48 @@ mod tests {
         control.pause();
         assert!(crate::enrich::gate(&control, &control.graph()).is_some());
         assert!(gate(&store, &control).is_some());
+    }
+
+    #[test]
+    fn the_graph_switch_does_not_govern_a_model_that_is_not_the_graph_model() {
+        let (store, control) = rig();
+        let graph = control.graph();
+        // The shipped state, and the whole point: `[graph].enabled` is false
+        // on every fresh install.
+        assert!(!graph.enabled, "off is the default");
+
+        // What 0.11.0 actually shipped: `gate` refuses outright, and BOTH
+        // translation passes in `run` sat behind `graph.enabled` — the live
+        // one by a literal `if graph.enabled &&`, the batch one through this.
+        // So a person who fetched the 911 MB translator and picked a target
+        // got a card reading "into English · everything you do not read" and
+        // no translations, with one `debug!` line to say why.
+        assert!(
+            gate(&store, &control).is_some_and(|r| r.contains("switched off")),
+            "the graph switch closes the assistant's ordinary gate"
+        );
+
+        // With the dedicated translator selected and installed, translation
+        // is not the graph model's business, and it runs.
+        assert!(translation_stands_alone(&control, &graph, true));
+
+        // Without it there is nothing here that could translate without the
+        // graph model — the Qwen backend IS the graph model — so the switch
+        // stands, exactly as it did in 0.9.0.
+        assert!(!translation_stands_alone(&control, &graph, false));
+
+        // The machine's gates still apply in full. A paused daemon writes
+        // nothing, including this.
+        control.pause();
+        assert!(!translation_stands_alone(&control, &control.graph(), true));
+        control.resume();
+        assert!(translation_stands_alone(&control, &control.graph(), true));
+
+        // And with the graph switch ON this is not the standalone path at
+        // all: the ordinary passes own the tick, unchanged.
+        control.set_graph_enabled(true);
+        assert!(!translation_stands_alone(&control, &control.graph(), true));
+        assert_eq!(gate(&store, &control), None);
     }
 
     #[test]

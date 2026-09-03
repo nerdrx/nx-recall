@@ -26,7 +26,7 @@ use crate::asr::{Asr, normalise_words};
 use crate::config::{IdentityConfig, LangConfig, SAMPLE_RATE, TruthConfig};
 use crate::embed::{Embedder, Embedding};
 use crate::identity::{self, Decision, Refusal};
-use crate::lang::{self, Lang};
+use crate::lang;
 use crate::langctx::{self, ContextFix, Intent};
 use crate::models::ModelSet;
 use crate::overlap::OverlapDetector;
@@ -720,20 +720,26 @@ impl Analyzer {
         if got == want {
             return Ok(None);
         }
-        let target = match want {
-            "de" => Lang::De,
-            _ => Lang::En,
-        };
+        // 0.11.x: a tag with no arbiter behind it is NOT English. See
+        // `arbiter::target_for` — the catch-all this replaced sent a voice
+        // declared to speak Japanese to the English decoder and stored the
+        // result as `lang = "ja"`. `None` here falls through to the marking
+        // branch below, which is what "the classifier and the declaration
+        // cannot both be right and this daemon cannot tell which is wrong"
+        // already means everywhere else in this function.
+        let target = crate::arbiter::target_for(want);
         // Already decoding under that exact constraint: the text is what this
         // model says, and running it twice would say it again.
         let already_constrained = self.asr.lang() == Some(want);
-        let outcome = if already_constrained {
-            Arbitration::Rejected {
+        let outcome = match target {
+            Some(target) if !already_constrained => {
+                self.arbiters.arbitrate(target, samples, &self.lang_cfg)
+            }
+            Some(_) => Arbitration::Rejected {
                 read_as: got,
                 words: 0,
-            }
-        } else {
-            self.arbiters.arbitrate(target, samples, &self.lang_cfg)
+            },
+            None => Arbitration::Unavailable,
         };
 
         if let Arbitration::Replaced { text, model_id } = outcome {

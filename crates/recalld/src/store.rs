@@ -1718,6 +1718,12 @@ impl Store {
                 text_via::ARBITER
             ],
         )?;
+        // The words changed, so the translation of the old words is not a
+        // translation of this row any more. Same rule as
+        // `set_segment_text_via`, and it has to be spelled twice because these
+        // two are the only paths that replace a transcript and they do not
+        // share a body.
+        self.clear_segment_translation(segment_id)?;
         Ok(())
     }
 
@@ -1868,6 +1874,17 @@ impl Store {
              WHERE id = ?1 AND deleted_at IS NULL",
             params![segment_id, text, asr_model_id, via, at_utc_ns],
         )?;
+        // …and so is the translation, for exactly the same reason and one
+        // sharper. `clear_segment_translation` documents it — "a turn whose
+        // words changed has a translation of words nobody said any more" — and
+        // until 0.11.x it had no caller outside a test. That is worse than a
+        // stale confidence flag: `segments_for_translation` queues on
+        // `translation_via IS NULL`, so a row translated once was never
+        // revisited, and the translation of the *pre-re-decode* text was
+        // served on the wire for ever, under a `via` naming a model that had
+        // translated something else. Cleared here, the ordinary pass picks the
+        // row up again against the words it now says.
+        self.clear_segment_translation(segment_id)?;
         self.log_operation(
             "segments.redecode",
             &format!("[{segment_id}]"),
@@ -6730,6 +6747,18 @@ pub struct LearnedThreshold {
     pub at_ns: i64,
 }
 
+// How many times this thread has loaded the whole calibration corpus.
+//
+// Test instrument, and it earns its keep: the thing worth asserting about the
+// nightly fit's rate limit is not what it returns but that it stops the
+// **expensive** half from running, and that is invisible from the outside.
+// Thread-local rather than a global atomic so two tests fitting at once cannot
+// read each other's counts.
+#[cfg(test)]
+thread_local! {
+    pub static CALIBRATION_ROW_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One truth-labelled turn with its embedding, in the shape a calibration fit
 /// needs it. The same rows the bench reads, through the same door.
 #[derive(Debug, Clone)]
@@ -6950,6 +6979,8 @@ impl Store {
     /// downstream is chronological, and a fit that had to sort its own input
     /// is a fit that could forget to.
     pub fn truth_calibration_rows(&self, min_duration_s: f64) -> Result<Vec<CalibrationRow>> {
+        #[cfg(test)]
+        CALIBRATION_ROW_LOADS.with(|c| c.set(c.get() + 1));
         let mut stmt = self.conn.prepare(
             "SELECT g.id, g.t_start_ns, COALESCE(g.overlap_frac, 0.0),
                     (g.t_end_ns - g.t_start_ns), COALESCE(g.text, ''),
@@ -6993,6 +7024,34 @@ impl Store {
                 Ok(row)
             })
             .collect()
+    }
+
+    /// How many rows [`Self::truth_calibration_rows`] would return, without
+    /// returning any of them.
+    ///
+    /// The rate limit on the nightly calibration pass is "six hours, and only
+    /// if the corpus grew by a fifth". The second half needs a number; it does
+    /// not need every embedding in the corpus deserialised to get one. The
+    /// predicate is deliberately the same one, spelled as an `EXISTS` where the
+    /// loading query has a `JOIN … MAX(x.id)`: both mean "this segment has at
+    /// least one embedding", and `calibration_count_matches_the_rows_it_counts`
+    /// holds them together.
+    pub fn truth_calibration_row_count(&self, min_duration_s: f64) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM segments g
+             JOIN discord_users d ON d.user_id = g.truth_user_id
+             JOIN speakers s ON s.id = d.speaker_id
+             WHERE g.deleted_at IS NULL
+               AND g.truth_verdict = ?1
+               AND d.speaker_id IS NOT NULL
+               AND s.merged_into IS NULL
+               AND (g.t_end_ns - g.t_start_ns) >= ?2
+               AND EXISTS (SELECT 1 FROM embeddings x WHERE x.segment_id = g.id)",
+            params![truth_verdict::SINGLE, (min_duration_s * 1e9) as i64],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// The whole bank with the segment each prototype came from, so a replay

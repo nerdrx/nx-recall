@@ -437,10 +437,30 @@ impl Japanese {
         }
     }
 
-    /// Ask the identifier what this turn was spoken in. `None` when it is not
-    /// installed or had no opinion.
-    pub fn identify(&mut self, samples: &[f32]) -> Option<Reading> {
-        self.identifier()?.identify(samples)
+    /// Ask the identifier what this turn was spoken in.
+    ///
+    /// **Two options, and the outer one is the point.** `None` means the
+    /// identifier did not run at all — not installed, or it would not load —
+    /// so nothing was spent on this turn. `Some(None)` means it ran and had no
+    /// opinion, which is a reading and costs what a reading costs.
+    ///
+    /// One `Option` cannot tell those apart, and the caller counts
+    /// `lid_checked` off this answer. With a single `Option`, a `Lid::load`
+    /// that failed once — a corrupt export, a machine out of memory — latched
+    /// `lid_unavailable` and then reported *every* subsequent turn as checked
+    /// while no model ever ran. `lid_checked` is documented as what this
+    /// feature costs ("a rising count with `routed_ja` at zero means the
+    /// daemon is paying 20 ms a turn to be told German"), so a dead identifier
+    /// read as the busiest possible one.
+    pub fn identify(&mut self, samples: &[f32]) -> Option<Option<Reading>> {
+        Some(self.identifier()?.identify(samples))
+    }
+
+    /// Is the identifier loadable at all? Loads it on the first call, like
+    /// [`Self::identify`], and is here so a test can ask the question without
+    /// a 116 MB export.
+    pub fn lid_ready(&mut self) -> bool {
+        self.identifier().is_some()
     }
 }
 
@@ -503,7 +523,12 @@ pub fn route_segment(
         if (samples.len() as f32 / SAMPLE_RATE as f32) < lang_cfg.arbiter_min_duration_s {
             return Ok(checked);
         }
-        let reading = japanese.identify(samples);
+        // Counted only when a model actually ran. See `Japanese::identify`:
+        // an identifier that never loaded costs nothing, and counting it is
+        // how a dead feature came to read as an expensive one.
+        let Some(reading) = japanese.identify(samples) else {
+            return Ok(checked);
+        };
         checked.lid_checked = true;
         if !post_route(reading.as_ref(), asr_cfg) {
             debug!(
@@ -603,6 +628,72 @@ mod tests {
             lang: lang.into(),
             confidence,
         }
+    }
+
+    /// A router pointed at a directory with nothing in it: switched on, and
+    /// with no identifier behind the switch.
+    fn a_router_with_no_models() -> Japanese {
+        let models = ModelSet::resolve_at(
+            std::path::PathBuf::from("/nonexistent/nx-recall-audit"),
+            &crate::config::ModelsConfig::default(),
+        );
+        Japanese::new(
+            &models,
+            &crate::config::AsrConfig {
+                japanese: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn an_identifier_that_never_ran_is_not_a_turn_that_was_checked() {
+        let mut j = a_router_with_no_models();
+        // Nothing on disk, so the load fails once and latches. The OUTER
+        // option is what says so.
+        assert!(!j.lid_ready());
+        assert_eq!(j.identify(&vec![0.0f32; 16_000]), None);
+        // And it stays `None` on every turn after, without a second warning —
+        // which is exactly the state in which the old single-`Option`
+        // signature made `route_segment` write `lid_checked = true` for ever.
+        assert_eq!(j.identify(&vec![0.0f32; 16_000]), None);
+
+        // The distinction the outer option buys: `Some(None)` is a reading
+        // that cost a model pass and found nothing, and only that is counted.
+        // (`post_route` reads the inner one, and is unchanged by any of this.)
+        assert!(!post_route(None, &crate::config::AsrConfig::default()));
+
+        // A turn nothing was spent on carries no count.
+        assert!(!Checked::default().lid_checked);
+    }
+
+    #[test]
+    fn a_router_that_is_not_ready_does_not_route_and_does_not_count() {
+        // `ready()` is the cheap early exit, and it is false in every state
+        // where `lid_checked` would otherwise be a lie: switched off, or the
+        // pair not installed.
+        let mut off = a_router_with_no_models();
+        assert!(!off.ready(), "no models means not ready");
+        assert!(!off.lid_ready());
+
+        let models = ModelSet::resolve_at(
+            std::path::PathBuf::from("/nonexistent/nx-recall-audit"),
+            &crate::config::ModelsConfig::default(),
+        );
+        let switched_off = Japanese::new(
+            &models,
+            &crate::config::AsrConfig {
+                japanese: false,
+                ..Default::default()
+            },
+        );
+        assert!(!switched_off.ready());
+        assert!(
+            switched_off
+                .startup_note()
+                .is_some_and(|s| s.contains("off")),
+            "and it says so once, at start-up"
+        );
     }
 
     #[test]

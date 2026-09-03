@@ -114,6 +114,10 @@ impl Arbiters {
     /// measured guard. The caller writes the row; this decides nothing about
     /// the database and touches none of it.
     ///
+    /// Callers holding a *tag* rather than a [`Lang`] must go through
+    /// [`target_for`] — see the note there for what a `match` with a catch-all
+    /// arm costs.
+    ///
     /// The order is deliberate — the cheap, certain refusals come first, so a
     /// 0.8 s fragment never costs a model pass:
     ///
@@ -341,9 +345,59 @@ pub fn arbiter_for(want: Lang) -> Option<&'static str> {
     }
 }
 
+/// The decoder that can be forced to a language *tag*, or `None` when this
+/// daemon owns no arbiter that speaks it.
+///
+/// There are exactly two arbiters — the English-only export and Whisper forced
+/// to German — and there is no third. Before 0.11.x the one caller that starts
+/// from a tag wrote `match want { "de" => Lang::De, _ => Lang::En }`, whose
+/// catch-all arm was harmless while `de` and `en` were the only tags a voice
+/// could carry. 0.11.0 made `ja` one of them (the speaker picker offers it), and
+/// the catch-all then meant: take a turn from somebody declared to speak
+/// Japanese, re-decode it with the **English** model, and write the English
+/// words back stamped `lang = "ja"`. A transcript nobody said, wearing a
+/// language nobody read it in, with no mark on the row to say so.
+///
+/// So the mapping is total and it is `Option`: a tag with no decoder behind it
+/// is a tag this daemon cannot arbitrate, and saying so is the whole point.
+pub fn target_for(tag: &str) -> Option<Lang> {
+    match tag {
+        "de" => Some(Lang::De),
+        "en" => Some(Lang::En),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_language_with_no_decoder_behind_it_is_not_arbitrated_as_english() {
+        // The two this machine can force a decoder to.
+        assert_eq!(target_for("de"), Some(Lang::De));
+        assert_eq!(target_for("en"), Some(Lang::En));
+
+        // Everything else, and `ja` above all: 0.11.0 lets a voice be tagged
+        // Japanese, and the arbiter has no Japanese decoder. The old catch-all
+        // arm answered `Lang::En` here, which is how an English re-decode came
+        // to be stored with `lang = "ja"`.
+        // Spelled out, because it is the whole finding: this is the expression
+        // `analysis::correct_language` used to hold, and what it answered.
+        let shipped = |want: &str| if want == "de" { Lang::De } else { Lang::En };
+        assert_eq!(shipped("ja"), Lang::En, "what 0.11.0 shipped");
+        assert_eq!(target_for("ja"), None, "there is no Japanese arbiter");
+        for tag in ["fr", "es", "nl", "pl", "tr", "uk", "zh", ""] {
+            assert_eq!(target_for(tag), None, "{tag}");
+        }
+
+        // And the two that ARE arbitrated are exactly the two `installed()`
+        // knows how to report, so the list a person reads and the list the
+        // router uses cannot drift apart.
+        for tag in ["en", "de"] {
+            assert!(target_for(tag).is_some(), "{tag}");
+        }
+    }
 
     #[test]
     fn caption_hallucinations_are_stripped_before_anything_classifies_them() {

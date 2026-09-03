@@ -3609,8 +3609,14 @@ impl Service {
                 // hits are still a perfectly good answer to the question, and
                 // the whole point of this method is that not answering is a
                 // first-class result.
+                //
+                // 0.11.x: its own reason. Reporting a dead model as
+                // `UNGROUNDED` said "the model's answer did not come from the
+                // cited turns" about an answer that does not exist, and every
+                // client without a branch for it — including this project's
+                // own GUI — rendered that as "The transcript does not say".
                 warn!("a grounded answer failed: {e:?}");
-                (None, Some(refusal::UNGROUNDED))
+                (None, Some(refusal::FAILED))
             }
         };
         out["answer"] = answer.unwrap_or(Value::Null);

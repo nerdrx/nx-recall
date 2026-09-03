@@ -127,6 +127,34 @@ pub mod refusal {
     pub const SWITCHED_OFF: &str = "the local model is switched off";
     /// [`GATE`] is false.
     pub const OFF: &str = "answers are off until the bench passes";
+    /// The model call itself did not complete — a timeout and a kill, a
+    /// non-zero exit, a child that would not spawn.
+    ///
+    /// Its own reason, and that is the whole point. This used to be reported
+    /// as [`UNGROUNDED`], which says *"the model's answer did not come from
+    /// the cited turns"* about an answer that was never produced; the GUI has
+    /// no branch for `UNGROUNDED` either, so it fell through to its default
+    /// and told the person **"The transcript does not say."** That is a
+    /// positive claim about the contents of their own archive, made by a
+    /// daemon that had just learned nothing whatsoever about it. A failure
+    /// says it failed.
+    pub const FAILED: &str = "the model did not answer";
+
+    /// Every reason a client can be handed, in one list.
+    ///
+    /// Here so the set cannot drift from what the protocol documents and what
+    /// a client branches on — the previous drift is why `OFF` was undocumented
+    /// and unhandled. `every_refusal_reason_a_client_can_receive_is_written
+    /// _down` holds this against `docs/PROTOCOL.md`.
+    pub const ALL: &[&str] = &[
+        NO_HITS,
+        NOT_STATED,
+        UNGROUNDED,
+        NO_MODEL,
+        SWITCHED_OFF,
+        OFF,
+        FAILED,
+    ];
 }
 
 /// One row, as the model is shown it.
@@ -296,11 +324,22 @@ pub fn rows_text(rows: &[Row]) -> String {
 /// The ids `rows_text` actually put on the page. The grammar is built from
 /// this and not from the input, so a row dropped by the budget is a row the
 /// model cannot cite.
+/// The trailing space matters (it is what stops `[12]` matching inside
+/// `[123]`), and so does the line anchor. `contains` over the whole page also
+/// searches the rows' **transcript text**, and a turn can perfectly well
+/// contain the characters `[5000] ` — somebody read a log line out, or the
+/// decoder heard bracketed numbering. That would admit id 5000 to the grammar
+/// and to the allowlist for a row the budget had dropped and the model never
+/// saw: a citation the check then happily resolves against a turn that was not
+/// on the page. A page is a set of lines, so the question is asked of a line.
 pub fn shown_ids(rows: &[Row]) -> Vec<i64> {
     let text = rows_text(rows);
     rows.iter()
         .map(|r| r.id)
-        .filter(|id| text.contains(&format!("[{id}] ")))
+        .filter(|id| {
+            let head = format!("[{id}] ");
+            text.lines().any(|line| line.starts_with(&head))
+        })
         .collect()
 }
 
@@ -687,6 +726,40 @@ mod tests {
         assert!(de.contains("kein Weltwissen") && en.contains("no outside knowledge"));
     }
 
+    #[test]
+    fn every_refusal_reason_a_client_can_receive_is_written_down() {
+        // The protocol is the contract a client branches on. A reason that is
+        // in the code and not in the document is a reason every client handles
+        // by accident — `answers are off until the bench passes` was exactly
+        // that, and the GUI rendered it as "The transcript does not say."
+        // Prose is wrapped and its backticks are escaped, so both sides are
+        // flattened to words before they are compared.
+        let flat = |s: &str| {
+            s.replace('\\', "")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let doc = flat(include_str!("../../../docs/PROTOCOL.md"));
+        for reason in refusal::ALL {
+            assert!(
+                doc.contains(&flat(reason)),
+                "PROTOCOL.md does not document {reason:?}"
+            );
+        }
+        // …and they are seven distinct strings, so a client that branches on
+        // one is never silently handling another.
+        let mut seen: Vec<&&str> = refusal::ALL.iter().collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), refusal::ALL.len());
+
+        // The one that matters most: a model that never answered does not get
+        // to say anything about the archive.
+        assert_ne!(refusal::FAILED, refusal::NOT_STATED);
+        assert_ne!(refusal::FAILED, refusal::UNGROUNDED);
+    }
+
     // ---- the page ----------------------------------------------------------
 
     #[test]
@@ -722,6 +795,56 @@ mod tests {
         assert!(!g.contains(&format!("\"{}\"", rows.last().unwrap().id)));
         // …and a row longer than the cap is shown short, with a mark saying so.
         assert!(text.lines().next().unwrap().ends_with('…'));
+    }
+
+    /// A row that was dropped by the budget must not be readmitted by
+    /// something a *surviving* row happened to say.
+    #[test]
+    fn a_dropped_row_is_not_let_back_in_by_words_somebody_spoke() {
+        let long = "x".repeat(MAX_ROW_CHARS * 2);
+        let mut rows: Vec<Row> = (0..40)
+            .map(|i| row(1000 + i, "20:00", "Aspen", &long))
+            .collect();
+        // The last row is far past the budget and will be dropped.
+        let dropped = rows.last().unwrap().id;
+        // The first row — which survives — quotes it. A person reading a log
+        // line out loud, or a decoder hearing bracketed numbering; either way
+        // it is transcript text, not a page header.
+        rows[0].text = format!("schau mal, da stand [{dropped}] und dann nichts mehr");
+
+        let text = rows_text(&rows);
+        let shown = shown_ids(&rows);
+        assert!(
+            text.contains(&format!("[{dropped}] ")),
+            "the page does contain those characters — inside a row's words"
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.starts_with(&format!("[{dropped}] "))),
+            "…but no line of the page IS that row"
+        );
+
+        // So it is not a shown id, it is not in the grammar, and the model
+        // cannot cite a turn it was never given.
+        assert!(
+            !shown.contains(&dropped),
+            "a row the budget dropped was readmitted by another row's words"
+        );
+        assert!(!answer_grammar(&shown).contains(&format!("\"{dropped}\"")));
+
+        // The rows that really are on the page are still all there.
+        for line in text.lines() {
+            let id: i64 = line
+                .trim_start_matches('[')
+                .split(']')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(shown.contains(&id), "{id} is on the page and not shown");
+        }
+        assert_eq!(shown.len(), text.lines().count());
     }
 
     // ---- the post-checks ---------------------------------------------------
