@@ -747,23 +747,40 @@ const NOTES = [
 
 /// 0.9.0: one paragraph per conversation, as the local model writes them.
 /// Two, on two different days, so the card has both of its groups.
+/// 0.11.6: a digest is prose about people, so the canned ones say people's
+/// names. Both shapes the daemon can serve are here, because a client has to
+/// draw them the same way and the only honest way to know that is to have one
+/// of each in the fixture:
+///
+/// * 501 is a digest written since 0.11.6 (`rendered: "names"`) — the model
+///   was handed the labels and wrote them, so `summary_raw` already reads like
+///   the summary.
+/// * 503 was written before it (`rendered: "legacy"`) — the model wrote
+///   letters and the daemon substituted names on the way out, so the raw still
+///   says "A" and "B". Nothing was re-generated to get there and no model was
+///   asked anything.
 const DIGESTS = [
   {
     thread_id: 501,
     lang: 'de',
     day_offset: 1,
+    rendered: 'names',
     summary:
-      'A hat nach dem Shader von dem Avatar gefragt, den B gestern gezeigt hat. B hat die Datei noch und will den Link morgen schicken; heute kommt er nicht mehr dazu.',
-    open: ['B schickt A morgen den Link'],
+      'Kira hat nach dem Shader von dem Avatar gefragt, den Speaker 07 gestern gezeigt hat. Speaker 07 hat die Datei noch und will den Link morgen schicken; heute kommt er nicht mehr dazu.',
+    open: ['Speaker 07 schickt Kira morgen den Link'],
     people: [1, 2],
   },
   {
     thread_id: 503,
     lang: 'en',
     day_offset: 0,
+    rendered: 'legacy',
     summary:
+      'Speaker 07 asked whether anybody recorded the meetup. Speaker 12 had OBS running for about two hours and offered to cut it down to the world tour section before sending it over.',
+    summary_raw:
       'A asked whether anybody recorded the meetup. B had OBS running for about two hours and offered to cut it down to the world tour section before sending it over.',
-    open: ['B cuts the recording and sends it to A'],
+    open: ['Speaker 12 cuts the recording and sends it to Speaker 07'],
+    open_raw: ['B cuts the recording and sends it to A'],
     people: [2, 3],
   },
 ];
@@ -1801,8 +1818,15 @@ export function startMock({
       thread_id: d.thread_id,
       day: iso,
       lang: d.lang,
+      // 0.11.6: `summary` / `open` are the prose a person reads, with names
+      // in them. `*_raw` is what the model wrote, so nothing is lost and a
+      // client that wants the letters can still have them; `rendered` says
+      // which way this row got its names.
       summary: d.summary,
+      summary_raw: d.summary_raw ?? d.summary,
       open: d.open ?? [],
+      open_raw: d.open_raw ?? d.open ?? [],
+      rendered: d.rendered ?? 'names',
       // 0.10.0: the share travels ON the participant, not as a parallel list
       // — a client that has to join two arrays to draw one bar will
       // eventually join them wrong.
@@ -1812,7 +1836,14 @@ export function startMock({
           const sh = shares.find((x) => x.speaker_id === id);
           return {
             speaker_id: id,
-            label: state.speakers.find((s) => s.id === id)?.name ?? null,
+            // 0.11.6: the same label the paragraph above the chips uses — the
+            // name if there is one, else the auto label as a name says it
+            // ("Speaker 07", not "Speaker_07"). A chip that spells it the
+            // other way beside the sentence reads as two different people.
+            label: (() => {
+              const sp = state.speakers.find((s) => s.id === id);
+              return sp?.name ?? (sp?.auto ?? '').replace(/^Speaker_(\d+)$/, 'Speaker $1');
+            })(),
             share: sh?.share ?? null,
             turns: sh?.turns ?? null,
           };
@@ -3616,8 +3647,9 @@ export function startMock({
         thread_id: 500,
         lang: 'de',
         day_offset: 0,
+        rendered: 'names',
         summary:
-          'A und B haben über das Portal im Treppenhaus geredet. Es geht erst auf, wenn das Licht ausgeht; das hinter der Bar führt zurück in dieselbe Instanz.',
+          'Kira und Speaker 12 haben über das Portal im Treppenhaus geredet. Es geht erst auf, wenn das Licht ausgeht; das hinter der Bar führt zurück in dieselbe Instanz.',
         open: [],
         people: [1, 3],
       };

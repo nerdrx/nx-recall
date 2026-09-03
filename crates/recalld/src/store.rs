@@ -981,6 +981,13 @@ impl Store {
         self.apply_learned_identity()?;
         // ---- end 0.11.0 ---------------------------------------------------
 
+        // ---- 0.11.6: a digest names people --------------------------------
+        // Three nullable columns on `digests`, no backfill and no version
+        // bump: a row written before this change has none of them, and
+        // `digest::digest_json` renders those the legacy way at read time.
+        self.apply_digest_names()?;
+        // ---- end 0.11.6 ---------------------------------------------------
+
         match current {
             None => {
                 self.conn.execute(
@@ -5946,9 +5953,26 @@ pub struct DigestRow {
     pub thread_id: i64,
     pub day: String,
     pub lang: String,
+    /// The paragraph as it was rendered when the row was written — prose with
+    /// people's names in it. Kept on the row so anything reading the database
+    /// directly sees what the user saw.
     pub summary: String,
     pub people_json: String,
     pub open_json: String,
+    /// 0.11.6: what the model actually wrote, before letters became names.
+    /// `None` on every row written before 0.11.6, which is what makes those
+    /// rows recognisable without a version column of their own.
+    pub summary_raw: Option<String>,
+    /// 0.11.6: the roster the letters stood for, `[{"id": 3, "label": "Aspen"}]`
+    /// in letter order — `A` is index 0. The label is the one that was current
+    /// when the digest was written; the id is what a re-render follows, so a
+    /// rename moves the paragraph too.
+    pub roster_json: Option<String>,
+    /// 0.11.6: how `summary` was arrived at — `"names"` (the model was given
+    /// the labels and wrote them), `"letters"` (it wrote letters and the
+    /// daemon substituted), or `"legacy"` for a row from before any of this,
+    /// which is rendered at read time.
+    pub rendered: Option<String>,
     pub model_id: String,
     pub created_ns: i64,
 }
@@ -6123,12 +6147,15 @@ impl Store {
     pub fn upsert_digest(&self, d: &DigestRow) -> Result<()> {
         self.conn.execute(
             "INSERT INTO digests
-                 (thread_id, day, lang, summary, people_json, open_json, model_id, created_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 (thread_id, day, lang, summary, people_json, open_json, model_id,
+                  created_ns, summary_raw, roster_json, rendered)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(thread_id) DO UPDATE SET
                  day = excluded.day, lang = excluded.lang, summary = excluded.summary,
                  people_json = excluded.people_json, open_json = excluded.open_json,
-                 model_id = excluded.model_id, created_ns = excluded.created_ns",
+                 model_id = excluded.model_id, created_ns = excluded.created_ns,
+                 summary_raw = excluded.summary_raw, roster_json = excluded.roster_json,
+                 rendered = excluded.rendered",
             params![
                 d.thread_id,
                 d.day,
@@ -6137,9 +6164,26 @@ impl Store {
                 d.people_json,
                 d.open_json,
                 d.model_id,
-                d.created_ns
+                d.created_ns,
+                d.summary_raw,
+                d.roster_json,
+                d.rendered
             ],
         )?;
+        Ok(())
+    }
+
+    /// 0.11.6: a digest says people's names, so the row has to carry what the
+    /// model wrote and who the letters were.
+    ///
+    /// Three nullable columns and no backfill. A row from before this change
+    /// has `summary_raw IS NULL`, and that is exactly the fact
+    /// [`crate::digest::digest_json`] keys the legacy read-time rendering off —
+    /// there is nothing to guess and no model call to make.
+    fn apply_digest_names(&self) -> Result<()> {
+        self.add_column_if_missing("digests", "summary_raw", "TEXT")?;
+        self.add_column_if_missing("digests", "roster_json", "TEXT")?;
+        self.add_column_if_missing("digests", "rendered", "TEXT")?;
         Ok(())
     }
 
@@ -6162,6 +6206,9 @@ impl Store {
             summary: String::new(),
             people_json: "[]".into(),
             open_json: "[]".into(),
+            summary_raw: None,
+            roster_json: None,
+            rendered: None,
             model_id: model_id.to_string(),
             created_ns: at_utc_ns,
         })
@@ -6172,7 +6219,7 @@ impl Store {
     pub fn digest_rows(&self, day: Option<&str>, limit: usize) -> Result<Vec<DigestRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT d.thread_id, d.day, d.lang, d.summary, d.people_json, d.open_json,
-                    d.model_id, d.created_ns
+                    d.model_id, d.created_ns, d.summary_raw, d.roster_json, d.rendered
              FROM digests d
              JOIN threads t ON t.id = d.thread_id
              WHERE TRIM(d.summary) <> '' AND (?1 IS NULL OR d.day = ?1)
@@ -6190,6 +6237,9 @@ impl Store {
                     open_json: r.get(5)?,
                     model_id: r.get(6)?,
                     created_ns: r.get(7)?,
+                    summary_raw: r.get(8)?,
+                    roster_json: r.get(9)?,
+                    rendered: r.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
