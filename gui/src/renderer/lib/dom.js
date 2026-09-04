@@ -137,7 +137,11 @@ export function fmtFirstSeen(iso) {
 // the other. The microphone and the room mic get plain words instead: they are
 // not applications and reading "mic" on a row about a person is a puzzle.
 
-const SOURCE_WORD = { mic: 'your mic', room: 'the room' };
+// 0.12.1 adds a third: one Discord user's own audio stream. Its match key is
+// `discord:<snowflake>`, which is not a thing to show anybody, and its display
+// name is "Discord · <nickname>" — which is the nickname of the person whose
+// row you are already looking at, said twice. The word is what is left.
+const SOURCE_WORD = { mic: 'your mic', room: 'the room', 'discord-user': 'Discord' };
 
 /** What one source chip says. */
 export function sourceLabel(s) {

@@ -711,6 +711,7 @@ fn ingest(name: &str) -> (Rig, truthnet::Ingest, u16, String) {
         Arc::new(TruthStats::default()),
         token.clone(),
         0,
+        None,
     )
     .expect("binding the ingest on an ephemeral port");
     let port = served.addr().port();

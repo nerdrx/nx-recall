@@ -68,6 +68,8 @@ pub mod notes;
 pub mod overlap;
 pub mod palette;
 pub mod partial;
+/// 0.12.1: one Discord user's own audio, as its own source.
+pub mod peruser;
 pub mod pipeline;
 pub mod polyglot;
 pub mod proto;

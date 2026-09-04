@@ -1280,6 +1280,35 @@ pub struct TruthConfig {
     /// Discord and never matches any of these; the list is here so a fork of
     /// the client under another name can be told about without a rebuild.
     pub sources: Vec<String>,
+    // ---- 0.12.1: per-user audio ------------------------------------------
+    /// Accept **audio** on the truth ingest, one stream per Discord user, and
+    /// record each as its own source ([`crate::store::KIND_DISCORD_USER`]).
+    ///
+    /// A third switch and not a fold into `enabled`, because it is a different
+    /// claim of a different size. `enabled` opens a door for *timestamps*:
+    /// who spoke, when, under what nickname. This one lets the recordings
+    /// themselves arrive over a TCP socket. The plugin has its own switch, also
+    /// off; neither side trusts the other to have asked.
+    pub audio: bool,
+    /// How long a per-user stream counts as **live** after its last frame.
+    ///
+    /// This is the number the de-duplication rule turns on: while any stream is
+    /// live, the mixed Discord tap is muted for analysis, and when the last one
+    /// goes quiet the mixed tap resumes. Too short and a stutter in the call
+    /// produces a duplicated turn from the mixed source; too long and a plugin
+    /// that was switched off mid-call leaves the mixed source deaf. Four
+    /// seconds is eight 500 ms frames.
+    pub audio_live_s: f32,
+    /// How long a per-user stream may be silent before its session is closed
+    /// and its last turn flushed. Longer than `audio_live_s` on purpose: the
+    /// mixed tap should recover quickly, but ending a session is what writes a
+    /// row, and ending one that is about to resume splits a turn in half.
+    pub audio_idle_s: u64,
+    /// The longest single frame the ingest will take, in milliseconds. A guard
+    /// against a client that batches a whole minute into one line and blows the
+    /// pipeline's queue with it, not a working limit — the plugin sends 500 ms.
+    pub audio_max_frame_ms: u64,
+    // ---- end 0.12.1 -------------------------------------------------------
 }
 
 impl Default for TruthConfig {
@@ -1294,6 +1323,10 @@ impl Default for TruthConfig {
             batch_pause_s: 20,
             max_queue_seconds: 5,
             sources: vec!["discord".into(), "vesktop".into()],
+            audio: false,
+            audio_live_s: 4.0,
+            audio_idle_s: 10,
+            audio_max_frame_ms: 5_000,
         }
     }
 }

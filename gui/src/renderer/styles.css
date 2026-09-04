@@ -685,8 +685,13 @@ select.input option, select.input optgroup {
   padding: 2px 8px; font-size: 9px; letter-spacing: 0.09em;
   background: transparent; border-color: var(--clear-line);
 }
+/* The three kinds that are not an application: the two microphones, and
+   (0.12.1) one Discord user's own audio stream. Same accent, because the claim
+   they share is the one worth seeing at a glance — this turn did not come off a
+   program's output mixed with everything else. */
 .chip.heard.kind-mic,
-.chip.heard.kind-room { color: var(--violet); border-color: var(--clear-line-accent); background: var(--violet-soft); }
+.chip.heard.kind-room,
+.chip.heard.kind-discord-user { color: var(--violet); border-color: var(--clear-line-accent); background: var(--violet-soft); }
 .person-tags .heard-on { margin-left: 0; }
 
 /* Four choices, one row: the daemon classifies two languages, so this is a

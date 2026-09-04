@@ -3828,3 +3828,158 @@ restamped, moves: [{from, to, n}]}`. `recalld truth report` prints it as a
 1,341 more used to be counted here" are different facts about the same install
 and every measurement made before the rule read the second number without
 knowing it.
+## 0.12.1 — per-user Discord audio
+
+Every Discord turn this daemon has ever stored came off the **mixed** stream:
+one tap on the client's output, carrying everybody at once. Whose voice is
+whose has therefore been a recognition problem, and when two people talk over
+each other, a separation problem too. FINDINGS §33 measured the separation
+route and refused it — the artifact tax is five times the interference removed,
+and it is charged by the embedder, so a better separator cannot pay it. Its
+last question was whether the client could just hand the streams over
+separately. On Vesktop it can.
+
+This section is that path. It is additive: no method, event, field or behaviour
+described above this line changes, `proto` stays `1`, and **there is no schema
+migration** — `sources.kind` has been free text since v4 and both new
+vocabulary values are strings.
+
+- **The route.** A third on the loopback ingest, beside the two from 0.9.0:
+
+  | route | body | replies |
+  |---|---|---|
+  | `POST /v1/discord/audio` | NDJSON, `{t_ms, user_id, name?, channel_id?, rate, seq, pcm}` | `204` |
+
+  `pcm` is base64 mono PCM16 little-endian at `rate` (8 000–96 000 Hz;
+  the plugin sends 16 000, and anything else is resampled by the daemon).
+  `t_ms` is `Date.now()` for the frame's **first sample** — the same clock the
+  speaking edges are on and the same clock `segments.t_start_ns` ends up on, so
+  nothing is converted. `seq` is per stream and its only job is to make a hole
+  visible.
+
+  Base64 in NDJSON rather than a binary body: the other two routes are NDJSON,
+  one batch carries several people at once, one bad line is skippable without
+  poisoning the rest, and the 33% the encoding costs is 16 kB over a loopback
+  socket. **Measured sizes** — one 500 ms frame of 16 kHz PCM16 is 16 000 bytes
+  of PCM, 21 336 of base64, ~21.4 kB of JSON line; four people at 500 ms is
+  ~86 kB per POST against `MAX_BODY` of 1 MiB, so a batch is budgeted in bytes
+  and not in lines. Steady state is ~43 kB/s per speaking person.
+
+  Auth, the `413`, the `204`-for-everything-else and the one-bad-line-is-counted
+  rule are 0.9.0's and unchanged. A malformed or refused frame is counted in
+  the audio counters, never raised: the client retries a whole batch on any
+  non-2xx, so failing a batch over one frame would loop on it forever.
+
+- **`[truth] audio = false`.** A third switch, and deliberately not folded into
+  `enabled`. `enabled` opens a door for timestamps; this one lets recordings
+  arrive over a TCP socket. **Both sides are off by default and neither trusts
+  the other to have asked** — the plugin has its own switch too, because audio
+  leaving the client and audio entering the recordings are two different
+  people's decisions. While it is off the route answers `204` and counts the
+  lines as rejected, so "I turned it on in the plugin and nothing happened" has
+  a number attached to it. Three more keys: `audio_live_s` (4.0),
+  `audio_idle_s` (10) and `audio_max_frame_ms` (5 000).
+
+- **`sources.kind = "discord-user"`** — one row per Discord account whose own
+  audio has arrived, `match_key` `discord:<user_id>`, `display_name`
+  `Discord · <nickname>`. Rows are created **on demand**, by the first frame,
+  so there are as many as there are people the user has been in a call with.
+
+  - It has no rule and no device: `sources.set` **refuses** a `discord:` key
+    the way it refuses `mic` and `room`, and `sources.list` reports `allowed`
+    as `[truth].audio`. Deciding it by `[rules]` would be worse than wrong —
+    the key is in nobody's allowlist, so every one of these would read as
+    denied while plainly recording.
+  - It **bridges threads**, like both microphones. Here it is not a nicety: one
+    call is now one session per person, and a conversation that could not cross
+    a session boundary would render a four-handed call as four monologues.
+  - The Discord user id is on `sessions.instance_key`, not parsed back out of
+    the match key.
+
+- **`segments.label_via = "discord-stream"`**, `match_score` NULL. The audio is
+  single-speaker **by construction** — the packets were decoded from one
+  person's connection — so this is `"mic"`'s claim made about somebody else,
+  and exactly as strong. It is not `"truth"`, which means the weaker,
+  retroactive "Discord's speaking ring says this mixed turn was probably them".
+  Three consequences, each a rule and not a heuristic:
+
+  - **The overlap gate does not apply.** `overlap_frac` is still computed and
+    still stored — it is information, and `enroll_max_overlap` reads it — but a
+    positive reading cannot cost the embedding, because there is no second
+    talker for it to be about. The duration floor is unchanged.
+  - **The identity ladder does not run.** No comparison, no mint, no margin.
+  - **Enrolment follows `[truth] enrol`** (off by default) **and the audio bar
+    unchanged**: `overlap_frac ≤ enroll_max_overlap`, `duration_s ≥
+    enroll_min_duration_s`. Ground truth says whose voice it is; it does not say
+    the recording is worth keeping, and that has been the rule since 0.9.0. **No
+    goldens are kept**: a golden outlives retention on the argument that it is
+    the user's own voice and a future embedding model will need it, and that
+    argument does not transfer to anybody else.
+
+- **The voice, and the link.** The speaker is whatever `discord_users.speaker_id`
+  points at. When the account is unlinked a voice is **minted and linked on the
+  spot**, with `discord_users.via = "discord-stream"` — a fifth value beside
+  `truth`, `manual` and `learned`. There is nothing to decide: the voice exists
+  *for* that account and holds nothing else, which is why it is not the
+  auto-linker's `truth` (20 turns at 90% agreement). A `manual` link is never
+  overwritten, and **the Discord nickname is still never applied to the voice**
+  — it is minted `Speaker_NN` like any other.
+
+- **The de-duplication rule.** Both sources hear the same call, so:
+
+  > While **any** per-user stream is live, the mixed Discord tap is **muted for
+  > analysis**. Its audio is discarded at the head of the pipeline, exactly as a
+  > global pause discards it, and the turn in progress goes with it rather than
+  > being spliced across the boundary. A stream is live until `audio_live_s`
+  > after its last frame. When the last one goes quiet the mixed tap resumes on
+  > its next buffer, opening a fresh turn.
+
+  Muting rather than de-duplicating afterwards, because the duplicate this
+  prevents has no key to be found by: `segments` has no uniqueness constraint a
+  second reading of the same speech would violate, and matching two turns by
+  time overlap after the fact would be a guess about which transcript is real.
+  The turn that is never written needs no rule for choosing. The cost of the
+  rule is bounded and in the right direction: a plugin switched off mid-call,
+  or a client that cannot do this at all, costs `audio_live_s` of transcript
+  rather than the evening.
+
+  "Mixed Discord tap" means a source whose match key matches `[truth].sources`
+  the way everything else in this section matches it — and never a
+  `discord:` key, which would be a source muting itself.
+
+- **Sessions.** Opened by the first frame for an account, closed
+  `audio_idle_s` after the last one, ended **at the last frame** and not at now
+  — the last thing anybody knows is that they were being heard then, which is
+  the rule `open_span_timeout_s` already follows for a speaking span.
+
+- **Placing a frame in time.** Contiguous frames are placed by sample count
+  from the run's anchor, not by their own `t_ms`: the wall clock is quantised to
+  the millisecond and jitters by whole scheduler slices, and deriving each
+  frame's position from it would wander past the pipeline's 100 ms gap
+  threshold, which reads a wander as a hole and throws away the turn in
+  progress. `t_ms` anchors the run; the samples carry it from there. A
+  **sequence gap** ends the run, and the next frame anchors a new one from its
+  own `t_ms` — so a hole is re-anchored and the half-built turn is discarded
+  rather than spliced, which is what a hole should get.
+
+- **`truth.status` gains `audio`**: `{enabled, live, live_s, idle_s, streams:
+  [{user_id, name, channel_id, session_id, speaker_id, frames, quiet_ms,
+  live}], counters: {frames, samples, rejected, gaps, sessions_opened,
+  sessions_closed, voices_minted, clock_skew}}`. `null` only on a daemon that
+  does not have the feature — a client must be able to tell that from "off",
+  and a missing key cannot.
+
+- **CLI.** `recalld truth audio on|off` edits the config (restart to apply) and
+  says the rest of what has to be true — the plugin's own switch, that it is
+  Vesktop only, and that `[truth] enrol` is separately off so these turns will
+  be named but will not teach the voicebank. `recalld truth report` prints the
+  live streams, the counters, and whether the mixed tap is muted right now,
+  which is the single most surprising thing the daemon can be doing to a
+  Discord recording.
+
+- **Discord desktop cannot do this**, and the plugin says so rather than
+  looking switched on: voice is decoded and mixed in `discord_voice.node`,
+  whose JS surface offers per-user volume, mute and pan — parameters passed
+  *into* the native mixer — and no way at all to receive a user's audio
+  (FINDINGS §33.7). Vesktop and the web client use `MediaEngineWebRTC`, where
+  every remote user is their own `MediaStream`.

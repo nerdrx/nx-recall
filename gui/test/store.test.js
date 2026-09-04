@@ -49,7 +49,7 @@ import {
   applyAssist,
   translationLeads,
 } from '../src/renderer/lib/store.js';
-import { speakerColor } from '../src/renderer/lib/dom.js';
+import { sourceLabel, speakerColor } from '../src/renderer/lib/dom.js';
 import { accentColor } from '../src/renderer/lib/palette.js';
 import { splitOutcome } from '../src/renderer/views/speakers.js';
 
@@ -1016,6 +1016,30 @@ test('the room microphone is not an application either', () => {
   ];
   assert.equal(allowedAppCount(), 1);
   assert.deepEqual(appSources().map((s) => s.match_key), ['VRChat.exe']);
+});
+
+test('a Discord user’s own audio stream is not an application either (0.12.1)', () => {
+  reset();
+  store.sources = [
+    { match_key: 'VRChat.exe', kind: 'app', allowed: true },
+    { match_key: 'vesktop', kind: 'app', allowed: true },
+    // One row per account whose audio has arrived. There can be dozens, they
+    // have no rule and no toggle (`sources.set` refuses them; they follow
+    // `[truth].audio`), and a list of everybody the user has ever been in a
+    // call with would drown the four programs they actually chose to record.
+    { match_key: 'discord:1', display_name: 'Discord · Aspen', kind: 'discord-user', allowed: true },
+    { match_key: 'discord:2', display_name: 'Discord · Rowan', kind: 'discord-user', allowed: true },
+  ];
+  assert.equal(allowedAppCount(), 2, 'the badge counts programs, not people');
+  assert.deepEqual(appSources().map((s) => s.match_key), ['VRChat.exe', 'vesktop']);
+});
+
+test('a per-user Discord chip says Discord, never the snowflake', () => {
+  // The match key is `discord:<id>`, which is not a thing to show anybody, and
+  // the display name repeats the nickname of the person whose row it is on.
+  assert.equal(sourceLabel({ kind: 'discord-user', source: 'discord:12345', name: 'Discord · Aspen' }), 'Discord');
+  assert.equal(sourceLabel({ kind: 'mic', source: 'mic' }), 'your mic');
+  assert.equal(sourceLabel({ kind: 'app', source: 'VRChat.exe' }), 'VRChat.exe');
 });
 
 test('a room block folds in from the method, the event and the status push', () => {

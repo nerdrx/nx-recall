@@ -625,7 +625,15 @@ export function micChip(state = store.mic.state) {
 export function appSources() {
   // 0.10.0 adds a second one: the room microphone is a source row too, and it
   // is no more an application than the headset is.
-  return store.sources.filter((s) => s.kind !== 'mic' && s.kind !== 'room');
+  //
+  // 0.12.1 adds a whole family: one row per Discord account whose own audio
+  // stream has arrived. They are not applications either, they have no rule and
+  // no toggle (`sources.set` refuses them; they follow `[truth].audio`), and
+  // there can be dozens — a list of everybody the user has been in a call with,
+  // sitting above the four programs they actually chose to record, would drown
+  // the card this list is the whole content of. They belong to the Discord
+  // card, and they are shown there.
+  return store.sources.filter((s) => s.kind !== 'mic' && s.kind !== 'room' && s.kind !== 'discord-user');
 }
 
 /** What the rail badge counts: allowed applications. */
