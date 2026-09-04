@@ -236,7 +236,16 @@ fn main() -> Result<()> {
         if spans.is_empty() {
             no_spans += 1;
         }
-        row.simul = truth::simultaneous_frac(&spans, row.t_start_ns, row.t_end_ns);
+        // `Audible::everyone()`: this bench is §26's, and §26's whole corpus
+        // is what the own-account rule turned out to be wrong about. It keeps
+        // counting every ring so its numbers stay comparable with the ones in
+        // that section; §34's are measured against the re-judged database.
+        row.simul = truth::simultaneous_frac(
+            &spans,
+            row.t_start_ns,
+            row.t_end_ns,
+            truth::Audible::everyone(),
+        );
         row.present = truth::coverage(&spans, row.t_start_ns, row.t_end_ns)
             .into_iter()
             .filter(|c| c.frac >= recalld::store::truth_verdict::PRESENT_MIN)

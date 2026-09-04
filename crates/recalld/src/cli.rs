@@ -555,6 +555,56 @@ segment's prior state, so the pass is reversible as a class.
         limit: Option<usize>,
     },
     // ---- end 0.12.0 -------------------------------------------------------
+
+    // ---- 0.12.1: the re-verdict -------------------------------------------
+    /// Re-judge the verdicts on disk: your own account is not presence on
+    /// audio your own client made. Previews unless `--apply`.
+    #[command(long_about = "\
+Re-judge the verdicts already on disk under the own-account rule.
+
+A Discord client never plays your own microphone back to you, so on audio
+captured from that client yours is the one voice the recording cannot hold.
+Discord's speaking rings are still the truth about the CALL; they were being
+read as the truth about the RECORDING, and on that one account the two
+disagree systematically. The verdicts written before this rule counted your
+own ring as a second person present, which turned a turn where you talked over
+somebody into `overlap` — a label on single-speaker audio. On the install this
+was measured on that is 1,341 of 1,791 `overlap` verdicts, and every number
+computed against `overlap` was diluted about eight-fold by them.
+
+The verdict is recomputed from the speaking spans, exactly as the nightly pass
+computes a fresh one. Where the spans are gone:
+
+  single/partial     naming you        -> `nobody`, no spans needed: the
+                                          verdict itself says nobody else
+                                          reached the presence bar
+  single/partial     naming anybody    unchanged, and provably so, for the
+                     else               same reason read backwards
+  overlap            with no spans     LEFT ALONE and counted. It records that
+                                        two accounts were present and not which
+                                        two; guessing here would invent the
+                                        thing this pass exists to correct
+
+A microphone is untouched: there your own account is the only voice that CAN
+be present. `truth_overlap_frac` is re-measured on the same rule wherever the
+spans survive.
+
+The daemon runs this once by itself, on the first start after the upgrade,
+when `[truth] label` is on. This command is the same pass for an operator who
+wants to see it first, or whose labelling pass is off.
+
+  (no flag)    print what would change. Writes nothing.
+  --apply      write the verdicts and log one `truth.rejudge` operation
+               per 200 rows, prior state and all.")]
+    Rejudge {
+        /// Actually write. Without it the command only reports.
+        #[arg(long)]
+        apply: bool,
+        /// Stop after this many verdicts.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+    },
+    // ---- end 0.12.1 -------------------------------------------------------
 }
 
 #[derive(Subcommand, Debug)]

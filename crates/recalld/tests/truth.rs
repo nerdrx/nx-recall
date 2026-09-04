@@ -17,7 +17,7 @@ use recalld::allowlist::Allowlist;
 use recalld::bus::Bus;
 use recalld::config::{IdentityConfig, TruthConfig};
 use recalld::control::Control;
-use recalld::store::{SCHEMA_VERSION, SegmentAnalysis, Store, truth_verdict, truth_via};
+use recalld::store::{KIND_MIC, SCHEMA_VERSION, SegmentAnalysis, Store, truth_verdict, truth_via};
 use recalld::truth::{self, TruthStats, TruthStop};
 use recalld::truthnet;
 
@@ -350,6 +350,61 @@ fn only_discord_sessions_are_labelled() {
     assert_eq!(r.verdict_of(discord).0, Some(truth_verdict::SINGLE.into()));
 }
 
+/// 0.12.1: the live pass reads the SOURCE KIND, not just the source's name.
+///
+/// The unit tests pin the rule; this pins the wiring, which is the half that
+/// can rot silently — `segments_for_truth` has to carry `sources.kind` all the
+/// way to the verdict, and a Discord-named microphone (there is nothing
+/// stopping one) must not have the user deleted from its own recording.
+#[test]
+fn the_labelling_pass_drops_your_own_ring_on_app_audio_and_only_there() {
+    let r = rig("audible");
+    let mic_sess = {
+        let s = r.store();
+        let you = s.ensure_you_speaker(0).unwrap();
+        s.upsert_discord_user("me", "nerdrx", 0).unwrap();
+        s.set_discord_link("me", Some(you), Some(truth_via::MANUAL), 0)
+            .unwrap();
+        // A microphone whose name would match `[truth].sources` anyway, so
+        // the only thing separating it from the app stream is its kind.
+        let mic = s
+            .upsert_source_kind("discord-headset", "Discord headset", KIND_MIC, 0)
+            .unwrap();
+        s.begin_session(mic, 0).unwrap()
+    };
+    // Aspen across the turn, the user talking over her. Twice, on two streams.
+    let app = r.segment(10_000, 11_000);
+    let mic = {
+        let s = r.store();
+        s.insert_segment(mic_sess, 10_000 * MS, 11_000 * MS, "segments/m.wav", 0)
+            .unwrap()
+    };
+    {
+        let s = r.store();
+        s.truth_speaking_start("aspen", "Aspen", None, 10_000 * MS)
+            .unwrap();
+        s.truth_speaking_stop("aspen", 10_900 * MS).unwrap();
+        s.truth_speaking_start("me", "nerdrx", None, 10_200 * MS)
+            .unwrap();
+        s.truth_speaking_stop("me", 10_700 * MS).unwrap();
+    }
+    r.label();
+
+    assert_eq!(
+        r.verdict_of(app),
+        (Some(truth_verdict::SINGLE.into()), Some("aspen".into())),
+        "a Discord client does not play your microphone back to you"
+    );
+    assert_eq!(
+        r.verdict_of(mic).0,
+        Some(truth_verdict::OVERLAP.into()),
+        "on a microphone both mouths are real, whatever the source is called"
+    );
+    let s = r.store();
+    assert_eq!(s.segment_truth_overlap(app).unwrap(), Some(0.0));
+    assert!(s.segment_truth_overlap(mic).unwrap().unwrap() > 0.0);
+}
+
 // ---------------------------------------------------------------------------
 // linking and the report
 // ---------------------------------------------------------------------------
@@ -559,6 +614,54 @@ fn the_overlap_gate_is_scored_against_overlap_verdicts() {
     assert_eq!(g["flagged_when_single"], 1);
     assert!((g["precision"].as_f64().unwrap() - 2.0 / 3.0).abs() < 1e-9);
     assert!((g["recall"].as_f64().unwrap() - 2.0 / 3.0).abs() < 1e-9);
+}
+
+/// 0.12.1: the report says how many `overlap` verdicts the rule took away.
+///
+/// `null` before the pass has run and a filled block after it, because "450
+/// overlap rows" and "450 overlap rows, and 1,341 more used to be counted
+/// here" are different facts and the operator can only see the second one if
+/// something says it.
+#[test]
+fn the_summary_reports_what_the_re_verdict_reassigned() {
+    let r = rig("rejudge-report");
+    let identity = IdentityConfig::default();
+    let cfg = TruthConfig::default();
+    {
+        let s = r.store();
+        let you = s.ensure_you_speaker(0).unwrap();
+        s.upsert_discord_user("me", "nerdrx", 0).unwrap();
+        s.set_discord_link("me", Some(you), Some(truth_via::MANUAL), 0)
+            .unwrap();
+        s.truth_speaking_start("aspen", "Aspen", None, 10_000 * MS)
+            .unwrap();
+        s.truth_speaking_stop("aspen", 10_900 * MS).unwrap();
+        s.truth_speaking_start("me", "nerdrx", None, 10_200 * MS)
+            .unwrap();
+        s.truth_speaking_stop("me", 10_700 * MS).unwrap();
+    }
+    let seg = r.segment(10_000, 11_000);
+    {
+        // The verdict the OLD rule wrote, put there by hand: the pass that
+        // writes it now cannot produce it any more, which is the whole point.
+        let s = r.store();
+        s.set_segment_truth(seg, None, truth_verdict::OVERLAP, None)
+            .unwrap();
+    }
+    let before = truth::summary(&r.store(), &identity, &cfg).unwrap();
+    assert!(
+        before["rejudge"].is_null(),
+        "an unrun pass has not reassigned nothing — it has not run"
+    );
+
+    truth::rejudge(&r.store, usize::MAX, true, 1).unwrap();
+    let after = truth::summary(&r.store(), &identity, &cfg).unwrap();
+    assert_eq!(after["rejudge"]["overlap_reassigned"], 1);
+    assert_eq!(after["rejudge"]["changed"], 1);
+    assert_eq!(after["rejudge"]["moves"][0]["from"], truth_verdict::OVERLAP);
+    assert_eq!(after["rejudge"]["moves"][0]["to"], truth_verdict::SINGLE);
+    assert_eq!(after["overlap"], 0);
+    assert_eq!(after["single"], 1);
 }
 
 // ---------------------------------------------------------------------------
