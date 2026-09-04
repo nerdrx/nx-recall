@@ -894,6 +894,18 @@ document.addEventListener('keydown', (e) => {
         name: r.querySelector('.name')?.textContent ?? '',
         linked: r.querySelector('select')?.value ?? '',
       })),
+      // 0.12.2: which Discord client is muted, as the card draws it. The
+      // driver reads the RENDERED row rather than the wire, because the bug
+      // this feature fixes was invisible in the UI for a whole evening.
+      audio: (document.getElementById('truth-audio') || {}).textContent ?? '',
+      clientsHint: (document.getElementById('truth-clients-hint') || {}).textContent ?? '',
+      clients: [...document.querySelectorAll('#truth-clients .src-row')].map((r) => ({
+        source: r.dataset.bridgeClient,
+        muted: r.dataset.bridgeMuted === 'true',
+        state: r.querySelector('.chip')?.textContent ?? '',
+        role: r.querySelector('select')?.value ?? '',
+        why: r.querySelector('.why')?.textContent ?? '',
+      })),
     }),
     // ---- end 0.10.0 ------------------------------------------------------
     // 0.6.1. Three facts the driver has to be able to read back: what a voice

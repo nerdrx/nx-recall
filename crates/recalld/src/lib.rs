@@ -28,6 +28,7 @@ pub mod asr;
 pub mod asr_cjk;
 pub mod assist;
 pub mod b64;
+pub mod bridge;
 pub mod brief;
 pub mod bus;
 // ---- 0.11.0: learned identity ---------------------------------------------

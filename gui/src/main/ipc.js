@@ -131,6 +131,11 @@ const ALLOWED = new Set([
   'truth.link',
   'truth.unlink',
   // ---- end 0.10.0 ---------------------------------------------------------
+  // 0.12.2. Which Discord client carries the RecallBridge plugin, which is a
+  // consent-shaped decision the card offers and therefore has to be reachable:
+  // a control the UI draws and this set forgets is a dead button, and this one
+  // decides whether a whole second call gets recorded.
+  'sources.instance_role',
   'status',
 ]);
 

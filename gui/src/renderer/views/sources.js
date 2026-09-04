@@ -411,7 +411,111 @@ export function mount(root, ctx) {
       .filter((s) => s.live)
       .map((s) => s.name || s.user_id)
       .join(', ');
-    return `Per-user audio: ${a.live} live stream${a.live === 1 ? '' : 's'} — ${names}. Each is recorded and named as that person; the mixed Discord tap is muted while they are arriving, so nothing is transcribed twice.`;
+    return `Per-user audio: ${a.live} live stream${a.live === 1 ? '' : 's'} — ${names}. Each is recorded and named as that person; the Discord client carrying the plugin is muted while they are arriving, so nothing is transcribed twice.`;
+  }
+
+  // -- 0.12.2: which Discord client has the plugin in it ---------------------
+  //
+  // Two clients at once is an ordinary thing to run, and until 0.12.2 the mute
+  // took BOTH of their calls off the record. The daemon now works out which
+  // instance the per-user streams are explaining and mutes only that one; this
+  // is where it says which, and where the user overrides it when it is wrong.
+
+  let rolePending = null;
+
+  const ROLE_LABEL = {
+    auto: 'Decide for me',
+    bridge: 'Has the plugin',
+    other: 'No plugin — never mute',
+  };
+
+  function clientsBlock() {
+    const mute = truth?.audio?.mute;
+    if (!mute) return null;
+    const rows = mute.instances ?? [];
+    const wrap = h('div', { id: 'truth-clients', style: 'padding:0 0 12px' });
+    wrap.append(
+      h('p', {
+        class: 'rail-hint',
+        id: 'truth-clients-hint',
+        style: 'padding:0 0 8px;max-width:64ch',
+        text: 'Discord clients heard in the last half-minute. Only the one carrying the plugin is muted while per-user audio arrives — the other one is a different call and keeps recording. If the guess is wrong, say so here; a client you mark “no plugin” is never muted, whatever the measurement says.',
+      })
+    );
+    if (!rows.length) {
+      wrap.append(
+        h('div', {
+          class: 'empty',
+          id: 'truth-clients-empty',
+          text: 'No Discord client has been heard yet in this window.',
+        })
+      );
+      return wrap;
+    }
+    for (const r of rows) wrap.append(clientRow(r, mute));
+    return wrap;
+  }
+
+  function clientRow(r, mute) {
+    const role = r.role ?? 'auto';
+    // A share the rule refused to compute is not a share of zero: it is
+    // "nobody has answered this yet", and drawing it as 0% would put a
+    // confident verdict over an open question.
+    const share = r.share == null ? 'measuring' : `${Math.round(r.share * 100)}% match`;
+    const select = h(
+      'select',
+      {
+        class: 'cap-select',
+        dataset: { bridgeRole: r.source },
+        'aria-label': `Whether ${r.source} carries the RecallBridge plugin`,
+        disabled: rolePending === r.source || store.conn.status !== 'connected',
+        onchange: (e) => setRole(r.source, e.target.value),
+      },
+      ...['auto', 'bridge', 'other'].map((v) =>
+        h('option', { value: v, selected: v === role, text: ROLE_LABEL[v] })
+      )
+    );
+    // Three columns, not the source list's four: a Discord client has no
+    // application plate, and the reason it is muted needs the width the plate
+    // would have taken.
+    return h(
+      'div',
+      {
+        class: 'src-row bridge-row',
+        dataset: { bridgeClient: r.source, bridgeMuted: String(!!r.muted) },
+      },
+      h(
+        'div',
+        {},
+        h('div', { class: 'name', text: r.source }),
+        h('div', {
+          class: 'key',
+          text: `${r.instance_key || 'instance unknown'} · ${share}${role === 'auto' ? '' : ' · set by you'}`,
+        }),
+        h('p', { class: 'why', text: r.why ?? '' })
+      ),
+      h(
+        'span',
+        { class: `chip${r.muted ? ' live' : ''}`, dataset: { bridgeState: r.source } },
+        r.muted ? 'muted' : 'recording'
+      ),
+      select
+    );
+  }
+
+  async function setRole(source, role) {
+    rolePending = source;
+    renderTruth();
+    try {
+      await ask('sources.instance_role', { source, role });
+    } catch (e) {
+      toast(`Could not set the role for ${source}: ${e?.message ?? e}`);
+    } finally {
+      rolePending = null;
+    }
+    // Re-read rather than patch: the verdict is the daemon's, and one role
+    // changing can move which OTHER client is muted.
+    await loadTruth();
   }
 
   /** `precision · recall · n`, or an honest sentence when there is nothing. */
@@ -475,6 +579,11 @@ export function mount(root, ctx) {
       // recognised, and this is about not having to recognise them.
       h('p', { class: 'rail-hint', id: 'truth-audio', style: 'padding:0 0 12px;max-width:64ch' }, audioLine())
     );
+
+    // 0.12.2, and only when the daemon has anything to say: which Discord
+    // client is muted right now, and the control that overrules it.
+    const clients = clientsBlock();
+    if (clients) truthCard.append(clients);
 
     if (!truthUsers.length) {
       truthCard.append(

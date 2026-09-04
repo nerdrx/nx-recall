@@ -1083,6 +1083,30 @@ export function startMock({
     // 0.9.0's Discord bridge, on and having heard from the plugin a moment
     // ago, so the "receiving" light is reachable in a screenshot.
     truth: { enabled: true, listening: '127.0.0.1:7797', last_event_ms: Date.now() - 4_000 },
+    // 0.12.2: two Discord clients at once, which is the shape the rule exists
+    // for. `vesktop` carries the RecallBridge plugin and is explained by the
+    // per-user streams; `Discord` is a second client in another call and must
+    // keep recording. Both start on `auto` so the card's control has somewhere
+    // to move to.
+    bridge: {
+      roles: {},
+      instances: [
+        {
+          session_id: 4211,
+          source: 'vesktop',
+          instance_key: 'serial:44628',
+          share: 0.96,
+          active_ms: 8_700,
+        },
+        {
+          session_id: 4212,
+          source: 'Discord',
+          instance_key: 'serial:58919',
+          share: 0.07,
+          active_ms: 5_700,
+        },
+      ],
+    },
     truthUsers: DISCORD_USERS.map((u) => ({ ...u })),
     // The memory graph (schema v7). Tier 3 is off, like the real daemon, and
     // the model IS installed — so the view's "turn it on" path is reachable
@@ -1552,6 +1576,121 @@ export function startMock({
       active: roomActive(),
       state: roomState(),
       device: state.room.device,
+    };
+  }
+
+  /// 0.12.2. `truth.status.audio`, including which Discord instance is muted
+  /// and why. The rule is mirrored rather than approximated, because the card
+  /// renders its output and a mock that decided differently would teach the
+  /// view a shape the daemon never sends:
+  ///
+  /// * a role of `other` is never muted, however sure the measurement is;
+  /// * a role of `bridge` is muted whenever streams are live;
+  /// * on `auto`, the highest share at or above the bar is the bridge's, and
+  ///   a share under the evidence bar is `null` rather than zero.
+  const SHARE_BAR = 0.85;
+  const SHARE_MARGIN = 0.1;
+  const MIN_ACTIVE_MS = 3_000;
+
+  function audioPayload() {
+    const live = state.truth.enabled ? 2 : 0;
+    return {
+      enabled: state.truth.enabled,
+      live,
+      live_s: 4.0,
+      idle_s: 10,
+      streams: [
+        {
+          user_id: '482913',
+          name: 'Aspen',
+          channel_id: 'c1',
+          session_id: 4213,
+          speaker_id: 2,
+          frames: 1_204,
+          quiet_ms: 120,
+          live: live > 0,
+        },
+        {
+          user_id: '771020',
+          name: 'Wren',
+          channel_id: 'c1',
+          session_id: 4214,
+          speaker_id: 5,
+          frames: 986,
+          quiet_ms: 340,
+          live: live > 0,
+        },
+      ],
+      counters: {
+        frames: 2_190,
+        samples: 17_520_000,
+        rejected: 0,
+        gaps: 1,
+        sessions_opened: 2,
+        sessions_closed: 0,
+        voices_minted: 1,
+        clock_skew: 0,
+      },
+      mute: mutePayload(live > 0),
+    };
+  }
+
+  function mutePayload(streamsLive) {
+    const rows = state.bridge.instances.map((i) => ({
+      ...i,
+      role: state.bridge.roles[i.source] ?? 'auto',
+      share: i.active_ms >= MIN_ACTIVE_MS ? i.share : null,
+    }));
+    // The winner needs the bar AND a clear margin over the runner-up, and it
+    // is not looked for at all once the user has named the bridge's client:
+    // there is one plugin, so there is one bridge.
+    const named = rows.some((r) => r.role === 'bridge');
+    const ranked = rows
+      .filter((r) => r.role === 'auto' && r.share != null)
+      .sort((a, b) => b.share - a.share || a.session_id - b.session_id);
+    const tooClose =
+      !named &&
+      ranked.length > 1 &&
+      ranked[0].share >= SHARE_BAR &&
+      ranked[0].share - ranked[1].share < SHARE_MARGIN;
+    const winner =
+      !named && !tooClose && ranked[0] && ranked[0].share >= SHARE_BAR ? ranked[0] : undefined;
+    const pct = (s) => `${Math.round(s * 100)}%`;
+    const instances = rows.map((r) => {
+      let muted = false;
+      let why = '';
+      if (r.role === 'other') {
+        why = 'you set this client to “not the bridge”, so it is never muted';
+      } else if (r.role === 'bridge') {
+        muted = streamsLive;
+        why = streamsLive
+          ? 'you set this client to “has the plugin”, and streams are live'
+          : 'you set this client to “has the plugin”; nothing is arriving, so it records as normal';
+      } else if (!streamsLive) {
+        why = 'no per-user stream is arriving; nothing is muted';
+      } else if (r.share == null) {
+        why = 'not enough evidence yet — recording, because a duplicate is cheaper than a lost call';
+      } else if (winner && winner.session_id === r.session_id) {
+        muted = true;
+        why = `${pct(r.share)} of this client's speech is explained by the per-user streams, so it is the bridge's client and is muted`;
+      } else if (named && r.share >= SHARE_BAR) {
+        why = `${pct(r.share)} matches the streams, but you have already said which client has the plugin — recording`;
+      } else if (tooClose) {
+        why = `${pct(r.share)} matches the streams, and so does another client — too close to call, so both keep recording; say which one has the plugin to settle it`;
+      } else {
+        why = `only ${pct(r.share)} of this client's speech is explained by the per-user streams, so it is a different call — recording`;
+      }
+      return { ...r, muted, why };
+    });
+    return {
+      share_bar: SHARE_BAR,
+      share_margin: SHARE_MARGIN,
+      window_s: 25.0,
+      min_active_s: MIN_ACTIVE_MS / 1000,
+      streams_live: streamsLive,
+      muted_sessions: instances.filter((i) => i.muted).map((i) => i.session_id),
+      instances,
+      roles: { ...state.bridge.roles },
     };
   }
 
@@ -2340,6 +2479,27 @@ export function startMock({
       return { match_key: s.match_key, allowed: s.allowed };
     },
 
+    // 0.12.2. Which Discord client carries the RecallBridge plugin, keyed on
+    // the source match key because that is what survives a relaunch.
+    'sources.instance_role'(params) {
+      const source = String(params?.source ?? '').trim();
+      if (!source) throw err('bad_params', 'source required');
+      const role = String(params?.role ?? '');
+      if (!['auto', 'bridge', 'other'].includes(role)) {
+        throw err('bad_params', 'role must be one of auto, bridge, other');
+      }
+      if (source === 'mic' || source === 'room' || source.startsWith('discord:')) {
+        throw err(
+          'refused',
+          'a bridge role says which Discord CLIENT carries the RecallBridge plugin; the microphones and the per-user streams are not clients and are never muted by this rule'
+        );
+      }
+      if (role === 'auto') delete state.bridge.roles[source];
+      else state.bridge.roles[source] = role;
+      emit('status', 'status', statusPayload());
+      return { source, role, persisted: true, roles: { ...state.bridge.roles } };
+    },
+
     'mic.get': () => ({ ...micPayload(), you_speaker: youSpeaker() }),
 
     'mic.set'(params) {
@@ -2420,6 +2580,7 @@ export function startMock({
       users: state.truthUsers.length,
       linked: state.truthUsers.filter((u) => u.speaker != null).length,
       counters: { speaking: 4821, voice: 96, rejected: 0 },
+      audio: audioPayload(),
     }),
 
     'truth.users': () => ({ users: state.truthUsers.map((u) => ({ ...u })) }),

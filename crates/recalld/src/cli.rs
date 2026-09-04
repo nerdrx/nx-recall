@@ -50,6 +50,31 @@ pub enum Command {
         match_key: String,
     },
 
+    /// Say which Discord client carries the RecallBridge plugin (0.12.2).
+    #[command(long_about = "\
+Say which Discord client carries the RecallBridge plugin.
+
+While per-user audio is arriving, the client the plugin is IN has to be muted
+for analysis or every sentence is transcribed twice. The daemon works out which
+one that is by itself — it is the client whose speech the per-user streams
+explain — and this command overrides that when it is wrong, or when a second
+client is running and you would rather not wait for the measurement.
+
+  recalld role vesktop bridge   # this one has the plugin: mute it
+  recalld role Discord other    # this one does not: never mute it
+  recalld role vesktop auto     # forget it, measure it again
+
+The key is the source match key `recalld sources` prints — the process binary,
+which is what survives a relaunch. A role set on a source with two copies of
+the same binary running speaks about both of them; leave those on `auto`.")]
+    Role {
+        #[arg(value_name = "MATCH_KEY")]
+        match_key: String,
+        /// `bridge`, `other`, or `auto`.
+        #[arg(value_name = "ROLE")]
+        role: String,
+    },
+
     /// Turn the microphone on or off, or ask what it is doing.
     // clap reflows a doc comment into paragraphs, which turns the example block
     // below into one long line. `long_about` is taken verbatim.

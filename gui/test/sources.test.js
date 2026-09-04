@@ -112,3 +112,66 @@ test('the chips are derived from the turns, not asserted beside them', async (t)
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// 0.12.2 — which Discord client is muted
+// ---------------------------------------------------------------------------
+//
+// The Sources card renders `truth.status.audio.mute` verbatim, so what this
+// guards is the mock agreeing with the daemon's rule rather than with itself:
+// a role of `other` is never muted however sure the measurement is, a role of
+// `bridge` is muted whenever streams are live, and `auto` mutes exactly one
+// instance — the one the streams explain.
+
+test('only one Discord client is muted, and it is the one the streams explain', async (t) => {
+  const c = await rig(t);
+  const mute = (await c.request('truth.status')).audio.mute;
+  assert.equal(mute.streams_live, true, 'the fixture has a call running');
+  assert.equal(mute.instances.length, 2, 'two clients, which is the whole point');
+
+  const by = (src) => mute.instances.find((i) => i.source === src);
+  assert.equal(by('vesktop').muted, true, 'the plugin’s own client');
+  assert.equal(by('Discord').muted, false, 'the other call keeps recording');
+  assert.ok(by('vesktop').share >= mute.share_bar);
+  assert.ok(by('Discord').share < mute.share_bar);
+  assert.deepEqual(mute.muted_sessions, [by('vesktop').session_id]);
+  assert.ok(by('Discord').why.includes('different call'));
+});
+
+test('a manual role acts in both directions and auto is not a stored state', async (t) => {
+  const c = await rig(t);
+  const read = async (src) =>
+    (await c.request('truth.status')).audio.mute.instances.find((i) => i.source === src);
+
+  // The user says the rule has it backwards. Both states must act.
+  await c.request('sources.instance_role', { source: 'vesktop', role: 'other' });
+  await c.request('sources.instance_role', { source: 'Discord', role: 'bridge' });
+  assert.equal((await read('vesktop')).muted, false, '`other` is never muted');
+  assert.equal((await read('Discord')).muted, true, '`bridge` needs no evidence');
+  assert.ok((await read('vesktop')).why.includes('not the bridge'));
+
+  const roles = (await c.request('truth.status')).audio.mute.roles;
+  assert.deepEqual(roles, { vesktop: 'other', Discord: 'bridge' });
+
+  // Back to auto: the override is removed, not stored as a third value.
+  await c.request('sources.instance_role', { source: 'vesktop', role: 'auto' });
+  await c.request('sources.instance_role', { source: 'Discord', role: 'auto' });
+  assert.deepEqual((await c.request('truth.status')).audio.mute.roles, {});
+  assert.equal((await read('vesktop')).muted, true, 'the measurement is back');
+  assert.equal((await read('Discord')).muted, false);
+});
+
+test('the microphones are never bridge roles', async (t) => {
+  const c = await rig(t);
+  for (const key of ['mic', 'room', 'discord:12345']) {
+    await assert.rejects(
+      () => c.request('sources.instance_role', { source: key, role: 'bridge' }),
+      /not clients/,
+      key
+    );
+  }
+  await assert.rejects(
+    () => c.request('sources.instance_role', { source: 'vesktop', role: 'brdige' }),
+    /auto, bridge, other/
+  );
+});

@@ -421,6 +421,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.11.8 | +125h | the identifier is asked about one-second turns (its own knob, split from the arbiter's floor); a turn it hears as French is re-read by the night shift's decoder forced to French, +62% at one second with nothing made worse; the cheap local backend measured worse than doing nothing on every language and rejected; Spanish and Italian routable but off until their rows are collected; the Discord ingest's 413 now reaches the client instead of a reset |
 | 0.12.0 | +130h | the data round, measured on the archive's own record: identity scored on the mean of a voice's three best prototypes and a stale whitening taken back (held out: 96.7% → 98.8% precision, 82.6% → 93.0% recall, no new model); per-voice thresholds and a 0.06 overlap gate learned from Discord's verdicts; `truth label` names the 168 turns Discord can name and refuses two guards that read a second Discord client wrong; `lang sweep` tags the short rows the old floor skipped and never touches a word; the audio route stops rewriting your own back-channels into kanji (declared languages count, fillers are never routed, weak decodes are refused, three identifier windows must agree) and `lang unroute` restores the 45 rows it got wrong; per-person highlights, a colour and an icon, on every surface down to the caption bar; the translator no longer retries a line it can never read |
 | 0.12.1 | +131h | the audible rule: your own account is not present on Discord audio, so 1,341 turns that were called overlap were single-speaker all along and the daemon re-judges them on first start; the overlap gate re-measured on the corrected record and kept; the archive sweep reports itself finished; experimental per-user Discord audio: Vesktop hands the bridge every remote user's stream, each becomes its own source with its speaker known by construction, the mixed tap goes quiet while they arrive, off by default |
+| 0.12.2 | +132h | the mute aims at one Discord client instead of at Discord: with two clients running, only the one whose speech the per-user streams explain goes quiet and the other call keeps recording — 108 right, 36 declined, 0 wrong over 144 synthetic two-call timelines, every guard failing towards recording — plus a per-source override (`bridge`/`other`/`auto`) in the Sources card, `recalld role`, and `truth.status` saying which client is muted and why |
 
 ## Quickstart
 
@@ -454,6 +455,18 @@ because taking everybody's voice out of the client is a larger claim than the
 speaking timestamps the rest of the bridge sends; the Discord desktop client
 cannot do it at all, and says so instead of looking enabled. See PROTOCOL,
 "0.12.1 — per-user Discord audio".
+
+If you run **two Discord clients** — the plugin's one and another, in another
+call — only the plugin's one is muted. Recall works out which by asking, over a
+rolling half-minute, whose speech the per-user streams actually explain; until
+it has enough evidence, or when two busy calls look alike, it mutes nothing and
+records both, because a sentence transcribed twice is a nuisance and a call
+nobody recorded is gone. You can also just tell it: the Sources card lists every
+Discord client it has heard with a three-way control, and `recalld role vesktop
+bridge` / `recalld role Discord other` does the same from a terminal. A client
+you mark "no plugin" is never muted, whatever the measurement thinks. See
+PROTOCOL, "0.12.2 — the mute aims at one client, not at Discord", and FINDINGS
+§37 for the numbers.
 
 Orbit integration is deliberately one-way and manual:
 Recall may read Orbit's name-picker once; **nothing ever flows back**. Orbit's

@@ -1854,6 +1854,25 @@ impl Store {
             .optional()?)
     }
 
+    /// Which *copy* of the application this session was opened for (v14):
+    /// `serial:<object.serial>`, `pid:<pid>`, or NULL for a session opened
+    /// before v14 or by a node that advertised neither.
+    ///
+    /// NULL is not "instance one". 0.12.2's mute reads this to say *which*
+    /// client it silenced, and a row that cannot say is shown as unknown
+    /// rather than folded in with the others.
+    pub fn session_instance_key(&self, session_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT instance_key FROM sessions WHERE id = ?1",
+                params![session_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Mirror a config rule into the DB so `sources` can show it.
     pub fn set_allowed(&self, match_key: &str, allowed: bool, first_seen: i64) -> Result<()> {
         self.conn.execute(
