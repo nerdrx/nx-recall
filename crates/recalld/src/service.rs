@@ -4807,7 +4807,13 @@ impl Service {
         }
         let apply = req.params["apply"].as_bool().unwrap_or(false);
         let now = crate::clock::utc_now_ns();
-        Ok(crate::identity_learn::repair_prototypes(&self.store(), apply, now)?.to_json())
+        Ok(crate::identity_learn::repair_prototypes(
+            &self.store(),
+            &self.control.identity,
+            apply,
+            now,
+        )?
+        .to_json())
     }
     // ---- end 0.9.0 --------------------------------------------------------
 }

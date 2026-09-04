@@ -4431,7 +4431,7 @@ fn cmd_identity(cfg: &Config, data_dir: &Path, action: Option<IdentityAction>) -
             limit,
         } => match (foreign, prototypes) {
             (true, _) => cmd_identity_repair_foreign(cfg, data_dir, apply, limit),
-            (_, true) => cmd_identity_repair_prototypes(data_dir, apply),
+            (_, true) => cmd_identity_repair_prototypes(cfg, data_dir, apply),
             _ => {
                 println!(
                     "`identity repair` needs --foreign or --prototypes. Naming what it \
@@ -4581,8 +4581,67 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
             s,
         );
     }
-    if let Some((a, s)) = &report.aggregate {
-        row(&format!("+ scoring a voice by {}", a.as_str()), s);
+
+    // Every rule for turning a voice's prototypes into one score, each one on
+    // the global bar and on the bars it earns for itself. A bar is a number on
+    // a score scale and the aggregate IS the scale, so the second row is the
+    // one that describes what installing that rule would do (FINDINGS §45).
+    if !report.aggregates.is_empty() {
+        println!("\nhow a voice's prototypes become one score");
+        println!(
+            "  {:<28}{:>5}{:>9}{:>7}{:>10}{:>11}{:>9}{:>8}",
+            "arm", "n", "correct", "wrong", "declined", "precision", "recall", "F-0.5"
+        );
+        for arm in &report.aggregates {
+            let mark = if arm.incumbent { "  <- installed" } else { "" };
+            row(&format!("{}, global bar", arm.rule.as_str()), &arm.globals);
+            println!(
+                "{}",
+                format_args!(
+                    "  {:<28}{:>5}{:>9}{:>7}{:>10}{:>11}{:>9}{:>8.3}{mark}",
+                    format!("{}, bars refit for it", arm.rule.as_str()),
+                    arm.fitted.n,
+                    arm.fitted.correct,
+                    arm.fitted.wrong,
+                    arm.fitted.declined,
+                    if arm.fitted.precision().is_nan() {
+                        "—".to_string()
+                    } else {
+                        format!("{:.1}%", arm.fitted.precision() * 100.0)
+                    },
+                    if arm.fitted.recall().is_nan() {
+                        "—".to_string()
+                    } else {
+                        format!("{:.1}%", arm.fitted.recall() * 100.0)
+                    },
+                    arm.fitted.f_beta(recalld::calib::BETA),
+                )
+            );
+        }
+        if let Some((a, _)) = &report.aggregate {
+            let bars = report
+                .aggregate_thresholds
+                .iter()
+                .map(|v| {
+                    format!(
+                        "{} {:.2}/{:.2}",
+                        name_of(v.speaker_id),
+                        v.threshold,
+                        v.margin
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  best challenger: {} — installing it writes {}",
+                a.as_str(),
+                if bars.is_empty() {
+                    "no per-voice bar; every voice on the global".to_string()
+                } else {
+                    bars
+                }
+            );
+        }
     }
     println!(
         "\n  thresholds: {}",
@@ -4663,7 +4722,11 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
                 ""
             },
             match (&report.aggregate, report.aggregate_swap) {
-                (Some((a, _)), true) => format!(", a voice is now scored by {}", a.as_str()),
+                (Some((a, _)), true) => format!(
+                    ", a voice is now scored by {} with the {} bar(s) refit for it",
+                    a.as_str(),
+                    report.aggregate_thresholds.len()
+                ),
                 _ => String::new(),
             }
         );
@@ -4679,10 +4742,12 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
 
 /// The one repair that is a correctness fix rather than an operating point:
 /// throwing out a prototype that is a recording of somebody else.
-fn cmd_identity_repair_prototypes(data_dir: &Path, apply: bool) -> Result<()> {
+fn cmd_identity_repair_prototypes(cfg: &Config, data_dir: &Path, apply: bool) -> Result<()> {
     let store = Store::open(data_dir)?;
     let now = recalld::clock::utc_now_ns();
-    let report = recalld::identity_learn::repair_prototypes(&store, apply, now)?;
+    // The install's operating point, not the crate's: a before/after table
+    // measured at a `max_overlap` nobody is running describes nobody's machine.
+    let report = recalld::identity_learn::repair_prototypes(&store, &cfg.identity, apply, now)?;
 
     if let Some(note) = &report.note {
         println!("{note}.");

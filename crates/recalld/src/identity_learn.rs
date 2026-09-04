@@ -68,6 +68,28 @@ fn whitening_grid() -> Vec<Whitening> {
     out
 }
 
+/// One prototype-aggregate arm, measured the two ways that matter (0.12.3).
+///
+/// A rule and a threshold are not independent choices: a bar is a number on a
+/// score scale, and the aggregate *is* the scale. Comparing a top-3 mean
+/// against bars fitted under max measures the scale and not the rule — §36's
+/// error, in the one place §32 left it. So every arm carries both its score
+/// under the global bar and its score under bars refit for **it**, and the
+/// installation gate reads the second.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateArm {
+    pub rule: calib::Aggregate,
+    /// Held out with every voice on the global bar.
+    pub globals: Score,
+    /// Held out with per-voice thresholds fitted on the fit split under this
+    /// rule. Equal to `globals` when the fit proposes nothing.
+    pub fitted: Score,
+    /// The thresholds behind `fitted`, and what an install of this rule writes.
+    pub thresholds: Vec<VoiceThreshold>,
+    /// Is this the rule the box is running right now?
+    pub incumbent: bool,
+}
+
 /// What one calibration run found, whether or not it wrote anything.
 #[derive(Debug, Clone, Default)]
 pub struct Report {
@@ -91,9 +113,17 @@ pub struct Report {
     /// held-out numbers did not re-earn it, so it was taken back (0.12.0).
     pub projection_cleared: bool,
     /// The best prototype-aggregate arm and what it scored held out (0.12.0).
+    /// The score is the arm's **fitted** one: the operating point an install
+    /// would actually put the box on.
     pub aggregate: Option<(calib::Aggregate, Score)>,
     pub aggregate_installed: calib::Aggregate,
     pub aggregate_swap: bool,
+    /// Every aggregate arm, incumbent included, measured under the global bar
+    /// and under bars refit for it (0.12.3).
+    pub aggregates: Vec<AggregateArm>,
+    /// The winning arm's own thresholds — installed with it, because the pair
+    /// is what the gate approved.
+    pub aggregate_thresholds: Vec<VoiceThreshold>,
     /// Did the threshold proposal clear the gate?
     pub thresholds_swap: bool,
     pub projection_swap: bool,
@@ -119,14 +149,7 @@ impl Report {
             "per_voice": self.per_voice.iter().map(|(s, f, e)| json!({
                 "speaker": s, "fit": f, "held_out": e,
             })).collect::<Vec<_>>(),
-            "proposed": self.proposed.iter().map(|v| json!({
-                "speaker": v.speaker_id,
-                "threshold": v.threshold,
-                "margin": v.margin,
-                "n": v.n,
-                "f_beta": v.f_beta,
-                "f_beta_global": v.f_beta_global,
-            })).collect::<Vec<_>>(),
+            "proposed": self.proposed.iter().map(threshold_json).collect::<Vec<_>>(),
             "installed": self.installed.iter().map(|(s, t, m, n)| json!({
                 "speaker": s, "threshold": t, "margin": m, "n": n,
             })).collect::<Vec<_>>(),
@@ -146,6 +169,15 @@ impl Report {
             })),
             "aggregate_installed": self.aggregate_installed.as_str(),
             "aggregate_swap": self.aggregate_swap,
+            "aggregates": self.aggregates.iter().map(|a| json!({
+                "rule": a.rule.as_str(),
+                "incumbent": a.incumbent,
+                "globals": score_json(&a.globals),
+                "fitted": score_json(&a.fitted),
+                "thresholds": a.thresholds.iter().map(threshold_json).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "aggregate_thresholds": self.aggregate_thresholds.iter()
+                .map(threshold_json).collect::<Vec<_>>(),
             "thresholds_swap": self.thresholds_swap,
             "projection_swap": self.projection_swap,
             "gate": {
@@ -158,6 +190,17 @@ impl Report {
             "note": self.note,
         })
     }
+}
+
+fn threshold_json(v: &VoiceThreshold) -> Value {
+    json!({
+        "speaker": v.speaker_id,
+        "threshold": v.threshold,
+        "margin": v.margin,
+        "n": v.n,
+        "f_beta": v.f_beta,
+        "f_beta_global": v.f_beta_global,
+    })
 }
 
 fn score_json(s: &Score) -> Value {
@@ -462,27 +505,87 @@ pub fn calibrate(
     // held-out rows exactly as the incumbent is. No hyperparameter search, so
     // no inner split — the grid IS the arms, and every one of them is judged
     // on the same rows by the same gate.
+    //
+    // Two things 0.12.3 changed, both of them corrections rather than features
+    // (§45):
+    //
+    // * **Every arm refits its own thresholds.** A bar is a number on a score
+    //   scale and the aggregate *is* the scale, so scoring a top-3 mean against
+    //   bars fitted under max measures the scale and not the rule. That is §36's
+    //   error, and it was still here: the arms were compared under the globals
+    //   while the box ran per-voice bars, and on the live install the two
+    //   comparisons do not agree.
+    // * **The incumbent is an arm too.** The loop used to `continue` past the
+    //   installed rule, so its own operating point was never in the table the
+    //   report prints, and the thing the winner was compared against was the
+    //   globals row rather than what the box is actually doing.
     {
-        let mut best: Option<(calib::Aggregate, Score)> = None;
-        for a in calib::aggregate_grid() {
-            if a == base_agg {
-                continue;
-            }
-            let s = judge(cfg, &globals, &bank, &eval, None, you, a)?;
-            if best
-                .as_ref()
-                .is_none_or(|(_, b)| s.f_beta(calib::BETA) > b.f_beta(calib::BETA))
-            {
-                best = Some((a, s));
-            }
+        let mut arms: Vec<AggregateArm> = Vec::new();
+        let mut grid = calib::aggregate_grid();
+        if !grid.contains(&base_agg) {
+            grid.insert(0, base_agg);
         }
-        if let Some((a, s)) = best {
-            report.aggregate_swap = calib::may_install(&report.baseline, &s);
-            report.aggregate = Some((a, s));
+        for a in grid {
+            let (g, f, thresholds) = if a == base_agg {
+                // Step 1 measured exactly this pair. Re-deriving it would be a
+                // second answer to one question.
+                (report.baseline, report.candidate, report.proposed.clone())
+            } else {
+                let obs: Vec<Obs> = fit
+                    .iter()
+                    .filter(|r| crate::identity::gate(cfg, r.overlap_frac, r.duration_s).is_none())
+                    .filter_map(|r| {
+                        replay(cfg, &globals, &bank, r, None, a)
+                            .ok()
+                            .and_then(|x| x.1)
+                    })
+                    .collect();
+                let props =
+                    calib::fit_thresholds(&obs, MIN_ROWS_PER_VOICE, THRESHOLD_BOUNDS, global);
+                let mut t = Thresholds::global(global.0, global.1);
+                for v in &props {
+                    t.insert(v.speaker_id, v.threshold, v.margin);
+                }
+                (
+                    judge(cfg, &globals, &bank, &eval, None, you, a)?,
+                    judge(cfg, &t, &bank, &eval, None, you, a)?,
+                    props,
+                )
+            };
+            arms.push(AggregateArm {
+                rule: a,
+                globals: g,
+                fitted: f,
+                thresholds,
+                incumbent: a == base_agg,
+            });
+        }
+        // The comparison that decides: the challenger's own operating point
+        // against the incumbent's own operating point.
+        let incumbent = arms
+            .iter()
+            .find(|x| x.incumbent)
+            .map(|x| x.fitted)
+            .unwrap_or(report.baseline);
+        let best = arms
+            .iter()
+            .filter(|x| !x.incumbent)
+            .max_by(|x, y| {
+                x.fitted
+                    .f_beta(calib::BETA)
+                    .partial_cmp(&y.fitted.f_beta(calib::BETA))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned();
+        if let Some(b) = best {
+            report.aggregate_swap = calib::may_install(&incumbent, &b.fitted);
+            report.aggregate = Some((b.rule, b.fitted));
+            report.aggregate_thresholds = b.thresholds.clone();
             if apply && report.aggregate_swap {
-                store.set_learned_aggregate(a)?;
+                store.set_learned_aggregate(b.rule)?;
             }
         }
+        report.aggregates = arms;
     }
 
     // ---- write, if the gate said so --------------------------------------
@@ -492,11 +595,28 @@ pub fn calibrate(
         // Every learned bar in the table was fitted against the *old* rule for
         // turning a voice's prototypes into one score, and against the new one
         // it means something nobody measured — 0.41 under max cosine and 0.41
-        // under a top-3 mean are not the same operating point. So they go, and
-        // the proposals this run made under the old rule go with them: the next
-        // pass refits under the rule that is now installed. One run changes the
-        // scale, the next one calibrates to it.
+        // under a top-3 mean are not the same operating point. So they go.
+        //
+        // Until 0.12.3 that was the whole rule, and the next pass refitted:
+        // one run changed the scale, the next calibrated to it. The gap was
+        // real. What the gate approves is a **pair** — this rule with these
+        // bars, measured together on the held-out rows — and installing half
+        // of it left the box on an operating point nothing had measured until
+        // the following evening. The winning arm now brings its own thresholds
+        // with it, and they are the ones the gate read (§45).
         report.cleared = store.clear_learned_thresholds(None)?;
+        for v in &report.aggregate_thresholds {
+            if store.set_learned_threshold(
+                v.speaker_id,
+                v.threshold,
+                v.margin,
+                truth_via::LEARNED,
+                v.n as i64,
+                now_utc_ns,
+            )? {
+                report.written += 1;
+            }
+        }
     } else if apply && report.thresholds_swap {
         let keep: Vec<i64> = report.proposed.iter().map(|v| v.speaker_id).collect();
         // Every voice not in the proposal goes back to the global. A learned
@@ -605,7 +725,12 @@ impl RepairReport {
 ///
 /// The before/after table is measured anyway and printed, because a command
 /// that deletes from the voicebank is not allowed to be a leap of faith.
-pub fn repair_prototypes(store: &Store, apply: bool, now_utc_ns: i64) -> Result<RepairReport> {
+pub fn repair_prototypes(
+    store: &Store,
+    cfg: &IdentityConfig,
+    apply: bool,
+    now_utc_ns: i64,
+) -> Result<RepairReport> {
     let mut report = RepairReport::default();
     let rows = store.truth_calibration_rows(MIN_DURATION_S)?;
     let Some(model_id) = rows
@@ -619,7 +744,9 @@ pub fn repair_prototypes(store: &Store, apply: bool, now_utc_ns: i64) -> Result<
     report.condemned = store.condemned_prototypes(&model_id)?;
 
     // Measure before deleting, so a preview and an apply print the same table.
-    let cfg = IdentityConfig::default();
+    // The operating point is the *install's*, not the crate defaults: this
+    // install's `max_overlap` is 0.06 against a default of 0.1, and a table
+    // measured at the default describes a machine nobody is running (§45).
     let you = store.you_speaker_id()?;
     let bank: Bank = store.prototypes_with_source(&model_id)?;
     let agg = store.learned_aggregate()?;
@@ -644,8 +771,8 @@ pub fn repair_prototypes(store: &Store, apply: bool, now_utc_ns: i64) -> Result<
             .filter(|r| !consumed.contains(&r.segment_id))
             .collect();
         let repaired: Bank = store.prototypes_with_source_excluding(&model_id, &doomed)?;
-        let before = judge(&cfg, &thresholds, &bank, &eval, None, you, agg)?;
-        let after = judge(&cfg, &thresholds, &repaired, &eval, None, you, agg)?;
+        let before = judge(cfg, &thresholds, &bank, &eval, None, you, agg)?;
+        let after = judge(cfg, &thresholds, &repaired, &eval, None, you, agg)?;
         report.measured = Some((before, after));
     } else {
         report.note = Some("not enough truth to hold anything out".into());
@@ -1087,7 +1214,8 @@ mod tests {
     fn changing_the_scoring_rule_takes_back_thresholds_fitted_on_the_old_scale() {
         // 0.41 under max cosine and 0.41 under a top-3 mean are not the same
         // operating point. A run that moves the scale must not leave numbers
-        // behind that were measured against the other one.
+        // behind that were measured against the other one — every bar the box
+        // ends up with has to have been fitted under the rule it ends up with.
         let s = a_store_with_a_lucky_prototype(60);
         let a = s.mint_speaker(0).unwrap();
         s.set_learned_threshold(a, 0.44, 0.02, truth_via::LEARNED, 90, 1)
@@ -1096,8 +1224,26 @@ mod tests {
         let r = calibrate(&s, &IdentityConfig::default(), true, 3).unwrap();
         assert!(r.aggregate_swap);
         assert!(r.cleared >= 1);
-        assert_eq!(r.written, 0, "nothing fitted on the old scale is kept");
-        assert!(s.learned_thresholds().unwrap().is_empty());
+        let stray_survived = s
+            .learned_thresholds()
+            .unwrap()
+            .iter()
+            .any(|l| l.speaker_id == a);
+        assert!(
+            !stray_survived,
+            "a bar fitted on the old scale must not stay"
+        );
+        // Whatever IS installed came from the winning arm's own refit, which is
+        // the pair the held-out gate approved.
+        let refit: Vec<i64> = r
+            .aggregate_thresholds
+            .iter()
+            .map(|v| v.speaker_id)
+            .collect();
+        for l in s.learned_thresholds().unwrap() {
+            assert!(refit.contains(&l.speaker_id), "{l:?} was not refit");
+        }
+        assert_eq!(r.written, refit.len());
 
         // And the next run calibrates to the rule that is now installed.
         let again = calibrate(&s, &IdentityConfig::default(), true, 4).unwrap();
@@ -1106,6 +1252,284 @@ mod tests {
             s.learned_aggregate().unwrap(),
             crate::calib::Aggregate::TopK(_)
         ));
+    }
+
+    // ---- 0.12.3: every aggregate, with thresholds refit for it -------------
+
+    #[test]
+    fn every_aggregate_is_measured_both_ways_including_the_installed_one() {
+        // The pass used to measure the other rules under the global bar only,
+        // and to skip the incumbent entirely. Both halves were a scale error
+        // waiting to happen (§36): a bar fitted under max is not the same
+        // operating point under a top-3 mean, and an incumbent nothing measures
+        // cannot be compared with anything.
+        let s = a_store_with_a_lucky_prototype(60);
+        let r = calibrate(&s, &IdentityConfig::default(), false, 1).unwrap();
+        let rules: Vec<String> = r.aggregates.iter().map(|a| a.rule.as_str()).collect();
+        assert_eq!(rules, vec!["max", "top-2", "top-3", "top-4", "top-5"]);
+        assert_eq!(
+            r.aggregates.iter().filter(|a| a.incumbent).count(),
+            1,
+            "exactly one arm is what the box runs"
+        );
+        for arm in &r.aggregates {
+            assert_eq!(arm.globals.n, r.baseline.n, "{} globals", arm.rule.as_str());
+            assert_eq!(arm.fitted.n, r.baseline.n, "{} fitted", arm.rule.as_str());
+        }
+        // The incumbent's two rows ARE step 1's two rows: one measurement, not
+        // two that could disagree.
+        let inc = r.aggregates.iter().find(|a| a.incumbent).unwrap();
+        assert_eq!(inc.globals, r.baseline);
+        assert_eq!(inc.fitted, r.candidate);
+    }
+
+    #[test]
+    fn an_aggregate_is_judged_on_the_operating_point_it_would_install() {
+        // What the gate compares is (rule + the bars fitted for that rule)
+        // against (the installed rule + the bars fitted for *it*) — never a
+        // candidate's score against the incumbent's bars, which is §36's error.
+        let s = a_store_with_a_lucky_prototype(60);
+        let r = calibrate(&s, &IdentityConfig::default(), false, 1).unwrap();
+        let (rule, score) = r.aggregate.expect("an arm was measured");
+        let arm = r
+            .aggregates
+            .iter()
+            .find(|a| a.rule == rule)
+            .expect("the winner is in the table");
+        assert_eq!(arm.fitted, score, "the reported score is the fitted one");
+        assert_eq!(arm.thresholds, r.aggregate_thresholds);
+        assert!(!arm.incumbent);
+        // And the winner is the best fitted arm among the challengers.
+        let best = r
+            .aggregates
+            .iter()
+            .filter(|a| !a.incumbent)
+            .map(|a| a.fitted.f_beta(calib::BETA))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((score.f_beta(calib::BETA) - best).abs() < 1e-12);
+    }
+
+    /// A store shaped like the live box of 2026-09-04 22:00: a **phantom
+    /// voice** minted from one person's own turns, holding three tight
+    /// prototypes of them, while that person's own bank is one good prototype
+    /// and two vectors merged in from elsewhere that match nobody (§44.3).
+    ///
+    /// Max asks "could this be them?" and A's one good prototype answers yes.
+    /// A top-3 mean asks A's whole record and the record is mostly junk, so the
+    /// phantom — whose three prototypes all agree — wins A's turns. This is the
+    /// case where the *generous* rule is the right one, and the pass has to be
+    /// able to say so and take a top-k back.
+    fn a_store_with_a_phantom_voice(per_person: usize) -> Store {
+        let s = Store::open_in_memory().unwrap();
+        let src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let sec = 1_000_000_000i64;
+        let at = |deg: f64| -> Embedding {
+            let r = deg.to_radians();
+            Embedding::new("m@1", vec![r.cos() as f32, r.sin() as f32])
+        };
+        let a = s.mint_speaker(0).unwrap();
+        let b = s.mint_speaker(0).unwrap();
+        let phantom = s.mint_speaker(0).unwrap();
+        for (u, sp) in [("ua", a), ("ub", b)] {
+            s.upsert_discord_user(u, u, 0).unwrap();
+            s.set_discord_link(u, Some(sp), Some(truth_via::MANUAL), 0)
+                .unwrap();
+        }
+        // A talks at 0 degrees. One prototype of A is right beside that; the
+        // other two came in through a merge and are nowhere near it.
+        for d in [1.0, 80.0, 85.0] {
+            s.add_prototype(a, &at(d), None, false, 20, 0).unwrap();
+        }
+        // The phantom is three recordings of A, filed under a voice of its own.
+        for d in [2.0, 3.0, 4.0] {
+            s.add_prototype(phantom, &at(d), None, false, 20, 0)
+                .unwrap();
+        }
+        for d in [89.0, 91.0, 92.0] {
+            s.add_prototype(b, &at(d), None, false, 20, 0).unwrap();
+        }
+        for k in 0..per_person {
+            for (user, deg) in [("ua", 0.0), ("ub", 90.0)] {
+                let t = ((k * 2) as i64 + i64::from(user == "ub") + 1) * 10 * sec;
+                let seg = s.insert_segment(sess, t, t + 5 * sec, "a.wav", 0).unwrap();
+                s.store_embedding(seg, &at(deg + (k % 5) as f64 * 0.05))
+                    .unwrap();
+                s.set_segment_truth(seg, Some(user), truth_verdict::SINGLE, Some(0.95))
+                    .unwrap();
+            }
+        }
+        s
+    }
+
+    /// A store where the two comparisons **disagree**, which is the whole
+    /// reason the arms refit.
+    ///
+    /// An unlinked imposter takes every one of B's turns under max cosine, and
+    /// takes them cleanly: one bar on that one voice turns seventy wrong names
+    /// into seventy declines. Under a top-2 mean the imposter loses B's first
+    /// group and keeps the second, so it tops too few rows for a bar to be
+    /// fitted at all and the wrong names stay.
+    ///
+    /// Read off the **global** bar, top-2 is far ahead — 0.77 against 0.46 —
+    /// and the pass that only ever measured the globals installed it. Read off
+    /// each rule's own operating point, max is ahead at 0.81 and top-2 costs
+    /// precision. The second reading is the one that describes the box.
+    fn a_store_where_the_globals_and_the_bars_disagree() -> Store {
+        let s = Store::open_in_memory().unwrap();
+        let src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let sec = 1_000_000_000i64;
+        // Three orthogonal directions, so a prototype's cosine to each group of
+        // turns is just its coordinate and the arithmetic above is exact.
+        let at = |x: f32, y: f32, z: f32| -> Embedding {
+            let slack = (1.0 - x * x - y * y - z * z).max(0.0).sqrt();
+            Embedding::new("m@1", vec![x, y, z, slack])
+        };
+        let a = s.mint_speaker(0).unwrap();
+        let b = s.mint_speaker(0).unwrap();
+        let imposter = s.mint_speaker(0).unwrap();
+        for (u, sp) in [("ua", a), ("ub", b)] {
+            s.upsert_discord_user(u, u, 0).unwrap();
+            s.set_discord_link(u, Some(sp), Some(truth_via::MANUAL), 0)
+                .unwrap();
+        }
+        s.add_prototype(a, &at(0.0, 0.0, 1.0), None, false, 20, 0)
+            .unwrap();
+        // B's two prototypes are close together on its first group of turns and
+        // both weak on the second.
+        s.add_prototype(b, &at(0.40, 0.30, 0.0), None, false, 20, 0)
+            .unwrap();
+        s.add_prototype(b, &at(0.38, 0.29, 0.0), None, false, 20, 0)
+            .unwrap();
+        // The imposter's best prototype beats both of B's on both groups; its
+        // second is a dud on the first group and strong on the second.
+        s.add_prototype(imposter, &at(0.42, 0.42, 0.0), None, false, 20, 0)
+            .unwrap();
+        s.add_prototype(imposter, &at(0.10, 0.36, 0.0), None, false, 20, 0)
+            .unwrap();
+
+        // Six of A's turns, four of B's first group and three of its second,
+        // repeating — so the chronological split sees the same mixture on both
+        // sides of the cut.
+        let pattern = [
+            ("ua", 0),
+            ("ub", 1),
+            ("ua", 0),
+            ("ub", 2),
+            ("ua", 0),
+            ("ub", 1),
+            ("ua", 0),
+            ("ub", 2),
+            ("ua", 0),
+            ("ub", 1),
+            ("ua", 0),
+            ("ub", 2),
+            ("ub", 1),
+        ];
+        for k in 0..130usize {
+            let (user, group) = pattern[k % pattern.len()];
+            let t = (k as i64 + 1) * 10 * sec;
+            let seg = s.insert_segment(sess, t, t + 5 * sec, "a.wav", 0).unwrap();
+            let v = match group {
+                0 => at(0.0, 0.0, 1.0),
+                1 => at(1.0, 0.0, 0.0),
+                _ => at(0.0, 1.0, 0.0),
+            };
+            s.store_embedding(seg, &v).unwrap();
+            s.set_segment_truth(seg, Some(user), truth_verdict::SINGLE, Some(0.95))
+                .unwrap();
+        }
+        s
+    }
+
+    #[test]
+    fn a_rule_that_only_wins_on_the_global_bar_is_not_installed() {
+        // The failure this round exists to stop. Under the global bar the
+        // challenger is far ahead; under the bars each rule earns for itself
+        // the incumbent is ahead and the challenger costs precision. The gate
+        // reads the second, so nothing moves.
+        let s = a_store_where_the_globals_and_the_bars_disagree();
+        let r = calibrate(&s, &IdentityConfig::default(), true, 3).unwrap();
+
+        let inc = r.aggregates.iter().find(|x| x.incumbent).unwrap();
+        assert_eq!(inc.rule, crate::calib::Aggregate::Max);
+        let top2 = r
+            .aggregates
+            .iter()
+            .find(|x| x.rule == crate::calib::Aggregate::TopK(2))
+            .unwrap();
+        assert!(
+            top2.globals.f_beta(calib::BETA) > inc.globals.f_beta(calib::BETA) + 0.05,
+            "the globals prefer top-2: {:?} vs {:?}",
+            top2.globals,
+            inc.globals
+        );
+        assert!(
+            inc.fitted.f_beta(calib::BETA) > top2.fitted.f_beta(calib::BETA),
+            "each rule on its own bars prefers max: {:?} vs {:?}",
+            inc.fitted,
+            top2.fitted
+        );
+        assert!(inc.fitted.precision() > top2.fitted.precision());
+        assert!(!inc.thresholds.is_empty(), "max earns a bar here");
+        assert!(
+            top2.thresholds.is_empty(),
+            "top-2 tops too few rows to fit one"
+        );
+
+        assert!(!r.aggregate_swap, "{:?}", r.aggregate);
+        assert_eq!(s.learned_aggregate().unwrap(), crate::calib::Aggregate::Max);
+    }
+
+    #[test]
+    fn the_pass_takes_back_a_top_k_the_corpus_no_longer_supports() {
+        // The half that did not exist: `aggregate_grid` was walked with the
+        // installed rule skipped, so a box that had learned `top-3` could move
+        // to another top-k but could never go home to max. On this fixture max
+        // is right and the top-k means are not, and the pass has to say so.
+        let s = a_store_with_a_phantom_voice(60);
+        s.set_learned_aggregate(crate::calib::Aggregate::TopK(3))
+            .unwrap();
+        let r = calibrate(&s, &IdentityConfig::default(), true, 9).unwrap();
+        assert!(r.aggregate_swap, "{:?}", r.aggregate);
+        assert_eq!(r.aggregate.unwrap().0, crate::calib::Aggregate::Max);
+        assert_eq!(
+            s.learned_aggregate().unwrap(),
+            crate::calib::Aggregate::Max,
+            "the box is back on the rule its own numbers support"
+        );
+        let ops = s.operations_of(OP, 10).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(ops[0].prior_state.contains("\"aggregates\""));
+    }
+
+    #[test]
+    fn installing_a_rule_installs_the_bars_that_were_measured_with_it() {
+        // The pair the gate approved is (rule, bars). Installing the rule and
+        // clearing the bars would put the box on an operating point nothing in
+        // this run measured, and leave it there until the next pass.
+        let s = a_store_where_the_globals_and_the_bars_disagree();
+        s.set_learned_aggregate(crate::calib::Aggregate::TopK(2))
+            .unwrap();
+        let r = calibrate(&s, &IdentityConfig::default(), true, 11).unwrap();
+        assert!(r.aggregate_swap);
+        assert_eq!(r.aggregate.unwrap().0, crate::calib::Aggregate::Max);
+        assert!(
+            !r.aggregate_thresholds.is_empty(),
+            "the winning rule earned a bar; it is half of what was approved"
+        );
+        let installed = s.learned_thresholds().unwrap();
+        assert_eq!(installed.len(), r.aggregate_thresholds.len());
+        for v in &r.aggregate_thresholds {
+            let row = installed
+                .iter()
+                .find(|l| l.speaker_id == v.speaker_id)
+                .unwrap_or_else(|| panic!("voice {} was measured but not written", v.speaker_id));
+            assert!((row.threshold - v.threshold).abs() < 1e-6);
+            assert_eq!(row.n, v.n as i64);
+            assert_eq!(row.via, truth_via::LEARNED);
+        }
     }
 
     #[test]
@@ -1151,7 +1575,7 @@ mod tests {
     #[test]
     fn a_repair_preview_names_the_prototype_and_deletes_nothing() {
         let (s, phantom, p) = a_store_with_a_wrong_prototype();
-        let r = repair_prototypes(&s, false, 1).unwrap();
+        let r = repair_prototypes(&s, &IdentityConfig::default(), false, 1).unwrap();
         assert_eq!(r.condemned.len(), 1, "{:?}", r.condemned);
         assert_eq!(r.condemned[0].prototype_id, p);
         assert_eq!(r.condemned[0].owner, phantom);
@@ -1163,16 +1587,38 @@ mod tests {
     #[test]
     fn a_repair_apply_removes_it_and_says_so_in_the_audit_trail() {
         let (s, phantom, _p) = a_store_with_a_wrong_prototype();
-        let r = repair_prototypes(&s, true, 5).unwrap();
+        let r = repair_prototypes(&s, &IdentityConfig::default(), true, 5).unwrap();
         assert_eq!(r.deleted, 1);
         assert!(s.speaker_prototypes(phantom, "m@1").unwrap().is_empty());
         let ops = s.operations_of(REPAIR_OP, 10).unwrap();
         assert_eq!(ops.len(), 1);
         assert!(ops[0].prior_state.contains("\"condemned\""));
         // Idempotent: the evidence is gone with the prototype.
-        let again = repair_prototypes(&s, true, 6).unwrap();
+        let again = repair_prototypes(&s, &IdentityConfig::default(), true, 6).unwrap();
         assert_eq!(again.deleted, 0);
         assert_eq!(s.operations_of(REPAIR_OP, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_repair_measures_at_the_installs_operating_point_not_the_defaults() {
+        // The table this command prints is the whole argument for a permanent
+        // deletion, and until 0.12.3 it was measured with `IdentityConfig::
+        // default()` — on the live box a `max_overlap` of 0.1 against the 0.06
+        // the daemon actually gates at. A number that describes nobody's
+        // machine is not evidence for deleting from this one.
+        let (s, _phantom, _p) = a_store_with_a_wrong_prototype();
+        let cfg = IdentityConfig {
+            // Longer than every turn in the fixture, so this gate refuses all.
+            min_duration_s: 6.0,
+            ..IdentityConfig::default()
+        };
+        let r = repair_prototypes(&s, &cfg, false, 1).unwrap();
+        let (before, after) = r.measured.expect("there was enough truth to measure");
+        assert_eq!(before.declined, before.n, "this gate refuses every turn");
+        assert_eq!(after.declined, after.n);
+        // And with the fixture's own operating point it names people again.
+        let d = repair_prototypes(&s, &IdentityConfig::default(), false, 1).unwrap();
+        assert!(d.measured.unwrap().0.declined < before.declined);
     }
 
     #[test]
@@ -1180,7 +1626,7 @@ mod tests {
         // The command is not allowed to be a leap of faith: it prints the same
         // before/after table `calibrate` does, measured the same way.
         let (s, _phantom, _p) = a_store_with_a_wrong_prototype();
-        let r = repair_prototypes(&s, false, 1).unwrap();
+        let r = repair_prototypes(&s, &IdentityConfig::default(), false, 1).unwrap();
         let (before, after) = r.measured.expect("there was enough truth to measure");
         assert_eq!(before.n, after.n, "the same held-out rows, both sides");
         assert!(after.wrong <= before.wrong);
