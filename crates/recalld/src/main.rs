@@ -3310,6 +3310,50 @@ fn cmd_truth(
             }
             Ok(())
         }
+        // ---- 0.12.1: per-user Discord audio --------------------------------
+        TruthAction::Audio { state } => {
+            let on = match state.trim().to_ascii_lowercase().as_str() {
+                "on" | "true" | "yes" => true,
+                "off" | "false" | "no" => false,
+                other => anyhow::bail!("say `on` or `off`, not {other:?}"),
+            };
+            let mut edited = Config::load(config_path)?;
+            edited.truth.audio = on;
+            edited.save(config_path)?;
+            if on {
+                // Said in the imperative, because every one of these is a step
+                // somebody will otherwise get halfway through and stop: the
+                // feature needs two switches and a token, and it is silent
+                // rather than broken when one of them is missing.
+                println!(
+                    "Per-user Discord audio ON\n  config: {}\n\n  \
+                     restart `recalld run` to apply, then in Vencord → Plugins →\n  \
+                     RecallBridge turn on \"Send each person's AUDIO as well\".\n  \
+                     Both switches are needed; both are off by default.\n\n  \
+                     Vesktop or the web client only — the Discord desktop client\n  \
+                     decodes voice in a native module and no plugin can reach it.\n\n  \
+                     While per-user streams are arriving the mixed Discord tap is\n  \
+                     muted, so nothing is transcribed twice.{}",
+                    config_path.display(),
+                    if edited.truth.enrol {
+                        ""
+                    } else {
+                        "\n\n  [truth] enrol is off, so these turns will be transcribed and\n  \
+                         named but will NOT teach the voicebank. `enrol = true` in the\n  \
+                         config if you want them to."
+                    }
+                );
+            } else {
+                println!(
+                    "Per-user Discord audio OFF\n  config: {}\n  \
+                     restart `recalld run` to apply. Frames that arrive anyway are\n  \
+                     refused and counted; the mixed Discord tap carries the call again.",
+                    config_path.display()
+                );
+            }
+            Ok(())
+        }
+        // ---- end 0.12.1 ----------------------------------------------------
         TruthAction::Users => {
             let a = call(cfg, data_dir, "truth.users", json!({}))?;
             let users = a["users"].as_array().cloned().unwrap_or_default();
@@ -3639,6 +3683,55 @@ fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
             "{:<20}`recalld truth label` lists them; --apply names them",
             ""
         );
+    }
+
+    // 0.12.1: per-user audio. Printed here rather than in its own command
+    // because this is the page somebody reads when they want to know whether
+    // the bridge is doing anything, and "the mixed tap is muted right now" is
+    // the single most surprising thing the daemon can be doing to a Discord
+    // recording.
+    if let Some(audio) = st["audio"].as_object() {
+        let on = audio["enabled"].as_bool().unwrap_or(false);
+        let live = audio["live"].as_i64().unwrap_or(0);
+        println!(
+            "\n{:<20}{}",
+            "per-user audio",
+            if on {
+                "ON"
+            } else {
+                "OFF — `recalld truth audio on` (Vesktop only)"
+            }
+        );
+        if on {
+            println!(
+                "{:<20}{live} live stream(s){}",
+                "  streams",
+                if live > 0 {
+                    " — the mixed Discord tap is muted while they arrive"
+                } else {
+                    " — nothing arriving; Discord is recorded off the speakers"
+                }
+            );
+            for s in audio["streams"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{:<20}{:<20} {} frame(s), {} ms quiet",
+                    "",
+                    s["name"].as_str().unwrap_or("—"),
+                    s["frames"].as_i64().unwrap_or(0),
+                    s["quiet_ms"].as_i64().unwrap_or(0),
+                );
+            }
+            let c = &audio["counters"];
+            let n = |k: &str| c[k].as_i64().unwrap_or(0);
+            println!(
+                "{:<20}{} taken, {} refused, {} gap(s), {} voice(s) minted",
+                "  frames",
+                n("frames"),
+                n("rejected"),
+                n("gaps"),
+                n("voices_minted"),
+            );
+        }
     }
 
     let id = &a["identity"];

@@ -3969,6 +3969,14 @@ vocabulary values are strings.
   does not have the feature — a client must be able to tell that from "off",
   and a missing key cannot.
 
+- **CLI.** `recalld truth audio on|off` edits the config (restart to apply) and
+  says the rest of what has to be true — the plugin's own switch, that it is
+  Vesktop only, and that `[truth] enrol` is separately off so these turns will
+  be named but will not teach the voicebank. `recalld truth report` prints the
+  live streams, the counters, and whether the mixed tap is muted right now,
+  which is the single most surprising thing the daemon can be doing to a
+  Discord recording.
+
 - **Discord desktop cannot do this**, and the plugin says so rather than
   looking switched on: voice is decoded and mixed in `discord_voice.node`,
   whose JS surface offers per-user volume, mute and pan — parameters passed

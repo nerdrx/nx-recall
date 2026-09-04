@@ -503,6 +503,33 @@ pub enum TruthAction {
     On,
     /// Turn the loopback ingest off.
     Off,
+    // ---- 0.12.1: per-user Discord audio ------------------------------------
+    /// Accept per-user AUDIO on the ingest, not just speaking edges. Edits the
+    /// config; restart `recalld run`.
+    #[command(long_about = "\
+Accept per-user audio on the ingest, not just speaking edges.
+
+On Vesktop (not the Discord desktop client) every remote user in a call arrives
+as their own MediaStream, so the RecallBridge plugin can send each person's
+voice separately. Recall then records each as its own source and attributes
+every turn to that account with no voice matching at all — the stream is one
+person by construction, so there is nothing to un-mix and nobody to identify.
+While those streams are arriving the ordinary mixed Discord tap is muted, so
+nothing is transcribed twice.
+
+This is a bigger claim than `truth on`, which only carries timestamps: it lets
+recordings arrive over a TCP socket. It is off by default and so is the
+plugin's own switch — neither side assumes the other asked.
+
+Enrolment into the voicebank still follows `[truth] enrol`, which is separate
+and also off. Turn that on too if you want these turns to teach the voicebank
+what those people sound like on other sources.")]
+    Audio {
+        /// `on` or `off`.
+        #[arg(value_name = "STATE")]
+        state: String,
+    },
+    // ---- end 0.12.1 --------------------------------------------------------
     /// Every Discord account heard so far, and the voice it is linked to.
     Users,
     /// Say that a Discord account is a particular voice.
