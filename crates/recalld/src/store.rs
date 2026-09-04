@@ -112,7 +112,28 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // is evidence about whatever was being recorded and every scope matches it.
 // There is no backfill for the same reason there was none for v11 — the answer
 // for a row already on disk is genuinely unknown. See `apply_v17`.
-pub const SCHEMA_VERSION: i64 = 17;
+//
+// ---- 0.12.4 (schema v19): every correction is word-level ground truth ------
+// One table, `text_truth`. When a person retypes a line they produce the only
+// reference transcript this machine will ever have for that turn, and until
+// now it existed only as a `segments.correct` operation — recoverable, but
+// only by walking a log and joining three other tables to find out which
+// decoders had read the same audio. `text_truth` is that join, written once,
+// at the moment the truth is made: the corrected words, what each pass had
+// read (`live_text`, `context_text`, `night_text`, `canary_text`), the
+// cross-check verdict standing over the words being replaced, and the three
+// facets a measurement is cut by — voice, source kind, duration.
+//
+// It is **derived** data and it is deliberately not a cache: nothing reads it
+// to render a transcript, and dropping the table loses no user-visible state.
+// It is backfilled on migration from the operations history, which is where
+// every one of its fields already lived. See `apply_v19` and
+// `crate::text_truth`.
+//
+// v18 belongs to a sibling build in the same release; this one is v19 so the
+// two never claim the same number. The migration chain is unconditional and
+// idempotent, so a v17 database moving straight to v19 is the ordinary path.
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -540,6 +561,50 @@ pub struct SegmentRow {
     /// for a translation from another. Always set when `translation` is.
     pub translation_via: Option<String>,
     // ---- end 0.9.0 --------------------------------------------------------
+}
+
+/// One hand-made correction, as `text_truth` keeps it (v19, 0.12.4).
+///
+/// `truth_text` is what a person typed and is therefore the reference; every
+/// other text field is what some decoder read of the same audio. See
+/// `crate::text_truth` for how the three readings are attributed, and
+/// `apply_v19` for the table.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TextTruth {
+    pub segment_id: i64,
+    pub truth_text: String,
+    pub live_text: Option<String>,
+    pub context_text: Option<String>,
+    pub night_text: Option<String>,
+    /// Always `None` today — the cross-check stores a verdict, not words.
+    pub canary_text: Option<String>,
+    pub asr_confidence: Option<String>,
+    pub speaker_id: Option<i64>,
+    pub source_kind: String,
+    pub duration_ns: i64,
+    pub created_ns: i64,
+}
+
+/// One `segments.redecode` operation, read back: when a machine rewrote this
+/// row, and the words and route it wrote over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedecodePrior {
+    pub at_utc_ns: i64,
+    pub text: Option<String>,
+    pub text_via: Option<String>,
+}
+
+/// What a segment is, for the purpose of bucketing a measurement about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentFacets {
+    pub speaker_id: Option<i64>,
+    pub source_kind: String,
+    pub duration_ns: i64,
+    pub asr_confidence: Option<String>,
+    pub night_text: Option<String>,
+    /// The words on the row right now, and which pass wrote them.
+    pub text: Option<String>,
+    pub text_via: Option<String>,
 }
 
 /// A turn the idle quality worker may act on: enough to find its audio, place
@@ -1256,6 +1321,15 @@ impl Store {
         // banner at the top of this file and `crate::bridge::Scope`.
         self.apply_v17()?;
         // ---- end 0.12.3 ---------------------------------------------------
+
+        // ---- 0.12.4 (schema v19): word-level ground truth ------------------
+        // One table and one backfill, both in `apply_v19`. The backfill reads
+        // the `segments.correct` and `segments.redecode` operations that are
+        // already on disk and writes nothing back to them, so it is safe to
+        // run on every open: the table's UNIQUE key makes a second pass a
+        // no-op.
+        self.apply_v19()?;
+        // ---- end 0.12.4 ---------------------------------------------------
 
         match current {
             None => {
@@ -6203,6 +6277,180 @@ impl Store {
         Ok(())
     }
 
+    // ---- 0.12.4 (schema v19): word-level ground truth ---------------------
+
+    /// The `text_truth` table, and the one backfill that fills it from history.
+    ///
+    /// `UNIQUE(segment_id, created_ns)` is what makes this idempotent, and it
+    /// is the natural key rather than a convenience: `created_ns` is the
+    /// instant of the `segments.correct` operation, so one correction is one
+    /// row and re-running the backfill writes nothing. A turn corrected twice
+    /// keeps both rows — the second correction is evidence the first transcript
+    /// was wrong too, exactly as `accuracy::corrections` has always counted it.
+    fn apply_v19(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS text_truth (
+                 id             INTEGER PRIMARY KEY,
+                 segment_id     INTEGER NOT NULL REFERENCES segments(id),
+                 -- What the person typed. The reference transcript.
+                 truth_text     TEXT    NOT NULL,
+                 -- What each pass that ever read this clip made of it. NULL
+                 -- means that pass never ran on this row, which is not the
+                 -- same as it having read nothing.
+                 live_text      TEXT,
+                 context_text   TEXT,
+                 night_text     TEXT,
+                 -- Always NULL today: the cross-check decoder stores its
+                 -- VERDICT and not its words (`crate::quality`). The column
+                 -- exists so the day that changes is a one-line write rather
+                 -- than a migration. See `crate::text_truth`.
+                 canary_text    TEXT,
+                 -- The verdict standing over the words being replaced.
+                 asr_confidence TEXT,
+                 -- The three facets a measurement is cut by, as they were at
+                 -- the moment of the correction.
+                 speaker_id     INTEGER REFERENCES speakers(id),
+                 source_kind    TEXT    NOT NULL,
+                 duration_ns    INTEGER NOT NULL,
+                 created_ns     INTEGER NOT NULL,
+                 UNIQUE(segment_id, created_ns)
+             );
+             CREATE INDEX IF NOT EXISTS idx_text_truth_created
+                 ON text_truth(created_ns);
+             CREATE INDEX IF NOT EXISTS idx_text_truth_cell
+                 ON text_truth(source_kind, speaker_id, created_ns);",
+        )?;
+        crate::text_truth::backfill(self)?;
+        Ok(())
+    }
+
+    /// One correction, with everything a measurement needs beside it.
+    pub fn insert_text_truth(&self, row: &TextTruth) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO text_truth
+                 (segment_id, truth_text, live_text, context_text, night_text,
+                  canary_text, asr_confidence, speaker_id, source_kind,
+                  duration_ns, created_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                row.segment_id,
+                row.truth_text,
+                row.live_text,
+                row.context_text,
+                row.night_text,
+                row.canary_text,
+                row.asr_confidence,
+                row.speaker_id,
+                row.source_kind,
+                row.duration_ns,
+                row.created_ns,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Every truth row, oldest first — the order a chronological held-out split
+    /// has to read them in.
+    pub fn text_truth_rows(&self, limit: usize) -> Result<Vec<TextTruth>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT segment_id, truth_text, live_text, context_text, night_text,
+                    canary_text, asr_confidence, speaker_id, source_kind,
+                    duration_ns, created_ns
+             FROM text_truth ORDER BY created_ns ASC, id ASC LIMIT ?1",
+        )?;
+        Ok(stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(TextTruth {
+                    segment_id: r.get(0)?,
+                    truth_text: r.get(1)?,
+                    live_text: r.get(2)?,
+                    context_text: r.get(3)?,
+                    night_text: r.get(4)?,
+                    canary_text: r.get(5)?,
+                    asr_confidence: r.get(6)?,
+                    speaker_id: r.get(7)?,
+                    source_kind: r.get(8)?,
+                    duration_ns: r.get(9)?,
+                    created_ns: r.get(10)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn text_truth_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM text_truth", [], |r| r.get(0))?)
+    }
+
+    /// The facets one segment falls under: whose voice, which kind of source,
+    /// how long, what the cross-check said, and what the night shift read.
+    ///
+    /// Read **now** rather than from the log, exactly as `accuracy::summary`
+    /// buckets its corrections: a turn reassigned since is a turn that belongs
+    /// to the voice it belongs to today.
+    pub fn segment_facets(&self, segment_id: i64) -> Result<Option<SegmentFacets>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT g.speaker_id, src.kind, g.t_end_ns - g.t_start_ns,
+                        g.asr_confidence, g.night_text, g.text, g.text_via
+                 FROM segments g
+                 JOIN sessions ss ON ss.id = g.session_id
+                 JOIN sources src ON src.id = ss.source_id
+                 WHERE g.id = ?1",
+                params![segment_id],
+                |r| {
+                    Ok(SegmentFacets {
+                        speaker_id: r.get(0)?,
+                        source_kind: r.get(1)?,
+                        duration_ns: r.get(2)?,
+                        asr_confidence: r.get(3)?,
+                        night_text: r.get(4)?,
+                        text: r.get(5)?,
+                        text_via: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Every machine rewrite this row has been through, oldest first: when it
+    /// happened, and the `(text, text_via)` the `segments.redecode` operation
+    /// kept of the state it replaced.
+    ///
+    /// Same `target_ids` match as `segments_routed_by_lid`, and for the same
+    /// reason: the column is written as `[<id>]` by every writer of it.
+    pub fn redecode_priors(&self, segment_id: i64) -> Result<Vec<RedecodePrior>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT at_utc_ns, prior_state FROM operations
+             WHERE op = 'segments.redecode' AND target_ids = '[' || ?1 || ']'
+             ORDER BY at_utc_ns ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![segment_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .iter()
+            .map(|(at, raw)| {
+                let v: Option<serde_json::Value> = serde_json::from_str(raw).ok();
+                let field = |key: &str| {
+                    v.as_ref()
+                        .and_then(|v| v.get(key))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                };
+                RedecodePrior {
+                    at_utc_ns: *at,
+                    text: field("text"),
+                    text_via: field("text_via"),
+                }
+            })
+            .collect())
+    }
+
     /// Open a speaking row, closing anything this user already had open.
     ///
     /// Two starts with no stop between them is a dropped batch, not two
@@ -9112,7 +9360,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(v, 17);
+        assert_eq!(v, 19);
 
         // The columns are back…
         let columns = |table: &str| -> Vec<String> {

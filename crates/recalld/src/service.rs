@@ -474,6 +474,9 @@ impl Service {
             "person.brief" => self.person_brief(req),
             "accuracy.summary" => self.accuracy_summary(),
             // ---- end 0.8.0 -------------------------------------------------
+            // ---- 0.12.4, word-level ground truth ---------------------------
+            "accuracy.learn" => self.accuracy_learn(req),
+            // ---- end 0.12.4 ------------------------------------------------
             // ---- 0.9.0, ground truth (PROTOCOL "ground truth (Discord)") ---
             "truth.status" => self.truth_status(),
             "truth.users" => self.truth_users(),
@@ -3141,14 +3144,27 @@ impl Service {
         store
             .correct_segment_text(segment_id, &text)
             .map_err(|e| Error::new("not_found", format!("{e:#}")))?;
+        let at = utc_now_ns();
         store
             .log_operation(
                 "segments.correct",
                 &json!([segment_id]).to_string(),
                 &json!({"segment_id": segment_id, "text": prior_text}).to_string(),
-                utc_now_ns(),
+                at,
             )
             .map_err(Error::from)?;
+        // 0.12.4: the same edit, written down as word-level ground truth —
+        // these words beside what each decoder read of the same audio. The
+        // operations row above stays the audit trail and the source of truth
+        // for a rebuild; `text_truth` is the join, made once, while everything
+        // it needs is still findable. A failure here must never fail the
+        // correction: the edit itself has already landed, and the table is
+        // rebuilt from the log on the next open.
+        if let Err(e) =
+            crate::text_truth::record(&store, segment_id, &text, prior_text.as_deref(), at)
+        {
+            tracing::warn!("could not record the correction as ground truth: {e:#}");
+        }
         let row = store.segment_row(segment_id).map_err(Error::from)?;
         drop(store);
 
@@ -3996,6 +4012,24 @@ impl Service {
     /// corrections somebody made to them.
     fn accuracy_summary(&self) -> Result<Value, Error> {
         crate::accuracy::summary(&self.store()).map_err(Error::from)
+    }
+
+    /// `accuracy.learn {apply?}` (0.12.4) — measure each decoder against the
+    /// corrections, per cell, and say which rules that would justify.
+    ///
+    /// Read-only unless `apply` is true, and it is the *whole* report either
+    /// way: `recalld accuracy report` is this method with `apply` absent. The
+    /// pass is cheap (one indexed read and some string arithmetic), so there is
+    /// no cached answer to go stale.
+    fn accuracy_learn(&self, req: &Request) -> Result<Value, Error> {
+        let apply = req.opt_bool("apply")?.unwrap_or(false);
+        let store = self.store();
+        let learned = crate::text_truth::learn(&store).map_err(Error::from)?;
+        if apply {
+            learned.rules.save(&store).map_err(Error::from)?;
+        }
+        let installed = crate::text_truth::Rules::load(&store);
+        Ok(learned.to_json(apply, &installed))
     }
 
     // ---- 0.9.0: ground truth from Discord --------------------------------
@@ -8610,6 +8644,76 @@ mod tests {
         assert_eq!(a["estimated_wer"], json!(0.2), "one word in five");
         assert_eq!(a["by_source"][0]["source"], json!("VRChat.exe"));
         assert!(a["since_ns"].is_string());
+    }
+
+    #[test]
+    fn a_correction_through_the_socket_becomes_a_row_of_ground_truth() {
+        let r = rig("text-truth");
+        let (_, seg) = a_segment(&r, "the belt holds the line");
+        call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"segments.correct","params":{{"segment_id":{seg},"text":"the bell holds the line"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let rows = r.service.store().text_truth_rows(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].truth_text, "the bell holds the line");
+        assert_eq!(
+            rows[0].live_text.as_deref(),
+            Some("the belt holds the line"),
+            "the words the person replaced, filed under the pass that wrote them"
+        );
+        assert_eq!(rows[0].source_kind, "app");
+
+        // …and the card's block says so, with the distance still to go.
+        let a = call(&r, r#"{"id":2,"method":"accuracy.summary"}"#).unwrap();
+        assert_eq!(a["learned"]["corrections"], json!(1));
+        assert_eq!(a["learned"]["ready"], json!(false));
+        assert_eq!(
+            a["learned"]["needed"],
+            json!(crate::text_truth::MIN_ROWS_PER_CELL - 1)
+        );
+        assert_eq!(a["learned"]["rules"], json!(0));
+    }
+
+    #[test]
+    fn the_learn_pass_reads_only_until_it_is_told_to_apply() {
+        let r = rig("text-learn");
+        let (_, seg) = a_segment(&r, "a b c d");
+        call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"segments.correct","params":{{"segment_id":{seg},"text":"a b c e"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let out = call(&r, r#"{"id":2,"method":"accuracy.learn"}"#).unwrap();
+        assert_eq!(out["corrections"], json!(1));
+        assert_eq!(out["applied"], json!(false));
+        assert_eq!(
+            out["min_rows_per_cell"],
+            json!(crate::text_truth::MIN_ROWS_PER_CELL)
+        );
+        assert_eq!(
+            out["short_by"][0]["needed"],
+            json!(crate::text_truth::MIN_ROWS_PER_CELL - 1),
+            "and it says exactly how many more that cell wants"
+        );
+        assert!(out["global"]["verdict"].as_str().unwrap().contains("of 30"));
+
+        // One correction justifies nothing, so even --apply installs nothing.
+        let out = call(
+            &r,
+            r#"{"id":3,"method":"accuracy.learn","params":{"apply":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(out["applied"], json!(true));
+        assert_eq!(out["installed"]["global"], Value::Null);
+        assert_eq!(out["installed"]["cells"], json!({}));
     }
 
     // ---- 0.9.0: the assistant ------------------------------------------

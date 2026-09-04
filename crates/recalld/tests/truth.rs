@@ -145,7 +145,14 @@ fn the_v11_migration_is_idempotent_and_keeps_what_it_wrote() {
     // no-op property load-bearing rather than incidental: the statement that
     // renames the sweep's bare mark has to find nothing to do on the second
     // open, and it does, because it selects on the shape it removes.
-    assert_eq!(SCHEMA_VERSION, 17, "0.12.3 is schema v17");
+    //
+    // 0.12.3 took it to v17, and 0.12.4's `text_truth` to v19 (v18 belongs to
+    // a sibling build in the same release). v19 is the *second* migration with
+    // a backfill in it, and this test is now the thing that says its natural
+    // key works: `text_truth` is filled from the operations log on every open,
+    // so a second open that wrote a second copy of every correction would be
+    // caught here and nowhere else.
+    assert_eq!(SCHEMA_VERSION, 19, "0.12.4 is schema v19");
     let dir = temp_dir("schema");
     let mut seg = 0i64;
     // Three opens: the first migrates, the second and third must be no-ops

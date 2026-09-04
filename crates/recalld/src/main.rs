@@ -41,8 +41,8 @@ use recalld::truth::{self, TruthStats, TruthStop};
 use recalld::truthnet;
 
 use crate::cli::{
-    Cli, Command, GraphAction, IdentityAction, LangAction, MicAction, ModelsAction, NightBackend,
-    NotesAction, SemanticAction, SpeakersAction, TruthAction,
+    AccuracyAction, Cli, Command, GraphAction, IdentityAction, LangAction, MicAction, ModelsAction,
+    NightBackend, NotesAction, SemanticAction, SpeakersAction, TruthAction,
 };
 
 fn main() -> Result<()> {
@@ -229,7 +229,13 @@ fn main() -> Result<()> {
         Command::Ask { question, limit } => cmd_ask(&cfg, &data_dir, &question.join(" "), limit),
         Command::Notes { action } => cmd_notes(&cfg, &data_dir, action),
         Command::Brief { speaker_id } => cmd_brief(&cfg, &data_dir, speaker_id),
-        Command::Accuracy => cmd_accuracy(&cfg, &data_dir),
+        Command::Accuracy { action } => match action {
+            None => cmd_accuracy(&cfg, &data_dir),
+            Some(AccuracyAction::Report) => cmd_accuracy_learn(&cfg, &data_dir, false, true),
+            Some(AccuracyAction::Learn { apply }) => {
+                cmd_accuracy_learn(&cfg, &data_dir, apply, false)
+            }
+        },
         // ---- end 0.8.0 -------------------------------------------------
         // ---- 0.9.0, ground truth from Discord --------------------------
         Command::Truth { action } => cmd_truth(&cfg, &data_dir, &config_path, action),
@@ -3413,11 +3419,107 @@ fn cmd_accuracy(cfg: &Config, data_dir: &Path) -> Result<()> {
             );
         }
     }
+    // 0.12.4: the same corrections, as ground truth about the decoders.
+    let l = &a["learned"];
+    let learned = l["corrections"].as_i64().unwrap_or(0);
+    let rules = l["rules"].as_i64().unwrap_or(0);
+    if rules > 0 {
+        println!("{:<16}{rules} from {learned} corrections", "learned rules");
+    } else {
+        println!(
+            "{:<16}none yet — {} more corrections in one cell",
+            "learned rules",
+            l["needed"].as_i64().unwrap_or(0)
+        );
+    }
     println!(
         "\nMeasured against YOUR corrections, so it is the error rate of the turns\n\
          somebody bothered to fix — biased high, and the number that moves when the\n\
-         vocabulary or the window length changes."
+         vocabulary or the window length changes.\n\
+         `recalld accuracy report` breaks it down by decoder."
     );
+    Ok(())
+}
+
+/// `recalld accuracy learn|report` (0.12.4) — which decoder your corrections
+/// say to believe, cell by cell.
+fn cmd_accuracy_learn(cfg: &Config, data_dir: &Path, apply: bool, report: bool) -> Result<()> {
+    let out = call(cfg, data_dir, "accuracy.learn", json!({"apply": apply}))?;
+    let n = out["corrections"].as_i64().unwrap_or(0);
+    let min = out["min_rows_per_cell"].as_i64().unwrap_or(0);
+    let margin = out["margin_pp"].as_f64().unwrap_or(0.0);
+    println!(
+        "{n} correction{} on record, {} of them with a decoder's reading beside them.",
+        if n == 1 { "" } else { "s" },
+        out["measurable"].as_i64().unwrap_or(0)
+    );
+    println!(
+        "A cell needs {min} of its own to be fitted, and a rule must take {margin:.0} points \
+         off held-out error.\n"
+    );
+
+    let pct = |v: &Value| {
+        v.as_f64()
+            .map(|w| format!("{:.1}%", w * 100.0))
+            .unwrap_or_else(|| "—".into())
+    };
+    let cell_line = |row: &Value| {
+        let d = |name: &str| {
+            row["decoders"]
+                .as_array()
+                .and_then(|a| a.iter().find(|d| d["decoder"] == name))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        println!(
+            "{:<22}{:>5}{:>6}  {:>7} {:>7} {:>7}   {}",
+            row["cell"].as_str().unwrap_or("?"),
+            row["rows"].as_i64().unwrap_or(0),
+            row["held_out"].as_i64().unwrap_or(0),
+            pct(&d("live")["wer"]),
+            pct(&d("context")["wer"]),
+            pct(&d("night")["wer"]),
+            row["verdict"].as_str().unwrap_or(""),
+        );
+    };
+    println!(
+        "{:<22}{:>5}{:>6}  {:>7} {:>7} {:>7}   verdict",
+        "cell (kind/voice/len)", "rows", "held", "live", "ctx", "night"
+    );
+    cell_line(&out["global"]);
+    for row in out["cells"].as_array().cloned().unwrap_or_default() {
+        cell_line(&row);
+    }
+
+    let installed = &out["installed"];
+    let have = installed["cells"].as_object().map(|m| m.len()).unwrap_or(0)
+        + usize::from(!installed["global"].is_null());
+    println!();
+    if apply {
+        println!("Installed. {have} rule(s) are now in force.");
+    } else if report {
+        println!("{have} rule(s) currently in force.");
+    } else {
+        println!("Nothing was changed. Re-run with --apply to install what is above.");
+    }
+    if have == 0 {
+        let short = out["short_by"].as_array().cloned().unwrap_or_default();
+        println!(
+            "No cell has cleared the bar yet. The night shift keeps its two-of-three vote\n\
+             and the live pass keeps its words, which is what 0.9.0 shipped."
+        );
+        for row in short.iter().take(6) {
+            println!(
+                "  {:<22}{} more correction(s)",
+                row["cell"].as_str().unwrap_or("?"),
+                row["needed"].as_i64().unwrap_or(0)
+            );
+        }
+        println!(
+            "\nCorrect transcripts in the GUI — the accuracy card on the Memory page counts\n\
+             down for you. Every fix is one row of ground truth and they only ever add up."
+        );
+    }
     Ok(())
 }
 

@@ -95,6 +95,10 @@ pub mod store;
 /// there was one.
 pub mod sweep;
 // ---- end 0.12.0 ----------------------------------------------------------
+// ---- 0.12.4: every correction is word-level ground truth ------------------
+/// The `text_truth` table and the decoder-choice rules fitted to it.
+pub mod text_truth;
+// ---- end 0.12.4 -----------------------------------------------------------
 pub mod threads;
 pub mod timeref;
 pub mod translate;

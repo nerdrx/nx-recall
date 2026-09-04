@@ -317,6 +317,21 @@ words only when the night decoder and the cross-check agree with each other
 against the live reading, in the row's own language. Every replacement is on
 the record, next to the words it replaced.
 
+**Every correction you type is word-level ground truth.** When you fix a line,
+the daemon writes that line down beside what each decoder read of the same
+audio — the live pass, the context re-decode, the night shift — and the whole
+correction history already on disk is backfilled into the same table on first
+start. `recalld accuracy learn` then measures each decoder against your own
+words, per voice, per kind of source, per turn length, held out chronologically,
+and can hand a cell to whichever decoder wins it: which words to keep, and
+whether the night shift's two-of-three vote should stand there. It ships a rule
+only after four gates — 30 corrections in the cell, 12 held-out rows the two
+decoders both read, a chronological split, and two points of held-out error
+removed — so on this archive's 37 corrections it currently ships nothing, and
+the accuracy card counts down how many more it wants rather than saying nothing
+at all. None of the night shift's guards is ever for sale: a cell that has
+earned the vote still cannot replace German with Swedish.
+
 ## Getting it useful
 
 - **One query box.** *"was hat Aspen gestern über den Shader gesagt?"* becomes

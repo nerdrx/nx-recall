@@ -1133,6 +1133,8 @@ document.addEventListener('keydown', (e) => {
         bySpeaker: [...document.querySelectorAll('[data-acc="by-speaker"] .acc-row')].map((r) => r.dataset.accRow),
         empty: (document.getElementById('accuracy-empty') || {}).textContent ?? '',
         note: (document.getElementById('accuracy-note') || {}).textContent ?? '',
+        // 0.12.4: what the corrections have taught it, and what it still wants.
+        learned: (document.getElementById('accuracy-learned') || {}).textContent ?? '',
       },
       vocab: {
         user: [...document.querySelectorAll('#vocab-user .vocab-chip')].map((c) => c.dataset.term),

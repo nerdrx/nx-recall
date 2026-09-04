@@ -2389,7 +2389,18 @@ export function runE2E(deps) {
       // …and it says what kind of number it is. An estimate that presents
       // itself as a measurement is the whole failure mode of a card like this.
       assert(/estimate/i.test(a.dash.note), `the card does not own up to being an estimate: "${a.dash.note}"`);
-      return { corrections: a.dash.corrections, wer: a.dash.wer, sources: a.dash.bySource, speakers: a.dash.bySpeaker };
+      // 0.12.4: the one line that looks forwards. Under the bar it must say
+      // how many more corrections are wanted — a card that only reported
+      // "nothing learned" would leave the reader with nothing to do about it.
+      assert(/learned from \d+ correction/i.test(a.dash.learned), `no learned line: "${a.dash.learned}"`);
+      assert(/\d+ more/.test(a.dash.learned), `the countdown is missing: "${a.dash.learned}"`);
+      return {
+        corrections: a.dash.corrections,
+        wer: a.dash.wer,
+        sources: a.dash.bySource,
+        speakers: a.dash.bySpeaker,
+        learned: a.dash.learned,
+      };
     });
 
     await step('the-vocabulary-is-editable-where-it-is-a-decision', async () => {

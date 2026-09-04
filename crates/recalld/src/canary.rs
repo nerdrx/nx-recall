@@ -154,17 +154,26 @@ impl Drop for Canary {
 /// is what stops a decoder that returned two of the twenty words from scoring
 /// well for having got those two right.
 pub fn agreement(a: &str, b: &str) -> f32 {
-    let ref_words = normalise_words(a);
-    let hyp_words = normalise_words(b);
-    if ref_words.is_empty() && hyp_words.is_empty() {
-        return 1.0;
-    }
-    let denom = ref_words.len().max(hyp_words.len());
+    let (distance, denom) = word_edits(a, b);
     if denom == 0 {
         return 1.0;
     }
-    let distance = edit_distance(&ref_words, &hyp_words);
     (1.0 - distance as f32 / denom as f32).max(0.0)
+}
+
+/// The two numbers [`agreement`] is one minus the ratio of: how many whole-word
+/// edits separate the two transcripts once case and punctuation are folded
+/// away, and the length of the longer of them.
+///
+/// Public because `crate::text_truth` sums these across a bucket of corrections
+/// before dividing — a corpus edit share rather than a mean of per-line rates,
+/// which is the same lesson `accuracy::Correction::edits` learned in 0.10.1 —
+/// and it must fold case and punctuation the same way this comparison does.
+pub fn word_edits(a: &str, b: &str) -> (usize, usize) {
+    let ref_words = normalise_words(a);
+    let hyp_words = normalise_words(b);
+    let denom = ref_words.len().max(hyp_words.len());
+    (edit_distance(&ref_words, &hyp_words), denom)
 }
 
 /// Plain word-level Levenshtein. Two rows rather than a matrix: a turn is a

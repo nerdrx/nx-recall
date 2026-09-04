@@ -832,8 +832,34 @@ export function mount(root, ctx) {
         id: 'accuracy-note',
         style: 'padding:10px 0 0;max-width:70ch',
         text: 'Two different estimates. "Changed" counts only the lines somebody retyped, so it reads high where you have been careful and says nothing where you have not. "Shaky" is the share of all checked rows a second decoder read differently — unbiased, but a disagreement is not always an error.',
-      })
+      }),
+      learnedLine(a.learned)
     );
+  }
+
+  /**
+   * What the corrections have TAUGHT it (0.12.4).
+   *
+   * Every other number on this card looks backwards. This one is the reason to
+   * keep correcting: each fix is one row of word-level ground truth, and at
+   * thirty of them in one cell — one voice, one kind of source, one turn length
+   * — the daemon can start measuring which of its decoders to believe there.
+   * So the line says the count, and, until the bar is met, exactly how many
+   * more are wanted. "Nothing learned yet" on its own would be a dead end.
+   */
+  function learnedLine(l) {
+    if (!l) return null;
+    const n = l.corrections ?? 0;
+    const rules = l.rules ?? 0;
+    const text = rules
+      ? `${rules} decoder rule${rules === 1 ? '' : 's'} learned from ${n} correction${n === 1 ? '' : 's'}.`
+      : `Learned from ${n} correction${n === 1 ? '' : 's'} — ${l.needed ?? 0} more in one voice, source and turn length and it can start choosing between its decoders.`;
+    return h('p', {
+      class: 'rail-hint',
+      id: 'accuracy-learned',
+      style: 'padding:6px 0 0;max-width:70ch',
+      text,
+    });
   }
 
   /**
