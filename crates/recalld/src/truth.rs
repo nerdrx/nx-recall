@@ -1201,6 +1201,18 @@ fn label_from_truth_pass(store: &Arc<std::sync::Mutex<Store>>, stats: &TruthStat
 /// stands. Ground truth says whose voice it is; it does not say the recording
 /// is worth keeping, and the four conditions in `identity.rs` are the only
 /// thing that ever decided that.
+///
+/// **The scale rule** (§36): the score those conditions read has to come off
+/// the same aggregate the live ladder uses. Until 0.12.2 this pass called
+/// [`crate::identity::rank`] — a hard-coded max over a voice's prototypes —
+/// while `analysis` ranked with the *learned* aggregate and the per-voice
+/// thresholds were fitted on that aggregate's scale. On an install that had
+/// learned `top-3`, the label half of the decision compared a max-cosine score
+/// against a top-3 threshold, and the enrol half compared it against a 0.55
+/// that means something else on each scale. §32 wrote the rule down for the
+/// projection and PLDA-lite; this is the same rule, applied to the one caller
+/// that had been missed. It is behind `[truth] enrol` and that switch has
+/// never been on, so nothing on disk was ever written by the old behaviour.
 pub fn enrol_batch(
     store: &Arc<std::sync::Mutex<Store>>,
     control: &Arc<Control>,
@@ -1255,7 +1267,19 @@ pub fn enrol_batch(
                         crate::calib::Thresholds::global(identity.label_threshold, 0.0)
                     };
                     // ---- end 0.11.0 ------------------------------------
-                    Some((embedding, bank, thresholds))
+                    // ---- 0.12.2: the same scale as the ladder ----------
+                    // Read the same way `analysis::learned_aggregate` reads
+                    // it, and for the same reason: an unreadable value costs
+                    // the improvement, never the decision.
+                    let aggregate = if identity.learn {
+                        guard
+                            .learned_aggregate()
+                            .unwrap_or(crate::calib::Aggregate::Max)
+                    } else {
+                        crate::calib::Aggregate::Max
+                    };
+                    // ---- end 0.12.2 ------------------------------------
+                    Some((embedding, bank, thresholds, aggregate))
                 }
                 // Nothing was ever embedded — refused at the identity gate, or
                 // recorded before the models were installed. Stamped so it is
@@ -1263,14 +1287,14 @@ pub fn enrol_batch(
                 None => None,
             }
         };
-        let Some((embedding, bank, thresholds)) = gathered else {
+        let Some((embedding, bank, thresholds, aggregate)) = gathered else {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
             guard.mark_truth_enrol_considered(c.id, at)?;
             continue;
         };
 
         // ---- judge (no lock) ----
-        let ranked = crate::identity::rank(&embedding, &bank)?;
+        let ranked = crate::identity::rank_with(&embedding, &bank, aggregate)?;
         let decision = crate::identity::decide_with(
             identity,
             &thresholds,
@@ -2183,6 +2207,112 @@ mod tests {
         // returned separately and never reach `links`. 20 labelled turns all
         // agreeing link, however many the ladder passed on.
         assert_eq!(links(&[(7, 20)]), Some((7, 1.0, 20)));
+    }
+
+    // ---- 0.12.2: the enrol pass reads the ladder's own scale --------------
+
+    /// One linked voice, one enrolable turn, and a bank whose *best* prototype
+    /// is a near-perfect match while the voice's record as a whole is not.
+    ///
+    /// Max cosine 1.00; top-3 mean (1.00 + 0.20 + 0.20) / 3 = 0.467. The label
+    /// bar (0.35) is cleared on either scale, the enrol bar (0.55) only on the
+    /// max one — so the two scales give opposite answers on this one turn,
+    /// which is the whole point of the fixture.
+    fn a_store_with_one_enrolable_turn() -> (Store, i64) {
+        use crate::embed::Embedding;
+        use crate::store::truth_via;
+        let s = Store::open_in_memory().unwrap();
+        let src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let sp = s.mint_speaker(0).unwrap();
+        s.upsert_discord_user("u1", "u1", 0).unwrap();
+        s.set_discord_link("u1", Some(sp), Some(truth_via::MANUAL), 0)
+            .unwrap();
+        let far = (1.0f32 - 0.2 * 0.2).sqrt();
+        for v in [
+            vec![1.0f32, 0.0, 0.0],
+            vec![0.2, far, 0.0],
+            vec![0.2, 0.0, far],
+        ] {
+            s.add_prototype(sp, &Embedding::new("m@1", v), None, false, 20, 0)
+                .unwrap();
+        }
+        let sec = 1_000_000_000i64;
+        let seg = s
+            .insert_segment(sess, 10 * sec, 15 * sec, "a.wav", 0)
+            .unwrap();
+        s.store_embedding(seg, &Embedding::new("m@1", vec![1.0, 0.0, 0.0]))
+            .unwrap();
+        s.set_segment_truth(seg, Some("u1"), "single", Some(0.99))
+            .unwrap();
+        (s, sp)
+    }
+
+    fn enrol_once(store: Store, speaker: i64, learn: bool) -> (i64, u64) {
+        let store = Arc::new(std::sync::Mutex::new(store));
+        let control = Control::new(
+            std::path::PathBuf::from("/nonexistent"),
+            None,
+            &crate::allowlist::Allowlist::default(),
+        );
+        let identity = IdentityConfig {
+            learn,
+            ..Default::default()
+        };
+        let stats = TruthStats::default();
+        let stop = TruthStop::default();
+        enrol_batch(
+            &store,
+            &control,
+            &TruthConfig::default(),
+            &identity,
+            &stats,
+            &stop,
+        )
+        .unwrap();
+        let guard = store.lock().unwrap();
+        (
+            guard.prototype_count(speaker).unwrap(),
+            stats.enrolled.load(Ordering::Relaxed),
+        )
+    }
+
+    #[test]
+    fn the_enrol_pass_scores_on_the_aggregate_the_ladder_learned() {
+        // The bar it has to clear is 0.55 on the scale the *thresholds* were
+        // fitted on. Under `top-3` this voice scores 0.467, so the turn is a
+        // match the pass must decline to enrol — under the max the pass used
+        // to hard-code it scores 1.00 and sails through, which is a 0.55 that
+        // means something else.
+        let (s, sp) = a_store_with_one_enrolable_turn();
+        s.set_learned_aggregate(crate::calib::Aggregate::TopK(3))
+            .unwrap();
+        let (protos, enrolled) = enrol_once(s, sp, true);
+        assert_eq!(protos, 3, "no prototype is added under the learned scale");
+        assert_eq!(enrolled, 0);
+    }
+
+    #[test]
+    fn the_same_turn_still_enrols_where_the_bank_is_scored_on_its_best() {
+        // The companion, so the test above cannot pass by refusing everything:
+        // with nothing learned the aggregate is `max`, and the same fixture
+        // enrols.
+        let (s, sp) = a_store_with_one_enrolable_turn();
+        let (protos, enrolled) = enrol_once(s, sp, true);
+        assert_eq!(protos, 4, "the max scale enrols this turn");
+        assert_eq!(enrolled, 1);
+    }
+
+    #[test]
+    fn a_store_that_has_learned_an_aggregate_is_ignored_when_learning_is_off() {
+        // `[identity] learn = false` means every learned value is ignored, and
+        // the aggregate is one, exactly as the threshold table already is.
+        let (s, sp) = a_store_with_one_enrolable_turn();
+        s.set_learned_aggregate(crate::calib::Aggregate::TopK(3))
+            .unwrap();
+        let (protos, enrolled) = enrol_once(s, sp, false);
+        assert_eq!(protos, 4);
+        assert_eq!(enrolled, 1);
     }
 
     // ---- the report's arithmetic ----------------------------------------

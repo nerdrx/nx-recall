@@ -1263,6 +1263,18 @@ pub struct TruthConfig {
     /// speaker's voicebank. Off by default — an automatic write to the
     /// voicebank is the one thing here that changes future behaviour rather
     /// than merely measuring it.
+    ///
+    /// **Measured 2026-09-04 (§36) and still off.** Held out on 777 rows, the
+    /// bank the pass would have built at the shipping bar is *bit for bit* the
+    /// bank a control that never consults Discord builds from the same rows:
+    /// every turn that clears the enrol bar is a turn the live path in
+    /// `analysis` already enrols on `Matched { enroll: true }`, and on the fit
+    /// split ground truth disagrees with the ladder about exactly one of them.
+    /// Lowering the bar is the only way to make the pass do something the live
+    /// path does not, it buys +0.001 F-0.5, and it is precisely what makes a
+    /// mis-linked Discord account able to write another person's voice into a
+    /// bank permanently — a poisoning the nightly gate does not merely miss but
+    /// *endorses*, because it scores both banks against the same wrong key.
     pub enrol: bool,
     /// A speaking row with no stop is closed this long after it started. The
     /// plugin sends a stop for every start, so this only fires when Discord

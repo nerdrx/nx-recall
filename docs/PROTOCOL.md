@@ -1318,6 +1318,25 @@ above this line changes, and `proto` stays `1`.
   that. Every candidate is stamped `truth_enrol_ns` whether it enrolled or
   not, so a refused turn is not re-examined forever.
 
+  Two rules the pass has to obey, both of them measured rather than argued:
+
+  - **It ranks on the aggregate the ladder learned** (`settings
+    .identity_aggregate`, 0.12.2), not on a hard-coded max over a voice's
+    prototypes. The label half of its decision reads the per-voice thresholds,
+    which are fitted on that aggregate's scale, and `enroll_threshold = 0.55`
+    means a different thing on each scale. Same rule §32 wrote down for the
+    learned projection; this was the caller it had missed. `[identity] learn =
+    false` means max, exactly as it means the global thresholds.
+  - **The bar stays where it is, and the switch stays off** (§36). Held out on
+    777 rows, the bank this pass builds at the shipping bar is identical to the
+    bank a control that never looks at Discord builds from the same rows:
+    a turn that clears the enrol bar is a turn the live path in `analysis`
+    already enrols. Ground truth's only distinct contribution would be at a
+    *lower* bar, where it is also the mechanism by which one mis-linked account
+    writes another person's voice into a bank permanently — and the nightly
+    gate cannot catch that, because it scores the poisoned bank against the
+    same wrong link and finds it an improvement.
+
 - **`truth.status`** → `{listening, enabled, port, label, enrol, sources,
   token_path, spans, open_spans, last_span_ms, users, linked, counters}`.
   `listening` is the address actually bound and `enabled` is the intention;
