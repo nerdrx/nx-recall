@@ -27,6 +27,54 @@ export const PALETTE = [
   { token: 'magenta', hue: 312, hex: '#b83bc4' },
 ];
 
+// The mood palette (0.12.4), mirroring MOOD_PALETTE in the daemon's
+// palette.rs. Three hues, and they are three of the ten above: the suite turns
+// one wheel rather than two.
+//
+// What differs is where the saturation and lightness come from. A highlight
+// paints a NAME at --sp-s / --sp-l; a mood paints a SENTENCE, which is body
+// text and cannot wear a 72% accent. So this spends --mood-s / --mood-l
+// (46%/30% light, 46%/79% dark — tokens.css), measured against every ground a
+// transcript row is painted on: worst case 5.61:1 light, 8.41:1 dark.
+//
+// `neutral` is a mood and is deliberately NOT here. It is what a transcript
+// already looks like, and a colour for it would repaint the whole archive to
+// say nothing. moodColor() returns null for it and the row keeps its ink,
+// which is the same fall-through an unknown token gets.
+export const MOOD_PALETTE = [
+  { token: 'happy', hue: 44, hex: '#705d29' },
+  { token: 'sad', hue: 232, hex: '#293370' },
+  { token: 'angry', hue: 350, hex: '#702935' },
+];
+
+// The events a row may carry, as the daemon spells them, and the one word each
+// gets on a chip. A closed set here as well as there: an event a newer daemon
+// invents is dropped rather than rendered as a raw identifier.
+export const EVENT_LABELS = {
+  laughter: 'laughter',
+  music: 'music',
+  applause: 'applause',
+  cry: 'crying',
+};
+
+const BY_MOOD = new Map(MOOD_PALETTE.map((a) => [a.token, a]));
+
+// The tint for a mood, as a CSS colour in the ground's own saturation and
+// lightness — or null for `neutral`, for a mood this build cannot paint, and
+// for no mood at all. A null means "leave the ink alone", which is what an
+// untinted row already is.
+export function moodColor(token) {
+  const a = token ? BY_MOOD.get(token) : null;
+  return a ? `hsl(${a.hue} var(--mood-s) var(--mood-l))` : null;
+}
+
+// The events on a segment, filtered to the ones this build has a word for and
+// in the palette's own order so two rows with the same events read the same.
+export function eventsOf(seg) {
+  const raw = Array.isArray(seg?.events) ? seg.events : [];
+  return Object.keys(EVENT_LABELS).filter((e) => raw.includes(e));
+}
+
 const BY_TOKEN = new Map(PALETTE.map((a) => [a.token, a]));
 
 // The entry for a token, or null. Unknown is not an error: a daemon newer than

@@ -1243,6 +1243,8 @@ fn move_hint() -> Turn {
         // Nobody said this, so there is nobody to highlight.
         colour: None,
         icon: None,
+        // …and nobody laughed.
+        laughed: false,
     }
 }
 

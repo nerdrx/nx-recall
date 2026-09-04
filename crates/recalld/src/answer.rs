@@ -198,6 +198,15 @@ pub struct Row {
     /// question is often about *who*, for the same reason.
     pub who: String,
     pub text: String,
+    /// The audio events on this turn (0.12.4), as
+    /// [`crate::mood::Event::as_str`] spells them, or empty.
+    ///
+    /// Rendered into the row's line as `(laughter)` after the name, so
+    /// *"what did they find funny?"* is a question the rows can state the
+    /// answer to. `mood` is deliberately **not** here: the events were
+    /// measured and it was not (FINDINGS §42), and a model handed a tag
+    /// nobody trusts will happily build a sentence on it.
+    pub events: Vec<&'static str>,
 }
 
 /// What came back, before any of it is believed.
@@ -367,7 +376,26 @@ pub fn rows_text(rows: &[Row]) -> String {
     let mut out = String::new();
     for row in rows {
         let text = clip(row.text.trim(), MAX_ROW_CHARS);
-        let line = format!("[{}] {} {}: {}\n", row.id, row.clock, row.who, text);
+        // 0.12.4: what was on the clip besides the words, in brackets after
+        // the name. `[204] 19:38 Wren (laughter): oh no`.
+        //
+        // Parentheses and not brackets, because `[` is the citation syntax and
+        // a second bracketed thing on the line is a second thing that looks
+        // like an id — see `shown_ids`, which had to be taught that a turn's
+        // own text can contain `[5000] `.
+        //
+        // This is the only place a stored tag reaches a prompt, and the
+        // grounding post-check does NOT see it: [`check`] tests the answer's
+        // overlap against the rows' `text` alone, so a sentence that says
+        // "they laughed" and shares no word with what was actually said is
+        // still refused. That is deliberate. The event tells the model WHICH
+        // row to read; the words are what it has to read off it.
+        let mark = if row.events.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", row.events.join(", "))
+        };
+        let line = format!("[{}] {} {}{}: {}\n", row.id, row.clock, row.who, mark, text);
         if !out.is_empty() && out.len() + line.len() > HIT_BUDGET_CHARS {
             break;
         }
@@ -793,6 +821,15 @@ mod tests {
             clock: clock.into(),
             who: who.into(),
             text: text.into(),
+            events: Vec::new(),
+        }
+    }
+
+    /// The same, with something on the clip besides the words (0.12.4).
+    fn row_with(id: i64, clock: &str, who: &str, text: &str, events: &[&'static str]) -> Row {
+        Row {
+            events: events.to_vec(),
+            ..row(id, clock, who, text)
         }
     }
 
@@ -958,6 +995,56 @@ mod tests {
              [112] 19:13 Kira: ich kauf ihn heute Abend\n"
         );
         assert_eq!(shown_ids(&page()), vec![107, 109, 112]);
+    }
+
+    /// 0.12.4: an event goes after the name, in parentheses, and it changes
+    /// nothing about what a citation has to be grounded in.
+    #[test]
+    fn an_event_marks_the_line_and_never_grounds_the_answer() {
+        let rows = vec![
+            row_with(
+                301,
+                "21:04",
+                "Kira",
+                "der Tank ist einfach explodiert",
+                &["laughter"],
+            ),
+            row_with(
+                302,
+                "21:05",
+                "Aspen",
+                "das war knapp",
+                &["laughter", "music"],
+            ),
+            row(303, "21:06", "Kira", "nochmal von vorne"),
+        ];
+        assert_eq!(
+            rows_text(&rows),
+            "[301] 21:04 Kira (laughter): der Tank ist einfach explodiert\n\
+             [302] 21:05 Aspen (laughter, music): das war knapp\n\
+             [303] 21:06 Kira: nochmal von vorne\n"
+        );
+        // The mark is not a bracket, so it cannot be mistaken for an id and the
+        // page's own id scan is unaffected.
+        assert_eq!(shown_ids(&rows), vec![301, 302, 303]);
+
+        // The event tells the model WHICH row to read. It is not something the
+        // model may read an answer OFF: an answer built out of the tag and
+        // nothing else shares no content word with the turn and is refused.
+        let ungrounded = json!({"answer": "They laughed.", "citations": [301]});
+        assert_eq!(
+            check(&ungrounded, &rows, &shown_ids(&rows)),
+            Outcome::Refused(refusal::UNGROUNDED)
+        );
+        // An answer that actually reads the words stands, laughter and all.
+        let grounded = json!({
+            "answer": "Kira laughed when the Tank explodiert.",
+            "citations": [301],
+        });
+        assert!(matches!(
+            check(&grounded, &rows, &shown_ids(&rows)),
+            Outcome::Answered(_)
+        ));
     }
 
     /// A row the budget dropped is a row the model cannot cite — because it is

@@ -7,7 +7,7 @@
 
 import { h, clear, fmtClock, fmtDay, fmtDayLabel, fmtDate } from '../lib/dom.js';
 import { store, speakerLabel, segmentSpeakerLabel, isUncertain, isShaky, ask } from '../lib/store.js';
-import { shakyMark, translationCell } from '../lib/marks.js';
+import { moodChips, shakyMark, translationCell } from '../lib/marks.js';
 // 0.12.0 — per-person highlights. The same three helpers the transcript uses,
 // because a hit and the row it takes you to must not disagree about a colour.
 import { look, lookOf, iconSpan, markRow } from './highlight.js';
@@ -777,6 +777,10 @@ export function mount(root, ctx, arg) {
       h(
         'span',
         { class: 'meta' },
+        // 0.12.4: the same chips the transcript draws, from the same function
+        // and in the same place, because a hit that looked different from the
+        // row it takes you to is a hit you have to re-read on arrival.
+        moodChips(seg),
         // The same mark the transcript uses, for the same reason: a result you
         // are about to trust is entitled to say a second decoder did not.
         isShaky(seg) ? shakyMark() : null,

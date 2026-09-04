@@ -113,6 +113,23 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // There is no backfill for the same reason there was none for v11 — the answer
 // for a row already on disk is genuinely unknown. See `apply_v17`.
 //
+// ---- 0.12.4 (schema v18): how a turn sounded ------------------------------
+// Three nullable columns on `segments`, written by `crate::mood`'s background
+// pass and by nothing else: `mood` (one of `crate::mood::Mood`'s four words, or
+// NULL when the model abstained), `events` (a sorted, comma-separated subset of
+// `crate::mood::Event`'s closed set, or NULL for none) and `mood_at_ns` (when
+// the pass looked).
+//
+// **`mood_at_ns` is the queue and the other two are the answer**, which is why
+// there are three columns and not two. The pass is resumable in the shape every
+// other walk in this daemon is — `WHERE mood_at_ns IS NULL` — and it stamps the
+// row whatever it concluded, including "the model had no opinion" and
+// "retention has taken the audio". Without the third column a row the model
+// abstained on would be indistinguishable from a row nothing had reached, and
+// the pass would re-read it every night for the life of the archive.
+//
+// No backfill, for the usual reason: for a row already on disk nobody has
+// listened, and NULL is the only honest way to say so. See `apply_v18`.
 // ---- 0.12.4 (schema v19): every correction is word-level ground truth ------
 // One table, `text_truth`. When a person retypes a line they produce the only
 // reference transcript this machine will ever have for that turn, and until
@@ -561,6 +578,53 @@ pub struct SegmentRow {
     /// for a translation from another. Always set when `translation` is.
     pub translation_via: Option<String>,
     // ---- end 0.9.0 --------------------------------------------------------
+    // ---- 0.12.4 (schema v18): how it sounded ------------------------------
+    /// One of [`crate::mood::Mood`]'s four words, or `None`.
+    ///
+    /// `None` means one of two things and the row cannot tell them apart:
+    /// nothing has listened yet, or the model listened and abstained — which it
+    /// does on about three quarters of real turns (FINDINGS §42). Both are
+    /// correctly rendered the same way, which is *not at all*, so the
+    /// distinction stays in `mood_at_ns` and off the wire.
+    pub mood: Option<String>,
+    /// The audio events on this turn, as the sorted comma-joined closed set
+    /// [`crate::mood::Event`] defines, or `None` for a turn that carried none.
+    pub events: Option<String>,
+    // ---- end 0.12.4 -------------------------------------------------------
+}
+
+/// One row the mood pass may listen to (0.12.4, `crate::mood`).
+#[derive(Debug, Clone)]
+pub struct MoodCandidate {
+    pub id: i64,
+    pub duration_s: f32,
+    /// Relative to the data dir, and never empty: the query filters those out.
+    pub audio_path: String,
+    /// What the row says. The pass does not read it — it is carried for the
+    /// `spike/mood_score.py` scored the tag against, and what a `sqlite3`
+    /// query wants beside a tag it is trying to make sense of (FINDINGS §42.8).
+    pub text: Option<String>,
+}
+
+/// How a person, or a conversation, has sounded (0.12.4).
+///
+/// Counts and a denominator, never a verdict. Turning these into a sentence is
+/// [`crate::mood::summary`]'s job, and it refuses to write one from too few
+/// rows — see [`crate::mood::MIN_ROWS_FOR_A_SUMMARY`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MoodTotals {
+    /// Rows of theirs the pass has actually listened to. The denominator, and
+    /// the reason none of the numbers below is ever published alone.
+    pub read: i64,
+    pub happy: i64,
+    pub sad: i64,
+    pub angry: i64,
+    pub neutral: i64,
+    pub laughter: i64,
+    pub music: i64,
+    /// The newest row the pass has read of theirs, so a client can say how
+    /// current the picture is. `None` when `read` is zero.
+    pub last_ns: Option<i64>,
 }
 
 /// One hand-made correction, as `text_truth` keeps it (v19, 0.12.4).
@@ -1322,6 +1386,10 @@ impl Store {
         self.apply_v17()?;
         // ---- end 0.12.3 ---------------------------------------------------
 
+        // ---- 0.12.4 (schema v18): how a turn sounded ----------------------
+        // Three nullable columns on `segments`, no backfill. See the banner at
+        // the top of this file and `crate::mood`.
+        self.apply_v18()?;
         // ---- 0.12.4 (schema v19): word-level ground truth ------------------
         // One table and one backfill, both in `apply_v19`. The backfill reads
         // the `segments.correct` and `segments.redecode` operations that are
@@ -4110,13 +4178,14 @@ impl Store {
     /// How many columns [`Self::SEGMENT_COLUMNS`] selects. A query that appends
     /// its own — the search's snippet — indexes from here rather than from a
     /// number somebody has to remember to bump.
-    const SEGMENT_COLUMN_COUNT: usize = 22;
+    const SEGMENT_COLUMN_COUNT: usize = 24;
 
     const SEGMENT_COLUMNS: &'static str =
         "g.id, g.session_id, sc.match_key, g.t_start_ns, g.t_end_ns,
          sp.canonical_id, sp.display_name, g.text, g.overlap_frac, g.match_score, g.audio_path,
          g.lang, g.label_via, g.thread_id, g.lang_via, g.text_via, g.asr_confidence,
-         g.night_text, g.translation, g.translation_via, sp.colour, sp.icon";
+         g.night_text, g.translation, g.translation_via, sp.colour, sp.icon,
+         g.mood, g.events";
 
     fn segment_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentRow> {
         Ok(SegmentRow {
@@ -4147,6 +4216,11 @@ impl Store {
             // decided the two were the same person.
             speaker_colour: r.get(20)?,
             speaker_icon: r.get(21)?,
+            // 0.12.4 (v18), how it sounded. NULL on every row until the mood
+            // pass has been over it, which is every row on a machine where
+            // `[mood].enabled` is false — the shipped default.
+            mood: r.get(22)?,
+            events: r.get(23)?,
         })
     }
 
@@ -6598,6 +6672,67 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Schema v18: how a turn sounded.
+    ///
+    /// Three nullable columns and one index. No backfill — see the banner at
+    /// the top of this file. The index is the pass's own queue, in the shape
+    /// the sweep's is (`mood_at_ns IS NULL`, oldest first), so a walk over a
+    /// twenty-thousand-row archive is a range scan rather than a table scan
+    /// every minute for the life of the daemon.
+    fn apply_v18(&self) -> Result<()> {
+        self.add_column_if_missing("segments", "mood", "TEXT")?;
+        self.add_column_if_missing("segments", "events", "TEXT")?;
+        self.add_column_if_missing("segments", "mood_at_ns", "INTEGER")?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_segments_mood_queue
+                 ON segments(mood_at_ns, t_start_ns);",
+        )?;
+        Ok(())
+    }
+
+    // ---- the mood pass (0.12.4, `crate::mood`) ---------------------------
+
+    /// One row nobody has listened to for a mood yet, with everything the pass
+    /// needs and nothing else.
+    ///
+    /// Deliberately not a [`SweepCandidate`]: that struct carries the speaker's
+    /// declared languages because the language route cannot run without them,
+    /// and a mood is a fact about a sound rather than about a language — the
+    /// pass asks nothing about who is speaking or what they said. What it does
+    /// need that the sweep does not is the *live text*, which is what
+    /// `spike/mood_bench.py` scored the laughter tag against — see FINDINGS
+    /// §42.5, where "the decoder had no words for this clip" turned out to be
+    /// the only proxy on this corpus with enough positives to separate
+    /// anything.
+    pub fn segments_for_mood(
+        &self,
+        min_duration_s: f32,
+        limit: usize,
+    ) -> Result<Vec<MoodCandidate>> {
+        let min_ns = (min_duration_s.max(0.0) as f64 * 1e9) as i64;
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT g.id, g.t_end_ns - g.t_start_ns, g.audio_path, g.text
+                 FROM segments g
+                 WHERE g.deleted_at IS NULL
+                   AND g.mood_at_ns IS NULL
+                   AND g.audio_path <> ''
+                   AND g.t_end_ns - g.t_start_ns >= ?1
+                 ORDER BY g.t_start_ns
+                 LIMIT ?2",
+            )?
+            .query_map(params![min_ns, limit.max(1) as i64], |r| {
+                Ok(MoodCandidate {
+                    id: r.get(0)?,
+                    duration_s: r.get::<_, i64>(1)? as f32 / 1e9,
+                    audio_path: r.get(2)?,
+                    text: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn text_truth_count(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -6670,6 +6805,127 @@ impl Store {
                 }
             })
             .collect())
+    }
+
+    /// What the pass heard, and that it has been here.
+    ///
+    /// Called on **every** row the pass reaches, including the two where it
+    /// heard nothing: a model that abstained (`mood = None`) and a clip
+    /// retention has taken (both `None`). That is the whole of why
+    /// `mood_at_ns` exists as a separate column — see the v18 banner.
+    ///
+    /// `events` is stored as the sorted, comma-joined closed set rather than as
+    /// a JSON array, for the reason `speakers.languages` is: it is a handful of
+    /// short fixed words, every reader of it wants a `LIKE '%laughter%'` and no
+    /// reader ever wants half of one.
+    pub fn set_segment_mood(
+        &self,
+        segment_id: i64,
+        mood: Option<&str>,
+        events: Option<&str>,
+        at_utc_ns: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET mood = ?2, events = ?3, mood_at_ns = ?4
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![segment_id, mood, events, at_utc_ns],
+        )?;
+        Ok(())
+    }
+
+    /// How much archive the mood pass still owes at a given floor, and how much
+    /// it has already been over: `(owed, read)`.
+    ///
+    /// The first half is [`Self::segments_for_mood`]'s filter term for term,
+    /// which is the property `lang_sweep_counts` had to learn the hard way: a
+    /// status line that counts rows the walk would decline is a status line
+    /// that prints the same backlog forever.
+    pub fn mood_counts(&self, min_duration_s: f32) -> Result<(i64, i64)> {
+        let min_ns = (min_duration_s.max(0.0) as f64 * 1e9) as i64;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT
+                   SUM(CASE WHEN g.mood_at_ns IS NULL THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN g.mood_at_ns IS NOT NULL THEN 1 ELSE 0 END)
+                 FROM segments g
+                 WHERE g.deleted_at IS NULL
+                   AND g.audio_path <> ''
+                   AND g.t_end_ns - g.t_start_ns >= ?1",
+                params![min_ns],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .map(|(a, b)| (a.unwrap_or(0), b.unwrap_or(0)))?)
+    }
+
+    /// How one voice has sounded, over every row the pass has read of theirs.
+    ///
+    /// Counts, not a verdict, and `read` is on the wire beside them because a
+    /// count with no denominator is a claim: "3 laughs" means nothing until you
+    /// know whether the pass has been over thirty of their turns or three
+    /// thousand. `person.get` renders the ratio and refuses to render anything
+    /// at all under [`crate::mood::MIN_ROWS_FOR_A_SUMMARY`].
+    ///
+    /// Resolved through `speaker_resolved` like every other per-person total,
+    /// so a merged-away voice's turns count toward the voice that survived.
+    pub fn person_mood(&self, speaker_id: i64) -> Result<MoodTotals> {
+        Ok(self.conn.query_row(
+            "SELECT
+               SUM(CASE WHEN g.mood_at_ns IS NOT NULL THEN 1 ELSE 0 END),
+               SUM(CASE WHEN g.mood = 'happy' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN g.mood = 'sad' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN g.mood = 'angry' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN g.mood = 'neutral' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN g.events LIKE '%laughter%' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN g.events LIKE '%music%' THEN 1 ELSE 0 END),
+               MAX(CASE WHEN g.mood_at_ns IS NOT NULL THEN g.t_start_ns END)
+             FROM segments g
+             JOIN speaker_resolved sp ON sp.id = g.speaker_id
+             WHERE sp.canonical_id = ?1 AND g.deleted_at IS NULL",
+            params![speaker_id],
+            |r| {
+                Ok(MoodTotals {
+                    read: r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    happy: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    sad: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    angry: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    neutral: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    laughter: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                    music: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                    last_ns: r.get(7)?,
+                })
+            },
+        )?)
+    }
+
+    /// The same totals over one conversation, for the "how it felt" line.
+    pub fn thread_mood(&self, thread_id: i64) -> Result<MoodTotals> {
+        Ok(self.conn.query_row(
+            "SELECT
+               SUM(CASE WHEN g.mood_at_ns IS NOT NULL THEN 1 ELSE 0 END),
+               SUM(CASE WHEN g.mood = 'happy' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN g.mood = 'sad' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN g.mood = 'angry' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN g.mood = 'neutral' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN g.events LIKE '%laughter%' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN g.events LIKE '%music%' THEN 1 ELSE 0 END),
+               MAX(CASE WHEN g.mood_at_ns IS NOT NULL THEN g.t_start_ns END)
+             FROM segments g
+             WHERE g.thread_id = ?1 AND g.deleted_at IS NULL",
+            params![thread_id],
+            |r| {
+                Ok(MoodTotals {
+                    read: r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    happy: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    sad: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    angry: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    neutral: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    laughter: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                    music: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                    last_ns: r.get(7)?,
+                })
+            },
+        )?)
     }
 
     /// Open a speaking row, closing anything this user already had open.
@@ -9628,6 +9884,114 @@ mod tests {
         let seg_row = s.segment_row(seg).unwrap().unwrap();
         assert_eq!(seg_row.speaker_colour.as_deref(), Some("violet"));
         assert_eq!(seg_row.speaker_icon.as_deref(), Some("\u{1f319}"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0.12.4 (v18). Three nullable columns, no backfill, and one property
+    /// that is easy to get wrong and expensive to notice: **the queue has to
+    /// empty.**
+    ///
+    /// `mood_at_ns` is a separate column from the two answers precisely so a
+    /// row the model abstained on stops being asked about. If the pass wrote
+    /// only `mood` and `events`, the three rows in four SenseVoice declines on
+    /// would come back in every query for the life of the archive, and the
+    /// backlog printed on the Memory card would never move — the exact bug
+    /// `lang_sweep_counts` had to learn from in 0.12.1.
+    #[test]
+    fn a_row_the_model_had_no_opinion_about_leaves_the_mood_queue() {
+        let dir = std::env::temp_dir().join(format!("nxr-v18-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).unwrap();
+        let v: i64 = s
+            .conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let src = s.upsert_source("VRChat.exe", "VRChat.exe", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        // Three rows: one the model will answer about, one it will decline,
+        // and one whose clip retention has taken.
+        let heard = s
+            .insert_segment(sess, 0, 3_000_000_000, "a.wav", 0)
+            .unwrap();
+        let quiet = s
+            .insert_segment(sess, 4_000_000_000, 7_000_000_000, "b.wav", 0)
+            .unwrap();
+        let gone = s
+            .insert_segment(sess, 8_000_000_000, 11_000_000_000, "", 0)
+            .unwrap();
+
+        // The queue skips the row with no audio, and there is nothing to skip
+        // it FOR — this is the filter `mood_counts` has to match term for term.
+        let queued: Vec<i64> = s
+            .segments_for_mood(1.0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(queued, vec![heard, quiet]);
+        assert_eq!(s.mood_counts(1.0).unwrap(), (2, 0));
+
+        // A short row is never queued at all, whatever the floor is doing.
+        let brief = s
+            .insert_segment(sess, 12_000_000_000, 12_300_000_000, "c.wav", 0)
+            .unwrap();
+        assert!(
+            !s.segments_for_mood(1.0, 10)
+                .unwrap()
+                .iter()
+                .any(|c| c.id == brief),
+            "a 300ms back-channel reached the queue"
+        );
+
+        s.set_segment_mood(heard, Some("happy"), Some("laughter,music"), 100)
+            .unwrap();
+        // The abstention: both answers NULL, and the STAMP set anyway.
+        s.set_segment_mood(quiet, None, None, 100).unwrap();
+
+        assert!(
+            s.segments_for_mood(1.0, 10).unwrap().is_empty(),
+            "a row the model declined came back in the queue"
+        );
+        assert_eq!(
+            s.mood_counts(1.0).unwrap(),
+            (0, 2),
+            "the backlog never reached zero"
+        );
+
+        // The answers read back on the ordinary segment shape, which is what
+        // every surface in the app draws from.
+        let row = s.segment_row(heard).unwrap().unwrap();
+        assert_eq!(row.mood.as_deref(), Some("happy"));
+        assert_eq!(row.events.as_deref(), Some("laughter,music"));
+        let row = s.segment_row(quiet).unwrap().unwrap();
+        assert_eq!(row.mood, None);
+        assert_eq!(
+            row.events, None,
+            "an abstention is NULL, never the empty string"
+        );
+        // A row nothing has reached is indistinguishable from an abstention on
+        // the wire, and that is correct — both render as nothing.
+        let row = s.segment_row(gone).unwrap().unwrap();
+        assert_eq!(row.mood, None);
+
+        // The totals a person page reads. `read` is the denominator and counts
+        // the abstention, because the pass DID listen to it — a laughter share
+        // over "rows with a mood" would be a different and much flatterier
+        // number.
+        let t = s.thread_mood(0).unwrap();
+        assert_eq!(t.read, 0, "these rows are in no thread");
+        let src_totals = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM segments WHERE mood_at_ns IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(src_totals, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

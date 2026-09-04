@@ -2833,6 +2833,197 @@ export function runE2E(deps) {
 
     await step('shot-highlights', async () => ({ file: await shot('highlights') }));
 
+    // 0.12.4 — how a turn sounded.
+    //
+    // Four steps, and they are four because the feature has two independent
+    // gates and both have to be exercised in both positions:
+    //
+    //   1. the four states of `mood_display` — every one of them ACTS;
+    //   2. the daemon's `rendered` flag, which decides whether the MOOD half
+    //      may be drawn at all, in both worlds;
+    //   3. the tint's legibility rule, which is what makes a coloured sentence
+    //      shippable on two grounds;
+    //   4. the card, which has to say WHY when it is withholding something.
+
+    await step('the-mood-chips-are-events-and-only-events-by-default', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      const v = await waitFor('rows with chips', async () => {
+        const v = await js('window.__recallDebug.mood()');
+        return v.rows && v.chips ? v : null;
+      });
+      // The shipped state: `tags`, and the daemon says the mood half is not
+      // measured — so there are event chips and NO mood chips, whatever the
+      // fixture's `mood` column says.
+      assert(v.mode === 'tags', `mood_display ships as "${v.mode}"`);
+      assert(v.rendered === false, `the mock claims mood is rendered: ${v.rendered}`);
+      assert(v.events > 0, 'no event chips on any row');
+      assert(
+        v.moods === 0,
+        `a mood chip was drawn while the daemon says it is not measured: ${JSON.stringify(v.sample)}`
+      );
+      // …and nothing is tinted, because `tags` is not `tint`.
+      assert(v.tinted === 0, `${v.tinted} rows were tinted in "tags" mode`);
+      // Most rows wear nothing at all. A mark on every row is not a mark, and
+      // this is the assertion that would catch a fixture that over-seeded.
+      assert(v.chips < v.rows, `every one of ${v.rows} rows carries a chip`);
+      return { rows: v.rows, chips: v.chips, events: v.events, sample: v.sample };
+    });
+
+    await step('each-mood-display-mode-changes-what-a-row-wears', async () => {
+      const set = async (mode) => {
+        await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+        await waitFor('the mood card', async () =>
+          (await js('window.__recallDebug.mood()')).modes.length ? true : null
+        );
+        await js(`document.getElementById("mood-display-${mode}").click()`);
+        await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+        // Waited on the STORE and not on the radio button: `display` reads a
+        // control that only exists while the Memory view is mounted, and the
+        // assertions below are about a transcript ROW.
+        return waitFor(`mood_display=${mode} on a row`, async () => {
+          const v = await js('window.__recallDebug.mood()');
+          return v.mode === mode ? v : null;
+        });
+      };
+
+      // The radio buttons only exist while the Memory view is mounted, so the
+      // card is read from THERE — `set()` leaves the driver on the transcript,
+      // which is where the row assertions belong and where a `modes` read
+      // would correctly find nothing.
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      const modes = await waitFor('the mood card', async () => {
+        const m = (await js('window.__recallDebug.mood()')).modes;
+        return m.length ? m : null;
+      });
+      assert(
+        modes.join(',') === 'tags,tint,both,off',
+        `the card offers ${JSON.stringify(modes)}`
+      );
+
+      // `off` — neither. The one state where a bug is invisible unless it is
+      // asserted, which is exactly why it is asserted.
+      const off = await set('off');
+      assert(off.chips === 0, `"off" still drew ${off.chips} chips`);
+      assert(off.tinted === 0, `"off" still tinted ${off.tinted} rows`);
+
+      // `tint` — the MOOD moves to the words, and the events keep their chips,
+      // because there is no such thing as the colour of laughter. That split is
+      // what makes this state act on a daemon that is withholding the mood
+      // (the shipped one) rather than being a no-op waiting on a measurement.
+      const tint = await set('tint');
+      assert(tint.moods === 0, `"tint" drew ${tint.moods} mood chips`);
+      assert(tint.events > 0, '"tint" dropped the event chips, which have no colour to move to');
+
+      // `both` — chips are back, and they are still events only.
+      const both = await set('both');
+      assert(both.events > 0, '"both" drew no event chips');
+
+      // …and back to the shipped state, so the screenshots below and every
+      // step after this one see the app as a person gets it.
+      const tags = await set('tags');
+      assert(tags.events > 0, '"tags" drew no event chips');
+      return { off: off.chips, both: both.events, tags: tags.events };
+    });
+
+    await step('the-mood-tint-appears-only-when-the-daemon-says-it-is-measured', async () => {
+      // The other world. The mock ships the daemon's real answer (false); this
+      // flips it, which is the only way to exercise the half of the renderer a
+      // person gets the day the measurement changes.
+      // Through the driver's own daemon client, not `window.recall`: the
+      // renderer's ALLOWED set refuses anything that is not a protocol method,
+      // and `mock.mood` is deliberately not one.
+      await deps.request('mock.mood', { rendered: true });
+      await waitFor('the daemon to say mood is rendered', async () =>
+        (await js('window.__recallDebug.mood()')).rendered === true ? true : null
+      );
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.getElementById("mood-display-both").click()');
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      const v = await waitFor('a tinted row', async () => {
+        const v = await js('window.__recallDebug.mood()');
+        return v.mode === 'both' && v.tinted ? v : null;
+      });
+      assert(v.moods > 0, 'the mood chip did not appear once the daemon allowed it');
+      assert(v.tinted > 0, 'no row took a mood colour');
+      // The colour is the token's hue through the GROUND's own saturation and
+      // lightness — never a literal — which is the whole legibility argument
+      // and the one thing a screenshot cannot check.
+      for (const style of v.tintColors) {
+        assert(
+          /hsl\(\d+ var\(--mood-s\) var\(--mood-l\)\)/.test(style),
+          `a row was tinted with a literal colour: ${style}`
+        );
+      }
+      // `neutral` is a mood the fixture carries and no surface paints, so the
+      // tinted rows must be strictly fewer than the rows with a mood at all.
+      const neutral = await js(
+        `document.querySelectorAll('#seg-list .txt.mood-neutral').length`
+      );
+      assert(neutral === 0, `${neutral} rows were tinted "neutral"`);
+      const light = await js('window.__recallDebug.mood()');
+      const file = await shot('transcript-mood');
+      return { tinted: v.tinted, moods: v.moods, sample: light.sample, file };
+    });
+
+    await step('a-person-page-says-how-they-sound-and-refuses-to-say-more', async () => {
+      // Still in the world where the daemon allows the mood half (the step
+      // above turned it on and the step below turns it back off), so this can
+      // check both claims the page is willing to make and the shape of the one
+      // it is not.
+      await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
+      const target = await js(
+        'Number(document.querySelector("#speaker-list .sp-row").dataset.speaker)'
+      );
+      await js(`window.__recallDebug.go('person', { id: ${target} })`);
+      const p = await waitFor('the person page', async () => {
+        const p = await js('window.__recallDebug.person()');
+        return p.mounted && p.sound ? p : null;
+      });
+      // The DENOMINATOR is in the subtitle, where it cannot be scrolled past:
+      // "they laugh a lot" over thirty turns and over three thousand are
+      // different claims and only one of them is worth anything.
+      assert(
+        /over \d+ turns? the decoder has listened to/.test(p.sound.sub),
+        `the card does not say what it is over: "${p.sound.sub}"`
+      );
+      const keys = p.sound.cells.map(([k]) => k);
+      assert(keys.includes('laughter'), `no laughter cell: ${JSON.stringify(p.sound.cells)}`);
+      // …and the note says what kind of number this is, because a tag on the
+      // AUDIO is not a count of anything anybody said.
+      assert(/audio/i.test(p.sound.note), `the note does not say what it is: "${p.sound.note}"`);
+      return { sub: p.sound.sub, cells: p.sound.cells };
+    });
+
+    await step('the-mood-card-says-what-it-is-withholding-and-why', async () => {
+      // Back to the world the user actually gets, and the card has to explain
+      // itself in it — in the DAEMON's sentence, not one this app invented.
+      await deps.request('mock.mood', { rendered: false });
+      await waitFor('the daemon to withhold the mood again', async () =>
+        (await js('window.__recallDebug.mood()')).rendered === false ? true : null
+      );
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      const card = await waitFor('the reason on the card', async () => {
+        const v = await js('window.__recallDebug.mood()');
+        return v.why ? v : null;
+      });
+      assert(/§42/.test(card.why), `the card does not cite the measurement: "${card.why}"`);
+      assert(/not shown/.test(card.why), `the card does not say it is withholding: "${card.why}"`);
+      // The chip half is still promised, because it was measured separately.
+      assert(/[Ll]aughter/.test(card.why), 'the card does not say what IS shown');
+      // The subtitle is a fact and not a mood: how much has been read.
+      assert(/turns read|off —|not installed/.test(card.sub), `the badge says "${card.sub}"`);
+      // And the setting is back where a person left it.
+      await js('document.getElementById("mood-display-tags").click()');
+      await js('document.getElementById("mood-card").scrollIntoView({ block: "start" })');
+      const file = await shot('memory-mood');
+      // Put the driver back where it found it. Every step after this one reads
+      // the TRANSCRIPT header — the live chip, the pause banner — and a step
+      // that wanders off and leaves the app somewhere else fails the next one
+      // with a message about a feature it never touched.
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      return { why: card.why, sub: card.sub, file };
+    });
+
     // 8 — pause from the TRAY path stops the feed (DESIGN §8, the marquee case)
     await step('tray-pause-stops-feed', async () => {
       await deps.setPaused(true); // exactly what the tray menu item calls

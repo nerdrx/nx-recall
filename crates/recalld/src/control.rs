@@ -110,6 +110,10 @@ pub struct Control {
     night: Mutex<crate::config::NightConfig>,
     /// What the night shift has done since the daemon started.
     pub night_stats: Arc<crate::night::NightStats>,
+    /// The mood pass's settings (0.12.4), live like every other switch here.
+    mood: Mutex<crate::config::MoodConfig>,
+    /// What the mood pass has done since the daemon started.
+    pub mood_stats: Arc<crate::mood::MoodStats>,
     // ---- 0.9.0, the assistant -------------------------------------------
     /// Reminders, digests and translation. Live like `asr` and `graph` and for
     /// the same reason: every one of them has a switch.
@@ -150,6 +154,9 @@ impl Control {
             quality: Arc::new(crate::quality::QualityStats::default()),
             night: Mutex::new(crate::config::NightConfig::default()),
             night_stats: Arc::new(crate::night::NightStats::default()),
+            // 0.12.4.
+            mood: Mutex::new(crate::config::MoodConfig::default()),
+            mood_stats: Arc::new(crate::mood::MoodStats::default()),
             // 0.9.0.
             assist: Mutex::new(crate::config::AssistConfig::default()),
             assist_stats: Arc::new(crate::assist::AssistStats::default()),
@@ -461,6 +468,20 @@ impl Control {
     pub fn with_night(mut self: Arc<Self>, cfg: crate::config::NightConfig) -> Arc<Self> {
         let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
         *this.night.get_mut().unwrap_or_else(|p| p.into_inner()) = cfg;
+        self
+    }
+
+    // ---- the mood pass (0.12.4) ------------------------------------------
+
+    pub fn mood(&self) -> crate::config::MoodConfig {
+        self.mood.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Point the mood pass at the running config. Set before the handle is
+    /// shared, like the rest of the wiring.
+    pub fn with_mood(mut self: Arc<Self>, cfg: crate::config::MoodConfig) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
+        *this.mood.get_mut().unwrap_or_else(|p| p.into_inner()) = cfg;
         self
     }
 

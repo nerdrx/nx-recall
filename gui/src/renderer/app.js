@@ -975,6 +975,21 @@ document.addEventListener('keydown', (e) => {
           preview: r.querySelector('.thread-preview').textContent,
         })),
         back: !!document.getElementById('person-back'),
+        // 0.12.4 — "How they sound". `null` when the card is absent, which is
+        // the answer for anybody the pass has read fewer than thirty turns of
+        // — most people — and is what a test has to be able to see.
+        sound: (() => {
+          const card = document.getElementById('person-sound');
+          if (!card || card.hidden) return null;
+          return {
+            sub: document.getElementById('sound-sub')?.textContent ?? '',
+            cells: [...document.querySelectorAll('#sound-strip .person-stat')].map((s) => [
+              s.dataset.sound,
+              s.querySelector('b').textContent,
+            ]),
+            note: document.getElementById('sound-note')?.textContent ?? '',
+          };
+        })(),
         // 0.10.0 — "Where you meet" and "How you talk".
         worlds: [...document.querySelectorAll('#person-world-chips .world-chip')].map((c) => ({
           id: c.dataset.world,
@@ -1189,6 +1204,49 @@ document.addEventListener('keydown', (e) => {
           .slice(0, 3)
           .map((l) => l.textContent),
       },
+    }),
+    // 0.12.4: the mood round, from both ends — the card's four radio buttons
+    // and what a transcript row actually wears because of them. One hook, so a
+    // test that flips the setting and a test that reads the row cannot be
+    // looking at two different definitions of "on".
+    mood: () => ({
+      // The setting itself, off the STORE. The radio buttons below only exist
+      // while the Memory view is mounted, and the thing a row-level assertion
+      // has to wait on is "the setting has landed", which is true everywhere.
+      mode: store.assist.mood_display,
+      // The card.
+      sub: document.getElementById('mood-sub')?.textContent ?? '',
+      display: document.querySelector('input[name="mood-display"]:checked')?.value ?? null,
+      modes: [...document.querySelectorAll('input[name="mood-display"]')].map((r) => r.value),
+      why: document.getElementById('mood-why')?.textContent ?? '',
+      off: document.getElementById('mood-off')?.textContent ?? '',
+      // What the daemon says, so a test can assert the client obeyed it rather
+      // than asserting its own copy of the rule.
+      rendered: store.status?.mood?.rendered ?? null,
+      // The rows. `chips` counts rows wearing a chip at all; `events` and
+      // `moods` split it, because the two halves are gated differently and a
+      // single number could not tell a passing test from a failing one.
+      rows: document.querySelectorAll('#seg-list .seg').length,
+      chips: document.querySelectorAll('#seg-list .mood-chips').length,
+      events: document.querySelectorAll('#seg-list .mood-chip.event').length,
+      moods: document.querySelectorAll('#seg-list .mood-chip.mood').length,
+      // The tint. The CLASS is what is asserted, because the colour is an
+      // `hsl()` of two CSS variables and a computed value would be asserting
+      // the theme rather than the feature; `tintColors` is carried anyway so a
+      // failure says what it actually drew.
+      tinted: document.querySelectorAll('#seg-list .txt.has-mood').length,
+      tintColors: [...document.querySelectorAll('#seg-list .txt.has-mood')]
+        .slice(0, 3)
+        .map((t) => t.getAttribute('style') ?? ''),
+      // A sample, so a failure names a row rather than a count.
+      sample: [...document.querySelectorAll('#seg-list .seg')]
+        .filter((r) => r.querySelector('.mood-chips') || r.querySelector('.txt.has-mood'))
+        .slice(0, 3)
+        .map((r) => ({
+          seg: Number(r.dataset.seg),
+          chips: [...r.querySelectorAll('.mood-chip')].map((c) => c.textContent),
+          tint: r.querySelector('.txt.has-mood')?.className ?? '',
+        })),
     }),
     // 0.10.2: the Translation card's three controls, as a person sees them.
     translation: () => ({

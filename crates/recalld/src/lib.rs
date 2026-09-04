@@ -64,6 +64,11 @@ pub mod langctx;
 pub mod lid;
 pub mod llm;
 pub mod models;
+/// 0.12.4: how a turn sounded — SenseVoice's own emotion and event tags,
+/// read off the stored clips by a background pass. See `docs/PROTOCOL.md`
+/// and `spike/FINDINGS.md` §42 for what of it is measured and what is only
+/// stored.
+pub mod mood;
 pub mod night;
 pub mod nllb;
 pub mod notes;

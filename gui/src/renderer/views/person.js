@@ -19,6 +19,9 @@ import { store, speakerLabel, isYou, ask } from '../lib/store.js';
 // most other people's names on it, so it reads the same helpers everywhere.
 import { lookOn, iconSpan, highlightPicker } from './highlight.js';
 import { toast } from '../lib/sheets.js';
+// 0.12.4 — the mood tint's three hues, so the one mood word on this page is
+// painted through the ground exactly as a transcript row's words are.
+import { moodColor } from '../lib/palette.js';
 import { playSpeaker, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 
 export const id = 'person';
@@ -67,9 +70,23 @@ export function mount(root, ctx, arg) {
   // about this person, and the edges are about everybody else.
   const worlds = h('div', { class: 'card', id: 'person-worlds' });
   const talk = h('div', { class: 'card', id: 'person-talk' });
+  // 0.12.4. Below "how you talk" and above the edges, for the same reason
+  // those two are in that order: it is still about this person, and it is the
+  // softest claim on the page, so it goes last of the three.
+  const sound = h('div', { class: 'card', id: 'person-sound' });
   const edges = h('div', { class: 'card', id: 'person-edges' });
   const threads = h('div', { class: 'card', id: 'person-threads' });
-  const body = h('div', { class: 'view-body view-enter' }, header, stats, worlds, talk, edges, threads);
+  const body = h(
+    'div',
+    { class: 'view-body view-enter' },
+    header,
+    stats,
+    worlds,
+    talk,
+    sound,
+    edges,
+    threads
+  );
 
   root.append(
     h('div', { class: 'view-head' }, back, h('div', {}, title, sub), h('div', { class: 'spacer' })),
@@ -409,6 +426,89 @@ export function mount(root, ctx, arg) {
     }
   }
 
+  // -- how they sound (0.12.4) ----------------------------------------------
+  //
+  // Its own card and not a cell in "How you talk", because it is a different
+  // kind of number: everything on that card is arithmetic over turns and
+  // timestamps, and this is a model's opinion about audio. Mixing the two would
+  // put a guess in a row of measurements.
+  //
+  // Three refusals are built in, and all three are the daemon's rather than
+  // this file's:
+  //
+  //   - the card is absent until the pass has read enough of their turns for a
+  //     ratio to be about them (`person.get` sends `summary: null`);
+  //   - the laughter line is absent below the base rate (`laughs`);
+  //   - the mood line is absent while the measurement says so (`mood`).
+  //
+  // The DENOMINATOR is always printed. "They laugh a lot" over thirty turns and
+  // over three thousand are different claims, and only one of them is worth
+  // anything.
+
+  function renderSound() {
+    clear(sound);
+    const m = page?.mood ?? null;
+    const s = m?.summary ?? null;
+    sound.hidden = !s;
+    if (!s) return;
+    const pct = Math.round((s.laughter_share ?? 0) * 100);
+    sound.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('div', { class: 'card-title', text: 'How they sound' }),
+        h('span', {
+          class: 'sub',
+          id: 'sound-sub',
+          // The denominator, in the subtitle, where it cannot be scrolled past.
+          text: `over ${s.read} turn${s.read === 1 ? '' : 's'} the decoder has listened to`,
+        })
+      )
+    );
+    const cells = [
+      h(
+        'div',
+        { class: 'person-stat', dataset: { sound: 'laughter' } },
+        h('b', { text: `${s.laughter} (${pct}%)` }),
+        h('small', { text: 'turns with laughter' })
+      ),
+    ];
+    if ((m.counts?.music ?? 0) > 0) {
+      cells.push(
+        h(
+          'div',
+          { class: 'person-stat', dataset: { sound: 'music' } },
+          h('b', { text: String(m.counts.music) }),
+          h('small', { text: 'turns over music' })
+        )
+      );
+    }
+    // Only where the daemon says the measurement earned it. The counts that
+    // would fill this are in `m.counts` either way and are deliberately not
+    // drawn from here: the client does not get to decide what is believable.
+    if (s.mood) {
+      cells.push(
+        h(
+          'div',
+          { class: 'person-stat', dataset: { sound: 'mood' } },
+          h('b', { text: s.mood.mood, style: `color:${moodColor(s.mood.mood) ?? 'inherit'}` }),
+          h('small', { text: `${s.mood.rows} turns read that way` })
+        )
+      );
+    }
+    sound.append(h('div', { class: 'person-strip', id: 'sound-strip' }, ...cells));
+    sound.append(
+      h('p', {
+        class: 'rail-hint',
+        id: 'sound-note',
+        style: 'padding:10px 0 0;max-width:70ch',
+        text: s.laughs
+          ? 'They laugh more often than the archive average. This is a tag the decoder puts on the AUDIO — it is not counted from anything anybody said, and it says nothing about what was funny.'
+          : 'Laughter here is about as often as anywhere else in the archive, so it says nothing in particular about them. It is a tag on the audio, not a count of words.',
+      })
+    );
+  }
+
   // -- who they talk with ---------------------------------------------------
 
   function renderEdges() {
@@ -639,6 +739,10 @@ export function mount(root, ctx, arg) {
     renderHeader();
     renderStats();
     renderWorlds();
+    // 0.12.4: it comes off `person.get` like the rest of the page, so it is
+    // painted here rather than beside `renderTalk` — which has its own,
+    // separate query.
+    renderSound();
     renderEdges();
     renderThreads();
   }
@@ -697,6 +801,7 @@ export function mount(root, ctx, arg) {
   renderStats();
   renderWorlds();
   renderTalk();
+  renderSound();
   renderEdges();
   renderThreads();
   void load();

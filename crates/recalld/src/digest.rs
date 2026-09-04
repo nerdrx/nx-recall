@@ -665,6 +665,21 @@ pub fn digest_json(store: &Store, row: &DigestRow) -> Value {
         // it — a paragraph about an evening reads differently once you know
         // which room it was in.
         "world": store.thread_world(row.thread_id).ok().flatten(),
+        // 0.12.4: how it felt. The same block `thread.get` carries, from the
+        // same function, because a digest and a conversation page are two
+        // renderings of one evening and the second must not be able to say
+        // something the first cannot.
+        //
+        // It is NOT part of the paragraph, and that is the point. Every clause
+        // added to a prompt that both decides and writes made the deciding
+        // worse (the table in this module's note), and "say how it felt" is
+        // exactly such a clause — so the feeling is *counted* and handed over
+        // beside the prose, never asked of the model. `summary` inside it is
+        // null on most conversations, which is the honest answer for eight
+        // turns of "ja / ne / lol".
+        "mood": crate::service::mood_summary_json(
+            &store.thread_mood(row.thread_id).unwrap_or_default(),
+        ),
         "model_id": row.model_id,
         "created_ms": ns_to_ms(row.created_ns),
     })

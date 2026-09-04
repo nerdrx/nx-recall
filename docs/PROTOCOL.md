@@ -4614,3 +4614,229 @@ rewrites text, `segments.reassign` rewrites the speaker); after 0.12.4 an
 applied resplit can also *shorten* an existing row and add a sibling beside it.
 A client that re-reads a segment by id after a `segment.updated` event was
 already doing the right thing.
+## 0.12.4 — how a turn sounded (schema v18)
+
+The user asked for one thing: *"colour in the text or tag the text with the mood
+in the transcript"*. The honest answer turned out to be two features with two
+different amounts of evidence behind them, and this section is mostly about
+keeping those two apart on the wire.
+
+**Nothing here is new inference.** SenseVoice — the decoder 0.11.6 catalogued
+for Korean and Chinese (FINDINGS §27) — has always emitted four tags per decode:
+language, emotion, audio event, and whether inverse text normalisation ran. The
+daemon read `text` and dropped the rest. 0.12.4 reads two more of them.
+
+### What is measured, and therefore what is drawn
+
+`spike/mood_bench.py` ran SenseVoice-small int8 over the user's own archive on
+four niced cores before a line of GUI was written. The table is FINDINGS §42; the
+two sentences that decide the protocol are:
+
+* **Events are drawn.** `laughter` and `music` are marks on the audio, and
+  laughter agrees with the transcript's own laughter tokens far above the base
+  rate.
+* **Mood is stored and withheld.** The model declines to answer on most turns,
+  and on the rest it did not clear the margin fixed before the run.
+
+So the wire carries both and **one flag says which may be believed**. That is
+deliberate: a daemon that quietly omitted a column would leave a future client
+unable to tell "withheld" from "old daemon", and a client that decided for itself
+would be telling somebody how their friend felt on evidence nobody checked.
+
+### Schema v18 — `segments.mood`, `.events`, `.mood_at_ns`
+
+Three nullable columns on `segments`, no backfill.
+
+| column | value |
+|---|---|
+| `mood` | `happy`, `sad`, `angry`, `neutral`, or NULL |
+| `events` | the sorted comma-joined subset of `laughter,music,applause,cry`, or NULL |
+| `mood_at_ns` | when the pass looked |
+
+**`mood_at_ns` is the queue and the other two are the answer.** There are three
+columns and not two because the pass stamps every row it reaches, *including*
+the ones it heard nothing on — a model that abstained and a clip retention has
+taken both write NULL/NULL, and without the third column they would be
+indistinguishable from a row nothing had visited. The pass would then re-read
+them every night for the life of the archive.
+
+NULL in `mood` therefore means one of two things and the row cannot tell them
+apart: nothing has listened, or the model listened and declined. Both render
+identically — as nothing — so the distinction stays off the wire.
+
+### The segment shape gains two keys
+
+Every surface that carries a segment carries them: the transcript, a search hit,
+`thread.get`, replay, and the live `segment` event.
+
+```json
+"mood": "happy",
+"events": ["laughter", "music"]
+```
+
+`events` is an **array of the closed set**, never the stored comma-joined
+string, and it is `[]` — not `null` — on a turn that carried none and on every
+row the pass has not reached. A client iterates it without a null check, because
+"no event" and "not looked at" are the same thing to draw.
+
+`mood` is a bare string or `null`. **A client must consult
+`status.mood.rendered` before drawing it.**
+
+### `status.mood`
+
+Always present, always the same shape, so a client can tell "off", "the model is
+not installed" and "an older daemon" apart:
+
+```json
+"mood": {
+  "enabled": false,          // [mood].enabled — is the pass listening
+  "available": true,         // is SenseVoice on disk
+  "how": null,               // …and how to get it, when it is not
+  "phase": "off",            // off | unavailable | blocked | idle | running
+  "rendered": false,         // MAY THE MOOD BE DRAWN — a measurement, not a setting
+  "why": "The mood tag is stored but not shown: …",
+  "live": false,             // are the tags also read on the way in
+  "backlog": 0,
+  "read_total": 0,
+  "counters": { "read": 0, "with_mood": 0, "with_event": 0, "no_audio": 0, "last_run_ms": 0 }
+}
+```
+
+`rendered` is the load-bearing key and it is **not** `enabled`. The pass being on
+says the tags are being written; `rendered` says whether the mood among them may
+be believed, and it comes from `crate::mood::MOOD_IS_MEASURED` rather than from
+config. There is no request that changes it, and that is on purpose: whether a
+measurement came out is not the operator's opinion, and a switch there would be
+an invitation to turn on a feature the evidence calls noise. **Laughter and music
+are never gated by it** — they were measured separately and they passed.
+
+`why` carries the daemon's own sentence for the refusal, so a client prints the
+reason instead of inventing a friendlier one.
+
+### `[assist] mood_display` — the fourth control on that card
+
+`tags` (the default), `tint`, `both`, `off`. Set through `assist.set` beside the
+three translation settings, carried on `assist.get`, on the `assist` event and on
+`status.assist`, and live in all four — a control that needs a restart is not a
+control.
+
+**The setting governs the MOOD; the events are governed only by `off`.** A mood
+can be a chip or a colour, and an event can only ever be a chip — there is no
+such thing as the colour of laughter. So `tint` means "put the mood on the
+words instead of on a chip", and laughter and music keep theirs. That is also
+what keeps all four states acting on the daemon as it ships, where the mood is
+withheld: without the split, `tint` would draw nothing at all and be a setting
+waiting on a measurement.
+
+It is on `[assist]` rather than on `[mood]` because it is a fact about a **page**
+and `[mood].enabled` is a fact about the **pass**. Two questions, two switches: a
+person who turns the display off has not turned the listening off.
+
+```
+assist.set {"mood_display": "both"}
+```
+
+Refused with `params` for anything outside the four, in the shape
+`translation_display` is: a client that sends `tinted` is told, rather than
+silently getting the default and wondering why its radio button will not stick.
+
+`off` still leaves the laughter glyph on the headset overlay, which is another
+surface with its own answer — see `docs/OVERLAY.md`.
+
+### `speakers.palette` gains `mood_palette`
+
+```json
+{ "palette": [ … ten … ], "mood_palette": [
+  {"token": "happy",  "hue": 44,  "hex": "#705d29"},
+  {"token": "sad",    "hue": 232, "hex": "#293370"},
+  {"token": "angry",  "hue": 350, "hex": "#702935"}
+]}
+```
+
+Three, and they are three of the ten the person palette already spends, so the
+suite turns one wheel. `neutral` is a mood and is deliberately **absent**: it is
+what a transcript already looks like, and painting it would repaint the whole
+archive to say nothing. A lookup that misses falls through to the ordinary ink,
+which is the rule an unknown token already follows.
+
+Tokens and not hex, for the reason `crate::palette`'s module note gives — see
+`docs/DESIGN.md` §6.1 for the saturation and lightness a *sentence* is painted
+at, which are not a name's.
+
+### `person.get` and `thread.get` gain `mood`; so does a digest
+
+One block, one function, three callers, so a digest and the conversation page it
+opens can never say different things about one evening.
+
+```json
+"mood": {
+  "read": 214,
+  "counts": {"happy": 31, "sad": 4, "angry": 2, "neutral": 60, "laughter": 26, "music": 3},
+  "last_ms": 1756000000000,
+  "last_ns": "1756000000000000000",
+  "summary": {
+    "read": 214,
+    "laughter": 26,
+    "laughter_share": 0.121,
+    "laughs": true,
+    "mood": null
+  }
+}
+```
+
+`counts` is unconditional — they are facts about rows. `summary` is the block
+that says what may be **said**, and it is `null` for nearly everybody: under
+thirty read rows the daemon refuses to write one at all, because a person heard
+twice is not somebody who "laughs half the time". `laughs` is the one claim this
+daemon will make about a person from these tags, and `summary.mood` is the one it
+will not until the measurement changes.
+
+The daemon hands over counts and booleans and never prose. A daemon that shipped
+English sentences would have to ship them in every language the GUI is read in.
+
+**The digest's `mood` is beside the paragraph, never inside it.** Every clause
+added to a prompt that both decides and writes made the deciding worse (the table
+in `crate::digest`'s module note), and "say how it felt" is exactly such a clause.
+The feeling is counted, not asked of the model.
+
+### `search.answer` may read an event off a row
+
+The rows the model is shown gain the event in parentheses after the name:
+
+```
+[301] 21:04 Kira (laughter): der Tank ist einfach explodiert
+```
+
+Parentheses and not brackets, because `[` is the citation syntax and a second
+bracketed thing on the line is a second thing that looks like an id. `mood` is
+**not** on the line — the events were measured and it was not, and a model handed
+a tag nobody trusts will happily build a sentence on it.
+
+**The grounding post-check is unchanged and does not see the mark.** The overlap
+test runs against the rows' `text` alone, so an answer that says *"they laughed"*
+and shares no content word with the turn is still refused. The event tells the
+model which row to read; the words are what it has to read off it.
+
+### `[mood]`
+
+```toml
+[mood]
+enabled = false        # off by default, like every optional pass
+rows_per_run = 2000    # per opening of the gate
+batch_rows = 64        # rows fetched per query, NOT a decode batch
+min_duration_s = 1.0
+live = false           # read the tags on the capture path too
+```
+
+The clock is **borrowed**: `[night].window` and `[night].also_when_idle_min`, the
+same borrow `[asr].lang_sweep` makes and for the same reason — "the hours this
+machine is nobody's" is one fact about a household, and two copies of it would
+eventually disagree. There is no GPU gate, because nothing here touches the card.
+
+`batch_rows` is not the night shift's kind of batch. SenseVoice's tags are **per
+clip**, so concatenating eight turns would ask which of them the laughter was on;
+every clip is decoded on its own, and the number only bounds a query.
+
+`live = false` was measured before it was offered rather than defaulted off out
+of caution — see FINDINGS §42. A live mood chip is worth less than a dropped
+turn, and the overnight pass reaches the same row within a day.

@@ -667,6 +667,8 @@ mod tests {
             night_text: None,
             translation: None,
             translation_via: None,
+            mood: None,
+            events: None,
         }
     }
 

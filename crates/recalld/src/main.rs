@@ -373,12 +373,19 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     // …and the accuracy round's idle worker reads its switches the same way.
     .with_asr(cfg.asr.clone())
     .with_night(cfg.night.clone())
+    // 0.12.4: the mood pass, for the same reason again.
+    .with_mood(cfg.mood.clone())
     // 0.9.0: reminders, digests and translation, for the same reason again.
     .with_assist(cfg.assist.clone());
     // The three translation settings live in one place rather than being
     // threaded through `segment_json`'s dozen call sites; see `translate::LIVE`.
     // `assist.set` writes the same three, which is what makes them live.
     recalld::translate::adopt(&cfg.assist);
+    // 0.12.4: the fourth control on that card, live for the same reason and
+    // read from the same place. Not folded into `translate::adopt` — a mood
+    // chip is not a translation setting, and one function that owned both
+    // would be a name that lied.
+    recalld::mood::set_display(&cfg.assist.mood_display);
     // …and where the second backend's files are (0.11.0). Not a setting: the
     // translator is loaded on first use, and this is the disk it is loaded from.
     recalld::translate::set_models_root(models_root.clone());
@@ -689,6 +696,29 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
             .map_err(|e| warn!("no night shift: {e}"))
             .ok()
     };
+    // ---- 0.12.4: the mood pass --------------------------------------------
+    // Its own thread rather than a pass inside the night shift's or the
+    // sweep's, and the reason is the one gate none of the three shares: this
+    // needs SenseVoice and nothing else — no GPU, no local compile, no
+    // identifier. Folding it into either would make an unrelated
+    // `enabled = false` silently turn it off.
+    let mood_stop = Arc::new(recalld::mood::MoodStop::default());
+    let mood_thread = {
+        let store = Arc::clone(&store);
+        let control = Arc::clone(&control);
+        let bus = Arc::clone(&bus);
+        let root = models_root.clone();
+        let dir = data_dir.to_path_buf();
+        let whole = cfg.clone();
+        let stats = Arc::clone(&control.mood_stats);
+        let stop = Arc::clone(&mood_stop);
+        std::thread::Builder::new()
+            .name("recalld-mood".into())
+            .spawn(move || recalld::mood::run(store, control, bus, root, dir, whole, stats, stop))
+            .map_err(|e| warn!("no mood pass: {e}"))
+            .ok()
+    };
+    // ---- end 0.12.4 -------------------------------------------------------
     // ---- 0.12.0: the archive language sweep -------------------------------
     // Its own thread rather than a second pass inside the night shift's, and
     // the reason is the one gate the two do not share: the night shift needs a
@@ -798,6 +828,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     quality_stop.stop();
     truth_stop.stop();
     night_stop.stop();
+    mood_stop.stop();
     sweep_stop.stop();
     reminder_stop.stop();
     assist_stop.stop();
@@ -818,6 +849,8 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         quality_thread,
         truth_thread,
         night_thread,
+        // 0.12.4.
+        mood_thread,
         // 0.12.0.
         sweep_thread,
         // 0.9.0.
