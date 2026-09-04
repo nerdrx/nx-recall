@@ -104,6 +104,72 @@ pub const LINK_MIN_SEGMENTS: i64 = 20;
 // the arithmetic
 // ---------------------------------------------------------------------------
 
+/// Which of Discord's accounts the audio in front of us can physically
+/// contain (0.12.1, FINDINGS §34).
+///
+/// Discord's speaking rings are the truth about *the call*. They are not the
+/// truth about *the recording*, and on one account the two disagree
+/// systematically: a Discord client never plays your own microphone back to
+/// you, so on application audio captured from that client yours is the one
+/// voice the stream cannot hold (§17 finding 1, and measured again in §33 —
+/// the user's own prototype, the best-attested in the bank, wins 12 of 1,306
+/// turns Discord says they were talking across).
+///
+/// Counting your own ring as presence therefore does not merely add noise, it
+/// relabels single-speaker audio: 1,306 of this install's 1,509 two-user
+/// `overlap` verdicts were you-plus-somebody, i.e. one voice wearing an
+/// `overlap` label, and every number computed against `overlap` was diluted
+/// eight-fold by them.
+///
+/// A microphone is the exact opposite and the rule must not touch it: on
+/// `mic` audio the user's own account is the only voice that *can* be there.
+/// So the rule is one line — drop the own account, and only on application
+/// audio — and it is spelled as a type rather than a bare `bool` so that
+/// neither caller can pass the wrong one by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Audible<'a> {
+    /// `sources.kind` for the session the segment belongs to.
+    kind: &'a str,
+    /// Every Discord account linked to the pinned "You" voice. A slice
+    /// because a person may have two, and an alt is as inaudible as the main.
+    own: &'a [String],
+}
+
+impl<'a> Audible<'a> {
+    pub fn new(kind: &'a str, own: &'a [String]) -> Self {
+        Self { kind, own }
+    }
+
+    /// A stream nothing is known to be missing from: every account counts.
+    /// What a caller with no linked "You" account has, and what every test
+    /// that is not about this rule wants.
+    pub fn everyone() -> Self {
+        Self {
+            kind: crate::store::KIND_APP,
+            own: &[],
+        }
+    }
+
+    /// Can this account's voice be in this recording at all?
+    pub fn hears(&self, user_id: &str) -> bool {
+        !self.silences(user_id)
+    }
+
+    fn silences(&self, user_id: &str) -> bool {
+        self.kind == crate::store::KIND_APP && self.own.iter().any(|u| u == user_id)
+    }
+
+    /// The accounts this stream cannot contain — empty on a microphone, and
+    /// empty when nothing is linked to "You".
+    pub fn silent(&self) -> &'a [String] {
+        if self.kind == crate::store::KIND_APP {
+            self.own
+        } else {
+            &[]
+        }
+    }
+}
+
 /// One user's share of a segment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Coverage {
@@ -222,10 +288,19 @@ pub fn coverage(spans: &[TruthSpan], t_start_ns: i64, t_end_ns: i64) -> Vec<Cove
 /// `truth_nearby` is what separates `nobody` from `unknown`: with no data at
 /// all the only honest answer is that we do not know, and calling that
 /// "nobody was talking" would put a false disagreement into every report.
-pub fn verdict(cov: &[Coverage], truth_nearby: bool) -> Verdict {
+///
+/// `audible` is [`Audible`]'s one rule: on application audio the user's own
+/// account is not *presence*, because that stream cannot carry their voice.
+/// It is applied to presence rather than to [`coverage`] so the arithmetic
+/// stays a description of the call and only the verdict — the claim about the
+/// recording — is corrected. A turn where the user talked over somebody thus
+/// reads `single` for that somebody, and a turn where only the user talked
+/// reads `nobody`, which is what `nobody` has always meant: truth covers this
+/// moment and none of the voices this recording can hold was in it.
+pub fn verdict(cov: &[Coverage], truth_nearby: bool, audible: Audible<'_>) -> Verdict {
     let present: Vec<&Coverage> = cov
         .iter()
-        .filter(|c| c.frac >= truth_verdict::PRESENT_MIN)
+        .filter(|c| c.frac >= truth_verdict::PRESENT_MIN && audible.hears(&c.user_id))
         .collect();
     match present.len() {
         0 => {
@@ -268,7 +343,18 @@ pub fn verdict(cov: &[Coverage], truth_nearby: bool) -> Verdict {
 /// and for the same reason: a re-sent batch is one utterance reported twice,
 /// not one person overlapping themselves. After the merge a sweep over the
 /// interval endpoints totals the time at depth ≥ 2.
-pub fn simultaneous_frac(spans: &[TruthSpan], t_start_ns: i64, t_end_ns: i64) -> f64 {
+///
+/// `audible` for the same reason the verdict takes it (0.12.1): this number
+/// is read as "how much of *this recording* holds two voices", and a mouth
+/// the stream cannot carry is not a second voice in it. Counting the user's
+/// own ring here is what made §26's median `overlap` turn look 47%
+/// simultaneous when seven of every eight such turns were one person talking.
+pub fn simultaneous_frac(
+    spans: &[TruthSpan],
+    t_start_ns: i64,
+    t_end_ns: i64,
+    audible: Audible<'_>,
+) -> f64 {
     let dur = (t_end_ns - t_start_ns) as f64;
     if dur <= 0.0 {
         return 0.0;
@@ -276,6 +362,9 @@ pub fn simultaneous_frac(spans: &[TruthSpan], t_start_ns: i64, t_end_ns: i64) ->
     // Per user, clipped to the segment and merged.
     let mut by_user: Vec<(String, Vec<(i64, i64)>)> = Vec::new();
     for s in spans {
+        if !audible.hears(&s.user_id) {
+            continue;
+        }
         let lo = s.t_start_ns.max(t_start_ns);
         let hi = s.t_end_ns.min(t_end_ns);
         if hi <= lo {
@@ -383,7 +472,15 @@ pub fn migrate_v13(conn: &rusqlite::Connection) -> Result<()> {
         if rows.is_empty() {
             continue;
         }
-        set.execute(rusqlite::params![id, simultaneous_frac(&rows, a, b)])?;
+        // `Audible::everyone()`: a migration runs on a raw connection and has
+        // no business resolving merged speakers to find the "You" account.
+        // The 0.12.1 re-verdict pass (`truth::rejudge`) restamps exactly this
+        // set of rows with the own-account rule applied, so a backfill and a
+        // re-judge on the same upgrade end at the same number.
+        set.execute(rusqlite::params![
+            id,
+            simultaneous_frac(&rows, a, b, Audible::everyone())
+        ])?;
         filled += 1;
     }
     if filled > 0 {
@@ -497,9 +594,17 @@ pub fn label_batch(
     stop: &TruthStop,
 ) -> Result<bool> {
     // ---- gather (lock held) ----
-    let candidates = {
+    //
+    // The own accounts come with the batch rather than per row: it is two
+    // small queries, it cannot change inside one pass in any way that matters,
+    // and asking once means the rule is read from the same place for every row
+    // the batch judges.
+    let (candidates, own) = {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-        guard.segments_for_truth(&cfg.sources, cfg.batch_segments)?
+        (
+            guard.segments_for_truth(&cfg.sources, cfg.batch_segments)?,
+            guard.own_discord_user_ids()?,
+        )
     };
     if candidates.is_empty() {
         return Ok(false);
@@ -524,13 +629,14 @@ pub fn label_batch(
         };
 
         // ---- judge (no lock) ----
+        let audible = Audible::new(&c.kind, &own);
         let cov = coverage(&spans, c.t_start_ns, c.t_end_ns);
-        let v = verdict(&cov, nearby);
+        let v = verdict(&cov, nearby, audible);
         // How much of the turn had two mouths open at once (v13). Stored
         // beside the verdict rather than derived later: the spans it is
         // computed from are subject to retention, the verdict is not.
-        let simul =
-            (!spans.is_empty()).then(|| simultaneous_frac(&spans, c.t_start_ns, c.t_end_ns));
+        let simul = (!spans.is_empty())
+            .then(|| simultaneous_frac(&spans, c.t_start_ns, c.t_end_ns, audible));
 
         // ---- commit (lock held) ----
         {
@@ -544,6 +650,299 @@ pub fn label_batch(
     }
     Ok(true)
 }
+
+// ---- 0.12.1: the re-verdict pass ------------------------------------------
+
+/// `operations.op` for one chunk of re-judged verdicts.
+pub const OP_REJUDGE: &str = "truth.rejudge";
+
+/// `settings` key holding the last re-judge's result, as JSON.
+///
+/// A settings row rather than a column or a migration flag: it is one small
+/// fact about a pass that runs once, `truth report` is the only thing that
+/// reads it, and its presence is also what stops the automatic run from
+/// happening twice.
+pub const REJUDGE_KEY: &str = "truth_rejudge";
+
+/// How many rows one automatic re-judge will take before it stops for the
+/// night. Ten thousand is more than the whole verdict table on the install
+/// this was written for and small enough that a pathological archive cannot
+/// turn first-start into an hour of SQLite.
+pub const REJUDGE_AUTO_LIMIT: usize = 10_000;
+
+/// One verdict the rule changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rejudged {
+    pub segment_id: i64,
+    pub t_start_ns: i64,
+    pub from: String,
+    pub to: String,
+    /// The user the new verdict is about, when it is about one.
+    pub user_id: Option<String>,
+    pub coverage: Option<f64>,
+    /// The re-measured simultaneous share, or `None` where the spans are gone
+    /// and the old number has to stand.
+    pub overlap_frac: Option<f64>,
+    /// False when the answer came from the stored columns rather than from
+    /// the speaking spans, because the spans are no longer on disk.
+    pub from_spans: bool,
+}
+
+/// What a re-judge did, or would do.
+#[derive(Debug, Clone, Default)]
+pub struct RejudgeReport {
+    /// Verdicts looked at: every `single`, `overlap` and `partial` on disk.
+    pub examined: usize,
+    /// The ones the rule moves.
+    pub changed: Vec<Rejudged>,
+    /// Rows re-judged from the stored columns because the spans are gone.
+    pub from_columns: usize,
+    /// `overlap` rows whose spans are gone: the one case the rule can neither
+    /// confirm nor correct, because the verdict never wrote down *who*.
+    pub unresolvable: usize,
+    /// Rows whose stored `truth_overlap_frac` was re-measured.
+    pub restamped: usize,
+}
+
+impl RejudgeReport {
+    /// `overlap` verdicts the rule took away — the eight-fold number §34 is
+    /// about, and the one `truth report` prints.
+    pub fn overlap_reassigned(&self) -> usize {
+        self.changed
+            .iter()
+            .filter(|r| r.from == truth_verdict::OVERLAP)
+            .count()
+    }
+
+    /// `from -> to`, counted, biggest first. What a person actually reads.
+    pub fn moves(&self) -> Vec<(String, String, usize)> {
+        let mut out: Vec<(String, String, usize)> = Vec::new();
+        for r in &self.changed {
+            match out.iter_mut().find(|(f, t, _)| *f == r.from && *t == r.to) {
+                Some((_, _, n)) => *n += 1,
+                None => out.push((r.from.clone(), r.to.clone(), 1)),
+            }
+        }
+        out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
+    pub fn to_json(&self, at_ns: i64) -> Value {
+        json!({
+            "at_ms": ns_to_ms(at_ns),
+            "examined": self.examined,
+            "changed": self.changed.len(),
+            "overlap_reassigned": self.overlap_reassigned(),
+            "from_columns": self.from_columns,
+            "unresolvable": self.unresolvable,
+            "restamped": self.restamped,
+            "moves": self.moves()
+                .iter()
+                .map(|(f, t, n)| json!({"from": f, "to": t, "n": n}))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Re-judge the verdicts already on disk under the own-account rule
+/// (0.12.1, FINDINGS §34).
+///
+/// ## Why a pass and not a migration
+///
+/// The rule changed what a verdict *means*, and the verdicts on disk were
+/// written by the old meaning. 1,791 `overlap` rows on the install this was
+/// measured on; 1,341 of them were the user talking over one other person on
+/// audio that cannot carry the user, i.e. one voice wearing an `overlap`
+/// label. Everything downstream — the overlap gate's precision and recall,
+/// the calibration corpus, `identity calibrate`'s held-out gate curve — reads
+/// those rows, so leaving them is not "old data", it is a wrong answer key
+/// that keeps being marked against.
+///
+/// ## What it can and cannot re-derive
+///
+/// The verdict is recomputed from the speaking spans, exactly as
+/// [`label_batch`] would compute it today. Where the spans are gone the pass
+/// falls back to the stored columns and says which rows it did that for:
+///
+/// * a `single` or `partial` naming an account this stream cannot contain is
+///   `nobody` with no spans needed — the verdict itself records that nobody
+///   else reached the presence bar, which is the whole question;
+/// * a `single` or `partial` naming anybody else cannot move, for the same
+///   reason read the other way round;
+/// * an **`overlap` row with no surviving spans cannot be re-judged at all**.
+///   It records that two accounts were present and not which two, and the
+///   answer is one of them. Those rows are left exactly as they are and
+///   counted in [`RejudgeReport::unresolvable`], because a pass that guessed
+///   here would be inventing the thing it exists to correct.
+///
+/// `apply` false computes everything and writes nothing.
+pub fn rejudge(
+    store: &Arc<std::sync::Mutex<Store>>,
+    limit: usize,
+    apply: bool,
+    at_ns: i64,
+) -> Result<RejudgeReport> {
+    // ---- gather (lock held) ----
+    //
+    // The own accounts first and on their own: nothing linked to "You" means
+    // nothing is known to be inaudible, and a pass with no rule to apply must
+    // not touch a row — nor walk the verdict table to discover that.
+    let own = {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        guard.own_discord_user_ids()?
+    };
+    if own.is_empty() {
+        return Ok(RejudgeReport::default());
+    }
+    let candidates = {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        guard.segments_for_rejudge(limit)?
+    };
+    let mut report = RejudgeReport {
+        examined: candidates.len(),
+        ..Default::default()
+    };
+
+    for c in candidates {
+        let audible = Audible::new(&c.kind, &own);
+        // ---- gather (lock held) ----
+        let (spans, nearby) = {
+            let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+            let spans = guard.truth_spans_between(c.t_start_ns, c.t_end_ns)?;
+            let nearby = !guard
+                .truth_spans_between(c.t_start_ns - TRUTH_REACH_NS, c.t_end_ns + TRUTH_REACH_NS)?
+                .is_empty();
+            (spans, nearby)
+        };
+
+        // ---- judge (no lock) ----
+        let (v, simul, from_spans) = if spans.is_empty() {
+            let silenced = c.user_id.as_deref().is_some_and(|u| !audible.hears(u));
+            match (c.verdict.as_str(), silenced) {
+                // The verdict is its own evidence: it says one account was
+                // present and this stream cannot hold that account. `nobody`
+                // is what is left, and truth demonstrably covered this moment
+                // once — a `single` is not written over a gap.
+                (truth_verdict::SINGLE | truth_verdict::PARTIAL, true) => {
+                    report.from_columns += 1;
+                    (Verdict::Nobody, None, false)
+                }
+                (truth_verdict::SINGLE | truth_verdict::PARTIAL, false) => continue,
+                // `overlap` never wrote down who. Left alone, and counted.
+                _ => {
+                    report.unresolvable += 1;
+                    continue;
+                }
+            }
+        } else {
+            let cov = coverage(&spans, c.t_start_ns, c.t_end_ns);
+            let v = verdict(&cov, nearby, audible);
+            let f = simultaneous_frac(&spans, c.t_start_ns, c.t_end_ns, audible);
+            (v, Some(f), true)
+        };
+
+        let moved = v.as_str() != c.verdict
+            || v.user_id().map(str::to_string) != c.user_id
+            || v.coverage() != c.coverage;
+        let restamp =
+            simul.is_some_and(|f| c.overlap_frac.is_none_or(|old| (old - f).abs() > 1e-9));
+        if !moved && !restamp {
+            continue;
+        }
+        if moved {
+            report.changed.push(Rejudged {
+                segment_id: c.id,
+                t_start_ns: c.t_start_ns,
+                from: c.verdict.clone(),
+                to: v.as_str().to_string(),
+                user_id: v.user_id().map(str::to_string),
+                coverage: v.coverage(),
+                overlap_frac: simul,
+                from_spans,
+            });
+        }
+        if restamp {
+            report.restamped += 1;
+        }
+
+        // ---- commit (lock held) ----
+        if apply {
+            let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+            if moved {
+                guard.set_segment_truth(c.id, v.user_id(), v.as_str(), v.coverage())?;
+            }
+            if let Some(f) = simul
+                && restamp
+            {
+                guard.set_segment_truth_overlap(c.id, f)?;
+            }
+        }
+    }
+
+    if apply {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        // The prior state, chunked like `truth.label`'s and for the same
+        // reason: one `operations` row carrying four thousand segments is a
+        // row nothing can read back.
+        for chunk in report.changed.chunks(LABEL_CHUNK) {
+            let targets: Vec<i64> = chunk.iter().map(|r| r.segment_id).collect();
+            let prior = json!({
+                "segments": chunk.iter().map(|r| json!({
+                    "segment_id": r.segment_id,
+                    "truth_verdict": r.from,
+                    "to_verdict": r.to,
+                    "to_user_id": r.user_id,
+                    "to_coverage": r.coverage,
+                    "from_spans": r.from_spans,
+                })).collect::<Vec<_>>(),
+            });
+            guard.log_operation(
+                OP_REJUDGE,
+                &serde_json::to_string(&targets)?,
+                &prior.to_string(),
+                at_ns,
+            )?;
+        }
+        guard.set_setting(REJUDGE_KEY, &report.to_json(at_ns).to_string())?;
+    }
+    Ok(report)
+}
+
+/// The automatic half: re-judge once, on the first start after the upgrade,
+/// and never again.
+///
+/// It runs here rather than in a migration because it is not one — it reads
+/// the speaking spans, it can take thousands of small queries, and a
+/// migration that does that runs while the user is waiting for the daemon to
+/// come up. The worker already has the discipline this needs: gather under
+/// the lock, judge with none held, and stand down while capture is busy.
+///
+/// It is bounded three ways — [`REJUDGE_AUTO_LIMIT`] rows, only the verdicts
+/// that assert somebody was present, and only once, on a `settings` row it
+/// writes itself. And it is gated on `[truth].label` with everything else in
+/// this worker: the switch that lets the daemon write verdicts is the switch
+/// that lets it correct them. With labelling off, `recalld truth rejudge`
+/// is the route and the operator drives it.
+fn rejudge_once(store: &Arc<std::sync::Mutex<Store>>) -> Result<()> {
+    {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.setting(REJUDGE_KEY)?.is_some() {
+            return Ok(());
+        }
+    }
+    let report = rejudge(store, REJUDGE_AUTO_LIMIT, true, utc_now_ns())?;
+    info!(
+        examined = report.examined,
+        changed = report.changed.len(),
+        overlap_reassigned = report.overlap_reassigned(),
+        unresolvable = report.unresolvable,
+        "re-judged the verdicts on disk: your own account is not presence on \
+         audio your own client produced"
+    );
+    Ok(())
+}
+
+// ---- end 0.12.1 ------------------------------------------------------------
 
 /// Link Discord users to voices where the evidence is one-sided enough that
 /// there is nothing to decide.
@@ -1038,6 +1437,15 @@ pub fn run(
             if let Some(reason) = gate(&control, &cfg) {
                 debug!("ground-truth worker standing down: {reason}");
             } else {
+                // ---- 0.12.1: the re-verdict, once ------------------------
+                // Before the labelling batch and before everything that reads
+                // a verdict: the corrected verdicts are what the auto-linker,
+                // the retro-labeller and the calibration pass should see on
+                // the very first evening after the upgrade, not on the second.
+                if let Err(e) = rejudge_once(&store) {
+                    warn!("the ground-truth re-verdict pass failed: {e:#}");
+                }
+                // ---- end 0.12.1 ------------------------------------------
                 if let Err(e) = label_batch(&store, &control, &cfg, &stats, &stop) {
                     warn!("a ground-truth labelling batch failed: {e:#}");
                 }
@@ -1202,6 +1610,19 @@ pub fn summary(store: &Store, identity: &IdentityConfig, cfg: &TruthConfig) -> R
                 .len() as i64,
         },
         // ---- end 0.12.0 ----
+        // ---- 0.12.1: what the own-account rule took off the `overlap` pile
+        //
+        // Reported rather than merely done, because "there are 450 overlap
+        // rows" and "there are 450 overlap rows, and 1,341 more used to be
+        // counted here" are different facts about the same install, and every
+        // measurement anybody made before the rule read the second number
+        // without knowing it. `null` until the pass has run: nothing was
+        // reassigned is a claim, and an unrun pass has not made it.
+        "rejudge": store
+            .setting(REJUDGE_KEY)?
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or(Value::Null),
+        // ---- end 0.12.1 ----
         "single": count_of(truth_verdict::SINGLE),
         "overlap": count_of(truth_verdict::OVERLAP),
         "partial": count_of(truth_verdict::PARTIAL),
@@ -1317,7 +1738,7 @@ mod tests {
     const SEG: (i64, i64) = (0, 1_000_000_000); // 0..1000 ms
 
     fn simul(spans: &[TruthSpan]) -> f64 {
-        simultaneous_frac(spans, SEG.0, SEG.1)
+        simultaneous_frac(spans, SEG.0, SEG.1, Audible::everyone())
     }
 
     #[test]
@@ -1338,14 +1759,17 @@ mod tests {
         let spans = [span("a", 0, 500), span("b", 500, 1000)];
         assert_eq!(simul(&spans), 0.0);
         let cov = coverage(&spans, SEG.0, SEG.1);
-        assert!(matches!(verdict(&cov, true), Verdict::Overlap));
+        assert!(matches!(
+            verdict(&cov, true, Audible::everyone()),
+            Verdict::Overlap
+        ));
     }
 
     #[test]
     fn the_interjection_case_reads_as_the_interjection_it_is() {
         // Six seconds of one person, half a second of another across it.
         let spans = [span("a", 0, 6000), span("b", 2000, 2500)];
-        let f = simultaneous_frac(&spans, 0, 6_000_000_000);
+        let f = simultaneous_frac(&spans, 0, 6_000_000_000, Audible::everyone());
         assert!((f - 0.5 / 6.0).abs() < 1e-9, "{f}");
     }
 
@@ -1372,7 +1796,12 @@ mod tests {
     fn spans_are_clipped_to_the_segment_before_anything_is_counted() {
         // Both users talk together for a full second, but only the last
         // 250 ms of it is inside the segment.
-        let f = simultaneous_frac(&[span("a", -1000, 250), span("b", -1000, 250)], 0, SEG.1);
+        let f = simultaneous_frac(
+            &[span("a", -1000, 250), span("b", -1000, 250)],
+            0,
+            SEG.1,
+            Audible::everyone(),
+        );
         assert!((f - 0.25).abs() < 1e-9, "{f}");
         // Entirely outside contributes nothing.
         assert_eq!(simul(&[span("a", 2000, 3000), span("b", 2000, 3000)]), 0.0);
@@ -1380,8 +1809,14 @@ mod tests {
 
     #[test]
     fn a_zero_length_segment_has_no_simultaneity_rather_than_a_division_by_zero() {
-        assert_eq!(simultaneous_frac(&[span("a", 0, 100)], 500, 500), 0.0);
-        assert_eq!(simultaneous_frac(&[span("a", 0, 100)], 500, 400), 0.0);
+        assert_eq!(
+            simultaneous_frac(&[span("a", 0, 100)], 500, 500, Audible::everyone()),
+            0.0
+        );
+        assert_eq!(
+            simultaneous_frac(&[span("a", 0, 100)], 500, 400, Audible::everyone()),
+            0.0
+        );
         assert_eq!(simul(&[]), 0.0);
     }
 
@@ -1492,7 +1927,11 @@ mod tests {
         let seg_start = 0;
         let seg_end = 1_000_000_000; // 1 s
         let judge = |spans: &[TruthSpan], nearby: bool| {
-            verdict(&coverage(spans, seg_start, seg_end), nearby)
+            verdict(
+                &coverage(spans, seg_start, seg_end),
+                nearby,
+                Audible::everyone(),
+            )
         };
 
         // one user over the single bar, nobody else present
@@ -1525,6 +1964,186 @@ mod tests {
         // nobody. This is the distinction the whole report rests on.
         assert_eq!(judge(&[], false), Verdict::Unknown);
         assert_eq!(judge(&[], true), Verdict::Nobody);
+    }
+
+    // ---- 0.12.1: the own-account rule (FINDINGS §34) ---------------------
+
+    const ME: &str = "me";
+
+    /// The user's own account, as `Audible` gets it from the store.
+    fn own() -> Vec<String> {
+        vec![ME.to_string()]
+    }
+
+    fn judge_on(kind: &str, own: &[String], spans: &[TruthSpan], nearby: bool) -> Verdict {
+        verdict(
+            &coverage(spans, 0, 1_000_000_000),
+            nearby,
+            Audible::new(kind, own),
+        )
+    }
+
+    #[test]
+    fn your_own_ring_is_not_a_second_voice_on_audio_your_own_client_made() {
+        // 1,306 of this install's 1,509 two-user `overlap` verdicts are this
+        // exact picture: somebody talking across most of the turn, the user
+        // talking over them, and a recording that cannot contain the user
+        // (§17 finding 1, §33). It is single-speaker audio wearing an
+        // `overlap` label, and the label is what has to go.
+        let spans = [span("aspen", 0, 900), span(ME, 200, 700)];
+        assert_eq!(
+            judge_on(crate::store::KIND_APP, &own(), &spans, true),
+            Verdict::Single {
+                user_id: "aspen".into(),
+                frac: 0.9,
+            },
+            "with the user's ring dropped, Aspen is alone and over the bar"
+        );
+        // The arithmetic is untouched: `coverage` still describes the CALL,
+        // and the user is still in it at half of the turn. Only presence —
+        // the claim about the recording — changed.
+        let cov = coverage(&spans, 0, 1_000_000_000);
+        assert!(cov.iter().any(|c| c.user_id == ME && c.frac > 0.4));
+    }
+
+    #[test]
+    fn on_the_microphone_your_own_account_is_the_only_voice_that_can_be_there() {
+        // The mirror image, and the reason the rule is about the SOURCE and
+        // not about the account. A microphone hears the user and nobody
+        // else's Discord audio; dropping them there would delete the one
+        // verdict that stream can produce.
+        let alone = [span(ME, 0, 1000)];
+        assert_eq!(
+            judge_on(crate::store::KIND_MIC, &own(), &alone, true),
+            Verdict::Single {
+                user_id: ME.into(),
+                frac: 1.0,
+            }
+        );
+        // And a room mic hears whoever is in the room, the user included.
+        assert!(matches!(
+            judge_on(crate::store::KIND_ROOM, &own(), &alone, true),
+            Verdict::Single { .. }
+        ));
+        // Two people on a microphone is still two people.
+        let both = [span("aspen", 0, 900), span(ME, 200, 700)];
+        assert_eq!(
+            judge_on(crate::store::KIND_MIC, &own(), &both, true),
+            Verdict::Overlap
+        );
+        // On application audio, the same two rings are one voice.
+        assert!(matches!(
+            judge_on(crate::store::KIND_APP, &own(), &both, true),
+            Verdict::Single { .. }
+        ));
+    }
+
+    #[test]
+    fn dropping_your_ring_can_leave_a_partial_or_nobody_and_says_so() {
+        // Aspen only reaches half the turn: `partial`, which is the verdict
+        // that exists so a half-covered turn is neither scored as clean nor
+        // claimed as overlapped. Promoting these to `single` would lower the
+        // 0.8 bar through the back door.
+        let half = [span("aspen", 0, 500), span(ME, 0, 900)];
+        assert!(matches!(
+            judge_on(crate::store::KIND_APP, &own(), &half, true),
+            Verdict::Partial { ref user_id, frac } if user_id == "aspen" && (frac - 0.5).abs() < 1e-9
+        ));
+        // Nobody but the user: `nobody`, and that is exactly what `nobody`
+        // has always meant — truth covers this moment and none of the voices
+        // this recording can hold was in it.
+        let only_me = [span(ME, 0, 1000)];
+        assert_eq!(
+            judge_on(crate::store::KIND_APP, &own(), &only_me, true),
+            Verdict::Nobody
+        );
+        // With no truth data anywhere near, it is still `unknown`: the rule
+        // removes a voice, it does not manufacture coverage.
+        assert_eq!(
+            judge_on(crate::store::KIND_APP, &own(), &only_me, false),
+            Verdict::Unknown
+        );
+        // A user under the presence bar was never present, and the rule does
+        // not change that either.
+        assert_eq!(
+            judge_on(crate::store::KIND_APP, &own(), &[span(ME, 0, 100)], true),
+            Verdict::Nobody
+        );
+    }
+
+    #[test]
+    fn with_nothing_linked_to_you_every_ring_still_counts() {
+        // `Audible` with an empty own-list is the state of an install that
+        // has never linked an account: nothing is known to be inaudible, and
+        // a rule with no subject must not fire.
+        let spans = [span("aspen", 0, 900), span(ME, 200, 700)];
+        assert_eq!(
+            judge_on(crate::store::KIND_APP, &[], &spans, true),
+            Verdict::Overlap
+        );
+        assert_eq!(
+            verdict(
+                &coverage(&spans, 0, 1_000_000_000),
+                true,
+                Audible::everyone()
+            ),
+            Verdict::Overlap
+        );
+    }
+
+    #[test]
+    fn an_alt_account_is_as_inaudible_as_the_main_one() {
+        let two = vec![ME.to_string(), "me-alt".to_string()];
+        let spans = [span("aspen", 0, 900), span("me-alt", 200, 700)];
+        assert!(matches!(
+            judge_on(crate::store::KIND_APP, &two, &spans, true),
+            Verdict::Single { ref user_id, .. } if user_id == "aspen"
+        ));
+    }
+
+    #[test]
+    fn the_simultaneous_share_does_not_count_a_mouth_the_stream_cannot_carry() {
+        // §26 read the median `overlap` turn as 47% simultaneous. Seven of
+        // every eight of those turns were one person talking, and the second
+        // "mouth" was the user's own — which is why this number takes the
+        // same rule the verdict does.
+        let spans = [span("aspen", 0, 1000), span(ME, 0, 500)];
+        assert_eq!(
+            simultaneous_frac(
+                &spans,
+                0,
+                1_000_000_000,
+                Audible::new(crate::store::KIND_APP, &own())
+            ),
+            0.0
+        );
+        // On a microphone the same two rings really are two mouths.
+        assert!(
+            (simultaneous_frac(
+                &spans,
+                0,
+                1_000_000_000,
+                Audible::new(crate::store::KIND_MIC, &own())
+            ) - 0.5)
+                .abs()
+                < 1e-9
+        );
+        // And a real second voice is untouched by the rule.
+        let real = [
+            span("aspen", 0, 1000),
+            span("rowan", 0, 500),
+            span(ME, 0, 900),
+        ];
+        assert!(
+            (simultaneous_frac(
+                &real,
+                0,
+                1_000_000_000,
+                Audible::new(crate::store::KIND_APP, &own())
+            ) - 0.5)
+                .abs()
+                < 1e-9
+        );
     }
 
     #[test]
@@ -1941,5 +2560,213 @@ mod tests {
         let moved = label_from_truth(&store, usize::MAX, true, 1).unwrap();
         assert!(moved.iter().all(|m| m.segment_id != seg));
         assert_eq!(label_of(&store, seg), (None, None));
+    }
+
+    // ---- 0.12.1: the re-verdict pass -------------------------------------
+
+    const SEC: i64 = 1_000_000_000;
+
+    /// An install shaped like the one §34 measured: a Discord app session and
+    /// a microphone session, the user's account linked to the pinned "You"
+    /// voice, and a friend linked to another.
+    fn a_store_to_rejudge() -> (Arc<std::sync::Mutex<Store>>, i64, i64) {
+        use crate::store::truth_via;
+        let s = Store::open_in_memory().unwrap();
+        let you = s.ensure_you_speaker(0).unwrap();
+        let aspen = s.mint_speaker(0).unwrap();
+        s.upsert_discord_user("me", "nerdrx", 0).unwrap();
+        s.set_discord_link("me", Some(you), Some(truth_via::MANUAL), 0)
+            .unwrap();
+        s.upsert_discord_user("aspen", "Aspen", 0).unwrap();
+        s.set_discord_link("aspen", Some(aspen), Some(truth_via::MANUAL), 0)
+            .unwrap();
+        let app = s.upsert_source("vesktop", "Vesktop", 1).unwrap();
+        let app_sess = s.begin_session(app, 0).unwrap();
+        let mic = s
+            .upsert_source_kind("mic", "Microphone", crate::store::KIND_MIC, 1)
+            .unwrap();
+        let mic_sess = s.begin_session(mic, 0).unwrap();
+        (Arc::new(std::sync::Mutex::new(s)), app_sess, mic_sess)
+    }
+
+    /// A turn with its spans and the verdict the OLD rule wrote for it.
+    fn old_verdict_turn(
+        store: &Arc<std::sync::Mutex<Store>>,
+        session: i64,
+        at_s: i64,
+        rings: &[(&str, i64, i64)],
+    ) -> i64 {
+        let g = store.lock().unwrap();
+        let (a, b) = (at_s * SEC, at_s * SEC + 2 * SEC);
+        let seg = g.insert_segment(session, a, b, "t.wav", 0).unwrap();
+        let mut spans = Vec::new();
+        for (u, from_ms, to_ms) in rings {
+            g.truth_speaking_start(u, u, None, a + from_ms * 1_000_000)
+                .unwrap();
+            g.truth_speaking_stop(u, a + to_ms * 1_000_000).unwrap();
+            spans.push(TruthSpan {
+                user_id: (*u).to_string(),
+                name: (*u).to_string(),
+                t_start_ns: a + from_ms * 1_000_000,
+                t_end_ns: a + to_ms * 1_000_000,
+            });
+        }
+        // Exactly what the pass would have written before the rule existed.
+        let cov = coverage(&spans, a, b);
+        let v = verdict(&cov, true, Audible::everyone());
+        g.set_segment_truth(seg, v.user_id(), v.as_str(), v.coverage())
+            .unwrap();
+        g.set_segment_truth_overlap(seg, simultaneous_frac(&spans, a, b, Audible::everyone()))
+            .unwrap();
+        seg
+    }
+
+    fn verdict_of(store: &Arc<std::sync::Mutex<Store>>, seg: i64) -> (String, Option<String>) {
+        let g = store.lock().unwrap();
+        let t = g.segment_truth(seg).unwrap().unwrap();
+        (t.verdict.unwrap(), t.user_id)
+    }
+
+    #[test]
+    fn the_re_verdict_takes_the_phantom_overlaps_back() {
+        let (store, app, mic) = a_store_to_rejudge();
+        // The phantom: Aspen across the turn, the user talking over her, on
+        // Discord's own output.
+        let phantom = old_verdict_turn(&store, app, 10, &[("aspen", 0, 1800), ("me", 400, 1400)]);
+        // The real thing: two other people. Nothing to correct.
+        let real = old_verdict_turn(&store, app, 20, &[("aspen", 0, 1800), ("rowan", 400, 1400)]);
+        // The user alone on application audio: a `single` about a voice the
+        // recording cannot hold.
+        let ghost = old_verdict_turn(&store, app, 30, &[("me", 0, 1900)]);
+        // The same picture on the microphone, where it is simply true.
+        let real_mic = old_verdict_turn(&store, mic, 40, &[("me", 0, 1900)]);
+        assert_eq!(verdict_of(&store, phantom).0, truth_verdict::OVERLAP);
+        assert_eq!(verdict_of(&store, ghost).0, truth_verdict::SINGLE);
+
+        // ---- the preview writes nothing ----
+        let preview = rejudge(&store, usize::MAX, false, 1).unwrap();
+        assert_eq!(preview.examined, 4);
+        assert_eq!(preview.changed.len(), 2);
+        assert_eq!(preview.overlap_reassigned(), 1);
+        assert_eq!(verdict_of(&store, phantom).0, truth_verdict::OVERLAP);
+
+        // ---- and the apply writes exactly what it previewed ----
+        let done = rejudge(&store, usize::MAX, true, 1).unwrap();
+        assert_eq!(done.changed, preview.changed, "preview is the same pass");
+        assert_eq!(
+            verdict_of(&store, phantom),
+            (truth_verdict::SINGLE.to_string(), Some("aspen".to_string())),
+            "one voice, one label"
+        );
+        assert_eq!(verdict_of(&store, real).0, truth_verdict::OVERLAP);
+        assert_eq!(verdict_of(&store, ghost).0, truth_verdict::NOBODY);
+        assert_eq!(
+            verdict_of(&store, real_mic),
+            (truth_verdict::SINGLE.to_string(), Some("me".to_string())),
+            "the microphone is the one place the user's own account IS the answer"
+        );
+
+        // The simultaneous share is re-measured on the same rule: the phantom
+        // holds one mouth, the real overlap still holds two.
+        let g = store.lock().unwrap();
+        assert_eq!(g.segment_truth_overlap(phantom).unwrap(), Some(0.0));
+        assert!(g.segment_truth_overlap(real).unwrap().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn a_second_re_verdict_has_nothing_left_to_do() {
+        let (store, app, _) = a_store_to_rejudge();
+        old_verdict_turn(&store, app, 10, &[("aspen", 0, 1800), ("me", 400, 1400)]);
+        assert_eq!(
+            rejudge(&store, usize::MAX, true, 1).unwrap().changed.len(),
+            1
+        );
+        let again = rejudge(&store, usize::MAX, true, 2).unwrap();
+        assert!(again.changed.is_empty(), "idempotent, like every pass here");
+        assert_eq!(again.restamped, 0);
+    }
+
+    #[test]
+    fn the_re_verdict_is_written_down_and_readable_back() {
+        let (store, app, _) = a_store_to_rejudge();
+        let seg = old_verdict_turn(&store, app, 10, &[("aspen", 0, 1800), ("me", 400, 1400)]);
+        let r = rejudge(&store, usize::MAX, true, 77).unwrap();
+        let g = store.lock().unwrap();
+        let ops = g.operations_of(OP_REJUDGE, 10).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(ops[0].target_ids.contains(&seg.to_string()));
+        assert!(ops[0].prior_state.contains(truth_verdict::OVERLAP));
+        // And the count `truth report` prints survives the pass that made it.
+        let stored: Value =
+            serde_json::from_str(&g.setting(REJUDGE_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(stored["overlap_reassigned"], json!(1));
+        assert_eq!(stored["changed"], json!(r.changed.len()));
+    }
+
+    #[test]
+    fn a_verdict_whose_spans_are_gone_is_re_derived_only_where_that_is_honest() {
+        let (store, app, _) = a_store_to_rejudge();
+        let (mine, hers, over) = {
+            let g = store.lock().unwrap();
+            let mk = |at_s: i64, v: &str, user: Option<&str>, cov: Option<f64>| {
+                let a = at_s * SEC;
+                let seg = g.insert_segment(app, a, a + 2 * SEC, "t.wav", 0).unwrap();
+                g.set_segment_truth(seg, user, v, cov).unwrap();
+                seg
+            };
+            (
+                // A `single` about the user, with no span left anywhere.
+                mk(10, truth_verdict::SINGLE, Some("me"), Some(0.95)),
+                // A `single` about somebody else: nothing the rule can move.
+                mk(20, truth_verdict::SINGLE, Some("aspen"), Some(0.95)),
+                // An `overlap`, which never wrote down WHO.
+                mk(30, truth_verdict::OVERLAP, None, None),
+            )
+        };
+        let r = rejudge(&store, usize::MAX, true, 1).unwrap();
+        assert_eq!(r.from_columns, 1);
+        assert_eq!(r.unresolvable, 1, "the one row that cannot be re-judged");
+        assert_eq!(
+            verdict_of(&store, mine).0,
+            truth_verdict::NOBODY,
+            "the verdict itself is the evidence: nobody else reached the bar"
+        );
+        assert_eq!(verdict_of(&store, hers).0, truth_verdict::SINGLE);
+        assert_eq!(
+            verdict_of(&store, over).0,
+            truth_verdict::OVERLAP,
+            "guessing here would invent the thing the pass exists to correct"
+        );
+    }
+
+    #[test]
+    fn with_no_account_linked_to_you_the_pass_refuses_to_touch_anything() {
+        let s = Store::open_in_memory().unwrap();
+        let app = s.upsert_source("vesktop", "Vesktop", 1).unwrap();
+        let sess = s.begin_session(app, 0).unwrap();
+        let store = Arc::new(std::sync::Mutex::new(s));
+        let seg = old_verdict_turn(&store, sess, 10, &[("aspen", 0, 1800), ("me", 400, 1400)]);
+        let r = rejudge(&store, usize::MAX, true, 1).unwrap();
+        assert_eq!(r.examined, 0, "no subject, no rule, no walk of the table");
+        assert_eq!(verdict_of(&store, seg).0, truth_verdict::OVERLAP);
+    }
+
+    #[test]
+    fn the_automatic_re_verdict_runs_once_and_only_once() {
+        let (store, app, _) = a_store_to_rejudge();
+        old_verdict_turn(&store, app, 10, &[("aspen", 0, 1800), ("me", 400, 1400)]);
+        rejudge_once(&store).unwrap();
+        assert_eq!(verdict_of(&store, 1).0, truth_verdict::SINGLE);
+        // A second turn arrives with an old-rule verdict — a row the live
+        // pass would never write now, so the only way it exists is somebody
+        // putting it there. The automatic pass is done and does not re-run;
+        // `recalld truth rejudge` is the route.
+        let late = old_verdict_turn(&store, app, 20, &[("aspen", 0, 1800), ("me", 400, 1400)]);
+        rejudge_once(&store).unwrap();
+        assert_eq!(verdict_of(&store, late).0, truth_verdict::OVERLAP);
+        assert_eq!(
+            rejudge(&store, usize::MAX, true, 1).unwrap().changed.len(),
+            1
+        );
     }
 }

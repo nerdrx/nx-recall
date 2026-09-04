@@ -6231,7 +6231,7 @@ impl Store {
             return Ok(Vec::new());
         }
         let sql = format!(
-            "SELECT g.id, g.t_start_ns, g.t_end_ns, g.speaker_id, g.overlap_frac
+            "SELECT g.id, g.t_start_ns, g.t_end_ns, g.speaker_id, g.overlap_frac, sc.kind
                FROM segments g
                JOIN sessions ss ON ss.id = g.session_id
                JOIN sources  sc ON sc.id = ss.source_id
@@ -6261,6 +6261,7 @@ impl Store {
                     t_end_ns: r.get(2)?,
                     speaker_id: r.get(3)?,
                     overlap_frac: r.get(4)?,
+                    kind: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -6594,6 +6595,68 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The Discord accounts that are the user themselves (0.12.1).
+    ///
+    /// "The user" is the pinned "You" voice, and an account is theirs when it
+    /// is linked to it — by hand or by the auto-linker, it makes no difference
+    /// here. A list rather than one id because a person may have two accounts
+    /// and an alt is exactly as inaudible in their own client's output as the
+    /// main one; empty when nothing is linked, which is the state
+    /// [`crate::truth::Audible`] treats as "nothing is known to be missing".
+    pub fn own_discord_user_ids(&self) -> Result<Vec<String>> {
+        match self.you_speaker_id()? {
+            None => Ok(Vec::new()),
+            Some(you) => self.discord_user_ids_for_speaker(you),
+        }
+    }
+
+    /// Every verdict that could change if a user stops counting as present,
+    /// oldest first (0.12.1, `truth::rejudge`).
+    ///
+    /// `single`, `overlap` and `partial` and nothing else, and that is a
+    /// closed argument rather than an optimisation: the own-account rule only
+    /// ever *removes* presence, and removing presence cannot turn `nobody`
+    /// into anything or make an `unknown` known. Whatever else is re-judged
+    /// later, this query is the complete set of rows this rule can touch, so
+    /// the pass is bounded by the number of verdicts that assert somebody was
+    /// talking — 3,781 on the install §34 measured, not the 9,770 with a
+    /// verdict of any kind.
+    pub fn segments_for_rejudge(&self, limit: usize) -> Result<Vec<RejudgeCandidate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.t_start_ns, g.t_end_ns, sc.kind, g.truth_verdict,
+                    g.truth_user_id, g.truth_coverage, g.truth_overlap_frac
+               FROM segments g
+               JOIN sessions ss ON ss.id = g.session_id
+               JOIN sources  sc ON sc.id = ss.source_id
+              WHERE g.deleted_at IS NULL
+                AND g.truth_verdict IN (?1, ?2, ?3)
+              ORDER BY g.t_start_ns ASC, g.id ASC
+              LIMIT ?4",
+        )?;
+        Ok(stmt
+            .query_map(
+                params![
+                    truth_verdict::SINGLE,
+                    truth_verdict::OVERLAP,
+                    truth_verdict::PARTIAL,
+                    limit as i64
+                ],
+                |r| {
+                    Ok(RejudgeCandidate {
+                        id: r.get(0)?,
+                        t_start_ns: r.get(1)?,
+                        t_end_ns: r.get(2)?,
+                        kind: r.get(3)?,
+                        verdict: r.get(4)?,
+                        user_id: r.get(5)?,
+                        coverage: r.get(6)?,
+                        overlap_frac: r.get(7)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Discord segments nothing has been able to say anything about: no
     /// verdict at all. Counted so `unknown` in the report is a real number
     /// rather than the absence of one.
@@ -6654,6 +6717,26 @@ pub struct TruthCandidate {
     pub t_end_ns: i64,
     pub speaker_id: Option<i64>,
     pub overlap_frac: Option<f32>,
+    /// `sources.kind` for the session this turn belongs to (0.12.1). The
+    /// verdict needs it: which accounts the recording can physically contain
+    /// is a fact about the *stream*, not about the call
+    /// ([`crate::truth::Audible`]).
+    pub kind: String,
+}
+
+/// A verdict already on disk, with everything a re-judge needs to redo it
+/// (0.12.1). `coverage` and `overlap_frac` are what was stored, kept so the
+/// pass can say what it could re-derive when the spans behind them are gone.
+#[derive(Debug, Clone)]
+pub struct RejudgeCandidate {
+    pub id: i64,
+    pub t_start_ns: i64,
+    pub t_end_ns: i64,
+    pub kind: String,
+    pub verdict: String,
+    pub user_id: Option<String>,
+    pub coverage: Option<f64>,
+    pub overlap_frac: Option<f64>,
 }
 
 /// A clean turn that might be worth enrolling.
