@@ -42,7 +42,7 @@ use recalld::truthnet;
 
 use crate::cli::{
     AccuracyAction, Cli, Command, GraphAction, IdentityAction, LangAction, MicAction, ModelsAction,
-    NightBackend, NotesAction, SemanticAction, SpeakersAction, TruthAction,
+    NightBackend, NotesAction, SemanticAction, SpeakersAction, TruthAction, TurnsAction,
 };
 
 fn main() -> Result<()> {
@@ -195,6 +195,21 @@ fn main() -> Result<()> {
                 cmd_lang_unroute(&cfg, &data_dir, dir.as_deref(), apply)
             } // ---- end 0.12.0 ---------------------------------------------
         },
+        // ---- 0.12.4, cutting a turn where the speaker changes -----------
+        //
+        // In THIS process, like the language repair and the semantic backfill
+        // and for the same two reasons: it is a long batch job that has to be
+        // niceable and Ctrl-C-able, and it loads models the daemon may not
+        // have resident.
+        Command::Turns { action } => match action {
+            TurnsAction::Resplit {
+                apply,
+                undo,
+                limit,
+                dir,
+            } => cmd_turns_resplit(&cfg, &data_dir, dir.as_deref(), apply, undo, limit),
+        },
+        // ---- end 0.12.4 --------------------------------------------------
         // ---- 0.11.0, source-aware identity -----------------------------
         Command::Identity { action } => cmd_identity(&cfg, &data_dir, action),
         // ---- end 0.11.0 -------------------------------------------------
@@ -2410,6 +2425,119 @@ fn cmd_lang_unroute(cfg: &Config, data_dir: &Path, dir: Option<&Path>, apply: bo
     Ok(())
 }
 // ---- end 0.12.0 -----------------------------------------------------------
+
+// ---- 0.12.4: cutting a turn where the speaker changes ---------------------
+
+/// `recalld turns resplit [--apply|--undo]` — cut the archive's mixed turns
+/// where the person talking changes (FINDINGS §39).
+fn cmd_turns_resplit(
+    cfg: &Config,
+    data_dir: &Path,
+    dir: Option<&Path>,
+    apply: bool,
+    undo: bool,
+    limit: Option<usize>,
+) -> Result<()> {
+    pipeline::deprioritise_current_thread(19, &[]);
+    let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open(data_dir)?));
+    let now = recalld::clock::utc_now_ns();
+
+    if undo {
+        let n = recalld::turnsplit::unsplit(&store, limit.unwrap_or(usize::MAX), now)?;
+        println!(
+            "{n} split turn(s) put back. Each row has its whole span and its own clip again,\n\
+             and the pieces the split minted are deleted. The words are NOT restored: the span\n\
+             is right and nothing has re-read the audio, so the honest state is a turn waiting\n\
+             for the analysis leg. `recalld lang repair` or the idle worker will fill it in."
+        );
+        return Ok(());
+    }
+
+    // The models are not optional here, unlike the unroute pass: without the
+    // embedder there is no curve and therefore no answer at all, and a run
+    // that silently reported "nothing to cut" would be a lie.
+    let root = fetch::target_dir(dir, &cfg.models, data_dir);
+    let models = ModelSet::resolve_at(root, &cfg.models);
+    let mut analyzer = recalld::analysis::Analyzer::load(
+        &models,
+        // The pass exists BECAUSE the live switch is off by default; making it
+        // read that switch would mean the command could do nothing and not say
+        // why. Every other number in the operating point is the config's.
+        &recalld::config::IdentityConfig {
+            split_turns: true,
+            ..cfg.identity.clone()
+        },
+    )?;
+    analyzer.set_lang_config(&cfg.lang);
+    analyzer.set_truth_config(&cfg.truth);
+    analyzer.set_asr_config(&models, &cfg.asr, &cfg.night, &cfg.runtime);
+    let stats = recalld::analysis::AnalysisStats::default();
+
+    let report = recalld::turnsplit::resplit(
+        &store,
+        &mut analyzer,
+        &stats,
+        data_dir,
+        limit.unwrap_or(usize::MAX),
+        apply,
+        now,
+    )?;
+
+    println!("{:<26}{}", "turns examined", report.examined);
+    if report.examined == 0 {
+        println!(
+            "\nNo turn on this install has a `partial` or `overlap` verdict, so there is\n\
+             nothing here that Discord says holds more than one person's audio."
+        );
+        return Ok(());
+    }
+    println!("{:<26}{}", "  too short to cut", report.too_short);
+    println!("{:<26}{}", "  clip already retained", report.no_audio);
+    println!(
+        "{:<26}{} (a piece with no words is not a turn)",
+        "  cut found and refused", report.wordless
+    );
+    println!("{:<26}{}", "turns that change speaker", report.cuts.len());
+    println!("{:<26}{}", "new rows", report.new_rows());
+
+    if !report.cuts.is_empty() {
+        println!("\n{:<9} {:<21} {:<9} CUT AT", "SEGMENT", "WHEN", "VERDICT");
+        for c in report.cuts.iter().take(AUDIT_TAIL) {
+            let at = c
+                .at_s
+                .iter()
+                .map(|s| format!("{s:.2}s"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "{:<9} {:<21} {:<9} {at}",
+                c.segment_id,
+                format_time(c.t_start_ns),
+                c.verdict
+            );
+            for (i, said) in c.said.iter().enumerate() {
+                println!("          [{i}] {said:?}");
+            }
+        }
+        if report.cuts.len() > AUDIT_TAIL {
+            println!("  … and {} more", report.cuts.len() - AUDIT_TAIL);
+        }
+    }
+
+    if apply {
+        println!(
+            "\n{} turn(s) cut. Each wrote a `turns.resplit` operation with its whole prior\n\
+             state, and the original clip is still on disk, so `recalld turns resplit --undo`\n\
+             puts them back.",
+            report.cuts.len()
+        );
+    } else {
+        println!("\nNothing written. Add --apply.");
+    }
+    Ok(())
+}
+
+// ---- end 0.12.4 -----------------------------------------------------------
 
 /// `recalld speakers prune [--apply]` — the one-off voice sweep.
 fn cmd_prune(cfg: &Config, data_dir: &Path, apply: bool) -> Result<()> {

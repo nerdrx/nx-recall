@@ -482,6 +482,15 @@ decision, and a rule ships only if it lowers held-out error by 2 points.")]
         action: Option<TruthAction>,
     },
 
+    // ---- 0.12.4: cutting a turn where the speaker changes -----------------
+    /// The turns themselves: cut the archive's mixed rows where the person
+    /// talking changes.
+    Turns {
+        #[command(subcommand)]
+        action: TurnsAction,
+    },
+    // ---- end 0.12.4 -------------------------------------------------------
+
     // ---- 0.9.0, the assistant ------------------------------------------
     /// One paragraph per conversation, for a day.
     ///
@@ -1192,6 +1201,64 @@ BEFORE widening a declaration, not after.")]
     },
     // ---- end 0.12.0 ------------------------------------------------------
 }
+
+// ---- 0.12.4: cutting a turn where the speaker changes ---------------------
+
+#[derive(Subcommand, Debug)]
+pub enum TurnsAction {
+    /// Cut the archive's `partial` and `overlap` turns where the speaker
+    /// changes. Previews unless `--apply`.
+    #[command(long_about = "\
+Cut the archive's mixed turns where the person talking changes.
+
+A turn ends at silence and nowhere else, so a fast exchange — \"yeah\" / \"no
+it isn't\" across half a second — is one row with one label. Discord's own
+per-user spans say how often: 409 of this install's 515 `overlap` turns hold
+at least one point where the solo speaker changes.
+
+This walks every `partial` and `overlap` row, slides the daemon's own ERes2Net
+over the audio and cuts at the boundaries where the window ending there and
+the window starting there disagree by more than `[identity]
+split_turn_distance`. No piece is ever shorter than the identity ladder's own
+floor, because a piece exists to be labelled.
+
+WHAT IT IS WORTH, MEASURED (FINDINGS \u{00a7}39). At the shipped operating point it
+finds 41.7% of the reachable change points within \u{00b1}0.5 s at 67.9% precision,
+splits 0.87% of turns Discord says are one person, and turns 118 rows that
+were `overlap` or `partial` into `single` pieces the voicebank can be scored
+against. It missed the recall bar it was given, so the LIVE switch
+(`[identity] split_turns`) ships off and this command is how the archive gets
+the benefit anyway.
+
+The original row survives, shortened to its first piece; the other pieces
+become new rows. Nothing is deleted — not the row, whose id every thread,
+promise and correction points at, and not the original clip, which is what
+makes `--undo` able to put the turn back. Each cut turn writes one
+`turns.resplit` operation carrying its whole prior state.
+
+  (no flag)    print what would be cut, turn by turn. Writes nothing.
+  --apply      cut them.
+  --undo       put back what the last run cut, newest first.")]
+    Resplit {
+        /// Actually write. Without it the command only reports.
+        #[arg(long)]
+        apply: bool,
+
+        /// Put back what a previous `--apply` cut, newest first.
+        #[arg(long, conflicts_with = "apply")]
+        undo: bool,
+
+        /// Stop after this many turns.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+
+        /// Use this models directory instead of `[models].dir`.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+    },
+}
+
+// ---- end 0.12.4 -----------------------------------------------------------
 
 #[derive(Subcommand, Debug)]
 pub enum SemanticAction {

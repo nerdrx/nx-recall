@@ -112,6 +112,10 @@ pub mod truthnet;
 pub mod unroute;
 // ---- end 0.12.0 ---------------------------------------------------------
 pub mod turns;
+// ---- 0.12.4: cutting a turn where the speaker changes ---------------------
+/// Where inside one turn the person talking changes (0.12.4, FINDINGS §39).
+pub mod turnsplit;
+// ---- end 0.12.4 -----------------------------------------------------------
 // ---- 0.10.0, worlds and turn-taking --------------------------------------
 /// Turn-taking statistics: how a person talks (0.10.0).
 pub mod turntaking;

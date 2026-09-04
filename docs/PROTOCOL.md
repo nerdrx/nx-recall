@@ -4500,3 +4500,117 @@ with nothing to do about it. `recalld accuracy` prints the same line, and
 decoder's reading beside them, spread over ten cells whose largest holds 11 —
 and no night reading at all, because `[night].enabled` has never been on here.
 The recording and the pass are in; the bar is unmet and says so.
+## 0.12.4 — a turn cut where the speaker changes
+
+**No wire change, and that is the design.** A split turn is two ordinary
+segments: two `segment.new` events, two rows in `transcript.page`, two clips.
+No client learns a new field, no client learns a new event, and a client that
+predates this section renders a split turn correctly because there is nothing
+about it to render specially. The only thing that changes is that some turns
+that used to be one row are now two.
+
+### What a piece is
+
+The daemon has always ended a turn at silence and nowhere else
+(`crate::turns`), so a fast exchange — "yeah" / "no it isn't" across half a
+second — arrives as one row with one label. `crate::turnsplit` slides the
+identity extractor over the turn at a 0.25 s hop, compares the window *ending*
+at each boundary with the one *starting* there, and cuts where they disagree
+most, subject to three refusals:
+
+* no piece shorter than `[identity].split_turn_min_piece_s` (default
+  `min_duration_s`, 1.0 s) — a piece exists to be labelled, and a piece the
+  ladder must refuse is a row with no speaker where there used to be one;
+* at most `split_turn_max_cuts` cuts, no two closer together than a piece;
+* **no piece without words.** The detector reads the voice and not the words,
+  so it will cut a laugh or a two-second "yeah" in half; a split that leaves
+  any piece silent is refused whole.
+
+Each piece then goes through the ordinary path — its own clip, its own row, its
+own transcript, its own trip through the ladder — so `t_start_ns`/`t_end_ns`,
+`overlap_frac`, `speaker_id`, `match_score`, `label_via`, `lang` and the truth
+verdict on a piece all mean exactly what they mean on any other segment. The
+pieces tile the turn: piece *n*'s `t_end_ns` is piece *n+1*'s `t_start_ns`, and
+between them they hold every sample.
+
+### The transcript is partitioned, never re-decoded
+
+The whole turn is decoded once with word timestamps
+(`crate::asr::TimedAsr`) and each piece takes the words that **start** inside
+it. Concatenating the pieces' `text` in time order reproduces the turn's word
+sequence exactly — no word is lost at a cut and none is spelled twice. That is
+a property of the construction and not of the model: two independent decodes
+could do neither, because a word straddling the cut belongs to whichever piece
+got most of its audio, to both, or to nothing.
+
+`asr_model_id` on every piece is the same decoder, because it was the same
+decode.
+
+### The switch
+
+```toml
+[identity]
+split_turns = false            # measured off — FINDINGS §39
+split_turn_window_s = 1.5
+split_turn_hop_s = 0.25
+split_turn_min_piece_s = 1.0
+split_turn_distance = 0.85
+split_turn_max_cuts = 3
+```
+
+`split_turn_distance` is a **distance**, `1 - cos`, and is not comparable with
+`label_threshold`: two 1.5 s windows of the *same* person on this audio already
+score around 0.6, so anything that sounds like a sensible similarity bar is
+below the noise floor.
+
+**Off by default, on the numbers.** At this operating point the detector finds
+41.7% of the reachable change points within ±0.5 s at 67.9% precision and
+splits 0.87% of turns Discord says are one person. That clears the false-split
+bar and misses the recall bar it was set (≥50%), so the live default is off and
+the archive pass below is how an install gets the benefit.
+
+### `recalld turns resplit`
+
+The same detector over the archive's `partial` and `overlap` rows — the two
+verdicts that *mean* the row holds more than one person's audio. `single` is
+never re-decided by this pass: Discord has already settled it.
+
+```
+recalld turns resplit           # what it would cut, turn by turn. Writes nothing.
+recalld turns resplit --apply   # cut them.
+recalld turns resplit --undo    # put back what the last run cut, newest first.
+```
+
+**The original row survives, shortened to its first piece**; the other pieces
+become new rows in the same session. Nothing is deleted — not the row, whose id
+`threads`, `commitments`, `time_refs`, `notes`,
+`speaker_prototypes.source_segment_id`, `segment_vectors` and every stored
+correction point at, and not the original clip, which is what makes `--undo`
+work. Everything the analysis leg owns about audio the row no longer covers —
+the words, the language, the speaker, the overlap reading, the vectors, the
+verdict — is cleared and recomputed per piece.
+
+Each cut turn writes one `turns.resplit` operation whose `prior_state` carries
+the whole turn back:
+
+```json
+{"segment_id": 11050, "t_start_ns": 1788…, "t_end_ns": 1788…,
+ "audio_path": "segments/000312/seg-000239-1788….wav",
+ "text": "Yeah that's all Imano", "truth_verdict": "overlap",
+ "minted": [17421]}
+```
+
+`--undo` restores the span and the clip and soft-deletes the minted pieces. It
+does **not** restore the words: the span is right again and nothing has re-read
+the audio, so the honest state is a turn waiting for the analysis leg, which is
+the same state the split left it in. It is idempotent by the span — undoing
+twice cannot delete a second generation of rows.
+
+### What a client should expect
+
+Nothing new to implement, and one thing not to assume: a segment id is no
+longer a stable claim on a fixed span. It always could change (`segments.correct`
+rewrites text, `segments.reassign` rewrites the speaker); after 0.12.4 an
+applied resplit can also *shorten* an existing row and add a sibling beside it.
+A client that re-reads a segment by id after a `segment.updated` event was
+already doing the right thing.

@@ -106,6 +106,19 @@ digests and translations, the **ground-truth pass** that scores the voicebank
 against Discord's own word, and the **night shift**: whisper-large-v3 on the
 GPU, replacing words only under a two-of-three vote.
 
+A turn ends at silence, so a fast exchange — *"yeah" / "no it isn't"* across
+half a second — lands as one row with one name. `recalld turns resplit` cuts
+those rows apart: it slides the same voiceprint model along the turn, finds
+where the person talking changes, and writes each piece as an ordinary turn
+with its own clip and its own label. The transcript is **partitioned by word
+time, never re-decoded** — the pieces' words are the turn's words, in order,
+with none lost at the cut and none spelled twice. Measured against Discord's
+own per-user spans it finds two changes in five and splits fewer than one
+percent of turns Discord says are one person, which is why it runs as a pass
+you read and can undo rather than as a live default. On this archive it turned
+93 rows the voicebank could never be scored against into ground truth, and took
+held-out identity precision from 85.7% to 86.8%.
+
 The box that earns its keep is the overlap gate. Every naive approach
 confidently mislabels overlapping speakers about half the time — and
 confidence scores *cannot see it happening*. NX Recall would rather write
@@ -166,6 +179,7 @@ failed are listed further down with their numbers.
 | Electron's click-through on Linux | sets no X11 input shape, is a no-op on Wayland — so the caption bar is a native layer-shell surface |
 | Full live pipeline: VAD, gate, ASR, identity, vectors | 30 CPU seconds per audio minute — **half of one core**, and 90% of it is the transcriber |
 | Moving the live path onto the idle 7900 XTX | **refused.** sherpa-onnx has no AMD provider at all, so the 90% is unreachable; a per-turn whisper Vulkan decoder measured *slower* (1639 ms vs 360 ms) and no cheaper |
+| Cutting a turn where the speaker changes, against Discord's per-user spans | **41.7%** of the reachable change points at ±0.5 s, 67.9% precision, **0.87%** false splits on turns Discord says are one person. Live switch ships off — it missed the 50% recall bar; the archive pass turns 93 unlabellable rows into ground truth and takes identity precision **85.7% → 86.8%** |
 
 ## The graveyard of clever ideas
 
