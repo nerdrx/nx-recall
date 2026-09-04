@@ -290,6 +290,7 @@ pub fn list_outputs() -> Result<()> {
         pointer: None,
         drag: None,
         turns: Vec::new(),
+        growing: None,
         translation_display: TranslationDisplay::default(),
         last_change: Instant::now(),
         faded_out: false,
@@ -391,6 +392,7 @@ pub fn run(opts: Options) -> Result<()> {
         pointer: None,
         drag: None,
         turns: Vec::new(),
+        growing: None,
         translation_display: TranslationDisplay::default(),
         last_change: Instant::now(),
         faded_out: false,
@@ -564,6 +566,11 @@ fn pump(socket: &Path, tx: &Sender<Update>, wake: &Waker) -> Result<()> {
         let msg = f.read()?;
         let changed = match msg["ev"].as_str() {
             Some("segment") => caps.apply(&msg["data"]),
+            // 0.12.4: words for a turn that is still being spoken, from a turn
+            // long enough to have been sliced. It is drawn UNDER the last-N
+            // window rather than inside it (see `Update::growing`), because it
+            // is the turn that has not happened yet.
+            Some("slice") => caps.apply_slice(&msg["data"]),
             Some("relabel") => {
                 caps.apply_relabel(&msg["data"]);
                 true
@@ -601,6 +608,11 @@ fn pump(socket: &Path, tx: &Sender<Update>, wake: &Waker) -> Result<()> {
         // shape.
         let update = Update {
             turns: caps.turns().cloned().collect(),
+            // Travels WITH the turns for the same reason `display` does: the
+            // draw side has no socket, and a growing row that arrived in a
+            // different message from the stack it belongs under would be one
+            // repaint showing a sentence twice.
+            growing: caps.growing().cloned(),
             display,
         };
         if tx.send(update).is_err() {
@@ -614,6 +626,8 @@ fn pump(socket: &Path, tx: &Sender<Update>, wake: &Waker) -> Result<()> {
 /// row in it is laid out.
 struct Update {
     turns: Vec<Turn>,
+    /// The turn being spoken right now, if it has been sliced (0.12.4).
+    growing: Option<Turn>,
     display: TranslationDisplay,
 }
 
@@ -669,6 +683,10 @@ struct App {
     /// margins at that moment. `None` between drags.
     drag: Option<Drag>,
     turns: Vec<Turn>,
+    /// The turn being spoken right now, if it is long enough to have been
+    /// sliced (0.12.4). Kept beside the ring rather than in it, so it is never
+    /// counted against `[captions] turns`, never trimmed and never re-sorted.
+    growing: Option<Turn>,
     /// `[assist] translation_display`, as the feed last heard it.
     translation_display: TranslationDisplay,
     last_change: Instant,
@@ -928,6 +946,7 @@ impl App {
 
     fn set_turns(&mut self, update: Update) {
         self.turns = update.turns;
+        self.growing = update.growing;
         self.translation_display = update.display;
         self.last_change = Instant::now();
         self.faded_out = false;
@@ -943,7 +962,11 @@ impl App {
         if !self.settings.click_through {
             return 1.0;
         }
-        if self.turns.is_empty() {
+        // 0.12.4: somebody talking right now is the strongest possible reason
+        // for the bar to be lit, and a growing row is the only evidence of it
+        // that is not also a settled turn. Without this the bar would fade out
+        // during a long monologue — the one case slicing exists to serve.
+        if self.turns.is_empty() && self.growing.is_none() {
             return 0.0;
         }
         layout::fade_at(
@@ -1153,6 +1176,17 @@ impl App {
             if shown.is_empty() && !self.settings.click_through {
                 shown.push(move_hint());
             }
+            // 0.12.4, under the settled rows and OUTSIDE the last-N window,
+            // exactly where `captions.js` puts it: it is the turn happening
+            // now, so it is at the bottom, and it is not one of the N turns you
+            // asked to keep — it is the one that has not finished.
+            if let Some(g) = self
+                .growing
+                .as_ref()
+                .filter(|g| self.settings.show_you || !g.mine)
+            {
+                shown.push(g.clone());
+            }
             self.renderer.render(&shown, None)
         });
 
@@ -1243,6 +1277,8 @@ fn move_hint() -> Turn {
         // Nobody said this, so there is nobody to highlight.
         colour: None,
         icon: None,
+        // Nor is anybody still saying it: the hint is a finished sentence.
+        growing: false,
     }
 }
 

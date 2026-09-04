@@ -156,6 +156,13 @@
 .cap-row.provisional .cap-text {
   color: #a9a4bb;
 }
+/* 0.12.4 — a GROWING row (a sliced turn) is not a guess: its words were decoded
+   from their own audio at a VAD boundary and will not be taken back, so they
+   are drawn in settled ink. Only the "…" remains, saying the one thing that is
+   still true — the sentence has not finished. */
+.cap-row.provisional.growing .cap-text {
+  color: inherit;
+}
 .cap-ell {
   /* Never wraps onto its own line: an ellipsis alone at the left margin reads
      as a fourth row appearing rather than as a sentence continuing. */

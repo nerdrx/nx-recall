@@ -34,6 +34,8 @@ import {
   // whether anybody is talking.
   livePartial,
   PARTIAL_STALE_MS,
+  // 0.12.4: the same rule for a row that is GROWING rather than being replaced.
+  SLICE_STALE_MS,
   setFollowing,
   loadOlderPage,
   replaceSegments,
@@ -545,7 +547,11 @@ export function mount(root, ctx) {
     // has to come off the screen without an event: a pause, a discarded turn
     // after an audio gap, or a daemon that went away all end a turn silently.
     // One timer, only while a row is up, aimed at the exact moment it expires.
-    staleTimer = setTimeout(renderPartial, Math.max(250, PARTIAL_STALE_MS - (Date.now() - p.at) + 100));
+    // 0.12.4: a growing row is allowed to sit much longer between slices than
+    // a partial is between decodes, so the timer is aimed at whichever rule
+    // this row is under.
+    const staleMs = p.growing ? SLICE_STALE_MS : PARTIAL_STALE_MS;
+    staleTimer = setTimeout(renderPartial, Math.max(250, staleMs - (Date.now() - p.at) + 100));
     const stick = following() && nearBottom();
     // Rebuilt rather than patched: it is one row of four spans and it changes
     // once a second, and a patch would have to know which of them moved.
@@ -570,12 +576,19 @@ export function mount(root, ctx) {
     // be the same answer `segRow` gives, or the row would change colour at the
     // moment the final replaces it.
     const { color, icon } = lookOf(p.speaker);
+    // 0.12.4: a GROWING row is a different claim from a provisional one, and
+    // it is the stronger of the two. A partial's words may be replaced
+    // wholesale by the next reading; a slice's words are final — they are
+    // already the words the row will carry — and only the END of the sentence
+    // is still missing. It gets its own class so it can be drawn in settled ink
+    // rather than as a guess, and the ellipsis stays on both, because on both
+    // the sentence is unfinished.
     const row = h('div', {
-      class: `seg partial${isYou(p.speaker) ? ' you' : ''}`,
+      class: `seg partial${p.growing ? ' growing' : ''}${isYou(p.speaker) ? ' you' : ''}`,
       dataset: { partial: String(p.seq_in_turn) },
       // Not a control and not a row anybody can act on. Announced politely by
       // the container, never focusable.
-      'aria-label': 'still being said',
+      'aria-label': p.growing ? 'still being said, words so far' : 'still being said',
     });
     row.append(
       h('span', { class: 't', text: p.t_start_ms ? fmtClock(p.t_start_ms) : '' }),
@@ -1142,6 +1155,10 @@ export function mount(root, ctx) {
         who: el.querySelector('.nm')?.textContent ?? '',
         text: el.querySelector('.txt')?.textContent ?? '',
         ellipsis: !!el.querySelector('.seg-ell'),
+        // 0.12.4: whether this row is GROWING (a sliced turn, words being
+        // added) rather than provisional (a partial, words being replaced).
+        growing: el.classList.contains('growing'),
+        ink: getComputedStyle(el.querySelector('.txt')).color,
         // The two rules that make it a tail and not a row.
         inList: !!list.querySelector('.seg.partial'),
         counted: list.querySelectorAll('.seg').length,

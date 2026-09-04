@@ -142,6 +142,26 @@ const MY_LINES = [
  */
 const PARTIAL_LINE = 'the door behind the bar goes back into the same instance if you take it twice';
 
+/**
+ * The monologue SIGUSR2 delivers one SLICE at a time (0.12.4).
+ *
+ * Deliberately long — a turn has to run past `[captions] slice_after_s` before
+ * the daemon cuts it at all, and the whole point of the feature is the turn
+ * nobody would otherwise read until it was over. It is written as three
+ * sentences so the cuts fall where a person actually pauses, which is where the
+ * real slicer cuts too: at a dip the VAD found, never mid-word.
+ *
+ * The three slices must CONCATENATE to the final text exactly. That is the
+ * claim a client is being tested against — a growing row adds words and never
+ * takes any back — and a fixture whose pieces did not join would let a renderer
+ * that re-writes the row wholesale pass.
+ */
+const SLICE_PIECES = [
+  'so the way the portal network actually works is that every instance keeps its own copy of the graph',
+  'which means two people standing in the same room can be looking at completely different exits',
+  'and that is why the door behind the bar only works when somebody else has already gone through it',
+];
+
 // name: null means "not named yet" — the onboarding case (DESIGN §5).
 // `languages` is schema v5: which languages this voice actually speaks, so a
 // wrong-language transcript can be corrected rather than merely noticed. `null`
@@ -2380,6 +2400,81 @@ export function startMock({
     return { partials: cuts.length, t_start_ns: tStartNs, speaker };
   }
 
+  // ---- 0.12.4, sliced turns -------------------------------------------------
+
+  /**
+   * One long turn, delivered as three slices and then as the row.
+   *
+   * The shape of the wire is what is being fixtured: `text` is THIS slice, and
+   * `text_so_far` is every slice joined — the daemon does the joining, so a
+   * client that accumulated `text` itself would double a piece on any
+   * redelivery. A renderer is expected to draw `text_so_far`.
+   *
+   * The final `segment` carries the same `t_start_ns`, so it replaces the
+   * growing row by `(session, t_start_ns)` rather than appending a fourth one.
+   * Its text is the pieces joined, because that is precisely what the daemon
+   * writes: the slices it already read, plus the remainder.
+   */
+  function emitSlicedTurn() {
+    const now = Date.now();
+    const tStartNs = String(now) + '000000';
+    // Nobody, deliberately, on the slices AND on the row.
+    //
+    // Two reasons, and the second one is why this is spelled out. A slice
+    // genuinely carries no identity — the ladder needs an embedding and an
+    // embedding needs a finished turn (PROTOCOL 0.12.4), so `null` is the
+    // honest fixture. And attributing this turn to a named voice put a
+    // fifty-four-word row under that voice in the middle of a run whose later
+    // steps assert about the rows of named voices; the suite went from green to
+    // intermittently red, in a different step each time. A fixture must not
+    // change the population another test is sampling.
+    const speaker = null;
+    const joined = SLICE_PIECES.join(' ');
+    SLICE_PIECES.forEach((piece, i) => {
+      setTimeout(() => {
+        emit('segments', 'slice', {
+          session: SESSIONS[2].id,
+          source: 'VRChat.exe',
+          speaker,
+          speaker_hint: null,
+          t_start_ms: now,
+          t_start_ns: tStartNs,
+          // Each slice is another `slice_after_s` of speech.
+          elapsed_ms: (i + 1) * 6200,
+          text: piece,
+          text_so_far: SLICE_PIECES.slice(0, i + 1).join(' '),
+          seq: i,
+          final: false,
+        });
+      }, i * 700);
+    });
+    setTimeout(() => {
+      const seg = {
+        id: state.nextSegId++,
+        session: SESSIONS[2].id,
+        source: 'VRChat.exe',
+        speaker,
+        text: joined,
+        t_ms: now,
+        t_ns: tStartNs,
+        t_start_ns: tStartNs,
+        t_end_ns: String(now + 19000) + '000000',
+        dur_ms: 19000,
+        overlap_frac: 0.04,
+        match_score: 0.68,
+        label_via: null,
+        lang: 'en',
+        lang_via: 'classified',
+        asr_confidence: 'solid',
+        text_via: 'live',
+        thread: liveThread(),
+      };
+      state.segments.push(seg);
+      emit('segments', 'segment', seg);
+    }, SLICE_PIECES.length * 700 + 400);
+    return { slices: SLICE_PIECES.length, t_start_ns: tStartNs, speaker, words: joined.split(' ').length };
+  }
+
   function emitMine() {
     const now = Date.now();
     const text = MY_LINES[state.myLineIdx % MY_LINES.length];
@@ -3968,6 +4063,10 @@ export function startMock({
       return { sent: 'partial-turn', ...emitPartialTurn() };
     }
     if (n === 2) {
+      // 0.12.4: one long turn, in slices, growing one row.
+      return { sent: 'sliced-turn', ...emitSlicedTurn() };
+    }
+    if (n === 3) {
       // 0.9.0: a reminder coming round, and a conversation the model has just
       // read. Both are things a canned world cannot produce on its own, and
       // both are the events the assistant round's two surfaces are built on.

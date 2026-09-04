@@ -65,6 +65,12 @@ pub struct Turn {
     pub colour: Option<String>,
     /// The emoji that goes before the name, or none.
     pub icon: Option<String>,
+    /// This row is still being added to (0.12.4, sliced turns). It is drawn
+    /// with a trailing ellipsis and nothing else different: a slice's words are
+    /// decoded from their own audio at a boundary the VAD found and will not be
+    /// taken back, so hedging the ink would tell the reader to distrust text
+    /// that is not in doubt. What is unfinished is the sentence.
+    pub growing: bool,
 }
 
 /// `[assist] translation_display` — which of a translated row's two lines
@@ -173,6 +179,10 @@ pub struct Captions {
     /// first, and `speakers.list`'s own `you` flag as the answer that survives a
     /// daemon too old to have the first.
     you: Option<i64>,
+    /// The turn being spoken right now, if it is long enough to have been
+    /// sliced (0.12.4): its session, its `t_start_ns` as a string, and the row
+    /// to draw. Deliberately NOT in `turns` — see `apply_slice`.
+    growing: Option<(i64, String, Turn)>,
 }
 
 impl Captions {
@@ -184,6 +194,7 @@ impl Captions {
             names: std::collections::HashMap::new(),
             styles: std::collections::HashMap::new(),
             you: None,
+            growing: None,
         }
     }
 
@@ -261,6 +272,12 @@ impl Captions {
         let Some(id) = seg["id"].as_i64() else {
             return false;
         };
+        // 0.12.4, and FIRST, before any branch below can return: this may be
+        // the turn a growing row has been showing, and the row has to go
+        // whether the segment lands in the ring, is refused as history, or
+        // replaces one already there. The replace key is
+        // `(session, t_start_ns)` — a slice has no id to match on.
+        let replaced = self.clear_growing_for(seg);
         // A correction, a re-decode, a reassignment: same row, new words. The
         // name it is already wearing is kept — a correction to the WORDS is not
         // an opinion about who said them, and re-deriving it here would undo a
@@ -271,9 +288,10 @@ impl Captions {
             return true;
         }
         let t_ms = seg["t_ms"].as_i64().unwrap_or(0);
-        // History being re-published. Not news, not ours to show.
+        // History being re-published. Not news, not ours to show — but if it
+        // took a growing row off the bar, the bar still has to be redrawn.
         if t_ms < self.newest_ms {
-            return false;
+            return replaced;
         }
         self.newest_ms = self.newest_ms.max(t_ms);
         let turn = self.to_turn(seg);
@@ -391,7 +409,74 @@ impl Captions {
                 )
             }),
             mine: self.you.is_some() && seg["speaker"].as_i64() == self.you,
+            growing: false,
         }
+    }
+
+    // ---- 0.12.4, sliced turns ----------------------------------------------
+
+    /// A `slice` frame: words for a turn that is STILL being spoken.
+    ///
+    /// Kept beside the ring rather than in it, for the reason the JS store
+    /// keeps `store.partial` out of `segments`: it is not a row, it has no id,
+    /// and it must never be counted, trimmed or re-sorted with the turns that
+    /// are. It is drawn under the last-N window, because it is the turn that
+    /// has not happened yet rather than one of the five you asked to keep.
+    ///
+    /// `text_so_far` and not `text`: the daemon has already joined this turn's
+    /// slices, and a client that accumulated them itself would double one on
+    /// any redelivery.
+    pub fn apply_slice(&mut self, d: &Value) -> bool {
+        let (Some(session), Some(start)) = (d["session"].as_i64(), d["t_start_ns"].as_str()) else {
+            return false;
+        };
+        let text = d["text_so_far"]
+            .as_str()
+            .or_else(|| d["text"].as_str())
+            .unwrap_or_default();
+        if text.is_empty() {
+            return false;
+        }
+        let who = match d["speaker"].as_i64() {
+            Some(id) => self.names.get(&id).cloned().unwrap_or_else(|| "…".into()),
+            None => "…".into(),
+        };
+        let mut turn = self.to_turn_with(d, &who);
+        turn.text = text.to_owned();
+        turn.growing = true;
+        // A slice has no id and its `t_ms` is the turn's START, which is older
+        // than `newest_ms` by construction — so neither of the two rules that
+        // guard the ring applies to it, and neither is consulted.
+        turn.id = 0;
+        turn.t_ms = d["t_start_ms"].as_i64().unwrap_or(0);
+        self.growing = Some((session, start.to_owned(), turn));
+        true
+    }
+
+    /// The turn being said right now, or none.
+    pub fn growing(&self) -> Option<&Turn> {
+        self.growing.as_ref().map(|(_, _, t)| t)
+    }
+
+    /// Drop the growing row if `seg` is the turn it was about.
+    ///
+    /// The replace key is `(session, t_start_ns)` and nothing else — the same
+    /// key `gui/src/renderer/lib/store.js` uses, and for the same reason: a
+    /// slice has no id, and `t_start_ns` is a STRING on both events precisely
+    /// so this comparison is exact rather than a float that lost its last three
+    /// digits.
+    pub fn clear_growing_for(&mut self, seg: &Value) -> bool {
+        let Some((session, start, _)) = self.growing.as_ref() else {
+            return false;
+        };
+        let Some(seen) = seg["t_start_ns"].as_str().or_else(|| seg["t_ns"].as_str()) else {
+            return false;
+        };
+        if seg["session"].as_i64() != Some(*session) || seen != start {
+            return false;
+        }
+        self.growing = None;
+        true
     }
 }
 
@@ -802,6 +887,144 @@ mod tests {
         assert_eq!(
             t.translation,
             Some((Some("en".to_owned()), "the same, in English".to_owned()))
+        );
+    }
+
+    // ---- 0.12.4, sliced turns ----------------------------------------------
+
+    const START_MS: i64 = 1_772_486_400_123;
+    const START_NS: &str = "1772486400123456789";
+
+    fn slice(seq: u64, so_far: &str) -> Value {
+        json!({
+            "session": 3, "source": "VRChat.exe", "speaker": 1,
+            "speaker_hint": "proximity",
+            "t_start_ms": START_MS, "t_start_ns": START_NS,
+            "elapsed_ms": (seq + 1) * 6200,
+            "text": "the newest piece", "text_so_far": so_far,
+            "seq": seq, "final": false,
+        })
+    }
+
+    /// The settled turn, carrying the same start — so it replaces the growing
+    /// row rather than appearing beside it.
+    fn settled(id: i64, t_ms: i64) -> Value {
+        json!({"id": id, "t_ms": t_ms, "speaker": 1, "text": "the whole thing",
+               "session": 3, "t_start_ns": START_NS,
+               "overlap_frac": 0.02, "asr_confidence": "solid"})
+    }
+
+    #[test]
+    fn a_slice_draws_the_words_so_far_and_says_it_is_growing() {
+        let mut caps = Captions::new(5);
+        caps.learn_speakers(&json!({"speakers": [{"id": 1, "name": "Kira"}]}));
+        assert!(caps.apply_slice(&slice(0, "so the way the portal network works")));
+        let g = caps.growing().expect("a growing row");
+        assert_eq!(g.text, "so the way the portal network works");
+        assert!(g.growing, "the row does not say it is still being said");
+        assert_eq!(g.who, "Kira");
+
+        // It GROWS: the words that were there are still there, with more after.
+        assert!(caps.apply_slice(&slice(
+            1,
+            "so the way the portal network works and the door"
+        )));
+        assert_eq!(
+            caps.growing().unwrap().text,
+            "so the way the portal network works and the door"
+        );
+    }
+
+    #[test]
+    fn a_growing_row_is_never_one_of_the_last_n_turns() {
+        // In the ring it would be counted against `[captions] turns`, trimmed,
+        // and re-sorted by a `t_ms` that is the turn's START and therefore
+        // older than everything around it.
+        let mut caps = Captions::new(3);
+        for i in 1..=3 {
+            caps.apply(&seg(i, 1000 * i));
+        }
+        caps.apply_slice(&slice(0, "still talking"));
+        let ids: Vec<i64> = caps.turns().map(|t| t.id).collect();
+        assert_eq!(ids, vec![1, 2, 3], "the growing row entered the ring");
+    }
+
+    #[test]
+    fn the_settled_turn_takes_the_growing_row_down() {
+        let mut caps = Captions::new(5);
+        caps.apply_slice(&slice(0, "still talking"));
+        assert!(caps.growing().is_some());
+        assert!(caps.apply(&settled(7, START_MS)));
+        assert!(
+            caps.growing().is_none(),
+            "the growing row outlived its turn"
+        );
+        assert_eq!(caps.turns().count(), 1, "one turn is one row");
+    }
+
+    #[test]
+    fn somebody_elses_turn_landing_leaves_the_growing_row_alone() {
+        // The replace key is `(session, t_start_ns)` and nothing else. Blanking
+        // the live row because a different turn settled would take the sentence
+        // being spoken off the glass mid-word.
+        let mut caps = Captions::new(5);
+        caps.apply_slice(&slice(0, "still talking"));
+
+        let mut other = settled(8, START_MS + 10);
+        other["t_start_ns"] = json!("1772486400000000000");
+        caps.apply(&other);
+        assert!(caps.growing().is_some(), "a different turn cleared the row");
+
+        let mut other_session = settled(9, START_MS + 20);
+        other_session["session"] = json!(4);
+        caps.apply(&other_session);
+        assert!(
+            caps.growing().is_some(),
+            "a different session cleared the row"
+        );
+    }
+
+    #[test]
+    fn a_re_published_archive_row_still_takes_down_the_row_it_settles() {
+        // The 0.8.2 rule refuses the row as news — but if that same event was
+        // the turn the bar has been growing, the bar still has to be redrawn or
+        // the growing row would sit there until the next person spoke.
+        let mut caps = Captions::new(5);
+        caps.seed_tail(&json!({"segments": [seg(100, START_MS + 500_000)]}));
+        caps.apply_slice(&slice(0, "still talking"));
+        assert!(
+            caps.apply(&settled(7, START_MS)),
+            "an archive row that closed the growing turn reported no change"
+        );
+        assert!(caps.growing().is_none());
+    }
+
+    #[test]
+    fn a_slice_with_no_replace_key_or_no_words_is_refused() {
+        let mut caps = Captions::new(5);
+        let mut no_key = slice(0, "still talking");
+        no_key["t_start_ns"] = json!(null);
+        assert!(!caps.apply_slice(&no_key));
+        // Nothing to draw is not a row to draw.
+        assert!(!caps.apply_slice(&slice(0, "")));
+        assert!(caps.growing().is_none());
+    }
+
+    #[test]
+    fn a_growing_row_ends_in_an_ellipsis_and_is_otherwise_an_ordinary_row() {
+        use crate::raster::row_lines;
+        let mut caps = Captions::new(5);
+        caps.apply_slice(&slice(0, "the door behind the bar"));
+        let g = caps.growing().unwrap();
+        let lines = row_lines(g, TranslationDisplay::Main);
+        assert_eq!(lines.lead, "the door behind the bar…");
+        assert!(lines.sub.is_none());
+        // …and a settled row is untouched.
+        caps.apply(&settled(7, START_MS));
+        let t = caps.turns().last().unwrap();
+        assert_eq!(
+            row_lines(t, TranslationDisplay::Main).lead,
+            "the whole thing"
         );
     }
 }

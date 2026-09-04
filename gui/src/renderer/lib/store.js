@@ -968,6 +968,21 @@ function noteUnknownSpeaker(id, onDone) {
 export const PARTIAL_STALE_MS = 6000;
 
 /**
+ * The same rule for a GROWING row (0.12.4, sliced turns).
+ *
+ * A slice is not offered on a cadence — it is offered when the person pauses,
+ * at least `[captions] slice_after_s` apart — so six seconds of quiet is the
+ * NORMAL gap between two slices of one turn and would blink the row off between
+ * every pair of them.
+ *
+ * The bound that is actually true of a growing row comes from the VAD: a turn
+ * cannot run past `[vad] max_segment_ms` (30 s) without being cut and
+ * published, so a row still growing much past that has lost its `segment` and
+ * is orphaned. Thirty-five seconds is that cap plus the merge gap and a decode.
+ */
+export const SLICE_STALE_MS = 35000;
+
+/**
  * The turn being said right now, or null — with the staleness rule applied.
  *
  * Every surface that draws a provisional row asks THIS rather than reading
@@ -979,7 +994,10 @@ export function livePartial(now = Date.now()) {
   const p = store.partial;
   if (!p) return null;
   if (store.paused || store.conn.status !== 'connected') return null;
-  if (now - p.at > PARTIAL_STALE_MS) return null;
+  // 0.12.4: a growing row is allowed to sit for much longer than a partial,
+  // because the gap between two slices is a person not pausing rather than the
+  // daemon having gone away. See `SLICE_STALE_MS`.
+  if (now - p.at > (p.growing ? SLICE_STALE_MS : PARTIAL_STALE_MS)) return null;
   return p;
 }
 
@@ -1090,6 +1108,46 @@ export function applyEvent(evt, opts = {}) {
       return { partial: true };
     }
     // ---- end 0.11.0 -------------------------------------------------------
+
+    // ---- 0.12.4, sliced turns ---------------------------------------------
+    // Words for a turn that is still being said, and — unlike a partial —
+    // words that are KEPT: they are already on their way to the row that lands
+    // when the turn ends. It goes in exactly the same slot for exactly the same
+    // reason (see `store.partial`) and is replaced by the same
+    // `(session, t_start_ns)` key, so every surface that already draws a
+    // provisional row draws this one with no change at all.
+    //
+    // The one difference is which field is the row: a partial REPLACES the row
+    // with a better reading of the same audio, a slice EXTENDS it with new
+    // audio. So `text_so_far` is what is drawn — the daemon has already done
+    // the joining, and a client that accumulated `text` itself would double a
+    // slice whenever an event was redelivered.
+    case 'slice': {
+      if (!d || d.t_start_ns == null || d.session == null) return null;
+      if (store.paused) return null;
+      const soFar = typeof d.text_so_far === 'string' ? d.text_so_far : d.text;
+      store.partial = {
+        session: d.session,
+        source: d.source ?? null,
+        speaker: d.speaker ?? null,
+        speaker_hint: d.speaker_hint ?? null,
+        t_start_ms: typeof d.t_start_ms === 'number' ? d.t_start_ms : null,
+        t_start_ns: String(d.t_start_ns),
+        elapsed_ms: typeof d.elapsed_ms === 'number' ? d.elapsed_ms : 0,
+        text: typeof soFar === 'string' ? soFar : '',
+        // The `seq_in_turn` name is kept so the row's `dataset.partial` key and
+        // every debug handle read one field across both events.
+        seq_in_turn: typeof d.seq === 'number' ? d.seq : 0,
+        // What tells the two apart where it matters: the staleness rule, and a
+        // renderer that wants to say "this row is being added to" rather than
+        // "this row is a guess".
+        growing: true,
+        at: Date.now(),
+      };
+      noteUnknownSpeaker(store.partial.speaker, opts.onSpeakersChanged);
+      return { partial: true };
+    }
+    // ---- end 0.12.4 -------------------------------------------------------
 
     case 'purge': {
       const ids = Array.isArray(d?.ids) ? d.ids : [];

@@ -450,3 +450,31 @@ Electron window, which is exactly the fallback this path needs to keep working.
 | the bar's size, position and fade schedule | `src/layout.rs` | yes — unit tests |
 | the layer surface (config, both input regions, the drag math, the cross-screen hop, the shm conversion) | `src/desktop.rs`, `src/layout.rs` | yes for the parts a compositor is not needed for; the surface itself was run and photographed on KWin in both modes. **Neither the click passing through nor the drag was exercised by synthetic input** — see "Desktop: layer-shell" |
 | which surface a desktop gets, and where the binary is | `gui/src/main/captions.js` | yes — `gui/test/layer_captions.test.js` |
+| the growing row for a sliced turn (`slice` events, the `(session, t_start_ns)` replace key, the trailing ellipsis) | `src/feed.rs` (`apply_slice`, `clear_growing_for`), `src/raster.rs` (`row_lines`), `src/desktop.rs` | yes — unit tests, plus `--feed` against the mock's sliced-turn delivery |
+
+## 0.12.4 — the row that grows
+
+A turn is not published until the speaker stops, so a thirty-second monologue
+used to reach the bar thirty seconds late, all at once. The daemon now cuts a
+long turn at pauses the VAD already found and publishes each piece as a `slice`
+event (PROTOCOL "0.12.4 — sliced turns"); the bar draws them as **one row that
+grows**, under the last-N window, and replaces it with the settled `segment`
+when the turn ends.
+
+Three properties, and each one is a bug that was easy to write instead:
+
+* **`text_so_far`, never `text`.** The daemon joins the pieces. A bar that
+  accumulated them itself would double one on any redelivery.
+* **Outside the ring.** The growing row lives in its own field
+  (`Captions::growing`), not in `turns`. In the ring it would be counted
+  against `[captions] turns`, trimmed, and re-sorted by a timestamp that is the
+  turn's START and therefore older than everything around it.
+* **Settled ink, and only an ellipsis.** A slice's words were decoded from
+  their own audio at a boundary the VAD scored as not-speech; they will not be
+  taken back. Hedging them the way a partial is hedged would tell the reader to
+  distrust text that is not in doubt. What is unfinished is the sentence.
+
+The bar also stays **lit** while a row is growing (`fade()` reads it), because
+somebody talking right now is the strongest possible reason for captions to be
+visible — and a long monologue is exactly the case where the ring has not moved
+and the old rule would have faded the bar out mid-sentence.

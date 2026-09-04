@@ -160,6 +160,23 @@ pub enum Gate {
     SingleSpeaker,
 }
 
+/// Where a turn's words come from (0.12.4, `crate::slice`).
+///
+/// Two answers and not a bare `Option<&str>`, because the absent case is not
+/// "no words" — it is "read them", which is the single most expensive thing
+/// this daemon does and must be spelled out at every call site rather than
+/// implied by a `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Words<'a> {
+    /// Run the recogniser over this audio. What every turn did before 0.12.4
+    /// and what every unsliced turn still does.
+    Decode,
+    /// Already read, slice by slice, while the turn was still being spoken.
+    /// The audio is still handed in — the overlap detector and the embedder
+    /// both need it — but the recogniser is not run over it again.
+    Joined(&'a str),
+}
+
 /// `goldens/<speaker>/golden-<segment>.wav`, relative to the data dir.
 ///
 /// Deliberately **not** under `segments/`: the retention sweeper walks that
@@ -333,6 +350,26 @@ impl Analyzer {
     }
     // ---- 0.11.0, partial turns: end ----------------------------------------
 
+    // ---- 0.12.4, sliced turns: begin ---------------------------------------
+    /// Decode ONE SLICE of an open turn, or the remainder after the last slice
+    /// (`crate::slice`).
+    ///
+    /// The same recogniser, the same thread and the same contract as
+    /// [`Self::transcribe_partial`] beside it — and a different bargain. A
+    /// partial re-reads the WHOLE open turn every time, so its words are thrown
+    /// away by the next partial and paid for again; a slice reads its own audio
+    /// and nobody else's, exactly once, and the words it produces are the words
+    /// that go on the row. That is the difference between O(N²) and O(N) over a
+    /// turn, and it is why this feature is on and partials are not.
+    ///
+    /// The caller is responsible for the boundary being one the VAD scored as
+    /// not-speech. Handing this half a word is not a worse reading of that
+    /// word, it is a different word, and this method has no way to tell.
+    pub fn transcribe_slice(&mut self, samples: &[f32]) -> String {
+        self.asr.transcribe(samples)
+    }
+    // ---- 0.12.4, sliced turns: end -----------------------------------------
+
     /// All the inference for one turn. Touches no database.
     pub fn prepare(&mut self, samples: &[f32]) -> Result<Prepared> {
         self.prepare_with(samples, Gate::Full)
@@ -346,10 +383,34 @@ impl Analyzer {
     /// [`Gate::SingleSpeaker`] changes is only whether a positive reading is
     /// allowed to throw the embedding away.
     pub fn prepare_with(&mut self, samples: &[f32], gate: Gate) -> Result<Prepared> {
+        self.prepare_words(samples, gate, Words::Decode)
+    }
+
+    /// [`Self::prepare_with`], for a turn whose words have already been read.
+    ///
+    /// The one caller is a turn that was SLICED (0.12.4, `crate::slice`): its
+    /// audio was decoded piece by piece while the person was still speaking,
+    /// and decoding it again here would spend the turn's whole cost twice and
+    /// throw away the reading that is already on somebody's screen.
+    ///
+    /// Everything else is identical, deliberately. The overlap detector still
+    /// runs, the gate still decides, and the embedding is still taken over the
+    /// WHOLE turn — which is the reason the pieces are joined into one row
+    /// rather than left as several: a voice is identified from a turn, and six
+    /// embeddings of six fragments are six weaker claims about the same person.
+    pub fn prepare_words(
+        &mut self,
+        samples: &[f32],
+        gate: Gate,
+        words: Words<'_>,
+    ) -> Result<Prepared> {
         let duration_s = samples.len() as f32 / SAMPLE_RATE as f32;
         let overlap_frac = self.overlap.overlap_frac(samples)?;
 
-        let raw = self.asr.transcribe(samples);
+        let raw = match words {
+            Words::Decode => self.asr.transcribe(samples),
+            Words::Joined(text) => text.to_string(),
+        };
         // An empty transcript is stored as NULL rather than "": it keeps the
         // full-text index free of empty documents and makes "has a transcript"
         // a single IS NOT NULL.
@@ -1360,9 +1421,10 @@ pub fn analyse_or_log(
     stats: &AnalysisStats,
     segment_id: i64,
     samples: &[f32],
+    words: Words<'_>,
     now_utc_ns: i64,
 ) -> Vec<i64> {
-    let prepared = match analyzer.prepare(samples) {
+    let prepared = match analyzer.prepare_words(samples, Gate::Full, words) {
         Ok(p) => p,
         Err(e) => {
             warn!(segment_id, "analysis failed: {e:#}");
@@ -1391,6 +1453,7 @@ pub fn analyse_or_log(
 /// Same shape, same lock discipline; the only difference is which `commit` runs
 /// — and that difference is the whole point, because a mic turn must never fall
 /// through to the voicebank.
+#[allow(clippy::too_many_arguments)]
 pub fn analyse_mic_or_log(
     analyzer: &mut Analyzer,
     store: &std::sync::Mutex<Store>,
@@ -1398,9 +1461,10 @@ pub fn analyse_mic_or_log(
     segment_id: i64,
     samples: &[f32],
     mic: &MicEnroll<'_>,
+    words: Words<'_>,
     now_utc_ns: i64,
 ) -> Vec<i64> {
-    let prepared = match analyzer.prepare(samples) {
+    let prepared = match analyzer.prepare_words(samples, Gate::Full, words) {
         Ok(p) => p,
         Err(e) => {
             warn!(segment_id, "analysis failed: {e:#}");
@@ -1432,6 +1496,7 @@ pub fn analyse_mic_or_log(
 /// construction: [`Gate::SingleSpeaker`], so an overlap reading cannot cost the
 /// embedding, and [`Analyzer::commit_pinned`], so the voicebank is never asked
 /// a question it cannot answer better than the wire already did.
+#[allow(clippy::too_many_arguments)]
 pub fn analyse_pinned_or_log(
     analyzer: &mut Analyzer,
     store: &std::sync::Mutex<Store>,
@@ -1439,9 +1504,10 @@ pub fn analyse_pinned_or_log(
     segment_id: i64,
     samples: &[f32],
     pin: &PinnedLeg<'_>,
+    words: Words<'_>,
     now_utc_ns: i64,
 ) -> Vec<i64> {
-    let prepared = match analyzer.prepare_with(samples, Gate::SingleSpeaker) {
+    let prepared = match analyzer.prepare_words(samples, Gate::SingleSpeaker, words) {
         Ok(p) => p,
         Err(e) => {
             warn!(segment_id, "analysis failed: {e:#}");
