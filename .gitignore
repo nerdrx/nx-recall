@@ -1,5 +1,8 @@
 # Rust
 /target/
+# `spike/livegpu_bench` is detached from the workspace (FINDINGS §40), so it
+# builds into its own tree — 2.3 GB of it, since it links the whole daemon.
+spike/*/target/
 **/*.rs.bk
 
 # Release artifacts: packaging/build-release.sh output, ~140 MB a shot.

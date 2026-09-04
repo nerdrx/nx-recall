@@ -2892,6 +2892,7 @@ fn cmd_status(cfg: &Config, data_dir: &Path) -> Result<()> {
             models
         }
     );
+    print_devices(&s["asr"]["devices"]);
     println!(
         "{:<18}{} segment(s), {} analysed, {} labelled, {} refused (overlap)",
         "counters",
@@ -2928,6 +2929,47 @@ fn cmd_status(cfg: &Config, data_dir: &Path) -> Result<()> {
     );
     print_storage(&s["storage"]);
     Ok(())
+}
+
+/// Which device the models run on (0.12.4, FINDINGS §40).
+///
+/// One line per live model, with the reason folded to one per *runtime* rather
+/// than repeated per model: the four models have two reasons between them, and
+/// printing the same paragraph twice teaches a reader that it is boilerplate.
+/// An older daemon has no `devices` key and gets nothing rather than a wrong
+/// claim about its own hardware.
+fn print_devices(devices: &Value) {
+    let Some(models) = devices["live_models"].as_array() else {
+        return;
+    };
+    println!(
+        "{:<18}live on {}, night shift on {}",
+        "inference",
+        devices["live"].as_str().unwrap_or("?"),
+        devices["night"].as_str().unwrap_or("?"),
+    );
+    let mut explained: Vec<&str> = Vec::new();
+    for m in models {
+        println!(
+            "{:<18}{:<28} {:<12} {:>5.1}% of the live CPU",
+            "",
+            m["model"].as_str().unwrap_or("?"),
+            m["device"].as_str().unwrap_or("?"),
+            m["cpu_share_pct"].as_f64().unwrap_or(0.0),
+        );
+        let runtime = m["runtime"].as_str().unwrap_or("?");
+        if !explained.contains(&runtime) {
+            explained.push(runtime);
+        }
+    }
+    for runtime in explained {
+        let why = models
+            .iter()
+            .find(|m| m["runtime"].as_str() == Some(runtime))
+            .and_then(|m| m["why"].as_str())
+            .unwrap_or("");
+        println!("{:<18}{runtime}: {why}", "");
+    }
 }
 
 /// The disk breakdown, in the four parts that behave differently: audio is

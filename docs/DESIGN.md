@@ -175,11 +175,40 @@ set). Measured selections:
 - Windowing: embed **contiguous detector-approved single-speaker audio**, as long as
   possible — not fixed short windows (10 s beat 3 s by 27 pp coverage when one
   talker dominates). ASR batches to ~30 s only if a Whisper-family model is in use.
-- **Runtime rule — affinity, not model size.** The whole pipeline measures < 5% of
-  one core, so throughput is a non-issue; the real risk (demonstrated live on the
-  dev box) is priority/placement. The daemon sets nice 19 on inference threads and
-  supports `[runtime] inference_cpus` to pin off the game's CCD (9950X3D: game keeps
-  0–15/X3D). Both implemented in Step 1.
+- **Runtime rule — affinity, not model size.** The real risk (demonstrated live on
+  the dev box) is priority/placement, not throughput. The daemon sets nice 19 on
+  inference threads and supports `[runtime] inference_cpus` to pin off the game's
+  CCD (9950X3D: game keeps 0–15/X3D). Both implemented in Step 1.
+  - ~~The whole pipeline measures < 5% of one core~~ → **it measures 30 CPU
+    seconds per audio minute, half of one core** (0.11.5 config, FINDINGS §40,
+    the user's own 22.8 minutes). The old figure was §10's and it was true: it
+    measured *Parakeet 110m at one thread*. The daemon ships the 0.6b v3
+    multilingual export at four threads. Affinity is still the rule — half a
+    core at nice 19 on the non-game CCD is not what stutters a frame — but the
+    number should not be quoted as if throughput were free.
+
+| stage | runtime | CPU s / audio min | share of the live path |
+|---|---|---:|---:|
+| VAD (silero) | `ort` | 0.17 | 0.6% |
+| overlap (pyannote-3.0) | `ort` | 0.16 | 0.5% |
+| **ASR (parakeet-tdt-0.6b-v3)** | **sherpa-onnx** | **26.76** | **89.5%** |
+| embed (eres2net) | sherpa-onnx | 2.81 | 9.4% |
+
+- **Three tiers, and all three are on the CPU** — the live path has no GPU leg
+  and will not get one soon (FINDINGS §40, and `crate::device` reports it in
+  `recalld status`). Not for want of a card: the night shift runs whisper.cpp on
+  this same 7900 XTX through Vulkan. The live path cannot follow it because
+  **90% of its cost is Parakeet, and Parakeet runs under sherpa-onnx, whose
+  provider enum has no AMD variant at all** — `cuda`, `coreml`, `xnnpack`,
+  `nnapi`, `trt`, `directml`, and nothing for AMD. The two models that *do* go
+  through `ort`, which has AMD execution providers in its binding, are 1.1% of
+  the bill between them, and reaching even those needs ~19 GB of ROCm math
+  libraries installed system-wide. Measured, not assumed: a per-turn whisper
+  Vulkan decoder was benchmarked against the incumbent and was **both slower to
+  answer (1639 ms p50 against 360 ms) and no cheaper in CPU**, because a live
+  decoder cannot amortise the model load the way a night batch does. There is
+  deliberately **no `live_gpu` setting**: all three of its states would do the
+  same thing.
 - **Three tiers, not one (0.11.2).** The first night with the night shift, the
   digests, the translator, the cross-check and the truth pass all running, the
   capture thread missed its PipeWire deadlines 658 times in one hour — because
