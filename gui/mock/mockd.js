@@ -1986,6 +1986,39 @@ export function startMock({
         cross_check: cc(segsBySpeaker(speaker_id)),
       })),
       since_ns: String(state.startedAt - 30 * DAY) + '000000',
+      // 0.12.4: what those corrections have taught the daemon about which of
+      // its decoders to believe. The mock has a handful of canned corrections,
+      // which is exactly the state a real archive is in — under the bar — so
+      // the card's countdown is what the driver sees, and that is the point.
+      learned: learnedPayload(),
+    };
+  }
+
+  /// `accuracy.summary.learned`, and the block `accuracy.learn` echoes back.
+  const LEARN_MIN_ROWS = 30;
+  const LEARN_MARGIN_PP = 2.0;
+
+  function learnedPayload() {
+    const n = state.corrections.length;
+    const installed = state.decoderRules ?? { global: null, cells: {} };
+    const rules = Object.keys(installed.cells ?? {}).length + (installed.global ? 1 : 0);
+    return {
+      corrections: n,
+      min_rows_per_cell: LEARN_MIN_ROWS,
+      margin_pp: LEARN_MARGIN_PP,
+      rules,
+      learned_ns: installed.learned_ns ?? null,
+      learned_ms: installed.learned_ms ?? null,
+      ready: n >= LEARN_MIN_ROWS,
+      needed: Math.max(0, LEARN_MIN_ROWS - n),
+      installed: {
+        learned_ns: installed.learned_ns ?? '0',
+        corrections: n,
+        min_rows_per_cell: LEARN_MIN_ROWS,
+        margin_pp: LEARN_MARGIN_PP,
+        global: installed.global ?? null,
+        cells: installed.cells ?? {},
+      },
     };
   }
 
@@ -3372,6 +3405,59 @@ export function startMock({
     // --- 0.8.0: accuracy ---------------------------------------------------
 
     'accuracy.summary': () => accuracyPayload(),
+
+    // --- 0.12.4: what the corrections taught it ----------------------------
+    //
+    // The mock has three canned corrections, which is under the bar in every
+    // cell — the same state a real archive is in on the day this shipped. So
+    // the honest answer here is a table of cells that have not qualified and
+    // an exact count of what each still wants, and that is what the daemon
+    // returns too.
+    'accuracy.learn'(params) {
+      const apply = params?.apply === true;
+      const cellOf = (c) => `${c.source === 'mic' ? 'mic' : 'app'}/${c.speaker_id ?? '-'}/short`;
+      const groups = new Map();
+      for (const c of state.corrections) {
+        const k = cellOf(c);
+        groups.set(k, [...(groups.get(k) ?? []), c]);
+      }
+      const report = (key, rows) => ({
+        cell: key,
+        source_kind: key.split('/')[0],
+        speaker_id: key.split('/')[1] === '-' ? null : Number(key.split('/')[1]),
+        bucket: 'short',
+        rows: rows.length,
+        held_out: Math.max(0, rows.length - Math.round(rows.length * 0.6)),
+        decoders: [
+          { decoder: 'live', rows: rows.length, wer: wer(rows) },
+          { decoder: 'context', rows: 0, wer: null },
+          { decoder: 'night', rows: 0, wer: null },
+        ],
+        rule: null,
+        verdict: `${rows.length} of ${LEARN_MIN_ROWS} corrections — inheriting the shipped rule`,
+      });
+      // Nothing has qualified, so `--apply` installs nothing. The mock keeps
+      // the same shape as the daemon rather than pretending otherwise.
+      if (apply) state.decoderRules = { global: null, cells: {} };
+      return {
+        corrections: state.corrections.length,
+        measurable: state.corrections.length,
+        min_rows_per_cell: LEARN_MIN_ROWS,
+        margin_pp: LEARN_MARGIN_PP,
+        fit_fraction: 0.6,
+        global: report('*/-/short', state.corrections),
+        cells: [...groups.entries()]
+          .sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]))
+          .map(([k, rows]) => report(k, rows)),
+        short_by: [...groups.entries()].map(([k, rows]) => ({
+          cell: k,
+          needed: LEARN_MIN_ROWS - rows.length,
+        })),
+        rules: learnedPayload().installed,
+        applied: apply,
+        installed: learnedPayload().installed,
+      };
+    },
 
     // --- 0.8.0: notes to self ----------------------------------------------
 

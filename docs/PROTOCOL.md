@@ -4317,3 +4317,132 @@ re-derives exactly what 0.12.1 measured. Scoping begins **from the first scoped
 span onward**: a verdict written before the plugin was updated is never
 re-scoped by a bridge that arrived afterwards, and nothing in this section moves
 a number 0.12.1 or §34 reported.
+
+## 0.12.4 — every correction is word-level ground truth (schema v19)
+
+`accuracy.summary` has always measured *how wrong* the transcripts were. It
+could never say **which decoder to believe**, because the three readings of a
+clip were never in the same place: the live pass's words and the context
+re-decode's live inside `segments.redecode` operations, the night shift's in
+`segments.night_text`, and the person's in a `segments.correct` operation. This
+release puts them on one row, at the moment the truth is made.
+
+Nothing above this line changes shape. `proto` stays `1`, `segments.correct`
+takes and returns exactly what it did, and every field described here is
+additive.
+
+### Schema v19 — the `text_truth` table
+
+| column | meaning |
+|---|---|
+| `segment_id` | the turn |
+| `truth_text` | what the person typed. The reference |
+| `live_text` | what the first pass read, when it is recoverable |
+| `context_text` | what a re-decode read (`context`, `arbiter` and `lid` are one pass here) |
+| `night_text` | what the night shift read, **whether or not the vote let it win** |
+| `canary_text` | always `NULL` today — see below |
+| `asr_confidence` | the cross-check verdict standing over the words being replaced |
+| `speaker_id`, `source_kind`, `duration_ns` | the three facets a measurement is cut by, **as they are now** |
+| `created_ns` | the instant of the correction. With `segment_id` it is the natural key |
+
+Written by `segments.correct` after the row is rewritten, and **backfilled from
+the operations history on migration** — every field already existed on disk, so
+a v17 archive arrives with its whole correction history in the table. The
+backfill runs on every open and is a no-op after the first: the natural key
+makes replaying history idempotent, which `tests/truth.rs`'s three-open test now
+also covers. The table is derived data. Nothing renders from it, and dropping it
+loses no user-visible state.
+
+Two things it deliberately does not claim:
+
+- **`canary_text` is null, and that is the honest value.** The cross-check
+  decoder stores its *verdict* and not its words (`crate::quality`); the night
+  shift re-decodes the clip when it needs the actual sentence and throws it
+  away again. The column exists so that the day the words are kept is a write
+  rather than a migration.
+- **A reading is filed by the route recorded with it, not guessed.** Every
+  `segments.redecode` operation carries `{text, text_via}` and a timestamp, so
+  for a correction at `T`: operations at or before `T` each contribute one
+  reading under the pass their `text_via` names; the words the correction
+  replaced are filed under the route named by the **first operation after
+  `T`** (that operation replaced them, so its `prior_state.text_via` is how
+  they got there), falling back to the row's current `text_via`; and nothing
+  after `T` contributes anything else, because the text it kept is the
+  corrected text and scoring the truth against itself is not a measurement.
+
+### `accuracy.learn {apply?}` — which decoder wins, per cell
+
+A **cell** is one voice, one source kind, one duration bucket (`short` under
+2 s, `mid` under 6 s, `long`), keyed as `app/25/short`; an unlabelled voice is
+`-` and is a real cell, not a missing one.
+
+```json
+{"id": 9, "method": "accuracy.learn", "params": {"apply": false}}
+```
+
+The reply carries `corrections`, `measurable`, `min_rows_per_cell`,
+`margin_pp`, `fit_fraction`, a `global` cell report, one report per `cell`,
+`short_by` (what each under-sampled cell still wants), the `rules` the pass
+would install, `applied`, and `installed` — the rules actually in force. A cell
+report is `{cell, source_kind, speaker_id, bucket, rows, held_out, decoders:
+[{decoder, rows, wer}], rule, verdict}`; `wer` is the bounded corpus edit share
+over normalised words, the same figure `edit_rate` is, and `null` where that
+decoder read none of the held-out rows.
+
+**Read-only unless `apply` is true.** Four gates, and a rule ships only if it
+clears all of them:
+
+1. **A minimum sample per cell** — 30 corrections, `calib::MIN_ROWS_PER_VOICE`
+   for the same reason. A smaller cell inherits the global decision.
+2. **A minimum sample per comparison** — 12 held-out rows *both* decoders read.
+   This is not implied by the first and the archive is why it is written down:
+   the first run of this pass over 37 corrections found a 37-row cell whose
+   live-against-context comparison rested on four rows, and would have shipped
+   a rule off it. Thirty corrections are not thirty measurements of every
+   decoder.
+3. **A chronological hold-out** — `calib::split_at` at `FIT_FRACTION`, so
+   nothing the fit saw scores it.
+4. **A margin** — 2 percentage points off held-out error, `calib`'s
+   `improvement_is_material` restated. Without it every rounding-error
+   improvement installs itself.
+
+A cell that clears none of them ships **nothing**, and the 0.9.0 vote stands.
+
+### What a rule can change
+
+Exactly two things, stored in `settings` under `text.decoder_rules`:
+
+- **`winner`** — `live` (the shipped answer), `context` or `night`.
+- **`vote`** — what `crate::night` may do in that cell. `two_of_three` is the
+  0.9.0 rule and the default everywhere. `night_wins` drops the requirement for
+  a second voter **and nothing else** — every guard still runs, because the
+  guards are about §12's hallucinations and no amount of held-out WER makes a
+  Swedish sentence an acceptable replacement for a German one, and a reading
+  that agrees with the words already there is still not a replacement.
+  `keep_live` refuses the replacement outright and keeps the reading as an
+  annotation.
+
+The night shift reads them once per batch, under the same lock it gathers
+under. An absent or malformed setting is "no rules", never an error: a night
+shift must not stop because a setting could not be parsed.
+
+### `accuracy.summary` gains `learned`
+
+```json
+{"learned": {"corrections": 37, "min_rows_per_cell": 30, "margin_pp": 2.0,
+             "rules": 0, "learned_ns": null, "learned_ms": null,
+             "ready": false, "needed": 0, "installed": {…}}}
+```
+
+`needed` is how many more corrections the smallest useful sample wants, and it
+is the half of the block that matters on a real machine: the Memory view's
+accuracy card renders one line — *"Learned from 37 corrections — N more in one
+voice, source and turn length and it can start choosing between its decoders"*
+— because a card that only said "nothing learned yet" would leave the reader
+with nothing to do about it. `recalld accuracy` prints the same line, and
+`recalld accuracy report` prints the whole per-cell table.
+
+**On this install, today, nothing ships.** 37 corrections, 31 of them with a
+decoder's reading beside them, spread over ten cells whose largest holds 11 —
+and no night reading at all, because `[night].enabled` has never been on here.
+The recording and the pass are in; the bar is unmet and says so.

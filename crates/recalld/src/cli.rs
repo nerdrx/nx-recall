@@ -458,7 +458,19 @@ Nothing but one of these commands ever moves a note off `open`.")]
     /// How wrong the transcripts were, measured from the corrections you made
     /// to them. A biased sample by construction — you correct what matters —
     /// and the only real measurement this machine has.
-    Accuracy,
+    #[command(long_about = "\
+How wrong the transcripts were, measured from the corrections you made.\n\n\
+  recalld accuracy                the headline figures\n  \
+  recalld accuracy report         which decoder is winning, per cell\n  \
+  recalld accuracy learn          what your corrections would justify changing\n  \
+  recalld accuracy learn --apply  …and install it\n\n\
+A cell is one voice, on one kind of source, at one turn length. Each needs 30\n\
+corrections of its own before it is fitted rather than inheriting the global\n\
+decision, and a rule ships only if it lowers held-out error by 2 points.")]
+    Accuracy {
+        #[command(subcommand)]
+        action: Option<AccuracyAction>,
+    },
 
     /// Ground truth from Discord: the token the Vencord plugin needs, who has
     /// been linked to which voice, and how right the voicebank actually is.
@@ -536,6 +548,22 @@ a reply."
         /// Restrict to one speaker, by id or display name.
         #[arg(long, value_name = "SPEAKER")]
         speaker: Option<String>,
+    },
+}
+
+/// 0.12.4: what the corrections have taught the daemon about its decoders.
+#[derive(Subcommand, Debug)]
+pub enum AccuracyAction {
+    /// The per-cell table: how each decoder scored against your corrections,
+    /// and which rules are installed.
+    Report,
+    /// Run the measurement and say what it would change. Reads only, unless
+    /// you pass `--apply`.
+    Learn {
+        /// Install the rules this pass justifies. Nothing is installed for a
+        /// cell that has not cleared the minimum sample and the margin.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
