@@ -74,9 +74,18 @@ fn main() -> Result<()> {
         Command::Sources => cmd_sources(&data_dir),
         Command::Allow { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, true),
         Command::Deny { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, false),
-        Command::Role { match_key, role } => {
-            cmd_role(&cfg, &config_path, &data_dir, &match_key, &role)
-        }
+        Command::Role {
+            match_key,
+            role,
+            account,
+        } => cmd_role(
+            &cfg,
+            &config_path,
+            &data_dir,
+            &match_key,
+            &role,
+            account.as_deref(),
+        ),
         Command::Mic { action } => cmd_mic(&cfg, &data_dir, action),
         // ---- 0.10.0 -------------------------------------------------------
         Command::Room { action, device } => cmd_room(&cfg, &data_dir, action, device.as_deref()),
@@ -565,11 +574,20 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         let runtime = cfg.runtime.clone();
         let stats = Arc::clone(&truth_stats);
         let stop = Arc::clone(&truth_stop);
+        let picker = Arc::clone(&bridge);
         std::thread::Builder::new()
             .name("recalld-truth".into())
             .spawn(move || {
                 truth::run(
-                    store, control, bus, truth_cfg, identity, runtime, stats, stop,
+                    store,
+                    control,
+                    bus,
+                    truth_cfg,
+                    identity,
+                    runtime,
+                    stats,
+                    stop,
+                    Some(picker),
                 )
             })
             .map_err(|e| warn!("no ground-truth worker: {e}"))
@@ -587,6 +605,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
                 token,
                 cfg.truth.port,
                 Some(Arc::clone(&peruser)),
+                Some(Arc::clone(&bridge)),
             )
         }) {
             Ok(ingest) => Some(ingest),
@@ -1198,6 +1217,7 @@ fn cmd_role(
     data_dir: &Path,
     match_key: &str,
     role: &str,
+    account: Option<&str>,
 ) -> Result<()> {
     let parsed = recalld::bridge::Role::parse(role).ok_or_else(|| {
         anyhow::anyhow!(
@@ -1205,12 +1225,26 @@ fn cmd_role(
             recalld::bridge::ROLES.join(", ")
         )
     })?;
+    let account = account.map(str::trim).filter(|a| !a.is_empty());
+    if account.is_some() && parsed != recalld::bridge::Role::Bridge {
+        anyhow::bail!(
+            "--account names the bridge whose spans this client's audio carries, \
+             so it only means anything with role \"bridge\""
+        );
+    }
     let said = match parsed {
-        recalld::bridge::Role::Bridge => {
-            format!(
-                "{match_key} carries the RecallBridge plugin: it is muted while per-user audio arrives."
-            )
-        }
+        recalld::bridge::Role::Bridge => match account {
+            Some(a) => format!(
+                "{match_key} carries the RecallBridge plugin signed in as {a}: it is muted \
+                 while that bridge's per-user audio arrives, and its turns are judged \
+                 against that bridge's speaking spans and no other's."
+            ),
+            None => {
+                format!(
+                    "{match_key} carries the RecallBridge plugin: it is muted while per-user audio arrives."
+                )
+            }
+        },
         recalld::bridge::Role::Other => {
             format!(
                 "{match_key} does not carry the plugin: it is never muted, and its call is always recorded."
@@ -1229,6 +1263,7 @@ fn cmd_role(
         json!({
             "source": match_key,
             "role": parsed.as_str(),
+            "account_id": account,
         }),
     ) {
         Ok(out) => {
@@ -1246,9 +1281,10 @@ fn cmd_role(
             if parsed == recalld::bridge::Role::Auto {
                 file.truth.bridge_roles.remove(match_key);
             } else {
-                file.truth
-                    .bridge_roles
-                    .insert(match_key.to_string(), parsed.as_str().to_string());
+                file.truth.bridge_roles.insert(
+                    match_key.to_string(),
+                    recalld::bridge::role_spec(parsed, account),
+                );
             }
             file.save(config_path)?;
             println!(
@@ -3522,7 +3558,11 @@ fn cmd_truth(
 fn cmd_truth_rejudge(data_dir: &Path, apply: bool, limit: Option<usize>) -> Result<()> {
     let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open(data_dir)?));
     let now = recalld::clock::utc_now_ns();
-    let r = recalld::truth::rejudge(&store, limit.unwrap_or(usize::MAX), apply, now)?;
+    // No picker: `truth rejudge` runs against a data directory, with or
+    // without a daemon behind it, so a live override is not readable here. On
+    // an archive that is exactly right — every span it re-judges predates the
+    // scope, so `Scope::Every` is the only correct answer anyway.
+    let r = recalld::truth::rejudge(&store, limit.unwrap_or(usize::MAX), apply, now, None)?;
 
     println!("{:<24}{}", "verdicts examined", r.examined);
     if r.examined == 0 {
@@ -3767,6 +3807,39 @@ fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
             "{:<20}`recalld truth label` lists them; --apply names them",
             ""
         );
+    }
+
+    // 0.12.3: the bridges. Printed before the audio block because it is the
+    // frame the rest of this page is read in: with two plugins, "168 spans" is
+    // two different numbers about two different calls, and a report that does
+    // not separate them is a report about neither.
+    if let Some(b) = st["bridges"].as_object() {
+        let rows = b["bridges"].as_array().cloned().unwrap_or_default();
+        if !rows.is_empty() {
+            println!("\n{:<20}{}", "bridges seen", rows.len());
+            for r in &rows {
+                println!(
+                    "{:<20}{:<9} {:<20} {:<12} {} span(s), {}/min",
+                    "",
+                    r["kind"].as_str().unwrap_or("—"),
+                    r["account_id"].as_str().unwrap_or("—"),
+                    r["source"].as_str().unwrap_or("(no client mapped)"),
+                    r["spans"].as_i64().unwrap_or(0),
+                    r["spans_per_min"].as_f64().unwrap_or(0.0),
+                );
+            }
+            let amb = b["ambiguous"].as_array().cloned().unwrap_or_default();
+            for kind in amb {
+                let kind = kind.as_str().unwrap_or("—");
+                println!(
+                    "\n{:<20}two {kind} bridges are live and nothing says which client is\n\
+                     {:<20}which. Their spans are being pooled, so a verdict may be about\n\
+                     {:<20}the other call. Settle it with\n\
+                     {:<20}`recalld role <MATCH_KEY> bridge --account <USER_ID>`.",
+                    "  AMBIGUOUS", "", "", ""
+                );
+            }
+        }
     }
 
     // 0.12.1: per-user audio. Printed here rather than in its own command

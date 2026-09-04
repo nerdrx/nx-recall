@@ -37,6 +37,15 @@ use recalld::store::{KIND_DISCORD_USER, Store, label_via, truth_via};
 use recalld::truth::TruthStats;
 use recalld::truthnet;
 
+/// An older plugin's streams: no `client` on the wire, so no kind, so evidence
+/// about every mixed instance. 0.12.2's behaviour, which is what an install
+/// that has not updated its plugin still gets.
+fn legacy_live() -> recalld::bridge::LiveKinds {
+    let mut l = recalld::bridge::LiveKinds::default();
+    l.insert(None);
+    l
+}
+
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 fn fixtures_dir() -> PathBuf {
@@ -133,6 +142,7 @@ impl Rig {
             TOKEN.to_string(),
             0,
             Some(Arc::clone(&peruser)),
+            Some(Arc::clone(&bridge)),
         )
         .expect("binding the ingest on an ephemeral port");
         let port = ingest.addr().port();
@@ -250,6 +260,27 @@ fn line(user: &str, name: &str, t_ms: i64, seq: u64, frame: &[f32]) -> String {
         "pcm": b64::encode(&bytes),
     })
     .to_string()
+}
+
+/// The same, from a named bridge (0.12.3): the `client` object every
+/// RecallBridge POST carries once two plugins can be pointed at one daemon.
+fn line_from(
+    user: &str,
+    name: &str,
+    t_ms: i64,
+    seq: u64,
+    frame: &[f32],
+    kind: &str,
+    account: &str,
+) -> String {
+    let mut v: serde_json::Value =
+        serde_json::from_str(&line(user, name, t_ms, seq, frame)).expect("the line we just built");
+    v["client"] = serde_json::json!({
+        "kind": kind,
+        "account_id": account,
+        "instance": format!("{account}-run1"),
+    });
+    v.to_string()
 }
 
 /// A fixture cut into 500 ms frames, as a batch of lines, starting at `t0_ms`.
@@ -527,7 +558,7 @@ fn the_bridges_own_discord_instance_is_muted_while_a_per_user_stream_is_live() {
     );
     let v = rig
         .bridge
-        .verdicts(recalld::clock::monotonic_ns(), true)
+        .verdicts(recalld::clock::monotonic_ns(), &legacy_live())
         .into_iter()
         .find(|v| v.session_id == session)
         .expect("the instance is a candidate");
@@ -578,7 +609,7 @@ fn a_second_discord_client_in_another_call_keeps_recording() {
 
     let v = |id: i64| {
         rig.bridge
-            .verdicts(recalld::clock::monotonic_ns(), true)
+            .verdicts(recalld::clock::monotonic_ns(), &legacy_live())
             .into_iter()
             .find(|v| v.session_id == id)
             .expect("both instances are candidates")
@@ -618,9 +649,10 @@ fn a_manual_role_overrides_the_measurement_in_both_directions() {
     // Both roles are set the wrong way round from what the measurement would
     // say, which is the point: the user is allowed to be right about their own
     // machine, and neither state may be read and ignored.
-    rig.bridge.set_role("vesktop", recalld::bridge::Role::Other);
     rig.bridge
-        .set_role("Discord", recalld::bridge::Role::Bridge);
+        .set_role("vesktop", recalld::bridge::Role::Other, None);
+    rig.bridge
+        .set_role("Discord", recalld::bridge::Role::Bridge, None);
     assert_eq!(rig.bridge.role("vesktop"), recalld::bridge::Role::Other);
     assert_eq!(rig.bridge.role("Discord"), recalld::bridge::Role::Bridge);
 
@@ -650,8 +682,10 @@ fn a_manual_role_overrides_the_measurement_in_both_directions() {
     );
 
     // `auto` is the absence of a role, not a third stored state.
-    rig.bridge.set_role("vesktop", recalld::bridge::Role::Auto);
-    rig.bridge.set_role("Discord", recalld::bridge::Role::Auto);
+    rig.bridge
+        .set_role("vesktop", recalld::bridge::Role::Auto, None);
+    rig.bridge
+        .set_role("Discord", recalld::bridge::Role::Auto, None);
     assert!(rig.bridge.roles().is_empty());
     rig.finish();
 }
@@ -700,7 +734,7 @@ fn neither_microphone_is_ever_muted_however_live_the_streams_are() {
     );
     assert!(
         rig.bridge
-            .verdicts(recalld::clock::monotonic_ns(), true)
+            .verdicts(recalld::clock::monotonic_ns(), &legacy_live())
             .is_empty(),
         "neither microphone is even a candidate"
     );
@@ -883,4 +917,84 @@ fn a_per_user_source_is_never_read_as_the_mixed_tap() {
     let cfg = Config::default().truth;
     assert!(is_mixed_discord_source(&cfg, "vesktop"));
     assert!(!is_mixed_discord_source(&cfg, &match_key("777")));
+}
+
+// ---------------------------------------------------------------------------
+// 6. 0.12.3: two bridges
+// ---------------------------------------------------------------------------
+
+/// One person, heard by two clients. Keyed on the user id alone these two runs
+/// share a stream — their sequence numbers interleave, every second frame reads
+/// as a hole, and the two calls' audio lands in one session. Keyed on (account,
+/// user) they are two streams, which is what they are.
+#[test]
+fn the_same_person_heard_by_two_bridges_is_two_streams() {
+    let rig = Rig::start("two-bridges", true);
+    let speech = vec![0.05f32; SAMPLE_RATE as usize / 2];
+    let mut body = String::new();
+    for seq in 0..2u64 {
+        let t = 1_000 + (seq as i64) * 500;
+        body.push_str(&line_from(
+            "aspen", "Aspen", t, seq, &speech, "vesktop", "acct-v",
+        ));
+        body.push('\n');
+        body.push_str(&line_from(
+            "aspen", "Aspen", t, seq, &speech, "discord", "acct-d",
+        ));
+        body.push('\n');
+    }
+    let (status, _) = rig.post("/v1/discord/audio", &body, Some(TOKEN));
+    assert_eq!(status, 204);
+
+    let st = rig.peruser.status();
+    let rows = st["streams"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "one person, two ears: {st}");
+    let accounts: Vec<&str> = rows
+        .iter()
+        .map(|r| r["account_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(accounts, vec!["acct-d", "acct-v"]);
+    assert!(rows.iter().all(|r| r["user_id"] == "aspen"));
+    assert_ne!(
+        rows[0]["session_id"], rows[1]["session_id"],
+        "two calls are not one session"
+    );
+    // Neither run saw a hole: the sequence numbers were never braided.
+    assert_eq!(rig.stats.gaps.load(Ordering::Relaxed), 0);
+
+    // And the liveness the mute rule reads says WHOSE streams, not just that
+    // there are some.
+    let live = rig.peruser.live_kinds();
+    assert!(live.any());
+    assert!(live.explains("vesktop"));
+    assert!(live.explains("Discord"));
+}
+
+/// The rule, from the other side: only Vesktop's bridge is streaming, so only
+/// Vesktop's tap can be a duplicate. The official client's call keeps
+/// recording, whatever its share looks like.
+#[test]
+fn only_the_streaming_bridges_client_is_a_candidate_for_the_mute() {
+    let rig = Rig::start("one-bridge-two-clients", true);
+    let speech = vec![0.05f32; SAMPLE_RATE as usize / 2];
+    let mut body = String::new();
+    for seq in 0..2u64 {
+        let t = 1_000 + (seq as i64) * 500;
+        body.push_str(&line_from(
+            "aspen", "Aspen", t, seq, &speech, "vesktop", "acct-v",
+        ));
+        body.push('\n');
+    }
+    let (status, _) = rig.post("/v1/discord/audio", &body, Some(TOKEN));
+    assert_eq!(status, 204);
+
+    let live = rig.peruser.live_kinds();
+    assert!(
+        live.explains("vesktop"),
+        "the bridge's own client is the one that could be a duplicate"
+    );
+    assert!(
+        !live.explains("Discord"),
+        "the official client's call is not in these streams and must keep recording"
+    );
 }

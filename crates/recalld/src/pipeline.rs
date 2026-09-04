@@ -739,9 +739,17 @@ impl Pipeline {
         let Some(peruser) = self.peruser.as_ref() else {
             return false;
         };
-        if !peruser.any_live() {
+        // 0.12.3: not "is anything arriving" but "whose". With two bridges the
+        // first question has an answer that is true of the machine and false of
+        // the client in front of us, and acting on it is how the official
+        // client's call went unrecorded in the first place.
+        let live = peruser.live_kinds();
+        if !live.any() {
             return false;
         }
+        // Cloned out before `discord_side`, which takes `&mut self` to fill its
+        // per-session cache.
+        let peruser = std::sync::Arc::clone(peruser);
         let Some(bridge) = self.bridge.clone() else {
             return false;
         };
@@ -749,7 +757,14 @@ impl Pipeline {
             // The evidence for "which instance are these streams explaining"
             // is the streams themselves, so they are observed on the way past.
             DiscordSide::PerUser => {
-                bridge.observe_stream(chunk.capture_mono_ns, &chunk.samples);
+                // A buffer whose stream has already been swept is not evidence
+                // about anything: the run it belonged to has stopped arriving,
+                // and crediting it to the unscoped bucket would let it explain
+                // — and so mute — every Discord client for the rest of the
+                // window.
+                if let Some(kind) = peruser.client_kind_for_session(chunk.session_id) {
+                    bridge.observe_stream(kind, chunk.capture_mono_ns, &chunk.samples);
+                }
                 false
             }
             DiscordSide::Mixed {
@@ -763,7 +778,7 @@ impl Pipeline {
                     chunk.capture_mono_ns,
                     &chunk.samples,
                 );
-                bridge.is_muted(chunk.session_id, chunk.capture_mono_ns, true)
+                bridge.is_muted(chunk.session_id, chunk.capture_mono_ns, &live)
             }
             DiscordSide::Neither => false,
         }
@@ -772,8 +787,13 @@ impl Pipeline {
     /// Why the instance is muted, for the one line the transition logs.
     fn mute_reason(&self, session_id: i64) -> Option<String> {
         let bridge = self.bridge.as_ref()?;
+        let live = self
+            .peruser
+            .as_ref()
+            .map(|p| p.live_kinds())
+            .unwrap_or_default();
         bridge
-            .verdicts(crate::clock::monotonic_ns(), true)
+            .verdicts(crate::clock::monotonic_ns(), &live)
             .into_iter()
             .find(|v| v.session_id == session_id)
             .map(|v| v.why)

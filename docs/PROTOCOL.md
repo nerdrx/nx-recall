@@ -4121,3 +4121,199 @@ Neither microphone is ever a candidate, and neither is any non-Discord source: a
 mic hears a room, not a call, and no amount of per-user audio makes it a
 duplicate of anything. With one Discord client running, the behaviour is 0.12.1's
 — the single candidate clears the bar and is muted.
+
+## 0.12.3 — two bridges, and whose word is about which call
+
+0.12.2 aimed the *mute* at one Discord client. It left the *verdict* aimed at
+all of them, and on the install it was written for that was about to stop being
+a theoretical problem.
+
+The user runs two Discord clients with two accounts, often in two different
+calls: the official desktop client patched with the NX Vencord build, and
+Vesktop. Per-user audio (0.12.1) is Vesktop-only by construction, so to get it
+the second client gets the same plugin — and then **both clients run RecallBridge
+and both POST at the same daemon**. `truth_speaking` had no notion of which one
+sent a span. `coverage()` reads every span overlapping a segment's time, so two
+concurrent calls were mixed into every verdict; both bridges emitted roster
+lines for different channels into one table; and a per-user frame from Vesktop
+was attributed to whichever call the mute rule happened to be looking at.
+
+This section gives a span a sender and a segment a scope. Additive: `proto`
+stays `1`, one migration, and an install with one plugin — or with an older
+plugin that sends no `client` at all — behaves exactly as 0.12.2 did.
+
+### The wire: `client`
+
+Every RecallBridge POST — `speaking`, `voice` and `audio` — carries one more
+field on every line:
+
+```json
+"client": {"kind": "vesktop" | "discord" | "web",
+           "account_id": "<the plugin's own Discord user id>",
+           "instance": "<random, per plugin start>"}
+```
+
+- **`kind`** comes from Vencord's own `IS_VESKTOP` / `IS_DISCORD_DESKTOP` /
+  `IS_WEB` build globals — the same ones the audio patch's `predicate` reads, so
+  "the audio half is impossible here" and "this is the official client" can
+  never disagree. It is what maps a bridge to the PipeWire node its client plays
+  through without asking anybody: on this machine Vesktop's is
+  `application.process.binary = vesktop` and the official client's is `Discord`
+  / `WEBRTC VoiceEngine` (FINDINGS §37). `web` is accepted and never maps: a
+  browser tab's audio comes out of the browser's node, which is not in
+  `[truth].sources`.
+- **`account_id`** is the bridge's identity, and the only thing that separates
+  two clients of the *same* kind — two Vesktops share one `sources` row and can
+  share nothing else.
+- **`instance`** is random per plugin start and is **not stored**. It tells a
+  reloaded plugin from a second one, which is a question about right now, and a
+  column of it would be a column of churn. `truth.status` shows it.
+
+**A malformed `client`, or none at all, never costs a line.** It is read as
+absent, the line is stored unscoped, and the payload is taken. A refused line is
+a span that never existed; provenance is not worth one.
+
+### Schema v17 — `truth_speaking.account_id`, `.client_kind`
+
+Two nullable columns, one index, **no backfill**.
+
+> **NULL is a fact, not a placeholder.** It means the line came from a plugin
+> that predates the field — from the only bridge there was — so it is evidence
+> about whatever was being recorded then, and **every scope matches it**.
+
+Without that last clause, upgrading the daemon would silently un-judge the whole
+archive: 9,770 verdicts' worth of spans are unscoped on the install this was
+written for, and a scope that excluded them would turn every one of those turns
+`unknown`.
+
+Two writes change with it, both to "per bridge":
+
+- **A second `start` closes the first only within one bridge.** Two starts with
+  no stop between them is a dropped batch (0.9.0) — but with two bridges in two
+  calls the same account can genuinely be talking in both, and the official
+  client's ring is not evidence that Vesktop's utterance ended. Matched with
+  `IS`, so an old plugin's spans remain one stream of their own.
+- **A `stop` (and a `leave`) closes its own bridge's span**, for the same reason.
+
+### The scope: whose spans may judge this turn
+
+A mixed Discord session belongs to a client, and only that client's bridge saw
+the call in it. `crate::bridge::Scope` is the answer, in three values:
+
+| scope | spans it reads | when |
+|---|---|---|
+| `Every` | all of them | one bridge, or an ambiguous pair |
+| `Account(a)` | `account_id IS NULL OR account_id = a` | a bridge maps to this source |
+| `Legacy` | `account_id IS NULL` | no bridge maps to this source |
+
+and the ladder that picks one, in order of certainty:
+
+1. **The user said so** — `[truth] bridge_roles` may name an account
+   (`bridge:<account_id>`), and that beats every measurement. It is the only
+   thing that can separate two clients of one kind.
+2. **Nobody has ever scoped a span** — one bridge by construction. `Every`,
+   which is 0.12.2 exactly.
+3. **The kind maps** — exactly one bridge of this source's kind: that one.
+4. **No bridge of this kind** — the spans on disk are somebody else's call.
+   `Legacy`, so a scoped-only archive answers `unknown` rather than judging this
+   audio against the wrong conversation. **`unknown`, never `nobody`**: the
+   `truth_nearby` reach is scoped too, so "this bridge saw nothing here" cannot
+   become "truth covered this moment and nobody was talking".
+5. **Two bridges of one kind, no override** — ambiguous. `Every`, which is the
+   pre-0.12.3 answer and therefore adds no new wrongness, and `truth.status`
+   says out loud that it is guessing.
+
+`coverage()`, `verdict()`, `truth_overlap_frac`, `truth label`, `truth rejudge`
+and `truth report` all read through it.
+
+### `Audible` gains the bridge's own account
+
+0.12.1's rule was "every Discord account linked to the pinned You voice is
+dropped from presence on `app` audio". Two accounts already reached it —
+`discord_user_ids_for_speaker` resolves through `speaker_resolved`, so linking
+the second account to the same "You" voice is the whole of the setup, merges
+included — and that stays the way to say "these are both me".
+
+0.12.3 adds a **stronger** clause that needs no link at all: **the bridge's own
+account is silent on its own client's audio.** `own` is "an account the user has
+told us is theirs"; this is "the account this recording is physically made
+from", which is a fact about the stream and not a preference. A client never
+plays your microphone back to you (§17), and the bridge account *is* that
+client's local user.
+
+### The mute, per bridge
+
+0.12.1's rule read "is **any** per-user stream live". With two bridges that
+question is true of the machine and false of the client in front of it, and
+acting on the machine's answer is 0.12.1's bug with a second coat of paint. The
+liveness the rule reads is now a *set of kinds*:
+
+> A per-user stream can only be a duplicate of **its own bridge's client**. A
+> Vesktop bridge's streams never mute the official client's session, and vice
+> versa. An unscoped stream — an older plugin — explains every instance, which
+> is 0.12.2 unchanged.
+
+Three consequences, and all three fail towards recording:
+
+- The share is computed only against the streams that could be about this
+  instance. Two busy calls scored 0.98 alike (§37); a share computed against the
+  wrong streams is not merely uninformative, it is confidently wrong.
+- An instance no live stream is about is not a candidate, so it cannot win the
+  margin and cannot be the runner-up that denies it to somebody else.
+- **A `bridge` role cannot mute a client whose bridge is not sending.** The role
+  answers "which of the candidates"; this answers "is there a candidate", and a
+  fact outranks a preference.
+
+`truth.status.audio.mute` gains `streams_kinds` (which bridges are arriving) and
+each instance gains `explained` (whether any of them could be about it).
+
+### `sources.instance_role` gains `account_id`
+
+Optional, and only meaningful beside `role: "bridge"` — anything else is a
+`params` error rather than a silently dropped field. It persists as
+`bridge:<account_id>` in `[truth] bridge_roles`; a bare `bridge` is unchanged and
+a trailing colon is a typo and is refused. On the CLI:
+
+```
+recalld role vesktop bridge --account 482913
+```
+
+Naming the account says **whose speaking spans this client's audio is judged
+against**, which is a different question from whether it is muted, and the one
+the source key cannot answer.
+
+### `truth.status.bridges`
+
+```json
+{"bridges": [{"account_id": "482913", "kind": "vesktop", "instance": "a1b2c3d4",
+              "last_span_ms": 1757000000000, "last_line_ms": 1757000000100,
+              "spans": 412, "spans_per_min": 8.2, "source": "vesktop"}],
+ "ambiguous": [], "recent_s": 300}
+```
+
+Always an object, never `null` on a daemon that has the feature: `{"bridges":
+[], "ambiguous": []}` is "one plugin, or an older one", and a client must be able
+to tell that from "no such field".
+
+The rows come from `truth_speaking` and not from a live registry, because the
+verdict pass judges segments recorded hours ago and has to know which bridges
+existed *then*. `instance` and a bridge that has connected without anybody
+speaking yet come from the registry, which is the only thing the database cannot
+answer. `source` is resolved through the same ladder the verdict pass uses, so
+the status can never disagree with the thing it describes.
+
+`ambiguous` is a list of **kinds**, not a boolean: two Vesktops and one official
+client is a real state and only half of it is broken. `recalld truth report`
+prints one line per bridge and, when the list is non-empty, the warning and the
+command that settles it. The Sources card prints the account under each client
+("labels from the plugin signed in as …") and the warning above the list.
+
+### Rejudge, and what does not move
+
+**Historical verdicts stay as they are.** `recalld truth rejudge` runs against a
+data directory with no daemon behind it, so it reads no live override, and every
+span it re-judges predates the field — `scope_of` answers `Every` and the pass
+re-derives exactly what 0.12.1 measured. Scoping begins **from the first scoped
+span onward**: a verdict written before the plugin was updated is never
+re-scoped by a bridge that arrived afterwards, and nothing in this section moves
+a number 0.12.1 or §34 reported.

@@ -93,14 +93,30 @@ impl Rig {
     }
 
     fn label(&self) {
+        self.label_with(None);
+    }
+
+    /// A labelling pass that can see a manual `bridge:<account_id>` override
+    /// (0.12.3) — the one thing the database cannot answer.
+    fn label_with(&self, bridge: Option<&recalld::bridge::Picker>) {
         truth::label_batch(
             &self.store,
             &self.control,
             &self.cfg,
             &TruthStats::default(),
             &TruthStop::default(),
+            bridge,
         )
         .expect("a labelling pass");
+    }
+
+    /// A speaking span from a named bridge (0.12.3).
+    fn ring(&self, user: &str, from_ms: i64, to_ms: i64, client: &recalld::bridge::ClientRef) {
+        let s = self.store();
+        s.truth_speaking_start(user, user, Some("c"), from_ms * MS, client)
+            .expect("opening a span");
+        s.truth_speaking_stop(user, to_ms * MS, client)
+            .expect("closing it");
     }
 
     fn verdict_of(&self, id: i64) -> (Option<String>, Option<String>) {
@@ -129,7 +145,7 @@ fn the_v11_migration_is_idempotent_and_keeps_what_it_wrote() {
     // no-op property load-bearing rather than incidental: the statement that
     // renames the sweep's bare mark has to find nothing to do on the second
     // open, and it does, because it selects on the shape it removes.
-    assert_eq!(SCHEMA_VERSION, 16, "0.12.1 is schema v16");
+    assert_eq!(SCHEMA_VERSION, 17, "0.12.3 is schema v17");
     let dir = temp_dir("schema");
     let mut seg = 0i64;
     // Three opens: the first migrates, the second and third must be no-ops
@@ -148,8 +164,18 @@ fn the_v11_migration_is_idempotent_and_keeps_what_it_wrote() {
                 .set_segment_truth(seg, Some("u1"), truth_verdict::SINGLE, Some(0.97))
                 .unwrap();
             store.upsert_discord_user("u1", "Aspen", 0).unwrap();
-            store.truth_speaking_start("u1", "Aspen", None, 0).unwrap();
-            store.truth_speaking_stop("u1", 900 * MS).unwrap();
+            store
+                .truth_speaking_start(
+                    "u1",
+                    "Aspen",
+                    None,
+                    0,
+                    &recalld::bridge::ClientRef::default(),
+                )
+                .unwrap();
+            store
+                .truth_speaking_stop("u1", 900 * MS, &recalld::bridge::ClientRef::default())
+                .unwrap();
         }
         // Every v11 surface still answers, and still holds what it was given.
         let t = store.segment_truth(seg).unwrap().unwrap();
@@ -178,10 +204,23 @@ fn a_start_with_no_stop_is_closed_by_the_next_start() {
     let r = rig("open-start");
     {
         let s = r.store();
-        s.truth_speaking_start("u1", "Aspen", Some("c"), 0).unwrap();
+        s.truth_speaking_start(
+            "u1",
+            "Aspen",
+            Some("c"),
+            0,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
         // No stop. The next start is a dropped batch, not two mouths.
-        s.truth_speaking_start("u1", "Aspen", Some("c"), 500 * MS)
-            .unwrap();
+        s.truth_speaking_start(
+            "u1",
+            "Aspen",
+            Some("c"),
+            500 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
         let spans = s.truth_spans_between(-1, 10_000 * MS).unwrap();
         assert_eq!(spans.len(), 2);
         assert_eq!(
@@ -196,8 +235,14 @@ fn a_start_with_no_stop_is_closed_by_the_next_start() {
 fn a_start_with_no_stop_is_closed_by_the_timeout_and_not_by_now() {
     let r = rig("timeout");
     let s = r.store();
-    s.truth_speaking_start("u1", "Aspen", None, 1_000 * MS)
-        .unwrap();
+    s.truth_speaking_start(
+        "u1",
+        "Aspen",
+        None,
+        1_000 * MS,
+        &recalld::bridge::ClientRef::default(),
+    )
+    .unwrap();
     let timeout = 30_000 * MS;
 
     // Not yet: 29 s later the ring may genuinely still be lit.
@@ -215,7 +260,10 @@ fn a_start_with_no_stop_is_closed_by_the_timeout_and_not_by_now() {
 fn a_stop_with_no_start_invents_nothing() {
     let r = rig("orphan-stop");
     let s = r.store();
-    assert!(!s.truth_speaking_stop("u1", 500 * MS).unwrap());
+    assert!(
+        !s.truth_speaking_stop("u1", 500 * MS, &recalld::bridge::ClientRef::default())
+            .unwrap()
+    );
     assert!(s.truth_spans_between(0, 10_000 * MS).unwrap().is_empty());
 }
 
@@ -223,7 +271,14 @@ fn a_stop_with_no_start_invents_nothing() {
 fn an_open_span_is_reported_clipped_to_the_window_it_was_asked_for() {
     let r = rig("open-clip");
     let s = r.store();
-    s.truth_speaking_start("u1", "Aspen", None, 0).unwrap();
+    s.truth_speaking_start(
+        "u1",
+        "Aspen",
+        None,
+        0,
+        &recalld::bridge::ClientRef::default(),
+    )
+    .unwrap();
     let spans = s.truth_spans_between(0, 1_000 * MS).unwrap();
     assert_eq!(spans[0].t_end_ns, 1_000 * MS, "clipped, never unbounded");
 }
@@ -243,27 +298,69 @@ fn the_labelling_pass_writes_the_verdict_table_onto_real_segments() {
     {
         let s = r.store();
         // single: u1 across almost all of it, u2 barely
-        s.truth_speaking_start("u1", "Aspen", None, 10_000 * MS)
+        s.truth_speaking_start(
+            "u1",
+            "Aspen",
+            None,
+            10_000 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("u1", 10_950 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("u1", 10_950 * MS).unwrap();
-        s.truth_speaking_start("u2", "Ash", None, 10_900 * MS)
+        s.truth_speaking_start(
+            "u2",
+            "Ash",
+            None,
+            10_900 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("u2", 11_000 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("u2", 11_000 * MS).unwrap();
         // overlap: both well over the presence bar
-        s.truth_speaking_start("u1", "Aspen", None, 11_000 * MS)
+        s.truth_speaking_start(
+            "u1",
+            "Aspen",
+            None,
+            11_000 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("u1", 11_700 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("u1", 11_700 * MS).unwrap();
-        s.truth_speaking_start("u2", "Ash", None, 11_600 * MS)
+        s.truth_speaking_start(
+            "u2",
+            "Ash",
+            None,
+            11_600 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("u2", 12_000 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("u2", 12_000 * MS).unwrap();
         // partial: one voice, half the span
-        s.truth_speaking_start("u1", "Aspen", None, 12_000 * MS)
+        s.truth_speaking_start(
+            "u1",
+            "Aspen",
+            None,
+            12_000 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("u1", 12_500 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("u1", 12_500 * MS).unwrap();
         // nobody: a flicker under the presence bar, with truth all around
-        s.truth_speaking_start("u1", "Aspen", None, 13_000 * MS)
+        s.truth_speaking_start(
+            "u1",
+            "Aspen",
+            None,
+            13_000 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("u1", 13_100 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("u1", 13_100 * MS).unwrap();
     }
     r.label();
 
@@ -305,9 +402,16 @@ fn a_segment_with_no_truth_anywhere_near_is_unknown_and_stays_re_examinable() {
     // batch finally flushed. The pass must reconsider.
     {
         let s = r.store();
-        s.truth_speaking_start("u1", "Aspen", None, 10_000 * MS)
+        s.truth_speaking_start(
+            "u1",
+            "Aspen",
+            None,
+            10_000 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("u1", 10_950 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("u1", 10_950 * MS).unwrap();
     }
     r.label();
     assert_eq!(
@@ -319,9 +423,16 @@ fn a_segment_with_no_truth_anywhere_near_is_unknown_and_stays_re_examinable() {
     // …and a settled verdict is never re-read, however much truth arrives.
     {
         let s = r.store();
-        s.truth_speaking_start("u2", "Ash", None, 10_000 * MS)
+        s.truth_speaking_start(
+            "u2",
+            "Ash",
+            None,
+            10_000 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("u2", 11_000 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("u2", 11_000 * MS).unwrap();
     }
     r.label();
     assert_eq!(
@@ -338,9 +449,16 @@ fn only_discord_sessions_are_labelled() {
         let s = r.store();
         let src = s.upsert_source("VRChat.exe", "VRChat", 0).unwrap();
         let sess = s.begin_session(src, 0).unwrap();
-        s.truth_speaking_start("u1", "Aspen", None, 10_000 * MS)
+        s.truth_speaking_start(
+            "u1",
+            "Aspen",
+            None,
+            10_000 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("u1", 10_950 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("u1", 10_950 * MS).unwrap();
         s.insert_segment(sess, 10_000 * MS, 11_000 * MS, "segments/vr.wav", 0)
             .unwrap()
     };
@@ -381,12 +499,26 @@ fn the_labelling_pass_drops_your_own_ring_on_app_audio_and_only_there() {
     };
     {
         let s = r.store();
-        s.truth_speaking_start("aspen", "Aspen", None, 10_000 * MS)
+        s.truth_speaking_start(
+            "aspen",
+            "Aspen",
+            None,
+            10_000 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("aspen", 10_900 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("aspen", 10_900 * MS).unwrap();
-        s.truth_speaking_start("me", "nerdrx", None, 10_200 * MS)
+        s.truth_speaking_start(
+            "me",
+            "nerdrx",
+            None,
+            10_200 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("me", 10_700 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("me", 10_700 * MS).unwrap();
     }
     r.label();
 
@@ -633,12 +765,26 @@ fn the_summary_reports_what_the_re_verdict_reassigned() {
         s.upsert_discord_user("me", "nerdrx", 0).unwrap();
         s.set_discord_link("me", Some(you), Some(truth_via::MANUAL), 0)
             .unwrap();
-        s.truth_speaking_start("aspen", "Aspen", None, 10_000 * MS)
+        s.truth_speaking_start(
+            "aspen",
+            "Aspen",
+            None,
+            10_000 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("aspen", 10_900 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("aspen", 10_900 * MS).unwrap();
-        s.truth_speaking_start("me", "nerdrx", None, 10_200 * MS)
+        s.truth_speaking_start(
+            "me",
+            "nerdrx",
+            None,
+            10_200 * MS,
+            &recalld::bridge::ClientRef::default(),
+        )
+        .unwrap();
+        s.truth_speaking_stop("me", 10_700 * MS, &recalld::bridge::ClientRef::default())
             .unwrap();
-        s.truth_speaking_stop("me", 10_700 * MS).unwrap();
     }
     let seg = r.segment(10_000, 11_000);
     {
@@ -654,7 +800,7 @@ fn the_summary_reports_what_the_re_verdict_reassigned() {
         "an unrun pass has not reassigned nothing — it has not run"
     );
 
-    truth::rejudge(&r.store, usize::MAX, true, 1).unwrap();
+    truth::rejudge(&r.store, usize::MAX, true, 1, None).unwrap();
     let after = truth::summary(&r.store(), &identity, &cfg).unwrap();
     assert_eq!(after["rejudge"]["overlap_reassigned"], 1);
     assert_eq!(after["rejudge"]["changed"], 1);
@@ -704,18 +850,36 @@ fn request(port: u16, head: &str, body: &str) -> Http {
 
 /// The ingest, on an ephemeral port, over a throwaway store.
 fn ingest(name: &str) -> (Rig, truthnet::Ingest, u16, String) {
+    let (r, served, port, token, _) = ingest_with_picker(name);
+    (r, served, port, token)
+}
+
+/// The same, keeping the instance picker the ingest registers bridges on
+/// (0.12.3) — which is the only way to ask "which plugins has this daemon heard
+/// from" without a database round trip.
+fn ingest_with_picker(
+    name: &str,
+) -> (
+    Rig,
+    truthnet::Ingest,
+    u16,
+    String,
+    Arc<recalld::bridge::Picker>,
+) {
     let r = rig(name);
     let token = "0123456789abcdef0123456789abcdef".to_string();
+    let picker = Arc::new(recalld::bridge::Picker::new());
     let served = truthnet::serve(
         Arc::clone(&r.store),
         Arc::new(TruthStats::default()),
         token.clone(),
         0,
         None,
+        Some(Arc::clone(&picker)),
     )
     .expect("binding the ingest on an ephemeral port");
     let port = served.addr().port();
-    (r, served, port, token)
+    (r, served, port, token, picker)
 }
 
 #[test]
@@ -862,5 +1026,219 @@ fn one_malformed_line_does_not_poison_the_batch() {
     let spans = r.store().truth_spans_between(0, 10_000 * MS).unwrap();
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].t_end_ns, 1_800 * MS);
+    served.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 0.12.3: two bridges, two calls, one daemon
+// ---------------------------------------------------------------------------
+
+fn client(kind: &str, account: &str) -> recalld::bridge::ClientRef {
+    recalld::bridge::ClientRef {
+        kind: recalld::bridge::ClientKind::parse(kind),
+        account_id: Some(account.to_string()),
+        instance: Some(format!("{account}-run1")),
+    }
+}
+
+/// v17's two columns, and the rule that a span from before them is not a
+/// placeholder: it is the only bridge there was, so every scope matches it.
+#[test]
+fn a_span_remembers_which_bridge_reported_it_and_null_means_the_only_one() {
+    let r = rig("v17-columns");
+    r.ring("aspen", 1_000, 2_000, &client("vesktop", "acct-v"));
+    r.ring("someone", 1_000, 2_000, &client("discord", "acct-d"));
+    // An older plugin's line.
+    r.ring(
+        "legacy",
+        1_000,
+        2_000,
+        &recalld::bridge::ClientRef::default(),
+    );
+
+    let s = r.store();
+    let every = s
+        .truth_spans_between_scoped(0, 5_000 * MS, &recalld::bridge::Scope::Every)
+        .unwrap();
+    assert_eq!(every.len(), 3);
+
+    // Scoped to one bridge: that bridge's spans AND the unscoped one, which is
+    // the half that keeps an upgraded archive judgeable.
+    let vesktop = s
+        .truth_spans_between_scoped(
+            0,
+            5_000 * MS,
+            &recalld::bridge::Scope::Account("acct-v".into()),
+        )
+        .unwrap();
+    let users: Vec<&str> = vesktop.iter().map(|s| s.user_id.as_str()).collect();
+    assert_eq!(users, vec!["aspen", "legacy"]);
+    assert_eq!(vesktop[0].client_kind.as_deref(), Some("vesktop"));
+    assert_eq!(vesktop[1].account_id, None);
+
+    // And `Legacy` is the honest empty answer for a client no bridge maps to.
+    let legacy = s
+        .truth_spans_between_scoped(0, 5_000 * MS, &recalld::bridge::Scope::Legacy)
+        .unwrap();
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(legacy[0].user_id, "legacy");
+}
+
+/// One account, two clients, both talking. Closing the earlier open row on a
+/// second start is a per-bridge rule: the official client's ring is not
+/// evidence that Vesktop's utterance ended.
+#[test]
+fn one_accounts_ring_in_two_clients_is_two_spans_and_neither_cuts_the_other() {
+    let r = rig("v17-open-spans");
+    let v = client("vesktop", "acct-v");
+    let d = client("discord", "acct-d");
+    {
+        let s = r.store();
+        s.truth_speaking_start("aspen", "Aspen", None, 1_000 * MS, &v)
+            .unwrap();
+        // The other bridge sees the same person start in its own call. Under
+        // the pre-v17 rule this closed the row above at 1_200 ms.
+        s.truth_speaking_start("aspen", "Aspen", None, 1_200 * MS, &d)
+            .unwrap();
+        s.truth_speaking_stop("aspen", 5_000 * MS, &v).unwrap();
+        s.truth_speaking_stop("aspen", 2_000 * MS, &d).unwrap();
+    }
+    let s = r.store();
+    let spans = s
+        .truth_spans_between_scoped(0, 9_000 * MS, &recalld::bridge::Scope::Every)
+        .unwrap();
+    assert_eq!(spans.len(), 2);
+    let vspan = spans
+        .iter()
+        .find(|s| s.account_id.as_deref() == Some("acct-v"))
+        .unwrap();
+    assert_eq!(
+        vspan.t_end_ns,
+        5_000 * MS,
+        "the other client's ring must not have cut this one short"
+    );
+}
+
+/// The roll-up `truth.status` and the scope rule both read.
+#[test]
+fn the_bridges_roll_up_says_who_has_been_talking_and_how_recently() {
+    let r = rig("v17-rollup");
+    let now = 600_000 * MS;
+    r.ring("aspen", 590_000, 591_000, &client("vesktop", "acct-v"));
+    r.ring("aspen", 100, 200, &client("vesktop", "acct-v"));
+    r.ring("someone", 595_000, 596_000, &client("discord", "acct-d"));
+    r.ring(
+        "legacy",
+        595_000,
+        596_000,
+        &recalld::bridge::ClientRef::default(),
+    );
+
+    let bridges = r
+        .store()
+        .truth_bridges(now, 5 * 60 * 1_000_000_000)
+        .unwrap();
+    assert_eq!(bridges.len(), 2, "an unscoped span is not a bridge row");
+    let v = bridges.iter().find(|b| b.account_id == "acct-v").unwrap();
+    assert_eq!(v.kind, Some(recalld::bridge::ClientKind::Vesktop));
+    assert_eq!(v.spans, 2);
+    assert_eq!(v.spans_recent, 1, "the one from ten minutes ago is history");
+    assert_eq!(v.last_span_ns, 590_000 * MS);
+}
+
+/// **The headline, end to end.** Two bridges in two calls; the segment is the
+/// official client's audio. Its verdict must be about the people in ITS call,
+/// and the other bridge's spans must not reach it.
+#[test]
+fn a_turn_is_judged_against_the_bridge_that_could_hear_it() {
+    let r = rig("v17-scoped-verdict");
+    let seg = r.segment(10_000, 12_000);
+    // The rig's source is `Discord`, so the official client's bridge is the
+    // one that can hear this turn.
+    r.ring("someone", 10_000, 11_900, &client("discord", "acct-d"));
+    // …and Vesktop's call, in the same two seconds, with somebody else in it.
+    r.ring("aspen", 10_100, 11_800, &client("vesktop", "acct-v"));
+
+    r.label();
+    let (verdict, user) = r.verdict_of(seg);
+    assert_eq!(
+        verdict.as_deref(),
+        Some(truth_verdict::SINGLE),
+        "unscoped this reads `overlap`, which is two calls braided into one turn"
+    );
+    assert_eq!(user.as_deref(), Some("someone"));
+}
+
+/// The same install, one turn later: a mixed source that no live bridge maps
+/// to. The spans on disk belong to somebody else's call, so the only honest
+/// verdict is `unknown` — never a confident `nobody`, and never a verdict
+/// about the wrong conversation.
+#[test]
+fn a_client_with_no_bridge_of_its_kind_is_unknown_and_not_nobody() {
+    let r = rig("v17-no-bridge");
+    let seg = r.segment(10_000, 12_000);
+    // Only Vesktop has a plugin. The rig's segment is the official client's.
+    r.ring("aspen", 10_000, 11_900, &client("vesktop", "acct-v"));
+    r.label();
+    assert_eq!(r.verdict_of(seg).0.as_deref(), Some(truth_verdict::UNKNOWN));
+}
+
+/// Two clients of one kind share a source row, so only the user can separate
+/// them — and `recalld role <KEY> bridge --account <ID>` is how.
+#[test]
+fn a_same_kind_override_names_the_bridge_the_measurement_cannot() {
+    let r = rig("v17-same-kind");
+    let seg = r.segment(10_000, 12_000);
+    // Two Vesktops. Nothing about the source key says which is which.
+    r.ring("aspen", 10_000, 11_900, &client("vesktop", "acct-a"));
+    r.ring("someone", 10_100, 11_800, &client("vesktop", "acct-b"));
+
+    let picker = recalld::bridge::Picker::new();
+    picker.set_role("Discord", recalld::bridge::Role::Bridge, Some("acct-b"));
+    r.label_with(Some(&picker));
+    let (verdict, user) = r.verdict_of(seg);
+    assert_eq!(verdict.as_deref(), Some(truth_verdict::SINGLE));
+    assert_eq!(user.as_deref(), Some("someone"));
+}
+
+/// The wire, over the socket: a `client` object reaches the columns and the
+/// live registry, and a line without one still lands.
+#[test]
+fn the_ingest_records_which_bridge_a_speaking_line_came_from() {
+    let (r, served, port, token, picker) = ingest_with_picker("v17-wire");
+    let body = "{\"t_ms\":1000,\"user_id\":\"u1\",\"speaking\":true,\"name\":\"Aspen\",\
+                \"channel_id\":\"c\",\"client\":{\"kind\":\"vesktop\",\"account_id\":\"acct-v\",\
+                \"instance\":\"run-1\"}}\n\
+                {\"t_ms\":2000,\"user_id\":\"u1\",\"speaking\":false,\
+                \"client\":{\"kind\":\"vesktop\",\"account_id\":\"acct-v\"}}\n\
+                {\"t_ms\":3000,\"user_id\":\"u2\",\"speaking\":true,\"name\":\"Old\"}\n";
+    let res = request(
+        port,
+        &format!("POST /v1/discord/speaking HTTP/1.1\r\nAuthorization: Bearer {token}"),
+        body,
+    );
+    assert_eq!(res.status, 204);
+
+    let spans = r
+        .store()
+        .truth_spans_between_scoped(0, 9_000 * MS, &recalld::bridge::Scope::Every)
+        .unwrap();
+    let scoped = spans.iter().find(|s| s.user_id == "u1").unwrap();
+    assert_eq!(scoped.account_id.as_deref(), Some("acct-v"));
+    assert_eq!(scoped.client_kind.as_deref(), Some("vesktop"));
+    assert_eq!(scoped.t_end_ns, 2_000 * MS);
+    // A plugin that predates the field is not refused and is not invented a
+    // scope for.
+    let legacy = spans.iter().find(|s| s.user_id == "u2").unwrap();
+    assert_eq!(legacy.account_id, None);
+
+    let live = picker.bridges_live();
+    assert_eq!(live.len(), 1, "only a scoped line is a bridge");
+    let row = &live[&(
+        Some(recalld::bridge::ClientKind::Vesktop),
+        "acct-v".to_string(),
+    )];
+    assert_eq!(row.instance.as_deref(), Some("run-1"));
+    assert_eq!(row.lines, 2);
     served.shutdown();
 }

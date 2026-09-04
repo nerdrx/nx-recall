@@ -110,6 +110,10 @@ pub struct Frame {
     /// was lost, and audio that was lost must not be spliced over.
     pub seq: u64,
     pub samples: Vec<f32>,
+    /// Which bridge sent it (0.12.3). Two plugins now POST at one daemon, and
+    /// a stream is only a duplicate of *its own* client's mixed tap — so the
+    /// frame has to say whose it is or the mute is a coin flip.
+    pub client: crate::bridge::ClientRef,
 }
 
 /// Why a line was not taken. Every one of these is counted, not raised: the
@@ -189,6 +193,7 @@ pub fn parse_frame(v: &Value, max_frame_ms: u64) -> Result<Frame, Reject> {
         rate,
         seq,
         samples,
+        client: crate::bridge::ClientRef::parse(v),
     })
 }
 
@@ -232,9 +237,27 @@ impl AudioStats {
 // one live stream
 // ---------------------------------------------------------------------------
 
+/// Which stream a frame belongs to (0.12.3).
+///
+/// **The account, and not only the user.** Two bridges may both be in a call
+/// with the same person — or, far more commonly, both report the local user of
+/// the *other* client — and one stream table keyed on the user id alone would
+/// braid two people's audio into one session, re-anchoring on every frame
+/// because the two runs' sequence numbers interleave. `None` is an older
+/// plugin, which is one bridge by construction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StreamKey {
+    account: Option<String>,
+    user: String,
+}
+
 struct Stream {
     session_id: i64,
     speaker_id: Option<i64>,
+    /// The bridge this stream came from, so the mute rule can tell whose
+    /// client's audio it would be a duplicate of.
+    kind: Option<crate::bridge::ClientKind>,
+    account: Option<String>,
     name: String,
     channel_id: Option<String>,
     resampler: LinearResampler,
@@ -262,7 +285,7 @@ pub struct PerUser {
     store: Arc<std::sync::Mutex<Store>>,
     queue: Arc<EventQueue>,
     cfg: TruthConfig,
-    streams: std::sync::Mutex<HashMap<String, Stream>>,
+    streams: std::sync::Mutex<HashMap<StreamKey, Stream>>,
     pub stats: Arc<AudioStats>,
 }
 
@@ -299,15 +322,19 @@ impl PerUser {
             return Ok(());
         }
         let now = utc_now_ns();
+        let key = StreamKey {
+            account: frame.client.account_id.clone(),
+            user: frame.user_id.clone(),
+        };
         let mut streams = self.streams.lock().unwrap_or_else(|p| p.into_inner());
 
         // ---- the session, opened on the first frame and not before ----
-        if !streams.contains_key(&frame.user_id) {
+        if !streams.contains_key(&key) {
             let opened = self.open(&frame, now)?;
-            streams.insert(frame.user_id.clone(), opened);
+            streams.insert(key.clone(), opened);
         }
         let stream = streams
-            .get_mut(&frame.user_id)
+            .get_mut(&key)
             .expect("just inserted or already present");
 
         // A nickname that changed mid-call renames the source row, because the
@@ -478,6 +505,8 @@ impl PerUser {
         Ok(Stream {
             session_id,
             speaker_id,
+            kind: frame.client.kind,
+            account: frame.client.account_id.clone(),
             name: frame.name.clone(),
             channel_id: frame.channel_id.clone(),
             resampler: LinearResampler::new(),
@@ -499,15 +528,51 @@ impl PerUser {
     /// plugin that is switched off, crashes, or is running on a client that
     /// cannot do this costs a few seconds of transcript rather than the call.
     pub fn any_live(&self) -> bool {
+        self.live_kinds().any()
+    }
+
+    /// [`Self::any_live`], but saying **whose** streams (0.12.3).
+    ///
+    /// This is the input the two-bridge rule actually needs. "Something is
+    /// arriving" was a sufficient answer while there was one plugin; with two,
+    /// it is the difference between muting the client whose call is being
+    /// recorded twice and muting the one whose call nobody else can hear.
+    pub fn live_kinds(&self) -> crate::bridge::LiveKinds {
+        let mut out = crate::bridge::LiveKinds::default();
         if !self.cfg.audio {
-            return false;
+            return out;
         }
         let window = (self.cfg.audio_live_s.max(0.5) * 1e9) as u64;
         let now = monotonic_ns();
         let streams = self.streams.lock().unwrap_or_else(|p| p.into_inner());
+        for s in streams.values() {
+            if now.saturating_sub(s.last_frame_mono_ns) <= window {
+                out.insert(s.kind);
+            }
+        }
+        out
+    }
+
+    /// Which bridge a per-user session's frames came from, for the pipeline:
+    /// the stream's audio is evidence about that client's mixed tap and about
+    /// no other.
+    ///
+    /// **Two levels of `Option`, and both are load-bearing.** The outer one is
+    /// "there is no such stream any more" — a buffer still in the queue when
+    /// the sweep closed its session — and the inner one is "an older plugin,
+    /// which named no client". They must not collapse: an unnamed bridge's
+    /// audio explains every mixed instance, so filing a stale buffer under it
+    /// would let a stream that has stopped arriving mute a client for the rest
+    /// of the window.
+    pub fn client_kind_for_session(
+        &self,
+        session_id: i64,
+    ) -> Option<Option<crate::bridge::ClientKind>> {
+        let streams = self.streams.lock().unwrap_or_else(|p| p.into_inner());
         streams
             .values()
-            .any(|s| now.saturating_sub(s.last_frame_mono_ns) <= window)
+            .find(|s| s.session_id == session_id)
+            .map(|s| s.kind)
     }
 
     /// Close the sessions of streams that have stopped arriving.
@@ -523,10 +588,10 @@ impl PerUser {
         let mut ended = Vec::new();
         {
             let mut streams = self.streams.lock().unwrap_or_else(|p| p.into_inner());
-            streams.retain(|user, s| {
+            streams.retain(|key, s| {
                 let quiet = now.saturating_sub(s.last_frame_mono_ns) > idle;
                 if quiet {
-                    ended.push((user.clone(), s.session_id, s.last_frame_mono_ns));
+                    ended.push((key.user.clone(), s.session_id, s.last_frame_mono_ns));
                 }
                 !quiet
             });
@@ -576,10 +641,16 @@ impl PerUser {
         let streams = self.streams.lock().unwrap_or_else(|p| p.into_inner());
         let mut rows: Vec<Value> = streams
             .iter()
-            .map(|(user_id, s)| {
+            .map(|(key, s)| {
                 let quiet_ms = now.saturating_sub(s.last_frame_mono_ns) / 1_000_000;
                 json!({
-                    "user_id": user_id,
+                    "user_id": key.user,
+                    // 0.12.3: which bridge's ear this is. Two rows may now
+                    // carry one `user_id` — the same person, heard by two
+                    // clients — and without these two fields that list is
+                    // unreadable.
+                    "account_id": s.account,
+                    "client_kind": s.kind.map(crate::bridge::ClientKind::as_str),
                     "name": s.name,
                     "channel_id": s.channel_id,
                     "session_id": s.session_id,
@@ -591,7 +662,10 @@ impl PerUser {
             })
             .collect();
         // Stable order, so a status that is polled does not shuffle.
-        rows.sort_by(|a, b| a["user_id"].as_str().cmp(&b["user_id"].as_str()));
+        rows.sort_by(|a, b| {
+            (a["account_id"].as_str(), a["user_id"].as_str())
+                .cmp(&(b["account_id"].as_str(), b["user_id"].as_str()))
+        });
         let live = rows.iter().filter(|r| r["live"] == json!(true)).count();
         json!({
             "enabled": self.cfg.audio,

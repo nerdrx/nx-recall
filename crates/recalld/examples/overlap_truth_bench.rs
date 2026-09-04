@@ -230,6 +230,10 @@ fn main() -> Result<()> {
                     name: r.get(1)?,
                     t_start_ns: r.get(2)?,
                     t_end_ns: r.get(3)?,
+                    // The bench reads a corpus, not a live wire: every span it
+                    // sees is whatever the archive holds, unscoped.
+                    account_id: None,
+                    client_kind: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
