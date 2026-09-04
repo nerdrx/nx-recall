@@ -8,7 +8,7 @@ mod cli;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -398,6 +398,38 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         _ => None,
     };
 
+    // ---- 0.12.1: per-user Discord audio -----------------------------------
+    //
+    // Built whether or not `[truth].audio` is on, for the same reason the truth
+    // worker is started whether or not the ingest is: the router is what
+    // reports "off" to a client that asks, and the pipeline holds it to answer
+    // one question per buffer ("is a per-user stream live") whose answer is
+    // `false` for free when the switch is off.
+    //
+    // It pushes at the SAME queue every microphone and every application pushes
+    // at. That is the whole integration: a Discord user's voice becomes an
+    // `AudioChunk` with a session id, and everything downstream — VAD, the
+    // segmenter, ASR, the store, retention, threading — treats it as audio,
+    // because it is.
+    let audio_stats = Arc::new(recalld::peruser::AudioStats::default());
+    let peruser = Arc::new(recalld::peruser::PerUser::new(
+        Arc::clone(&store),
+        Arc::clone(&queue),
+        cfg.truth.clone(),
+        Arc::clone(&audio_stats),
+    ));
+    pipeline.attach_peruser(Arc::clone(&peruser));
+    if cfg.truth.audio {
+        info!(
+            live_s = cfg.truth.audio_live_s,
+            idle_s = cfg.truth.audio_idle_s,
+            enrol = cfg.truth.enrol,
+            "per-user Discord audio is on: the mixed Discord tap will be muted \
+             for analysis while any stream is live"
+        );
+    }
+    // ---- end 0.12.1 -------------------------------------------------------
+
     let nice = cfg.runtime.inference_nice;
     let cpus = cfg.runtime.inference_cpus.clone();
     let queue_for_thread = Arc::clone(&queue);
@@ -545,6 +577,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
                 Arc::clone(&truth_stats),
                 token,
                 cfg.truth.port,
+                Some(Arc::clone(&peruser)),
             )
         }) {
             Ok(ingest) => Some(ingest),
@@ -561,7 +594,32 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         stats: Arc::clone(&truth_stats),
         listening: truth_ingest.as_ref().map(|i| i.addr()),
         token_path: truth_token_path,
+        audio: Some(Arc::clone(&peruser)),
     }));
+    // 0.12.1: the janitor for per-user streams. A second of granularity against
+    // an idle window measured in seconds, and it exists because the case that
+    // has to be noticed is precisely the one where nothing arrives any more:
+    // everybody left the call, or Discord was closed mid-word. Without it the
+    // last turn of every call would sit unflushed until the daemon stopped.
+    let audio_sweep_stop = Arc::new(AtomicBool::new(false));
+    let audio_sweep = {
+        let peruser = Arc::clone(&peruser);
+        let stop = Arc::clone(&audio_sweep_stop);
+        std::thread::Builder::new()
+            .name("recalld-peruser".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    peruser.sweep();
+                }
+                // On the way out, close what is still open through the same
+                // path a quiet stream takes, so a daemon stopping mid-call
+                // flushes the same last turn.
+                peruser.close_all();
+            })
+            .map_err(|e| warn!("no per-user audio janitor: {e}"))
+            .ok()
+    };
     // ---- end 0.9.0 --------------------------------------------------------
     // The night shift (0.9.0). Started like the two workers above it — the
     // switch is live, and every gate it has is re-read on its own loop.
@@ -699,7 +757,11 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     if let Some(i) = truth_ingest {
         i.shutdown();
     }
+    // 0.12.1: stopped AFTER the ingest, so no frame can open a session the
+    // janitor has already closed on its way out.
+    audio_sweep_stop.store(true, Ordering::Relaxed);
     for handle in [
+        audio_sweep,
         roster_thread,
         sweeper_thread,
         enrich_thread,

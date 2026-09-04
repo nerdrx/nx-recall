@@ -115,10 +115,27 @@ pub fn ingest_pcm(
     // The same question the live pipeline asks, from the same column: is this
     // session the user's own microphone? If so the voicebank is not consulted
     // and the speaker is the pinned "You".
-    let mic_speaker = match store.session_source_kind(session_id)? {
-        Some(kind) if kind == KIND_MIC => Some(store.ensure_you_speaker(t0_ns)?),
+    let kind = store.session_source_kind(session_id)?;
+    let mic_speaker = match kind.as_deref() {
+        Some(k) if k == KIND_MIC => Some(store.ensure_you_speaker(t0_ns)?),
         _ => None,
     };
+    // 0.12.1, and the same question again from the same column: is this session
+    // one Discord user's own audio stream? If so the voicebank is not consulted
+    // either, and the speaker is the voice that account is linked to.
+    let discord_speaker = match kind.as_deref() {
+        Some(k) if k == crate::store::KIND_DISCORD_USER => {
+            store.discord_session_speaker(session_id)?
+        }
+        _ => None,
+    };
+    let pin = discord_speaker.map(|speaker_id| crate::analysis::PinnedLeg {
+        speaker_id,
+        label_via: crate::store::label_via::DISCORD_STREAM,
+        // Never, for anybody but the user — see `PinnedLeg`.
+        goldens: None,
+        enrol: pipe.cfg.truth.enrol,
+    });
     let turns = segment_pcm(pipe.vad, pipe.cfg, samples)?;
     let mut ids = Vec::new();
     for (seq, span) in turns.into_iter().enumerate() {
@@ -159,10 +176,19 @@ pub fn ingest_pcm(
                     )?
                     .also_changed;
             }
-            (Some(a), None) => {
-                also_changed = a.process(store, id, slice, t_start_ns)?.also_changed;
-            }
-            // Models off: the mic label is provenance, not inference, so it is
+            (Some(a), None) => match &pin {
+                // 0.12.1: single-speaker by construction, so the overlap gate
+                // does not apply and the ladder has nothing to decide.
+                Some(pin) => {
+                    also_changed = a
+                        .process_pinned(store, id, slice, pin, t_start_ns)?
+                        .also_changed;
+                }
+                None => {
+                    also_changed = a.process(store, id, slice, t_start_ns)?.also_changed;
+                }
+            },
+            // Models off: a pinned label is provenance, not inference, so it is
             // still true and still worth writing.
             (None, Some(speaker_id)) => store.set_segment_speaker_via(
                 id,
@@ -170,7 +196,16 @@ pub fn ingest_pcm(
                 None,
                 Some(crate::store::label_via::MIC),
             )?,
-            (None, None) => {}
+            (None, None) => {
+                if let Some(pin) = &pin {
+                    store.set_segment_speaker_via(
+                        id,
+                        Some(pin.speaker_id),
+                        None,
+                        Some(pin.label_via),
+                    )?;
+                }
+            }
         }
         if let Some(bus) = pipe.bus.as_ref() {
             publish_segment(bus, store, id);

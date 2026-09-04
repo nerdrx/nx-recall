@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 
-use crate::analysis::{AnalysisStats, Analyzer, MicEnroll, analyse_mic_or_log, analyse_or_log};
+use crate::analysis::{
+    AnalysisStats, Analyzer, MicEnroll, PinnedLeg, analyse_mic_or_log, analyse_or_log,
+    analyse_pinned_or_log,
+};
 use crate::bus::{Bus, Topic};
 use crate::clock::{Anchor, samples_to_ns, utc_now_ns};
 use crate::config::{Config, SAMPLE_RATE};
@@ -130,6 +133,17 @@ struct SessionPipeline {
     /// is otherwise invisible precisely because it is treated like everything
     /// else.
     is_room: bool,
+    /// The voice this session's turns are pinned to, when the session is one
+    /// Discord user's own audio stream (0.12.1, `sources.kind =
+    /// "discord-user"`). Read from the row once, like the two flags above, and
+    /// for the same reason: `Store::discord_session_speaker` is the thing that
+    /// knows, and the capture side is not.
+    ///
+    /// `Some` here is the strongest claim in this struct. It means the whole
+    /// identity ladder is skipped — no comparison, no mint, no margin — because
+    /// the audio arrived on a wire that carried one person's packets. It is
+    /// exactly [`Self::is_mic`]'s claim about somebody who is not the user.
+    discord_speaker: Option<i64>,
     // ---- 0.11.0, partial turns: begin --------------------------------------
     /// Cadence, sequence and the previous turn's identity, for the provisional
     /// captions published while a turn is still open (`crate::partial`).
@@ -150,6 +164,7 @@ impl SessionPipeline {
         first_chunk_mono_ns: u64,
         is_mic: bool,
         is_room: bool,
+        discord_speaker: Option<i64>,
     ) -> Self {
         Self {
             vad_state,
@@ -164,6 +179,7 @@ impl SessionPipeline {
             segment_seq: 0,
             is_mic,
             is_room,
+            discord_speaker,
             // ---- 0.11.0, partial turns ------------------------------------
             partial: crate::partial::PartialState::default(),
             source_key: None,
@@ -313,6 +329,23 @@ pub struct Pipeline {
     /// Semantic search's text embedder (0.6.5), when the optional model is
     /// installed. Shared with the socket service — one 118 MB session, not two.
     semantic: Option<Arc<crate::semantic::SemanticLeg>>,
+    // ---- 0.12.1: per-user Discord audio ------------------------------------
+    /// The per-user audio router, when the daemon has one. Read for exactly one
+    /// question — "is any per-user stream live right now" — which is the whole
+    /// input to the de-duplication rule in [`Self::on_audio`].
+    peruser: Option<Arc<crate::peruser::PerUser>>,
+    /// `[truth].sources`, so a session's match key can be tested against the
+    /// same list everything else tests against.
+    truth_cfg: crate::config::TruthConfig,
+    /// Whether a session is the mixed Discord tap. Cached per session because
+    /// the answer is a property of the source row and cannot change under a
+    /// session, and kept OUTSIDE `sessions` because the mute removes the
+    /// `SessionPipeline` and would otherwise re-read the row per buffer.
+    is_mixed_discord: HashMap<i64, bool>,
+    /// Which mixed sessions are currently muted, so the transition is logged
+    /// once rather than fifty times a second.
+    muted_mixed: std::collections::HashSet<i64>,
+    // ---- end 0.12.1 --------------------------------------------------------
 }
 
 impl Pipeline {
@@ -412,7 +445,17 @@ impl Pipeline {
             bus,
             was_paused: false,
             semantic: None,
+            peruser: None,
+            truth_cfg: cfg.truth.clone(),
+            is_mixed_discord: HashMap::new(),
+            muted_mixed: std::collections::HashSet::new(),
         })
+    }
+
+    /// Give the inference thread the per-user audio router (0.12.1). Set once,
+    /// before the thread starts, like the semantic leg beside it.
+    pub fn attach_peruser(&mut self, peruser: Arc<crate::peruser::PerUser>) {
+        self.peruser = Some(peruser);
     }
 
     /// Give the inference thread the semantic leg, so a turn is embedded as
@@ -463,6 +506,47 @@ impl Pipeline {
             info!("resumed: writing segments again");
         }
 
+        // ---- 0.12.1: the de-duplication rule ---------------------------------
+        //
+        // While ANY per-user Discord stream is live, the MIXED Discord tap is
+        // muted for analysis. Both are carrying the same call — one off the
+        // speakers, one per person straight out of the client — so leaving both
+        // on would write every sentence twice, under two different speakers, in
+        // the same thread.
+        //
+        // Muting rather than de-duplicating afterwards, because the duplicate
+        // this prevents has no key to be found by: `segments` has no uniqueness
+        // constraint a second reading of the same speech would violate, and
+        // matching two turns by time overlap after the fact would be a guess
+        // about which of two transcripts is the real one. The turn that is
+        // never written needs no rule for choosing.
+        //
+        // It is the same discard a pause performs, for the same reason: the
+        // half-built turn goes with it, so nothing said before the mute can be
+        // written by a segment that ends after it. When the last stream goes
+        // quiet (`[truth].audio_live_s` after its last frame) the mixed tap
+        // picks the call back up on its next buffer, opening a fresh turn — so
+        // a plugin that is switched off mid-call costs a few seconds of
+        // transcript rather than the rest of the evening.
+        if self.mixed_discord_is_muted(chunk.session_id) {
+            if !self.muted_mixed.contains(&chunk.session_id) {
+                self.muted_mixed.insert(chunk.session_id);
+                info!(
+                    session_id = chunk.session_id,
+                    "per-user Discord streams are live; muting the mixed tap for analysis"
+                );
+            }
+            self.sessions.remove(&chunk.session_id);
+            return Ok(());
+        }
+        if self.muted_mixed.remove(&chunk.session_id) {
+            info!(
+                session_id = chunk.session_id,
+                "per-user Discord streams stopped; the mixed tap is analysing again"
+            );
+        }
+        // ---- end 0.12.1 ------------------------------------------------------
+
         let seg_cfg = self.seg_cfg;
         let new_state = self.vad.new_state();
         let merger = crate::ingest::turn_merger(&self.cfg);
@@ -470,13 +554,17 @@ impl Pipeline {
         // as "an application", which is the safe answer: the worst case is a
         // mic turn going through the voicebank like any other voice, never an
         // app turn being labelled as the user.
-        let (is_mic, is_room) = if self.sessions.contains_key(&chunk.session_id) {
-            (false, false) // unused; the entry already exists
+        let (is_mic, is_room, discord_speaker) = if self.sessions.contains_key(&chunk.session_id) {
+            (false, false, None) // unused; the entry already exists
         } else {
             let kind = self.session_kind(chunk.session_id);
+            let discord_speaker = (kind.as_deref() == Some(crate::store::KIND_DISCORD_USER))
+                .then(|| self.session_discord_speaker(chunk.session_id))
+                .flatten();
             (
                 kind.as_deref() == Some(KIND_MIC),
                 kind.as_deref() == Some(crate::store::KIND_ROOM),
+                discord_speaker,
             )
         };
         let fresh_state = self.vad.new_state();
@@ -488,6 +576,7 @@ impl Pipeline {
                 chunk.capture_mono_ns,
                 is_mic,
                 is_room,
+                discord_speaker,
             )
         });
 
@@ -574,6 +663,59 @@ impl Pipeline {
         }
     }
 
+    // ---- 0.12.1: per-user Discord audio --------------------------------------
+
+    /// The voice a per-user Discord session is pinned to, read once when the
+    /// session starts.
+    ///
+    /// `None` — an unlinked account, a poisoned lock, a session of some other
+    /// kind — means "take the ordinary route", which is the safe answer for the
+    /// same reason [`Self::session_kind`]'s is: the worst case is a Discord
+    /// turn going through the voicebank exactly as it did before this feature
+    /// existed, never a turn being pinned to the wrong person.
+    fn session_discord_speaker(&self, session_id: i64) -> Option<i64> {
+        let Ok(store) = self.store.lock() else {
+            warn!(
+                session_id,
+                "store mutex poisoned; not pinning a per-user Discord session"
+            );
+            return None;
+        };
+        match store.discord_session_speaker(session_id) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(session_id, "could not read the pinned Discord voice: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Should this session's audio be discarded because per-user streams are
+    /// carrying the same call?
+    ///
+    /// Two conditions, and the cheap one is first: there is no router, or
+    /// nothing is arriving on it, on almost every buffer this daemon ever
+    /// handles.
+    fn mixed_discord_is_muted(&mut self, session_id: i64) -> bool {
+        let Some(peruser) = self.peruser.as_ref() else {
+            return false;
+        };
+        if !peruser.any_live() {
+            return false;
+        }
+        if let Some(known) = self.is_mixed_discord.get(&session_id) {
+            return *known;
+        }
+        let key = self.session_source_key(session_id);
+        let mixed = key
+            .as_deref()
+            .is_some_and(|k| crate::peruser::is_mixed_discord_source(&self.truth_cfg, k));
+        self.is_mixed_discord.insert(session_id, mixed);
+        mixed
+    }
+
+    // ---- end 0.12.1 -----------------------------------------------------------
+
     fn on_session_end(&mut self, session_id: i64, mono_ns: u64) -> Result<()> {
         let mut final_turns = Vec::new();
         if let Some(session) = self.sessions.get_mut(&session_id) {
@@ -586,6 +728,11 @@ impl Pipeline {
             self.write_segment(session_id, span)?;
         }
         self.sessions.remove(&session_id);
+        // 0.12.1: the two caches that outlive `sessions` on purpose (the mute
+        // removes the entry) must not outlive the session itself, or a reused
+        // row id would inherit a stale answer.
+        self.is_mixed_discord.remove(&session_id);
+        self.muted_mixed.remove(&session_id);
 
         let store = self
             .store
@@ -617,6 +764,7 @@ impl Pipeline {
         session.segment_seq += 1;
         let is_mic = session.is_mic;
         let is_room = session.is_room;
+        let discord_speaker = session.discord_speaker;
         let rel = segment_path(session_id, session.segment_seq, t_start_ns);
         let abs = self.data_dir.join(&rel);
 
@@ -693,6 +841,33 @@ impl Pipeline {
                     t_start_ns,
                 ),
                 None if is_mic => Vec::new(),
+                // 0.12.1: one Discord user's own stream. The ladder is skipped
+                // entirely — there is nothing for it to decide — but the turn is
+                // still transcribed, still embedded, and still a candidate for
+                // enrolment, which is the point: this is the cleanest material
+                // the voicebank will ever be offered for anybody who is not the
+                // user, and it is the only path that produces it.
+                None if discord_speaker.is_some() => analyse_pinned_or_log(
+                    analyzer,
+                    &self.store,
+                    &self.analysis_stats,
+                    segment_id,
+                    &samples,
+                    &PinnedLeg {
+                        speaker_id: discord_speaker.expect("matched Some just above"),
+                        label_via: crate::store::label_via::DISCORD_STREAM,
+                        // No goldens for anybody but the user: a golden outlives
+                        // retention on the strength of being the user's own
+                        // voice, and that argument does not transfer.
+                        goldens: None,
+                        // `[truth].enrol` and nothing else. The audio is proof
+                        // of WHOSE voice it is; it is not permission to write to
+                        // the voicebank, and that switch is where that
+                        // permission has lived since 0.9.0.
+                        enrol: self.truth_cfg.enrol,
+                    },
+                    t_start_ns,
+                ),
                 None => analyse_or_log(
                     analyzer,
                     &self.store,
@@ -702,20 +877,19 @@ impl Pipeline {
                     t_start_ns,
                 ),
             };
-        } else if let Some(speaker_id) = you {
+        } else if let Some((speaker_id, via)) = you
+            .map(|s| (s, crate::store::label_via::MIC))
+            .or(discord_speaker.map(|s| (s, crate::store::label_via::DISCORD_STREAM)))
+        {
             // No models loaded. The label is provenance, not inference, so it
-            // is still true — and stamping it here is what makes a mic capture
-            // useful on a machine that has not fetched the model set yet.
+            // is still true — and stamping it here is what makes a mic capture,
+            // or a per-user Discord stream, useful on a machine that has not
+            // fetched the model set yet.
             let store = self
                 .store
                 .lock()
                 .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
-            store.set_segment_speaker_via(
-                segment_id,
-                Some(speaker_id),
-                None,
-                Some(crate::store::label_via::MIC),
-            )?;
+            store.set_segment_speaker_via(segment_id, Some(speaker_id), None, Some(via))?;
         }
         // The text vector, after the transcript exists and before the event
         // goes out. On THIS thread on purpose: it is the deprioritised worker
@@ -1104,6 +1278,7 @@ mod tests {
             0,
             false,
             false,
+            None,
         );
         s.anchor = Anchor {
             mono_ns: 0,
@@ -1131,6 +1306,7 @@ mod tests {
             0,
             false,
             false,
+            None,
         );
         s.anchor = Anchor {
             mono_ns: 0,
@@ -1156,6 +1332,7 @@ mod tests {
             0,
             false,
             false,
+            None,
         );
         s.anchor = Anchor {
             mono_ns: 0,
@@ -1183,6 +1360,7 @@ mod tests {
             0,
             false,
             false,
+            None,
         );
         s.anchor = Anchor {
             mono_ns: 0,
@@ -1239,6 +1417,7 @@ mod tests {
             0,
             false,
             false,
+            None,
         );
         fine.received = 16_000;
         fine.ring = vec![0.25; 16_000];
@@ -1269,6 +1448,7 @@ mod tests {
             0,
             false,
             false,
+            None,
         );
         assert_eq!(s.open_turn_start(), None, "nobody is talking");
 
@@ -1308,6 +1488,7 @@ mod tests {
             0,
             false,
             false,
+            None,
         );
         s.received = 16_000;
         s.ring = vec![0.25; 16_000];
@@ -1338,6 +1519,7 @@ mod tests {
             0,
             false,
             false,
+            None,
         );
         s.ring = (0..100).map(|i| i as f32).collect();
         s.ring_base = 1000;

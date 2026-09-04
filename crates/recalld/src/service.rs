@@ -345,6 +345,10 @@ pub struct TruthWiring {
     /// the result would be useless.
     pub listening: Option<std::net::SocketAddr>,
     pub token_path: std::path::PathBuf,
+    /// The per-user audio router (0.12.1), or `None` on a daemon that has none.
+    /// `truth.status` reads it for the stream list and the counters; nothing
+    /// here writes to it.
+    pub audio: Option<Arc<crate::peruser::PerUser>>,
 }
 
 impl Service {
@@ -905,6 +909,15 @@ impl Service {
                     } else if r.kind == crate::store::KIND_ROOM {
                         // 0.10.0: `[room].enabled`, never a rule.
                         room.enabled
+                    } else if r.kind == crate::store::KIND_DISCORD_USER {
+                        // 0.12.1: a per-user Discord stream has no rule and no
+                        // device. It exists because the plugin sent audio, and
+                        // it "captures" exactly while `[truth].audio` says the
+                        // daemon will take any. Deciding it by `[rules]` would
+                        // be worse than wrong — the match key is `discord:<id>`,
+                        // which is in nobody's allowlist, so every one of these
+                        // would read as denied while plainly recording.
+                        self.truth_cfg().audio
                     } else {
                         live.decide(&r.match_key).captures()
                     };
@@ -943,6 +956,17 @@ impl Service {
                 "the room microphone is not an application rule — use room.set \
                  {enabled, mode, device}; it hears everyone sitting in the room, \
                  so it has its own switch, its own device and its own default (off)",
+            ));
+        }
+        // 0.12.1, third time, same reason: `[truth].audio` is the switch, and a
+        // rule keyed on `discord:<id>` would be a consent decision recorded in
+        // a place nothing reads.
+        if match_key.starts_with("discord:") {
+            return Err(Error::new(
+                "refused",
+                "a per-user Discord stream is not an application rule — it exists \
+                 because the RecallBridge plugin sent that person's audio, and it \
+                 follows [truth].audio, which is off by default",
             ));
         }
         let allowed = req
@@ -4022,6 +4046,10 @@ impl Service {
             "users": users.len(),
             "linked": users.iter().filter(|u| u.speaker_id.is_some()).count(),
             "counters": wiring.map(|w| w.stats.to_json()),
+            // 0.12.1. Always present, never null on a daemon that has the
+            // feature at all: a client must be able to tell "switched off" from
+            // "older daemon", and a missing key cannot.
+            "audio": wiring.and_then(|w| w.audio.as_ref()).map(|a| a.status()),
         }))
     }
 

@@ -27,8 +27,32 @@
 //! ```text
 //! POST /v1/discord/speaking   NDJSON  {t_ms, user_id, speaking, name, channel_id}
 //! POST /v1/discord/voice      NDJSON  {t_ms, ev, user_id, name, channel_id, self_mute?, self_deaf?}
+//! POST /v1/discord/audio      NDJSON  {t_ms, user_id, name, channel_id, rate, seq, pcm}
 //! GET  /v1/health                     {"ok": true, ...}
 //! ```
+//!
+//! ## 0.12.1: the third route, and why it is a bigger door
+//!
+//! The first two carry *timestamps*. `/v1/discord/audio` carries one Discord
+//! user's own voice, base64 PCM16 mono at 16 kHz, ~16 kB per 500 ms frame per
+//! person (`crate::peruser`). Batched across everyone in the call that is
+//! comfortably inside [`MAX_BODY`] — four people at 500 ms is about 86 kB —
+//! and the plugin budgets its batches in bytes rather than lines for exactly
+//! that reason.
+//!
+//! It is behind its own switch, `[truth].audio`, which is off even when
+//! `[truth].enabled` is on. Turning the ingest on to measure speaker accuracy
+//! should not, silently, also start writing recordings that arrived over a
+//! socket. When it is off the route answers `204` and counts the lines as
+//! rejected: a newer plugin talking to a daemon that was not asked is the same
+//! case as a newer plugin talking to an older daemon, and neither should look
+//! like success.
+//!
+//! Base64 inside NDJSON rather than a binary body, deliberately: the other two
+//! routes are NDJSON, one batch can carry several people at once, one bad line
+//! is skippable without poisoning the rest, and the 33% the encoding costs is
+//! 16 kB against a loopback socket. A binary framing would have bought
+//! bandwidth nobody is short of at the price of a second wire format.
 //!
 //! `t_ms` is the plugin's `Date.now()` — wall-clock UNIX milliseconds. That is
 //! the same clock `segments.t_start_ns` is on: the pipeline derives a segment's
@@ -172,11 +196,16 @@ impl Drop for Ingest {
 /// Bind `127.0.0.1:port` and start serving. `port` 0 asks the OS for an
 /// ephemeral one, which is what a test wants and what
 /// [`Ingest::addr`] then reports.
+///
+/// `audio` is the per-user audio router (0.12.1), or `None` on a daemon built
+/// without one — in which case `/v1/discord/audio` behaves exactly like any
+/// other route this version has never heard of.
 pub fn serve(
     store: Arc<std::sync::Mutex<Store>>,
     stats: Arc<TruthStats>,
     token: String,
     port: u16,
+    audio: Option<Arc<crate::peruser::PerUser>>,
 ) -> Result<Ingest> {
     if token.trim().is_empty() {
         bail!("refusing to start the truth ingest with an empty token");
@@ -222,10 +251,12 @@ pub fn serve(
                 let store = Arc::clone(&store);
                 let stats = Arc::clone(&stats);
                 let token = Arc::clone(&token);
+                let audio = audio.clone();
                 if let Err(e) = std::thread::Builder::new()
                     .name("recalld-truth-conn".into())
                     .spawn(move || {
-                        if let Err(e) = serve_one(&store, &stats, &token, stream) {
+                        if let Err(e) = serve_one(&store, &stats, &token, audio.as_deref(), stream)
+                        {
                             debug!("a truth ingest connection ended: {e:#}");
                         }
                     })
@@ -270,6 +301,7 @@ fn serve_one(
     store: &Arc<std::sync::Mutex<Store>>,
     stats: &TruthStats,
     token: &str,
+    audio: Option<&crate::peruser::PerUser>,
     stream: TcpStream,
 ) -> Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
@@ -380,7 +412,15 @@ fn serve_one(
         }
     };
 
-    let kind = match path.split('?').next().unwrap_or("") {
+    let route = path.split('?').next().unwrap_or("");
+
+    // ---- 0.12.1: audio, which is not a truth line and is not stored like one
+    if route == "/v1/discord/audio" {
+        ingest_audio(stats, audio, &body);
+        return respond(&mut out, Reply::NoContent, None);
+    }
+
+    let kind = match route {
         "/v1/discord/speaking" => Some(Line::Speaking),
         "/v1/discord/voice" => Some(Line::Voice),
         // Everything else is 204: the plugin cannot act on a 404 and a route
@@ -428,6 +468,55 @@ fn serve_one(
 enum Line {
     Speaking,
     Voice,
+}
+
+/// The audio route's body, line by line.
+///
+/// It answers `204` whatever happens, like the other two, and for the same
+/// reason: the client is fire-and-forget and retries a whole batch on any
+/// non-2xx, so a status that says "one of your 40 frames was malformed" would
+/// make it resend the other 39 forever. Everything that did not land is
+/// counted instead, and `truth.status` is where a person reads the count.
+///
+/// `None` for `audio`, or the switch being off, is the same case as an
+/// unrecognised route — the lines are counted as rejected rather than dropped
+/// in silence, so "I turned it on in the plugin and nothing happened" has a
+/// number attached to it.
+fn ingest_audio(stats: &TruthStats, audio: Option<&crate::peruser::PerUser>, body: &str) {
+    let lines = body.lines().filter(|l| !l.trim().is_empty());
+    let Some(audio) = audio.filter(|a| a.accepting()) else {
+        let n = lines.count() as u64;
+        if n > 0 {
+            stats.rejected.fetch_add(n, Ordering::Relaxed);
+            debug!(
+                lines = n,
+                "per-user audio arrived but [truth].audio is off; refusing it"
+            );
+        }
+        return;
+    };
+    for line in lines {
+        // Counted on the AUDIO counters, not the ingest's: everything that
+        // arrives on this route is audio, and splitting "unparseable" from
+        // "parseable but wrong" across two different counters would make
+        // `truth.status` read as though half the refusals had not happened.
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            audio.stats.rejected.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        match crate::peruser::parse_frame(&v, audio.max_frame_ms()) {
+            Ok(frame) => {
+                if let Err(e) = audio.ingest(frame) {
+                    warn!("could not take a per-user audio frame: {e:#}");
+                    audio.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(why) => {
+                debug!("refusing a per-user audio frame: {}", why.as_str());
+                audio.stats.rejected.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 fn authorized(header: Option<&str>, token: &str) -> bool {
@@ -573,7 +662,7 @@ mod tests {
     #[test]
     fn an_empty_token_is_refused_rather_than_started_open() {
         let store = Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
-        let started = serve(store, Arc::new(TruthStats::default()), "  ".into(), 0);
+        let started = serve(store, Arc::new(TruthStats::default()), "  ".into(), 0, None);
         let Err(err) = started else {
             panic!("an empty token must not start a listener");
         };

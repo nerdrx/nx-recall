@@ -106,6 +106,60 @@ pub struct MicEnroll<'a> {
     pub max_goldens: usize,
 }
 
+/// The general case the microphone turned out to be one of (0.12.1).
+///
+/// "This audio is one known person, by construction" is a claim two sources
+/// can make. The headset makes it because one person wears one headset; a
+/// per-user Discord stream makes it because the packets were decoded from one
+/// person's connection. What differs is only *which* voice, what provenance to
+/// stamp, and whether keeping clips of it forever is defensible — so those are
+/// the three fields, and everything else is shared.
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedLeg<'a> {
+    pub speaker_id: i64,
+    /// What goes in `segments.label_via`: `mic`, or `discord-stream`.
+    pub label_via: &'static str,
+    /// Where retention-exempt clips are kept, and how many. `None` keeps none
+    /// — which is the answer for anybody who is not the user.
+    pub goldens: Option<(&'a Path, usize)>,
+    /// Whether a prototype may be added at all, before the audio-quality bar is
+    /// even consulted. The mic's is unconditional; Discord's follows
+    /// `[truth].enrol`, because writing to the voicebank on the strength of
+    /// something that arrived over a socket is the one thing here that changes
+    /// future behaviour rather than merely recording the present.
+    pub enrol: bool,
+}
+
+impl<'a> PinnedLeg<'a> {
+    /// The headset's, so `commit_mic` stays exactly what it was.
+    fn mic(mic: &MicEnroll<'a>) -> Self {
+        Self {
+            speaker_id: mic.speaker_id,
+            label_via: crate::store::label_via::MIC,
+            goldens: Some((mic.data_dir, mic.max_goldens)),
+            enrol: true,
+        }
+    }
+}
+
+/// How the overlap gate applies to one turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// `identity::gate`: too overlapped, or too short, and no embedding is
+    /// taken. What every source has always used.
+    Full,
+    /// Duration only (0.12.1). For a source whose audio is single-speaker **by
+    /// construction** — one Discord user's own stream — where a positive
+    /// overlap reading is the detector being wrong about reverb rather than a
+    /// second person, and refusing the embedding would throw away the cleanest
+    /// enrolment material this daemon will ever see.
+    ///
+    /// It does not lower the duration floor. A 0.4 s grunt makes an embedding
+    /// that is noise whoever it belongs to, and the floor is about the vector
+    /// being worth storing rather than about the name being in doubt.
+    SingleSpeaker,
+}
+
 /// `goldens/<speaker>/golden-<segment>.wav`, relative to the data dir.
 ///
 /// Deliberately **not** under `segments/`: the retention sweeper walks that
@@ -281,6 +335,17 @@ impl Analyzer {
 
     /// All the inference for one turn. Touches no database.
     pub fn prepare(&mut self, samples: &[f32]) -> Result<Prepared> {
+        self.prepare_with(samples, Gate::Full)
+    }
+
+    /// [`Self::prepare`], with a say in which gate the embedding is behind.
+    ///
+    /// The overlap detector still RUNS under every gate and its reading is
+    /// still stored: it is information about the audio whatever the source, the
+    /// correction UI reads it, and `enroll_max_overlap` reads it too. What
+    /// [`Gate::SingleSpeaker`] changes is only whether a positive reading is
+    /// allowed to throw the embedding away.
+    pub fn prepare_with(&mut self, samples: &[f32], gate: Gate) -> Result<Prepared> {
         let duration_s = samples.len() as f32 / SAMPLE_RATE as f32;
         let overlap_frac = self.overlap.overlap_frac(samples)?;
 
@@ -290,7 +355,12 @@ impl Analyzer {
         // a single IS NOT NULL.
         let text = (!normalise_words(&raw).is_empty()).then_some(raw);
 
-        let refusal = identity::gate(&self.cfg, overlap_frac, duration_s);
+        let refusal = match gate {
+            Gate::Full => identity::gate(&self.cfg, overlap_frac, duration_s),
+            Gate::SingleSpeaker => {
+                (duration_s < self.cfg.min_duration_s).then_some(identity::Refusal::TooShort)
+            }
+        };
         let embedding = match refusal {
             Some(_) => None,
             None => Some(self.embedder.embed(samples, SAMPLE_RATE)?),
@@ -508,6 +578,33 @@ impl Analyzer {
         mic: &MicEnroll<'_>,
         now_utc_ns: i64,
     ) -> Result<Outcome> {
+        self.commit_pinned(
+            store,
+            segment_id,
+            prepared,
+            &PinnedLeg::mic(mic),
+            now_utc_ns,
+        )
+    }
+
+    /// The general form of [`Self::commit_mic`] (0.12.1): a turn whose speaker
+    /// is known from where the audio came from rather than from what is in it.
+    ///
+    /// Everything the doc comment above says about the microphone holds here
+    /// word for word — the label is provenance, `match_score` stays NULL
+    /// because nothing was compared, and enrolment keeps the two gates that are
+    /// about the *recording* while dropping the two that are about
+    /// *identifying*. The only judgements the caller gets to make are whose
+    /// voice it is, what to stamp, whether a clip may be kept, and whether the
+    /// voicebank may be written to at all.
+    pub fn commit_pinned(
+        &self,
+        store: &Store,
+        segment_id: i64,
+        prepared: Prepared,
+        pin: &PinnedLeg<'_>,
+        now_utc_ns: i64,
+    ) -> Result<Outcome> {
         let Prepared {
             overlap_frac,
             duration_s,
@@ -531,20 +628,22 @@ impl Analyzer {
         )?;
         // Provenance, before anything else can fail: the label does not depend
         // on the embedder having produced a vector. It is recorded as such —
-        // `label_via = "mic"` — so nothing downstream has to infer it from a
-        // NULL score, which is a thing three other paths also produce.
+        // `label_via = "mic"` or `"discord-stream"` — so nothing downstream has
+        // to infer it from a NULL score, which is a thing three other paths
+        // also produce.
         store.set_segment_speaker_via(
             segment_id,
-            Some(mic.speaker_id),
+            Some(pin.speaker_id),
             None,
-            Some(crate::store::label_via::MIC),
+            Some(pin.label_via),
         )?;
 
         let mut enrolled = false;
         let mut golden = false;
         if let Some(embedding) = embedding {
             store.store_embedding(segment_id, &embedding)?;
-            if overlap_frac <= self.cfg.enroll_max_overlap
+            if pin.enrol
+                && overlap_frac <= self.cfg.enroll_max_overlap
                 && duration_s >= self.cfg.enroll_min_duration_s
             {
                 // `enrolled` follows what the store actually did. Every slot
@@ -554,7 +653,7 @@ impl Analyzer {
                 // to the bank (audit finding #25).
                 enrolled = store
                     .add_prototype(
-                        mic.speaker_id,
+                        pin.speaker_id,
                         &embedding,
                         Some(segment_id),
                         false,
@@ -565,14 +664,31 @@ impl Analyzer {
                 // The golden is kept on the strength of the audio, not of the
                 // enrolment: a turn good enough to enrol from is good enough to
                 // keep whether or not the bank had room for its vector.
-                golden = keep_golden(store, mic, segment_id, duration_s)?;
+                //
+                // Only for a source that is allowed to keep one. A golden
+                // outlives retention by design, and the case for that is "this
+                // is the user's own voice and a future embedding model will
+                // need it" — which is not a case about anybody else.
+                if let Some((data_dir, max_goldens)) = pin.goldens {
+                    golden = keep_golden(
+                        store,
+                        &MicEnroll {
+                            speaker_id: pin.speaker_id,
+                            data_dir,
+                            max_goldens,
+                        },
+                        segment_id,
+                        duration_s,
+                    )?;
+                }
             }
         } else {
             debug!(
                 segment_id,
                 overlap_frac,
                 duration_s,
-                "microphone: labelled but not enrolled ({})",
+                via = pin.label_via,
+                "pinned: labelled but not enrolled ({})",
                 refusal.unwrap_or(Refusal::TooShort).as_str()
             );
         }
@@ -581,14 +697,14 @@ impl Analyzer {
             overlap_frac,
             text,
             decision: Decision::Pinned {
-                speaker_id: mic.speaker_id,
+                speaker_id: pin.speaker_id,
             },
-            speaker_id: Some(mic.speaker_id),
+            speaker_id: Some(pin.speaker_id),
             match_score: None,
             enrolled,
             golden,
             language_fix: None,
-            // The microphone never consults the voicebank, so there was no
+            // A pinned leg never consults the voicebank, so there was no
             // candidate list for the prior to have an opinion about.
             prior: None,
             also_changed: Vec::new(),
@@ -745,6 +861,22 @@ impl Analyzer {
     ) -> Result<Outcome> {
         let prepared = self.prepare(samples)?;
         let mut outcome = self.commit_mic(store, segment_id, prepared, mic, now_utc_ns)?;
+        self.after_commit(store, segment_id, &mut outcome, samples);
+        Ok(outcome)
+    }
+
+    /// `prepare_with(SingleSpeaker)` then `commit_pinned` (0.12.1), for callers
+    /// that hold the store exclusively — the offline leg, and the tests.
+    pub fn process_pinned(
+        &mut self,
+        store: &Store,
+        segment_id: i64,
+        samples: &[f32],
+        pin: &PinnedLeg<'_>,
+        now_utc_ns: i64,
+    ) -> Result<Outcome> {
+        let prepared = self.prepare_with(samples, Gate::SingleSpeaker)?;
+        let mut outcome = self.commit_pinned(store, segment_id, prepared, pin, now_utc_ns)?;
         self.after_commit(store, segment_id, &mut outcome, samples);
         Ok(outcome)
     }
@@ -1287,6 +1419,50 @@ pub fn analyse_mic_or_log(
         }
         Err(e) => {
             warn!(segment_id, "storing microphone analysis failed: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// `analyse_or_log` for a turn whose speaker is known from the wire it arrived
+/// on (0.12.1) — a per-user Discord stream.
+///
+/// Same shape and the same lock discipline as the two above it. The two
+/// differences are both consequences of the audio being one person by
+/// construction: [`Gate::SingleSpeaker`], so an overlap reading cannot cost the
+/// embedding, and [`Analyzer::commit_pinned`], so the voicebank is never asked
+/// a question it cannot answer better than the wire already did.
+pub fn analyse_pinned_or_log(
+    analyzer: &mut Analyzer,
+    store: &std::sync::Mutex<Store>,
+    stats: &AnalysisStats,
+    segment_id: i64,
+    samples: &[f32],
+    pin: &PinnedLeg<'_>,
+    now_utc_ns: i64,
+) -> Vec<i64> {
+    let prepared = match analyzer.prepare_with(samples, Gate::SingleSpeaker) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(segment_id, "analysis failed: {e:#}");
+            return Vec::new();
+        }
+    };
+    let Ok(store) = store.lock() else {
+        warn!(segment_id, "store mutex poisoned; analysis discarded");
+        return Vec::new();
+    };
+    match analyzer.commit_pinned(&store, segment_id, prepared, pin, now_utc_ns) {
+        Ok(mut outcome) => {
+            analyzer.after_commit(&store, segment_id, &mut outcome, samples);
+            stats.record(&outcome);
+            outcome.also_changed
+        }
+        Err(e) => {
+            warn!(
+                segment_id,
+                "storing per-user Discord analysis failed: {e:#}"
+            );
             Vec::new()
         }
     }

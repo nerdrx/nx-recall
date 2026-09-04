@@ -389,6 +389,31 @@ export function mount(root, ctx) {
     return { text: 'waiting for Discord', cls: 'chip' };
   }
 
+  /**
+   * Per-user audio (0.12.1), in one sentence.
+   *
+   * Three states worth telling apart and one that must never be guessed at: a
+   * daemon too old to have the feature says nothing rather than "off", because
+   * "off" is a claim about a switch that does not exist there.
+   */
+  function audioLine() {
+    const a = truth?.audio;
+    if (!a) {
+      return 'Per-user audio: not available on this daemon.';
+    }
+    if (!a.enabled) {
+      return 'Per-user audio is off. With it on, Vesktop sends each person in the call as their own stream, and every turn is that person by construction — no voice matching, no overlap to un-mix. Set [truth] audio = true and switch it on in Vencord → RecallBridge as well; both sides are off by default, because this takes people’s voices out of the client.';
+    }
+    if (!a.live) {
+      return 'Per-user audio is on and nothing is arriving. Join a voice call with RecallBridge’s audio option enabled; until a stream arrives, Discord is recorded off the speakers exactly as before.';
+    }
+    const names = a.streams
+      .filter((s) => s.live)
+      .map((s) => s.name || s.user_id)
+      .join(', ');
+    return `Per-user audio: ${a.live} live stream${a.live === 1 ? '' : 's'} — ${names}. Each is recorded and named as that person; the mixed Discord tap is muted while they are arriving, so nothing is transcribed twice.`;
+  }
+
   /** `precision · recall · n`, or an honest sentence when there is nothing. */
   function scorecard() {
     const id = truthSummary?.identity;
@@ -444,7 +469,11 @@ export function mount(root, ctx) {
         score.empty
           ? 'Identity score: no clean turns scored yet — a turn counts only when Discord says one person spoke for most of it, it is at least a second long, and that account is linked to a voice.'
           : `Identity score: ${score.text}. Precision is how often it is right when it answers; recall is how often it answers at all.`
-      )
+      ),
+      // 0.12.1: per-user audio. A different claim from everything else on this
+      // card — the rest of it is about measuring how well voices are being
+      // recognised, and this is about not having to recognise them.
+      h('p', { class: 'rail-hint', id: 'truth-audio', style: 'padding:0 0 12px;max-width:64ch' }, audioLine())
     );
 
     if (!truthUsers.length) {

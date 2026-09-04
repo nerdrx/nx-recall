@@ -51,7 +51,12 @@ pub fn is_confident(cfg: &IdentityConfig, seg: &NeighbourSegment) -> bool {
     }
     match seg.label_via.as_deref() {
         Some(label_via::PROXIMITY) => false,
-        Some(label_via::MIC) | Some(label_via::MANUAL) => true,
+        // Provenance, not inference: a headset turn, a hand-assigned one, and
+        // (0.12.1) a turn that arrived on one Discord user's own stream. Said
+        // out loud rather than left to the `_` arm below, which would reach the
+        // same verdict for the wrong reason — "match_score is NULL" is a
+        // property three unrelated paths share.
+        Some(label_via::MIC) | Some(label_via::MANUAL) | Some(label_via::DISCORD_STREAM) => true,
         // `match` and pre-v5 rows with no provenance: trust the score.
         _ => seg
             .match_score

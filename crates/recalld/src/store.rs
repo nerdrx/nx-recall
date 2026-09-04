@@ -112,6 +112,20 @@ pub const KIND_MIC: &str = "mic";
 /// client that has never heard of it renders the row by its `kind` string,
 /// which is exactly what the versioning rule asks of it.
 pub const KIND_ROOM: &str = "room";
+/// `sources.kind` for ONE Discord user's own audio stream (0.12.1).
+///
+/// Not a device and not an application: a row per account, fed by the
+/// RecallBridge plugin over the truth ingest from the `MediaStream` Vesktop
+/// gives it for that person. Its defining property is that the audio is
+/// **single-speaker by construction** — there is no mixture to un-mix and
+/// nothing to identify, because the stream *is* the identity.
+///
+/// Like [`KIND_ROOM`] it needs no migration: `kind` has been free text since
+/// v4, and a client that has never heard of it renders the row by its string.
+/// Unlike every other kind, rows of it are created on demand — the first frame
+/// for an account creates its source — so there can be as many as there are
+/// people the user has been in a call with.
+pub const KIND_DISCORD_USER: &str = "discord-user";
 
 /// The source kinds whose turns may join a conversation from ANOTHER session.
 ///
@@ -121,8 +135,18 @@ pub const KIND_ROOM: &str = "room";
 /// literally: the room and the headset are one physical evening, and a person
 /// sitting next to the user answering somebody in the instance is in that
 /// conversation whatever device carried their voice.
+///
+/// A per-user Discord stream bridges for the third time and the same reason
+/// (0.12.1), and here it is not merely defensible but required: one Discord
+/// call is now N sessions, one per person in it, and a conversation that could
+/// not cross a session boundary would render an entire call as N parallel
+/// monologues that never answer each other.
+///
+/// **`Store::segment_turn` repeats this test in SQL.** Adding a kind here and
+/// not there compiles, passes this function's own assertions, and silently
+/// does not bridge.
 pub fn kind_bridges_threads(kind: &str) -> bool {
-    kind == KIND_MIC || kind == KIND_ROOM
+    kind == KIND_MIC || kind == KIND_ROOM || kind == KIND_DISCORD_USER
 }
 
 /// `segments.label_via` — how this row's *speaker* came to be what it is (v5).
@@ -155,6 +179,23 @@ pub mod label_via {
     /// that promise intact and keeps this pass reversible as a class.
     pub const TRUTH: &str = "truth";
     // ---- end 0.12.0 --------------------------------------------------------
+    // ---- 0.12.1: per-user Discord audio ------------------------------------
+    /// The turn arrived on ONE Discord user's own stream, so the speaker is a
+    /// fact about the wire rather than a reading of the audio
+    /// ([`super::KIND_DISCORD_USER`]).
+    ///
+    /// This is [`MIC`]'s claim made about somebody else, and it is exactly as
+    /// strong: the headset is one person because one person wears it, and a
+    /// per-user WebRTC stream is one person because Discord decoded it from one
+    /// person's packets. `match_score` is NULL for the same reason it is on a
+    /// mic turn — there was no comparison to score.
+    ///
+    /// It is deliberately not [`TRUTH`], which means something weaker and
+    /// retroactive: "Discord's speaking ring says this mixed turn was probably
+    /// them". Here Discord did not say whose voice it was, it *handed over the
+    /// voice*.
+    pub const DISCORD_STREAM: &str = "discord-stream";
+    // ---- end 0.12.1 --------------------------------------------------------
 }
 
 /// `segments.lang_via` — how this row's *language* came to be what it is (v5).
@@ -312,6 +353,19 @@ pub mod truth_via {
     /// and it cleared the held-out gate (`speakers.threshold_via`).
     pub const LEARNED: &str = "learned";
     // ---- end 0.11.0 -------------------------------------------------------
+    // ---- 0.12.1: per-user Discord audio ------------------------------------
+    /// A voice minted the first time this account's **own audio stream**
+    /// arrived, and linked to it on the spot
+    /// ([`super::KIND_DISCORD_USER`]).
+    ///
+    /// Nothing was decided, which is why it is not [`TRUTH`]: the auto-linker
+    /// weighs 20 labelled turns at 90% agreement before it dares connect an
+    /// account to a voice it did not create. This link has no agreement to
+    /// measure, because the voice exists *for* this account and holds nothing
+    /// else. A person may still re-point it, and a [`MANUAL`] link is never
+    /// overwritten by this any more than by the auto-linker.
+    pub const DISCORD_STREAM: &str = "discord-stream";
+    // ---- end 0.12.1 --------------------------------------------------------
 }
 
 // ---- 0.12.0: retro-labelling from ground truth -----------------------------
@@ -1747,6 +1801,35 @@ impl Store {
             )
             .optional()?)
     }
+
+    // ---- 0.12.1: per-user Discord audio ------------------------------------
+
+    /// The voice a per-user Discord session is pinned to, read from the row
+    /// rather than remembered by whoever opened the session.
+    ///
+    /// The user id lives in `sessions.instance_key`, not in the source's match
+    /// key: `instance_key` is what the schema already means by "which instance
+    /// of this source", and parsing an identity back out of a display string
+    /// would be a second place to get it wrong. `NULL` for every other kind of
+    /// session, and for a per-user session whose account is somehow unlinked —
+    /// both of which the caller must read as "take the ordinary route", never
+    /// as "pin it to nobody".
+    pub fn discord_session_speaker(&self, session_id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT d.speaker_id FROM sessions ss
+                 JOIN sources sc ON sc.id = ss.source_id
+                 JOIN discord_users d ON d.user_id = ss.instance_key
+                 WHERE ss.id = ?1 AND sc.kind = ?2",
+                params![session_id, KIND_DISCORD_USER],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    // ---- end 0.12.1 ---------------------------------------------------------
 
     /// The session's source match key (`VRChat.exe`) — the same string
     /// `SegmentRow::source` carries.
@@ -4174,17 +4257,24 @@ impl Store {
     /// people physically in the room are in the same conversation as the people
     /// in the instance, and the only thing separating them is which device
     /// carried the sound.
+    ///
+    /// 0.12.1: and every per-user Discord stream, where it stops being a nicety.
+    /// One call is one session per person, so without the bridge a four-handed
+    /// conversation would thread as four monologues.
+    ///
+    /// The `IN` list must stay in step with [`kind_bridges_threads`]; the unit
+    /// test `every_bridging_kind_is_in_the_sql` is what holds the two together.
     pub fn segment_turn(&self, segment_id: i64) -> Result<Option<(i64, bool, Turn)>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT g.session_id, (sc.kind IN (?2, ?3)) AS bridges,
+                "SELECT g.session_id, (sc.kind IN (?2, ?3, ?4)) AS bridges,
                         g.t_start_ns, g.t_end_ns, g.speaker_id
                  FROM segments g
                  JOIN sessions ss ON ss.id = g.session_id
                  JOIN sources sc ON sc.id = ss.source_id
                  WHERE g.id = ?1 AND g.deleted_at IS NULL",
-                params![segment_id, KIND_MIC, KIND_ROOM],
+                params![segment_id, KIND_MIC, KIND_ROOM, KIND_DISCORD_USER],
                 |r| {
                     Ok((
                         r.get(0)?,

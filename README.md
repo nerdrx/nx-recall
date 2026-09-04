@@ -441,7 +441,20 @@ tray: instant, write-free, and it means it.
 
 Recall runs alongside nx-hub, nx-orbit, and the rest of the NX family. Its
 Discord ground truth arrives through the RecallBridge plugin in
-vencord-nx-plugins. Orbit integration is deliberately one-way and manual:
+vencord-nx-plugins.
+
+On Vesktop that plugin can also send each person in a call as their own audio
+stream, which Recall records as its own source and attributes to that account
+with no voice matching at all — the stream is one person by construction, so
+there is no mixture to un-mix and nobody to identify, and while the streams are
+arriving the ordinary mixed Discord tap is muted so nothing is transcribed
+twice. It is off at both ends and stays off until you turn it on in two places,
+because taking everybody's voice out of the client is a larger claim than the
+speaking timestamps the rest of the bridge sends; the Discord desktop client
+cannot do it at all, and says so instead of looking enabled. See PROTOCOL,
+"0.12.1 — per-user Discord audio".
+
+Orbit integration is deliberately one-way and manual:
 Recall may read Orbit's name-picker once; **nothing ever flows back**. Orbit's
 charter stays clean.
 
