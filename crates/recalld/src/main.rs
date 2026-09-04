@@ -74,6 +74,9 @@ fn main() -> Result<()> {
         Command::Sources => cmd_sources(&data_dir),
         Command::Allow { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, true),
         Command::Deny { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, false),
+        Command::Role { match_key, role } => {
+            cmd_role(&cfg, &config_path, &data_dir, &match_key, &role)
+        }
         Command::Mic { action } => cmd_mic(&cfg, &data_dir, action),
         // ---- 0.10.0 -------------------------------------------------------
         Command::Room { action, device } => cmd_room(&cfg, &data_dir, action, device.as_deref()),
@@ -419,6 +422,12 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         Arc::clone(&audio_stats),
     ));
     pipeline.attach_peruser(Arc::clone(&peruser));
+    // 0.12.2: which Discord instance the mute is aimed at. Shared between the
+    // inference thread (the only writer of evidence) and the socket (which
+    // reads the verdict for `truth.status` and moves the manual override).
+    let bridge = Arc::new(recalld::bridge::Picker::new());
+    bridge.load_roles(&cfg.truth.bridge_roles);
+    pipeline.attach_bridge(Arc::clone(&bridge));
     if cfg.truth.audio {
         info!(
             live_s = cfg.truth.audio_live_s,
@@ -595,6 +604,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         listening: truth_ingest.as_ref().map(|i| i.addr()),
         token_path: truth_token_path,
         audio: Some(Arc::clone(&peruser)),
+        bridge: Some(Arc::clone(&bridge)),
     }));
     // 0.12.1: the janitor for per-user streams. A second of granularity against
     // an idle window measured in seconds, and it exists because the case that
@@ -1174,6 +1184,80 @@ fn cmd_set_rule(config_path: &Path, data_dir: &Path, match_key: &str, allowed: b
         config_path.display()
     );
     Ok(())
+}
+
+/// `recalld role <MATCH_KEY> bridge|other|auto` (0.12.2).
+///
+/// Goes through the socket when a daemon is running, so the role acts on the
+/// next buffer rather than at the next restart; falls back to editing the
+/// config when there is nothing to talk to, because a switch you can only set
+/// while the thing is running is half a switch.
+fn cmd_role(
+    cfg: &Config,
+    config_path: &Path,
+    data_dir: &Path,
+    match_key: &str,
+    role: &str,
+) -> Result<()> {
+    let parsed = recalld::bridge::Role::parse(role).ok_or_else(|| {
+        anyhow::anyhow!(
+            "role must be one of {} — got {role:?}",
+            recalld::bridge::ROLES.join(", ")
+        )
+    })?;
+    let said = match parsed {
+        recalld::bridge::Role::Bridge => {
+            format!(
+                "{match_key} carries the RecallBridge plugin: it is muted while per-user audio arrives."
+            )
+        }
+        recalld::bridge::Role::Other => {
+            format!(
+                "{match_key} does not carry the plugin: it is never muted, and its call is always recorded."
+            )
+        }
+        recalld::bridge::Role::Auto => {
+            format!(
+                "{match_key} is measured again: the daemon decides which client the streams explain."
+            )
+        }
+    };
+    match call(
+        cfg,
+        data_dir,
+        "sources.instance_role",
+        json!({
+            "source": match_key,
+            "role": parsed.as_str(),
+        }),
+    ) {
+        Ok(out) => {
+            println!("{said}");
+            if !out["persisted"].as_bool().unwrap_or(false) {
+                println!(
+                    "  (the daemon could not write the config, so this lasts until it restarts)"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // No daemon. The file is still the truth it reads at start-up.
+            let mut file = Config::load(config_path)?;
+            if parsed == recalld::bridge::Role::Auto {
+                file.truth.bridge_roles.remove(match_key);
+            } else {
+                file.truth
+                    .bridge_roles
+                    .insert(match_key.to_string(), parsed.as_str().to_string());
+            }
+            file.save(config_path)?;
+            println!(
+                "{said}\n  config: {}\n  the daemon is not running ({e:#}); it will read this at start-up.",
+                config_path.display()
+            );
+            Ok(())
+        }
+    }
 }
 
 /// `models status`. With `configured_only` false it falls back to the directory
@@ -3707,7 +3791,7 @@ fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
                 "{:<20}{live} live stream(s){}",
                 "  streams",
                 if live > 0 {
-                    " — the mixed Discord tap is muted while they arrive"
+                    " — the Discord client carrying the plugin is muted while they arrive"
                 } else {
                     " — nothing arriving; Discord is recorded off the speakers"
                 }
@@ -3719,6 +3803,42 @@ fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
                     s["name"].as_str().unwrap_or("—"),
                     s["frames"].as_i64().unwrap_or(0),
                     s["quiet_ms"].as_i64().unwrap_or(0),
+                );
+            }
+            // 0.12.2: WHICH client is muted, and why. The line above says
+            // "the mixed Discord tap is muted" and on a two-client install
+            // that sentence is ambiguous in the one way that matters.
+            if let Some(mute) = audio["mute"].as_object() {
+                let rows = mute["instances"].as_array().cloned().unwrap_or_default();
+                if rows.is_empty() {
+                    println!(
+                        "{:<20}no Discord client has been heard yet in this window",
+                        "  clients"
+                    );
+                }
+                for r in rows {
+                    let share = r["share"]
+                        .as_f64()
+                        .map(|s| format!("{:.0}%", s * 100.0))
+                        .unwrap_or_else(|| "—".into());
+                    println!(
+                        "{:<20}{:<12} {:<16} {:<7} match {:<5} {}",
+                        "  client",
+                        r["source"].as_str().unwrap_or("—"),
+                        r["instance_key"].as_str().unwrap_or("instance unknown"),
+                        r["role"].as_str().unwrap_or("auto"),
+                        share,
+                        if r["muted"].as_bool().unwrap_or(false) {
+                            "MUTED"
+                        } else {
+                            "recording"
+                        },
+                    );
+                    println!("{:<20}{}", "", r["why"].as_str().unwrap_or(""));
+                }
+                println!(
+                    "{:<20}`recalld role <MATCH_KEY> bridge|other|auto` overrides it",
+                    ""
                 );
             }
             let c = &audio["counters"];

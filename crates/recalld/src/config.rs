@@ -1321,6 +1321,22 @@ pub struct TruthConfig {
     /// pipeline's queue with it, not a working limit — the plugin sends 500 ms.
     pub audio_max_frame_ms: u64,
     // ---- end 0.12.1 -------------------------------------------------------
+    // ---- 0.12.2: which client is the bridge's ------------------------------
+    /// Manual answers to "which Discord client has the plugin in it", keyed on
+    /// the **source match key** — `vesktop`, `Discord`, whatever
+    /// `application.process.binary` says. Values are `"bridge"` or `"other"`;
+    /// `"auto"` is the absence of an entry and is never written.
+    ///
+    /// Keyed on the source and not on `sessions.instance_key` because the whole
+    /// point of an override is to outlive a relaunch, and both halves of an
+    /// instance key (`object.serial`, the pid) are per-launch. Two copies of the
+    /// *same* binary share one entry; separating those is the automatic rule's
+    /// job (`crate::bridge`).
+    ///
+    /// Last field in the struct because it serialises as a TOML table and a
+    /// table cannot be followed by a scalar in the same section.
+    pub bridge_roles: BTreeMap<String, String>,
+    // ---- end 0.12.2 -------------------------------------------------------
 }
 
 impl Default for TruthConfig {
@@ -1339,6 +1355,7 @@ impl Default for TruthConfig {
             audio_live_s: 4.0,
             audio_idle_s: 10,
             audio_max_frame_ms: 5_000,
+            bridge_roles: BTreeMap::new(),
         }
     }
 }

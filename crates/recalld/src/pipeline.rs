@@ -307,6 +307,25 @@ pub struct Stats {
     pub room_segments: AtomicU64,
 }
 
+/// Which side of the per-user de-duplication rule a session sits on (0.12.2).
+///
+/// Three answers and not two, because the rule needs both halves of the
+/// comparison: the per-user streams are the *evidence*, the mixed instances are
+/// the *candidates*, and everything else in the program is neither and must
+/// never be looked at by any of this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiscordSide {
+    /// A `discord:<user_id>` source — one person's own stream off the plugin.
+    PerUser,
+    /// A mixed Discord tap: one client's whole output, one instance of it.
+    Mixed {
+        source: String,
+        instance_key: Option<String>,
+    },
+    /// Everything else the daemon records. VRChat, the microphone, the room.
+    Neither,
+}
+
 pub struct Pipeline {
     vad: SileroVad,
     seg_cfg: SegmenterConfig,
@@ -337,11 +356,15 @@ pub struct Pipeline {
     /// `[truth].sources`, so a session's match key can be tested against the
     /// same list everything else tests against.
     truth_cfg: crate::config::TruthConfig,
-    /// Whether a session is the mixed Discord tap. Cached per session because
-    /// the answer is a property of the source row and cannot change under a
-    /// session, and kept OUTSIDE `sessions` because the mute removes the
-    /// `SessionPipeline` and would otherwise re-read the row per buffer.
-    is_mixed_discord: HashMap<i64, bool>,
+    /// Which side of the de-duplication rule a session is on. Cached per
+    /// session because it is a property of the source row and cannot change
+    /// under a session, and kept OUTSIDE `sessions` because the mute removes
+    /// the `SessionPipeline` and would otherwise re-read the row per buffer.
+    discord_side: HashMap<i64, DiscordSide>,
+    /// 0.12.2: which Discord *instance* the mute is aimed at. `None` on a
+    /// daemon wired without one, in which case nothing is ever muted — which
+    /// is the safe half of the trade.
+    bridge: Option<Arc<crate::bridge::Picker>>,
     /// Which mixed sessions are currently muted, so the transition is logged
     /// once rather than fifty times a second.
     muted_mixed: std::collections::HashSet<i64>,
@@ -447,7 +470,8 @@ impl Pipeline {
             semantic: None,
             peruser: None,
             truth_cfg: cfg.truth.clone(),
-            is_mixed_discord: HashMap::new(),
+            discord_side: HashMap::new(),
+            bridge: None,
             muted_mixed: std::collections::HashSet::new(),
         })
     }
@@ -456,6 +480,13 @@ impl Pipeline {
     /// before the thread starts, like the semantic leg beside it.
     pub fn attach_peruser(&mut self, peruser: Arc<crate::peruser::PerUser>) {
         self.peruser = Some(peruser);
+    }
+
+    /// Give the inference thread the instance picker (0.12.2). Shared with the
+    /// socket, which reads its verdicts for `truth.status`; this thread is the
+    /// only writer of evidence.
+    pub fn attach_bridge(&mut self, bridge: Arc<crate::bridge::Picker>) {
+        self.bridge = Some(bridge);
     }
 
     /// Give the inference thread the semantic leg, so a turn is embedded as
@@ -528,12 +559,20 @@ impl Pipeline {
         // picks the call back up on its next buffer, opening a fresh turn — so
         // a plugin that is switched off mid-call costs a few seconds of
         // transcript rather than the rest of the evening.
-        if self.mixed_discord_is_muted(chunk.session_id) {
+        //
+        // 0.12.2 aims it at one INSTANCE rather than at a source key. The user
+        // runs two Discord clients, only one of which carries the plugin, and
+        // muting by source key took the other one's whole call off the record
+        // for as long as the plugin's call lasted. `crate::bridge` decides
+        // which instance the streams are explaining, and only that one goes
+        // quiet.
+        if self.mixed_discord_is_muted(&chunk) {
             if !self.muted_mixed.contains(&chunk.session_id) {
                 self.muted_mixed.insert(chunk.session_id);
                 info!(
                     session_id = chunk.session_id,
-                    "per-user Discord streams are live; muting the mixed tap for analysis"
+                    why = self.mute_reason(chunk.session_id).as_deref().unwrap_or("—"),
+                    "per-user Discord streams are live; muting this Discord instance for analysis"
                 );
             }
             self.sessions.remove(&chunk.session_id);
@@ -542,7 +581,7 @@ impl Pipeline {
         if self.muted_mixed.remove(&chunk.session_id) {
             info!(
                 session_id = chunk.session_id,
-                "per-user Discord streams stopped; the mixed tap is analysing again"
+                "this Discord instance is analysing again"
             );
         }
         // ---- end 0.12.1 ------------------------------------------------------
@@ -691,30 +730,81 @@ impl Pipeline {
     }
 
     /// Should this session's audio be discarded because per-user streams are
-    /// carrying the same call?
+    /// carrying the same call *on this instance*?
     ///
     /// Two conditions, and the cheap one is first: there is no router, or
     /// nothing is arriving on it, on almost every buffer this daemon ever
-    /// handles.
-    fn mixed_discord_is_muted(&mut self, session_id: i64) -> bool {
+    /// handles. Only past that does anything measure anything.
+    fn mixed_discord_is_muted(&mut self, chunk: &AudioChunk) -> bool {
         let Some(peruser) = self.peruser.as_ref() else {
             return false;
         };
         if !peruser.any_live() {
             return false;
         }
-        if let Some(known) = self.is_mixed_discord.get(&session_id) {
-            return *known;
+        let Some(bridge) = self.bridge.clone() else {
+            return false;
+        };
+        match self.discord_side(chunk.session_id).clone() {
+            // The evidence for "which instance are these streams explaining"
+            // is the streams themselves, so they are observed on the way past.
+            DiscordSide::PerUser => {
+                bridge.observe_stream(chunk.capture_mono_ns, &chunk.samples);
+                false
+            }
+            DiscordSide::Mixed {
+                source,
+                instance_key,
+            } => {
+                bridge.observe_mixed(
+                    chunk.session_id,
+                    &source,
+                    instance_key.as_deref(),
+                    chunk.capture_mono_ns,
+                    &chunk.samples,
+                );
+                bridge.is_muted(chunk.session_id, chunk.capture_mono_ns, true)
+            }
+            DiscordSide::Neither => false,
         }
-        let key = self.session_source_key(session_id);
-        let mixed = key
-            .as_deref()
-            .is_some_and(|k| crate::peruser::is_mixed_discord_source(&self.truth_cfg, k));
-        self.is_mixed_discord.insert(session_id, mixed);
-        mixed
     }
 
-    // ---- end 0.12.1 -----------------------------------------------------------
+    /// Why the instance is muted, for the one line the transition logs.
+    fn mute_reason(&self, session_id: i64) -> Option<String> {
+        let bridge = self.bridge.as_ref()?;
+        bridge
+            .verdicts(crate::clock::monotonic_ns(), true)
+            .into_iter()
+            .find(|v| v.session_id == session_id)
+            .map(|v| v.why)
+    }
+
+    /// Which side of the rule this session is on, read once per session.
+    fn discord_side(&mut self, session_id: i64) -> &DiscordSide {
+        if !self.discord_side.contains_key(&session_id) {
+            let key = self.session_source_key(session_id);
+            let side = match key.as_deref() {
+                Some(k) if k.starts_with("discord:") => DiscordSide::PerUser,
+                Some(k) if crate::peruser::is_mixed_discord_source(&self.truth_cfg, k) => {
+                    let instance_key = match self.store.lock() {
+                        Ok(store) => store.session_instance_key(session_id).unwrap_or(None),
+                        Err(_) => None,
+                    };
+                    DiscordSide::Mixed {
+                        source: k.to_string(),
+                        instance_key,
+                    }
+                }
+                _ => DiscordSide::Neither,
+            };
+            self.discord_side.insert(session_id, side);
+        }
+        self.discord_side
+            .get(&session_id)
+            .expect("just inserted or already present")
+    }
+
+    // ---- end 0.12.1 / 0.12.2 --------------------------------------------------
 
     fn on_session_end(&mut self, session_id: i64, mono_ns: u64) -> Result<()> {
         let mut final_turns = Vec::new();
@@ -731,8 +821,13 @@ impl Pipeline {
         // 0.12.1: the two caches that outlive `sessions` on purpose (the mute
         // removes the entry) must not outlive the session itself, or a reused
         // row id would inherit a stale answer.
-        self.is_mixed_discord.remove(&session_id);
+        self.discord_side.remove(&session_id);
         self.muted_mixed.remove(&session_id);
+        // 0.12.2: and the instance's evidence with them. A session row id is
+        // reused, and a reused one must not inherit a verdict.
+        if let Some(bridge) = self.bridge.as_ref() {
+            bridge.forget(session_id);
+        }
 
         let store = self
             .store

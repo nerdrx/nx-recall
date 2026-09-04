@@ -3776,6 +3776,72 @@ export function runE2E(deps) {
       return { users: after.users.length, linked, score: before.score, file };
     });
 
+    // 12f2 — two Discord clients, one plugin (0.12.2). The user runs Vesktop
+    // with the bridge and a second Discord in another call; until 0.12.2 the
+    // mute took BOTH calls off the record. The card has to say which client is
+    // muted, and the control has to move it — in both directions, because a
+    // role that is read and ignored is a blocker and not a footnote.
+    await step('the-discord-card-says-which-client-is-muted-and-lets-you-move-it', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      const shown = await waitFor('the Discord clients', async () => {
+        const t = await js('window.__recallDebug.truth()');
+        return t.clients.length ? t : null;
+      });
+      assert(shown.clients.length === 2, `${shown.clients.length} client(s); the fixture runs two`);
+      const by = (src) => shown.clients.find((c) => c.source === src);
+      assert(by('vesktop') && by('Discord'), `the two clients are not both drawn: ${JSON.stringify(shown.clients)}`);
+      assert(by('vesktop').muted, 'the plugin’s own client is not shown as muted');
+      assert(!by('Discord').muted, 'the OTHER call is shown as muted — this is the bug');
+      assert(/recording/.test(by('Discord').state), `the other client's chip reads "${by('Discord').state}"`);
+      assert(/different call/i.test(by('Discord').why), `no reason given: ${by('Discord').why}`);
+      assert(by('vesktop').role === 'auto' && by('Discord').role === 'auto', 'both start on auto');
+      assert(/never muted/i.test(shown.clientsHint), `the copy does not say what an override does: ${shown.clientsHint}`);
+      await js('document.getElementById("truth-clients").scrollIntoView({block: "center"})');
+      const before = await shot('sources-discord-clients');
+
+      // The user overrules it: the client the rule was sure about is marked as
+      // NOT the bridge, and the other one is marked as the one with the plugin.
+      await js(`(() => {
+        const s = document.querySelector('[data-bridge-role="vesktop"]');
+        s.value = 'other'; s.dispatchEvent(new Event('change'));
+      })()`);
+      await waitFor('the override to land', async () => {
+        const t = await js('window.__recallDebug.truth()');
+        const v = t.clients.find((c) => c.source === 'vesktop');
+        return v && v.role === 'other' && !v.muted ? t : null;
+      });
+      await js(`(() => {
+        const s = document.querySelector('[data-bridge-role="Discord"]');
+        s.value = 'bridge'; s.dispatchEvent(new Event('change'));
+      })()`);
+      const after = await waitFor('the second override to land', async () => {
+        const t = await js('window.__recallDebug.truth()');
+        const d = t.clients.find((c) => c.source === 'Discord');
+        return d && d.role === 'bridge' && d.muted ? t : null;
+      });
+      const now = (src) => after.clients.find((c) => c.source === src);
+      assert(!now('vesktop').muted, 'a client marked “no plugin” must never be muted');
+      assert(now('Discord').muted, 'a client marked “has the plugin” must be muted while streams are live');
+      assert(/muted/.test(now('Discord').state), `the chip did not follow: "${now('Discord').state}"`);
+      assert(/not the bridge/i.test(now('vesktop').why), `the reason did not follow: ${now('vesktop').why}`);
+
+      await js('document.getElementById("truth-clients").scrollIntoView({block: "center"})');
+      const file = await shot('sources-discord-clients-overridden');
+
+      // Put it back, so the rest of the pass sees the daemon's own answer.
+      for (const src of ['vesktop', 'Discord']) {
+        await js(`(() => {
+          const s = document.querySelector('[data-bridge-role="${src}"]');
+          s.value = 'auto'; s.dispatchEvent(new Event('change'));
+        })()`);
+      }
+      await waitFor('the roles to clear', async () => {
+        const t = await js('window.__recallDebug.truth()');
+        return t.clients.every((c) => c.role === 'auto') ? t : null;
+      });
+      return { clients: after.clients.map((c) => `${c.source}:${c.role}:${c.muted}`), before, file };
+    });
+
     // 12g — the Markdown export. DESIGN §12 is the whole shape of this step:
     // the card writes FILES, into a folder chosen in a native dialog, and
     // nothing else — and it refuses to touch a file it did not write.

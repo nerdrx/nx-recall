@@ -4002,3 +4002,122 @@ vocabulary values are strings.
   *into* the native mixer — and no way at all to receive a user's audio
   (FINDINGS §33.7). Vesktop and the web client use `MediaEngineWebRTC`, where
   every remote user is their own `MediaStream`.
+
+## 0.12.2 — the mute aims at one client, not at Discord
+
+0.12.1's de-duplication rule was written against a **source key**: while any
+per-user stream is live, every session whose source matches `[truth].sources` is
+muted for analysis. On an install with one Discord client that is exactly right.
+
+The user runs two. Vesktop carries the RecallBridge plugin and is sending
+per-user audio; a second client — the official Discord, on this machine — is in
+a **different call**, with different people, and has no plugin and therefore no
+streams. The rule muted both, and the second call went unrecorded for as long as
+the first one lasted. This section aims the mute at one **instance** and says
+who decides which. Additive: `proto` stays `1`, no schema migration, and the
+one-client behaviour is unchanged.
+
+### The rule, restated
+
+> While any per-user stream is live, **at most one** mixed Discord instance is
+> muted for analysis: the one whose speech the streams explain. Every other
+> instance keeps recording, including a second instance of the same source.
+
+"Instance" is a **session**. `sessions` has been per-PipeWire-node since Step 1
+— two copies of an application already open two concurrent rows against the one
+source — and v14 put `instance_key` (`serial:<object.serial>`, else
+`pid:<pid>`, else NULL) on it. Nothing new is stored.
+
+### How the instance is chosen
+
+Time is quantised into 100 ms buckets. A bucket is marked for an instance when
+that instance's audio was above an RMS floor of 0.005 in it, and marked globally
+when *some* per-user stream was. Then
+
+```text
+share = |instance buckets within ±300 ms of a stream bucket| / |instance buckets|
+```
+
+and the bridge's client is the instance with the highest share, subject to three
+guards, each of which exists because the measurement was run without it:
+
+- **An evidence floor.** No share at all until the instance has 3 s of active
+  audio inside the 25 s window. Under it, `share` is `null` — *not* zero, which
+  a client must not render as a confident "not the bridge".
+- **A bar**, 0.85. Loose on purpose: the mixed tap also carries join chimes,
+  notification pings and a shared screen, and none of that is in the streams.
+- **A margin**, 0.10, over the runner-up — and only when there *is* a runner-up.
+  Two independent calls that are both busy score alike (FINDINGS §37 measured
+  0.98 for a second call at 70% talk density), and a rule that guessed there
+  would take a real call off the record on a coin flip.
+
+Below the margin nothing is muted at all. **The trade is deliberate and it is
+not symmetric:** a duplicate is two transcripts of one sentence — ugly, findable,
+deletable — and a wrong mute is audio that was never recorded, with no row to
+say it happened. The same asymmetry is why an instance that appears mid-call
+starts with an empty window and **is never muted by inheritance**.
+
+Across 144 synthetic two-call timelines §37 measured **108 right, 36 declined,
+0 wrong**.
+
+### `sources.instance_role {source, role}`
+
+The override, because the automatic rule can be wrong and because the user asked
+for one.
+
+- `role` is `"bridge"`, `"other"` or `"auto"`. Anything else is a `params`
+  error and never a silent `"auto"`: a typo that quietly meant "measure it"
+  would be a mute somebody thought they had turned off.
+- **`"other"` is never muted**, however sure the measurement is. **`"bridge"` is
+  muted whenever streams are live**, with no evidence at all. `"auto"` **removes**
+  the entry rather than storing a third value.
+- Naming a `"bridge"` also stops the automatic rule naming a second one: there
+  is one plugin, so there is one bridge client.
+- It refuses `mic`, `room` and any `discord:` key, exactly as `sources.set`
+  does and for the same reason — a role is a statement about a Discord *client*.
+- Replies `{source, role, persisted, roles}`. Persisted to
+  `[truth] bridge_roles` in the config, so it survives a restart.
+
+**Keyed on the source match key, not on `instance_key`.** An override exists to
+outlive a relaunch and both halves of an instance key are per-launch. On this
+machine the two clients already differ there (FINDINGS §37): Vesktop's playback
+node is `application.process.binary = vesktop`, `node.name = vesktop`; the
+official client's is `application.process.binary = Discord` with
+`node.name = application.name = WEBRTC VoiceEngine`. Two source rows. Two copies
+of the *same* binary share one row and one role — that case is what the
+automatic rule is for, and the override then speaks about both of them.
+
+### `truth.status.audio` gains `mute`
+
+```json
+{"share_bar": 0.85, "share_margin": 0.1, "window_s": 25.0, "min_active_s": 3.0,
+ "streams_live": true, "muted_sessions": [4211],
+ "instances": [{"session_id": 4211, "source": "vesktop",
+                "instance_key": "serial:44628", "role": "auto", "share": 0.96,
+                "active_ms": 8700, "muted": true, "why": "…"}],
+ "roles": {"vesktop": "bridge"}}
+```
+
+`why` is one sentence, written for a person: it is what `recalld truth report`
+prints under each client and what the GUI's Sources card shows under each row.
+`roles` carries only overrides somebody set. An instance is listed while it has
+been heard in the last 50 s and is forgotten when its session ends.
+
+### CLI and UI
+
+`recalld role <MATCH_KEY> bridge|other|auto` moves it — over the socket when the
+daemon is running, so it acts on the next buffer, and by editing the config when
+it is not. `recalld truth report` prints one line per client with its role, its
+share, and whether it is muted.
+
+The Sources card's Discord panel lists every client heard in the window with a
+three-way control on each. That is where the user answers the question they
+asked: *which Discord client has the plugin installed, so not both inputs get
+disabled.*
+
+### What is unchanged
+
+Neither microphone is ever a candidate, and neither is any non-Discord source: a
+mic hears a room, not a call, and no amount of per-user audio makes it a
+duplicate of anything. With one Discord client running, the behaviour is 0.12.1's
+— the single candidate clears the bar and is muted.

@@ -349,6 +349,10 @@ pub struct TruthWiring {
     /// `truth.status` reads it for the stream list and the counters; nothing
     /// here writes to it.
     pub audio: Option<Arc<crate::peruser::PerUser>>,
+    /// Which Discord instance the mute is aimed at (0.12.2). The socket reads
+    /// its verdicts for `truth.status.audio.mute` and writes exactly one thing
+    /// to it: the manual role `sources.instance_role` sets.
+    pub bridge: Option<Arc<crate::bridge::Picker>>,
 }
 
 impl Service {
@@ -416,6 +420,7 @@ impl Service {
             "resume" => self.set_paused(false),
             "sources.list" => self.sources_list(),
             "sources.set" => self.sources_set(req),
+            "sources.instance_role" => self.sources_instance_role(req),
             "mic.get" => self.mic_get(),
             "mic.set" => self.mic_set(req),
             // ---- 0.10.0, the room microphone -----------------------------
@@ -4049,7 +4054,82 @@ impl Service {
             // 0.12.1. Always present, never null on a daemon that has the
             // feature at all: a client must be able to tell "switched off" from
             // "older daemon", and a missing key cannot.
-            "audio": wiring.and_then(|w| w.audio.as_ref()).map(|a| a.status()),
+            // 0.12.2 hangs `mute` off it: which instance is silenced right
+            // now and why, in the same object as the streams that caused it.
+            "audio": wiring.and_then(|w| w.audio.as_ref()).map(|a| {
+                let mut v = a.status();
+                let live = a.any_live();
+                if let Some(b) = wiring.and_then(|w| w.bridge.as_ref()) {
+                    v["mute"] = b.status(crate::clock::monotonic_ns(), live);
+                }
+                v
+            }),
+        }))
+    }
+
+    /// `sources.instance_role` — which Discord client has the plugin in it
+    /// (0.12.2).
+    ///
+    /// Keyed on the **source match key**, not on `sessions.instance_key`: an
+    /// override exists to outlive a relaunch, and both halves of an instance
+    /// key (`object.serial`, the pid) are per-launch. On the machine this was
+    /// built for the two clients already differ there — `vesktop` against
+    /// `Discord` — and two copies of one binary are what the automatic rule is
+    /// for.
+    fn sources_instance_role(&self, req: &Request) -> Result<Value, Error> {
+        let source = req.str("source")?.trim().to_string();
+        if source.is_empty() {
+            return Err(Error::params("source must not be empty"));
+        }
+        let role = req.str("role")?;
+        let role = crate::bridge::Role::parse(role).ok_or_else(|| {
+            Error::params(format!(
+                "role must be one of {}",
+                crate::bridge::ROLES.join(", ")
+            ))
+        })?;
+        // The same three refusals `sources.set` makes, for the same reason: a
+        // role is a statement about a Discord *client*, and neither microphone
+        // nor a per-user stream is one. A role recorded against them would sit
+        // in the config file doing nothing, which is worse than a refusal.
+        if source == crate::capture::MIC_MATCH_KEY
+            || source == crate::room::ROOM_MATCH_KEY
+            || source.starts_with("discord:")
+        {
+            return Err(Error::new(
+                "refused",
+                "a bridge role says which Discord CLIENT carries the RecallBridge \
+                 plugin; the microphones and the per-user streams are not clients \
+                 and are never muted by this rule",
+            ));
+        }
+        let Some(bridge) = self.truth.get().and_then(|w| w.bridge.as_ref()) else {
+            return Err(Error::new(
+                "unavailable",
+                "this daemon has no instance picker wired up",
+            ));
+        };
+        bridge.set_role(&source, role);
+
+        let mut persisted = false;
+        if let Some(path) = &self.control.config_path {
+            match Config::load(path) {
+                Ok(mut cfg) => {
+                    cfg.truth.bridge_roles = bridge.roles();
+                    match cfg.save(path) {
+                        Ok(()) => persisted = true,
+                        Err(e) => warn!("could not persist the bridge role for {source}: {e:#}"),
+                    }
+                }
+                Err(e) => warn!("could not re-read the config to persist a bridge role: {e:#}"),
+            }
+        }
+        info!(source = %source, role = role.as_str(), persisted, "bridge role changed");
+        Ok(json!({
+            "source": source,
+            "role": role.as_str(),
+            "persisted": persisted,
+            "roles": bridge.roles(),
         }))
     }
 
@@ -5324,6 +5404,96 @@ mod tests {
         let evs = events(&r);
         assert_eq!(evs[0]["ev"], "source");
         assert_eq!(evs[0]["data"]["match_key"], "VRChat.exe");
+    }
+
+    /// 0.12.2. Both states act, the refusals hold, and the verdict shows up on
+    /// `truth.status` where the Sources card and `truth report` read it.
+    #[test]
+    fn sources_instance_role_moves_the_live_rule_and_shows_up_on_the_status() {
+        let r = rig("instrole");
+        let bridge = Arc::new(crate::bridge::Picker::new());
+        let cfg = crate::config::TruthConfig {
+            enabled: true,
+            audio: true,
+            ..Default::default()
+        };
+        let peruser = Arc::new(crate::peruser::PerUser::new(
+            Arc::new(Mutex::new(Store::open(&r.dir.join("peruser")).unwrap())),
+            crate::queue::EventQueue::for_seconds(1.0, crate::config::SAMPLE_RATE),
+            cfg.clone(),
+            Arc::new(crate::peruser::AudioStats::default()),
+        ));
+        r.service.attach_truth(Arc::new(TruthWiring {
+            cfg,
+            stats: Arc::new(crate::truth::TruthStats::default()),
+            listening: None,
+            token_path: std::path::PathBuf::from("/dev/null"),
+            audio: Some(peruser),
+            bridge: Some(Arc::clone(&bridge)),
+        }));
+
+        let out = call(
+            &r,
+            r#"{"id":2,"method":"sources.instance_role","params":{"source":"vesktop","role":"bridge"}}"#,
+        )
+        .unwrap();
+        assert_eq!(out["role"], "bridge");
+        assert_eq!(out["roles"]["vesktop"], "bridge");
+        assert_eq!(bridge.role("vesktop"), crate::bridge::Role::Bridge);
+
+        // The other direction, and then away again.
+        call(
+            &r,
+            r#"{"id":3,"method":"sources.instance_role","params":{"source":"Discord","role":"other"}}"#,
+        )
+        .unwrap();
+        assert_eq!(bridge.role("Discord"), crate::bridge::Role::Other);
+        let out = call(
+            &r,
+            r#"{"id":4,"method":"sources.instance_role","params":{"source":"Discord","role":"auto"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            out["roles"].as_object().unwrap().len(),
+            1,
+            "auto is not stored"
+        );
+
+        // A value that is not a role is a params error and not a silent auto:
+        // a typo that quietly meant "measure it" would be a mute the user
+        // thought they had turned off.
+        assert_eq!(
+            call(
+                &r,
+                r#"{"id":5,"method":"sources.instance_role","params":{"source":"vesktop","role":"brdige"}}"#
+            )
+            .unwrap_err()
+            .code,
+            "params"
+        );
+        // And the three sources that are not Discord clients are refused, the
+        // same way `sources.set` refuses them.
+        for key in ["mic", "room", "discord:12345"] {
+            let req = format!(
+                r#"{{"id":6,"method":"sources.instance_role","params":{{"source":"{key}","role":"bridge"}}}}"#
+            );
+            assert_eq!(call(&r, &req).unwrap_err().code, "refused", "{key}");
+        }
+
+        // `truth.status.audio` carries the mute: what the rule is, what it
+        // decided, and every role somebody has set. This is the object the
+        // Sources card and `recalld truth report` render.
+        let st = call(&r, r#"{"id":7,"method":"truth.status"}"#).unwrap();
+        let mute = &st["audio"]["mute"];
+        assert_eq!(mute["share_bar"], crate::bridge::SHARE_BAR);
+        assert_eq!(mute["streams_live"], false, "nothing is arriving");
+        assert_eq!(mute["roles"]["vesktop"], "bridge");
+        assert_eq!(
+            mute["instances"].as_array().unwrap().len(),
+            0,
+            "no Discord instance has been heard on this daemon"
+        );
+        assert_eq!(mute["muted_sessions"].as_array().unwrap().len(), 0);
     }
 
     #[test]

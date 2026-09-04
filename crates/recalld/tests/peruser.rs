@@ -58,6 +58,10 @@ struct Rig {
     store: Arc<std::sync::Mutex<Store>>,
     queue: Arc<EventQueue>,
     peruser: Arc<PerUser>,
+    /// 0.12.2: which Discord instance the mute is aimed at. Held by the rig
+    /// because the tests set roles on it and read its verdicts, exactly as the
+    /// socket does.
+    bridge: Arc<recalld::bridge::Picker>,
     stats: Arc<AudioStats>,
     ingest: Option<truthnet::Ingest>,
     inference: Option<std::thread::JoinHandle<()>>,
@@ -114,6 +118,8 @@ impl Rig {
         )
         .expect("building the pipeline");
         pipeline.attach_peruser(Arc::clone(&peruser));
+        let bridge = Arc::new(recalld::bridge::Picker::new());
+        pipeline.attach_bridge(Arc::clone(&bridge));
 
         let q = Arc::clone(&queue);
         let inference = std::thread::Builder::new()
@@ -136,6 +142,7 @@ impl Rig {
             store,
             queue,
             peruser,
+            bridge,
             stats,
             ingest: Some(ingest),
             inference: Some(inference),
@@ -482,7 +489,7 @@ fn an_account_already_linked_by_hand_keeps_its_voice() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_mixed_discord_tap_is_muted_while_a_per_user_stream_is_live() {
+fn the_bridges_own_discord_instance_is_muted_while_a_per_user_stream_is_live() {
     let mut rig = Rig::start("dedup", true);
     let samples = fixture("clean_single_0.wav");
 
@@ -496,33 +503,206 @@ fn the_mixed_discord_tap_is_muted_while_a_per_user_stream_is_live() {
     let before = rig.segments_of("vesktop").len();
     assert!(before > 0, "the mixed tap must work when nothing else does");
 
-    // Now a per-user stream arrives.
-    let t0 = recalld::clock::ns_to_ms(utc_now_ns());
-    let (lines, _) = frames("777", "Aspen", t0, &samples);
-    rig.post("/v1/discord/audio", &(lines.join("\n") + "\n"), Some(TOKEN));
-    assert!(rig.peruser.any_live(), "a frame just arrived");
+    // One long-lived instance, because that is what a Discord client is: the
+    // rule is per SESSION, and a new session is a new candidate that has to
+    // earn its verdict rather than inherit one (0.12.2).
+    let session = open_session(&rig, mixed);
 
-    // …and the same speech through the mixed tap is discarded rather than
-    // written a second time. Drained BEFORE the streams are closed, because
-    // the mute is read when a buffer is handled: closing first would leave the
-    // pipeline handling the mixed audio in a world where nothing is live any
-    // more, which is the fallback case and not this one.
-    push_session(&rig, mixed, &samples);
-    rig.drain();
+    // Round one: the streams arrive and the same speech comes through the
+    // mixed tap. Some of it IS written — the rule waits for evidence, and
+    // recording a few seconds twice is the cheaper of the two mistakes.
+    round(&rig, session, &samples);
+    let learned = rig.segments_of("vesktop").len();
+
+    // Round two: the rule now knows which instance the streams explain, and
+    // not one more turn is written for speech they already carried.
+    round(&rig, session, &samples);
     let during = rig.segments_of("vesktop").len();
     assert_eq!(
         during,
-        before,
+        learned,
         "the mixed tap wrote {} extra turn(s) for speech the per-user stream \
          already carried",
-        during - before
+        during - learned
     );
+    let v = rig
+        .bridge
+        .verdicts(recalld::clock::monotonic_ns(), true)
+        .into_iter()
+        .find(|v| v.session_id == session)
+        .expect("the instance is a candidate");
+    assert!(v.muted, "{}", v.why);
+    assert_eq!(v.source, "vesktop");
+    assert!(
+        v.share.unwrap_or(0.0) >= recalld::bridge::SHARE_BAR,
+        "the share is what decided it: {:?}",
+        v.share
+    );
+
     // The per-user stream, meanwhile, did write them.
     rig.peruser.close_all();
     rig.drain();
     assert!(
         !rig.segments_of(&match_key("777")).is_empty(),
         "the per-user source must be the one that carries the call"
+    );
+    rig.finish();
+}
+
+/// **The bug 0.12.2 exists for.** Two Discord clients, one call each, one
+/// plugin between them: the second client's call must not go silent for as
+/// long as the first client's call lasts.
+#[test]
+fn a_second_discord_client_in_another_call_keeps_recording() {
+    let mut rig = Rig::start("twoclients", true);
+    let samples = fixture("clean_single_0.wav");
+    // Two source rows, which is what this machine actually produces: Vesktop's
+    // playback node is `vesktop`, the official client's is `Discord`
+    // (FINDINGS §37). The rule does not depend on that — it works on two
+    // instances of one source too — but this is the shape the user has.
+    let vesktop = rig.store().upsert_source("vesktop", "Vesktop", 0).unwrap();
+    let discord = rig.store().upsert_source("Discord", "Discord", 0).unwrap();
+    let bridge_session = open_session(&rig, vesktop);
+    let other_session = open_session(&rig, discord);
+
+    for _ in 0..2 {
+        // The bridge's client hears exactly what the streams carry.
+        round(&rig, bridge_session, &samples);
+        // The other client is in a different call: its speech is real, and the
+        // per-user streams know nothing about it. Placed twelve seconds back
+        // so it is inside the rolling window and outside every stream bucket,
+        // which is what "a different call" means to this rule.
+        push_audio(&rig, other_session, past_base(12_000), &samples);
+        rig.drain();
+    }
+
+    let v = |id: i64| {
+        rig.bridge
+            .verdicts(recalld::clock::monotonic_ns(), true)
+            .into_iter()
+            .find(|v| v.session_id == id)
+            .expect("both instances are candidates")
+    };
+    let b = v(bridge_session);
+    let o = v(other_session);
+    assert!(b.muted, "the plugin's own client: {}", b.why);
+    assert!(
+        !o.muted,
+        "the OTHER call must keep recording — this is the whole bug: {}",
+        o.why
+    );
+    assert!(
+        o.share.unwrap_or(1.0) < recalld::bridge::SHARE_BAR,
+        "nothing explains the other call: {:?}",
+        o.share
+    );
+    // Closing it is what writes its last turn — the verdicts above had to be
+    // read first, because an ended session is forgotten on purpose.
+    end_session(&rig, other_session);
+    assert!(
+        !rig.segments_of("Discord").is_empty(),
+        "the second client's call was written down"
+    );
+    rig.finish();
+}
+
+/// A role of `other` beats a certain automatic verdict, and a role of `bridge`
+/// mutes with no evidence at all. Both states act, and both are tested.
+#[test]
+fn a_manual_role_overrides_the_measurement_in_both_directions() {
+    let mut rig = Rig::start("roles", true);
+    let samples = fixture("clean_single_0.wav");
+    let vesktop = rig.store().upsert_source("vesktop", "Vesktop", 0).unwrap();
+    let discord = rig.store().upsert_source("Discord", "Discord", 0).unwrap();
+
+    // Both roles are set the wrong way round from what the measurement would
+    // say, which is the point: the user is allowed to be right about their own
+    // machine, and neither state may be read and ignored.
+    rig.bridge.set_role("vesktop", recalld::bridge::Role::Other);
+    rig.bridge
+        .set_role("Discord", recalld::bridge::Role::Bridge);
+    assert_eq!(rig.bridge.role("vesktop"), recalld::bridge::Role::Other);
+    assert_eq!(rig.bridge.role("Discord"), recalld::bridge::Role::Bridge);
+
+    let t0 = recalld::clock::ns_to_ms(utc_now_ns());
+    let (lines, _) = frames("777", "Aspen", t0, &samples);
+    rig.post("/v1/discord/audio", &(lines.join("\n") + "\n"), Some(TOKEN));
+    assert!(rig.peruser.any_live());
+
+    // `vesktop` is carrying exactly the audio the streams are carrying, at
+    // exactly the same instant — the automatic rule's clearest possible
+    // "this is the bridge's client".
+    push_session_at(&rig, vesktop, recalld::clock::monotonic_ns(), &samples);
+    // `Discord` is twelve seconds away from anything the streams know about —
+    // the automatic rule's clearest possible "this is another call".
+    push_session_at(&rig, discord, past_base(12_000), &samples);
+    rig.drain();
+
+    assert!(
+        !rig.segments_of("vesktop").is_empty(),
+        "a client the user marked `other` is never muted, however sure the \
+         measurement is"
+    );
+    assert!(
+        rig.segments_of("Discord").is_empty(),
+        "a client the user marked `bridge` is muted whenever streams are live, \
+         with no evidence at all"
+    );
+
+    // `auto` is the absence of a role, not a third stored state.
+    rig.bridge.set_role("vesktop", recalld::bridge::Role::Auto);
+    rig.bridge.set_role("Discord", recalld::bridge::Role::Auto);
+    assert!(rig.bridge.roles().is_empty());
+    rig.finish();
+}
+
+/// The one thing this rule may never touch. A microphone is not a Discord
+/// client, it is a person in a room, and no amount of per-user audio makes it
+/// a duplicate of anything.
+#[test]
+fn neither_microphone_is_ever_muted_however_live_the_streams_are() {
+    let mut rig = Rig::start("micsafe", true);
+    let samples = fixture("clean_single_0.wav");
+    let mic = rig
+        .store()
+        .upsert_source_kind(
+            recalld::capture::MIC_MATCH_KEY,
+            "Microphone",
+            recalld::store::KIND_MIC,
+            0,
+        )
+        .unwrap();
+    let room = rig
+        .store()
+        .upsert_source_kind(
+            recalld::room::ROOM_MATCH_KEY,
+            "Room",
+            recalld::store::KIND_ROOM,
+            0,
+        )
+        .unwrap();
+
+    let t0 = recalld::clock::ns_to_ms(utc_now_ns());
+    let (lines, _) = frames("777", "Aspen", t0, &samples);
+    rig.post("/v1/discord/audio", &(lines.join("\n") + "\n"), Some(TOKEN));
+    assert!(rig.peruser.any_live(), "a frame just arrived");
+
+    push_session(&rig, mic, &samples);
+    push_session(&rig, room, &samples);
+    rig.drain();
+    assert!(
+        !rig.segments_of(recalld::capture::MIC_MATCH_KEY).is_empty(),
+        "the headset microphone is not a Discord client"
+    );
+    assert!(
+        !rig.segments_of(recalld::room::ROOM_MATCH_KEY).is_empty(),
+        "the room microphone is not a Discord client"
+    );
+    assert!(
+        rig.bridge
+            .verdicts(recalld::clock::monotonic_ns(), true)
+            .is_empty(),
+        "neither microphone is even a candidate"
     );
     rig.finish();
 }
@@ -577,12 +757,29 @@ fn nothing_is_muted_when_the_feature_is_off() {
 /// chunks and then closed — which is what a capture thread does, and what makes
 /// the last turn get written instead of sitting in the merger's window.
 fn push_session(rig: &Rig, source_id: i64, samples: &[f32]) {
-    let session_id = {
-        let store = rig.store();
-        store.begin_session(source_id, utc_now_ns()).unwrap()
-    };
+    let session_id = open_session(rig, source_id);
     let per = (SAMPLE_RATE / 2) as usize;
     let base = recalld::clock::monotonic_ns();
+    push_audio(rig, session_id, base, samples);
+    rig.queue.push(recalld::queue::CaptureEvent::SessionEnd {
+        session_id,
+        mono_ns: base
+            + (samples.len().div_ceil(per) * per) as u64 * 1_000_000_000 / SAMPLE_RATE as u64,
+    });
+}
+
+/// One capture session, left OPEN. 0.12.2's rule is per session, so a test
+/// about a client that keeps running has to use one session for it: opening a
+/// second would be a second client as far as the rule is concerned, and that
+/// is exactly the distinction it exists to make.
+fn open_session(rig: &Rig, source_id: i64) -> i64 {
+    let store = rig.store();
+    store.begin_session(source_id, utc_now_ns()).unwrap()
+}
+
+/// Feed `samples` into an open session in 500 ms chunks, starting at `base`.
+fn push_audio(rig: &Rig, session_id: i64, base: u64, samples: &[f32]) {
+    let per = (SAMPLE_RATE / 2) as usize;
     let ns_of = |i: usize| (i * per) as u64 * 1_000_000_000 / SAMPLE_RATE as u64;
     for (i, chunk) in samples.chunks(per).enumerate() {
         rig.queue.push(recalld::queue::CaptureEvent::Audio(
@@ -593,10 +790,46 @@ fn push_session(rig: &Rig, source_id: i64, samples: &[f32]) {
             },
         ));
     }
+}
+
+/// Close an open session, which is what flushes its last turn.
+fn end_session(rig: &Rig, session_id: i64) {
     rig.queue.push(recalld::queue::CaptureEvent::SessionEnd {
         session_id,
-        mono_ns: base + ns_of(samples.len().div_ceil(per)),
+        mono_ns: recalld::clock::monotonic_ns(),
     });
+    rig.drain();
+}
+
+/// One whole capture session on `source_id`, placed at `base`.
+fn push_session_at(rig: &Rig, source_id: i64, base: u64, samples: &[f32]) -> i64 {
+    let session_id = open_session(rig, source_id);
+    push_audio(rig, session_id, base, samples);
+    rig.queue.push(recalld::queue::CaptureEvent::SessionEnd {
+        session_id,
+        mono_ns: base + (samples.len() as u64 * 1_000_000_000) / SAMPLE_RATE as u64,
+    });
+    session_id
+}
+
+/// A capture instant `ago_ms` in the past. Used to place a second client's
+/// call somewhere the per-user streams demonstrably are not — inside the
+/// rolling window, outside every stream bucket.
+fn past_base(ago_ms: u64) -> u64 {
+    recalld::clock::monotonic_ns().saturating_sub(ago_ms * 1_000_000)
+}
+
+/// One round of a live call: the plugin posts everybody's audio, the same
+/// speech arrives through the mixed tap at the same instant, and the pipeline
+/// is drained. Timestamped at `now` on both legs, because that is what "the
+/// same call through two taps" means and it is the whole input to the share.
+fn round(rig: &Rig, session_id: i64, samples: &[f32]) {
+    let t0 = recalld::clock::ns_to_ms(utc_now_ns());
+    let (lines, _) = frames("777", "Aspen", t0, samples);
+    rig.post("/v1/discord/audio", &(lines.join("\n") + "\n"), Some(TOKEN));
+    assert!(rig.peruser.any_live(), "a frame just arrived");
+    push_audio(rig, session_id, recalld::clock::monotonic_ns(), samples);
+    rig.drain();
 }
 
 // ---------------------------------------------------------------------------
