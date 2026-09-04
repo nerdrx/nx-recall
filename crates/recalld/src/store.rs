@@ -3177,6 +3177,48 @@ impl Store {
         )?)
     }
 
+    /// Live voices holding **more** prototypes than the cap, largest first.
+    ///
+    /// `add_prototype` enforces `[identity].max_prototypes` on every write, so
+    /// this can only be non-empty because something else put them there:
+    /// `merge_speakers` re-points a collapsed voice's prototypes with a bare
+    /// `UPDATE`, and nothing re-applies the cap afterwards. On the 2026-09-04
+    /// archive that left one voice with 47 prototypes against a cap of 20, 24
+    /// of them inherited from twenty minted voices that were merged in — and
+    /// those 24 match that voice's own ground-truth turns at 0.167 where the
+    /// enrolled ones manage 0.359 (FINDINGS §44).
+    ///
+    /// It reports and does not repair, deliberately. Every automatic trim was
+    /// measured against the same held-out protocol: dropping the most
+    /// *redundant* prototype — the shipping eviction rule with no incoming
+    /// vector — is catastrophic (held-out precision 92.6% → 42.7%), because
+    /// redundancy pruning keeps exactly the outliers that do not belong;
+    /// dropping the most *outlying* one is safe and immaterial (+0.001 F-0.5).
+    /// So the operator is told, and `identity repair --prototypes` remains the
+    /// only thing that deletes.
+    ///
+    /// Tombstones are excluded: a merged-away id holds nothing.
+    pub fn oversized_banks(&self, cap: usize) -> Result<Vec<(i64, String, i64)>> {
+        if cap == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.display_name, COUNT(p.id) AS n
+               FROM speakers s
+               JOIN speaker_prototypes p ON p.speaker_id = s.id
+              WHERE s.merged_into IS NULL
+              GROUP BY s.id
+             HAVING n > ?1
+              ORDER BY n DESC, s.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![cap as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn add_golden_sample(
         &self,
         speaker_id: i64,
@@ -11749,6 +11791,45 @@ mod tests {
             .unwrap();
         s.merge_speakers(a, b).unwrap();
         assert!(s.learned_thresholds().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_merge_leaves_a_bank_over_its_cap_and_the_audit_can_see_it() {
+        // `add_prototype` enforces `max_prototypes`; `merge_speakers` moves
+        // prototypes with a bare UPDATE and nothing re-applies it afterwards.
+        // On the 2026-09-04 archive that is how Rowan came to hold 47
+        // prototypes against a cap of 20 — and the 24 it inherited match
+        // Rowan's own ground-truth turns at 0.167 where the enrolled ones
+        // manage 0.359, which is the whole of what looked like drift
+        // (FINDINGS §44). Nothing here deletes: the cap is measured and
+        // reported, because every automatic trim was measured and refused.
+        let s = store();
+        let a = s.mint_speaker(0).unwrap();
+        let b = s.mint_speaker(0).unwrap();
+        for i in 0..3 {
+            s.add_prototype(a, &emb("m@1", &[1.0, i as f32, 0.0]), None, false, 3, i)
+                .unwrap();
+            s.add_prototype(b, &emb("m@1", &[0.0, i as f32, 1.0]), None, false, 3, i)
+                .unwrap();
+        }
+        assert_eq!(s.oversized_banks(3).unwrap(), vec![], "nothing is over yet");
+
+        s.merge_speakers(a, b).unwrap();
+        assert_eq!(
+            s.prototype_count(b).unwrap(),
+            6,
+            "the merge moved all three"
+        );
+        assert_eq!(
+            s.oversized_banks(3).unwrap(),
+            vec![(b, format!("Speaker_{b:02}"), 6)],
+            "the surviving voice is over the cap and the audit names it"
+        );
+        assert_eq!(
+            s.oversized_banks(6).unwrap(),
+            vec![],
+            "at the cap is not over it"
+        );
     }
 
     #[test]

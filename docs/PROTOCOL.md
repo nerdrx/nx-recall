@@ -2210,9 +2210,19 @@ candidate it removed and why, and three counters (`prior_foreign`,
 
 ### `recalld identity audit`
 
-A report; it writes nothing. Three parts: the **voice × source matrix**, the
-**count of labels the rule questions**, and the **twenty most recent** of them
-with their scores and `label_via`.
+A report; it writes nothing. Four parts: the **voice × source matrix**, the
+**banks over the cap**, the **count of labels the rule questions**, and the
+**twenty most recent** of them with their scores and `label_via`.
+
+**Banks over the cap** lists every live voice holding more than
+`[identity].max_prototypes` prototypes. `add_prototype` enforces that number on
+every write, so a voice can only be over it because `merge_speakers` re-pointed
+a collapsed voice's prototypes and nothing re-applied the cap. It reports and
+does not repair: FINDINGS §44 measured every automatic trim held out and refused
+all of them — pruning the most *redundant* prototype (the eviction rule with no
+incoming vector) is catastrophic, because redundancy pruning keeps exactly the
+outliers that do not belong, and pruning the most *outlying* one is safe and
+immaterial. `identity repair --prototypes` stays the only command that deletes.
 
 A past label is judged by **replaying the labels in the order they were made** and
 asking the prior's question of each using only what was known before it. Any

@@ -4525,6 +4525,49 @@ fn cmd_identity_audit(cfg: &Config, data_dir: &Path) -> Result<()> {
         println!("{id:>4}  {name:<24}  {cells}");
     }
 
+    // A cap that a merge quietly lifted. `add_prototype` never writes past
+    // `max_prototypes`, so anything over it arrived by `merge_speakers`, which
+    // re-points a collapsed voice's prototypes and does not re-apply the cap.
+    // The inherited vectors are the ones that look like drift and are not:
+    // FINDINGS §44 measured the voice itself as stable over the archive's 3.4
+    // days (turn-to-turn cosine −0.02/day, r = −0.05) while the inherited
+    // prototypes sit 0.19 cosine below the enrolled ones.
+    let over = store.oversized_banks(cfg.identity.max_prototypes)?;
+    println!("\n=== banks over the cap ===");
+    if over.is_empty() {
+        println!(
+            "None: every voice is within `[identity].max_prototypes` = {}.",
+            cfg.identity.max_prototypes
+        );
+    } else {
+        println!(
+            "`max_prototypes` is {}, and `add_prototype` never writes past it — so these\n\
+             came from a merge, which moves a collapsed voice's prototypes and does not\n\
+             re-apply the cap. Inherited prototypes match their new voice's own turns far\n\
+             less well than enrolled ones, which reads as the voice having changed.\n",
+            cfg.identity.max_prototypes
+        );
+        println!(
+            "{:>5}  {:<24}  {:>11}  {:>9}",
+            "VOICE", "NAME", "PROTOTYPES", "OVER BY"
+        );
+        for (id, name, n) in &over {
+            println!(
+                "{:>5}  {:<24}  {:>11}  {:>9}",
+                id,
+                name,
+                n,
+                n - cfg.identity.max_prototypes as i64
+            );
+        }
+        println!(
+            "\nNothing here is trimmed automatically: every automatic trim was measured\n\
+             held out and refused (FINDINGS §44). `recalld identity repair --prototypes`\n\
+             is the one command that deletes, and it only removes prototypes whose own\n\
+             source turn ground truth says was somebody else."
+        );
+    }
+
     println!("\n=== labels the rule questions ===");
     println!("{:<20}{}", "labels considered", report.considered);
     println!("{:<20}{}", "questioned", report.foreign.len());
