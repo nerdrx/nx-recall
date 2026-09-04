@@ -334,7 +334,7 @@ select.input option, select.input optgroup {
 .seg.partial .txt { color: var(--clear-muted); }
 .seg-ell { white-space: nowrap; margin-left: 0.15em; color: var(--clear-muted); }
 
-/* 0.12.4 — a GROWING row, from a turn that is being sliced.
+/* 0.12.5 — a GROWING row, from a turn that is being sliced.
  *
  * The one visual difference from a partial, and it is the honest one: the ink
  * goes back to normal. A partial's words are a guess that the next reading may
@@ -1353,6 +1353,42 @@ button.sp-num:focus-visible { outline: none; box-shadow: var(--clear-focus); }
    "do not read this as settled" — so it is deliberately the same look, and a
    row that is both merely gets one of it. */
 .seg.shaky .txt { color: var(--clear-muted); font-style: italic; }
+
+/* -- 0.12.4, how a turn sounded -------------------------------------------- */
+/* Chips at the end of a row: what the decoder heard on the clip besides the
+   words, and — only where the measurement earned it — how it read the voice.
+   Same pill geometry as every other chip in the app (§14.2), one size down and
+   in the ornament weight, because this is the least load-bearing thing on a
+   row: a transcript is a record of what was SAID and these are marks on the
+   audio around it. */
+.mood-chips { display: inline-flex; align-items: center; gap: 4px; }
+.mood-chip {
+  display: inline-flex; align-items: center;
+  padding: 2px 8px; border-radius: var(--clear-r-chip);
+  background: transparent; border: 1px solid var(--clear-line);
+  font-size: 9px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--clear-muted); white-space: nowrap; cursor: help; flex: none;
+}
+/* The mood chip carries its own hue inline (lib/marks.js), so the border warms
+   to it via currentColor and the two halves of the mark cannot disagree. The
+   event chips stay in the ornament grey: an event is a fact about the
+   recording, and a fact does not need a colour to argue for it. */
+.mood-chip.mood { border-color: currentColor; opacity: 0.9; }
+
+/* The tint itself. The COLOUR is inline — `hsl(<hue> var(--mood-s)
+   var(--mood-l))`, so it repaints on a theme flip without re-rendering a row,
+   exactly like every speaker colour in this app. What lives here is only what
+   a colour cannot express, and there is deliberately almost nothing: no
+   background wash, no weight change, no italic. A row is tinted or it is the
+   ordinary ink, and an untinted row is byte-for-byte what it was in 0.12.3.
+
+   One exception, and it is the legibility rule doing its job: a row whose
+   SPEAKER is in doubt, or whose words a second decoder disagreed with, already
+   overrides its colour to say so, and that claim outranks a guess about a
+   feeling. The mood tint stands down rather than fighting it — the same
+   precedence `markRow` gives `uncertain` over a speaker highlight. */
+.seg.uncertain .txt.has-mood,
+.seg.shaky .txt.has-mood { color: var(--clear-muted) !important; }
 
 /* -- fix this ------------------------------------------------------------- */
 /* The words are the control. At rest they are set exactly as they will be while

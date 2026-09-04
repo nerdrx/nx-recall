@@ -1427,6 +1427,50 @@ older daemon" have to be tellable apart, and a missing key says neither:
   against a gate of ≥30% relative and under 5% harmed). Turning it off is a
   supported choice and leaves every `night_text` in place.
 
+### `status.asr.devices` (0.12.4)
+
+Which device each model on the live path runs on, and why. Always present and
+always this shape, for the same reason the two blocks above it are — "this
+daemon measured the question and the answer is the CPU" and "this daemon is old
+enough not to have been asked" are different states:
+
+```json
+"devices": {
+  "live": "cpu",
+  "night": "vulkan",
+  "live_models": [
+    { "model": "silero-vad", "runtime": "onnxruntime", "device": "cpu",
+      "cpu_share_pct": 0.8, "why": "onnxruntime's ROCm provider was removed in 1.23, …" },
+    { "model": "parakeet-tdt-0.6b-v3", "runtime": "sherpa-onnx", "device": "cpu",
+      "cpu_share_pct": 87.5, "why": "sherpa-onnx accepts no AMD execution provider …" }
+  ],
+  "summary": "every model on the live path runs on the CPU. …"
+}
+```
+
+- `live` — the device every live model is on. `"cpu"`, and on an AMD machine it
+  is not going to be anything else; see below.
+- `night` — `"vulkan"` where `models build-night` has been run, `"unavailable"`
+  otherwise. Reported here as well as under `night` because the question a
+  person asks is "is my graphics card doing anything for this", and an answer
+  that omits the one thing that uses it is a misleading answer.
+- `cpu_share_pct` — that model's measured share of the live path's CPU
+  (FINDINGS §40, the user's own 22.8 minutes). A **constant**, not a live
+  counter: it is a property of the models, and a per-turn timer maintaining a
+  number nobody reads is exactly the cost this measurement was about. A client
+  ordering the list by it is ordering by "what would be worth moving".
+- `why` — one sentence per model, but only **two distinct sentences** across the
+  list, because the models split by runtime and each runtime is blocked for its
+  own reason. A UI should fold them rather than repeat them; `recalld status`
+  does.
+
+**What a client should not imply.** There is no setting here and there is not
+going to be one. A UI must not offer a "use the GPU" toggle, or present the CPU
+placement as a default that can be changed: 90% of the live cost is the
+transcriber, the transcriber runs under sherpa-onnx, and sherpa-onnx's provider
+enum has no AMD variant — that is upstream C++, not a flag this daemon withheld.
+The night shift is the GPU feature, and it has its own block.
+
 ### The vote, stated for clients
 
 The daemon never replaces a transcript on the night decoder's word alone. Two
@@ -2210,9 +2254,19 @@ candidate it removed and why, and three counters (`prior_foreign`,
 
 ### `recalld identity audit`
 
-A report; it writes nothing. Three parts: the **voice × source matrix**, the
-**count of labels the rule questions**, and the **twenty most recent** of them
-with their scores and `label_via`.
+A report; it writes nothing. Four parts: the **voice × source matrix**, the
+**banks over the cap**, the **count of labels the rule questions**, and the
+**twenty most recent** of them with their scores and `label_via`.
+
+**Banks over the cap** lists every live voice holding more than
+`[identity].max_prototypes` prototypes. `add_prototype` enforces that number on
+every write, so a voice can only be over it because `merge_speakers` re-pointed
+a collapsed voice's prototypes and nothing re-applied the cap. It reports and
+does not repair: FINDINGS §44 measured every automatic trim held out and refused
+all of them — pruning the most *redundant* prototype (the eviction rule with no
+incoming vector) is catastrophic, because redundancy pruning keeps exactly the
+outliers that do not belong, and pruning the most *outlying* one is safe and
+immaterial. `identity repair --prototypes` stays the only command that deletes.
 
 A past label is judged by **replaying the labels in the order they were made** and
 asking the prior's question of each using only what was known before it. Any
@@ -4318,7 +4372,541 @@ span onward**: a verdict written before the plugin was updated is never
 re-scoped by a bridge that arrived afterwards, and nothing in this section moves
 a number 0.12.1 or §34 reported.
 
-## 0.12.4 — sliced turns
+## 0.12.4 — every correction is word-level ground truth (schema v19)
+
+`accuracy.summary` has always measured *how wrong* the transcripts were. It
+could never say **which decoder to believe**, because the three readings of a
+clip were never in the same place: the live pass's words and the context
+re-decode's live inside `segments.redecode` operations, the night shift's in
+`segments.night_text`, and the person's in a `segments.correct` operation. This
+release puts them on one row, at the moment the truth is made.
+
+Nothing above this line changes shape. `proto` stays `1`, `segments.correct`
+takes and returns exactly what it did, and every field described here is
+additive.
+
+### Schema v19 — the `text_truth` table
+
+| column | meaning |
+|---|---|
+| `segment_id` | the turn |
+| `truth_text` | what the person typed. The reference |
+| `live_text` | what the first pass read, when it is recoverable |
+| `context_text` | what a re-decode read (`context`, `arbiter` and `lid` are one pass here) |
+| `night_text` | what the night shift read, **whether or not the vote let it win** |
+| `canary_text` | always `NULL` today — see below |
+| `asr_confidence` | the cross-check verdict standing over the words being replaced |
+| `speaker_id`, `source_kind`, `duration_ns` | the three facets a measurement is cut by, **as they are now** |
+| `created_ns` | the instant of the correction. With `segment_id` it is the natural key |
+
+Written by `segments.correct` after the row is rewritten, and **backfilled from
+the operations history on migration** — every field already existed on disk, so
+a v17 archive arrives with its whole correction history in the table. The
+backfill runs on every open and is a no-op after the first: the natural key
+makes replaying history idempotent, which `tests/truth.rs`'s three-open test now
+also covers. The table is derived data. Nothing renders from it, and dropping it
+loses no user-visible state.
+
+Two things it deliberately does not claim:
+
+- **`canary_text` is null, and that is the honest value.** The cross-check
+  decoder stores its *verdict* and not its words (`crate::quality`); the night
+  shift re-decodes the clip when it needs the actual sentence and throws it
+  away again. The column exists so that the day the words are kept is a write
+  rather than a migration.
+- **A reading is filed by the route recorded with it, not guessed.** Every
+  `segments.redecode` operation carries `{text, text_via}` and a timestamp, so
+  for a correction at `T`: operations at or before `T` each contribute one
+  reading under the pass their `text_via` names; the words the correction
+  replaced are filed under the route named by the **first operation after
+  `T`** (that operation replaced them, so its `prior_state.text_via` is how
+  they got there), falling back to the row's current `text_via`; and nothing
+  after `T` contributes anything else, because the text it kept is the
+  corrected text and scoring the truth against itself is not a measurement.
+
+### `accuracy.learn {apply?}` — which decoder wins, per cell
+
+A **cell** is one voice, one source kind, one duration bucket (`short` under
+2 s, `mid` under 6 s, `long`), keyed as `app/25/short`; an unlabelled voice is
+`-` and is a real cell, not a missing one.
+
+```json
+{"id": 9, "method": "accuracy.learn", "params": {"apply": false}}
+```
+
+The reply carries `corrections`, `measurable`, `min_rows_per_cell`,
+`margin_pp`, `fit_fraction`, a `global` cell report, one report per `cell`,
+`short_by` (what each under-sampled cell still wants), the `rules` the pass
+would install, `applied`, and `installed` — the rules actually in force. A cell
+report is `{cell, source_kind, speaker_id, bucket, rows, held_out, decoders:
+[{decoder, rows, wer}], rule, verdict}`; `wer` is the bounded corpus edit share
+over normalised words, the same figure `edit_rate` is, and `null` where that
+decoder read none of the held-out rows.
+
+**Read-only unless `apply` is true.** Four gates, and a rule ships only if it
+clears all of them:
+
+1. **A minimum sample per cell** — 30 corrections, `calib::MIN_ROWS_PER_VOICE`
+   for the same reason. A smaller cell inherits the global decision.
+2. **A minimum sample per comparison** — 12 held-out rows *both* decoders read.
+   This is not implied by the first and the archive is why it is written down:
+   the first run of this pass over 37 corrections found a 37-row cell whose
+   live-against-context comparison rested on four rows, and would have shipped
+   a rule off it. Thirty corrections are not thirty measurements of every
+   decoder.
+3. **A chronological hold-out** — `calib::split_at` at `FIT_FRACTION`, so
+   nothing the fit saw scores it.
+4. **A margin** — 2 percentage points off held-out error, `calib`'s
+   `improvement_is_material` restated. Without it every rounding-error
+   improvement installs itself.
+
+A cell that clears none of them ships **nothing**, and the 0.9.0 vote stands.
+
+### What a rule can change
+
+Exactly two things, stored in `settings` under `text.decoder_rules`:
+
+- **`winner`** — `live` (the shipped answer), `context` or `night`.
+- **`vote`** — what `crate::night` may do in that cell. `two_of_three` is the
+  0.9.0 rule and the default everywhere. `night_wins` drops the requirement for
+  a second voter **and nothing else** — every guard still runs, because the
+  guards are about §12's hallucinations and no amount of held-out WER makes a
+  Swedish sentence an acceptable replacement for a German one, and a reading
+  that agrees with the words already there is still not a replacement.
+  `keep_live` refuses the replacement outright and keeps the reading as an
+  annotation.
+
+The night shift reads them once per batch, under the same lock it gathers
+under. An absent or malformed setting is "no rules", never an error: a night
+shift must not stop because a setting could not be parsed.
+
+### `accuracy.summary` gains `learned`
+
+```json
+{"learned": {"corrections": 37, "min_rows_per_cell": 30, "margin_pp": 2.0,
+             "rules": 0, "learned_ns": null, "learned_ms": null,
+             "ready": false, "needed": 0, "installed": {…}}}
+```
+
+`needed` is how many more corrections the smallest useful sample wants, and it
+is the half of the block that matters on a real machine: the Memory view's
+accuracy card renders one line — *"Learned from 37 corrections — N more in one
+voice, source and turn length and it can start choosing between its decoders"*
+— because a card that only said "nothing learned yet" would leave the reader
+with nothing to do about it. `recalld accuracy` prints the same line, and
+`recalld accuracy report` prints the whole per-cell table.
+
+**On this install, today, nothing ships.** 37 corrections, 31 of them with a
+decoder's reading beside them, spread over ten cells whose largest holds 11 —
+and no night reading at all, because `[night].enabled` has never been on here.
+The recording and the pass are in; the bar is unmet and says so.
+## 0.12.4 — a turn cut where the speaker changes
+
+**No wire change, and that is the design.** A split turn is two ordinary
+segments: two `segment.new` events, two rows in `transcript.page`, two clips.
+No client learns a new field, no client learns a new event, and a client that
+predates this section renders a split turn correctly because there is nothing
+about it to render specially. The only thing that changes is that some turns
+that used to be one row are now two.
+
+### What a piece is
+
+The daemon has always ended a turn at silence and nowhere else
+(`crate::turns`), so a fast exchange — "yeah" / "no it isn't" across half a
+second — arrives as one row with one label. `crate::turnsplit` slides the
+identity extractor over the turn at a 0.25 s hop, compares the window *ending*
+at each boundary with the one *starting* there, and cuts where they disagree
+most, subject to three refusals:
+
+* no piece shorter than `[identity].split_turn_min_piece_s` (default
+  `min_duration_s`, 1.0 s) — a piece exists to be labelled, and a piece the
+  ladder must refuse is a row with no speaker where there used to be one;
+* at most `split_turn_max_cuts` cuts, no two closer together than a piece;
+* **no piece without words.** The detector reads the voice and not the words,
+  so it will cut a laugh or a two-second "yeah" in half; a split that leaves
+  any piece silent is refused whole.
+
+Each piece then goes through the ordinary path — its own clip, its own row, its
+own transcript, its own trip through the ladder — so `t_start_ns`/`t_end_ns`,
+`overlap_frac`, `speaker_id`, `match_score`, `label_via`, `lang` and the truth
+verdict on a piece all mean exactly what they mean on any other segment. The
+pieces tile the turn: piece *n*'s `t_end_ns` is piece *n+1*'s `t_start_ns`, and
+between them they hold every sample.
+
+### The transcript is partitioned, never re-decoded
+
+The whole turn is decoded once with word timestamps
+(`crate::asr::TimedAsr`) and each piece takes the words that **start** inside
+it. Concatenating the pieces' `text` in time order reproduces the turn's word
+sequence exactly — no word is lost at a cut and none is spelled twice. That is
+a property of the construction and not of the model: two independent decodes
+could do neither, because a word straddling the cut belongs to whichever piece
+got most of its audio, to both, or to nothing.
+
+`asr_model_id` on every piece is the same decoder, because it was the same
+decode.
+
+### The switch
+
+```toml
+[identity]
+split_turns = false            # measured off — FINDINGS §39
+split_turn_window_s = 1.5
+split_turn_hop_s = 0.25
+split_turn_min_piece_s = 1.0
+split_turn_distance = 0.85
+split_turn_max_cuts = 3
+```
+
+`split_turn_distance` is a **distance**, `1 - cos`, and is not comparable with
+`label_threshold`: two 1.5 s windows of the *same* person on this audio already
+score around 0.6, so anything that sounds like a sensible similarity bar is
+below the noise floor.
+
+**Off by default, on the numbers.** At this operating point the detector finds
+41.7% of the reachable change points within ±0.5 s at 67.9% precision and
+splits 0.87% of turns Discord says are one person. That clears the false-split
+bar and misses the recall bar it was set (≥50%), so the live default is off and
+the archive pass below is how an install gets the benefit.
+
+### `recalld turns resplit`
+
+The same detector over the archive's `partial` and `overlap` rows — the two
+verdicts that *mean* the row holds more than one person's audio. `single` is
+never re-decided by this pass: Discord has already settled it.
+
+```
+recalld turns resplit           # what it would cut, turn by turn. Writes nothing.
+recalld turns resplit --apply   # cut them.
+recalld turns resplit --undo    # put back what the last run cut, newest first.
+```
+
+**The original row survives, shortened to its first piece**; the other pieces
+become new rows in the same session. Nothing is deleted — not the row, whose id
+`threads`, `commitments`, `time_refs`, `notes`,
+`speaker_prototypes.source_segment_id`, `segment_vectors` and every stored
+correction point at, and not the original clip, which is what makes `--undo`
+work. Everything the analysis leg owns about audio the row no longer covers —
+the words, the language, the speaker, the overlap reading, the vectors, the
+verdict — is cleared and recomputed per piece.
+
+Each cut turn writes one `turns.resplit` operation whose `prior_state` carries
+the whole turn back:
+
+```json
+{"segment_id": 11050, "t_start_ns": 1788…, "t_end_ns": 1788…,
+ "audio_path": "segments/000312/seg-000239-1788….wav",
+ "text": "Yeah that's all Imano", "truth_verdict": "overlap",
+ "minted": [17421]}
+```
+
+`--undo` restores the span and the clip and soft-deletes the minted pieces. It
+does **not** restore the words: the span is right again and nothing has re-read
+the audio, so the honest state is a turn waiting for the analysis leg, which is
+the same state the split left it in. It is idempotent by the span — undoing
+twice cannot delete a second generation of rows.
+
+### What a client should expect
+
+Nothing new to implement, and one thing not to assume: a segment id is no
+longer a stable claim on a fixed span. It always could change (`segments.correct`
+rewrites text, `segments.reassign` rewrites the speaker); after 0.12.4 an
+applied resplit can also *shorten* an existing row and add a sibling beside it.
+A client that re-reads a segment by id after a `segment.updated` event was
+already doing the right thing.
+## 0.12.4 — how a turn sounded (schema v18)
+
+The user asked for one thing: *"colour in the text or tag the text with the mood
+in the transcript"*. The honest answer turned out to be two features with two
+different amounts of evidence behind them, and this section is mostly about
+keeping those two apart on the wire.
+
+**Nothing here is new inference.** SenseVoice — the decoder 0.11.6 catalogued
+for Korean and Chinese (FINDINGS §27) — has always emitted four tags per decode:
+language, emotion, audio event, and whether inverse text normalisation ran. The
+daemon read `text` and dropped the rest. 0.12.4 reads two more of them.
+
+### What is measured, and therefore what is drawn
+
+`spike/mood_bench.py` ran SenseVoice-small int8 over the user's own archive on
+four niced cores before a line of GUI was written. The table is FINDINGS §42; the
+two sentences that decide the protocol are:
+
+* **Events are drawn.** `laughter` and `music` are marks on the audio, and
+  laughter agrees with the transcript's own laughter tokens far above the base
+  rate.
+* **Mood is stored and withheld.** The model declines to answer on most turns,
+  and on the rest it did not clear the margin fixed before the run.
+
+So the wire carries both and **one flag says which may be believed**. That is
+deliberate: a daemon that quietly omitted a column would leave a future client
+unable to tell "withheld" from "old daemon", and a client that decided for itself
+would be telling somebody how their friend felt on evidence nobody checked.
+
+### Schema v18 — `segments.mood`, `.events`, `.mood_at_ns`
+
+Three nullable columns on `segments`, no backfill.
+
+| column | value |
+|---|---|
+| `mood` | `happy`, `sad`, `angry`, `neutral`, or NULL |
+| `events` | the sorted comma-joined subset of `laughter,music,applause,cry`, or NULL |
+| `mood_at_ns` | when the pass looked |
+
+**`mood_at_ns` is the queue and the other two are the answer.** There are three
+columns and not two because the pass stamps every row it reaches, *including*
+the ones it heard nothing on — a model that abstained and a clip retention has
+taken both write NULL/NULL, and without the third column they would be
+indistinguishable from a row nothing had visited. The pass would then re-read
+them every night for the life of the archive.
+
+NULL in `mood` therefore means one of two things and the row cannot tell them
+apart: nothing has listened, or the model listened and declined. Both render
+identically — as nothing — so the distinction stays off the wire.
+
+### The segment shape gains two keys
+
+Every surface that carries a segment carries them: the transcript, a search hit,
+`thread.get`, replay, and the live `segment` event.
+
+```json
+"mood": "happy",
+"events": ["laughter", "music"]
+```
+
+`events` is an **array of the closed set**, never the stored comma-joined
+string, and it is `[]` — not `null` — on a turn that carried none and on every
+row the pass has not reached. A client iterates it without a null check, because
+"no event" and "not looked at" are the same thing to draw.
+
+`mood` is a bare string or `null`. **A client must consult
+`status.mood.rendered` before drawing it.**
+
+### `status.mood`
+
+Always present, always the same shape, so a client can tell "off", "the model is
+not installed" and "an older daemon" apart:
+
+```json
+"mood": {
+  "enabled": false,          // [mood].enabled — is the pass listening
+  "available": true,         // is SenseVoice on disk
+  "how": null,               // …and how to get it, when it is not
+  "phase": "off",            // off | unavailable | blocked | idle | running
+  "rendered": false,         // MAY THE MOOD BE DRAWN — a measurement, not a setting
+  "why": "The mood tag is stored but not shown: …",
+  "live": false,             // are the tags also read on the way in
+  "backlog": 0,
+  "read_total": 0,
+  "counters": { "read": 0, "with_mood": 0, "with_event": 0, "no_audio": 0, "last_run_ms": 0 }
+}
+```
+
+`rendered` is the load-bearing key and it is **not** `enabled`. The pass being on
+says the tags are being written; `rendered` says whether the mood among them may
+be believed, and it comes from `crate::mood::MOOD_IS_MEASURED` rather than from
+config. There is no request that changes it, and that is on purpose: whether a
+measurement came out is not the operator's opinion, and a switch there would be
+an invitation to turn on a feature the evidence calls noise. **Laughter and music
+are never gated by it** — they were measured separately and they passed.
+
+`why` carries the daemon's own sentence for the refusal, so a client prints the
+reason instead of inventing a friendlier one.
+
+### `[assist] mood_display` — the fourth control on that card
+
+`tags` (the default), `tint`, `both`, `off`. Set through `assist.set` beside the
+three translation settings, carried on `assist.get`, on the `assist` event and on
+`status.assist`, and live in all four — a control that needs a restart is not a
+control.
+
+**The setting governs the MOOD; the events are governed only by `off`.** A mood
+can be a chip or a colour, and an event can only ever be a chip — there is no
+such thing as the colour of laughter. So `tint` means "put the mood on the
+words instead of on a chip", and laughter and music keep theirs. That is also
+what keeps all four states acting on the daemon as it ships, where the mood is
+withheld: without the split, `tint` would draw nothing at all and be a setting
+waiting on a measurement.
+
+It is on `[assist]` rather than on `[mood]` because it is a fact about a **page**
+and `[mood].enabled` is a fact about the **pass**. Two questions, two switches: a
+person who turns the display off has not turned the listening off.
+
+```
+assist.set {"mood_display": "both"}
+```
+
+Refused with `params` for anything outside the four, in the shape
+`translation_display` is: a client that sends `tinted` is told, rather than
+silently getting the default and wondering why its radio button will not stick.
+
+`off` still leaves the laughter glyph on the headset overlay, which is another
+surface with its own answer — see `docs/OVERLAY.md`.
+
+### `speakers.palette` gains `mood_palette`
+
+```json
+{ "palette": [ … ten … ], "mood_palette": [
+  {"token": "happy",  "hue": 44,  "hex": "#705d29"},
+  {"token": "sad",    "hue": 232, "hex": "#293370"},
+  {"token": "angry",  "hue": 350, "hex": "#702935"}
+]}
+```
+
+Three, and they are three of the ten the person palette already spends, so the
+suite turns one wheel. `neutral` is a mood and is deliberately **absent**: it is
+what a transcript already looks like, and painting it would repaint the whole
+archive to say nothing. A lookup that misses falls through to the ordinary ink,
+which is the rule an unknown token already follows.
+
+Tokens and not hex, for the reason `crate::palette`'s module note gives — see
+`docs/DESIGN.md` §6.1 for the saturation and lightness a *sentence* is painted
+at, which are not a name's.
+
+### `person.get` and `thread.get` gain `mood`; so does a digest
+
+One block, one function, three callers, so a digest and the conversation page it
+opens can never say different things about one evening.
+
+```json
+"mood": {
+  "read": 214,
+  "counts": {"happy": 31, "sad": 4, "angry": 2, "neutral": 60, "laughter": 26, "music": 3},
+  "last_ms": 1756000000000,
+  "last_ns": "1756000000000000000",
+  "summary": {
+    "read": 214,
+    "laughter": 26,
+    "laughter_share": 0.121,
+    "laughs": true,
+    "mood": null
+  }
+}
+```
+
+`counts` is unconditional — they are facts about rows. `summary` is the block
+that says what may be **said**, and it is `null` for nearly everybody: under
+thirty read rows the daemon refuses to write one at all, because a person heard
+twice is not somebody who "laughs half the time". `laughs` is the one claim this
+daemon will make about a person from these tags, and `summary.mood` is the one it
+will not until the measurement changes.
+
+The daemon hands over counts and booleans and never prose. A daemon that shipped
+English sentences would have to ship them in every language the GUI is read in.
+
+**The digest's `mood` is beside the paragraph, never inside it.** Every clause
+added to a prompt that both decides and writes made the deciding worse (the table
+in `crate::digest`'s module note), and "say how it felt" is exactly such a clause.
+The feeling is counted, not asked of the model.
+
+### `search.answer` may read an event off a row
+
+The rows the model is shown gain the event in parentheses after the name:
+
+```
+[301] 21:04 Kira (laughter): der Tank ist einfach explodiert
+```
+
+Parentheses and not brackets, because `[` is the citation syntax and a second
+bracketed thing on the line is a second thing that looks like an id. `mood` is
+**not** on the line — the events were measured and it was not, and a model handed
+a tag nobody trusts will happily build a sentence on it.
+
+**The grounding post-check is unchanged and does not see the mark.** The overlap
+test runs against the rows' `text` alone, so an answer that says *"they laughed"*
+and shares no content word with the turn is still refused. The event tells the
+model which row to read; the words are what it has to read off it.
+
+### `[mood]`
+
+```toml
+[mood]
+enabled = false        # off by default, like every optional pass
+rows_per_run = 2000    # per opening of the gate
+batch_rows = 64        # rows fetched per query, NOT a decode batch
+min_duration_s = 1.0
+live = false           # read the tags on the capture path too
+```
+
+The clock is **borrowed**: `[night].window` and `[night].also_when_idle_min`, the
+same borrow `[asr].lang_sweep` makes and for the same reason — "the hours this
+machine is nobody's" is one fact about a household, and two copies of it would
+eventually disagree. There is no GPU gate, because nothing here touches the card.
+
+`batch_rows` is not the night shift's kind of batch. SenseVoice's tags are **per
+clip**, so concatenating eight turns would ask which of them the laughter was on;
+every clip is decoded on its own, and the number only bounds a query.
+
+`live = false` was measured before it was offered rather than defaulted off out
+of caution — see FINDINGS §42. A live mood chip is worth less than a dropped
+turn, and the overnight pass reaches the same row within a day.
+
+## 0.12.4 — every scoring rule, with the bars it earns for itself
+
+`identity.calibrate` has chosen between prototype-aggregate rules since 0.12.0.
+It chose them wrong in two ways, and this round fixes both
+(`spike/FINDINGS.md` §45). Neither is a new feature; both are the same
+correction, which is that **a rule and a bar are one decision**.
+
+### The report carries every arm, twice
+
+A learned threshold is a number on a score scale, and the aggregate *is* the
+scale. Comparing a top-3 mean against per-voice bars fitted under max cosine
+measures the scale and not the rule — the error §36 found in `truth::enrol_batch`,
+still present in the one place §32 had left it. The pass now refits per-voice
+thresholds **under each candidate rule** and reports both readings:
+
+```jsonc
+{
+  "aggregates": [
+    {"rule": "max",   "incumbent": true,
+     "globals": {"n": 1113, "correct": 1015, "wrong": 49, "f_beta": 0.945},
+     "fitted":  {"n": 1113, "correct": 939,  "wrong": 27, "f_beta": 0.943},
+     "thresholds": [{"speaker": 2, "threshold": 0.32, "margin": 0.04, "n": 912}]},
+    {"rule": "top-4", "incumbent": false,
+     "globals": {"n": 1113, "correct": 1011, "wrong": 10, "f_beta": 0.973},
+     "fitted":  {"n": 1113, "correct": 1033, "wrong":  9, "f_beta": 0.978},
+     "thresholds": [ … ]}
+  ],
+  "aggregate": {"rule": "top-4", "score": { … the FITTED score … }},
+  "aggregate_thresholds": [ … the winning arm's own bars … ],
+  "aggregate_installed": "max",
+  "aggregate_swap": true
+}
+```
+
+Three rules a client can rely on:
+
+* **`aggregates` contains the installed rule**, flagged `incumbent: true`. The
+  loop used to skip it, so the rule the box was running never appeared in its
+  own table and could only be compared against the globals row. The incumbent's
+  two entries are the same two measurements as `baseline` and `candidate` —
+  one answer per question, not two that can disagree.
+* **`aggregate.score` is the `fitted` score**, because that is the operating
+  point an install would actually put the box on. The gate compares
+  (candidate rule + candidate's bars) against (installed rule + its bars).
+* **`aggregate_thresholds` is installed with the rule.** Through 0.12.3 a swap
+  cleared every learned bar and left the refit to the next pass — so between
+  the two runs the box sat on an operating point nothing had measured. The pair
+  is what the gate approved, so the pair is what is written: `cleared > 0`
+  **and** `written == aggregate_thresholds.length` on a run that swaps.
+
+Because the incumbent is now an arm, the pass can also go **home**: an install
+that learned `top-3` on an earlier corpus and no longer earns it is put back on
+`max`, through the same `swap_is_safe` + `improvement_is_material` gate as any
+other change. This is not hypothetical — the box did exactly that on
+2026-09-04, and §45 measures the reversal it should have made instead.
+
+### `identity.repair` measures at the install's operating point
+
+`repair_prototypes` scored its before/after table with `IdentityConfig::default()`.
+On this install the daemon gates at `max_overlap = 0.06` against a default of
+0.1, so the table that justifies a permanent deletion described a machine
+nobody was running. It now takes the caller's `[identity]` config, which is the
+same block `identity.calibrate` and the live ladder read. The wire shape does
+not change; the numbers in it do.
+
+## 0.12.5 — sliced turns
 
 Words for a turn that is **still being spoken**, from a turn long enough that
 waiting for it to end is the problem. One new event, no new topic, no new row,
@@ -4346,7 +4934,7 @@ The two events are deliberately the same shape, down to the field names, so a
 client that already draws a provisional row draws this one with no new code.
 What they do not share is what the words mean:
 
-| | `partial` (0.11.0) | `slice` (0.12.4) |
+| | `partial` (0.11.0) | `slice` (0.12.5) |
 |---|---|---|
 | each event is a reading of | the **whole open turn**, again | **new audio**, once |
 | the row is | **replaced** | **extended** |
@@ -4368,13 +4956,13 @@ no pause in it is never sliced; it ends on the VAD's 30 s cap exactly as it did
 before this existed. Half a word decoded alone is not a worse reading of that
 word, it is a different word, and it would be written down.
 
-`slice_after_s = 0` turns the feature off, and off is byte-for-byte 0.12.3: no
-slice is offered, and the turn is decoded whole. **Off is the default**, and a
+`slice_after_s = 0` turns the feature off, and off is byte-for-byte the
+behaviour before it: no slice is offered, and the turn is decoded whole. **Off is the default**, and a
 client must therefore treat `slice` as an event it may never see. The reason is
 measured rather than cautious: the CPU gate passed at +2.2% and a word reaches
 the glass 1.7 s sooner, but a piece read without the rest of the turn around it
 changes the words — the joined text disagrees with the whole-turn reading on
-17.6% of them, against a noise floor of exactly 0.00% (FINDINGS §39).
+17.6% of them, against a noise floor of exactly 0.00% (FINDINGS §41).
 
 ### One row at the end
 
@@ -4382,6 +4970,13 @@ When the turn finishes, an ordinary **`segment`** arrives carrying every slice
 joined to the remainder. A client replaces the growing row by matching
 **`(session, t_start_ns)`** — the same key, the same rule and the same reason as
 a partial: a slice has no `id`, because there is no row yet.
+
+**`[identity] split_turns` wins where they meet.** A turn that was sliced is
+never *also* cut at a speaker change: splitting needs a timed decode of the
+whole turn, which is exactly the decode slicing exists to avoid, so doing both
+would spend the turn twice and throw away the reading already on the glass. Both
+switches are off by default; an install that turns on both gets split turns and
+no slicing of the turns that would be split.
 
 There is no `continues` flag and there are no consecutive rows, and that is the
 load-bearing decision in this feature rather than an implementation detail.

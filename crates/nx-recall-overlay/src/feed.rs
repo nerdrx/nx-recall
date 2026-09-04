@@ -65,12 +65,26 @@ pub struct Turn {
     pub colour: Option<String>,
     /// The emoji that goes before the name, or none.
     pub icon: Option<String>,
-    /// This row is still being added to (0.12.4, sliced turns). It is drawn
+    /// This row is still being added to (0.12.5, sliced turns). It is drawn
     /// with a trailing ellipsis and nothing else different: a slice's words are
     /// decoded from their own audio at a boundary the VAD found and will not be
     /// taken back, so hedging the ink would tell the reader to distrust text
     /// that is not in doubt. What is unfinished is the sentence.
     pub growing: bool,
+    /// Somebody laughed on this turn (0.12.4).
+    ///
+    /// **Only laughter, of the four events the daemon stores.** The other three
+    /// are on the desktop's chips and not here, and that is a decision about
+    /// this surface rather than an omission: a caption bar is read once, at a
+    /// glance, over a game, and every glyph on it competes with the words. Of
+    /// the four, laughter is the one that changes how a line reads — "sure,
+    /// whatever" and "sure, whatever" with somebody laughing are two different
+    /// sentences — and music, applause and crying are trivia at 40 cm from an
+    /// eye.
+    ///
+    /// A `bool` and not the set, for the same reason: there is one glyph, and a
+    /// field that could hold four would invite a second.
+    pub laughed: bool,
 }
 
 /// `[assist] translation_display` — which of a translated row's two lines
@@ -401,6 +415,11 @@ impl Captions {
             who: who.to_owned(),
             text: seg["text"].as_str().unwrap_or("…").to_owned(),
             shaky: seg["asr_confidence"].as_str() == Some("shaky"),
+            // 0.12.4. The wire carries `events` as an array of the closed set;
+            // this surface asks it one question.
+            laughed: seg["events"]
+                .as_array()
+                .is_some_and(|es| es.iter().any(|e| e.as_str() == Some("laughter"))),
             lang: seg["lang"].as_str().map(str::to_owned),
             translation: seg["translation"]["text"].as_str().map(|text| {
                 (

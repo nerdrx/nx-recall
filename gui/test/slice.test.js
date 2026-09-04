@@ -1,4 +1,4 @@
-// Sliced turns (0.12.4), tested without a window.
+// Sliced turns (0.12.5), tested without a window.
 //
 // A slice is a `partial`'s twin on the wire and its opposite in meaning, and
 // every rule below is about the one word that separates them. A partial

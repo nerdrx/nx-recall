@@ -1279,6 +1279,8 @@ fn move_hint() -> Turn {
         icon: None,
         // Nor is anybody still saying it: the hint is a finished sentence.
         growing: false,
+        // …and nobody laughed.
+        laughed: false,
     }
 }
 

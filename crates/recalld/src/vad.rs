@@ -242,7 +242,7 @@ impl Segmenter {
     }
     // ---- 0.11.0, partial turns: end ----------------------------------------
 
-    // ---- 0.12.4, sliced turns: begin ---------------------------------------
+    // ---- 0.12.5, sliced turns: begin ---------------------------------------
     /// How long the current sub-threshold run is, in samples, or `None` when
     /// the segmenter is not in speech at all.
     ///
@@ -259,7 +259,7 @@ impl Segmenter {
         self.in_speech
             .then(|| self.cursor.saturating_sub(self.last_voiced_end))
     }
-    // ---- 0.12.4, sliced turns: end -----------------------------------------
+    // ---- 0.12.5, sliced turns: end -----------------------------------------
 
     /// Sample index below which buffered audio can never be needed again.
     pub fn retain_from(&self) -> u64 {

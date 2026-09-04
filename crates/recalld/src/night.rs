@@ -88,6 +88,7 @@ use crate::control::Control;
 use crate::lang::{self, Lang};
 use crate::models::{ConfidenceModel, NightModels};
 use crate::store::{RedecodeCandidate, Store, text_via};
+use crate::text_truth::{Cell, Rules, VoteRule};
 
 // ---------------------------------------------------------------------------
 // the clock
@@ -405,25 +406,52 @@ pub struct Readings<'a> {
 /// returns the text, as an annotation. That is a supported choice rather than a
 /// disabled feature: the reader is shown the second opinion and decides.
 pub fn judge_vote(r: &Readings<'_>, tau: f32, replace_allowed: bool) -> Vote {
+    judge_vote_ruled(r, tau, replace_allowed, VoteRule::TwoOfThree)
+}
+
+/// The same decision, under whichever rule this row's cell has learned
+/// (0.12.4, `crate::text_truth`).
+///
+/// [`VoteRule::TwoOfThree`] is [`judge_vote`] unchanged and is what every row
+/// gets until a measurement says otherwise. The other two rules exist because
+/// the shipped one is a *prior*, not a measurement of this install: it was
+/// fitted on 35 lab spans (FINDINGS §13), and a person who has corrected thirty
+/// turns of one voice on one kind of source has better evidence than that about
+/// those turns.
+///
+/// * [`VoteRule::NightWins`] drops the requirement for a second voter — and
+///   nothing else. Every guard still runs, because the guards are about
+///   §12's hallucinations and no amount of held-out WER makes a Swedish
+///   sentence an acceptable replacement for a German one.
+/// * [`VoteRule::KeepLive`] refuses the replacement outright; the reading is
+///   still stored beside the row, because it is still a second opinion the
+///   reader may want.
+pub fn judge_vote_ruled(r: &Readings<'_>, tau: f32, replace_allowed: bool, rule: VoteRule) -> Vote {
     let night = crate::arbiter::strip_captions(r.night);
     if crate::asr::normalise_words(&night).is_empty() {
         return Vote::Nothing;
     }
-    if !replace_allowed {
+    if !replace_allowed || rule == VoteRule::KeepLive {
         return Vote::Annotate { text: night };
     }
-    let Some(canary) = r
-        .canary
-        .filter(|c| !crate::asr::normalise_words(c).is_empty())
-    else {
-        // No cross-check reading: there is no second voter, so there is no
-        // majority, so there is nothing to replace anything with.
-        return Vote::Annotate { text: night };
-    };
-    let two_agree = agreement(&night, canary) >= tau
-        && agreement(&night, r.live) < tau
-        && agreement(canary, r.live) < tau;
-    if !two_agree {
+    if rule != VoteRule::NightWins {
+        let Some(canary) = r
+            .canary
+            .filter(|c| !crate::asr::normalise_words(c).is_empty())
+        else {
+            // No cross-check reading: there is no second voter, so there is no
+            // majority, so there is nothing to replace anything with.
+            return Vote::Annotate { text: night };
+        };
+        let two_agree = agreement(&night, canary) >= tau
+            && agreement(&night, r.live) < tau
+            && agreement(canary, r.live) < tau;
+        if !two_agree {
+            return Vote::Annotate { text: night };
+        }
+    } else if agreement(&night, r.live) >= tau {
+        // Even where the night decoder has earned the row, a reading that
+        // agrees with the words already there is not a replacement.
         return Vote::Annotate { text: night };
     }
     if !guards_pass(&night, r.row_lang, r.night_lang) {
@@ -747,14 +775,19 @@ pub fn night_batch(
     stats: &NightStats,
 ) -> Result<usize> {
     // ---- gather (lock held, no model) ----
-    let (candidates, langs): (Vec<RedecodeCandidate>, Vec<Option<String>>) = {
+    //
+    // The learned rules are read here with everything else, and once per batch
+    // rather than once per row: `recalld accuracy learn --apply` is a deliberate
+    // act at a keyboard, and a rule that lands mid-batch can wait for the next
+    // one.
+    let (candidates, langs, rules): (Vec<RedecodeCandidate>, Vec<Option<String>>, Rules) = {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
         let rows = guard.segments_for_night(cfg.max_rows_per_night)?;
         let mut langs = Vec::with_capacity(rows.len());
         for row in &rows {
             langs.push(guard.segment_lang_hint(row.id)?.0);
         }
-        (rows, langs)
+        (rows, langs, Rules::load(&guard))
     };
     if candidates.is_empty() {
         return Ok(0);
@@ -822,7 +855,17 @@ pub fn night_batch(
     let mut stamped = 0usize;
     for (i, (row, lang)) in kept.iter().enumerate() {
         let night = texts.get(i).map(String::as_str).unwrap_or("");
-        let vote = judge_vote(
+        // Which rule this row falls under (0.12.4). A row whose facets cannot
+        // be read — purged between the gather and the commit — gets the
+        // shipped rule, which is the conservative one.
+        let rule = {
+            let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+            guard
+                .segment_facets(row.id)?
+                .map(|f| rules.vote_for(&Cell::of(&f)))
+                .unwrap_or(VoteRule::TwoOfThree)
+        };
+        let vote = judge_vote_ruled(
             &Readings {
                 live: row.text.as_deref().unwrap_or(""),
                 canary: canary_texts.get(i).and_then(Option::as_deref),
@@ -832,6 +875,7 @@ pub fn night_batch(
             },
             crate::config::AsrConfig::default().confidence_tau,
             cfg.replace,
+            rule,
         );
         let changed = {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
@@ -1444,6 +1488,123 @@ mod tests {
             Some("de"),
         );
         assert_eq!(judge_vote(&r, 0.5, true), Vote::Nothing);
+    }
+
+    // ---- the learned vote rules (0.12.4) ----
+
+    #[test]
+    fn a_cell_that_earned_it_lets_the_night_reading_win_without_a_second_voter() {
+        // The same readings the two-of-three rule annotates — canary agrees
+        // with the LIVE text, so there is no majority — under a cell whose
+        // corrections say the night decoder is the one to believe.
+        let r = readings(
+            "das war ganz gut",
+            Some("das war ganz gut"),
+            "Das war völlig daneben leider.",
+            Some("de"),
+            Some("de"),
+        );
+        assert!(
+            matches!(
+                judge_vote_ruled(&r, 0.5, true, VoteRule::TwoOfThree),
+                Vote::Annotate { .. }
+            ),
+            "the shipped rule still needs the second voter"
+        );
+        assert_eq!(
+            judge_vote_ruled(&r, 0.5, true, VoteRule::NightWins),
+            Vote::Replace {
+                text: "Das war völlig daneben leider.".into()
+            }
+        );
+    }
+
+    #[test]
+    fn night_wins_does_not_switch_off_a_single_guard() {
+        // FINDINGS §12's hallucinations, under the most permissive rule the
+        // learner can reach. A cell cannot buy its way past the language guard.
+        for hallucination in [
+            "شكرا لمشاهدتكم",
+            "Kiitos kun katsoitte",
+            "Tack för att ni tittade",
+        ] {
+            let r = readings("ähm ja also", None, hallucination, Some("de"), Some("de"));
+            assert!(
+                matches!(
+                    judge_vote_ruled(&r, 0.5, true, VoteRule::NightWins),
+                    Vote::Annotate { .. }
+                ),
+                "{hallucination} won under night_wins"
+            );
+        }
+        // …and the one-word floor, and the row with no language of its own.
+        let r = readings("was hast du gesagt", None, "Ja.", Some("de"), Some("de"));
+        assert!(matches!(
+            judge_vote_ruled(&r, 0.5, true, VoteRule::NightWins),
+            Vote::Annotate { .. }
+        ));
+        let r = readings("mhm ok", None, "Mhm okay dann.", None, None);
+        assert!(matches!(
+            judge_vote_ruled(&r, 0.5, true, VoteRule::NightWins),
+            Vote::Annotate { .. }
+        ));
+    }
+
+    #[test]
+    fn night_wins_still_does_not_replace_words_it_agrees_with() {
+        let r = readings(
+            "ich sage dir keins",
+            None,
+            "Ich sage dir keins.",
+            Some("de"),
+            Some("de"),
+        );
+        assert!(matches!(
+            judge_vote_ruled(&r, 0.5, true, VoteRule::NightWins),
+            Vote::Annotate { .. }
+        ));
+    }
+
+    #[test]
+    fn keep_live_refuses_a_replacement_the_shipped_rule_would_have_allowed() {
+        let r = readings(
+            "komm ich sag the country",
+            Some("ich sage dir keins"),
+            "Ich sage dir keins.",
+            Some("de"),
+            Some("de"),
+        );
+        assert_eq!(
+            judge_vote_ruled(&r, 0.5, true, VoteRule::TwoOfThree),
+            Vote::Replace {
+                text: "Ich sage dir keins.".into()
+            }
+        );
+        assert_eq!(
+            judge_vote_ruled(&r, 0.5, true, VoteRule::KeepLive),
+            Vote::Annotate {
+                text: "Ich sage dir keins.".into()
+            },
+            "the reading is still kept beside the row"
+        );
+    }
+
+    #[test]
+    fn an_empty_reading_is_nothing_under_every_rule() {
+        for rule in [
+            VoteRule::TwoOfThree,
+            VoteRule::NightWins,
+            VoteRule::KeepLive,
+        ] {
+            let r = readings(
+                "etwas gesagt",
+                Some("etwas anderes"),
+                "  ",
+                Some("de"),
+                Some("de"),
+            );
+            assert_eq!(judge_vote_ruled(&r, 0.5, true, rule), Vote::Nothing);
+        }
     }
 
     #[test]

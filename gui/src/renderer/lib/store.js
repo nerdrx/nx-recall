@@ -116,6 +116,15 @@ export const store = {
     translate_to: '',
     read_languages: ['de', 'en'],
     translation_display: 'main',
+    /**
+     * How a mood or an event shows on a transcript row (0.12.4).
+     *
+     * `tags` (the default), `tint`, `both` or `off`. Every one of the four
+     * ACTS — see moodTags() / moodTint() below, which are the only two readers
+     * and are what the transcript, the search hits and the tests all go
+     * through. A setting that is read and ignored is not a setting.
+     */
+    mood_display: 'tags',
     /** `[{code, name}]`, from the daemon: the selector is built out of what it accepts. */
     languages: [],
   },
@@ -545,6 +554,7 @@ export function applyAssist(d) {
   if (d.translation_display === 'main' || d.translation_display === 'under') {
     next.translation_display = d.translation_display;
   }
+  if (MOOD_MODES.includes(d.mood_display)) next.mood_display = d.mood_display;
   if (Array.isArray(d.languages) && d.languages.length) next.languages = [...d.languages];
   store.assist = next;
   return store.assist;
@@ -559,6 +569,72 @@ export function applyAssist(d) {
  */
 export function translationLeads() {
   return store.assist.translation_display !== 'under';
+}
+
+// ---- 0.12.4, how a turn sounded --------------------------------------------
+
+/** The four states of `mood_display`, in the order the card offers them. */
+export const MOOD_MODES = ['tags', 'tint', 'both', 'off'];
+
+/** The mode, with anything unreadable folded onto the shipped default. */
+function moodMode() {
+  const m = store.assist.mood_display;
+  return MOOD_MODES.includes(m) ? m : 'tags';
+}
+
+/**
+ * Is anything about how a turn sounded drawn at all?
+ *
+ * The one thing `off` turns off, and — this is the part worth spelling out —
+ * the gate the EVENTS sit behind rather than moodTags().
+ *
+ * A mood can be a chip or a colour; an event can only ever be a chip, because
+ * there is no such thing as the colour of laughter. So `tint` means "show the
+ * mood as a colour instead of as a chip", not "show no chips": laughter and
+ * music keep theirs, and the mode does something on this daemon rather than
+ * being a no-op that waits for a measurement to come out.
+ */
+export function moodShown() {
+  return moodMode() !== 'off';
+}
+
+/**
+ * Does the MOOD wear a chip?
+ *
+ * One function, like translationLeads(), so the transcript, the search hits
+ * and the tests cannot disagree about what an unset or unknown value means —
+ * and it means the shipped default, `tags`.
+ */
+export function moodTags() {
+  const m = moodMode();
+  return m === 'tags' || m === 'both';
+}
+
+/** …and does the row's TEXT take the mood's colour? */
+export function moodTint() {
+  const m = moodMode();
+  return m === 'tint' || m === 'both';
+}
+
+/**
+ * May the MOOD half be drawn at all?
+ *
+ * Not a setting — a measurement, reported by the daemon on `status.mood`
+ * (`crate::mood::MOOD_IS_MEASURED`, FINDINGS §42). Laughter and music are
+ * never gated by it: they were measured separately and they passed.
+ *
+ * Defaults to FALSE against a daemon too old to say, which is the safe
+ * direction: the failure mode of guessing `true` is a transcript that tells
+ * somebody how their friend felt on evidence nobody checked.
+ */
+export function moodRendered() {
+  return store.status?.mood?.rendered === true;
+}
+
+/** The daemon's sentence for why the mood is not shown, or ''. */
+export function moodWhy() {
+  const why = store.status?.mood?.why;
+  return typeof why === 'string' ? why : '';
 }
 
 /**
@@ -968,7 +1044,7 @@ function noteUnknownSpeaker(id, onDone) {
 export const PARTIAL_STALE_MS = 6000;
 
 /**
- * The same rule for a GROWING row (0.12.4, sliced turns).
+ * The same rule for a GROWING row (0.12.5, sliced turns).
  *
  * A slice is not offered on a cadence — it is offered when the person pauses,
  * at least `[captions] slice_after_s` apart — so six seconds of quiet is the
@@ -994,7 +1070,7 @@ export function livePartial(now = Date.now()) {
   const p = store.partial;
   if (!p) return null;
   if (store.paused || store.conn.status !== 'connected') return null;
-  // 0.12.4: a growing row is allowed to sit for much longer than a partial,
+  // 0.12.5: a growing row is allowed to sit for much longer than a partial,
   // because the gap between two slices is a person not pausing rather than the
   // daemon having gone away. See `SLICE_STALE_MS`.
   if (now - p.at > (p.growing ? SLICE_STALE_MS : PARTIAL_STALE_MS)) return null;
@@ -1109,7 +1185,7 @@ export function applyEvent(evt, opts = {}) {
     }
     // ---- end 0.11.0 -------------------------------------------------------
 
-    // ---- 0.12.4, sliced turns ---------------------------------------------
+    // ---- 0.12.5, sliced turns ---------------------------------------------
     // Words for a turn that is still being said, and — unlike a partial —
     // words that are KEPT: they are already on their way to the row that lands
     // when the turn ends. It goes in exactly the same slot for exactly the same
@@ -1147,7 +1223,7 @@ export function applyEvent(evt, opts = {}) {
       noteUnknownSpeaker(store.partial.speaker, opts.onSpeakersChanged);
       return { partial: true };
     }
-    // ---- end 0.12.4 -------------------------------------------------------
+    // ---- end 0.12.5 -------------------------------------------------------
 
     case 'purge': {
       const ids = Array.isArray(d?.ids) ? d.ids : [];

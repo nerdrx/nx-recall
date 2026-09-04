@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::arbiter::{Arbiters, Arbitration};
-use crate::asr::{Asr, normalise_words};
+use crate::asr::normalise_words;
 use crate::config::{IdentityConfig, LangConfig, SAMPLE_RATE, TruthConfig};
 use crate::embed::{Embedder, Embedding};
 use crate::identity::{self, Decision, Refusal};
@@ -160,23 +160,6 @@ pub enum Gate {
     SingleSpeaker,
 }
 
-/// Where a turn's words come from (0.12.4, `crate::slice`).
-///
-/// Two answers and not a bare `Option<&str>`, because the absent case is not
-/// "no words" — it is "read them", which is the single most expensive thing
-/// this daemon does and must be spelled out at every call site rather than
-/// implied by a `None`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Words<'a> {
-    /// Run the recogniser over this audio. What every turn did before 0.12.4
-    /// and what every unsliced turn still does.
-    Decode,
-    /// Already read, slice by slice, while the turn was still being spoken.
-    /// The audio is still handed in — the overlap detector and the embedder
-    /// both need it — but the recogniser is not run over it again.
-    Joined(&'a str),
-}
-
 /// `goldens/<speaker>/golden-<segment>.wav`, relative to the data dir.
 ///
 /// Deliberately **not** under `segments/`: the retention sweeper walks that
@@ -210,7 +193,9 @@ pub enum LanguageFix {
 
 pub struct Analyzer {
     overlap: OverlapDetector,
-    asr: Asr,
+    /// One transducer, behind whichever binding `[identity].split_turns` asked
+    /// for at load (0.12.4). See [`crate::asr::Decoder`].
+    asr: crate::asr::Decoder,
     embedder: Embedder,
     cfg: IdentityConfig,
     /// The conversational language prior's thresholds and the arbiter's
@@ -255,7 +240,7 @@ impl Analyzer {
         }
         Ok(Self {
             overlap: OverlapDetector::load(&models.segmentation)?,
-            asr: Asr::load(models)?,
+            asr: crate::asr::Decoder::load(models, cfg.split_turns)?,
             embedder: Embedder::load(models)?,
             cfg: cfg.clone(),
             lang_cfg: LangConfig::default(),
@@ -332,6 +317,12 @@ impl Analyzer {
         self.arbiters.installed()
     }
 
+    /// The operating point this analyzer was loaded with. The archive resplit
+    /// reads it to say whether a turn was too short to cut or merely unchanged.
+    pub fn identity_config(&self) -> &IdentityConfig {
+        &self.cfg
+    }
+
     pub fn embed_model_id(&self) -> &str {
         self.embedder.model_id()
     }
@@ -350,7 +341,7 @@ impl Analyzer {
     }
     // ---- 0.11.0, partial turns: end ----------------------------------------
 
-    // ---- 0.12.4, sliced turns: begin ---------------------------------------
+    // ---- 0.12.5, sliced turns: begin ---------------------------------------
     /// Decode ONE SLICE of an open turn, or the remainder after the last slice
     /// (`crate::slice`).
     ///
@@ -360,7 +351,7 @@ impl Analyzer {
     /// away by the next partial and paid for again; a slice reads its own audio
     /// and nobody else's, exactly once, and the words it produces are the words
     /// that go on the row. That is the difference between O(N²) and O(N) over a
-    /// turn, and it is why this feature is on and partials are not.
+    /// turn, and it is the whole claim this feature makes about its cost.
     ///
     /// The caller is responsible for the boundary being one the VAD scored as
     /// not-speech. Handing this half a word is not a worse reading of that
@@ -368,12 +359,70 @@ impl Analyzer {
     pub fn transcribe_slice(&mut self, samples: &[f32]) -> String {
         self.asr.transcribe(samples)
     }
-    // ---- 0.12.4, sliced turns: end -----------------------------------------
+    // ---- 0.12.5, sliced turns: end -----------------------------------------
 
     /// All the inference for one turn. Touches no database.
     pub fn prepare(&mut self, samples: &[f32]) -> Result<Prepared> {
         self.prepare_with(samples, Gate::Full)
     }
+
+    // ---- 0.12.4, cutting a turn where the speaker changes ------------------
+
+    /// Where this turn should be cut, and what was said in each piece.
+    ///
+    /// **Only called when `[identity].split_turns` is on.** With the switch off
+    /// the pipeline never reaches here and decodes exactly where it always did,
+    /// so an install that has not asked for this feature does not pay a
+    /// reordering for it either.
+    ///
+    /// On, it costs one ERes2Net pass per hop, plus moving the turn's decode
+    /// ahead of the row insert. That is what the switch buys its recall with,
+    /// and the reason it is measured in FINDINGS §39 rather than assumed.
+    pub fn plan_split(&mut self, samples: &[f32]) -> Result<crate::turnsplit::Plan> {
+        let (whole, words) = self.asr.transcribe_timed(samples);
+        let shape = crate::turnsplit::Shape::from_config(&self.cfg, SAMPLE_RATE);
+        let cuts = if self.cfg.split_turns && shape.cuttable(samples.len()) {
+            let windows = shape.windows_of(samples.len());
+            let mut vectors = Vec::with_capacity(windows.len());
+            for w in &windows {
+                vectors.push(self.embedder.embed(&samples[w.from..w.to], SAMPLE_RATE)?);
+            }
+            let curve = crate::turnsplit::curve(&shape, &windows, &vectors)?;
+            crate::turnsplit::cuts(&shape, samples.len(), &curve)
+        } else {
+            Vec::new()
+        };
+        // Not a special case for its own sake: an uncut turn keeps the
+        // decoder's own string, punctuation and all, rather than one rebuilt
+        // from the word list.
+        let uncut = |wordless| crate::turnsplit::Plan {
+            pieces: vec![(
+                crate::turnsplit::Piece {
+                    from: 0,
+                    to: samples.len(),
+                },
+                whole.clone(),
+            )],
+            wordless,
+        };
+        let pieces = crate::turnsplit::pieces(samples.len(), &cuts);
+        if pieces.len() == 1 {
+            return Ok(uncut(false));
+        }
+        let split: Vec<(crate::turnsplit::Piece, String)> =
+            crate::turnsplit::spans(&pieces, SAMPLE_RATE)
+                .into_iter()
+                .map(|(p, from, to)| (p, crate::asr::words_in_span(&words, from, to)))
+                .collect();
+        if !crate::turnsplit::every_piece_speaks(&split) {
+            return Ok(uncut(true));
+        }
+        Ok(crate::turnsplit::Plan {
+            pieces: split,
+            wordless: false,
+        })
+    }
+    // ---- end 0.12.4 --------------------------------------------------------
 
     /// [`Self::prepare`], with a say in which gate the embedding is behind.
     ///
@@ -383,34 +432,53 @@ impl Analyzer {
     /// [`Gate::SingleSpeaker`] changes is only whether a positive reading is
     /// allowed to throw the embedding away.
     pub fn prepare_with(&mut self, samples: &[f32], gate: Gate) -> Result<Prepared> {
-        self.prepare_words(samples, gate, Words::Decode)
+        self.prepare_maybe_said(samples, gate, None)
     }
 
-    /// [`Self::prepare_with`], for a turn whose words have already been read.
-    ///
-    /// The one caller is a turn that was SLICED (0.12.4, `crate::slice`): its
-    /// audio was decoded piece by piece while the person was still speaking,
-    /// and decoding it again here would spend the turn's whole cost twice and
-    /// throw away the reading that is already on somebody's screen.
-    ///
-    /// Everything else is identical, deliberately. The overlap detector still
-    /// runs, the gate still decides, and the embedding is still taken over the
-    /// WHOLE turn — which is the reason the pieces are joined into one row
-    /// rather than left as several: a voice is identified from a turn, and six
-    /// embeddings of six fragments are six weaker claims about the same person.
-    pub fn prepare_words(
+    /// [`Self::prepare_with`], decoding the audio unless the words are already
+    /// in hand. `None` is the path every caller took before 0.12.4 and takes
+    /// still while `[identity].split_turns` is off — same call, same cost, same
+    /// order.
+    pub fn prepare_maybe_said(
         &mut self,
         samples: &[f32],
         gate: Gate,
-        words: Words<'_>,
+        said: Option<String>,
     ) -> Result<Prepared> {
+        let raw = match said {
+            Some(text) => text,
+            None => self.asr.transcribe(samples),
+        };
+        self.prepare_said(samples, gate, raw)
+    }
+
+    /// [`Self::prepare_with`] for audio whose words are already known.
+    ///
+    /// Two callers, and they arrive from opposite directions.
+    ///
+    /// A piece of a CUT turn (0.12.4, `[identity].split_turns`): the whole turn
+    /// was decoded once, with times, and this piece's words are the ones that
+    /// *start* inside it ([`crate::asr::words_in_span`]). Handing them in
+    /// rather than decoding the piece is what makes the split lossless — every
+    /// word of the turn belongs to exactly one piece by construction, where two
+    /// independent decodes could drop a word straddling the cut or spell it
+    /// twice — and it is also the cheaper of the two, one decode instead of N.
+    ///
+    /// A SLICED turn (0.12.5, `crate::slice`): the opposite arrangement, and
+    /// the same saving. Its audio was decoded piece by piece while the person
+    /// was still speaking and the pieces joined, so decoding it again here
+    /// would spend the turn's whole cost twice and throw away the reading that
+    /// is already on somebody's screen.
+    ///
+    /// Either way the rest is identical, deliberately: the overlap detector
+    /// still runs, the gate still decides, and the embedding is still taken
+    /// over the WHOLE audio handed in — which is why a sliced turn is joined
+    /// into one row rather than left as several, since six embeddings of six
+    /// fragments are six weaker claims about the same person.
+    pub fn prepare_said(&mut self, samples: &[f32], gate: Gate, raw: String) -> Result<Prepared> {
         let duration_s = samples.len() as f32 / SAMPLE_RATE as f32;
         let overlap_frac = self.overlap.overlap_frac(samples)?;
 
-        let raw = match words {
-            Words::Decode => self.asr.transcribe(samples),
-            Words::Joined(text) => text.to_string(),
-        };
         // An empty transcript is stored as NULL rather than "": it keeps the
         // full-text index free of empty documents and makes "has a transcript"
         // a single IS NOT NULL.
@@ -1421,10 +1489,10 @@ pub fn analyse_or_log(
     stats: &AnalysisStats,
     segment_id: i64,
     samples: &[f32],
-    words: Words<'_>,
+    said: Option<String>,
     now_utc_ns: i64,
 ) -> Vec<i64> {
-    let prepared = match analyzer.prepare_words(samples, Gate::Full, words) {
+    let prepared = match analyzer.prepare_maybe_said(samples, Gate::Full, said) {
         Ok(p) => p,
         Err(e) => {
             warn!(segment_id, "analysis failed: {e:#}");
@@ -1461,10 +1529,10 @@ pub fn analyse_mic_or_log(
     segment_id: i64,
     samples: &[f32],
     mic: &MicEnroll<'_>,
-    words: Words<'_>,
+    said: Option<String>,
     now_utc_ns: i64,
 ) -> Vec<i64> {
-    let prepared = match analyzer.prepare_words(samples, Gate::Full, words) {
+    let prepared = match analyzer.prepare_maybe_said(samples, Gate::Full, said) {
         Ok(p) => p,
         Err(e) => {
             warn!(segment_id, "analysis failed: {e:#}");
@@ -1504,10 +1572,10 @@ pub fn analyse_pinned_or_log(
     segment_id: i64,
     samples: &[f32],
     pin: &PinnedLeg<'_>,
-    words: Words<'_>,
+    said: Option<String>,
     now_utc_ns: i64,
 ) -> Vec<i64> {
-    let prepared = match analyzer.prepare_words(samples, Gate::SingleSpeaker, words) {
+    let prepared = match analyzer.prepare_maybe_said(samples, Gate::SingleSpeaker, said) {
         Ok(p) => p,
         Err(e) => {
             warn!(segment_id, "analysis failed: {e:#}");

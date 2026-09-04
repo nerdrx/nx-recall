@@ -156,7 +156,7 @@
 .cap-row.provisional .cap-text {
   color: #a9a4bb;
 }
-/* 0.12.4 — a GROWING row (a sliced turn) is not a guess: its words were decoded
+/* 0.12.5 — a GROWING row (a sliced turn) is not a guess: its words were decoded
    from their own audio at a VAD boundary and will not be taken back, so they
    are drawn in settled ink. Only the "…" remains, saying the one thing that is
    still true — the sentence has not finished. */

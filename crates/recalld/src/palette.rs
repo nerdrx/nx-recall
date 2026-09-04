@@ -71,6 +71,70 @@ pub const PALETTE: &[Accent] = &[
     Accent { token: "magenta", hue: 312, hex: "#b83bc4" },
 ];
 
+// ---------------------------------------------------------------------------
+// the mood palette (0.12.4)
+// ---------------------------------------------------------------------------
+
+/// The colours a row's **words** may be tinted by, when the mood pass has an
+/// opinion about how a turn sounded (`crate::mood`).
+///
+/// # Why it is here and not in `mood.rs`
+///
+/// Because it is a palette, and this file is where the rule about palettes
+/// lives: a stored colour is a token, never a hex, so the same mark is legible
+/// on both of NX Clear's grounds and in a headset overlay that has no CSS.
+/// Everything the module note above says applies here unchanged.
+///
+/// # Three hues, and they are three of the ten
+///
+/// `amber`, `indigo` and `rose` — the same hues [`PALETTE`] already spends, so
+/// the whole suite turns one wheel rather than two. What differs is the
+/// *saturation and lightness*: a highlight paints a NAME at `--sp-s`/`--sp-l`
+/// (72%/28% light, 72%/74% dark) and a mood paints a SENTENCE, which is a
+/// paragraph of body text and cannot wear a 72% accent. So the GUI spends
+/// `--mood-s`/`--mood-l` instead — 46%/30% light, 46%/79% dark — measured
+/// against every ground a transcript row is painted on (bg, surface, tile and
+/// the accent wash a selected row wears): worst case **5.61:1 on the light
+/// ground and 8.41:1 on the dark one**, both clear of WCAG AA. See
+/// `gui/src/renderer/tokens.css`.
+///
+/// # Why `neutral` is not in the list
+///
+/// It is a mood — [`crate::mood::Mood::Neutral`] is stored, and the chip says
+/// it — but it has no colour, on purpose. Neutral is what a transcript already
+/// looks like, and the overwhelming majority of rows are neutral or unread; a
+/// palette entry for it would repaint the whole archive to say nothing. Lookup
+/// returns `None` and the caller falls through to the ordinary ink, which is
+/// the same rule an unknown token already follows.
+///
+/// Mirrored in `gui/src/renderer/lib/palette.js`, and checked against this file
+/// by `gui/test/palette.test.js` exactly as [`PALETTE`] is. The overlay has no
+/// copy: it renders one event glyph and never tints (see `docs/OVERLAY.md`).
+#[rustfmt::skip]
+pub const MOOD_PALETTE: &[Accent] = &[
+    Accent { token: "happy", hue: 44, hex: "#705d29" },
+    Accent { token: "sad", hue: 232, hex: "#293370" },
+    Accent { token: "angry", hue: 350, hex: "#702935" },
+];
+
+/// The tint for a mood, or `None` — for `neutral`, and for a mood a newer
+/// daemon named that this build cannot paint.
+pub fn mood_accent(token: &str) -> Option<&'static Accent> {
+    MOOD_PALETTE.iter().find(|a| a.token == token)
+}
+
+/// The mood palette as the wire carries it, on the `palette` block of `status`
+/// beside the person one. A client draws a legend from this rather than from a
+/// copy it invented.
+pub fn mood_wire() -> Value {
+    json!(
+        MOOD_PALETTE
+            .iter()
+            .map(|a| json!({"token": a.token, "hue": a.hue, "hex": a.hex}))
+            .collect::<Vec<_>>()
+    )
+}
+
 /// The entry for a token, or `None` if this build has never heard of it.
 pub fn accent(token: &str) -> Option<&'static Accent> {
     PALETTE.iter().find(|a| a.token == token)
@@ -261,6 +325,43 @@ mod tests {
             assert!(a.hue < 360, "{} is not a hue", a.token);
             assert_eq!(a.hex.len(), 7, "{} needs a #rrggbb swatch", a.token);
         }
+    }
+
+    #[test]
+    fn the_mood_palette_is_three_of_the_ten_and_neutral_is_not_one_of_them() {
+        assert_eq!(MOOD_PALETTE.len(), 3);
+        // Three of the ten, not three new hues: the suite turns one wheel.
+        for m in MOOD_PALETTE {
+            assert!(
+                PALETTE.iter().any(|a| a.hue == m.hue),
+                "{} is a hue the person palette does not have",
+                m.token
+            );
+        }
+        // Every mood in the vocabulary has a palette entry or a stated reason
+        // not to, and `neutral` is the reason: it is what a transcript already
+        // looks like.
+        assert!(mood_accent("happy").is_some());
+        assert!(mood_accent("sad").is_some());
+        assert!(mood_accent("angry").is_some());
+        assert_eq!(mood_accent("neutral"), None);
+        assert_eq!(mood_accent("ecstatic"), None);
+        // Far enough apart to be told apart in a wall of text.
+        let mut hues: Vec<u16> = MOOD_PALETTE.iter().map(|a| a.hue).collect();
+        hues.sort_unstable();
+        for pair in hues.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= 20,
+                "{} and {} collide",
+                pair[0],
+                pair[1]
+            );
+        }
+        let v = mood_wire();
+        let rows = v.as_array().expect("an array");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["token"], "happy");
+        assert_eq!(rows[0]["hue"], 44);
     }
 
     #[test]

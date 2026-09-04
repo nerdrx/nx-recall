@@ -252,6 +252,10 @@ pub fn summary(store: &Store) -> Result<Value> {
         // of zero and must not be rendered as one.
         "since_ns": since.map(|ns| ns.to_string()),
         "since_ms": since.map(ns_to_ms),
+        // 0.12.4: what those same corrections have taught the daemon about
+        // which decoder to believe. Additive; a client that has never heard of
+        // it ignores it. See `crate::text_truth`.
+        "learned": crate::text_truth::summary_json(store)?,
     }))
 }
 

@@ -41,6 +41,7 @@ pub mod clock;
 pub mod commitment;
 pub mod config;
 pub mod control;
+pub mod device;
 pub mod digest;
 pub mod embed;
 pub mod enrich;
@@ -63,6 +64,11 @@ pub mod langctx;
 pub mod lid;
 pub mod llm;
 pub mod models;
+/// 0.12.4: how a turn sounded — SenseVoice's own emotion and event tags,
+/// read off the stored clips by a background pass. See `docs/PROTOCOL.md`
+/// and `spike/FINDINGS.md` §42 for what of it is measured and what is only
+/// stored.
+pub mod mood;
 pub mod night;
 pub mod nllb;
 pub mod notes;
@@ -87,7 +93,7 @@ pub mod roster;
 pub mod semantic;
 pub mod server;
 pub mod service;
-/// Sliced turns (0.12.4): a long turn reaches the glass in pieces.
+/// Sliced turns (0.12.5): a long turn reaches the glass in pieces.
 pub mod slice;
 pub mod split;
 pub mod store;
@@ -96,6 +102,10 @@ pub mod store;
 /// there was one.
 pub mod sweep;
 // ---- end 0.12.0 ----------------------------------------------------------
+// ---- 0.12.4: every correction is word-level ground truth ------------------
+/// The `text_truth` table and the decoder-choice rules fitted to it.
+pub mod text_truth;
+// ---- end 0.12.4 -----------------------------------------------------------
 pub mod threads;
 pub mod timeref;
 pub mod translate;
@@ -109,6 +119,10 @@ pub mod truthnet;
 pub mod unroute;
 // ---- end 0.12.0 ---------------------------------------------------------
 pub mod turns;
+// ---- 0.12.4: cutting a turn where the speaker changes ---------------------
+/// Where inside one turn the person talking changes (0.12.4, FINDINGS §39).
+pub mod turnsplit;
+// ---- end 0.12.4 -----------------------------------------------------------
 // ---- 0.10.0, worlds and turn-taking --------------------------------------
 /// Turn-taking statistics: how a person talks (0.10.0).
 pub mod turntaking;

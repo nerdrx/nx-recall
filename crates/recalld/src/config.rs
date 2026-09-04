@@ -355,6 +355,51 @@ pub struct IdentityConfig {
     /// `--reset` puts every voice back on the globals.
     pub learn: bool,
     // ---- end 0.11.0 -------------------------------------------------------
+
+    // ---- 0.12.4: cutting a turn where the speaker changes -----------------
+    /// May a turn be cut into two rows where the person talking changes
+    /// (`crate::turnsplit`)?
+    ///
+    /// **Off by default, and that is the measurement rather than caution.**
+    /// A turn ends at silence, so a fast exchange is one row with one label,
+    /// and Discord's own spans say how often: 409 of this install's 515
+    /// `overlap` turns contain a speaker change. The detector below finds
+    /// **41.7%** of the reachable ones within ±0.5 s at 67.9% precision and
+    /// splits 0.87% of turns Discord says are one person — which clears the
+    /// false-split bar and misses the recall bar it was given (≥50%), so it
+    /// ships off with the numbers written down (FINDINGS §39).
+    ///
+    /// What it costs when it is on: one ERes2Net pass per 0.25 s of every
+    /// turn — about 4× the identity leg's inference — and the ASR decoded
+    /// through the timestamped binding so a piece's words can be taken by
+    /// time. That is one decoder, not two: `crate::asr::TimedAsr` replaces
+    /// `Asr` when this is on rather than joining it.
+    pub split_turns: bool,
+    /// Length of each comparison window, in seconds. 1.5 measured: 1.0
+    /// halves the precision at the same false-split rate, because two
+    /// one-second windows of the *same* person already sit 0.62 apart in this
+    /// space (FINDINGS §32's same-speaker mean cosine of 0.377).
+    pub split_turn_window_s: f32,
+    /// Distance between window starts. The resolution of the answer: a cut
+    /// can only land on this grid, which is why the tolerance the detector is
+    /// scored at is ±0.3 s and ±0.5 s and not ±0.05 s.
+    pub split_turn_hop_s: f32,
+    /// No piece shorter than this. Defaults to `min_duration_s`: a piece
+    /// exists to be labelled, and a piece the ladder must refuse is a row
+    /// with no speaker where there used to be one.
+    pub split_turn_min_piece_s: f32,
+    /// `1 - cos` a boundary must reach to be a cut. **Not a similarity and
+    /// not comparable to `label_threshold`**: it is the distance between two
+    /// adjacent windows of the same recording, and on this audio same-speaker
+    /// pairs already score around 0.6. 0.85 is the point where the false-split
+    /// rate on `single` turns crosses under 1%.
+    pub split_turn_distance: f32,
+    /// At most this many cuts in one turn. Three measured: recall is still
+    /// rising at three (33.2% → 41.7% at ±0.5 s from one) and the false-split
+    /// rate does not move, because the extra cuts land in turns already being
+    /// cut.
+    pub split_turn_max_cuts: usize,
+    // ---- end 0.12.4 -------------------------------------------------------
 }
 
 impl Default for IdentityConfig {
@@ -381,6 +426,13 @@ impl Default for IdentityConfig {
             presence_hard: true,
             vrchat_sources: vec!["vrchat".into()],
             learn: true,
+            // ---- 0.12.4 ----------------------------------------------
+            split_turns: false,
+            split_turn_window_s: 1.5,
+            split_turn_hop_s: 0.25,
+            split_turn_min_piece_s: 1.0,
+            split_turn_distance: 0.85,
+            split_turn_max_cuts: 3,
         }
     }
 }
@@ -900,7 +952,7 @@ impl Default for AsrConfig {
     }
 }
 
-// ---- sliced turns (0.12.4) -----------------------------------------------
+// ---- sliced turns (0.12.5) -----------------------------------------------
 
 /// How a long turn reaches the glass before it is over (`crate::slice`).
 ///
@@ -925,16 +977,16 @@ impl Default for AsrConfig {
 /// The price is paid in words, not cycles: a slice is decoded without the
 /// context of the rest of the turn. That is why the cut is only ever made at a
 /// **dip the VAD already found** — never mid-word — and why the joined text is
-/// measured against the whole-turn decode before this ships (FINDINGS §39).
+/// measured against the whole-turn decode before this ships (FINDINGS §41).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptionsConfig {
     /// Slice a turn once it has been running this many seconds, or `0` to never
-    /// slice — which is exactly the behaviour of every version before 0.12.4,
-    /// and which is the default. See [`CaptionsConfig`] and FINDINGS §39 for
+    /// slice — which is exactly the behaviour of every version before 0.12.5,
+    /// and which is the default. See [`CaptionsConfig`] and FINDINGS §41 for
     /// why the measurement did not justify turning it on.
     ///
-    /// `6.0` is the value the numbers in §39 were taken at, and the one to try
+    /// `6.0` is the value the numbers in §41 were taken at, and the one to try
     /// first. Longer floors disagree with the whole-turn decode less and slice
     /// fewer turns: 8 s → 16.2%, 10 s → 14.4%, 12 s → 9.5%.
     ///
@@ -947,7 +999,7 @@ pub struct CaptionsConfig {
 impl Default for CaptionsConfig {
     fn default() -> Self {
         Self {
-            // OFF, and the reason is measured (FINDINGS §39).
+            // OFF, and the reason is measured (FINDINGS §41).
             //
             // The CPU gate passed with room to spare: **+2.2%** against a +10%
             // ceiling, because a turn's audio is decoded once whether it was
@@ -973,7 +1025,7 @@ impl Default for CaptionsConfig {
             //
             // So the mechanism ships complete and switched off, for a machine
             // whose owner would rather have the caption. What would change the
-            // answer is written down in §39: hand-transcribed long turns to say
+            // answer is written down in §41: hand-transcribed long turns to say
             // which reading is actually better, or the CPU budget to re-decode
             // the whole turn at close and keep the slices as captions only
             // (~+15%, measured).
@@ -1075,6 +1127,67 @@ impl Default for NightConfig {
     }
 }
 
+// ---- 0.12.4, the mood pass ------------------------------------------------
+
+/// How a turn sounded (`crate::mood`): laughter, music, and an emotion tag the
+/// daemon stores and does not render.
+///
+/// **Off by default**, like every optional background pass. Unlike the night
+/// shift it needs no GPU, no local compile and no gigabyte download — the model
+/// is SenseVoice, which 0.11.6 already catalogued for Korean and Chinese
+/// (`models fetch --cjk`, 239 MB) — so switching it on is a real choice rather
+/// than an aspiration, and the shipped default is still `false` because
+/// listening to somebody's whole archive is not something to start unasked.
+///
+/// It borrows `[night].window` and `[night].also_when_idle_min` for its clock
+/// rather than growing its own pair. That is the same borrow `[asr].lang_sweep`
+/// makes, and for the same reason: "the hours this machine is nobody's" is one
+/// fact about a household, not one per background job, and two copies of it
+/// would eventually disagree.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MoodConfig {
+    /// Run the pass at all.
+    pub enabled: bool,
+    /// The most rows one opening of the gate will listen to. A ceiling on a
+    /// background job that would otherwise walk the entire history the first
+    /// time it is switched on — though at RTF 0.08 (FINDINGS §42) the entire
+    /// history is a matter of minutes, so this is a politeness rather than a
+    /// protection.
+    pub rows_per_run: usize,
+    /// Rows fetched from the store per query. Not a decode batch — every clip
+    /// is decoded on its own, because SenseVoice's tags are *per clip* and
+    /// concatenating eight turns would ask which of them the laughter was on.
+    /// That is the one thing the night shift's batching cannot be copied for.
+    pub batch_rows: usize,
+    /// Clips shorter than this are not listened to. **One second.** An emotion
+    /// head given a 300 ms back-channel is guessing, and the queue is long
+    /// enough without the rows nothing could be said about.
+    pub min_duration_s: f32,
+    /// Read the tags on the way in, on the live path, as well as overnight.
+    ///
+    /// **False, and it is not merely a default.** Measured before it was
+    /// offered (FINDINGS §42): SenseVoice-small int8 costs RTF 0.08 on four
+    /// niced cores, which is small in a background pass and is a second decoder
+    /// on the capture path — where the budget is already spent on the primary
+    /// ASR and where the rule is that analysis never wins against a VR frame.
+    /// A live mood chip is worth less than a dropped turn, and the overnight
+    /// pass reaches the same row within a day.
+    pub live: bool,
+}
+
+impl Default for MoodConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rows_per_run: 2000,
+            batch_rows: 64,
+            min_duration_s: 1.0,
+            live: false,
+        }
+    }
+}
+
 // ---- 0.9.0, the assistant -------------------------------------------------
 
 /// The three things the daemon does *for* you rather than *to* the recording
@@ -1158,6 +1271,22 @@ pub struct AssistConfig {
     /// never leaves the row either way, and it keeps its language code — which
     /// is what stops "main" from being a quotation nobody can check.
     pub translation_display: String,
+    /// How a mood or an audio event shows on a transcript row (0.12.4):
+    /// `"tags"` — a chip at the end of the row saying what was heard, the
+    /// default — `"tint"` (the words take the mood's colour), `"both"`, or
+    /// `"off"`.
+    ///
+    /// It is on the `[assist]` block and not on `[mood]` because it is a fact
+    /// about a PAGE, not about the pass: `[mood].enabled` decides whether the
+    /// tags are read and written at all, and this decides what a client does
+    /// with the ones that exist. Two different questions, two different
+    /// switches, and a person who turns the display off has not turned the
+    /// listening off.
+    ///
+    /// `"off"` still leaves the LAUGHTER glyph on the headset overlay, which
+    /// has its own setting for the same reason a caption bar does: it is
+    /// another surface (`docs/OVERLAY.md`).
+    pub mood_display: String,
     // ---- end 0.10.2 -------------------------------------------------------
 
     // ---- 0.11.0, the translator -------------------------------------------
@@ -1201,6 +1330,7 @@ impl Default for AssistConfig {
             translate_min_words: 3,
             read_languages: vec!["de".to_string(), "en".to_string()],
             translation_display: crate::translate::DISPLAY_MAIN.to_string(),
+            mood_display: crate::mood::DISPLAY_TAGS.to_string(),
             translator: crate::translate::DEFAULT_TRANSLATOR.to_string(),
             translator_threads: 4,
             batch: 8,
@@ -1459,10 +1589,12 @@ pub struct Config {
     pub lang: LangConfig,
     /// The accuracy round's idle worker (0.8.0).
     pub asr: AsrConfig,
-    /// How a long turn reaches the glass before it is over (0.12.4).
+    /// How a long turn reaches the glass before it is over (0.12.5).
     pub captions: CaptionsConfig,
     /// The night shift (0.9.0).
     pub night: NightConfig,
+    /// The mood pass (0.12.4). Off by default.
+    pub mood: MoodConfig,
     pub graph: GraphConfig,
     /// The assistant round (0.9.0): reminders, digests, translation.
     pub assist: AssistConfig,
@@ -1569,9 +1701,24 @@ impl Config {
              # It is `0` (OFF) because reading a piece without the rest of the\n\
              # turn around it CHANGES THE WORDS: the joined text disagrees with\n\
              # the whole-turn reading on 17.6%% of them, and this archive has no\n\
-             # ground truth to say which is right (spike/FINDINGS.md §39). Set\n\
+             # ground truth to say which is right (spike/FINDINGS.md §41). Set\n\
              # it to 6.0 if you would rather have the caption than the doubt;\n\
-             # a larger number cuts fewer turns and disagrees less.\n\
+             # a larger number cuts fewer turns and disagrees less. Turning on\n\
+             # `[identity].split_turns` as well stands slicing down for the\n\
+             # turns it would cut: splitting needs a timed decode of the whole\n\
+             # turn, which is the decode slicing exists to avoid.\n\
+             #\n\
+             # `[mood]` reads how a turn SOUNDED off the clips already on\n\
+             # disk — laughter, music, and an emotion tag. It is off, it\n\
+             # needs `models fetch --cjk` (239 MB, the same decoder Korean\n\
+             # and Chinese use), it runs in `[night].window` on the niced\n\
+             # cores and never touches the GPU: the whole archive is a few\n\
+             # minutes. Laughter and music are SHOWN; the emotion tag is\n\
+             # stored and NOT shown, because it was measured against a word\n\
+             # list on this corpus and came out worse than a constant guess\n\
+             # (spike/FINDINGS.md 42). Whether it is drawn is not a setting.\n\
+             # What IS a setting is `[assist] mood_display`: `tags`, `tint`,\n\
+             # `both` or `off`.\n\
              \n{body}"
         );
         let tmp = path.with_extension("toml.tmp");
@@ -1698,7 +1845,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         // OFF by default: the CPU gate passed at +2.2% and the transcript gate
-        // did not (FINDINGS §39).
+        // did not (FINDINGS §41).
         assert_eq!(Config::default().captions.slice_after_s, 0.0);
 
         // ON has to survive a save/load — this is the state a person turns on
@@ -1770,6 +1917,18 @@ mod tests {
         assert_eq!(cfg.identity.vrchat_sources, vec!["vrchat".to_string()]);
         // Its mirror, which says the same about Discord and is not duplicated.
         assert_eq!(cfg.truth.sources, vec!["discord", "vesktop"]);
+        // 0.12.4: turn splitting is off, and the operating point behind it is
+        // the measured one rather than a round number (FINDINGS §39).
+        assert!(!cfg.identity.split_turns);
+        assert_eq!(cfg.identity.split_turn_window_s, 1.5);
+        assert_eq!(cfg.identity.split_turn_hop_s, 0.25);
+        assert_eq!(cfg.identity.split_turn_max_cuts, 3);
+        assert_eq!(cfg.identity.split_turn_distance, 0.85);
+        // A piece exists to be labelled, so the floor is the ladder's floor.
+        assert_eq!(
+            cfg.identity.split_turn_min_piece_s,
+            cfg.identity.min_duration_s
+        );
     }
 
     #[test]

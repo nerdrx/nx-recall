@@ -436,6 +436,48 @@ Electron window, which is exactly the fallback this path needs to keep working.
 
 ---
 
+## Laughter, and nothing else (0.12.4)
+
+0.12.4 gives every segment a `mood` and a set of `events` (PROTOCOL, schema
+v18). The caption bar draws **one glyph, for laughter, after the name**, and
+that is the whole of it. Three deliberate absences:
+
+- **No mood tint.** The desktop can colour a row's words because a transcript is
+  read at leisure on a known ground; a caption is read once, at a glance, over a
+  game, and a sentence in an unexpected hue is a sentence somebody re-reads. The
+  daemon also withholds the mood on the desktop (`status.mood.rendered` is false
+  — FINDINGS §42), so tinting here would be drawing a conclusion two other
+  surfaces refuse to draw.
+- **No music, applause or crying chip.** Every mark on this bar competes with
+  the words. Of the four events, laughter is the one that changes how a line
+  *reads* — "sure, whatever" and "sure, whatever" with somebody laughing are two
+  different sentences — and the rest are trivia at 40 cm from an eye.
+- **No `mood_display` setting here.** `[assist] mood_display` governs the
+  transcript. This surface's answer is fixed, because there is one glyph and
+  turning it off would be a setting with one visible state.
+
+### The glyph, and the font problem
+
+The same problem the highlight emoji has, and the same answer. This is a
+**monochrome coverage rasteriser** with no colour-emoji path, over whatever
+sans-serif the machine happens to ship, and `glyph()` turns anything the font
+lacks into `'?'` — so "Kira ?" is what a naive mark produces on a machine
+without the character.
+
+So the mark is a **ladder**, tried best-first and dropped silently if none of it
+lands: `☺`, then `♪`, then `~`. The emoji 😄 is deliberately not on it. `ᴴᴬ` was
+tried and rejected — modifier letters are missing from more fonts than they are
+present in, and a two-glyph mark next to a name reads as part of the name.
+
+Dropping it silently is correct here and would not be for the `≈` this file's
+shaky mark falls back for: `≈` means a second decoder disagreed, and a row that
+stops saying so is a row claiming to be solid. A caption with no laughter mark is
+just a caption, and the desktop transcript carries the same fact as a word.
+
+It goes **after** the name where the highlight icon goes before it, so the two
+marks cannot be read as one glyph, and it widens the name column rather than
+overprinting the words — the same layout rule, tested the same way.
+
 ## The pieces, and which of them are tested
 
 | what | where | tested? |
@@ -447,12 +489,13 @@ Electron window, which is exactly the fallback this path needs to keep working.
 | the desktop captions window (Route 2's source, and the fallback) | `gui/src/renderer/captions.*` | yes — `npm run headless`, both grounds |
 | the settings reader and writer (`captions.json`: the ranges, the JS's null asymmetry, the byte-identical text, the atomic write, `output`) | `src/settings.rs` | yes — unit tests |
 | which line a translated row leads with (`translation_display`) | `src/raster.rs` (`row_lines`), `src/feed.rs` | yes — unit tests both ways and for a row with no translation, plus `--feed` against the mock |
+| the laughter glyph, its font ladder and the width it takes (0.12.4) | `src/raster.rs` (`laugh_glyph`), `src/feed.rs` | yes — unit tests for the quiet row, for the ladder bottoming out at ASCII, for the glyph really being in this machine's font, and for the words moving right rather than being drawn over |
 | the bar's size, position and fade schedule | `src/layout.rs` | yes — unit tests |
 | the layer surface (config, both input regions, the drag math, the cross-screen hop, the shm conversion) | `src/desktop.rs`, `src/layout.rs` | yes for the parts a compositor is not needed for; the surface itself was run and photographed on KWin in both modes. **Neither the click passing through nor the drag was exercised by synthetic input** — see "Desktop: layer-shell" |
 | which surface a desktop gets, and where the binary is | `gui/src/main/captions.js` | yes — `gui/test/layer_captions.test.js` |
-| the growing row for a sliced turn (`slice` events, the `(session, t_start_ns)` replace key, the trailing ellipsis) | `src/feed.rs` (`apply_slice`, `clear_growing_for`), `src/raster.rs` (`row_lines`), `src/desktop.rs` | yes — unit tests, plus `--feed` against the mock's sliced-turn delivery |
+| the growing row for a sliced turn (0.12.5; `slice` events, the `(session, t_start_ns)` replace key, the trailing ellipsis) | `src/feed.rs` (`apply_slice`, `clear_growing_for`), `src/raster.rs` (`row_lines`), `src/desktop.rs` | yes — unit tests, plus `--feed` against the mock's sliced-turn delivery |
 
-## 0.12.4 — the row that grows
+## 0.12.5 — the row that grows
 
 A turn is not published until the speaker stops, so a thirty-second monologue
 used to reach the bar thirty seconds late, all at once. The daemon now cuts a

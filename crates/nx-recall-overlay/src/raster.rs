@@ -299,6 +299,15 @@ impl Renderer {
                 Some(icon) => format!("{icon} {}  ", turn.who),
                 None => format!("{}  ", turn.who),
             };
+            // 0.12.4: laughter, and only laughter. AFTER the name, where the
+            // highlight icon is before it, so the two marks cannot be read as
+            // one glyph — and through the same font check for the same reason:
+            // `glyph` turns anything the font lacks into '?', and "Kira ?" is
+            // worse than no mark at all. See `laugh_glyph`.
+            let name = match self.laugh_glyph(turn.laughed) {
+                Some(g) => format!("{} {g} ", name.trim_end()),
+                None => name,
+            };
             let name_w = self.measure(&name, name_size);
             let lines = row_lines(turn, self.style.translation_display);
             let column = inner - name_w - DOT_COLUMN;
@@ -449,6 +458,42 @@ impl Renderer {
     /// highlight always works, which is why dropping this half is a
     /// degradation rather than a failure — and why the desktop, which has a
     /// full font stack, is where an emoji highlight is really read.
+    /// Every glyph the laughter mark will try, best first.
+    ///
+    /// Three, and the list is a ladder rather than a preference: the system
+    /// sans-serif this surface rasterises with is whatever the machine happens
+    /// to ship, and none of these is guaranteed. `♪`-style symbols are common
+    /// in Noto Sans and DejaVu; `~` is in every font that has ever existed and
+    /// is the floor. The emoji 😄 is deliberately **not** on the list — there
+    /// is no colour-emoji path in a monochrome coverage rasteriser, and the
+    /// fonts here carry almost no emoji anyway (see [`Self::drawable_icon`]).
+    ///
+    /// `☺` first because it is a face and reads instantly; `ᴴᴬ` was tried and
+    /// rejected — modifier letters are missing from more fonts than they are
+    /// present in, and a two-glyph mark next to a name looks like part of it.
+    const LAUGH_GLYPHS: [char; 3] = ['\u{263a}', '\u{266a}', '~'];
+
+    /// The laughter mark, if this machine's font can draw one at all.
+    ///
+    /// The same rule and the same reason as [`Self::drawable_icon`]: a mark
+    /// that renders as a tofu box is worse than no mark, and this one is a
+    /// *degradation* rather than a failure because the desktop transcript
+    /// carries the same fact as a word (`gui/src/renderer/lib/marks.js`).
+    ///
+    /// Unlike the "≈" the shaky mark falls back for, dropping this silently is
+    /// correct: "≈" means a second decoder disagreed and a row that stops
+    /// saying so is a row claiming to be solid, whereas a caption with no
+    /// laughter mark is just a caption.
+    fn laugh_glyph(&self, laughed: bool) -> Option<char> {
+        laughed
+            .then(|| {
+                Self::LAUGH_GLYPHS
+                    .into_iter()
+                    .find(|c| self.font.lookup_glyph_index(*c) != 0)
+            })
+            .flatten()
+    }
+
     fn drawable_icon(&self, icon: Option<&str>) -> Option<String> {
         let icon = icon.map(str::trim).filter(|s| !s.is_empty())?;
         icon.chars()
@@ -622,6 +667,7 @@ mod tests {
             icon: None,
             // A finished turn. The growing case has its own test in `feed`.
             growing: false,
+            laughed: false,
         }
     }
 
@@ -951,5 +997,59 @@ mod tests {
         let b = r.render(&[lit], None);
         assert_eq!(a.width, b.width);
         assert_eq!(a.height, b.height);
+    }
+
+    /// 0.12.4: laughter is the only event this surface draws, it goes AFTER
+    /// the name, and it degrades to nothing rather than to a tofu box.
+    #[test]
+    fn laughter_is_one_glyph_after_the_name_and_only_one_this_font_has() {
+        let Some(r) = renderer() else { return };
+        assert_eq!(r.laugh_glyph(false), None, "a quiet turn wears no mark");
+        // Whatever this machine's font is, the ladder ends at '~', which every
+        // font has — so on a machine that can draw text at all there is a mark.
+        let g = r
+            .laugh_glyph(true)
+            .expect("the ladder bottoms out at ASCII");
+        assert!(
+            Renderer::LAUGH_GLYPHS.contains(&g),
+            "{g:?} is not on the ladder"
+        );
+        assert!(
+            r.font.lookup_glyph_index(g) != 0,
+            "{g:?} is not in this machine's font"
+        );
+        // The emoji nobody can draw in a coverage rasteriser is not on it.
+        assert!(!Renderer::LAUGH_GLYPHS.contains(&'\u{1f604}'));
+
+        // It widens the name column, exactly as the highlight icon does, so the
+        // words move right instead of being drawn over.
+        let quiet = turn(1, "der Tank ist explodiert");
+        let loud = Turn {
+            laughed: true,
+            ..turn(1, "der Tank ist explodiert")
+        };
+        let a = r.render(&[quiet], None);
+        let b = r.render(&[loud], None);
+        assert_eq!(a.width, b.width);
+        assert_eq!(a.height, b.height);
+        assert!(
+            ink(&b) > ink(&a),
+            "the laughter mark put no pixels on the surface"
+        );
+    }
+
+    /// How much was drawn. Coarse on purpose — the question is only "is there
+    /// more ink than there was", and a pixel-exact golden of a font this
+    /// machine happens to ship would fail on every other machine.
+    fn ink(s: &Surface) -> u64 {
+        // The alpha byte of every RGBA pixel. `as_chunks` rather than
+        // `chunks_exact` because the chunk size is a constant and clippy is
+        // right that the compiler can then see it.
+        s.pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| p[3] as u64)
+            .sum()
     }
 }

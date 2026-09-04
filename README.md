@@ -17,7 +17,7 @@ your own GPU. Every byte of it on your silicon. Nothing, ever, anywhere else.**
 ![rust](https://img.shields.io/badge/daemon-rust_·_70k_lines-b7410e?style=for-the-badge)
 ![tests](https://img.shields.io/badge/tests-1069_rust_·_175_node_·_192_e2e-2ea44f?style=for-the-badge)
 ![releases](https://img.shields.io/badge/releases-35_in_4_days-7700FF?style=for-the-badge)
-![footprint](https://img.shields.io/badge/live_pipeline-%3C5%25_of_one_core-2ea44f?style=for-the-badge)
+![footprint](https://img.shields.io/badge/live_pipeline-half_of_one_core-2ea44f?style=for-the-badge)
 ![experiments](https://img.shields.io/badge/experiments-38_scripts_·_25_findings-0a0714?style=for-the-badge)
 
 <br>
@@ -79,9 +79,24 @@ you take it off. The network cable stays cold.
 
 <img src="assets/readme/pipeline.svg" width="100%" alt="capture to meaning, one machine, no exits">
 
-Live, per turn, under five percent of one core: PipeWire tap → Silero VAD →
+Live, per turn, about half of one core: PipeWire tap → Silero VAD →
 turn merge → pyannote **overlap gate** → Parakeet-TDT v3 → ERes2Net
 voiceprint → identity ladder → thread → FTS5 and a 384-dimension vector.
+
+All of that is on the CPU, and it stays there. The obvious question — the
+7900 XTX is idle, the night shift already uses it, why is the transcriber on
+four cores? — was measured on 22.8 minutes of real turns and the answer was
+no. Nine tenths of the live cost is Parakeet; Parakeet runs under sherpa-onnx,
+whose provider list is `cuda`, `coreml`, `xnnpack`, `nnapi`, `trt`, `directml`
+and **nothing for AMD**. The two models that *could* move are 1.1% of the bill
+between them and want 19 GB of ROCm math libraries installed system-wide to do
+it. A GPU decoder was built and benchmarked anyway: invoked once per turn it
+was **slower to answer than the CPU it replaced** (1639 ms against 360 ms) and
+not cheaper, because the model load is the cost and a live decoder cannot
+batch it away the way a night shift can. So there is no `live_gpu` setting —
+all three of its states would do the same thing — and `recalld status` says
+which device every model is on and why instead. Full round in
+[FINDINGS §40](spike/FINDINGS.md).
 
 Then the parts that run when nobody is waiting: a **context re-decode** that
 re-reads short turns inside the audio around them, a **cross-check** by a
@@ -90,6 +105,19 @@ for suspected flips, a jailed 3B **language model** for promises, topics,
 digests and translations, the **ground-truth pass** that scores the voicebank
 against Discord's own word, and the **night shift**: whisper-large-v3 on the
 GPU, replacing words only under a two-of-three vote.
+
+A turn ends at silence, so a fast exchange — *"yeah" / "no it isn't"* across
+half a second — lands as one row with one name. `recalld turns resplit` cuts
+those rows apart: it slides the same voiceprint model along the turn, finds
+where the person talking changes, and writes each piece as an ordinary turn
+with its own clip and its own label. The transcript is **partitioned by word
+time, never re-decoded** — the pieces' words are the turn's words, in order,
+with none lost at the cut and none spelled twice. Measured against Discord's
+own per-user spans it finds two changes in five and splits fewer than one
+percent of turns Discord says are one person, which is why it runs as a pass
+you read and can undo rather than as a live default. On this archive it turned
+93 rows the voicebank could never be scored against into ground truth, and took
+held-out identity precision from 85.7% to 86.8%.
 
 The box that earns its keep is the overlap gate. Every naive approach
 confidently mislabels overlapping speakers about half the time — and
@@ -150,7 +178,9 @@ failed are listed further down with their numbers.
 | Quarterly model refresh, four newer checkpoints vs Parakeet v3 | **keep v3** — nearest 3.6% vs 3.3% lab WER; qwen3-asr ties on real audio and loses on speed |
 | Hotword biasing toward the roster and glossary | +9.1% recall on rare words against a +20% gate; at strength the glossary leaked into unrelated turns (control WER 8% → 29%). Not shipped |
 | Electron's click-through on Linux | sets no X11 input shape, is a no-op on Wayland — so the caption bar is a native layer-shell surface |
-| Full live pipeline: VAD, gate, ASR, identity, vectors | under 5% of one CPU core |
+| Full live pipeline: VAD, gate, ASR, identity, vectors | 30 CPU seconds per audio minute — **half of one core**, and 90% of it is the transcriber |
+| Moving the live path onto the idle 7900 XTX | **refused.** sherpa-onnx has no AMD provider at all, so the 90% is unreachable; a per-turn whisper Vulkan decoder measured *slower* (1639 ms vs 360 ms) and no cheaper |
+| Cutting a turn where the speaker changes, against Discord's per-user spans | **41.7%** of the reachable change points at ±0.5 s, 67.9% precision, **0.87%** false splits on turns Discord says are one person. Live switch ships off — it missed the 50% recall bar; the archive pass turns 93 unlabellable rows into ground truth and takes identity precision **85.7% → 86.8%** |
 
 ## The graveyard of clever ideas
 
@@ -302,6 +332,36 @@ words only when the night decoder and the cross-check agree with each other
 against the live reading, in the row's own language. Every replacement is on
 the record, next to the words it replaced.
 
+**Every correction you type is word-level ground truth.** When you fix a line,
+the daemon writes that line down beside what each decoder read of the same
+audio — the live pass, the context re-decode, the night shift — and the whole
+correction history already on disk is backfilled into the same table on first
+start. `recalld accuracy learn` then measures each decoder against your own
+words, per voice, per kind of source, per turn length, held out chronologically,
+and can hand a cell to whichever decoder wins it: which words to keep, and
+whether the night shift's two-of-three vote should stand there. It ships a rule
+only after four gates — 30 corrections in the cell, 12 held-out rows the two
+decoders both read, a chronological split, and two points of held-out error
+removed — so on this archive's 37 corrections it currently ships nothing, and
+the accuracy card counts down how many more it wants rather than saying nothing
+at all. None of the night shift's guards is ever for sale: a cell that has
+earned the vote still cannot replace German with Swedish.
+**How a turn sounded** is the newest thing here and it is the one that shipped
+*half* of what was asked for. The decoder that reads Korean and Chinese has
+always emitted an emotion tag and an audio-event tag beside every transcript,
+and this daemon has always thrown them away. A background pass — no GPU, four
+niced cores, a few minutes for a whole archive — now reads them off the stored
+clips and writes them down. **Laughter and music are shown**, as a small chip at
+the end of the row and a glyph in the headset captions: they line up with what
+the transcript itself says far more often than chance. **The mood is stored and
+not shown.** The model declines to name an emotion on most real turns, and on
+the ones it answers it did not beat a word list by the margin that was fixed
+before the measurement — so the tag sits in the database where next month's
+bigger archive can re-score it without listening to anything again, and the
+settings card says so, in the daemon's own sentence, instead of colouring your
+evening in on a guess. There is a switch for `tags`, `tint`, `both` and `off`,
+and all four do something.
+
 ## Getting it useful
 
 - **One query box.** *"was hat Aspen gestern über den Shader gesagt?"* becomes
@@ -424,8 +484,10 @@ Installed by its first user on day one; every finding became a release.
 | 0.12.1 | +131h | the audible rule: your own account is not present on Discord audio, so 1,341 turns that were called overlap were single-speaker all along and the daemon re-judges them on first start; the overlap gate re-measured on the corrected record and kept; the archive sweep reports itself finished; experimental per-user Discord audio: Vesktop hands the bridge every remote user's stream, each becomes its own source with its speaker known by construction, the mixed tap goes quiet while they arrive, off by default |
 | 0.12.2 | +136h | two Discord clients at once: the per-user mute aims at the one client whose voice activity the streams explain, decided on 25 seconds of evidence with a margin and never by inheritance, and a per-client role on the Discord card overrides it either way; enrolment from Discord-confirmed turns measured and left off, because at its own bar it enrols exactly what the ladder already does and below it a wrong link poisons the bank |
 | 0.12.3 | +137h | two bridges: every line the plugin sends names the client and account it came from, spans are kept per bridge, and a verdict only reads the bridge whose call the audio carries, so two Discord clients in two calls stop blending into each other; a call no bridge can see is unknown, not nobody; the report lists the bridges and warns when two of one kind are ambiguous |
-| 0.12.4 | +141h | sliced turns: a long turn is cut at a pause the VAD already found, each piece decoded once and put on the glass, and the pieces re-joined into ONE row at the end so identity, threads, digests, truth and export see exactly what they always saw. +2.2% CPU, a word 1.7 s sooner, nothing left past twelve seconds — and 17.6% of the words move against a zero noise floor, so it ships complete and switched off |
+| 0.12.5 | +150h | sliced turns: a long turn is cut at a pause the VAD already found, each piece decoded once and put on the glass, and the pieces re-joined into ONE row at the end so identity, threads, digests, truth and export see exactly what they always saw. +2.2% CPU, a word 1.7 s sooner, nothing left past twelve seconds — and 17.6% of the words move against a zero noise floor, so it ships complete and switched off |
+| 0.12.4 | +150h | the third data round: laughter and music chips from the night shift's ears (mood measured at 55 points below chance and kept off-screen); every correction becomes word-level truth and the accuracy card counts down to the first learned rule; turn splitting at speaker changes measured at 41.7% recall against a 50% bar and shipped off with an archive command; the live GPU measured and refused; calibration compares every prototype-scoring rule with its own refit bars after a twenty-phantom mint burst broke the bank overnight; voice drift measured as absent |
 | 0.12.2 | +132h | the mute aims at one Discord client instead of at Discord: with two clients running, only the one whose speech the per-user streams explain goes quiet and the other call keeps recording — 108 right, 36 declined, 0 wrong over 144 synthetic two-call timelines, every guard failing towards recording — plus a per-source override (`bridge`/`other`/`auto`) in the Sources card, `recalld role`, and `truth.status` saying which client is muted and why |
+| 0.12.4 | +140h | how a turn sounded, and half of it refused: a background pass reads SenseVoice's emotion and event tags off the stored clips (RTF 0.068 on four niced cores, no GPU, the whole 11½-hour archive in 47 minutes) and writes them to schema v18. Laughter and music are drawn — 3–10x more likely than chance to land on a clip the speech decoder had no words for — but only up to **five seconds**, past which the same tag is *below* chance because the model is answering "was there laughter anywhere in this clip" and a chip on a paragraph claims the turn was one. The **mood is stored and not shown**: the model declines on 74.7% of turns and, on the quarter it answers, agrees with a word list 31.6% of the time against an 86.4% constant baseline. The pre-registered laughter proxy (does the transcript say "haha") found twelve positives in fifteen thousand rows and had to be thrown away and replaced in the open. A four-state setting (`tags`/`tint`/`both`/`off`), a mood palette that is three of the ten person hues at a body-text saturation measured to 5.61:1 light and 8.41:1 dark, and a laughter glyph in the headset captions |
 
 ## Quickstart
 

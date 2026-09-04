@@ -15,8 +15,11 @@ import { dirname, join } from 'node:path';
 
 import {
   PALETTE,
+  MOOD_PALETTE,
   accent,
   accentColor,
+  eventsOf,
+  moodColor,
   nameColor,
   iconOf,
   isAccent,
@@ -35,14 +38,78 @@ test('the palette is ten distinct tokens and carries the brand colour', () => {
   }
 });
 
-test("the daemon's palette and this one are the same list", () => {
-  const rs = readFileSync(join(repo, 'crates/recalld/src/palette.rs'), 'utf8');
+// Both palettes are written as `Accent { … }` tables, so one regex over the
+// whole file finds thirteen entries and matches neither list. Cut the source at
+// the second table's name first — a reader tracing a drift has to be told WHICH
+// list drifted, and a combined assertion cannot say.
+function accentsIn(rs) {
   // Accent { token: "violet", hue: 268, hex: "#7700ff" },
-  const found = [...rs.matchAll(
+  return [...rs.matchAll(
     /token:\s*"([a-z]+)",\s*hue:\s*(\d+),\s*hex:\s*"(#[0-9a-f]{6})"/g,
   )].map((m) => ({ token: m[1], hue: Number(m[2]), hex: m[3] }));
+}
+
+function daemonPalettes() {
+  const rs = readFileSync(join(repo, 'crates/recalld/src/palette.rs'), 'utf8');
+  const at = rs.indexOf('MOOD_PALETTE: &[Accent]');
+  assert.ok(at > 0, 'the daemon source has no MOOD_PALETTE table');
+  return { people: accentsIn(rs.slice(0, at)), moods: accentsIn(rs.slice(at)) };
+}
+
+test("the daemon's palette and this one are the same list", () => {
+  const found = daemonPalettes().people;
   assert.ok(found.length > 0, 'found no palette entries in the daemon source');
   assert.deepEqual(found, PALETTE);
+});
+
+// 0.12.4. The same drift check for the mood tint, and one more assertion the
+// person palette does not need: the three mood hues must BE three of the ten,
+// because the whole design argument for them is that the suite turns one wheel.
+test("the mood palette is the daemon's, and its hues are three of the ten", () => {
+  const found = daemonPalettes().moods;
+  assert.equal(found.length, 3);
+  assert.deepEqual(found, MOOD_PALETTE);
+  for (const m of MOOD_PALETTE) {
+    assert.ok(
+      PALETTE.some((a) => a.hue === m.hue),
+      `${m.token} is a hue the person palette does not have`,
+    );
+  }
+});
+
+test('a mood is painted through the ground, and neutral is not painted at all', () => {
+  // The same legibility argument as a highlight, at the tint's own saturation
+  // and lightness — which is what makes a whole SENTENCE in it readable where
+  // --sp-s would be a highlighter pen.
+  assert.equal(moodColor('happy'), 'hsl(44 var(--mood-s) var(--mood-l))');
+  assert.equal(moodColor('sad'), 'hsl(232 var(--mood-s) var(--mood-l))');
+  assert.equal(moodColor('angry'), 'hsl(350 var(--mood-s) var(--mood-l))');
+  // A mood the daemon stores and no surface tints. Not an oversight — a
+  // transcript already looks like neutral, and painting it would repaint the
+  // whole archive to say nothing.
+  assert.equal(moodColor('neutral'), null);
+  // …and the ordinary absences, which must all fall through to the row's ink.
+  assert.equal(moodColor(null), null);
+  assert.equal(moodColor(undefined), null);
+  assert.equal(moodColor(''), null);
+  // A fifth mood from a newer daemon is not painted wrong, it is not painted.
+  assert.equal(moodColor('ecstatic'), null);
+});
+
+test('the events on a row are the closed set, in one order', () => {
+  assert.deepEqual(eventsOf({ events: ['laughter'] }), ['laughter']);
+  // Sorted into the palette's own order, so two rows with the same events read
+  // the same however the daemon happened to list them.
+  assert.deepEqual(eventsOf({ events: ['music', 'laughter'] }), ['laughter', 'music']);
+  assert.deepEqual(eventsOf({ events: ['cry', 'applause'] }), ['applause', 'cry']);
+  // An event this build has no word for is dropped, and the rest still render.
+  assert.deepEqual(eventsOf({ events: ['laughter', 'sneeze'] }), ['laughter']);
+  assert.deepEqual(eventsOf({ events: ['sneeze'] }), []);
+  // The ordinary row, and every shape of absence a daemon or a mock can send.
+  assert.deepEqual(eventsOf({ events: [] }), []);
+  assert.deepEqual(eventsOf({}), []);
+  assert.deepEqual(eventsOf(null), []);
+  assert.deepEqual(eventsOf({ events: null }), []);
 });
 
 test("the overlay's palette and this one are the same hues, in order", () => {

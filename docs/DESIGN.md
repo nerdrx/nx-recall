@@ -175,11 +175,40 @@ set). Measured selections:
 - Windowing: embed **contiguous detector-approved single-speaker audio**, as long as
   possible — not fixed short windows (10 s beat 3 s by 27 pp coverage when one
   talker dominates). ASR batches to ~30 s only if a Whisper-family model is in use.
-- **Runtime rule — affinity, not model size.** The whole pipeline measures < 5% of
-  one core, so throughput is a non-issue; the real risk (demonstrated live on the
-  dev box) is priority/placement. The daemon sets nice 19 on inference threads and
-  supports `[runtime] inference_cpus` to pin off the game's CCD (9950X3D: game keeps
-  0–15/X3D). Both implemented in Step 1.
+- **Runtime rule — affinity, not model size.** The real risk (demonstrated live on
+  the dev box) is priority/placement, not throughput. The daemon sets nice 19 on
+  inference threads and supports `[runtime] inference_cpus` to pin off the game's
+  CCD (9950X3D: game keeps 0–15/X3D). Both implemented in Step 1.
+  - ~~The whole pipeline measures < 5% of one core~~ → **it measures 30 CPU
+    seconds per audio minute, half of one core** (0.11.5 config, FINDINGS §40,
+    the user's own 22.8 minutes). The old figure was §10's and it was true: it
+    measured *Parakeet 110m at one thread*. The daemon ships the 0.6b v3
+    multilingual export at four threads. Affinity is still the rule — half a
+    core at nice 19 on the non-game CCD is not what stutters a frame — but the
+    number should not be quoted as if throughput were free.
+
+| stage | runtime | CPU s / audio min | share of the live path |
+|---|---|---:|---:|
+| VAD (silero) | `ort` | 0.17 | 0.6% |
+| overlap (pyannote-3.0) | `ort` | 0.16 | 0.5% |
+| **ASR (parakeet-tdt-0.6b-v3)** | **sherpa-onnx** | **26.76** | **89.5%** |
+| embed (eres2net) | sherpa-onnx | 2.81 | 9.4% |
+
+- **Three tiers, and all three are on the CPU** — the live path has no GPU leg
+  and will not get one soon (FINDINGS §40, and `crate::device` reports it in
+  `recalld status`). Not for want of a card: the night shift runs whisper.cpp on
+  this same 7900 XTX through Vulkan. The live path cannot follow it because
+  **90% of its cost is Parakeet, and Parakeet runs under sherpa-onnx, whose
+  provider enum has no AMD variant at all** — `cuda`, `coreml`, `xnnpack`,
+  `nnapi`, `trt`, `directml`, and nothing for AMD. The two models that *do* go
+  through `ort`, which has AMD execution providers in its binding, are 1.1% of
+  the bill between them, and reaching even those needs ~19 GB of ROCm math
+  libraries installed system-wide. Measured, not assumed: a per-turn whisper
+  Vulkan decoder was benchmarked against the incumbent and was **both slower to
+  answer (1639 ms p50 against 360 ms) and no cheaper in CPU**, because a live
+  decoder cannot amortise the model load the way a night batch does. There is
+  deliberately **no `live_gpu` setting**: all three of its states would do the
+  same thing.
 - **Three tiers, not one (0.11.2).** The first night with the night shift, the
   digests, the translator, the cross-check and the truth pass all running, the
   capture thread missed its PipeWire deadlines 658 times in one hour — because
@@ -331,6 +360,72 @@ every row), with these additions:
   of them shrinks on its own, and a single total would hide that. The status
   poll runs every three seconds in every open client and must never pay for a
   directory walk, so it reads a cache the sweeper refills once a pass.
+
+- v18 (0.12.4): `segments.mood`, `segments.events`, `segments.mood_at_ns` — how a
+  turn *sounded*, read off the stored clips by `crate::mood`. Three columns and
+  not two, and the third is the load-bearing one: `mood_at_ns` is the **queue**
+  and the other two are the **answer**. The pass stamps every row it reaches
+  including the ones it heard nothing on, because SenseVoice declines to name an
+  emotion on most real turns and a row it declined must not come back in the
+  queue every night for the life of the archive. No backfill — for a row already
+  on disk nobody has listened, and NULL is the only honest way to say so.
+
+## 6.1 Colour: the two palettes
+
+Two lists of hues live in `crates/recalld/src/palette.rs`, mirrored in
+`gui/src/renderer/lib/palette.js` and checked against each other by
+`gui/test/palette.test.js`. They exist as three copies because neither Rust
+binary can import the JS and the JS can import neither Rust file; three copies
+that have **drifted** is a person whose mark is one colour in the app and
+another in the headset, so the copies are not trusted, they are tested.
+
+**What is stored is a token, never a hex.** A mark is read on both of NX Clear's
+grounds and in three renderers, one of which (the headset overlay) rasterises
+text itself and has no CSS to resolve a variable with. A free-form `#111111`
+would let somebody make a name invisible on the dark ground, and the daemon
+could not warn them, because the daemon does not know which ground anybody is
+looking at. So the token is one HUE and saturation and lightness are the
+ground's business.
+
+### The person palette (v15, 0.12.0)
+
+Ten hues, spread at least 20° apart, painted at `--sp-s` / `--sp-l` — 72%/28%
+light, 72%/74% dark — which is the same pair `speakerHue()` already renders every
+*unhighlighted* voice through. That is the whole legibility argument: a highlight
+changes WHICH hue a name wears and never how readable it is.
+
+### The mood palette (v18, 0.12.4)
+
+Three hues — `amber`, `indigo`, `rose` for happy, sad and angry — and they are
+three of the ten above, so the suite turns one wheel rather than two.
+
+What differs is **where the numbers come from**, and the reason is what is being
+painted. A highlight colours a NAME: a short bold string in a fixed 148px column,
+which can carry a 72% accent. A mood colours a SENTENCE, and a paragraph of body
+text at 72% saturation is a highlighter pen. So the tint spends its own pair,
+`--mood-s` / `--mood-l` — **46%/30% light, 46%/79% dark** — measured across the
+three hues against every ground a transcript row is painted on (`--clear-bg`,
+`--clear-surface`, `--clear-tile`, and `--violet-soft`, which a selected row
+wears): **worst case 5.61:1 on the light ground and 8.41:1 on the dark one**,
+both clear of WCAG AA.
+
+Two rules keep the tint from being a decoration that costs legibility:
+
+- **`neutral` has no colour.** It is a mood the daemon stores and no surface
+  paints, on purpose: neutral is what a transcript already looks like, and the
+  overwhelming majority of rows are neutral or unread. A palette entry for it
+  would repaint the whole archive to say nothing. The lookup returns nothing and
+  the row keeps its ordinary ink — the same fall-through an unknown token gets.
+- **A doubted row outranks a feeling.** A row whose speaker is a guess, or whose
+  words a second decoder disagreed with, already overrides its colour to say so.
+  That claim is about whether the transcript is *true* and it wins; the mood tint
+  stands down rather than fighting it, which is the same precedence `markRow`
+  gives `uncertain` over a speaker highlight.
+
+The overlay carries **no** copy of the mood palette. It draws one glyph for
+laughter and never tints — see [OVERLAY.md](OVERLAY.md) — because a caption bar
+is read once, at a glance, over a game, and every mark on it competes with the
+words.
 
 ## 7. Roster (correction)
 

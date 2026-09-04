@@ -49,7 +49,7 @@ import {
 // module so the transcript and search cannot disagree about them.
 import { look, lookOf, iconSpan, markRow, highlightPicker } from './highlight.js';
 import { separatorWalker } from '../lib/seams.js';
-import { shakyMark, translationCell } from '../lib/marks.js';
+import { moodChips, shakyMark, translationCell } from '../lib/marks.js';
 import { openSheet, toast } from '../lib/sheets.js';
 import { play, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 // Conversation replay (0.9.2). The engine is in lib/replay.js and holds no DOM;
@@ -497,6 +497,12 @@ export function mount(root, ctx) {
       h(
         'span',
         { class: 'meta' },
+        // 0.12.4: what was on the clip besides the words, and — where the
+        // measurement earned it — how it sounded. First in the meta column,
+        // because it is about the turn itself rather than about where the turn
+        // came from or how much the app trusts it. Absent on a row with
+        // nothing to say, which is most of them.
+        moodChips(seg),
         seg.source === 'Discord' ? h('span', { class: 'chip', text: 'discord' }) : null,
         // Two decoders, one disagreement (0.8.0). Deliberately NOT folded into
         // the "?": that mark answers "who said this and which model wrote it",
@@ -547,7 +553,7 @@ export function mount(root, ctx) {
     // has to come off the screen without an event: a pause, a discarded turn
     // after an audio gap, or a daemon that went away all end a turn silently.
     // One timer, only while a row is up, aimed at the exact moment it expires.
-    // 0.12.4: a growing row is allowed to sit much longer between slices than
+    // 0.12.5: a growing row is allowed to sit much longer between slices than
     // a partial is between decodes, so the timer is aimed at whichever rule
     // this row is under.
     const staleMs = p.growing ? SLICE_STALE_MS : PARTIAL_STALE_MS;
@@ -576,7 +582,7 @@ export function mount(root, ctx) {
     // be the same answer `segRow` gives, or the row would change colour at the
     // moment the final replaces it.
     const { color, icon } = lookOf(p.speaker);
-    // 0.12.4: a GROWING row is a different claim from a provisional one, and
+    // 0.12.5: a GROWING row is a different claim from a provisional one, and
     // it is the stronger of the two. A partial's words may be replaced
     // wholesale by the next reading; a slice's words are final — they are
     // already the words the row will carry — and only the END of the sentence
@@ -1155,7 +1161,7 @@ export function mount(root, ctx) {
         who: el.querySelector('.nm')?.textContent ?? '',
         text: el.querySelector('.txt')?.textContent ?? '',
         ellipsis: !!el.querySelector('.seg-ell'),
-        // 0.12.4: whether this row is GROWING (a sliced turn, words being
+        // 0.12.5: whether this row is GROWING (a sliced turn, words being
         // added) rather than provisional (a partial, words being replaced).
         growing: el.classList.contains('growing'),
         ink: getComputedStyle(el.querySelector('.txt')).color,

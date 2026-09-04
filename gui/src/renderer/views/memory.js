@@ -22,7 +22,7 @@
 //      nothing leaves the machine — in plain words, next to the switch.
 
 import { h, clear, fmtDate, fmtClock, fmtDayLabel, fmtDur } from '../lib/dom.js';
-import { store, speakerLabel, ask, applyAssist } from '../lib/store.js';
+import { store, speakerLabel, ask, applyAssist, MOOD_MODES } from '../lib/store.js';
 // 0.12.0 — per-person highlights. Every graph row here (digest participants,
 // a commitment's two sides, a world's people) carries `colour`/`icon`, which is
 // what `lookOn` reads; `lookOf` is for the accuracy table, whose rows carry a
@@ -194,6 +194,13 @@ export function mount(root, ctx) {
   // queue. A person who has just read what the local model costs is the person
   // deciding whether to give it a second thing to do.
   const translateCard = h('div', { class: 'card', id: 'translate-card' });
+  // 0.12.4. Directly under Translation, because it is the other question of the
+  // same kind — "what else goes on a transcript row, and how loudly" — and
+  // because both of its controls are `assist.set` calls on the same live block.
+  // Its own card rather than a fourth block inside that one: a mood is not a
+  // translation, and a card whose title lied about half its contents would be a
+  // worse economy than one more heading.
+  const moodCard = h('div', { class: 'card', id: 'mood-card' });
   const body = h(
     'div',
     { class: 'view-body view-enter' },
@@ -209,7 +216,8 @@ export function mount(root, ctx) {
     worldsCard,
     topicsCard,
     enrichCard,
-    translateCard
+    translateCard,
+    moodCard
   );
 
   root.append(
@@ -832,8 +840,34 @@ export function mount(root, ctx) {
         id: 'accuracy-note',
         style: 'padding:10px 0 0;max-width:70ch',
         text: 'Two different estimates. "Changed" counts only the lines somebody retyped, so it reads high where you have been careful and says nothing where you have not. "Shaky" is the share of all checked rows a second decoder read differently — unbiased, but a disagreement is not always an error.',
-      })
+      }),
+      learnedLine(a.learned)
     );
+  }
+
+  /**
+   * What the corrections have TAUGHT it (0.12.4).
+   *
+   * Every other number on this card looks backwards. This one is the reason to
+   * keep correcting: each fix is one row of word-level ground truth, and at
+   * thirty of them in one cell — one voice, one kind of source, one turn length
+   * — the daemon can start measuring which of its decoders to believe there.
+   * So the line says the count, and, until the bar is met, exactly how many
+   * more are wanted. "Nothing learned yet" on its own would be a dead end.
+   */
+  function learnedLine(l) {
+    if (!l) return null;
+    const n = l.corrections ?? 0;
+    const rules = l.rules ?? 0;
+    const text = rules
+      ? `${rules} decoder rule${rules === 1 ? '' : 's'} learned from ${n} correction${n === 1 ? '' : 's'}.`
+      : `Learned from ${n} correction${n === 1 ? '' : 's'} — ${l.needed ?? 0} more in one voice, source and turn length and it can start choosing between its decoders.`;
+    return h('p', {
+      class: 'rail-hint',
+      id: 'accuracy-learned',
+      style: 'padding:6px 0 0;max-width:70ch',
+      text,
+    });
   }
 
   /**
@@ -1458,6 +1492,138 @@ export function mount(root, ctx) {
     }
   }
 
+  // -- how it sounded (0.12.4) ----------------------------------------------
+  //
+  // Two things on one card, and they are deliberately not the same kind of
+  // thing:
+  //
+  //   1. `mood_display` — YOUR choice about the page. Four states, and every
+  //      one of them acts: `tags` puts a chip at the end of the row, `tint`
+  //      colours the words, `both` does both, `off` does neither. A setting
+  //      that is read and ignored is a blocker, not a footnote.
+  //   2. What the DAEMON is willing to stand behind. That is not a choice and
+  //      it is not on a switch: `status.mood.rendered` is a measurement
+  //      (FINDINGS §42), and where it is false the card says so in the
+  //      daemon's own words rather than quietly dropping half the feature.
+  //
+  // The card is honest about the third thing too: the pass has to be ON for
+  // any of this to have anything to draw, and a person looking at four radio
+  // buttons with an unmarked transcript behind them deserves to be told which
+  // of the switches is the one that is off.
+
+  function renderMood() {
+    clear(moodCard);
+    const st = store.status?.mood ?? null;
+    const live = store.conn.status === 'connected' && !translatePending;
+    const mode = MOOD_MODES.includes(store.assist.mood_display)
+      ? store.assist.mood_display
+      : 'tags';
+    const rendered = st?.rendered === true;
+    const on = st?.enabled === true;
+    const available = st?.available === true;
+
+    moodCard.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('div', { class: 'card-title', text: 'How it sounded' }),
+        h('span', {
+          class: 'sub',
+          id: 'mood-sub',
+          text: !st
+            ? 'this daemon is older than 0.12.4'
+            : !on
+              ? 'off — nothing is listened to'
+              : !available
+                ? 'the decoder is not installed'
+                : `${st.read_total ?? 0} turns read · ${st.backlog ?? 0} to go`,
+        })
+      )
+    );
+
+    const option = (value, label, hint) =>
+      h(
+        'label',
+        { class: `radio-row${mode === value ? ' on' : ''}` },
+        h('input', {
+          type: 'radio',
+          name: 'mood-display',
+          value,
+          id: `mood-display-${value}`,
+          checked: mode === value || undefined,
+          disabled: !live,
+          onchange: () => void setAssist({ mood_display: value }),
+        }),
+        h('span', {}, h('b', { text: label }), h('small', { text: hint }))
+      );
+
+    moodCard.append(
+      h(
+        'div',
+        {
+          class: 'tune-block',
+          id: 'mood-display-row',
+          dataset: { pending: String(translatePending) },
+        },
+        h(
+          'span',
+          { class: 'tune-label' },
+          h('b', { text: 'On a transcript row' }),
+          h('small', {
+            text: 'Laughter and music are marks on the AUDIO, not words anybody said. Nothing here changes the transcript.',
+          })
+        ),
+        h(
+          'div',
+          { class: 'radio-set', role: 'radiogroup', 'aria-label': 'How a mood or an event shows' },
+          option('tags', 'A tag at the end', 'a small chip saying what was heard'),
+          option(
+            'tint',
+            'Colour the words',
+            'the mood becomes the row’s colour — laughter and music stay chips, because a sound has no colour'
+          ),
+          option('both', 'Both', 'the mood as a chip AND as the row’s colour'),
+          option('off', 'Neither', 'the tags are still read and stored, just not drawn')
+        )
+      )
+    );
+
+    // The measurement, in the daemon's own sentence. Present whenever the mood
+    // half is being withheld, in EVERY display mode — including `off`, where
+    // nothing is drawn anyway: a person who turns the setting on tomorrow
+    // should not have to discover this then.
+    if (st && !rendered) {
+      moodCard.append(
+        h('p', {
+          class: 'rail-hint',
+          id: 'mood-why',
+          style: 'padding:10px 0 0;max-width:70ch',
+          text: st.why || 'The mood tag is stored but not shown on this daemon.',
+        })
+      );
+    }
+
+    // …and what is missing, if anything is. One line, and it names the switch
+    // rather than describing the feeling of it being off.
+    if (st && !on) {
+      moodCard.append(
+        h('p', {
+          class: 'mic-warn',
+          id: 'mood-off',
+          text: 'Nothing is being listened to: set `enabled = true` under `[mood]` in config.toml. It runs in the same overnight window as the night shift, on the same niced cores, and never touches the GPU.',
+        })
+      );
+    } else if (st && !available) {
+      moodCard.append(
+        h('p', {
+          class: 'mic-warn',
+          id: 'mood-absent',
+          text: st.how || 'The decoder this needs is not installed.',
+        })
+      );
+    }
+  }
+
   function nameOf(code) {
     return store.assist.languages.find((l) => l.code === code)?.name ?? code;
   }
@@ -1483,6 +1649,7 @@ export function mount(root, ctx) {
     applyAssist(patch);
     translatePending = true;
     renderTranslation();
+    renderMood();
     try {
       applyAssist(await ask('assist.set', patch));
     } catch (e) {
@@ -1491,6 +1658,7 @@ export function mount(root, ctx) {
     } finally {
       translatePending = false;
       renderTranslation();
+      renderMood();
       // The transcript is not repainted from here. The daemon publishes an
       // `assist` event for a change made anywhere, this window is subscribed
       // to it like any other, and that is the one path — a second path would
@@ -1768,6 +1936,7 @@ export function mount(root, ctx) {
   renderTopics();
   renderEnrichment();
   renderTranslation();
+  renderMood();
   void load();
 
   return {
@@ -1818,7 +1987,13 @@ export function mount(root, ctx) {
       // The translation settings moved — here, in another window, or in the
       // config file. `status` carries them too, so a window that missed the
       // event converges on the next poll (0.10.2).
-      if (change?.assist || change?.status) renderTranslation();
+      if (change?.assist || change?.status) {
+        renderTranslation();
+        // `status` as well as `assist`: the mood card prints whether the pass
+        // is on, whether the model is installed and whether the measurement
+        // lets the mood half be drawn, and all three live on `status.mood`.
+        renderMood();
+      }
       if (change?.commitment) {
         const row = commitments.find((c) => c.id === change.commitment.id);
         if (row) Object.assign(row, change.commitment);

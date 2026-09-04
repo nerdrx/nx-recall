@@ -1,5 +1,5 @@
 //! Sliced turns: a long turn reaches the glass in pieces, and lands as one row
-//! (0.12.4).
+//! (0.12.5).
 //!
 //! # The problem, and why partials are not the answer to it
 //!
@@ -251,7 +251,7 @@ impl Slicer {
     }
 }
 
-/// One slice on the wire (docs/PROTOCOL.md "0.12.4 — sliced turns").
+/// One slice on the wire (docs/PROTOCOL.md "0.12.5 — sliced turns").
 ///
 /// Shaped like a [`crate::partial`] on purpose, down to the field names, so a
 /// client that already renders a provisional row folds this in with the code it

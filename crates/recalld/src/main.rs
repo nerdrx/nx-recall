@@ -41,8 +41,8 @@ use recalld::truth::{self, TruthStats, TruthStop};
 use recalld::truthnet;
 
 use crate::cli::{
-    Cli, Command, GraphAction, IdentityAction, LangAction, MicAction, ModelsAction, NightBackend,
-    NotesAction, SemanticAction, SpeakersAction, TruthAction,
+    AccuracyAction, Cli, Command, GraphAction, IdentityAction, LangAction, MicAction, ModelsAction,
+    NightBackend, NotesAction, SemanticAction, SpeakersAction, TruthAction, TurnsAction,
 };
 
 fn main() -> Result<()> {
@@ -195,6 +195,21 @@ fn main() -> Result<()> {
                 cmd_lang_unroute(&cfg, &data_dir, dir.as_deref(), apply)
             } // ---- end 0.12.0 ---------------------------------------------
         },
+        // ---- 0.12.4, cutting a turn where the speaker changes -----------
+        //
+        // In THIS process, like the language repair and the semantic backfill
+        // and for the same two reasons: it is a long batch job that has to be
+        // niceable and Ctrl-C-able, and it loads models the daemon may not
+        // have resident.
+        Command::Turns { action } => match action {
+            TurnsAction::Resplit {
+                apply,
+                undo,
+                limit,
+                dir,
+            } => cmd_turns_resplit(&cfg, &data_dir, dir.as_deref(), apply, undo, limit),
+        },
+        // ---- end 0.12.4 --------------------------------------------------
         // ---- 0.11.0, source-aware identity -----------------------------
         Command::Identity { action } => cmd_identity(&cfg, &data_dir, action),
         // ---- end 0.11.0 -------------------------------------------------
@@ -229,7 +244,13 @@ fn main() -> Result<()> {
         Command::Ask { question, limit } => cmd_ask(&cfg, &data_dir, &question.join(" "), limit),
         Command::Notes { action } => cmd_notes(&cfg, &data_dir, action),
         Command::Brief { speaker_id } => cmd_brief(&cfg, &data_dir, speaker_id),
-        Command::Accuracy => cmd_accuracy(&cfg, &data_dir),
+        Command::Accuracy { action } => match action {
+            None => cmd_accuracy(&cfg, &data_dir),
+            Some(AccuracyAction::Report) => cmd_accuracy_learn(&cfg, &data_dir, false, true),
+            Some(AccuracyAction::Learn { apply }) => {
+                cmd_accuracy_learn(&cfg, &data_dir, apply, false)
+            }
+        },
         // ---- end 0.8.0 -------------------------------------------------
         // ---- 0.9.0, ground truth from Discord --------------------------
         Command::Truth { action } => cmd_truth(&cfg, &data_dir, &config_path, action),
@@ -352,12 +373,19 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     // …and the accuracy round's idle worker reads its switches the same way.
     .with_asr(cfg.asr.clone())
     .with_night(cfg.night.clone())
+    // 0.12.4: the mood pass, for the same reason again.
+    .with_mood(cfg.mood.clone())
     // 0.9.0: reminders, digests and translation, for the same reason again.
     .with_assist(cfg.assist.clone());
     // The three translation settings live in one place rather than being
     // threaded through `segment_json`'s dozen call sites; see `translate::LIVE`.
     // `assist.set` writes the same three, which is what makes them live.
     recalld::translate::adopt(&cfg.assist);
+    // 0.12.4: the fourth control on that card, live for the same reason and
+    // read from the same place. Not folded into `translate::adopt` — a mood
+    // chip is not a translation setting, and one function that owned both
+    // would be a name that lied.
+    recalld::mood::set_display(&cfg.assist.mood_display);
     // …and where the second backend's files are (0.11.0). Not a setting: the
     // translator is loaded on first use, and this is the disk it is loaded from.
     recalld::translate::set_models_root(models_root.clone());
@@ -668,6 +696,29 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
             .map_err(|e| warn!("no night shift: {e}"))
             .ok()
     };
+    // ---- 0.12.4: the mood pass --------------------------------------------
+    // Its own thread rather than a pass inside the night shift's or the
+    // sweep's, and the reason is the one gate none of the three shares: this
+    // needs SenseVoice and nothing else — no GPU, no local compile, no
+    // identifier. Folding it into either would make an unrelated
+    // `enabled = false` silently turn it off.
+    let mood_stop = Arc::new(recalld::mood::MoodStop::default());
+    let mood_thread = {
+        let store = Arc::clone(&store);
+        let control = Arc::clone(&control);
+        let bus = Arc::clone(&bus);
+        let root = models_root.clone();
+        let dir = data_dir.to_path_buf();
+        let whole = cfg.clone();
+        let stats = Arc::clone(&control.mood_stats);
+        let stop = Arc::clone(&mood_stop);
+        std::thread::Builder::new()
+            .name("recalld-mood".into())
+            .spawn(move || recalld::mood::run(store, control, bus, root, dir, whole, stats, stop))
+            .map_err(|e| warn!("no mood pass: {e}"))
+            .ok()
+    };
+    // ---- end 0.12.4 -------------------------------------------------------
     // ---- 0.12.0: the archive language sweep -------------------------------
     // Its own thread rather than a second pass inside the night shift's, and
     // the reason is the one gate the two do not share: the night shift needs a
@@ -777,6 +828,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     quality_stop.stop();
     truth_stop.stop();
     night_stop.stop();
+    mood_stop.stop();
     sweep_stop.stop();
     reminder_stop.stop();
     assist_stop.stop();
@@ -797,6 +849,8 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         quality_thread,
         truth_thread,
         night_thread,
+        // 0.12.4.
+        mood_thread,
         // 0.12.0.
         sweep_thread,
         // 0.9.0.
@@ -2405,6 +2459,119 @@ fn cmd_lang_unroute(cfg: &Config, data_dir: &Path, dir: Option<&Path>, apply: bo
 }
 // ---- end 0.12.0 -----------------------------------------------------------
 
+// ---- 0.12.4: cutting a turn where the speaker changes ---------------------
+
+/// `recalld turns resplit [--apply|--undo]` — cut the archive's mixed turns
+/// where the person talking changes (FINDINGS §39).
+fn cmd_turns_resplit(
+    cfg: &Config,
+    data_dir: &Path,
+    dir: Option<&Path>,
+    apply: bool,
+    undo: bool,
+    limit: Option<usize>,
+) -> Result<()> {
+    pipeline::deprioritise_current_thread(19, &[]);
+    let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open(data_dir)?));
+    let now = recalld::clock::utc_now_ns();
+
+    if undo {
+        let n = recalld::turnsplit::unsplit(&store, limit.unwrap_or(usize::MAX), now)?;
+        println!(
+            "{n} split turn(s) put back. Each row has its whole span and its own clip again,\n\
+             and the pieces the split minted are deleted. The words are NOT restored: the span\n\
+             is right and nothing has re-read the audio, so the honest state is a turn waiting\n\
+             for the analysis leg. `recalld lang repair` or the idle worker will fill it in."
+        );
+        return Ok(());
+    }
+
+    // The models are not optional here, unlike the unroute pass: without the
+    // embedder there is no curve and therefore no answer at all, and a run
+    // that silently reported "nothing to cut" would be a lie.
+    let root = fetch::target_dir(dir, &cfg.models, data_dir);
+    let models = ModelSet::resolve_at(root, &cfg.models);
+    let mut analyzer = recalld::analysis::Analyzer::load(
+        &models,
+        // The pass exists BECAUSE the live switch is off by default; making it
+        // read that switch would mean the command could do nothing and not say
+        // why. Every other number in the operating point is the config's.
+        &recalld::config::IdentityConfig {
+            split_turns: true,
+            ..cfg.identity.clone()
+        },
+    )?;
+    analyzer.set_lang_config(&cfg.lang);
+    analyzer.set_truth_config(&cfg.truth);
+    analyzer.set_asr_config(&models, &cfg.asr, &cfg.night, &cfg.runtime);
+    let stats = recalld::analysis::AnalysisStats::default();
+
+    let report = recalld::turnsplit::resplit(
+        &store,
+        &mut analyzer,
+        &stats,
+        data_dir,
+        limit.unwrap_or(usize::MAX),
+        apply,
+        now,
+    )?;
+
+    println!("{:<26}{}", "turns examined", report.examined);
+    if report.examined == 0 {
+        println!(
+            "\nNo turn on this install has a `partial` or `overlap` verdict, so there is\n\
+             nothing here that Discord says holds more than one person's audio."
+        );
+        return Ok(());
+    }
+    println!("{:<26}{}", "  too short to cut", report.too_short);
+    println!("{:<26}{}", "  clip already retained", report.no_audio);
+    println!(
+        "{:<26}{} (a piece with no words is not a turn)",
+        "  cut found and refused", report.wordless
+    );
+    println!("{:<26}{}", "turns that change speaker", report.cuts.len());
+    println!("{:<26}{}", "new rows", report.new_rows());
+
+    if !report.cuts.is_empty() {
+        println!("\n{:<9} {:<21} {:<9} CUT AT", "SEGMENT", "WHEN", "VERDICT");
+        for c in report.cuts.iter().take(AUDIT_TAIL) {
+            let at = c
+                .at_s
+                .iter()
+                .map(|s| format!("{s:.2}s"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "{:<9} {:<21} {:<9} {at}",
+                c.segment_id,
+                format_time(c.t_start_ns),
+                c.verdict
+            );
+            for (i, said) in c.said.iter().enumerate() {
+                println!("          [{i}] {said:?}");
+            }
+        }
+        if report.cuts.len() > AUDIT_TAIL {
+            println!("  … and {} more", report.cuts.len() - AUDIT_TAIL);
+        }
+    }
+
+    if apply {
+        println!(
+            "\n{} turn(s) cut. Each wrote a `turns.resplit` operation with its whole prior\n\
+             state, and the original clip is still on disk, so `recalld turns resplit --undo`\n\
+             puts them back.",
+            report.cuts.len()
+        );
+    } else {
+        println!("\nNothing written. Add --apply.");
+    }
+    Ok(())
+}
+
+// ---- end 0.12.4 -----------------------------------------------------------
+
 /// `recalld speakers prune [--apply]` — the one-off voice sweep.
 fn cmd_prune(cfg: &Config, data_dir: &Path, apply: bool) -> Result<()> {
     let out = call(cfg, data_dir, "speakers.prune", json!({"apply": apply}))?;
@@ -2892,6 +3059,7 @@ fn cmd_status(cfg: &Config, data_dir: &Path) -> Result<()> {
             models
         }
     );
+    print_devices(&s["asr"]["devices"]);
     println!(
         "{:<18}{} segment(s), {} analysed, {} labelled, {} refused (overlap)",
         "counters",
@@ -2928,6 +3096,47 @@ fn cmd_status(cfg: &Config, data_dir: &Path) -> Result<()> {
     );
     print_storage(&s["storage"]);
     Ok(())
+}
+
+/// Which device the models run on (0.12.4, FINDINGS §40).
+///
+/// One line per live model, with the reason folded to one per *runtime* rather
+/// than repeated per model: the four models have two reasons between them, and
+/// printing the same paragraph twice teaches a reader that it is boilerplate.
+/// An older daemon has no `devices` key and gets nothing rather than a wrong
+/// claim about its own hardware.
+fn print_devices(devices: &Value) {
+    let Some(models) = devices["live_models"].as_array() else {
+        return;
+    };
+    println!(
+        "{:<18}live on {}, night shift on {}",
+        "inference",
+        devices["live"].as_str().unwrap_or("?"),
+        devices["night"].as_str().unwrap_or("?"),
+    );
+    let mut explained: Vec<&str> = Vec::new();
+    for m in models {
+        println!(
+            "{:<18}{:<28} {:<12} {:>5.1}% of the live CPU",
+            "",
+            m["model"].as_str().unwrap_or("?"),
+            m["device"].as_str().unwrap_or("?"),
+            m["cpu_share_pct"].as_f64().unwrap_or(0.0),
+        );
+        let runtime = m["runtime"].as_str().unwrap_or("?");
+        if !explained.contains(&runtime) {
+            explained.push(runtime);
+        }
+    }
+    for runtime in explained {
+        let why = models
+            .iter()
+            .find(|m| m["runtime"].as_str() == Some(runtime))
+            .and_then(|m| m["why"].as_str())
+            .unwrap_or("");
+        println!("{:<18}{runtime}: {why}", "");
+    }
 }
 
 /// The disk breakdown, in the four parts that behave differently: audio is
@@ -3371,11 +3580,107 @@ fn cmd_accuracy(cfg: &Config, data_dir: &Path) -> Result<()> {
             );
         }
     }
+    // 0.12.4: the same corrections, as ground truth about the decoders.
+    let l = &a["learned"];
+    let learned = l["corrections"].as_i64().unwrap_or(0);
+    let rules = l["rules"].as_i64().unwrap_or(0);
+    if rules > 0 {
+        println!("{:<16}{rules} from {learned} corrections", "learned rules");
+    } else {
+        println!(
+            "{:<16}none yet — {} more corrections in one cell",
+            "learned rules",
+            l["needed"].as_i64().unwrap_or(0)
+        );
+    }
     println!(
         "\nMeasured against YOUR corrections, so it is the error rate of the turns\n\
          somebody bothered to fix — biased high, and the number that moves when the\n\
-         vocabulary or the window length changes."
+         vocabulary or the window length changes.\n\
+         `recalld accuracy report` breaks it down by decoder."
     );
+    Ok(())
+}
+
+/// `recalld accuracy learn|report` (0.12.4) — which decoder your corrections
+/// say to believe, cell by cell.
+fn cmd_accuracy_learn(cfg: &Config, data_dir: &Path, apply: bool, report: bool) -> Result<()> {
+    let out = call(cfg, data_dir, "accuracy.learn", json!({"apply": apply}))?;
+    let n = out["corrections"].as_i64().unwrap_or(0);
+    let min = out["min_rows_per_cell"].as_i64().unwrap_or(0);
+    let margin = out["margin_pp"].as_f64().unwrap_or(0.0);
+    println!(
+        "{n} correction{} on record, {} of them with a decoder's reading beside them.",
+        if n == 1 { "" } else { "s" },
+        out["measurable"].as_i64().unwrap_or(0)
+    );
+    println!(
+        "A cell needs {min} of its own to be fitted, and a rule must take {margin:.0} points \
+         off held-out error.\n"
+    );
+
+    let pct = |v: &Value| {
+        v.as_f64()
+            .map(|w| format!("{:.1}%", w * 100.0))
+            .unwrap_or_else(|| "—".into())
+    };
+    let cell_line = |row: &Value| {
+        let d = |name: &str| {
+            row["decoders"]
+                .as_array()
+                .and_then(|a| a.iter().find(|d| d["decoder"] == name))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        println!(
+            "{:<22}{:>5}{:>6}  {:>7} {:>7} {:>7}   {}",
+            row["cell"].as_str().unwrap_or("?"),
+            row["rows"].as_i64().unwrap_or(0),
+            row["held_out"].as_i64().unwrap_or(0),
+            pct(&d("live")["wer"]),
+            pct(&d("context")["wer"]),
+            pct(&d("night")["wer"]),
+            row["verdict"].as_str().unwrap_or(""),
+        );
+    };
+    println!(
+        "{:<22}{:>5}{:>6}  {:>7} {:>7} {:>7}   verdict",
+        "cell (kind/voice/len)", "rows", "held", "live", "ctx", "night"
+    );
+    cell_line(&out["global"]);
+    for row in out["cells"].as_array().cloned().unwrap_or_default() {
+        cell_line(&row);
+    }
+
+    let installed = &out["installed"];
+    let have = installed["cells"].as_object().map(|m| m.len()).unwrap_or(0)
+        + usize::from(!installed["global"].is_null());
+    println!();
+    if apply {
+        println!("Installed. {have} rule(s) are now in force.");
+    } else if report {
+        println!("{have} rule(s) currently in force.");
+    } else {
+        println!("Nothing was changed. Re-run with --apply to install what is above.");
+    }
+    if have == 0 {
+        let short = out["short_by"].as_array().cloned().unwrap_or_default();
+        println!(
+            "No cell has cleared the bar yet. The night shift keeps its two-of-three vote\n\
+             and the live pass keeps its words, which is what 0.9.0 shipped."
+        );
+        for row in short.iter().take(6) {
+            println!(
+                "  {:<22}{} more correction(s)",
+                row["cell"].as_str().unwrap_or("?"),
+                row["needed"].as_i64().unwrap_or(0)
+            );
+        }
+        println!(
+            "\nCorrect transcripts in the GUI — the accuracy card on the Memory page counts\n\
+             down for you. Every fix is one row of ground truth and they only ever add up."
+        );
+    }
     Ok(())
 }
 
@@ -4126,7 +4431,7 @@ fn cmd_identity(cfg: &Config, data_dir: &Path, action: Option<IdentityAction>) -
             limit,
         } => match (foreign, prototypes) {
             (true, _) => cmd_identity_repair_foreign(cfg, data_dir, apply, limit),
-            (_, true) => cmd_identity_repair_prototypes(data_dir, apply),
+            (_, true) => cmd_identity_repair_prototypes(cfg, data_dir, apply),
             _ => {
                 println!(
                     "`identity repair` needs --foreign or --prototypes. Naming what it \
@@ -4276,8 +4581,67 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
             s,
         );
     }
-    if let Some((a, s)) = &report.aggregate {
-        row(&format!("+ scoring a voice by {}", a.as_str()), s);
+
+    // Every rule for turning a voice's prototypes into one score, each one on
+    // the global bar and on the bars it earns for itself. A bar is a number on
+    // a score scale and the aggregate IS the scale, so the second row is the
+    // one that describes what installing that rule would do (FINDINGS §45).
+    if !report.aggregates.is_empty() {
+        println!("\nhow a voice's prototypes become one score");
+        println!(
+            "  {:<28}{:>5}{:>9}{:>7}{:>10}{:>11}{:>9}{:>8}",
+            "arm", "n", "correct", "wrong", "declined", "precision", "recall", "F-0.5"
+        );
+        for arm in &report.aggregates {
+            let mark = if arm.incumbent { "  <- installed" } else { "" };
+            row(&format!("{}, global bar", arm.rule.as_str()), &arm.globals);
+            println!(
+                "{}",
+                format_args!(
+                    "  {:<28}{:>5}{:>9}{:>7}{:>10}{:>11}{:>9}{:>8.3}{mark}",
+                    format!("{}, bars refit for it", arm.rule.as_str()),
+                    arm.fitted.n,
+                    arm.fitted.correct,
+                    arm.fitted.wrong,
+                    arm.fitted.declined,
+                    if arm.fitted.precision().is_nan() {
+                        "—".to_string()
+                    } else {
+                        format!("{:.1}%", arm.fitted.precision() * 100.0)
+                    },
+                    if arm.fitted.recall().is_nan() {
+                        "—".to_string()
+                    } else {
+                        format!("{:.1}%", arm.fitted.recall() * 100.0)
+                    },
+                    arm.fitted.f_beta(recalld::calib::BETA),
+                )
+            );
+        }
+        if let Some((a, _)) = &report.aggregate {
+            let bars = report
+                .aggregate_thresholds
+                .iter()
+                .map(|v| {
+                    format!(
+                        "{} {:.2}/{:.2}",
+                        name_of(v.speaker_id),
+                        v.threshold,
+                        v.margin
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  best challenger: {} — installing it writes {}",
+                a.as_str(),
+                if bars.is_empty() {
+                    "no per-voice bar; every voice on the global".to_string()
+                } else {
+                    bars
+                }
+            );
+        }
     }
     println!(
         "\n  thresholds: {}",
@@ -4358,7 +4722,11 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
                 ""
             },
             match (&report.aggregate, report.aggregate_swap) {
-                (Some((a, _)), true) => format!(", a voice is now scored by {}", a.as_str()),
+                (Some((a, _)), true) => format!(
+                    ", a voice is now scored by {} with the {} bar(s) refit for it",
+                    a.as_str(),
+                    report.aggregate_thresholds.len()
+                ),
                 _ => String::new(),
             }
         );
@@ -4374,10 +4742,12 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
 
 /// The one repair that is a correctness fix rather than an operating point:
 /// throwing out a prototype that is a recording of somebody else.
-fn cmd_identity_repair_prototypes(data_dir: &Path, apply: bool) -> Result<()> {
+fn cmd_identity_repair_prototypes(cfg: &Config, data_dir: &Path, apply: bool) -> Result<()> {
     let store = Store::open(data_dir)?;
     let now = recalld::clock::utc_now_ns();
-    let report = recalld::identity_learn::repair_prototypes(&store, apply, now)?;
+    // The install's operating point, not the crate's: a before/after table
+    // measured at a `max_overlap` nobody is running describes nobody's machine.
+    let report = recalld::identity_learn::repair_prototypes(&store, &cfg.identity, apply, now)?;
 
     if let Some(note) = &report.note {
         println!("{note}.");
@@ -4523,6 +4893,49 @@ fn cmd_identity_audit(cfg: &Config, data_dir: &Path) -> Result<()> {
             .collect::<Vec<_>>()
             .join("  ·  ");
         println!("{id:>4}  {name:<24}  {cells}");
+    }
+
+    // A cap that a merge quietly lifted. `add_prototype` never writes past
+    // `max_prototypes`, so anything over it arrived by `merge_speakers`, which
+    // re-points a collapsed voice's prototypes and does not re-apply the cap.
+    // The inherited vectors are the ones that look like drift and are not:
+    // FINDINGS §44 measured the voice itself as stable over the archive's 3.4
+    // days (turn-to-turn cosine −0.02/day, r = −0.05) while the inherited
+    // prototypes sit 0.19 cosine below the enrolled ones.
+    let over = store.oversized_banks(cfg.identity.max_prototypes)?;
+    println!("\n=== banks over the cap ===");
+    if over.is_empty() {
+        println!(
+            "None: every voice is within `[identity].max_prototypes` = {}.",
+            cfg.identity.max_prototypes
+        );
+    } else {
+        println!(
+            "`max_prototypes` is {}, and `add_prototype` never writes past it — so these\n\
+             came from a merge, which moves a collapsed voice's prototypes and does not\n\
+             re-apply the cap. Inherited prototypes match their new voice's own turns far\n\
+             less well than enrolled ones, which reads as the voice having changed.\n",
+            cfg.identity.max_prototypes
+        );
+        println!(
+            "{:>5}  {:<24}  {:>11}  {:>9}",
+            "VOICE", "NAME", "PROTOTYPES", "OVER BY"
+        );
+        for (id, name, n) in &over {
+            println!(
+                "{:>5}  {:<24}  {:>11}  {:>9}",
+                id,
+                name,
+                n,
+                n - cfg.identity.max_prototypes as i64
+            );
+        }
+        println!(
+            "\nNothing here is trimmed automatically: every automatic trim was measured\n\
+             held out and refused (FINDINGS §44). `recalld identity repair --prototypes`\n\
+             is the one command that deletes, and it only removes prototypes whose own\n\
+             source turn ground truth says was somebody else."
+        );
     }
 
     println!("\n=== labels the rule questions ===");

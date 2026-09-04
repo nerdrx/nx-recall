@@ -1,5 +1,5 @@
 //! Does slicing a long turn put words on the glass sooner, and what does it
-//! cost in CPU and in words? (0.12.4)
+//! cost in CPU and in words? (0.12.5)
 //!
 //! ```text
 //! NXR_MODELS=/path/to/models \
@@ -59,7 +59,7 @@
 //! whose only slice decoded to nothing as "unsliced", and every point of the
 //! 17.6% is therefore real.
 //!
-//! Numbers live in `spike/FINDINGS.md` §39.
+//! Numbers live in `spike/FINDINGS.md` §41.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -79,7 +79,7 @@ use recalld::vad::{FRAME_SAMPLES, Segmenter, SileroVad};
 const TAIL_SILENCE_S: f32 = 2.5;
 
 /// The floor the headline numbers are taken at. NOT the shipped default, which
-/// is `0` — see `[captions] slice_after_s` and FINDINGS §39. The knob table at
+/// is `0` — see `[captions] slice_after_s` and FINDINGS §41. The knob table at
 /// the end of the run is what that decision was made from.
 const SLICE_AFTER_S: f32 = 6.0;
 

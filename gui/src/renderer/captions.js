@@ -142,7 +142,7 @@ function provisionalRow(p) {
   };
   const el = row({ seg, dim: isYou(p.speaker) ? YOU_DIM : 1 });
   el.classList.add('provisional');
-  // 0.12.4: a growing row is provisional in a weaker sense than a partial. Its
+  // 0.12.5: a growing row is provisional in a weaker sense than a partial. Its
   // words will not be taken back — they are already the words the finished row
   // will carry — so it is drawn in settled ink and keeps only the "…", which is
   // true of it: the sentence is not over. `growing` is what carries that, and
@@ -288,7 +288,7 @@ window.recall.onCaptionSettings(applySettings);
         text: el.querySelector('.cap-text')?.textContent ?? '',
         who: el.querySelector('.cap-who')?.textContent ?? '',
         ellipsis: !!el.querySelector('.cap-ell'),
-        // 0.12.4: a growing row (a sliced turn) against a provisional one (a
+        // 0.12.5: a growing row (a sliced turn) against a provisional one (a
         // partial). The difference is a claim about the words, so the test has
         // to be able to see both it and the ink that follows from it.
         growing: el.classList.contains('growing'),
