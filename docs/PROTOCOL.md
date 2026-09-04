@@ -4614,3 +4614,68 @@ rewrites text, `segments.reassign` rewrites the speaker); after 0.12.4 an
 applied resplit can also *shorten* an existing row and add a sibling beside it.
 A client that re-reads a segment by id after a `segment.updated` event was
 already doing the right thing.
+
+## 0.12.4 — every scoring rule, with the bars it earns for itself
+
+`identity.calibrate` has chosen between prototype-aggregate rules since 0.12.0.
+It chose them wrong in two ways, and this round fixes both
+(`spike/FINDINGS.md` §45). Neither is a new feature; both are the same
+correction, which is that **a rule and a bar are one decision**.
+
+### The report carries every arm, twice
+
+A learned threshold is a number on a score scale, and the aggregate *is* the
+scale. Comparing a top-3 mean against per-voice bars fitted under max cosine
+measures the scale and not the rule — the error §36 found in `truth::enrol_batch`,
+still present in the one place §32 had left it. The pass now refits per-voice
+thresholds **under each candidate rule** and reports both readings:
+
+```jsonc
+{
+  "aggregates": [
+    {"rule": "max",   "incumbent": true,
+     "globals": {"n": 1113, "correct": 1015, "wrong": 49, "f_beta": 0.945},
+     "fitted":  {"n": 1113, "correct": 939,  "wrong": 27, "f_beta": 0.943},
+     "thresholds": [{"speaker": 2, "threshold": 0.32, "margin": 0.04, "n": 912}]},
+    {"rule": "top-4", "incumbent": false,
+     "globals": {"n": 1113, "correct": 1011, "wrong": 10, "f_beta": 0.973},
+     "fitted":  {"n": 1113, "correct": 1033, "wrong":  9, "f_beta": 0.978},
+     "thresholds": [ … ]}
+  ],
+  "aggregate": {"rule": "top-4", "score": { … the FITTED score … }},
+  "aggregate_thresholds": [ … the winning arm's own bars … ],
+  "aggregate_installed": "max",
+  "aggregate_swap": true
+}
+```
+
+Three rules a client can rely on:
+
+* **`aggregates` contains the installed rule**, flagged `incumbent: true`. The
+  loop used to skip it, so the rule the box was running never appeared in its
+  own table and could only be compared against the globals row. The incumbent's
+  two entries are the same two measurements as `baseline` and `candidate` —
+  one answer per question, not two that can disagree.
+* **`aggregate.score` is the `fitted` score**, because that is the operating
+  point an install would actually put the box on. The gate compares
+  (candidate rule + candidate's bars) against (installed rule + its bars).
+* **`aggregate_thresholds` is installed with the rule.** Through 0.12.3 a swap
+  cleared every learned bar and left the refit to the next pass — so between
+  the two runs the box sat on an operating point nothing had measured. The pair
+  is what the gate approved, so the pair is what is written: `cleared > 0`
+  **and** `written == aggregate_thresholds.length` on a run that swaps.
+
+Because the incumbent is now an arm, the pass can also go **home**: an install
+that learned `top-3` on an earlier corpus and no longer earns it is put back on
+`max`, through the same `swap_is_safe` + `improvement_is_material` gate as any
+other change. This is not hypothetical — the box did exactly that on
+2026-09-04, and §45 measures the reversal it should have made instead.
+
+### `identity.repair` measures at the install's operating point
+
+`repair_prototypes` scored its before/after table with `IdentityConfig::default()`.
+On this install the daemon gates at `max_overlap = 0.06` against a default of
+0.1, so the table that justifies a permanent deletion described a machine
+nobody was running. It now takes the caller's `[identity]` config, which is the
+same block `identity.calibrate` and the live ladder read. The wire shape does
+not change; the numbers in it do.
