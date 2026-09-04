@@ -2056,7 +2056,7 @@ fn cmd_lang_sweep(
     let store = Arc::new(Mutex::new(Store::open(data_dir)?));
     let lang_cfg = cfg.lang.clone();
     // `--redecode` turns the rewriting on for THIS run only; without it the
-    // config decides, and the config ships with it off (FINDINGS §29).
+    // config decides, and the config ships with it off (FINDINGS §30).
     let asr_cfg = recalld::config::AsrConfig {
         lang_sweep_redecode: redecode || cfg.asr.lang_sweep_redecode,
         ..cfg.asr.clone()
@@ -2086,7 +2086,7 @@ fn cmd_lang_sweep(
     } else {
         println!(
             "  transcripts will NOT be replaced — only `lang` is written. \
-             Eight of the nine rewrites this measured were wrong (FINDINGS §29); \
+             Eight of the nine rewrites this measured were wrong (FINDINGS §30); \
              `--apply --redecode` turns it on anyway."
         );
     }
@@ -2163,7 +2163,11 @@ fn cmd_lang_sweep(
         (
             report.left_alone,
             "already readable, or a voice pinned to a language another pass owns — free, and \
-             never marked",
+             not owed again until their words or their voice change",
+        ),
+        (
+            report.too_short,
+            "shorter than the sweep's floor; still owed, in case the floor is lowered",
         ),
         (
             report.unavailable,
@@ -2175,16 +2179,27 @@ fn cmd_lang_sweep(
             println!("  {n:>6}  {line}");
         }
     }
-    let (left, _) = {
+    // An `--apply` run has moved the count itself, so the database is the
+    // honest answer. A **preview** writes nothing, so its own count cannot have
+    // fallen and re-reading it would print the number the operator started
+    // with — the shape of the bug this release is fixing. What a preview knows
+    // is how many rows it just resolved, so it subtracts them and says what
+    // `--apply` would leave.
+    let left = {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-        guard.lang_sweep_counts(floor)?
+        let (now, _) = guard.lang_sweep_counts(floor)?;
+        if apply {
+            now
+        } else {
+            now.saturating_sub(report.resolved() as i64)
+        }
     };
     println!(
         "{left} still owed{}",
-        if left > 0 && limit.is_some() {
-            " — run it again to continue"
-        } else {
-            ""
+        match () {
+            _ if left == 0 => " — the archive is swept",
+            _ if limit.is_some() => " — run it again to continue",
+            _ => "",
         }
     );
     Ok(())
@@ -3362,8 +3377,90 @@ fn cmd_truth(
         // ---- 0.12.0: retro-labelling from ground truth ----------------
         TruthAction::Label { apply, limit } => cmd_truth_label(data_dir, apply, limit),
         // ---- end 0.12.0 -----------------------------------------------
+        // ---- 0.12.1: the re-verdict -----------------------------------
+        TruthAction::Rejudge { apply, limit } => cmd_truth_rejudge(data_dir, apply, limit),
+        // ---- end 0.12.1 -----------------------------------------------
     }
 }
+
+// ---- 0.12.1: the re-verdict ------------------------------------------------
+
+/// `recalld truth rejudge` — re-read the verdicts on disk under the
+/// own-account rule (FINDINGS §34).
+///
+/// Opens the database directly, like `truth label` beside it: it is a bulk
+/// correction to history rather than a live decision, and it has to work on a
+/// machine where no daemon is running.
+fn cmd_truth_rejudge(data_dir: &Path, apply: bool, limit: Option<usize>) -> Result<()> {
+    let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open(data_dir)?));
+    let now = recalld::clock::utc_now_ns();
+    let r = recalld::truth::rejudge(&store, limit.unwrap_or(usize::MAX), apply, now)?;
+
+    println!("{:<24}{}", "verdicts examined", r.examined);
+    if r.examined == 0 {
+        println!(
+            "\nNothing to re-judge. Either no turn has a `single`, `overlap` or \
+             `partial`\nverdict yet, or no Discord account is linked to your own voice — \
+             with\nnothing linked to \"You\" there is no account this rule can call inaudible."
+        );
+        return Ok(());
+    }
+    println!("{:<24}{}", "verdicts that move", r.changed.len());
+    println!("{:<24}{}", "  of them `overlap`", r.overlap_reassigned());
+    for (from, to, n) in r.moves() {
+        println!("{:<24}{from:<9} -> {to:<9} {n}", "");
+    }
+    if r.from_columns > 0 {
+        println!(
+            "{:<24}{} (the spans are gone; the verdict itself was the evidence)",
+            "re-derived without spans", r.from_columns
+        );
+    }
+    if r.unresolvable > 0 {
+        println!(
+            "{:<24}{} `overlap` row(s) whose spans are gone. Left exactly as they\n{:<24}\
+             are: the verdict records that two accounts were present and not\n{:<24}which two.",
+            "cannot be re-judged", r.unresolvable, "", ""
+        );
+    }
+    if r.restamped > 0 {
+        println!("{:<24}{}", "overlap share redone", r.restamped);
+    }
+
+    if !r.changed.is_empty() {
+        println!(
+            "\n{:<9} {:<21} {:<9} {:<9} WHO",
+            "SEGMENT", "WHEN", "WAS", "NOW"
+        );
+        for m in r.changed.iter().take(AUDIT_TAIL) {
+            println!(
+                "{:<9} {:<21} {:<9} {:<9} {}",
+                m.segment_id,
+                format_time(m.t_start_ns),
+                m.from,
+                m.to,
+                m.user_id.as_deref().unwrap_or("—"),
+            );
+        }
+        if r.changed.len() > AUDIT_TAIL {
+            println!("  … and {} more", r.changed.len() - AUDIT_TAIL);
+        }
+    }
+
+    if apply {
+        println!(
+            "\n{} verdict(s) re-judged. Logged as `truth.rejudge`, prior state and all.\n\
+             `recalld truth report` now scores identity and the overlap gate against them,\n\
+             and `recalld identity calibrate` will fit the gate on the corrected corpus.",
+            r.changed.len()
+        );
+    } else {
+        println!("\nNothing written. Add --apply.");
+    }
+    Ok(())
+}
+
+// ---- end 0.12.1 ------------------------------------------------------------
 
 // ---- 0.12.0: retro-labelling from ground truth -----------------------------
 
@@ -3486,6 +3583,41 @@ fn cmd_truth_report(cfg: &Config, data_dir: &Path) -> Result<()> {
     // pass that was switched off, for as long as the feature had existed, and
     // no report said so — a switch nobody can see is indistinguishable from a
     // bug, and the operator spent the evening looking for the bug.
+    // ---- 0.12.1: the re-verdict, said out loud ----
+    //
+    // "450 overlap" and "450 overlap, and 1,341 more used to be counted here"
+    // are different facts about the same install, and every measurement made
+    // before the rule read the second number without knowing it. Silent until
+    // the pass has run, and silent when it moved nothing: a line saying zero
+    // is a claim, and an unrun pass has not made it.
+    let rj = &a["rejudge"];
+    if let Some(moved) = rj["changed"].as_i64().filter(|n| *n > 0) {
+        println!(
+            "\n{:<20}{moved} verdict(s), {} of them `overlap`",
+            "re-judged",
+            rj["overlap_reassigned"].as_i64().unwrap_or(0)
+        );
+        for m in rj["moves"].as_array().cloned().unwrap_or_default() {
+            println!(
+                "{:<20}{:<9} -> {:<9} {}",
+                "",
+                m["from"].as_str().unwrap_or("—"),
+                m["to"].as_str().unwrap_or("—"),
+                m["n"].as_i64().unwrap_or(0),
+            );
+        }
+        println!(
+            "{:<20}your own account is not presence on audio your own client made",
+            ""
+        );
+        if let Some(n) = rj["unresolvable"].as_i64().filter(|n| *n > 0) {
+            println!(
+                "{:<20}{n} `overlap` row(s) could not be re-judged: the spans are gone",
+                ""
+            );
+        }
+    }
+
     let enrol = &a["enrol"];
     let enrol_waiting = enrol["waiting"].as_i64().unwrap_or(0);
     if enrol_waiting > 0 || enrol["on"].as_bool().unwrap_or(false) {

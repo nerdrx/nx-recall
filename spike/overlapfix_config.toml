@@ -1,0 +1,19 @@
+# The live install's `[identity]` block, copied so §34's before/after runs
+# score the gate at the threshold the daemon actually ships (0.06) rather than
+# at the crate default. Used with `--data-dir <a copy>`; nothing here points at
+# the live data directory.
+[identity]
+label_threshold = 0.35
+enroll_threshold = 0.55
+enroll_margin = 0.06
+enroll_max_overlap = 0.05
+enroll_min_duration_s = 3.0
+max_overlap = 0.06
+min_duration_s = 1.0
+max_prototypes = 20
+split_max_centroid_similarity = 0.6
+split_ambiguous_margin = 0.05
+split_restarts = 8
+mint_min_duration_s = 2.0
+mint_min_words = 2
+proximity_gap_s = 2.5

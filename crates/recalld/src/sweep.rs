@@ -89,27 +89,53 @@
 //! not buy the same confidence, and the honest way to say so is separate
 //! numbers.
 //!
-//! ## Bounded, resumable, and it never revisits a row twice
+//! ## Bounded, resumable, and it finishes
 //!
 //! The work list is a query and not a cursor
 //! ([`Store::segments_for_lang_sweep`]), so an interrupted run loses at most
-//! the row it was on. What keeps the walk from spinning is that **every row the
-//! identifier is actually spent on leaves the list**:
+//! the row it was on. What makes the walk *end* is `segments.sweep_at_ns`
+//! (schema v16): **every row the pass reaches a conclusion about is stamped
+//! with the moment it did**, whatever the conclusion was.
 //!
-//! * routed → `lang` is set by the route, `lang_via` is `lid` (only with
-//!   `lang_sweep_redecode` on; off, nothing is ever routed);
-//! * heard as `de` or `en` → `lang` is set to that, `lang_via` is
-//!   [`crate::store::lang_via::SWEEP`] (see there for why it is not `lid`);
-//! * heard as anything else, or no opinion → `lang` stays NULL and `lang_via`
-//!   becomes `sweep` anyway. Nothing is claimed and the row is not asked about
-//!   again.
+//! Two columns, because there are two questions:
 //!
-//! Rows [`crate::asr_cjk::pre_route`] declines — a readable transcript, or a
-//! voice pinned to a language that is somebody else's business — are **not**
-//! marked. They cost a string classify and no model, and a declaration can be
-//! added tomorrow; marking them would freeze a decision that was free to
-//! re-make. They are remembered for the length of one run so the walk moves
-//! forward, which is [`crate::langctx::repair`]'s `passed` set for the same
+//! * `lang` / `lang_via` answer "how did this row get its language" — set by
+//!   the route (`lid`) on a row that was re-decoded, or to `de`/`en` with
+//!   [`crate::store::lang_via::SWEEP`] on a row the identifier named one of
+//!   those for. Both are claims about the row.
+//! * `sweep_at_ns` answers "has this pass been here", and nothing else reads
+//!   it. It is written for the two outcomes above, for a reading nothing acts
+//!   on, for a missing WAV — **and for a row
+//!   [`crate::asr_cjk::pre_route`] declined**, which is the one 0.11.9 got
+//!   wrong.
+//!
+//! ### Why the declined rows had to be marked, and how the mark stays honest
+//!
+//! 0.11.9 deliberately left them alone: they cost a string compare and no
+//! model, a declaration can be added tomorrow, and marking them would freeze a
+//! decision that was free to re-make. The reasoning was right about the future
+//! decision and wrong about the arithmetic. On the live install 1,729 of 1,782
+//! rows land there, so `recalld lang sweep --apply` printed the same "1730
+//! still owed" after every run, the nightly pass re-read all of them every
+//! night, and no output could ever say the archive was done.
+//!
+//! Both things are true at once, so the fix is to write the mark and then take
+//! responsibility for clearing it. `pre_route` reads exactly two things — the
+//! row's **text** and its voice's **declared languages** — and every write that
+//! can move either clears `sweep_at_ns` for the rows concerned:
+//! [`Store::set_segment_text_via`] and [`Store::set_segment_analysis`] for the
+//! words, [`Store::set_segment_speaker_via`], [`Store::merge_speakers`] and
+//! [`Store::set_speaker_languages`] for the voice. Adding a language tag to a
+//! speaker therefore hands the sweep every one of that voice's turns back,
+//! which is the retroactive behaviour `recalld languages` has always had for
+//! [`crate::langctx::repair`] and did not have for this.
+//!
+//! The one free outcome that is **not** a visit is a clip under the sweep's own
+//! floor. What would change that answer is configuration rather than data, so
+//! no write to the row could ever clear the mark — an operator who lowers
+//! `lang_sweep_min_s` has to get those rows back, and does, because nothing was
+//! written about them. Within a run they are remembered in `passed` so the walk
+//! still moves forward, which is [`crate::langctx::repair`]'s set for the same
 //! reason.
 
 use std::collections::{BTreeMap, HashSet};
@@ -145,18 +171,22 @@ pub enum Swept {
     /// are not touched — there is nothing here to re-decode.
     Stamped { lang: &'static str },
     /// The identifier ran and its answer was not one anything acts on, or it
-    /// had no opinion. The row is taken off the work list and nothing is
-    /// claimed about it.
+    /// had no opinion. Nothing is claimed about the row.
     Marked,
     /// `pre_route` declined: the transcript already reads as something, or the
-    /// voice is pinned to a language another feature owns. No model ran and the
-    /// row is left exactly as it was — including its NULL `lang_via`.
+    /// voice is pinned to a language another feature owns. No model ran, and
+    /// `lang`, `lang_via` and the words are all exactly as they were — the
+    /// visit is recorded in `sweep_at_ns`, which nothing else reads.
     LeftAlone,
+    /// Under `[asr].lang_sweep_min_s`. **Not** recorded as a visit: the thing
+    /// that would change this answer is the floor, and no write to the row can
+    /// move it, so an operator who lowers the floor has to get the row back.
+    TooShort,
     /// The identifier is not installed, or would not load. Nothing was spent
     /// and nothing was written; fetch it and run again.
     Unavailable,
     /// The row names a WAV that is not there — retention took it, or it never
-    /// landed. Marked, because there is nothing left to ask about.
+    /// landed. A visit, because there is nothing left to ask about.
     NoAudio,
     /// Preview only: what the run *would* have done, without running a decoder
     /// or writing anything.
@@ -181,10 +211,12 @@ pub struct SweepReport {
     pub routed: BTreeMap<String, usize>,
     /// Rows stamped `de` or `en` off the reading alone.
     pub stamped: BTreeMap<String, usize>,
-    /// Asked, nothing to do, marked so it is not asked again.
+    /// Asked, nothing to do, visited so it is not asked again.
     pub marked: usize,
-    /// `pre_route` declined. Not marked, and free.
+    /// `pre_route` declined. Free, and — since 0.12.1 — a visit all the same.
     pub left_alone: usize,
+    /// Under the sweep's floor. Free, and deliberately still owed.
+    pub too_short: usize,
     /// The identifier is not installed.
     pub unavailable: usize,
     /// The WAV is gone from disk even though the row still names one.
@@ -205,6 +237,23 @@ impl SweepReport {
     /// "this run did something".
     pub fn settled(&self) -> usize {
         self.routed.values().sum::<usize>() + self.stamped.values().sum::<usize>()
+    }
+
+    /// Rows this run took off the work list — or, in a preview, **would** take
+    /// off it.
+    ///
+    /// The three outcomes that are a visit: a model was spent (`asked`, which
+    /// in a preview is the rows the identifier answered about), the pre-filter
+    /// declined the row, or the audio is gone. `too_short` and `unavailable`
+    /// are deliberately not here: those two are still owed, because the thing
+    /// that would change them — the floor, and whether the identifier is
+    /// installed — is not on the row.
+    ///
+    /// It exists so a **preview** can print a truthful "still owed" line.
+    /// A preview writes nothing, so the database's own count cannot fall, and
+    /// a run that would finish the archive has to be able to say so.
+    pub fn resolved(&self) -> usize {
+        self.asked + self.left_alone + self.no_audio
     }
 }
 
@@ -301,32 +350,56 @@ pub fn sweep_one(
     poly: &mut Polyglot,
     row: &SweepCandidate,
 ) -> Result<Swept> {
+    // Marking a row visited is the last thing every arm below does, so it is
+    // written once, here. `at` is read before any model runs: what it records
+    // is when the sweep *decided*, and a timestamp taken after a two-second GPU
+    // decode would say the decision was made on evidence that arrived after it.
+    let at = crate::clock::utc_now_ns();
+    let visited = |outcome: Swept| -> Result<Swept> {
+        if pass.apply {
+            let guard = pass.store.lock().unwrap_or_else(|p| p.into_inner());
+            guard.mark_segment_swept(row.id, at)?;
+        }
+        Ok(outcome)
+    };
+
     // The cheap half first, and it is the same function the live path gates on
     // — reused rather than re-derived, because a second copy of this rule is a
     // second rule. A readable transcript or a voice pinned to somebody else's
     // language costs a string scan and no disk.
+    //
+    // It is still a **visit**, and that is 0.12.1's fix. 0.11.9 left these rows
+    // unmarked so that a declaration added tomorrow could still reach them, and
+    // paid for it with a work list that never emptied: 1,729 of the live
+    // install's 1,782 rows land here, so every run re-read all of them and no
+    // output could ever say the sweep was finished. The future decision is
+    // protected by [`Store::clear_segment_sweep`] and
+    // [`Store::clear_speaker_sweep`] instead — by *un*-marking the row when
+    // what was read actually changes, which is a claim about the row rather
+    // than a refusal to make one.
     if asr_cjk::pre_route(row.declared.as_ref(), row.text.as_deref(), pass.asr_cfg())
         == Pre::Nothing
     {
-        return Ok(Swept::LeftAlone);
+        return visited(Swept::LeftAlone);
     }
     let samples = match crate::ingest::read_wav(&pass.data_dir.join(&row.audio_path)) {
         Ok(s) if !s.is_empty() => s,
-        _ => {
-            if pass.apply {
-                let guard = pass.store.lock().unwrap_or_else(|p| p.into_inner());
-                guard.mark_segment_swept(row.id)?;
-            }
-            return Ok(Swept::NoAudio);
-        }
+        _ => return visited(Swept::NoAudio),
     };
     // The floor is checked here as well as inside the routes, so that a row
     // under it is never counted as asked. The routes would refuse it anyway;
     // this is the difference between "we spent nothing" and "we spent nothing
     // and said we did".
+    //
+    // **Not** a visit, unlike the pre-filter above, and the asymmetry is the
+    // point of having a rule rather than a habit: what would change this answer
+    // is the floor, which is configuration and not data, so no write to this
+    // row can move it and nothing would ever clear the mark. An operator who
+    // lowers `lang_sweep_min_s` has to get these rows back, and they do —
+    // because nothing was written about them.
     let cfg = pass.asr_cfg();
     if (samples.len() as f32 / SAMPLE_RATE as f32) < cfg.lid_min_s {
-        return Ok(Swept::LeftAlone);
+        return Ok(Swept::TooShort);
     }
 
     // Two ways to get a reading, and which one is used is the whole of
@@ -356,7 +429,7 @@ pub fn sweep_one(
             )?
         };
         if let Some(routed) = checked.routed {
-            return Ok(Swept::Routed {
+            return visited(Swept::Routed {
                 lang: routed.lang.to_string(),
             });
         }
@@ -381,7 +454,7 @@ pub fn sweep_one(
                 )?
             };
             if let Some(routed) = routed {
-                return Ok(Swept::Routed { lang: routed.lang });
+                return visited(Swept::Routed { lang: routed.lang });
             }
         }
         // A route that never ran its identifier spent nothing on this row, and
@@ -417,20 +490,21 @@ pub fn sweep_one(
         });
     }
 
-    let guard = pass.store.lock().unwrap_or_else(|p| p.into_inner());
-    match heard
+    let stamped = heard
         .as_ref()
-        .and_then(|r| STAMPABLE.iter().copied().find(|t| *t == r.lang))
-    {
-        Some(tag) => {
-            guard.set_segment_language(row.id, tag, lang_via::SWEEP)?;
-            Ok(Swept::Stamped { lang: tag })
-        }
-        None => {
-            guard.mark_segment_swept(row.id)?;
-            Ok(Swept::Marked)
-        }
+        .and_then(|r| STAMPABLE.iter().copied().find(|t| *t == r.lang));
+    if let Some(tag) = stamped {
+        let guard = pass.store.lock().unwrap_or_else(|p| p.into_inner());
+        guard.set_segment_language(row.id, tag, lang_via::SWEEP)?;
     }
+    // The visit is written last and in both cases. Since 0.12.1 `Marked` no
+    // longer writes anything of its own — `sweep_at_ns` *is* the mark, and
+    // `lang_via = "sweep"` went back to meaning one thing: the de/en stamp
+    // above, which is a provenance and always was.
+    visited(match stamped {
+        Some(lang) => Swept::Stamped { lang },
+        None => Swept::Marked,
+    })
 }
 
 /// Walk the work list, oldest first, until it dries up or the budget runs out.
@@ -516,15 +590,29 @@ pub fn run_pass(
                     // still in the work list when it looks again.
                     passed.insert(row.id);
                 }
+                // `passed` on all three, and for two different reasons. An
+                // `--apply` run has already taken the first off the list in
+                // the database, so remembering it is redundant and harmless; a
+                // *preview* has not, and without this the walk would hand the
+                // same free rows back for ever. The last two are never marked
+                // in either mode, so for them this set is the only thing that
+                // moves the walk forward.
                 Swept::LeftAlone => {
                     report.left_alone += 1;
+                    passed.insert(row.id);
+                }
+                Swept::TooShort => {
+                    report.too_short += 1;
                     passed.insert(row.id);
                 }
                 Swept::Unavailable => {
                     report.unavailable += 1;
                     passed.insert(row.id);
                 }
-                Swept::NoAudio => report.no_audio += 1,
+                Swept::NoAudio => {
+                    report.no_audio += 1;
+                    passed.insert(row.id);
+                }
             }
         }
         // Told after the batch, which is the night shift's order: the words are
@@ -972,6 +1060,171 @@ mod tests {
         assert_ne!(lang_via::SWEEP, lang_via::GUESSED);
     }
 
+    /// A store with `n` rows of the given text, two seconds each, no speaker.
+    fn an_archive_of(text: &str, n: i64) -> (Store, Vec<i64>) {
+        let store = Store::open_in_memory().expect("a store");
+        let source = store
+            .upsert_source("VRChat.exe", "VRChat.exe", 1)
+            .expect("a source");
+        let session = store.begin_session(source, 0).expect("a session");
+        let ids = (0..n)
+            .map(|i| {
+                let id = store
+                    .insert_segment(
+                        session,
+                        i * 10_000_000_000,
+                        i * 10_000_000_000 + 2_000_000_000,
+                        &format!("segments/000001/seg-{i}.wav"),
+                        0,
+                    )
+                    .expect("a segment");
+                store
+                    .set_segment_text_via(id, text, "m@1", "live", 0)
+                    .expect("text");
+                id
+            })
+            .collect();
+        (store, ids)
+    }
+
+    /// One `--apply` pass over a store, with no models installed — so the only
+    /// outcome reachable is the free one.
+    fn a_pass_over(store: &Arc<Mutex<Store>>) -> SweepReport {
+        let cfg = AsrConfig::default();
+        let lang_cfg = LangConfig::default();
+        let pass = Pass::new(
+            store,
+            None,
+            std::path::Path::new("/nonexistent"),
+            &cfg,
+            &lang_cfg,
+            true,
+        );
+        let (mut cjk, mut poly) = routers(pass.asr_cfg());
+        let never = || false;
+        run_pass(&pass, &mut cjk, &mut poly, 32, None, &never, |_| {}).expect("a pass")
+    }
+
+    fn owed(store: &Arc<Mutex<Store>>) -> i64 {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        guard.lang_sweep_counts(1.5).unwrap().0
+    }
+
+    #[test]
+    fn a_row_the_pre_filter_declines_leaves_the_work_list_too() {
+        // THE defect, from the live box (0.12.0): `recalld lang sweep --apply`
+        // reported "1729 already readable … 1730 still owed" run after run,
+        // for ever. The 53 rows that needed a model were done on the first
+        // pass; the 1,729 the text pre-filter declines were counted as owed
+        // every time, so the walk never emptied, the nightly pass re-read all
+        // of them every night, and no output ever said the sweep was finished.
+        //
+        // 0.11.9 left them unmarked on purpose — "a declaration can be added
+        // tomorrow, and marking them would freeze a decision that was free to
+        // re-make". That reasoning was right about the live path's future
+        // decision and wrong about the bookkeeping: what the sweep *owes* and
+        // what the sweep may one day *reconsider* are different questions, and
+        // `lang_via` could not answer both.
+        let (store, ids) = an_archive_of("ich glaube das ist der einzige weg", 3);
+        let store = Arc::new(Mutex::new(store));
+        assert_eq!(owed(&store), 3, "all three before anybody has looked");
+
+        let first = a_pass_over(&store);
+        assert_eq!(first.left_alone, 3);
+        assert_eq!(first.asked, 0, "no model was spent on any of them");
+
+        // The fix: looking at a row and deciding it needs nothing is a visit,
+        // and a visited row is not owed.
+        assert_eq!(
+            owed(&store),
+            0,
+            "nothing a model pass could change is still owed"
+        );
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .segments_for_lang_sweep(1.5, 10)
+                .unwrap()
+                .is_empty()
+        );
+        // …and the second run is free, which is what the nightly pass does 364
+        // more times.
+        let second = a_pass_over(&store);
+        assert_eq!(second.scanned, 0, "the walk is finished, not looping");
+        assert_eq!(second.left_alone, 0);
+
+        // Nothing was claimed about any of them: the mark is a visit, not a
+        // language, and `lang_via` is untouched so no other pass reads it.
+        let guard = store.lock().unwrap();
+        for id in &ids {
+            let subject = guard.language_subject(*id).unwrap().expect("a row");
+            assert_eq!(subject.lang_via, None, "row {id} carries no provenance");
+        }
+    }
+
+    #[test]
+    fn changing_what_pre_route_reads_puts_a_row_back_on_the_list() {
+        // The half of 0.11.9's reasoning that was right, kept. `pre_route`
+        // declines a row because of what its **text** says and what its
+        // **voice** is declared to speak; both can change, and when either does
+        // the sweep owes the row again. Otherwise the visit would freeze a
+        // decision that was free to re-make — which is the thing the original
+        // "never mark them" rule was protecting, and it is protected here by
+        // clearing the mark rather than by never writing it.
+
+        // 1. The words change.
+        let (store, ids) = an_archive_of("ich glaube das ist der einzige weg", 1);
+        let store = Arc::new(Mutex::new(store));
+        a_pass_over(&store);
+        assert_eq!(owed(&store), 0);
+        store
+            .lock()
+            .unwrap()
+            .set_segment_text_via(ids[0], "Sima Sen Okenki Deska.", "m@2", "context", 1)
+            .unwrap();
+        assert_eq!(
+            owed(&store),
+            1,
+            "a re-decoded transcript is one nobody has pre-filtered"
+        );
+
+        // 2. The voice's declaration changes. A speaker pinned to German is
+        // `correct_language`'s business and the sweep declines the row; clear
+        // the pin and it is the sweep's again.
+        let (store, ids) = an_archive_of("mumble mumble", 1);
+        let speaker = store.create_speaker("Aspen", 0).unwrap();
+        store
+            .set_speaker_languages(speaker, Some(&["de".to_string()]))
+            .unwrap();
+        store
+            .set_segment_speaker(ids[0], Some(speaker), None)
+            .unwrap();
+        let store = Arc::new(Mutex::new(store));
+        assert_eq!(a_pass_over(&store).left_alone, 1, "somebody else's row");
+        assert_eq!(owed(&store), 0);
+        store
+            .lock()
+            .unwrap()
+            .set_speaker_languages(speaker, None)
+            .unwrap();
+        assert_eq!(
+            owed(&store),
+            1,
+            "the pin is gone, so the reason for declining the row is too"
+        );
+
+        // 3. …and so does giving the row a different voice altogether.
+        a_pass_over(&store);
+        assert_eq!(owed(&store), 0);
+        store
+            .lock()
+            .unwrap()
+            .set_segment_speaker(ids[0], None, None)
+            .unwrap();
+        assert_eq!(owed(&store), 1);
+    }
+
     #[test]
     fn a_swept_row_leaves_the_work_list_and_a_left_alone_row_does_not() {
         let store = Store::open_in_memory().expect("a store");
@@ -1001,16 +1254,26 @@ mod tests {
             3,
             "every untagged row with audio is on the list"
         );
-        // One stamped, one marked: both leave.
+        // One stamped, one marked: both leave. The stamped row gets both
+        // writes, because that is what `sweep_one` does — the language is a
+        // provenance and the visit is bookkeeping, and since 0.12.1 they are
+        // two different columns saying two different things.
         store
             .set_segment_language(ids[0], "de", lang_via::SWEEP)
             .unwrap();
-        store.mark_segment_swept(ids[1]).unwrap();
+        store.mark_segment_swept(ids[0], 7).unwrap();
+        store.mark_segment_swept(ids[1], 7).unwrap();
         let left = store.segments_for_lang_sweep(1.0, 10).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, ids[2]);
         // The counts a `lang status` line reads say the same thing.
         assert_eq!(store.lang_sweep_counts(1.0).unwrap(), (1, 2));
+        // A marked row keeps its NULL `lang_via`: the mark is a visit, and
+        // `lang_via = "sweep"` is only ever the de/en stamp.
+        assert_eq!(
+            store.language_subject(ids[1]).unwrap().unwrap().lang_via,
+            None
+        );
         // And the floor really is a floor: at 2.5 s none of these 2 s rows is
         // on the list at all.
         assert!(store.segments_for_lang_sweep(2.5, 10).unwrap().is_empty());
@@ -1174,9 +1437,13 @@ mod tests {
             "and the budget of 1 did not stop the walk after one free row"
         );
         assert_eq!(report.scanned, 5);
-        // Nothing was written, so the work list is exactly as long as it was.
+        // All five were resolved without a model, so `--apply` has emptied the
+        // list even though the budget was never touched. Before 0.12.1 this
+        // read `5` and that was the defect: a budget that cannot be spent and a
+        // list that cannot empty is a nightly pass that runs for ever.
+        assert_eq!(report.resolved(), 5);
         let guard = store.lock().unwrap();
-        assert_eq!(guard.segments_for_lang_sweep(1.5, 10).unwrap().len(), 5);
+        assert!(guard.segments_for_lang_sweep(1.5, 10).unwrap().is_empty());
     }
 
     #[test]

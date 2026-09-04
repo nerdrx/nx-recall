@@ -1209,6 +1209,26 @@ above this line changes, and `proto` stays `1`.
   | every user < 0.2, truth data within 5 min | `nobody` | nothing |
   | no truth data within 5 min | `unknown` | nothing |
 
+  - **Your own account is not presence on audio your own client made**
+    (0.12.1, FINDINGS §34). Coverage is counted for every account exactly as
+    above — it describes the *call* — but a user is only **present** in a turn
+    if the recording can physically contain their voice, and on a `sources.kind
+    = "app"` stream captured from the user's own Discord client, theirs cannot:
+    a client never plays your microphone back to you (0.10.1, FINDINGS §17).
+    Every Discord account linked to the pinned "You" voice is therefore dropped
+    from presence on `app` audio, and only there — on `mic` and `room` the
+    user's own account is the one voice that *can* be present and nothing is
+    dropped. With no account linked to "You", nothing is known to be inaudible
+    and the rule does not fire.
+
+    It reads as one line and it moved three quarters of this install's
+    `overlap` pile: 1,791 `overlap` verdicts became 450, because 1,341 of them
+    were the user talking over one other person — single-speaker audio wearing
+    an `overlap` label. `single` went 1,474 → 2,466, `partial` 516 → 597,
+    `nobody` 350 → 618. A `single` naming only the user becomes `nobody`, which
+    is what `nobody` has always meant: truth covers this moment and none of the
+    voices this recording can hold was in it.
+
   - **`partial` is a fifth verdict and it had to exist.** A VAD span whose
     edges run past the words is common. Folding it into `single` would
     quietly lower a bar that was set at 0.8 on purpose; folding it into
@@ -1230,7 +1250,10 @@ above this line changes, and `proto` stays `1`.
     `truth_coverage`. The verdict asks whether two users each covered a fifth
     of the turn somewhere in it; this asks how much of it they overlapped.
     Each user's own spans are merged first (as coverage does), then a sweep
-    totals the time at depth ≥ 2. The v13 migration backfills it for verdicts
+    totals the time at depth ≥ 2. Since 0.12.1 it takes the same audibility
+    rule the verdict does — a mouth the stream cannot carry is not a second
+    voice in it — so on `app` audio the user's own spans are dropped before the
+    sweep. The v13 migration backfills it for verdicts
     already on disk, but **only where the speaking spans survive** — a purged
     span and a quiet turn would otherwise both read 0.0, so a row it cannot
     measure stays NULL. `nobody` and `unknown` are never stamped: there is no
@@ -3696,6 +3719,115 @@ has since declared `ja` clears guard 1 and its rows are then judged on guards 2
 and 3 alone — which on this install keeps ten rewrites, two of them right. Run
 the repair **before** widening a declaration, not after.
 
+## 0.12.1 — the sweep can finish (schema v16)
+
+`recalld lang sweep --apply` never emptied its work list. On the live install it
+printed the same two lines after every run:
+
+```text
+  1729  already readable, or a voice pinned to a language another pass owns
+1730 still owed
+```
+
+The 53 rows that needed the identifier were done on the first pass and stayed
+done. The 1,729 that [`asr_cjk::pre_route`] declines — a transcript that already
+reads as something, or a voice pinned to a language `correct_language` owns —
+were counted as owed every time, so the nightly pass re-walked all of them every
+night and no output could ever say the archive was swept.
+
+0.11.9 left those rows unmarked on purpose: they cost a string compare and no
+model, a declaration can be added tomorrow, and marking them would freeze a
+decision that was free to re-make. That reasoning was right about the future
+decision and wrong about the arithmetic, and the cause of both is that
+`lang_via` was being asked two questions — *how did this row get its language*
+and *has this pass been here* — that only one column can answer at a time.
+
+#### `segments.sweep_at_ns` (new, schema v16)
+
+- **A visit, not a claim.** Nullable; set to the moment the sweep reached a
+  conclusion about the row, whatever the conclusion was: re-decoded, stamped
+  `de`/`en`, asked and nothing to act on, audio gone, **and declined by the
+  pre-filter**. Nothing but `crate::sweep` reads it, which is what makes marking
+  a declined row safe.
+- **The one free outcome that is not a visit** is a clip under
+  `[asr].lang_sweep_min_s`. What would change that answer is configuration, not
+  data, so no write to the row could ever clear the mark; an operator who lowers
+  the floor must get those rows back, and does.
+- **It is cleared whenever something `pre_route` reads changes**, which is the
+  0.11.9 guarantee kept by a different mechanism. The row's words
+  (`set_segment_text_via`, `set_segment_analysis`), its voice
+  (`set_segment_speaker_via`, `merge_speakers`), or that voice's declared
+  languages (`set_speaker_languages`, i.e. `recalld languages`) each hand the
+  rows concerned straight back to the next run. Declaring a voice Japanese now
+  re-opens its whole history to the sweep, which is the retroactive behaviour
+  `recalld lang repair` has always had.
+
+#### `lang_via: "sweep"` now means one thing
+
+It is written **only with `lang` set**, to `de` or `en`. The bare form 0.11.9
+also wrote — `lang_via: "sweep"` with `lang: null`, as an "asked, nothing to
+say" mark — is gone; that was the second question, and it lives in
+`sweep_at_ns` now. **The v16 migration renames the existing ones**: every row
+carrying the bare form gets `sweep_at_ns = 0` (the honest answer to *when* is
+"before this migration") and its `lang_via` back to null. Rows with the stamp
+form are untouched. A client that special-cased the bare form can drop that
+branch; one that reads `lang_via` for provenance sees strictly fewer values.
+
+#### The CLI says when it is done
+
+- `recalld lang sweep` and `--apply` both end in `0 still owed — the archive is
+  swept` once nothing a model pass could change remains. A **preview** writes
+  nothing, so its own count cannot fall; it subtracts the rows it just resolved
+  and reports what `--apply` would leave, rather than printing the number the
+  operator started with.
+- `recalld lang` reports `sweep   N never asked about, M already swept`, where
+  `M` counts visits and therefore includes rows whose language the sweep set.
+
+## 0.12.1 — the verdicts on disk, re-judged
+
+The own-account rule above changed what a verdict *means*, and every verdict on
+disk was written by the old meaning. Leaving them is not "old data": the overlap
+gate's precision and recall, the calibration corpus and `identity calibrate`'s
+held-out gate curve all read those rows, so a stale `overlap` pile is a wrong
+answer key that keeps being marked against. FINDINGS §34 has the before/after.
+
+**`recalld truth rejudge`** lists what would move; `--apply` writes; `--limit N`
+stops after N. No schema change: the verdict is recomputed from the speaking
+spans exactly as the nightly pass computes a fresh one, `truth_overlap_frac` is
+re-measured under the same rule, and each `--apply` logs one `truth.rejudge`
+operation per 200 rows carrying every segment's prior verdict.
+
+Only `single`, `overlap` and `partial` are examined, and that is a closed
+argument rather than an optimisation: the rule only ever *removes* presence, and
+removing presence cannot turn a `nobody` into anything or make an `unknown`
+known. The pass is therefore bounded by the verdicts that assert somebody was
+talking — 3,781 rows on the install it was measured on, not the 9,770 with a
+verdict of any kind.
+
+Where the speaking spans have been purged:
+
+| stored verdict | what the pass does |
+|---|---|
+| `single`/`partial` naming **you** | `nobody`, no spans needed — the verdict itself records that nobody else reached the presence bar, which is the whole question |
+| `single`/`partial` naming anybody else | unchanged, and provably so: the same fact read the other way round |
+| **`overlap`** | **left exactly as it is, and counted.** It records that two accounts were present and not which two; guessing here would invent the thing the pass exists to correct |
+
+**It runs once by itself**, in the ground-truth worker, on the first start after
+the upgrade — bounded to 10,000 rows, gated on `[truth] label` with everything
+else in that worker (the switch that lets the daemon write verdicts is the
+switch that lets it correct them), and marked done by the `settings` row it
+writes. It is a pass and not a migration on purpose: it reads the speaking spans
+and can take thousands of small queries, and a migration that does that runs
+while the user is waiting for the daemon to come up. With `[truth] label = false`
+the CLI is the route and the operator drives it.
+
+**`truth.summary` carries `rejudge`** — `null` until the pass has run, otherwise
+`{at_ms, examined, changed, overlap_reassigned, from_columns, unresolvable,
+restamped, moves: [{from, to, n}]}`. `recalld truth report` prints it as a
+`re-judged` block, because "450 `overlap` rows" and "450 `overlap` rows, and
+1,341 more used to be counted here" are different facts about the same install
+and every measurement made before the rule read the second number without
+knowing it.
 ## 0.12.1 — per-user Discord audio
 
 Every Discord turn this daemon has ever stored came off the **mixed** stream:
