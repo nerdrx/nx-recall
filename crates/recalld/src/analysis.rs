@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::arbiter::{Arbiters, Arbitration};
-use crate::asr::{Asr, normalise_words};
+use crate::asr::normalise_words;
 use crate::config::{IdentityConfig, LangConfig, SAMPLE_RATE, TruthConfig};
 use crate::embed::{Embedder, Embedding};
 use crate::identity::{self, Decision, Refusal};
@@ -193,7 +193,9 @@ pub enum LanguageFix {
 
 pub struct Analyzer {
     overlap: OverlapDetector,
-    asr: Asr,
+    /// One transducer, behind whichever binding `[identity].split_turns` asked
+    /// for at load (0.12.4). See [`crate::asr::Decoder`].
+    asr: crate::asr::Decoder,
     embedder: Embedder,
     cfg: IdentityConfig,
     /// The conversational language prior's thresholds and the arbiter's
@@ -238,7 +240,7 @@ impl Analyzer {
         }
         Ok(Self {
             overlap: OverlapDetector::load(&models.segmentation)?,
-            asr: Asr::load(models)?,
+            asr: crate::asr::Decoder::load(models, cfg.split_turns)?,
             embedder: Embedder::load(models)?,
             cfg: cfg.clone(),
             lang_cfg: LangConfig::default(),
@@ -315,6 +317,12 @@ impl Analyzer {
         self.arbiters.installed()
     }
 
+    /// The operating point this analyzer was loaded with. The archive resplit
+    /// reads it to say whether a turn was too short to cut or merely unchanged.
+    pub fn identity_config(&self) -> &IdentityConfig {
+        &self.cfg
+    }
+
     pub fn embed_model_id(&self) -> &str {
         self.embedder.model_id()
     }
@@ -338,6 +346,64 @@ impl Analyzer {
         self.prepare_with(samples, Gate::Full)
     }
 
+    // ---- 0.12.4, cutting a turn where the speaker changes ------------------
+
+    /// Where this turn should be cut, and what was said in each piece.
+    ///
+    /// **Only called when `[identity].split_turns` is on.** With the switch off
+    /// the pipeline never reaches here and decodes exactly where it always did,
+    /// so an install that has not asked for this feature does not pay a
+    /// reordering for it either.
+    ///
+    /// On, it costs one ERes2Net pass per hop, plus moving the turn's decode
+    /// ahead of the row insert. That is what the switch buys its recall with,
+    /// and the reason it is measured in FINDINGS §39 rather than assumed.
+    pub fn plan_split(&mut self, samples: &[f32]) -> Result<crate::turnsplit::Plan> {
+        let (whole, words) = self.asr.transcribe_timed(samples);
+        let shape = crate::turnsplit::Shape::from_config(&self.cfg, SAMPLE_RATE);
+        let cuts = if self.cfg.split_turns && shape.cuttable(samples.len()) {
+            let windows = shape.windows_of(samples.len());
+            let mut vectors = Vec::with_capacity(windows.len());
+            for w in &windows {
+                vectors.push(self.embedder.embed(&samples[w.from..w.to], SAMPLE_RATE)?);
+            }
+            let curve = crate::turnsplit::curve(&shape, &windows, &vectors)?;
+            crate::turnsplit::cuts(&shape, samples.len(), &curve)
+        } else {
+            Vec::new()
+        };
+        // Not a special case for its own sake: an uncut turn keeps the
+        // decoder's own string, punctuation and all, rather than one rebuilt
+        // from the word list.
+        let uncut = |wordless| crate::turnsplit::Plan {
+            pieces: vec![(
+                crate::turnsplit::Piece {
+                    from: 0,
+                    to: samples.len(),
+                },
+                whole.clone(),
+            )],
+            wordless,
+        };
+        let pieces = crate::turnsplit::pieces(samples.len(), &cuts);
+        if pieces.len() == 1 {
+            return Ok(uncut(false));
+        }
+        let split: Vec<(crate::turnsplit::Piece, String)> =
+            crate::turnsplit::spans(&pieces, SAMPLE_RATE)
+                .into_iter()
+                .map(|(p, from, to)| (p, crate::asr::words_in_span(&words, from, to)))
+                .collect();
+        if !crate::turnsplit::every_piece_speaks(&split) {
+            return Ok(uncut(true));
+        }
+        Ok(crate::turnsplit::Plan {
+            pieces: split,
+            wordless: false,
+        })
+    }
+    // ---- end 0.12.4 --------------------------------------------------------
+
     /// [`Self::prepare`], with a say in which gate the embedding is behind.
     ///
     /// The overlap detector still RUNS under every gate and its reading is
@@ -346,10 +412,39 @@ impl Analyzer {
     /// [`Gate::SingleSpeaker`] changes is only whether a positive reading is
     /// allowed to throw the embedding away.
     pub fn prepare_with(&mut self, samples: &[f32], gate: Gate) -> Result<Prepared> {
+        self.prepare_maybe_said(samples, gate, None)
+    }
+
+    /// [`Self::prepare_with`], decoding the audio unless the words are already
+    /// in hand. `None` is the path every caller took before 0.12.4 and takes
+    /// still while `[identity].split_turns` is off — same call, same cost, same
+    /// order.
+    pub fn prepare_maybe_said(
+        &mut self,
+        samples: &[f32],
+        gate: Gate,
+        said: Option<String>,
+    ) -> Result<Prepared> {
+        let raw = match said {
+            Some(text) => text,
+            None => self.asr.transcribe(samples),
+        };
+        self.prepare_said(samples, gate, raw)
+    }
+
+    /// [`Self::prepare_with`] for audio whose words are already known.
+    ///
+    /// The one caller is a piece of a cut turn (0.12.4): the whole turn was
+    /// decoded once, with times, and this piece's words are the ones that
+    /// *start* inside it ([`crate::asr::words_in_span`]). Handing them in
+    /// rather than decoding the piece is what makes the split lossless — every
+    /// word of the turn belongs to exactly one piece by construction, where two
+    /// independent decodes could drop a word straddling the cut or spell it
+    /// twice — and it is also the cheaper of the two, one decode instead of N.
+    pub fn prepare_said(&mut self, samples: &[f32], gate: Gate, raw: String) -> Result<Prepared> {
         let duration_s = samples.len() as f32 / SAMPLE_RATE as f32;
         let overlap_frac = self.overlap.overlap_frac(samples)?;
 
-        let raw = self.asr.transcribe(samples);
         // An empty transcript is stored as NULL rather than "": it keeps the
         // full-text index free of empty documents and makes "has a transcript"
         // a single IS NOT NULL.
@@ -1360,9 +1455,10 @@ pub fn analyse_or_log(
     stats: &AnalysisStats,
     segment_id: i64,
     samples: &[f32],
+    said: Option<String>,
     now_utc_ns: i64,
 ) -> Vec<i64> {
-    let prepared = match analyzer.prepare(samples) {
+    let prepared = match analyzer.prepare_maybe_said(samples, Gate::Full, said) {
         Ok(p) => p,
         Err(e) => {
             warn!(segment_id, "analysis failed: {e:#}");
@@ -1391,6 +1487,7 @@ pub fn analyse_or_log(
 /// Same shape, same lock discipline; the only difference is which `commit` runs
 /// — and that difference is the whole point, because a mic turn must never fall
 /// through to the voicebank.
+#[allow(clippy::too_many_arguments)]
 pub fn analyse_mic_or_log(
     analyzer: &mut Analyzer,
     store: &std::sync::Mutex<Store>,
@@ -1398,9 +1495,10 @@ pub fn analyse_mic_or_log(
     segment_id: i64,
     samples: &[f32],
     mic: &MicEnroll<'_>,
+    said: Option<String>,
     now_utc_ns: i64,
 ) -> Vec<i64> {
-    let prepared = match analyzer.prepare(samples) {
+    let prepared = match analyzer.prepare_maybe_said(samples, Gate::Full, said) {
         Ok(p) => p,
         Err(e) => {
             warn!(segment_id, "analysis failed: {e:#}");
@@ -1432,6 +1530,7 @@ pub fn analyse_mic_or_log(
 /// construction: [`Gate::SingleSpeaker`], so an overlap reading cannot cost the
 /// embedding, and [`Analyzer::commit_pinned`], so the voicebank is never asked
 /// a question it cannot answer better than the wire already did.
+#[allow(clippy::too_many_arguments)]
 pub fn analyse_pinned_or_log(
     analyzer: &mut Analyzer,
     store: &std::sync::Mutex<Store>,
@@ -1439,9 +1538,10 @@ pub fn analyse_pinned_or_log(
     segment_id: i64,
     samples: &[f32],
     pin: &PinnedLeg<'_>,
+    said: Option<String>,
     now_utc_ns: i64,
 ) -> Vec<i64> {
-    let prepared = match analyzer.prepare_with(samples, Gate::SingleSpeaker) {
+    let prepared = match analyzer.prepare_maybe_said(samples, Gate::SingleSpeaker, said) {
         Ok(p) => p,
         Err(e) => {
             warn!(segment_id, "analysis failed: {e:#}");

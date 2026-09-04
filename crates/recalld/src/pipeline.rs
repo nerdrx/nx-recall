@@ -858,6 +858,14 @@ impl Pipeline {
         Ok(())
     }
 
+    /// One turn, as one row or — with `[identity].split_turns` on — as one row
+    /// per piece where the person talking changes (0.12.4).
+    ///
+    /// The split is decided here, before a file exists, because a piece is an
+    /// ordinary turn in every later respect: its own clip, its own row, its own
+    /// transcript, its own trip through the identity ladder. Nothing downstream
+    /// of this function knows a split happened, and the wire shape does not
+    /// change — a split turn is two ordinary segments.
     fn write_segment(&mut self, session_id: i64, span: crate::vad::SegmentSpan) -> Result<()> {
         // Checked again here, not only in `on_audio`: this is the one place a
         // file and a row are created, so this is where "no writes" has to be
@@ -874,8 +882,86 @@ impl Pipeline {
             return Ok(());
         }
 
-        let t_start_ns = session.utc_of_sample(span.start);
-        let t_end_ns = session.utc_of_sample(span.end);
+        // ---- 0.12.4: where the speaker changes ----
+        //
+        // The whole turn, decoded once, and the words handed to each piece by
+        // time — never a second decode per piece, which is what would let a
+        // word straddling the cut be lost or spelled twice.
+        //
+        // Off, this is one piece with no words in hand and the decode happens
+        // exactly where it always has: inside the analysis leg, after the row
+        // exists. That is not an optimisation, it is the guarantee that an
+        // install which has not asked for this feature does not get a
+        // re-ordered pipeline either.
+        let plan: Vec<(crate::turnsplit::Piece, Option<String>)> = match self
+            .analyzer
+            .as_mut()
+            .filter(|_| self.cfg.identity.split_turns && !self.control.is_paused())
+        {
+            Some(a) => match a.plan_split(&samples) {
+                Ok(p) => p
+                    .pieces
+                    .into_iter()
+                    .map(|(piece, text)| (piece, Some(text)))
+                    .collect(),
+                Err(e) => {
+                    // A detector that fell over must cost a split, never a
+                    // recording. The turn is written whole, as it would have
+                    // been with the switch off.
+                    warn!(session_id, "could not look for a speaker change: {e:#}");
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        let plan = if plan.is_empty() {
+            vec![(
+                crate::turnsplit::Piece {
+                    from: 0,
+                    to: samples.len(),
+                },
+                None,
+            )]
+        } else {
+            plan
+        };
+        if plan.len() > 1 {
+            info!(
+                session_id,
+                pieces = plan.len(),
+                seconds = samples.len() as f32 / SAMPLE_RATE as f32,
+                "the turn changes speaker; writing it as separate rows"
+            );
+        }
+        let mut last = Ok(());
+        for (piece, said) in plan {
+            last = self.write_piece(session_id, span, &samples, piece, said);
+            if last.is_err() {
+                break;
+            }
+        }
+        last
+    }
+
+    /// One row: the whole turn, or one piece of a split one.
+    fn write_piece(
+        &mut self,
+        session_id: i64,
+        span: crate::vad::SegmentSpan,
+        turn: &[f32],
+        piece: crate::turnsplit::Piece,
+        said: Option<String>,
+    ) -> Result<()> {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return Ok(());
+        };
+        let samples = turn[piece.from..piece.to].to_vec();
+        if samples.is_empty() {
+            return Ok(());
+        }
+
+        let t_start_ns = session.utc_of_sample(span.start + piece.from as u64);
+        let t_end_ns = session.utc_of_sample(span.start + piece.to as u64);
         session.segment_seq += 1;
         let is_mic = session.is_mic;
         let is_room = session.is_room;
@@ -953,6 +1039,7 @@ impl Pipeline {
                         data_dir: &self.data_dir,
                         max_goldens: self.cfg.mic.max_goldens,
                     },
+                    said,
                     t_start_ns,
                 ),
                 None if is_mic => Vec::new(),
@@ -981,6 +1068,7 @@ impl Pipeline {
                         // permission has lived since 0.9.0.
                         enrol: self.truth_cfg.enrol,
                     },
+                    said,
                     t_start_ns,
                 ),
                 None => analyse_or_log(
@@ -989,6 +1077,7 @@ impl Pipeline {
                     &self.analysis_stats,
                     segment_id,
                     &samples,
+                    said,
                     t_start_ns,
                 ),
             };

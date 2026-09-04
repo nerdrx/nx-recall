@@ -2057,6 +2057,227 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    // ---- 0.12.4: cutting a turn where the speaker changes -----------------
+
+    /// Archive turns worth looking for a speaker change in
+    /// (`crate::turnsplit`).
+    ///
+    /// `partial` and `overlap` and nothing else, because those are the two
+    /// verdicts that *mean* the row holds more than one person's audio, and a
+    /// pass that walked `single` rows would be re-deciding turns Discord has
+    /// already settled. A row already produced by a split is skipped by the
+    /// same rule the live path uses — it has its own verdict now.
+    ///
+    /// Rows whose clip retention has taken are still returned: the caller
+    /// counts them, because on an archive older than `[retention].audio_days`
+    /// "no audio" is the whole answer and an empty table would not say so.
+    pub fn segments_for_resplit(&self, limit: usize) -> Result<Vec<crate::turnsplit::Candidate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.session_id, g.t_start_ns, g.t_end_ns, g.audio_path, g.truth_verdict
+               FROM segments g
+              WHERE g.deleted_at IS NULL
+                AND g.truth_verdict IN (?1, ?2)
+              ORDER BY g.t_start_ns ASC, g.id ASC
+              LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![truth_verdict::PARTIAL, truth_verdict::OVERLAP, limit as i64],
+                |r| {
+                    Ok(crate::turnsplit::Candidate {
+                        segment_id: r.get(0)?,
+                        session_id: r.get(1)?,
+                        t_start_ns: r.get(2)?,
+                        t_end_ns: r.get(3)?,
+                        audio_path: r.get(4)?,
+                        verdict: r.get(5)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Cut one archive turn into pieces: the original row keeps the first one
+    /// and every other piece becomes a new row.
+    ///
+    /// **The original row survives**, shortened, rather than being replaced by
+    /// two new ones. That is the whole shape of this call and it is not a
+    /// convenience: a segment id is referenced by `threads`, `commitments`,
+    /// `time_refs`, `notes`, `speaker_prototypes.source_segment_id`,
+    /// `segment_vectors` and every correction the user has ever made. Deleting
+    /// it and minting two would orphan all of them to save one row.
+    ///
+    /// Everything the analysis leg owns — the words, the language, the
+    /// speaker, the overlap reading, the vectors, the verdict — is cleared on
+    /// the original, because all of it describes audio the row no longer
+    /// covers. The caller re-runs the analysis on each piece afterwards, which
+    /// is the same order the live path uses.
+    ///
+    /// The `operations` row is [`crate::turnsplit::OP_RESPLIT`] and carries
+    /// everything [`Self::unsplit_segment`] needs to put the turn back.
+    pub fn resplit_segment(
+        &self,
+        segment_id: i64,
+        pieces: &[(i64, i64, String)],
+        at_utc_ns: i64,
+    ) -> Result<Vec<i64>> {
+        if pieces.len() < 2 {
+            return Ok(Vec::new());
+        }
+        // Read the row back inside the call rather than trusting the caller's
+        // snapshot: the pass gathers unlocked and something may have moved the
+        // row since. A row that has gone, or has been split already, is left
+        // exactly as it is.
+        type Prior = (i64, i64, String, Option<String>, Option<String>);
+        let prior: Option<Prior> = self
+            .conn
+            .query_row(
+                "SELECT t_start_ns, t_end_ns, audio_path, text, truth_verdict
+                   FROM segments WHERE id = ?1 AND deleted_at IS NULL",
+                params![segment_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((t_start_ns, t_end_ns, audio_path, text, verdict)) = prior else {
+            return Ok(Vec::new());
+        };
+
+        let (first_start, first_end, first_path) = &pieces[0];
+        let mut minted = Vec::with_capacity(pieces.len() - 1);
+        for (start, end, path) in &pieces[1..] {
+            self.conn.execute(
+                "INSERT INTO segments (session_id, t_start_ns, t_end_ns, audio_path, created_at)
+                 SELECT session_id, ?2, ?3, ?4, ?5 FROM segments WHERE id = ?1",
+                params![segment_id, start, end, path, at_utc_ns],
+            )?;
+            minted.push(self.conn.last_insert_rowid());
+        }
+        self.conn.execute(
+            "UPDATE segments
+                SET t_start_ns = ?2, t_end_ns = ?3, audio_path = ?4,
+                    text = NULL, lang = NULL, lang_via = NULL, text_via = NULL,
+                    asr_model_id = NULL, asr_confidence = NULL, confidence_at_ns = NULL,
+                    overlap_frac = NULL, speaker_id = NULL, match_score = NULL,
+                    label_via = NULL, translation = NULL, translation_via = NULL,
+                    night_text = NULL, night_at_ns = NULL, redecode_at_ns = NULL,
+                    sweep_at_ns = NULL,
+                    truth_user_id = NULL, truth_verdict = NULL, truth_coverage = NULL,
+                    truth_overlap_frac = NULL, truth_enrol_ns = NULL
+              WHERE id = ?1",
+            params![segment_id, first_start, first_end, first_path],
+        )?;
+        // The vectors go with the words: a semantic vector of a sentence the
+        // row no longer holds is a wrong answer waiting to be given.
+        self.conn.execute(
+            "DELETE FROM segment_vectors WHERE segment_id = ?1",
+            params![segment_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM embeddings WHERE segment_id = ?1",
+            params![segment_id],
+        )?;
+
+        let mut ids = vec![segment_id];
+        ids.extend(&minted);
+        self.log_operation(
+            crate::turnsplit::OP_RESPLIT,
+            &serde_json::to_string(&ids)?,
+            &serde_json::json!({
+                "segment_id": segment_id,
+                "t_start_ns": t_start_ns,
+                "t_end_ns": t_end_ns,
+                "audio_path": audio_path,
+                "text": text,
+                "truth_verdict": verdict,
+                "minted": minted,
+            })
+            .to_string(),
+            at_utc_ns,
+        )?;
+        Ok(minted)
+    }
+
+    /// Put one split turn back: the original row regains its whole span and
+    /// its clip, and the rows the split minted are soft-deleted.
+    ///
+    /// The words are *not* restored from `prior_state` and that is deliberate:
+    /// the row's span is right again but nothing has re-read the audio, so the
+    /// honest state is a turn waiting for the analysis leg — the same state
+    /// [`Self::resplit_segment`] left it in. Restoring a transcript nothing
+    /// just decoded would be asserting a reading of audio this call has not
+    /// looked at.
+    ///
+    /// Returns false when the operation has already been undone or the row is
+    /// gone. Idempotent by the span rather than by a flag: a row that already
+    /// covers what `prior_state` says it covered was never split, or has been
+    /// put back once already, and either way there is nothing to do. Undoing
+    /// twice must not delete a second generation of pieces.
+    pub fn unsplit_segment(&self, prior: &serde_json::Value, at_utc_ns: i64) -> Result<bool> {
+        let Some(segment_id) = prior["segment_id"].as_i64() else {
+            return Ok(false);
+        };
+        let (Some(t_start_ns), Some(t_end_ns), Some(path)) = (
+            prior["t_start_ns"].as_i64(),
+            prior["t_end_ns"].as_i64(),
+            prior["audio_path"].as_str(),
+        ) else {
+            return Ok(false);
+        };
+        let n = self.conn.execute(
+            "UPDATE segments SET t_start_ns = ?2, t_end_ns = ?3, audio_path = ?4,
+                    text = NULL, lang = NULL, lang_via = NULL, text_via = NULL,
+                    asr_model_id = NULL, overlap_frac = NULL, speaker_id = NULL,
+                    match_score = NULL, label_via = NULL,
+                    truth_user_id = NULL, truth_verdict = NULL, truth_coverage = NULL,
+                    truth_overlap_frac = NULL
+              WHERE id = ?1 AND deleted_at IS NULL
+                AND (t_start_ns != ?2 OR t_end_ns != ?3)",
+            params![segment_id, t_start_ns, t_end_ns, path],
+        )?;
+        if n == 0 {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "DELETE FROM segment_vectors WHERE segment_id = ?1",
+            params![segment_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM embeddings WHERE segment_id = ?1",
+            params![segment_id],
+        )?;
+        for id in prior["minted"].as_array().into_iter().flatten() {
+            let Some(id) = id.as_i64() else { continue };
+            self.conn.execute(
+                "UPDATE segments SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+                params![id, at_utc_ns],
+            )?;
+        }
+        Ok(true)
+    }
+
+    /// Every applied `turns.resplit`, newest first — the order an undo wants.
+    pub fn resplit_operations(&self, limit: usize) -> Result<Vec<OperationRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, op, target_ids, prior_state, at_utc_ns
+               FROM operations WHERE op = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![crate::turnsplit::OP_RESPLIT, limit as i64], |r| {
+                Ok(OperationRow {
+                    id: r.get(0)?,
+                    op: r.get(1)?,
+                    target_ids: r.get(2)?,
+                    prior_state: r.get(3)?,
+                    at_utc_ns: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // ---- end 0.12.4 -------------------------------------------------------
+
     pub fn segment_count(&self, session_id: i64) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM segments WHERE session_id = ?1",
@@ -11778,5 +11999,227 @@ mod tests {
         assert!(s.clear_projection().unwrap());
         assert!(s.installed_projection().unwrap().is_none());
         assert!(!s.clear_projection().unwrap());
+    }
+
+    // ---- 0.12.4: cutting a turn where the speaker changes -----------------
+
+    /// One `overlap` turn with a transcript, a speaker and a vector — the
+    /// state a resplit has to take apart and be able to put back.
+    fn a_mixed_turn(s: &Store, verdict: &str) -> i64 {
+        let src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let sess = s.begin_session(src, 1_000).unwrap();
+        let id = s
+            .insert_segment(sess, 0, 4_000_000_000, "segments/000001/seg-1.wav", 0)
+            .unwrap();
+        s.set_segment_analysis(
+            id,
+            &SegmentAnalysis {
+                text: Some("yeah no it isn't".into()),
+                lang: Some("en".into()),
+                asr_model_id: Some("parakeet@1".into()),
+                overlap_frac: Some(0.4),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.set_segment_truth(id, Some("u1"), verdict, Some(0.5))
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn only_the_mixed_verdicts_are_offered_for_a_resplit() {
+        let s = store();
+        let overlap = a_mixed_turn(&s, truth_verdict::OVERLAP);
+        let partial = a_mixed_turn(&s, truth_verdict::PARTIAL);
+        let single = a_mixed_turn(&s, truth_verdict::SINGLE);
+        let unknown = a_mixed_turn(&s, truth_verdict::UNKNOWN);
+        let ids: Vec<i64> = s
+            .segments_for_resplit(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(|c| c.segment_id)
+            .collect();
+        assert!(ids.contains(&overlap) && ids.contains(&partial));
+        assert!(
+            !ids.contains(&single) && !ids.contains(&unknown),
+            "a turn Discord has settled is not this pass's to re-decide"
+        );
+    }
+
+    #[test]
+    fn a_resplit_keeps_the_original_row_and_mints_the_rest() {
+        let s = store();
+        let id = a_mixed_turn(&s, truth_verdict::OVERLAP);
+        let minted = s
+            .resplit_segment(
+                id,
+                &[
+                    (0, 2_000_000_000, "segments/000001/seg-1-p0.wav".into()),
+                    (
+                        2_000_000_000,
+                        4_000_000_000,
+                        "segments/000001/seg-1-p1.wav".into(),
+                    ),
+                ],
+                99,
+            )
+            .unwrap();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(minted[0], id, "the original row survives the split");
+
+        // The original now covers only its first piece, and everything the
+        // analysis leg owns about audio it no longer holds is gone.
+        let row: (i64, i64, String, Option<String>, Option<String>) = s
+            .conn
+            .query_row(
+                "SELECT t_start_ns, t_end_ns, audio_path, text, truth_verdict
+                   FROM segments WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, 0);
+        assert_eq!(row.1, 2_000_000_000);
+        assert_eq!(row.2, "segments/000001/seg-1-p0.wav");
+        assert_eq!(row.3, None, "words about audio this row no longer covers");
+        assert_eq!(row.4, None, "and the verdict that described the whole turn");
+
+        // The new row is in the same session and covers the second piece.
+        let new: (i64, i64, i64, String) = s
+            .conn
+            .query_row(
+                "SELECT session_id, t_start_ns, t_end_ns, audio_path
+                   FROM segments WHERE id = ?1",
+                params![minted[0]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        let sess: i64 = s
+            .conn
+            .query_row(
+                "SELECT session_id FROM segments WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new.0, sess);
+        assert_eq!((new.1, new.2), (2_000_000_000, 4_000_000_000));
+        assert_eq!(new.3, "segments/000001/seg-1-p1.wav");
+    }
+
+    #[test]
+    fn one_piece_is_not_a_split_and_writes_nothing() {
+        let s = store();
+        let id = a_mixed_turn(&s, truth_verdict::OVERLAP);
+        assert!(
+            s.resplit_segment(id, &[(0, 4_000_000_000, "x.wav".into())], 99)
+                .unwrap()
+                .is_empty()
+        );
+        let text: Option<String> = s
+            .conn
+            .query_row(
+                "SELECT text FROM segments WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("yeah no it isn't"));
+        assert!(s.resplit_operations(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_resplit_of_a_row_that_moved_under_it_does_nothing() {
+        let s = store();
+        let id = a_mixed_turn(&s, truth_verdict::OVERLAP);
+        s.conn
+            .execute(
+                "UPDATE segments SET deleted_at = 1 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        assert!(
+            s.resplit_segment(id, &[(0, 1, "a.wav".into()), (1, 2, "b.wav".into())], 99)
+                .unwrap()
+                .is_empty(),
+            "the gather is unlocked, so the write has to re-check"
+        );
+    }
+
+    #[test]
+    fn a_split_turn_can_be_put_back() {
+        let s = store();
+        let id = a_mixed_turn(&s, truth_verdict::OVERLAP);
+        let minted = s
+            .resplit_segment(
+                id,
+                &[
+                    (0, 2_000_000_000, "p0.wav".into()),
+                    (2_000_000_000, 4_000_000_000, "p1.wav".into()),
+                ],
+                99,
+            )
+            .unwrap();
+        let ops = s.resplit_operations(10).unwrap();
+        assert_eq!(ops.len(), 1);
+        let prior: serde_json::Value = serde_json::from_str(&ops[0].prior_state).unwrap();
+        assert!(s.unsplit_segment(&prior, 100).unwrap());
+
+        let row: (i64, i64, String) = s
+            .conn
+            .query_row(
+                "SELECT t_start_ns, t_end_ns, audio_path FROM segments WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (0, 4_000_000_000, "segments/000001/seg-1.wav".into()),
+            "the whole span, and the clip the split never deleted"
+        );
+        let gone: Option<i64> = s
+            .conn
+            .query_row(
+                "SELECT deleted_at FROM segments WHERE id = ?1",
+                params![minted[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, Some(100), "the minted piece is deleted, not orphaned");
+        // Twice is not twice as much: the second undo has nothing to do.
+        assert!(!s.unsplit_segment(&prior, 101).unwrap());
+    }
+
+    #[test]
+    fn an_undone_split_leaves_the_row_waiting_for_the_analysis_leg() {
+        // The span is right again and nothing has re-read the audio, so
+        // restoring the transcript would be asserting a reading of audio this
+        // call never looked at.
+        let s = store();
+        let id = a_mixed_turn(&s, truth_verdict::OVERLAP);
+        s.resplit_segment(
+            id,
+            &[
+                (0, 2_000_000_000, "p0.wav".into()),
+                (2_000_000_000, 4_000_000_000, "p1.wav".into()),
+            ],
+            99,
+        )
+        .unwrap();
+        let ops = s.resplit_operations(10).unwrap();
+        let prior: serde_json::Value = serde_json::from_str(&ops[0].prior_state).unwrap();
+        assert_eq!(prior["text"], "yeah no it isn't", "recorded, for the audit");
+        s.unsplit_segment(&prior, 100).unwrap();
+        let text: Option<String> = s
+            .conn
+            .query_row(
+                "SELECT text FROM segments WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(text, None);
     }
 }

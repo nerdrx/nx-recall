@@ -355,6 +355,51 @@ pub struct IdentityConfig {
     /// `--reset` puts every voice back on the globals.
     pub learn: bool,
     // ---- end 0.11.0 -------------------------------------------------------
+
+    // ---- 0.12.4: cutting a turn where the speaker changes -----------------
+    /// May a turn be cut into two rows where the person talking changes
+    /// (`crate::turnsplit`)?
+    ///
+    /// **Off by default, and that is the measurement rather than caution.**
+    /// A turn ends at silence, so a fast exchange is one row with one label,
+    /// and Discord's own spans say how often: 409 of this install's 515
+    /// `overlap` turns contain a speaker change. The detector below finds
+    /// **41.7%** of the reachable ones within ±0.5 s at 67.9% precision and
+    /// splits 0.87% of turns Discord says are one person — which clears the
+    /// false-split bar and misses the recall bar it was given (≥50%), so it
+    /// ships off with the numbers written down (FINDINGS §39).
+    ///
+    /// What it costs when it is on: one ERes2Net pass per 0.25 s of every
+    /// turn — about 4× the identity leg's inference — and the ASR decoded
+    /// through the timestamped binding so a piece's words can be taken by
+    /// time. That is one decoder, not two: `crate::asr::TimedAsr` replaces
+    /// `Asr` when this is on rather than joining it.
+    pub split_turns: bool,
+    /// Length of each comparison window, in seconds. 1.5 measured: 1.0
+    /// halves the precision at the same false-split rate, because two
+    /// one-second windows of the *same* person already sit 0.62 apart in this
+    /// space (FINDINGS §32's same-speaker mean cosine of 0.377).
+    pub split_turn_window_s: f32,
+    /// Distance between window starts. The resolution of the answer: a cut
+    /// can only land on this grid, which is why the tolerance the detector is
+    /// scored at is ±0.3 s and ±0.5 s and not ±0.05 s.
+    pub split_turn_hop_s: f32,
+    /// No piece shorter than this. Defaults to `min_duration_s`: a piece
+    /// exists to be labelled, and a piece the ladder must refuse is a row
+    /// with no speaker where there used to be one.
+    pub split_turn_min_piece_s: f32,
+    /// `1 - cos` a boundary must reach to be a cut. **Not a similarity and
+    /// not comparable to `label_threshold`**: it is the distance between two
+    /// adjacent windows of the same recording, and on this audio same-speaker
+    /// pairs already score around 0.6. 0.85 is the point where the false-split
+    /// rate on `single` turns crosses under 1%.
+    pub split_turn_distance: f32,
+    /// At most this many cuts in one turn. Three measured: recall is still
+    /// rising at three (33.2% → 41.7% at ±0.5 s from one) and the false-split
+    /// rate does not move, because the extra cuts land in turns already being
+    /// cut.
+    pub split_turn_max_cuts: usize,
+    // ---- end 0.12.4 -------------------------------------------------------
 }
 
 impl Default for IdentityConfig {
@@ -381,6 +426,13 @@ impl Default for IdentityConfig {
             presence_hard: true,
             vrchat_sources: vec!["vrchat".into()],
             learn: true,
+            // ---- 0.12.4 ----------------------------------------------
+            split_turns: false,
+            split_turn_window_s: 1.5,
+            split_turn_hop_s: 0.25,
+            split_turn_min_piece_s: 1.0,
+            split_turn_distance: 0.85,
+            split_turn_max_cuts: 3,
         }
     }
 }
@@ -1623,6 +1675,18 @@ mod tests {
         assert_eq!(cfg.identity.vrchat_sources, vec!["vrchat".to_string()]);
         // Its mirror, which says the same about Discord and is not duplicated.
         assert_eq!(cfg.truth.sources, vec!["discord", "vesktop"]);
+        // 0.12.4: turn splitting is off, and the operating point behind it is
+        // the measured one rather than a round number (FINDINGS §39).
+        assert!(!cfg.identity.split_turns);
+        assert_eq!(cfg.identity.split_turn_window_s, 1.5);
+        assert_eq!(cfg.identity.split_turn_hop_s, 0.25);
+        assert_eq!(cfg.identity.split_turn_max_cuts, 3);
+        assert_eq!(cfg.identity.split_turn_distance, 0.85);
+        // A piece exists to be labelled, so the floor is the ladder's floor.
+        assert_eq!(
+            cfg.identity.split_turn_min_piece_s,
+            cfg.identity.min_duration_s
+        );
     }
 
     #[test]

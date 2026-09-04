@@ -139,6 +139,7 @@ impl Asr {
 pub struct TimedAsr {
     recognizer: *const sherpa_rs::sherpa_rs_sys::SherpaOnnxOfflineRecognizer,
     model_id: String,
+    lang: Option<&'static str>,
 }
 
 // The recognizer is used behind `&mut` from one thread at a time; sherpa's
@@ -195,11 +196,18 @@ impl TimedAsr {
         Ok(Self {
             recognizer,
             model_id: models.asr_model_id(),
+            lang: models.asr_lang(),
         })
     }
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// The same answer [`Asr::lang`] gives, for the same reason: it is a
+    /// property of the export, not of the binding.
+    pub fn lang(&self) -> Option<&'static str> {
+        self.lang
     }
 
     /// Decode one buffer, keeping the words and where each of them starts.
@@ -244,6 +252,71 @@ impl TimedAsr {
             sys::SherpaOnnxDestroyOfflineRecognizerResult(result);
             sys::SherpaOnnxDestroyOfflineStream(stream);
             (text, words_from_tokens(&tokens, &stamps))
+        }
+    }
+}
+
+/// The live path's decoder: one model, either binding.
+///
+/// [`Asr`] is the safe wrapper the daemon has always used and [`TimedAsr`] is
+/// the same transducer decoded through the C API so the token timestamps
+/// survive. Which one is loaded is decided once, at start-up, by whether
+/// `[identity].split_turns` is on — because a piece of a cut turn takes its
+/// words *by time* from the whole turn's decode, and word times are the one
+/// thing the safe binding throws away.
+///
+/// An enum rather than two fields: two bindings of a 641 MB model is 641 MB
+/// too much, and one decode per turn is the contract either way. It is not two
+/// code paths either — [`Self::transcribe`] is what every existing caller
+/// keeps calling, and [`Self::words`] simply has nothing to give when the
+/// feature is off, which is exactly when nothing asks.
+pub enum Decoder {
+    Plain(Asr),
+    Timed(TimedAsr),
+}
+
+impl Decoder {
+    /// `timed` is `[identity].split_turns`.
+    pub fn load(models: &ModelSet, timed: bool) -> Result<Self> {
+        if timed {
+            Ok(Self::Timed(TimedAsr::load(models)?))
+        } else {
+            Ok(Self::Plain(Asr::load(models)?))
+        }
+    }
+
+    pub fn model_id(&self) -> &str {
+        match self {
+            Self::Plain(a) => a.model_id(),
+            Self::Timed(a) => a.model_id(),
+        }
+    }
+
+    /// What to stamp on this model's transcripts. The binding does not change
+    /// the model, so neither does it change the answer.
+    pub fn lang(&self) -> Option<&'static str> {
+        match self {
+            Self::Plain(a) => a.lang(),
+            Self::Timed(a) => a.lang(),
+        }
+    }
+
+    pub fn transcribe(&mut self, samples: &[f32]) -> String {
+        match self {
+            Self::Plain(a) => a.transcribe(samples),
+            Self::Timed(a) => a.transcribe_timed(samples).0,
+        }
+    }
+
+    /// Decode, keeping the word times when this decoder has them.
+    ///
+    /// The plain binding returns no words, which is the honest answer: it does
+    /// not know. A caller that needs them is a caller that asked for the timed
+    /// decoder at load.
+    pub fn transcribe_timed(&mut self, samples: &[f32]) -> (String, Vec<Word>) {
+        match self {
+            Self::Plain(a) => (a.transcribe(samples), Vec::new()),
+            Self::Timed(a) => a.transcribe_timed(samples),
         }
     }
 }
