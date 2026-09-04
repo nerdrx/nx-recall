@@ -120,6 +120,51 @@ pub fn style_of(styles: &SpeakerStyles, id: i64) -> (Option<&str>, Option<&str>)
     }
 }
 
+/// How a person or a conversation sounded, on the wire (0.12.4).
+///
+/// One function for both, because they are the same question at two scopes and
+/// two shapes would be two things to keep in step. `person.get` and
+/// `thread.get` both carry it, and so does a digest.
+///
+/// **Always present, and `summary` is null for nearly everybody.** The counts
+/// are unconditional — they are facts about rows, and a client may want to
+/// render a bar even where the daemon will not write a sentence — and
+/// `summary` is the block that says what may be *said*, which is nothing until
+/// the pass has read [`crate::mood::MIN_ROWS_FOR_A_SUMMARY`] of their turns.
+///
+/// `mood` inside the summary is null while [`crate::mood::MOOD_IS_MEASURED`] is
+/// false, and the raw per-mood counts beside it are not: the daemon publishes
+/// what it counted and refuses to draw a conclusion from it, which is the
+/// difference this whole feature turns on.
+pub fn mood_summary_json(t: &crate::store::MoodTotals) -> Value {
+    let s = crate::mood::summary(t);
+    json!({
+        // The denominator, first and always. A count of laughs with no count of
+        // rows behind it is a claim rather than a measurement.
+        "read": t.read,
+        "counts": {
+            "happy": t.happy,
+            "sad": t.sad,
+            "angry": t.angry,
+            "neutral": t.neutral,
+            "laughter": t.laughter,
+            "music": t.music,
+        },
+        "last_ms": t.last_ns.map(ns_to_ms),
+        "last_ns": t.last_ns.map(|v| v.to_string()),
+        "summary": s.map(|s| json!({
+            "read": s.read,
+            "laughter": s.laughter,
+            "laughter_share": s.laughter_share,
+            // The one claim this daemon will make about a person from these
+            // tags: they laugh more than the base rate.
+            "laughs": s.laughs,
+            // …and the one it will not, until the measurement says otherwise.
+            "mood": s.mood.map(|(m, n)| json!({"mood": m.as_str(), "rows": n})),
+        })),
+    })
+}
+
 /// One segment on the wire.
 ///
 /// Both time forms, deliberately (PROTOCOL "Field conventions"): `t_ms` is what
@@ -201,6 +246,32 @@ pub fn segment_json(row: &SegmentRow) -> Value {
             &crate::translate::target(),
         ),
         // ---- end 0.9.0 -----------------------------------------------------
+        // ---- 0.12.4: how it sounded ----------------------------------------
+        // One of `crate::mood::Mood`'s four words, or null. Null means one of
+        // two things — nothing has listened, or the model listened and declined
+        // to answer, which it does on most turns — and the row cannot tell them
+        // apart. Both render identically (not at all), so the distinction stays
+        // in `segments.mood_at_ns` and off the wire.
+        //
+        // **A client must consult `status.mood.rendered` before drawing this.**
+        // The tag is stored on every machine that runs the pass and is only
+        // *shown* where the measurement earned it (`crate::mood::MOOD_IS_MEASURED`,
+        // FINDINGS §42). Carrying it regardless is deliberate: the daemon says
+        // what it knows and one flag says what may be believed, rather than the
+        // wire quietly omitting a column and a future client having no way to
+        // tell "off" from "old daemon".
+        "mood": row.mood,
+        // The audio events on this turn, as an ARRAY of the closed set
+        // (`laughter`, `music`, `applause`, `cry`) — never the stored
+        // comma-joined string, which is a storage detail. `[]` for a turn that
+        // carried none, and for every row the pass has not reached: a client
+        // iterates it without a null check, and an absent event and no event
+        // are the same thing to draw.
+        "events": crate::mood::parse_events(row.events.as_deref())
+            .iter()
+            .map(|e| e.as_str())
+            .collect::<Vec<_>>(),
+        // ---- end 0.12.4 ----------------------------------------------------
     })
 }
 
@@ -271,6 +342,21 @@ pub fn answer_rows(asked: &Value) -> Vec<crate::answer::Row> {
                 // that can hold an answer whoever said it.
                 who: h["speaker_name"].as_str().unwrap_or("someone").to_string(),
                 text: text.to_string(),
+                // 0.12.4. Read out of the hit like everything else here, for
+                // the same reason: the model must be shown the rows the client
+                // is looking at, not a second query's answer about them.
+                events: h["events"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|e| e.as_str())
+                    // Through the closed set, so nothing a newer daemon (or a
+                    // hand-built request) puts in the array can reach a prompt
+                    // as free text.
+                    .filter_map(crate::mood::Event::parse)
+                    .map(crate::mood::Event::as_str)
+                    .collect(),
             })
         })
         .take(crate::answer::MAX_HITS)
@@ -618,6 +704,65 @@ impl Service {
     /// Always present, always the same shape — a client has to be able to tell
     /// "the cross-check is not installed" from "an older daemon", and a missing
     /// key cannot say either.
+    /// The mood pass's block in `status` (0.12.4).
+    ///
+    /// Always present and always the same shape, for the reason every block
+    /// here is: a client must be able to tell "off", "the model is not
+    /// installed" and "an older daemon" apart, and a missing key says none of
+    /// the three.
+    ///
+    /// `rendered` is the one a client acts on and it is **not** `enabled`. The
+    /// pass being on says the tags are being written; this says whether the
+    /// mood among them may be believed, and it is a measurement
+    /// ([`crate::mood::MOOD_IS_MEASURED`]) rather than a setting. Laughter and
+    /// music are not gated by it — they were measured separately and they
+    /// passed.
+    fn mood_json(&self, store: &crate::store::Store) -> Value {
+        let cfg = self.control.mood();
+        let available = self
+            .control
+            .models_root
+            .as_ref()
+            .map(|root| {
+                crate::models::ModelSet::resolve_at(
+                    root.clone(),
+                    &crate::config::ModelsConfig::default(),
+                )
+                .sense_voice()
+            })
+            .is_some_and(|m| m.present());
+        let stats = &self.control.mood_stats;
+        // The backlog is a count over a column with its own index, and the
+        // whole point of `status` is that it is polled every three seconds by
+        // every open client — so a failure here is a zero, never an error that
+        // takes the whole status call down with it.
+        let (owed, read) = store.mood_counts(cfg.min_duration_s).unwrap_or((0, 0));
+        json!({
+            "enabled": cfg.enabled,
+            "available": available,
+            "how": (!available).then(|| {
+                crate::models::CjkModel::how_to_get_it(&[crate::asr_cjk::KO, crate::asr_cjk::ZH])
+            }),
+            "phase": stats.phase().as_str(),
+            // Whether the MOOD half may be drawn. Laughter and music always
+            // may be. See the doc comment.
+            "rendered": crate::mood::MOOD_IS_MEASURED,
+            "why": (!crate::mood::MOOD_IS_MEASURED).then_some(crate::mood::WHY_MOOD_IS_NOT_SHOWN),
+            // Whether the tags are also read on the way in. False, and measured
+            // before it was offered — see `[mood].live`.
+            "live": cfg.live,
+            "backlog": owed,
+            "read_total": read,
+            "counters": {
+                "read": stats.read.load(Ordering::Relaxed),
+                "with_mood": stats.with_mood.load(Ordering::Relaxed),
+                "with_event": stats.with_event.load(Ordering::Relaxed),
+                "no_audio": stats.no_audio.load(Ordering::Relaxed),
+                "last_run_ms": stats.last_run_ms.load(Ordering::Relaxed),
+            },
+        })
+    }
+
     fn asr_quality_json(&self) -> Value {
         let cfg = self.control.asr();
         let confidence = self
@@ -769,8 +914,23 @@ impl Service {
                 "translate_to": crate::translate::target(),
                 "read_languages": crate::translate::read_languages(),
                 "translation_display": crate::translate::display(),
+                // 0.12.4. On the same three-second poll and in the same block
+                // as the three above, because it is the fourth control on one
+                // card and a client that missed the `assist` event has to
+                // converge on it the same way.
+                "mood_display": crate::mood::display(),
             },
             // ---- end 0.9.0 --------------------------------------------------
+            // ---- 0.12.4: how a turn sounded ---------------------------------
+            // Four keys, and the load-bearing one is `rendered`. A client draws
+            // the laughter and music marks it finds on a segment; it draws the
+            // MOOD only where this says the measurement earned it, so a daemon
+            // and a client can never disagree about whether a feature is on and
+            // a GUI never has to hard-code the answer to a question the daemon
+            // measured. `why` is the sentence the Memory card prints in its
+            // place, so the reason travels with the refusal.
+            "mood": self.mood_json(&store),
+            // ---- end 0.12.4 --------------------------------------------------
             "segments_total": store.segments_total()?,
             "counters": {
                 "sessions_opened": c.stats.sessions_opened.load(Ordering::Relaxed),
@@ -1549,7 +1709,15 @@ impl Service {
     /// client that draws swatches from a copy it invented would also be a
     /// second definition of the brand colour, and there is only one.
     fn speakers_palette(&self) -> Result<Value, Error> {
-        Ok(json!({"palette": crate::palette::wire()}))
+        Ok(json!({
+            "palette": crate::palette::wire(),
+            // 0.12.4: the three hues a mood tint may be painted in, served for
+            // the same reason and beside the first — a legend, and a client
+            // that finds a fourth mood in a newer daemon can draw it without a
+            // release. `neutral` is deliberately absent: it is a mood, and it
+            // has no colour, because a transcript already looks like neutral.
+            "mood_palette": crate::palette::mood_wire(),
+        }))
     }
 
     /// Pin a colour and an emoji to a voice — or take them off.
@@ -2332,6 +2500,9 @@ impl Service {
         // 0.11.0: where they are heard. The same shape `speakers.list` carries,
         // for the header's chips.
         let sources = store.speaker_sources(id).map_err(Error::from)?;
+        // 0.12.4: how they sound. Counts and a denominator, never a sentence —
+        // see `mood::summary` for why the daemon refuses to write the words.
+        let mood = store.person_mood(id).map_err(Error::from)?;
         // Participant *names*, resolved here rather than in the client: the
         // page lists people who may not be in the client's speaker list at all
         // (a merged-away id, a voice minted since the last query).
@@ -2374,6 +2545,12 @@ impl Service {
             // 0.11.0: heard on. Top level for the same reason `languages` is —
             // the header has a row of chips for it.
             "sources": source_chips(Some(&sources)),
+            // 0.12.4: how they sound, over every turn of theirs the pass has
+            // read. Top level for the same reason again — it is a fact about
+            // the person, not about one of their conversations — and `summary`
+            // inside it is null until there are enough rows for it to be about
+            // them rather than about three clips.
+            "mood": mood_summary_json(&mood),
             "totals": {
                 "segments": totals.segments,
                 "speech_ms": ns_to_ms(totals.speech_ns),
@@ -2460,6 +2637,9 @@ impl Service {
             &crate::turntaking::thread_turns(&store, id).map_err(Error::from)?,
         );
         let world_id = store.thread_world(id).map_err(Error::from)?;
+        // 0.12.4: how it felt. The same block `person.get` carries, at the
+        // scope of one conversation.
+        let mood = store.thread_mood(id).map_err(Error::from)?;
         let world_name = match &world_id {
             Some(w) => crate::worlds::name_of(&store, w).map_err(Error::from)?,
             None => None,
@@ -2512,6 +2692,13 @@ impl Service {
             },
             "world": world_id.as_ref().map(|w| json!({"world_id": w, "name": world_name})),
             // ---- end 0.10.0 ------------------------------------------
+            // 0.12.4: how it felt. `summary` is null on a conversation the
+            // pass has read fewer than thirty turns of, which is most of them
+            // — a conversation is eight turns of "ja / ne / lol" more often
+            // than it is an evening, and a mood line about eight turns is a
+            // sentence about nothing (`crate::digest`'s own finding, applied
+            // one rung along).
+            "mood": mood_summary_json(&mood),
             "segments": rows.iter().map(segment_json).collect::<Vec<_>>(),
         }))
     }
@@ -4286,6 +4473,11 @@ impl Service {
             "translate_to": crate::translate::target(),
             "read_languages": crate::translate::read_languages(),
             "translation_display": crate::translate::display(),
+                // 0.12.4. On the same three-second poll and in the same block
+                // as the three above, because it is the fourth control on one
+                // card and a client that missed the `assist` event has to
+                // converge on it the same way.
+                "mood_display": crate::mood::display(),
             "languages": crate::lang::OFFERED
                 .iter()
                 .map(|(code, name)| json!({"code": code, "name": name}))
@@ -4347,6 +4539,23 @@ impl Service {
             }
             Some(_) => return Err(Error::params("read_languages must be an array of strings")),
         };
+        // 0.12.4: the fourth control on the same card. Validated the same
+        // way, against the closed set rather than against a free string: a
+        // client that sends `"tinted"` gets told, instead of silently getting
+        // the default and wondering why its radio button does not stick.
+        let mood_display = match req.opt_str("mood_display")? {
+            None => None,
+            Some(raw) => {
+                let mode = raw.trim().to_ascii_lowercase();
+                if !crate::mood::DISPLAYS.contains(&mode.as_str()) {
+                    return Err(Error::params(format!(
+                        "mood_display is one of {}",
+                        crate::mood::DISPLAYS.join(", ")
+                    )));
+                }
+                Some(mode)
+            }
+        };
         let display = match req.opt_str("translation_display")? {
             None => None,
             Some(raw) => {
@@ -4362,9 +4571,10 @@ impl Service {
                 Some(mode)
             }
         };
-        if to.is_none() && read.is_none() && display.is_none() {
+        if to.is_none() && read.is_none() && display.is_none() && mood_display.is_none() {
             return Err(Error::params(
-                "assist.set needs at least one of translate_to, read_languages, translation_display",
+                "assist.set needs at least one of translate_to, read_languages, \
+                 translation_display, mood_display",
             ));
         }
 
@@ -4377,6 +4587,9 @@ impl Service {
         }
         if let Some(display) = &display {
             crate::translate::set_display(display);
+        }
+        if let Some(mode) = &mood_display {
+            crate::mood::set_display(mode);
         }
 
         let mut persisted = false;
@@ -4391,6 +4604,9 @@ impl Service {
                     }
                     if let Some(display) = &display {
                         file.assist.translation_display = display.clone();
+                    }
+                    if let Some(mode) = &mood_display {
+                        file.assist.mood_display = mode.clone();
                     }
                     match file.save(path) {
                         Ok(()) => persisted = true,
@@ -7555,9 +7771,92 @@ mod tests {
         assert_eq!(names, vec![a, b]);
         assert_eq!(threads[0]["participants"][0]["name"], json!("Kira"));
 
+        // 0.12.4: how they sound. The counts are always there and the SUMMARY
+        // is not — two turns is not a personality, and the page is entitled to
+        // an explicit null rather than a zero it has to interpret.
+        assert_eq!(p["mood"]["read"], json!(0), "nothing has listened yet");
+        assert_eq!(p["mood"]["counts"]["laughter"], json!(0));
+        assert_eq!(p["mood"]["summary"], Value::Null);
+        assert_eq!(p["mood"]["last_ms"], Value::Null);
+
         // A voice that is not there is not found, rather than an empty page.
         let e = call(&r, r#"{"id":2,"method":"person.get","params":{"id":9999}}"#).unwrap_err();
         assert_eq!(e.code, "not_found");
+    }
+
+    /// 0.12.4, the whole wire contract for how a turn sounded, in one place:
+    /// what a segment carries, what `status` says may be believed, and the fact
+    /// that the two are different questions.
+    #[test]
+    fn a_segment_carries_its_mood_and_status_says_whether_it_may_be_drawn() {
+        let r = rig("mood-wire");
+        let (seg, quiet) = {
+            let s = r.service.store();
+            let src = s.upsert_source("VRChat.exe", "VRChat.exe", 1).unwrap();
+            let sess = s.begin_session(src, 0).unwrap();
+            let seg = s
+                .insert_segment(sess, 0, 2_000_000_000, "a.wav", 0)
+                .unwrap();
+            let quiet = s
+                .insert_segment(sess, 3_000_000_000, 5_000_000_000, "b.wav", 0)
+                .unwrap();
+            s.set_segment_mood(seg, Some("happy"), Some("laughter,music"), 10)
+                .unwrap();
+            // The ordinary outcome: the pass listened and heard nothing.
+            s.set_segment_mood(quiet, None, None, 10).unwrap();
+            (seg, quiet)
+        };
+
+        let out = call(
+            &r,
+            r#"{"id":1,"method":"transcript","params":{"limit":10}}"#,
+        )
+        .unwrap();
+        let rows = out["segments"].as_array().unwrap();
+        let row = |id: i64| rows.iter().find(|s| s["id"] == json!(id)).unwrap();
+
+        // The tag is on the wire whatever the measurement says. The daemon
+        // reports what it knows; ONE flag says what may be believed.
+        assert_eq!(row(seg)["mood"], json!("happy"));
+        // …and the events are an ARRAY of the closed set, never the stored
+        // comma-joined string, which is a storage detail no client should see.
+        assert_eq!(row(seg)["events"], json!(["laughter", "music"]));
+
+        // The row the model declined on: null, and an EMPTY ARRAY rather than a
+        // null, so a client iterates without a null check. "No event" and "not
+        // looked at" are the same thing to draw.
+        assert_eq!(row(quiet)["mood"], Value::Null);
+        assert_eq!(row(quiet)["events"], json!([]));
+
+        let st = call(&r, r#"{"id":2,"method":"status"}"#).unwrap();
+        let mood = &st["mood"];
+        // Always present and always the same shape, so a client can tell "off"
+        // from "an older daemon".
+        assert_eq!(mood["enabled"], json!(false), "the pass ships off");
+        assert!(mood["phase"].is_string());
+        assert_eq!(mood["live"], json!(false), "the live path ships off");
+        // The load-bearing key, and it is NOT `enabled`: it is
+        // `crate::mood::MOOD_IS_MEASURED`, which no request can change.
+        assert_eq!(mood["rendered"], json!(crate::mood::MOOD_IS_MEASURED));
+        if !crate::mood::MOOD_IS_MEASURED {
+            let why = mood["why"].as_str().expect("a withheld tag says why");
+            assert!(why.contains("§42"), "the refusal does not cite it: {why}");
+        }
+        // The backlog is real arithmetic over the column, not a placeholder:
+        // both rows have been read, so nothing is owed.
+        assert_eq!(mood["read_total"], json!(2));
+        assert_eq!(mood["backlog"], json!(0));
+
+        // The palette a client draws a legend from, served rather than assumed.
+        let pal = call(&r, r#"{"id":3,"method":"speakers.palette"}"#).unwrap();
+        let moods = pal["mood_palette"].as_array().unwrap();
+        assert_eq!(moods.len(), 3);
+        assert_eq!(moods[0]["token"], json!("happy"));
+        // `neutral` is a mood and has no colour — see `palette::MOOD_PALETTE`.
+        assert!(
+            !moods.iter().any(|m| m["token"] == json!("neutral")),
+            "neutral was given a colour"
+        );
     }
 
     #[test]
@@ -8819,7 +9118,7 @@ mod tests {
     // ---- 0.10.2, the translation controls ---------------------------------
 
     #[test]
-    fn the_three_translation_settings_are_live_and_come_back_as_the_new_state() {
+    fn the_four_display_settings_are_live_and_come_back_as_the_new_state() {
         let _live = crate::translate::test_guard();
         let r = rig("assist-set");
 
@@ -8870,6 +9169,52 @@ mod tests {
             json!(["de"]),
             "the target left with it"
         );
+
+        // 0.12.4: the fourth control on the same card, live the same way and
+        // leaving the other three alone.
+        let out = call(
+            &r,
+            r#"{"id":6,"method":"assist.set","params":{"mood_display":"BOTH"}}"#,
+        )
+        .unwrap();
+        assert_eq!(out["mood_display"], json!("both"), "case-folded");
+        assert_eq!(out["translation_display"], json!("main"), "untouched");
+        assert_eq!(crate::mood::display(), "both", "and it took effect");
+        let s = call(&r, r#"{"id":7,"method":"status"}"#).unwrap();
+        assert_eq!(s["assist"]["mood_display"], json!("both"));
+
+        // Every one of the four is accepted, because every one of them acts.
+        for mode in crate::mood::DISPLAYS {
+            let out = call(
+                &r,
+                &format!(
+                    r#"{{"id":8,"method":"assist.set","params":{{"mood_display":"{mode}"}}}}"#
+                ),
+            )
+            .unwrap();
+            assert_eq!(out["mood_display"], json!(mode));
+        }
+
+        // …and a fifth is refused rather than silently becoming the default: a
+        // client whose radio button will not stick deserves to be told why.
+        let e = call(
+            &r,
+            r#"{"id":9,"method":"assist.set","params":{"mood_display":"tinted"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "params");
+        assert!(e.msg.contains("tags"), "{}", e.msg);
+
+        // An empty call still names all four, so the message is a usable one.
+        let e = call(&r, r#"{"id":10,"method":"assist.set","params":{}}"#).unwrap_err();
+        assert!(e.msg.contains("mood_display"), "{}", e.msg);
+
+        // `mood::DISPLAY` is one value for the whole process, like
+        // `translate::LIVE` — and unlike it there is no test guard, because
+        // this is the only test that writes it. Put it back anyway: a test
+        // that leaves a global somewhere else is a test that will one day be
+        // blamed for a failure it caused three files away.
+        crate::mood::set_display(crate::mood::DISPLAY_TAGS);
     }
 
     #[test]

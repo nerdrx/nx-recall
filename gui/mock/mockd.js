@@ -52,7 +52,7 @@ import path from 'node:path';
 // could drift from the GUI it is serving and the drift would look like a
 // working feature. gui/test/palette.test.js already holds this file to
 // crates/recalld/src/palette.rs, which is the list this stands in for.
-import { PALETTE, accent } from '../src/renderer/lib/palette.js';
+import { PALETTE, MOOD_PALETTE, accent } from '../src/renderer/lib/palette.js';
 
 const PROTO = 1;
 const DAEMON = 'recalld-mock/0.5';
@@ -473,6 +473,23 @@ function buildFiller(base) {
                 text: TRANSLATIONS[i % TRANSLATIONS.length],
                 via: 'qwen2.5-3b-instruct-q4_k_m@1',
               },
+        // 0.12.4: how it sounded. Two independent tracks, seeded at rates
+        // close to the ones the real archive measures (FINDINGS §42) so a
+        // screenshot looks like an evening rather than like a legend:
+        //
+        //   - `events` on roughly one row in nine, mostly laughter with the
+        //     occasional row over music, and BOTH on one row in each block so
+        //     the two-chip case is on every page;
+        //   - `mood` on roughly one row in four, which is the rate the model
+        //     actually answers at — the other three are `null`, meaning it
+        //     declined, and a client must render that as nothing.
+        //
+        // Deliberately not correlated with `asr_confidence` or with the
+        // speaker: a test that asserted "the shaky rows are the laughing ones"
+        // would be asserting the fixture.
+        events:
+          i % 9 === 3 ? (i % 27 === 3 ? ['laughter', 'music'] : ['laughter']) : i % 23 === 7 ? ['music'] : [],
+        mood: MOCK_MOODS[i % MOCK_MOODS.length],
         // Blocks of five, as above, but numbered BELOW the canned threads so
         // "recent conversations" still means the canned ones.
         thread: 100 + block,
@@ -697,6 +714,15 @@ function buildHistory() {
       thread: threadFor(32),
     });
   });
+  // 0.12.4: every row carries the two fields, whether or not it was seeded
+  // with them. Done here rather than at each of a dozen literals for the
+  // reason `segment_json` exists in the daemon: a row missing a key is a row
+  // that renders differently from its neighbours for no reason anybody meant,
+  // and `events: []` — not `undefined` — is what "nothing was heard" is.
+  for (const seg of out) {
+    if (!Array.isArray(seg.events)) seg.events = [];
+    if (seg.mood === undefined) seg.mood = null;
+  }
   return out;
 }
 
@@ -725,6 +751,45 @@ const TRANSLATIONS = [
   'perfekt, danke dir',
   'der Shader frisst allerdings Performance',
   'ich baue sowieso nur für den PC',
+];
+
+/// 0.12.4: the mood on a filler row, cycled.
+///
+/// Twelve entries and nine of them `null`, because that is what the model
+/// actually does — it declines on about three quarters of real turns
+/// (FINDINGS §42) — and a fixture where every row carries a mood would make a
+/// screenshot of the `tint` mode look like a paint chart and would hide the
+/// one bug that matters: a null must render as an ordinary row, not as a
+/// chip saying "null".
+///
+/// `neutral` is in the list and is deliberately NOT one of the three the
+/// palette paints: it is a mood the daemon stores and no surface tints, so it
+/// has to be in the fixture for a test to prove that.
+/// The four states of `[assist] mood_display`, as the daemon spells them.
+const MOOD_MODES = ['tags', 'tint', 'both', 'off'];
+
+/// The daemon's own sentence for why the mood half is not drawn. Copied from
+/// `crate::mood::WHY_MOOD_IS_NOT_SHOWN` rather than paraphrased: the card
+/// prints whatever the daemon sends, and a mock that sent something friendlier
+/// would be testing a string this app never shows.
+const MOOD_WHY =
+  'The mood tag is stored but not shown: the model declines to answer on most turns, ' +
+  'and on the rest it did not beat a word list by the margin set before the measurement ' +
+  '(FINDINGS §42). Laughter and music are shown, and were measured separately.';
+
+const MOCK_MOODS = [
+  null,
+  'happy',
+  null,
+  null,
+  'neutral',
+  null,
+  'sad',
+  null,
+  null,
+  'angry',
+  null,
+  null,
 ];
 
 const NOTES = [
@@ -1170,7 +1235,19 @@ export function startMock({
     /// German target is the only combination the canned translations above are
     /// coherent with — the English turns carry a German reading, and the
     /// German ones carry none.
-    assist: { translate_to: 'de', read_languages: ['de'], translation_display: 'main' },
+    assist: {
+      translate_to: 'de',
+      read_languages: ['de'],
+      translation_display: 'main',
+      // 0.12.4. `tags` is the daemon's own default, so the app under test
+      // boots into the state a person actually gets.
+      mood_display: 'tags',
+    },
+    // 0.12.4: the mood pass, as `status.mood` reports it. `enabled` is the
+    // pass; `rendered` is the measurement about the MOOD half, and the mock
+    // ships the daemon's answer to it (false) rather than a convenient one.
+    // The e2e driver flips it to exercise the other world.
+    mood: { enabled: true, rendered: false },
     /// Every `segments.correct` this daemon has served, which is where
     /// `accuracy.summary` comes from: the pre-correction text lives in the
     /// record, so a WER estimate is arithmetic over real edits rather than a
@@ -1247,6 +1324,50 @@ export function startMock({
       auto: sp?.auto ?? `Speaker_${id}`,
       colour: sp?.colour ?? null,
       icon: sp?.icon ?? null,
+    };
+  }
+
+  /// How a set of rows sounded (0.12.4) — the block `person.get`, `thread.get`
+  /// and a digest all carry, from one function so the three cannot drift.
+  ///
+  /// The daemon's own rules, reimplemented rather than faked: `summary` is null
+  /// under thirty read rows, `laughs` needs one row in twenty, and `mood` is
+  /// null while `state.mood.rendered` is false — which it is by default. A mock
+  /// that always sent a summary would let a client ship that never draws the
+  /// absent case, and the absent case is the common one.
+  function moodPayload(rows) {
+    const read = rows.length;
+    const count = (f) => rows.filter(f).length;
+    const laughter = count((s) => (s.events ?? []).includes('laughter'));
+    const counts = {
+      happy: count((s) => s.mood === 'happy'),
+      sad: count((s) => s.mood === 'sad'),
+      angry: count((s) => s.mood === 'angry'),
+      neutral: count((s) => s.mood === 'neutral'),
+      laughter,
+      music: count((s) => (s.events ?? []).includes('music')),
+    };
+    const last = rows.length ? Math.max(...rows.map((s) => s.t_ms)) : null;
+    const share = read ? laughter / read : 0;
+    const top = ['happy', 'sad', 'angry', 'neutral']
+      .map((m) => [m, counts[m]])
+      .filter(([, n]) => n > 0)
+      .sort((a, b) => b[1] - a[1])[0];
+    return {
+      read,
+      counts,
+      last_ms: last,
+      last_ns: last == null ? null : String(last) + '000000',
+      summary:
+        read < 30
+          ? null
+          : {
+              read,
+              laughter,
+              laughter_share: share,
+              laughs: share >= 0.05,
+              mood: state.mood.rendered && top ? { mood: top[0], rows: top[1] } : null,
+            },
     };
   }
 
@@ -1886,6 +2007,8 @@ export function startMock({
       translate_to: state.assist.translate_to,
       read_languages: effectiveRead(),
       translation_display: state.assist.translation_display,
+      // 0.12.4: the fourth control on the same card.
+      mood_display: state.assist.mood_display,
       languages: LANGUAGES.map((l) => ({ ...l })),
     };
   }
@@ -2238,6 +2361,25 @@ export function startMock({
         translate_to: state.assist.translate_to,
         read_languages: effectiveRead(),
         translation_display: state.assist.translation_display,
+        mood_display: state.assist.mood_display,
+      },
+      // 0.12.4: the mood pass. `rendered` is the load-bearing key and it is a
+      // MEASUREMENT rather than a switch — the mock ships it false, matching
+      // the daemon's `MOOD_IS_MEASURED`, so the headless run exercises the
+      // world the user actually gets. A test that wants the other world sets
+      // `state.mood.rendered = true` and gets it, which is the point of having
+      // the flag on the wire at all.
+      mood: {
+        enabled: state.mood.enabled,
+        available: true,
+        how: null,
+        phase: state.mood.enabled ? 'idle' : 'off',
+        rendered: state.mood.rendered,
+        why: state.mood.rendered ? null : MOOD_WHY,
+        live: false,
+        backlog: 0,
+        read_total: state.segments.length,
+        counters: { read: state.segments.length, with_mood: 0, with_event: 0, no_audio: 0, last_run_ms: 0 },
       },
       segments_total: state.segments.length,
       daemon: daemonId(),
@@ -2297,6 +2439,12 @@ export function startMock({
       asr_confidence: state.feedIdx % 5 === 2 ? 'shaky' : 'solid',
       text_via: 'live',
       lang: sp === 1 ? 'de' : 'en',
+      // 0.12.4. On a live row too, because that is what the wire looks like
+      // whether or not `[mood].live` is on: an overnight pass republishes the
+      // row it read, and a client cannot tell that apart from a first
+      // publication — nor should it have to.
+      events: state.feedIdx % 6 === 1 ? ['laughter'] : [],
+      mood: MOCK_MOODS[state.feedIdx % MOCK_MOODS.length],
       thread: liveThread(),
     };
     // Additive and often absent, exactly as it is on the wire: only the two
@@ -2768,7 +2916,12 @@ export function startMock({
     /// behind each. A READ, and the reason the picker has no list of its own:
     /// a daemon that grows an eleventh colour grows an eleventh swatch, and a
     /// GUI older than the daemon simply never offers the one it cannot render.
-    'speakers.palette': () => ({ palette: PALETTE.map((a) => ({ ...a })) }),
+    'speakers.palette': () => ({
+      palette: PALETTE.map((a) => ({ ...a })),
+      // 0.12.4: the three hues a mood tint may be painted in. `neutral` is a
+      // mood and is deliberately not one of them.
+      mood_palette: MOOD_PALETTE.map((a) => ({ ...a })),
+    }),
 
     // 0.6.1: the one-off voices sweep. Lists by default; `apply` deletes.
     'speakers.prune'(params) {
@@ -3039,6 +3192,9 @@ export function startMock({
           .sort((a, b) => b - a)
           .slice(0, 12)
           .map((t) => threadPayload(t)),
+        // 0.12.4: how they sound, computed over their own rows so it can never
+        // disagree with the chips a test counts in the transcript.
+        mood: moodPayload(mine),
       };
     },
 
@@ -3116,7 +3272,8 @@ export function startMock({
       const id = Number(params?.id);
       const rows = state.segments.filter((s) => s.thread === id);
       if (!rows.length) throw err('not_found', `no thread ${params?.id}`);
-      return { ...threadPayload(id), segments: rows };
+      // 0.12.4: how it felt, over this conversation's own rows.
+      return { ...threadPayload(id), mood: moodPayload(rows), segments: rows };
     },
 
     /**
@@ -3331,6 +3488,31 @@ export function startMock({
 
     'assist.get': () => assistState(),
 
+    /**
+     * `mock.mood {enabled?, rendered?}` — the one method here that is not on
+     * the wire (0.12.4).
+     *
+     * `status.mood.rendered` is a MEASUREMENT in the daemon
+     * (`crate::mood::MOOD_IS_MEASURED`), not a setting, so there is no request
+     * that can change it and there must not be one. The e2e driver still has
+     * to see both worlds: the one shipped today, where the mood is stored and
+     * withheld, and the one a person gets the day the measurement changes. A
+     * renderer whose other half is never exercised is a renderer that breaks
+     * silently on that day.
+     *
+     * So the switch lives here, in the fake daemon, prefixed `mock.` so nobody
+     * mistakes it for protocol. The real daemon has no such method and a client
+     * that called it would get `unknown_method`, which is the right answer.
+     */
+    'mock.mood'(params) {
+      if (params?.enabled !== undefined) state.mood.enabled = !!params.enabled;
+      if (params?.rendered !== undefined) state.mood.rendered = !!params.rendered;
+      // On `status`, the topic every client already has, so the app converges
+      // the same way it would on a daemon restart.
+      emit('status', 'status', statusPayload());
+      return { ...state.mood };
+    },
+
     'assist.set'(params) {
       const next = { ...state.assist };
       if (params?.translate_to !== undefined) {
@@ -3358,8 +3540,26 @@ export function startMock({
         if (mode !== 'main' && mode !== 'under') throw err('params', 'translation_display is "main" or "under"');
         next.translation_display = mode;
       }
-      if (params?.translate_to === undefined && params?.read_languages === undefined && params?.translation_display === undefined) {
-        throw err('params', 'assist.set needs at least one of translate_to, read_languages, translation_display');
+      // 0.12.4: the fourth control, validated against the closed set for the
+      // reason the daemon validates it — a client that sends "tinted" is told
+      // so instead of silently getting the default.
+      if (params?.mood_display !== undefined) {
+        const mode = String(params.mood_display ?? '').trim().toLowerCase();
+        if (!MOOD_MODES.includes(mode)) {
+          throw err('params', `mood_display is one of ${MOOD_MODES.join(', ')}`);
+        }
+        next.mood_display = mode;
+      }
+      if (
+        params?.translate_to === undefined &&
+        params?.read_languages === undefined &&
+        params?.translation_display === undefined &&
+        params?.mood_display === undefined
+      ) {
+        throw err(
+          'params',
+          'assist.set needs at least one of translate_to, read_languages, translation_display, mood_display'
+        );
       }
       state.assist = next;
       const payload = assistState();

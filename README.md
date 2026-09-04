@@ -301,6 +301,22 @@ words only when the night decoder and the cross-check agree with each other
 against the live reading, in the row's own language. Every replacement is on
 the record, next to the words it replaced.
 
+**How a turn sounded** is the newest thing here and it is the one that shipped
+*half* of what was asked for. The decoder that reads Korean and Chinese has
+always emitted an emotion tag and an audio-event tag beside every transcript,
+and this daemon has always thrown them away. A background pass — no GPU, four
+niced cores, a few minutes for a whole archive — now reads them off the stored
+clips and writes them down. **Laughter and music are shown**, as a small chip at
+the end of the row and a glyph in the headset captions: they line up with what
+the transcript itself says far more often than chance. **The mood is stored and
+not shown.** The model declines to name an emotion on most real turns, and on
+the ones it answers it did not beat a word list by the margin that was fixed
+before the measurement — so the tag sits in the database where next month's
+bigger archive can re-score it without listening to anything again, and the
+settings card says so, in the daemon's own sentence, instead of colouring your
+evening in on a guess. There is a switch for `tags`, `tint`, `both` and `off`,
+and all four do something.
+
 ## Getting it useful
 
 - **One query box.** *"was hat Aspen gestern über den Shader gesagt?"* becomes
@@ -424,6 +440,7 @@ Installed by its first user on day one; every finding became a release.
 | 0.12.2 | +136h | two Discord clients at once: the per-user mute aims at the one client whose voice activity the streams explain, decided on 25 seconds of evidence with a margin and never by inheritance, and a per-client role on the Discord card overrides it either way; enrolment from Discord-confirmed turns measured and left off, because at its own bar it enrols exactly what the ladder already does and below it a wrong link poisons the bank |
 | 0.12.3 | +137h | two bridges: every line the plugin sends names the client and account it came from, spans are kept per bridge, and a verdict only reads the bridge whose call the audio carries, so two Discord clients in two calls stop blending into each other; a call no bridge can see is unknown, not nobody; the report lists the bridges and warns when two of one kind are ambiguous |
 | 0.12.2 | +132h | the mute aims at one Discord client instead of at Discord: with two clients running, only the one whose speech the per-user streams explain goes quiet and the other call keeps recording — 108 right, 36 declined, 0 wrong over 144 synthetic two-call timelines, every guard failing towards recording — plus a per-source override (`bridge`/`other`/`auto`) in the Sources card, `recalld role`, and `truth.status` saying which client is muted and why |
+| 0.12.4 | +140h | how a turn sounded, and half of it refused: a background pass reads SenseVoice's emotion and event tags off the stored clips (RTF 0.068 on four niced cores, no GPU, the whole 11½-hour archive in 47 minutes) and writes them to schema v18. Laughter and music are drawn — 3–10x more likely than chance to land on a clip the speech decoder had no words for — but only up to **five seconds**, past which the same tag is *below* chance because the model is answering "was there laughter anywhere in this clip" and a chip on a paragraph claims the turn was one. The **mood is stored and not shown**: the model declines on 74.7% of turns and, on the quarter it answers, agrees with a word list 31.6% of the time against an 86.4% constant baseline. The pre-registered laughter proxy (does the transcript say "haha") found twelve positives in fifteen thousand rows and had to be thrown away and replaced in the open. A four-state setting (`tags`/`tint`/`both`/`off`), a mood palette that is three of the ten person hues at a body-text saturation measured to 5.61:1 light and 8.41:1 dark, and a laughter glyph in the headset captions |
 
 ## Quickstart
 

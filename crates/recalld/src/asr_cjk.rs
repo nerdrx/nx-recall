@@ -747,10 +747,37 @@ impl CjkAsr {
     }
 
     pub fn transcribe(&mut self, samples: &[f32]) -> String {
+        self.listen(samples).text
+    }
+
+    /// One decode, and **everything the result struct carries** — the words and
+    /// the three tag fields beside them.
+    ///
+    /// [`transcribe`](Self::transcribe) has always read `text` and dropped the
+    /// rest; 0.12.4 wants `emotion` and `event`, so the read moved here and the
+    /// old name became one line over it. Nothing about the decode changed: this
+    /// is the same call on the same stream, and the tags come out of the same
+    /// result the words do rather than out of a second pass.
+    ///
+    /// The three fields are the raw `<|…|>` strings, uninterpreted.
+    /// [`crate::mood`] owns what they mean, because meaning them is a closed
+    /// vocabulary and a vocabulary belongs to the module that renders it.
+    ///
+    /// **There is no confidence here and there is none to be had.** At sherpa's
+    /// C API (`c-api.h`, `SherpaOnnxOfflineRecognizerResult`) the struct is
+    /// `text`, `timestamps`, `count`, `tokens`, `tokens_arr`, `json`, `lang`,
+    /// `emotion`, `event` — nine fields, no score, and the `json` string's
+    /// documented keys are text/tokens/timestamps/segment/start_time/is_final.
+    /// The Python binding additionally exposes `ys_log_probs`, which is what a
+    /// per-tag probability would have to come from; it comes back **empty** for
+    /// this model (measured, FINDINGS §42), so even a fork of the C API would
+    /// have nothing to read. A tag is present or it is not, and that is the
+    /// whole of what this daemon can know about how sure the model was.
+    pub fn listen(&mut self, samples: &[f32]) -> Heard {
         use sherpa_rs::sherpa_rs_sys as sys;
 
         if samples.is_empty() {
-            return String::new();
+            return Heard::default();
         }
         unsafe {
             let stream = sys::SherpaOnnxCreateOfflineStream(self.recognizer);
@@ -763,19 +790,45 @@ impl CjkAsr {
             sys::SherpaOnnxDecodeOfflineStream(self.recognizer, stream);
             let result = sys::SherpaOnnxGetOfflineStreamResult(stream);
             let raw = result.read();
-            let text = if raw.text.is_null() {
-                String::new()
-            } else {
-                std::ffi::CStr::from_ptr(raw.text)
-                    .to_string_lossy()
-                    .trim()
-                    .to_string()
+            let field = |p: *const std::os::raw::c_char| -> String {
+                if p.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(p)
+                        .to_string_lossy()
+                        .trim()
+                        .to_string()
+                }
+            };
+            let heard = Heard {
+                text: field(raw.text),
+                lang: field(raw.lang),
+                emotion: field(raw.emotion),
+                event: field(raw.event),
             };
             sys::SherpaOnnxDestroyOfflineRecognizerResult(result);
             sys::SherpaOnnxDestroyOfflineStream(stream);
-            text
+            heard
         }
     }
+}
+
+/// One decode's whole result: the words, and the three tags beside them.
+///
+/// The Japanese Parakeet fills only `text` — `nemo_ctc` has no emotion head and
+/// leaves the other three empty, which is why every reader of this struct has
+/// to treat an empty string as "this decoder does not say" rather than as
+/// "neutral". [`crate::mood`] is the only reader, and it does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Heard {
+    pub text: String,
+    /// `<|ja|>` and friends, raw. The router reads the *script* instead (see
+    /// [`judge`]) and this is carried for the log line and for tests.
+    pub lang: String,
+    /// `<|HAPPY|>`, `<|NEUTRAL|>`, `<|EMO_UNKNOWN|>`, … raw.
+    pub emotion: String,
+    /// `<|Speech|>`, `<|Laughter|>`, `<|BGM|>`, `<|Event_UNK|>`, … raw.
+    pub event: String,
 }
 
 impl Drop for CjkAsr {

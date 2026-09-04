@@ -47,7 +47,7 @@ import {
 // module so the transcript and search cannot disagree about them.
 import { look, lookOf, iconSpan, markRow, highlightPicker } from './highlight.js';
 import { separatorWalker } from '../lib/seams.js';
-import { shakyMark, translationCell } from '../lib/marks.js';
+import { moodChips, shakyMark, translationCell } from '../lib/marks.js';
 import { openSheet, toast } from '../lib/sheets.js';
 import { play, stop as stopPreview, isActive, onPlayback, noAudioHint } from '../lib/preview.js';
 // Conversation replay (0.9.2). The engine is in lib/replay.js and holds no DOM;
@@ -495,6 +495,12 @@ export function mount(root, ctx) {
       h(
         'span',
         { class: 'meta' },
+        // 0.12.4: what was on the clip besides the words, and — where the
+        // measurement earned it — how it sounded. First in the meta column,
+        // because it is about the turn itself rather than about where the turn
+        // came from or how much the app trusts it. Absent on a row with
+        // nothing to say, which is most of them.
+        moodChips(seg),
         seg.source === 'Discord' ? h('span', { class: 'chip', text: 'discord' }) : null,
         // Two decoders, one disagreement (0.8.0). Deliberately NOT folded into
         // the "?": that mark answers "who said this and which model wrote it",

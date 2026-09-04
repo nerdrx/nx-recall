@@ -993,6 +993,67 @@ impl Default for NightConfig {
     }
 }
 
+// ---- 0.12.4, the mood pass ------------------------------------------------
+
+/// How a turn sounded (`crate::mood`): laughter, music, and an emotion tag the
+/// daemon stores and does not render.
+///
+/// **Off by default**, like every optional background pass. Unlike the night
+/// shift it needs no GPU, no local compile and no gigabyte download — the model
+/// is SenseVoice, which 0.11.6 already catalogued for Korean and Chinese
+/// (`models fetch --cjk`, 239 MB) — so switching it on is a real choice rather
+/// than an aspiration, and the shipped default is still `false` because
+/// listening to somebody's whole archive is not something to start unasked.
+///
+/// It borrows `[night].window` and `[night].also_when_idle_min` for its clock
+/// rather than growing its own pair. That is the same borrow `[asr].lang_sweep`
+/// makes, and for the same reason: "the hours this machine is nobody's" is one
+/// fact about a household, not one per background job, and two copies of it
+/// would eventually disagree.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MoodConfig {
+    /// Run the pass at all.
+    pub enabled: bool,
+    /// The most rows one opening of the gate will listen to. A ceiling on a
+    /// background job that would otherwise walk the entire history the first
+    /// time it is switched on — though at RTF 0.08 (FINDINGS §42) the entire
+    /// history is a matter of minutes, so this is a politeness rather than a
+    /// protection.
+    pub rows_per_run: usize,
+    /// Rows fetched from the store per query. Not a decode batch — every clip
+    /// is decoded on its own, because SenseVoice's tags are *per clip* and
+    /// concatenating eight turns would ask which of them the laughter was on.
+    /// That is the one thing the night shift's batching cannot be copied for.
+    pub batch_rows: usize,
+    /// Clips shorter than this are not listened to. **One second.** An emotion
+    /// head given a 300 ms back-channel is guessing, and the queue is long
+    /// enough without the rows nothing could be said about.
+    pub min_duration_s: f32,
+    /// Read the tags on the way in, on the live path, as well as overnight.
+    ///
+    /// **False, and it is not merely a default.** Measured before it was
+    /// offered (FINDINGS §42): SenseVoice-small int8 costs RTF 0.08 on four
+    /// niced cores, which is small in a background pass and is a second decoder
+    /// on the capture path — where the budget is already spent on the primary
+    /// ASR and where the rule is that analysis never wins against a VR frame.
+    /// A live mood chip is worth less than a dropped turn, and the overnight
+    /// pass reaches the same row within a day.
+    pub live: bool,
+}
+
+impl Default for MoodConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rows_per_run: 2000,
+            batch_rows: 64,
+            min_duration_s: 1.0,
+            live: false,
+        }
+    }
+}
+
 // ---- 0.9.0, the assistant -------------------------------------------------
 
 /// The three things the daemon does *for* you rather than *to* the recording
@@ -1076,6 +1137,22 @@ pub struct AssistConfig {
     /// never leaves the row either way, and it keeps its language code — which
     /// is what stops "main" from being a quotation nobody can check.
     pub translation_display: String,
+    /// How a mood or an audio event shows on a transcript row (0.12.4):
+    /// `"tags"` — a chip at the end of the row saying what was heard, the
+    /// default — `"tint"` (the words take the mood's colour), `"both"`, or
+    /// `"off"`.
+    ///
+    /// It is on the `[assist]` block and not on `[mood]` because it is a fact
+    /// about a PAGE, not about the pass: `[mood].enabled` decides whether the
+    /// tags are read and written at all, and this decides what a client does
+    /// with the ones that exist. Two different questions, two different
+    /// switches, and a person who turns the display off has not turned the
+    /// listening off.
+    ///
+    /// `"off"` still leaves the LAUGHTER glyph on the headset overlay, which
+    /// has its own setting for the same reason a caption bar does: it is
+    /// another surface (`docs/OVERLAY.md`).
+    pub mood_display: String,
     // ---- end 0.10.2 -------------------------------------------------------
 
     // ---- 0.11.0, the translator -------------------------------------------
@@ -1119,6 +1196,7 @@ impl Default for AssistConfig {
             translate_min_words: 3,
             read_languages: vec!["de".to_string(), "en".to_string()],
             translation_display: crate::translate::DISPLAY_MAIN.to_string(),
+            mood_display: crate::mood::DISPLAY_TAGS.to_string(),
             translator: crate::translate::DEFAULT_TRANSLATOR.to_string(),
             translator_threads: 4,
             batch: 8,
@@ -1379,6 +1457,8 @@ pub struct Config {
     pub asr: AsrConfig,
     /// The night shift (0.9.0).
     pub night: NightConfig,
+    /// The mood pass (0.12.4). Off by default.
+    pub mood: MoodConfig,
     pub graph: GraphConfig,
     /// The assistant round (0.9.0): reminders, digests, translation.
     pub assist: AssistConfig,
@@ -1469,6 +1549,18 @@ impl Config {
              # whatever it does to recall. `recalld identity calibrate` prints\n\
              # the whole table without writing; `--apply` writes what cleared\n\
              # the gate; `--reset` puts every voice back on the globals.\n\
+             #\n\
+             # `[mood]` reads how a turn SOUNDED off the clips already on\n\
+             # disk — laughter, music, and an emotion tag. It is off, it\n\
+             # needs `models fetch --cjk` (239 MB, the same decoder Korean\n\
+             # and Chinese use), it runs in `[night].window` on the niced\n\
+             # cores and never touches the GPU: the whole archive is a few\n\
+             # minutes. Laughter and music are SHOWN; the emotion tag is\n\
+             # stored and NOT shown, because it was measured against a word\n\
+             # list on this corpus and came out worse than a constant guess\n\
+             # (spike/FINDINGS.md 42). Whether it is drawn is not a setting.\n\
+             # What IS a setting is `[assist] mood_display`: `tags`, `tint`,\n\
+             # `both` or `off`.\n\
              \n{body}"
         );
         let tmp = path.with_extension("toml.tmp");

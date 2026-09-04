@@ -145,7 +145,9 @@ fn the_v11_migration_is_idempotent_and_keeps_what_it_wrote() {
     // no-op property load-bearing rather than incidental: the statement that
     // renames the sweep's bare mark has to find nothing to do on the second
     // open, and it does, because it selects on the shape it removes.
-    assert_eq!(SCHEMA_VERSION, 17, "0.12.3 is schema v17");
+    // …and 0.12.4's three mood columns to v17 → v18, which are additive and
+    // have no backfill, so they cost this test nothing but the number.
+    assert_eq!(SCHEMA_VERSION, 18, "0.12.4 is schema v18");
     let dir = temp_dir("schema");
     let mut seg = 0i64;
     // Three opens: the first migrates, the second and third must be no-ops

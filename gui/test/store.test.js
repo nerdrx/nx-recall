@@ -48,6 +48,12 @@ import {
   roomChip,
   applyAssist,
   translationLeads,
+  moodShown,
+  moodTags,
+  moodTint,
+  moodRendered,
+  moodWhy,
+  MOOD_MODES,
 } from '../src/renderer/lib/store.js';
 import { sourceLabel, speakerColor } from '../src/renderer/lib/dom.js';
 import { accentColor } from '../src/renderer/lib/palette.js';
@@ -67,7 +73,14 @@ function reset() {
   store.resync = { stale: [], attempt: 0, retrying: false, since: null };
   store.mic = { enabled: false, mode: 'follow', active: false, state: 'off', device: null, you_speaker: null };
   store.graph = { counts: null, enrichment: { phase: 'off' }, config: null };
-  store.assist = { translate_to: '', read_languages: ['de', 'en'], translation_display: 'main', languages: [] };
+  store.assist = {
+    translate_to: '',
+    read_languages: ['de', 'en'],
+    translation_display: 'main',
+    // 0.12.4. The daemon's own default, like the three above it.
+    mood_display: 'tags',
+    languages: [],
+  };
 }
 
 const seg = (id, over = { }) => ({
@@ -1241,4 +1254,76 @@ test('the translation settings fold in from four places and never lose the list'
   applyAssist({ translation_display: 'sideways' });
   assert.equal(store.assist.translation_display, 'under');
   assert.equal(applyEvent({ seq: 3, ev: 'assist', data: null }), null);
+});
+
+// 0.12.4. Four states, and the test exists because "a setting that is read and
+// ignored is a blocker": every one of them has to change what a row wears, and
+// the two readers below are the only two places that decide it.
+test('every state of mood_display acts, and the default is tags', () => {
+  reset();
+  assert.deepEqual(MOOD_MODES, ['tags', 'tint', 'both', 'off']);
+  // The shipped state: the mood is a chip, the words are the ordinary ink.
+  assert.equal(store.assist.mood_display, 'tags');
+  assert.equal(moodShown(), true);
+  assert.equal(moodTags(), true);
+  assert.equal(moodTint(), false);
+
+  // `tint` moves the MOOD to the words — and leaves the events as chips,
+  // because an event has no colour. This is what makes `tint` a state that
+  // acts on a daemon that is withholding the mood rather than a no-op.
+  applyAssist({ mood_display: 'tint' });
+  assert.equal(moodShown(), true, 'tint still draws the events');
+  assert.equal(moodTags(), false);
+  assert.equal(moodTint(), true);
+
+  applyAssist({ mood_display: 'both' });
+  assert.equal(moodShown(), true);
+  assert.equal(moodTags(), true);
+  assert.equal(moodTint(), true);
+
+  applyAssist({ mood_display: 'off' });
+  assert.equal(moodShown(), false, 'off must draw nothing');
+  assert.equal(moodTags(), false);
+  assert.equal(moodTint(), false);
+
+  // It arrives from `status` and from an `assist` event like the other three,
+  // and both repaint the transcript.
+  applyEvent({ seq: 1, ev: 'status', data: { assist: { mood_display: 'both' } } });
+  assert.equal(store.assist.mood_display, 'both');
+  const change = applyEvent({ seq: 2, ev: 'assist', data: { mood_display: 'tags' } });
+  assert.deepEqual(change, { assist: true });
+  assert.equal(store.assist.mood_display, 'tags');
+
+  // A mode nothing can render is ignored rather than stored, and an unknown
+  // value already in the store still reads as the shipped default rather than
+  // as nothing — a blank transcript is a worse failure than a wrong chip.
+  applyAssist({ mood_display: 'tinted' });
+  assert.equal(store.assist.mood_display, 'tags');
+  store.assist = { ...store.assist, mood_display: 'nonsense' };
+  assert.equal(moodShown(), true, 'an unreadable mode falls back to the default');
+  assert.equal(moodTags(), true);
+  assert.equal(moodTint(), false);
+});
+
+// The other gate, and it is the daemon's rather than the person's.
+test('the mood half is drawn only where the daemon says the measurement earned it', () => {
+  reset();
+  // No status at all — a daemon too old to say. FALSE is the safe direction:
+  // the failure mode of guessing true is a transcript telling somebody how
+  // their friend felt on evidence nobody checked.
+  assert.equal(moodRendered(), false);
+  assert.equal(moodWhy(), '');
+
+  applyEvent({
+    seq: 1,
+    ev: 'status',
+    data: { mood: { enabled: true, rendered: false, why: 'not measured (FINDINGS §42)' } },
+  });
+  assert.equal(moodRendered(), false);
+  assert.equal(moodWhy(), 'not measured (FINDINGS §42)');
+
+  // …and the world where it did earn it, which the same code has to serve.
+  applyEvent({ seq: 2, ev: 'status', data: { mood: { enabled: true, rendered: true, why: null } } });
+  assert.equal(moodRendered(), true);
+  assert.equal(moodWhy(), '');
 });

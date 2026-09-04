@@ -581,6 +581,22 @@ async function bootstrap() {
         settings: getCaptionSettings,
         set: setCaptionSettings,
       },
+      // The daemon socket, unfiltered (0.12.4).
+      //
+      // Every request the UI makes goes through `ipc.js`'s ALLOWED set, which
+      // exists so a compromised renderer cannot reach a method no button
+      // needs. That set is exactly right and must not grow a test hole in it —
+      // so the driver, which runs HERE in the main process and is only loaded
+      // when NX_RECALL_E2E is set, gets the raw client instead.
+      //
+      // Its one use is `mock.mood`: `status.mood.rendered` is a MEASUREMENT in
+      // the real daemon (`crate::mood::MOOD_IS_MEASURED`) and there is no
+      // request that changes it, by design. The mock still has to be able to
+      // show the driver both worlds — the one shipped today, where the mood is
+      // stored and withheld, and the one a person gets if the measurement ever
+      // changes — because a renderer whose other half is never exercised is a
+      // renderer that breaks silently on that day.
+      request: (method, params) => client.request(method, params),
       quit: () => {
         quitting = true;
         app.quit();
