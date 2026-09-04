@@ -469,6 +469,19 @@ you mark "no plugin" is never muted, whatever the measurement thinks. See
 PROTOCOL, "0.12.2 — the mute aims at one client, not at Discord", and FINDINGS
 §37 for the numbers.
 
+And if you point the plugin at **both** clients — which is how you get per-user
+audio out of a machine where only one of them can produce it — Recall keeps the
+two calls apart rather than pooling them. Every line the plugin sends now says
+which client and which account it came from, so a turn recorded off one client
+is only ever labelled with people the plugin *in that client* could see; a
+client no plugin is reporting for gets no Discord labels at all rather than
+somebody else's, and one bridge's audio never silences the other one's call. The
+Sources card names the plugin under each client, and if two clients of the same
+kind are both sending — two Vesktops, which share everything a machine can see —
+it says so and asks you which is which: `recalld role vesktop bridge --account
+<your id>`. See PROTOCOL, "0.12.3 — two bridges, and whose word is about which
+call".
+
 Orbit integration is deliberately one-way and manual:
 Recall may read Orbit's name-picker once; **nothing ever flows back**. Orbit's
 charter stays clean.

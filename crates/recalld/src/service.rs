@@ -4033,7 +4033,16 @@ impl Service {
         let (spans, open) = store.truth_span_counts().map_err(Error::from)?;
         let last = store.truth_last_span_ns().map_err(Error::from)?;
         let users = store.discord_users().map_err(Error::from)?;
+        let now_ns = crate::clock::utc_now_ns();
+        let bridges = store
+            .truth_bridges(now_ns, crate::truth::BRIDGE_RECENT_NS)
+            .map_err(Error::from)?;
+        let sources = store
+            .discord_source_keys(&cfg.sources)
+            .map_err(Error::from)?;
         drop(store);
+        let picker = wiring.and_then(|w| w.bridge.as_ref());
+        let bridges_json = Self::bridges_json(&bridges, &sources, picker, now_ns);
         Ok(json!({
             // `listening` is the fact; `enabled` is the intention. They differ
             // when the port was taken, and a client showing only the second
@@ -4051,6 +4060,13 @@ impl Service {
             "users": users.len(),
             "linked": users.iter().filter(|u| u.speaker_id.is_some()).count(),
             "counters": wiring.map(|w| w.stats.to_json()),
+            // 0.12.3. Which RecallBridge plugins this daemon has heard from,
+            // and which Discord client's audio each one's spans are allowed to
+            // judge. Always an object, never null on a daemon that has the
+            // feature: `{"bridges": [], "ambiguous": []}` is "one plugin, or an
+            // older one", which a client must be able to tell from "no such
+            // field".
+            "bridges": bridges_json,
             // 0.12.1. Always present, never null on a daemon that has the
             // feature at all: a client must be able to tell "switched off" from
             // "older daemon", and a missing key cannot.
@@ -4058,13 +4074,100 @@ impl Service {
             // now and why, in the same object as the streams that caused it.
             "audio": wiring.and_then(|w| w.audio.as_ref()).map(|a| {
                 let mut v = a.status();
-                let live = a.any_live();
+                let live = a.live_kinds();
                 if let Some(b) = wiring.and_then(|w| w.bridge.as_ref()) {
-                    v["mute"] = b.status(crate::clock::monotonic_ns(), live);
+                    v["mute"] = b.status(crate::clock::monotonic_ns(), &live);
                 }
                 v
             }),
         }))
+    }
+
+    /// `truth.status.bridges` — the plugins, and what each one's word counts
+    /// for (0.12.3).
+    ///
+    /// One row per bridge that has written a scoped span, plus whatever the
+    /// live registry knows that the database cannot (`instance`, and a bridge
+    /// that has connected this evening without anybody speaking yet). `source`
+    /// is the mixed Discord tap this bridge's spans are allowed to judge — the
+    /// answer to *the* question a two-client install has.
+    ///
+    /// `ambiguous` is the warning, and it is a list of kinds rather than a
+    /// boolean so the sentence a client writes can name the thing: two Vesktops
+    /// and one official client is a real state and only half of it is broken.
+    fn bridges_json(
+        bridges: &[crate::bridge::BridgeSeen],
+        sources: &[String],
+        picker: Option<&std::sync::Arc<crate::bridge::Picker>>,
+        now_ns: i64,
+    ) -> Value {
+        let live = picker.map(|p| p.bridges_live()).unwrap_or_default();
+        let recent_min = crate::truth::BRIDGE_RECENT_NS as f64 / 60e9;
+        let mut rows: Vec<Value> = bridges
+            .iter()
+            .map(|b| {
+                // Which mixed source this bridge's word is about. Read through
+                // the same rule the verdict pass uses, so the status can never
+                // disagree with the thing it is describing.
+                let source = sources.iter().find(|s| {
+                    matches!(
+                        crate::truth::scope_of(s, bridges, picker.map(|p| p.as_ref())),
+                        crate::bridge::Scope::Account(ref a) if *a == b.account_id
+                    )
+                });
+                let seen = live.get(&(b.kind, b.account_id.clone()));
+                json!({
+                    "account_id": b.account_id,
+                    "kind": b.kind.map(crate::bridge::ClientKind::as_str),
+                    "instance": seen.and_then(|s| s.instance.clone()),
+                    "last_span_ms": ns_to_ms(b.last_span_ns),
+                    "last_line_ms": seen.map(|s| s.last_seen_ms),
+                    "spans": b.spans,
+                    "spans_per_min": (b.spans_recent as f64 / recent_min * 10.0).round() / 10.0,
+                    "source": source,
+                })
+            })
+            .collect();
+        // A bridge that has connected but not yet seen anybody speak has no
+        // span and therefore no database row. It is still a bridge, and the
+        // first thing somebody checks after enabling the plugin is whether the
+        // daemon can see it — so it is listed, with the counts it honestly has.
+        for ((kind, account), s) in &live {
+            if bridges
+                .iter()
+                .any(|b| b.account_id == *account && b.kind == *kind)
+            {
+                continue;
+            }
+            rows.push(json!({
+                "account_id": account,
+                "kind": kind.map(crate::bridge::ClientKind::as_str),
+                "instance": s.instance,
+                "last_span_ms": Value::Null,
+                "last_line_ms": s.last_seen_ms,
+                "spans": 0,
+                "spans_per_min": 0.0,
+                "source": Value::Null,
+            }));
+        }
+        rows.sort_by(|a, b| {
+            (a["kind"].as_str(), a["account_id"].as_str())
+                .cmp(&(b["kind"].as_str(), b["account_id"].as_str()))
+        });
+        // Only bridges that have been heard recently can be ambiguous: last
+        // month's second client is not a live disagreement, it is history.
+        let live_bridges: Vec<crate::bridge::BridgeSeen> = bridges
+            .iter()
+            .filter(|b| now_ns - b.last_span_ns <= crate::truth::BRIDGE_RECENT_NS)
+            .cloned()
+            .collect();
+        let named = picker.map(|p| p.named_accounts()).unwrap_or_default();
+        let ambiguous = crate::bridge::ambiguous_kinds(&live_bridges, &named);
+        json!({
+            "bridges": rows,
+            "ambiguous": ambiguous,
+            "recent_s": crate::truth::BRIDGE_RECENT_NS as f64 / 1e9,
+        })
     }
 
     /// `sources.instance_role` — which Discord client has the plugin in it
@@ -4088,6 +4191,21 @@ impl Service {
                 crate::bridge::ROLES.join(", ")
             ))
         })?;
+        // 0.12.3: the account half. Optional, and only meaningful beside
+        // `bridge` — it says which of two same-kind clients' speaking spans
+        // this source's audio carries, which is the one thing the source key
+        // cannot say because both clients share it.
+        let account = req
+            .opt_str("account_id")?
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string);
+        if account.is_some() && role != crate::bridge::Role::Bridge {
+            return Err(Error::params(
+                "account_id names the bridge whose spans this client's audio carries, \
+                 so it only means anything with role \"bridge\"",
+            ));
+        }
         // The same three refusals `sources.set` makes, for the same reason: a
         // role is a statement about a Discord *client*, and neither microphone
         // nor a per-user stream is one. A role recorded against them would sit
@@ -4109,7 +4227,7 @@ impl Service {
                 "this daemon has no instance picker wired up",
             ));
         };
-        bridge.set_role(&source, role);
+        bridge.set_role(&source, role, account.as_deref());
 
         let mut persisted = false;
         if let Some(path) = &self.control.config_path {
@@ -4128,6 +4246,7 @@ impl Service {
         Ok(json!({
             "source": source,
             "role": role.as_str(),
+            "account_id": account,
             "persisted": persisted,
             "roles": bridge.roles(),
         }))
@@ -5404,6 +5523,133 @@ mod tests {
         let evs = events(&r);
         assert_eq!(evs[0]["ev"], "source");
         assert_eq!(evs[0]["data"]["match_key"], "VRChat.exe");
+    }
+
+    /// 0.12.3. `truth.status.bridges` is the page a two-client install reads
+    /// first: which plugins have been heard from, which Discord client each
+    /// one's word is about, and — when nothing can tell two of them apart —
+    /// that the daemon is knowingly pooling two calls.
+    #[test]
+    fn truth_status_lists_the_bridges_and_which_client_each_one_speaks_for() {
+        let r = rig("bridges");
+        let bridge = Arc::new(crate::bridge::Picker::new());
+        let cfg = crate::config::TruthConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        r.service.attach_truth(Arc::new(TruthWiring {
+            cfg,
+            stats: Arc::new(crate::truth::TruthStats::default()),
+            listening: None,
+            token_path: std::path::PathBuf::from("/dev/null"),
+            audio: None,
+            bridge: Some(Arc::clone(&bridge)),
+        }));
+
+        // Two clients, two source rows, two bridges — the install this round
+        // exists for.
+        let now = crate::clock::utc_now_ns();
+        {
+            let store = r.service.store();
+            store.upsert_source("vesktop", "vesktop", 0).unwrap();
+            store.upsert_source("Discord", "Discord", 0).unwrap();
+            for (user, account, kind) in [
+                ("aspen", "acct-v", "vesktop"),
+                ("someone", "acct-d", "discord"),
+            ] {
+                let client = crate::bridge::ClientRef {
+                    kind: crate::bridge::ClientKind::parse(kind),
+                    account_id: Some(account.to_string()),
+                    instance: Some(format!("{account}-run1")),
+                };
+                store
+                    .truth_speaking_start(user, user, None, now - 1_000_000_000, &client)
+                    .unwrap();
+                store.truth_speaking_stop(user, now, &client).unwrap();
+                bridge.saw_bridge(&client, now / 1_000_000);
+            }
+        }
+
+        let st = call(&r, r#"{"id":1,"method":"truth.status"}"#).unwrap();
+        let rows = st["bridges"]["bridges"].as_array().cloned().unwrap();
+        assert_eq!(rows.len(), 2);
+        let d = rows.iter().find(|b| b["kind"] == "discord").unwrap();
+        let v = rows.iter().find(|b| b["kind"] == "vesktop").unwrap();
+        assert_eq!(d["account_id"], "acct-d");
+        assert_eq!(
+            d["source"], "Discord",
+            "a discord bridge speaks for the official client's tap"
+        );
+        assert_eq!(v["source"], "vesktop");
+        assert_eq!(v["instance"], "acct-v-run1");
+        assert_eq!(v["spans"], 1);
+        assert!(v["spans_per_min"].as_f64().unwrap() > 0.0);
+        assert!(
+            st["bridges"]["ambiguous"].as_array().unwrap().is_empty(),
+            "two bridges of two kinds are not ambiguous"
+        );
+
+        // A second Vesktop, and nothing says which one is which. That is the
+        // one state the daemon warns about, because no measurement can settle
+        // it and the verdicts are being pooled meanwhile.
+        {
+            let store = r.service.store();
+            let client = crate::bridge::ClientRef {
+                kind: Some(crate::bridge::ClientKind::Vesktop),
+                account_id: Some("acct-v2".into()),
+                instance: None,
+            };
+            store
+                .truth_speaking_start("third", "third", None, now - 1_000_000_000, &client)
+                .unwrap();
+            store.truth_speaking_stop("third", now, &client).unwrap();
+        }
+        let st = call(&r, r#"{"id":2,"method":"truth.status"}"#).unwrap();
+        assert_eq!(
+            st["bridges"]["ambiguous"].as_array().unwrap(),
+            &vec![json!("vesktop")]
+        );
+        // Neither Vesktop bridge is mapped to a source while it is ambiguous:
+        // the honest answer is that nobody knows.
+        for b in st["bridges"]["bridges"].as_array().unwrap() {
+            if b["kind"] == "vesktop" {
+                assert_eq!(b["source"], Value::Null);
+            }
+        }
+
+        // Naming one settles it — and it is the same override the mute reads,
+        // so the two can never disagree.
+        call(
+            &r,
+            r#"{"id":3,"method":"sources.instance_role","params":{"source":"vesktop","role":"bridge","account_id":"acct-v2"}}"#,
+        )
+        .unwrap();
+        let st = call(&r, r#"{"id":4,"method":"truth.status"}"#).unwrap();
+        assert!(st["bridges"]["ambiguous"].as_array().unwrap().is_empty());
+        let named = st["bridges"]["bridges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["account_id"] == "acct-v2")
+            .unwrap();
+        assert_eq!(named["source"], "vesktop");
+        assert_eq!(
+            st["audio"],
+            Value::Null,
+            "the audio half is off; `bridges` is not"
+        );
+
+        // An account beside anything but `bridge` is a params error, not a
+        // silently dropped field.
+        assert_eq!(
+            call(
+                &r,
+                r#"{"id":5,"method":"sources.instance_role","params":{"source":"Discord","role":"other","account_id":"acct-d"}}"#
+            )
+            .unwrap_err()
+            .code,
+            "params"
+        );
     }
 
     /// 0.12.2. Both states act, the refusals hold, and the verdict shows up on

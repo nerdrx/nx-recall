@@ -1088,6 +1088,14 @@ export function startMock({
     // per-user streams; `Discord` is a second client in another call and must
     // keep recording. Both start on `auto` so the card's control has somewhere
     // to move to.
+    // 0.12.3: and two plugins, one per client, each in its own call. The
+    // account is what the daemon scopes a verdict by, and the card shows it
+    // because "which plugin labelled this turn" is otherwise unanswerable.
+    bridges: [
+      { account_id: '482913', kind: 'vesktop', source: 'vesktop', spans: 412, spans_per_min: 8.2 },
+      { account_id: '771020', kind: 'discord', source: 'Discord', spans: 96, spans_per_min: 3.1 },
+    ],
+    bridgesAmbiguous: [],
     bridge: {
       roles: {},
       instances: [
@@ -2581,6 +2589,14 @@ export function startMock({
       linked: state.truthUsers.filter((u) => u.speaker != null).length,
       counters: { speaking: 4821, voice: 96, rejected: 0 },
       audio: audioPayload(),
+      // 0.12.3. Always an object, never null on a daemon that has the feature:
+      // "one plugin" and "no such field" are different facts and the card
+      // draws them differently.
+      bridges: {
+        bridges: state.bridges.map((b) => ({ ...b })),
+        ambiguous: [...state.bridgesAmbiguous],
+        recent_s: 300,
+      },
     }),
 
     'truth.users': () => ({ users: state.truthUsers.map((u) => ({ ...u })) }),

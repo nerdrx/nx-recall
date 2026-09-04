@@ -947,16 +947,32 @@ mod tests {
             // Somebody else spoke through the window; our account did not.
             let base = 10_000 * SEC;
             r.store
-                .truth_speaking_start("u2", "Somebody", None, base - 60 * SEC)
+                .truth_speaking_start(
+                    "u2",
+                    "Somebody",
+                    None,
+                    base - 60 * SEC,
+                    &crate::bridge::ClientRef::default(),
+                )
                 .unwrap();
-            r.store.truth_speaking_stop("u2", base - 30 * SEC).unwrap();
+            r.store
+                .truth_speaking_stop("u2", base - 30 * SEC, &crate::bridge::ClientRef::default())
+                .unwrap();
             assert!(gather(&r, r.discord_seg, &cfg)[0].discord_absent);
 
             // And once the account itself is heard, the rule stands down.
             r.store
-                .truth_speaking_start("u1", "Rowan", None, base - 10 * SEC)
+                .truth_speaking_start(
+                    "u1",
+                    "Rowan",
+                    None,
+                    base - 10 * SEC,
+                    &crate::bridge::ClientRef::default(),
+                )
                 .unwrap();
-            r.store.truth_speaking_stop("u1", base).unwrap();
+            r.store
+                .truth_speaking_stop("u1", base, &crate::bridge::ClientRef::default())
+                .unwrap();
             assert!(!gather(&r, r.discord_seg, &cfg)[0].discord_absent);
         }
 
@@ -969,9 +985,17 @@ mod tests {
             let cfg = cfg();
             let base = 10_000 * SEC;
             r.store
-                .truth_speaking_start("u2", "Somebody", None, base - 60 * SEC)
+                .truth_speaking_start(
+                    "u2",
+                    "Somebody",
+                    None,
+                    base - 60 * SEC,
+                    &crate::bridge::ClientRef::default(),
+                )
                 .unwrap();
-            r.store.truth_speaking_stop("u2", base - 30 * SEC).unwrap();
+            r.store
+                .truth_speaking_stop("u2", base - 30 * SEC, &crate::bridge::ClientRef::default())
+                .unwrap();
             assert!(!gather(&r, r.vrchat_seg, &cfg)[0].discord_absent);
         }
 

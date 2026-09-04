@@ -100,6 +100,43 @@ pub const ENROL_MIN_COVERAGE: f64 = 0.95;
 pub const LINK_MIN_AGREEMENT: f64 = 0.90;
 pub const LINK_MIN_SEGMENTS: i64 = 20;
 
+/// How far back `truth.status` and the scope rule look when asking how busy a
+/// bridge is. Five minutes, the same reach [`TRUTH_REACH_NS`] uses, so "spans
+/// per minute" and "was the plugin running" are measured over one window.
+pub const BRIDGE_RECENT_NS: i64 = TRUTH_REACH_NS;
+
+// ---------------------------------------------------------------------------
+// 0.12.3: whose spans
+// ---------------------------------------------------------------------------
+
+/// Which bridge's spans a mixed Discord source's turns are judged against.
+///
+/// The picker is optional because every pass here has to work with the daemon's
+/// live state absent — `recalld truth rejudge` on a copied database has no
+/// socket and no `Picker` — and its absence changes nothing except that a
+/// manual override cannot be read.
+pub fn scope_of(
+    source: &str,
+    bridges: &[crate::bridge::BridgeSeen],
+    bridge: Option<&crate::bridge::Picker>,
+) -> crate::bridge::Scope {
+    let account = bridge.and_then(|b| b.role_account(source));
+    crate::bridge::scope_for_source(source, bridges, account.as_deref())
+}
+
+/// The account a scope names, for [`Audible`]: the bridge's own microphone
+/// cannot be in its own client's output.
+pub fn scope_account(scope: &crate::bridge::Scope) -> Option<&str> {
+    match scope {
+        crate::bridge::Scope::Account(a) => Some(a.as_str()),
+        // `Every` is either one bridge (in which case it may be an old plugin
+        // that never said which account it was) or an ambiguous pair. Neither
+        // supports a claim about whose microphone the stream cannot hold, so
+        // nothing is claimed.
+        crate::bridge::Scope::Every | crate::bridge::Scope::Legacy => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // the arithmetic
 // ---------------------------------------------------------------------------
@@ -132,12 +169,39 @@ pub struct Audible<'a> {
     kind: &'a str,
     /// Every Discord account linked to the pinned "You" voice. A slice
     /// because a person may have two, and an alt is as inaudible as the main.
+    ///
+    /// Two accounts reach this slice today with no extra machinery:
+    /// `Store::discord_user_ids_for_speaker` resolves through
+    /// `speaker_resolved`, so *every* `discord_users` row pointing at the
+    /// pinned voice (or at a voice merged into it) is here. Linking the second
+    /// account to the same "You" voice is the whole of the setup.
     own: &'a [String],
+    /// The account the bridge whose call this recording carries is signed in
+    /// as (0.12.3).
+    ///
+    /// A **stronger** rule than `own` and it needs no link at all: this is the
+    /// local user of the very client whose output was tapped, and a client
+    /// never plays your own microphone back to you. `own` is "an account the
+    /// user has told us is theirs"; this is "the account this recording is
+    /// physically made from". The second one is a fact about the stream, which
+    /// is exactly what [`Audible`] is for.
+    bridge_account: Option<&'a str>,
 }
 
 impl<'a> Audible<'a> {
     pub fn new(kind: &'a str, own: &'a [String]) -> Self {
-        Self { kind, own }
+        Self {
+            kind,
+            own,
+            bridge_account: None,
+        }
+    }
+
+    /// Name the bridge whose client made this recording (0.12.3). `None`
+    /// leaves the rule exactly as 0.12.1 wrote it.
+    pub fn with_bridge_account(mut self, account: Option<&'a str>) -> Self {
+        self.bridge_account = account.filter(|a| !a.is_empty());
+        self
     }
 
     /// A stream nothing is known to be missing from: every account counts.
@@ -147,6 +211,7 @@ impl<'a> Audible<'a> {
         Self {
             kind: crate::store::KIND_APP,
             own: &[],
+            bridge_account: None,
         }
     }
 
@@ -156,17 +221,23 @@ impl<'a> Audible<'a> {
     }
 
     fn silences(&self, user_id: &str) -> bool {
-        self.kind == crate::store::KIND_APP && self.own.iter().any(|u| u == user_id)
+        self.kind == crate::store::KIND_APP
+            && (self.own.iter().any(|u| u == user_id) || self.bridge_account == Some(user_id))
     }
 
     /// The accounts this stream cannot contain — empty on a microphone, and
-    /// empty when nothing is linked to "You".
-    pub fn silent(&self) -> &'a [String] {
-        if self.kind == crate::store::KIND_APP {
-            self.own
-        } else {
-            &[]
+    /// empty when nothing is linked to "You" and no bridge is named.
+    pub fn silent(&self) -> Vec<String> {
+        if self.kind != crate::store::KIND_APP {
+            return Vec::new();
         }
+        let mut out: Vec<String> = self.own.to_vec();
+        if let Some(a) = self.bridge_account
+            && !out.iter().any(|u| u == a)
+        {
+            out.push(a.to_string());
+        }
+        out
     }
 }
 
@@ -466,6 +537,12 @@ pub fn migrate_v13(conn: &rusqlite::Connection) -> Result<()> {
                     name: r.get(1)?,
                     t_start_ns: r.get(2)?,
                     t_end_ns: r.get(3)?,
+                    // v13 runs before v17's columns exist, and it is a
+                    // backfill over rows that predate every bridge there will
+                    // ever be a second of: unscoped is the only honest answer
+                    // and `Audible::everyone()` beside it is the matching one.
+                    account_id: None,
+                    client_kind: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -592,6 +669,7 @@ pub fn label_batch(
     cfg: &TruthConfig,
     stats: &TruthStats,
     stop: &TruthStop,
+    bridge: Option<&crate::bridge::Picker>,
 ) -> Result<bool> {
     // ---- gather (lock held) ----
     //
@@ -599,11 +677,17 @@ pub fn label_batch(
     // small queries, it cannot change inside one pass in any way that matters,
     // and asking once means the rule is read from the same place for every row
     // the batch judges.
-    let (candidates, own) = {
+    //
+    // The bridges come with it, and for the same reasons: which client's spans
+    // this source's audio carries cannot change inside one pass in any way that
+    // matters, and reading it once means every row in the batch is judged
+    // against the same answer.
+    let (candidates, own, bridges) = {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
         (
             guard.segments_for_truth(&cfg.sources, cfg.batch_segments)?,
             guard.own_discord_user_ids()?,
+            guard.truth_bridges(utc_now_ns(), BRIDGE_RECENT_NS)?,
         )
     };
     if candidates.is_empty() {
@@ -614,22 +698,33 @@ pub fn label_batch(
         if stop.stopped() || gate(control, cfg).is_some() {
             break;
         }
+        // Whose spans this turn may be judged against (0.12.3). Resolved per
+        // row because a batch spans several sources, and it is the difference
+        // between a verdict about this call and a verdict about both of them.
+        let scope = scope_of(&c.source, &bridges, bridge);
+
         // ---- gather (lock held) ----
         let (spans, nearby) = {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-            let spans = guard.truth_spans_between(c.t_start_ns, c.t_end_ns)?;
+            let spans = guard.truth_spans_between_scoped(c.t_start_ns, c.t_end_ns, &scope)?;
             // "Was the plugin running at all around here?" — asked separately
             // and over a wider window, because a segment with no overlapping
             // span is the interesting case and the answer decides whether it
-            // is `nobody` or `unknown`.
+            // is `nobody` or `unknown`. Scoped too, and that is the point: with
+            // the other client's call five minutes away, an unscoped reach turns
+            // "this bridge saw nothing" into a confident `nobody`.
             let nearby = !guard
-                .truth_spans_between(c.t_start_ns - TRUTH_REACH_NS, c.t_end_ns + TRUTH_REACH_NS)?
+                .truth_spans_between_scoped(
+                    c.t_start_ns - TRUTH_REACH_NS,
+                    c.t_end_ns + TRUTH_REACH_NS,
+                    &scope,
+                )?
                 .is_empty();
             (spans, nearby)
         };
 
         // ---- judge (no lock) ----
-        let audible = Audible::new(&c.kind, &own);
+        let audible = Audible::new(&c.kind, &own).with_bridge_account(scope_account(&scope));
         let cov = coverage(&spans, c.t_start_ns, c.t_end_ns);
         let v = verdict(&cov, nearby, audible);
         // How much of the turn had two mouths open at once (v13). Stored
@@ -781,6 +876,7 @@ pub fn rejudge(
     limit: usize,
     apply: bool,
     at_ns: i64,
+    bridge: Option<&crate::bridge::Picker>,
 ) -> Result<RejudgeReport> {
     // ---- gather (lock held) ----
     //
@@ -794,9 +890,17 @@ pub fn rejudge(
     if own.is_empty() {
         return Ok(RejudgeReport::default());
     }
-    let candidates = {
+    let (candidates, bridges) = {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-        guard.segments_for_rejudge(limit)?
+        (
+            guard.segments_for_rejudge(limit)?,
+            // 0.12.3. On an archive written before the field existed this is
+            // empty, `scope_of` answers `Every`, and the pass re-derives
+            // exactly what 0.12.1 measured — which is the contract: a verdict
+            // already on disk is never re-scoped by a bridge that arrived
+            // afterwards.
+            guard.truth_bridges(at_ns, BRIDGE_RECENT_NS)?,
+        )
     };
     let mut report = RejudgeReport {
         examined: candidates.len(),
@@ -804,13 +908,18 @@ pub fn rejudge(
     };
 
     for c in candidates {
-        let audible = Audible::new(&c.kind, &own);
+        let scope = scope_of(&c.source, &bridges, bridge);
+        let audible = Audible::new(&c.kind, &own).with_bridge_account(scope_account(&scope));
         // ---- gather (lock held) ----
         let (spans, nearby) = {
             let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-            let spans = guard.truth_spans_between(c.t_start_ns, c.t_end_ns)?;
+            let spans = guard.truth_spans_between_scoped(c.t_start_ns, c.t_end_ns, &scope)?;
             let nearby = !guard
-                .truth_spans_between(c.t_start_ns - TRUTH_REACH_NS, c.t_end_ns + TRUTH_REACH_NS)?
+                .truth_spans_between_scoped(
+                    c.t_start_ns - TRUTH_REACH_NS,
+                    c.t_end_ns + TRUTH_REACH_NS,
+                    &scope,
+                )?
                 .is_empty();
             (spans, nearby)
         };
@@ -923,14 +1032,17 @@ pub fn rejudge(
 /// this worker: the switch that lets the daemon write verdicts is the switch
 /// that lets it correct them. With labelling off, `recalld truth rejudge`
 /// is the route and the operator drives it.
-fn rejudge_once(store: &Arc<std::sync::Mutex<Store>>) -> Result<()> {
+fn rejudge_once(
+    store: &Arc<std::sync::Mutex<Store>>,
+    bridge: Option<&crate::bridge::Picker>,
+) -> Result<()> {
     {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
         if guard.setting(REJUDGE_KEY)?.is_some() {
             return Ok(());
         }
     }
-    let report = rejudge(store, REJUDGE_AUTO_LIMIT, true, utc_now_ns())?;
+    let report = rejudge(store, REJUDGE_AUTO_LIMIT, true, utc_now_ns(), bridge)?;
     info!(
         examined = report.examined,
         changed = report.changed.len(),
@@ -1426,6 +1538,10 @@ pub fn run(
     runtime: crate::config::RuntimeConfig,
     stats: Arc<TruthStats>,
     stop: Arc<TruthStop>,
+    // The live instance picker (0.12.3), for the one thing the database
+    // cannot answer: a manual `bridge:<account_id>` override the user set
+    // this evening, which has to reach the verdict scope without a restart.
+    bridge: Option<Arc<crate::bridge::Picker>>,
 ) {
     crate::pipeline::background_current_thread(runtime.inference_nice, &runtime.inference_cpus);
     let timeout_ns = (cfg.open_span_timeout_s.max(1) as i64) * 1_000_000_000;
@@ -1466,11 +1582,13 @@ pub fn run(
                 // a verdict: the corrected verdicts are what the auto-linker,
                 // the retro-labeller and the calibration pass should see on
                 // the very first evening after the upgrade, not on the second.
-                if let Err(e) = rejudge_once(&store) {
+                if let Err(e) = rejudge_once(&store, bridge.as_deref()) {
                     warn!("the ground-truth re-verdict pass failed: {e:#}");
                 }
                 // ---- end 0.12.1 ------------------------------------------
-                if let Err(e) = label_batch(&store, &control, &cfg, &stats, &stop) {
+                if let Err(e) =
+                    label_batch(&store, &control, &cfg, &stats, &stop, bridge.as_deref())
+                {
                     warn!("a ground-truth labelling batch failed: {e:#}");
                 }
                 if let Err(e) = link_batch(&store, &bus, &stats) {
@@ -1707,11 +1825,18 @@ mod tests {
     use super::*;
 
     fn span(user: &str, from_ms: i64, to_ms: i64) -> TruthSpan {
+        span_from(user, from_ms, to_ms, None)
+    }
+
+    /// The same, from a named bridge (0.12.3).
+    fn span_from(user: &str, from_ms: i64, to_ms: i64, account: Option<&str>) -> TruthSpan {
         TruthSpan {
             user_id: user.to_string(),
             name: format!("{user}-nick"),
             t_start_ns: from_ms * 1_000_000,
             t_end_ns: to_ms * 1_000_000,
+            account_id: account.map(str::to_string),
+            client_kind: account.map(|_| "vesktop".to_string()),
         }
     }
 
@@ -2731,14 +2856,27 @@ mod tests {
         let seg = g.insert_segment(session, a, b, "t.wav", 0).unwrap();
         let mut spans = Vec::new();
         for (u, from_ms, to_ms) in rings {
-            g.truth_speaking_start(u, u, None, a + from_ms * 1_000_000)
-                .unwrap();
-            g.truth_speaking_stop(u, a + to_ms * 1_000_000).unwrap();
+            g.truth_speaking_start(
+                u,
+                u,
+                None,
+                a + from_ms * 1_000_000,
+                &crate::bridge::ClientRef::default(),
+            )
+            .unwrap();
+            g.truth_speaking_stop(
+                u,
+                a + to_ms * 1_000_000,
+                &crate::bridge::ClientRef::default(),
+            )
+            .unwrap();
             spans.push(TruthSpan {
                 user_id: (*u).to_string(),
                 name: (*u).to_string(),
                 t_start_ns: a + from_ms * 1_000_000,
                 t_end_ns: a + to_ms * 1_000_000,
+                account_id: None,
+                client_kind: None,
             });
         }
         // Exactly what the pass would have written before the rule existed.
@@ -2774,14 +2912,14 @@ mod tests {
         assert_eq!(verdict_of(&store, ghost).0, truth_verdict::SINGLE);
 
         // ---- the preview writes nothing ----
-        let preview = rejudge(&store, usize::MAX, false, 1).unwrap();
+        let preview = rejudge(&store, usize::MAX, false, 1, None).unwrap();
         assert_eq!(preview.examined, 4);
         assert_eq!(preview.changed.len(), 2);
         assert_eq!(preview.overlap_reassigned(), 1);
         assert_eq!(verdict_of(&store, phantom).0, truth_verdict::OVERLAP);
 
         // ---- and the apply writes exactly what it previewed ----
-        let done = rejudge(&store, usize::MAX, true, 1).unwrap();
+        let done = rejudge(&store, usize::MAX, true, 1, None).unwrap();
         assert_eq!(done.changed, preview.changed, "preview is the same pass");
         assert_eq!(
             verdict_of(&store, phantom),
@@ -2808,10 +2946,13 @@ mod tests {
         let (store, app, _) = a_store_to_rejudge();
         old_verdict_turn(&store, app, 10, &[("aspen", 0, 1800), ("me", 400, 1400)]);
         assert_eq!(
-            rejudge(&store, usize::MAX, true, 1).unwrap().changed.len(),
+            rejudge(&store, usize::MAX, true, 1, None)
+                .unwrap()
+                .changed
+                .len(),
             1
         );
-        let again = rejudge(&store, usize::MAX, true, 2).unwrap();
+        let again = rejudge(&store, usize::MAX, true, 2, None).unwrap();
         assert!(again.changed.is_empty(), "idempotent, like every pass here");
         assert_eq!(again.restamped, 0);
     }
@@ -2820,7 +2961,7 @@ mod tests {
     fn the_re_verdict_is_written_down_and_readable_back() {
         let (store, app, _) = a_store_to_rejudge();
         let seg = old_verdict_turn(&store, app, 10, &[("aspen", 0, 1800), ("me", 400, 1400)]);
-        let r = rejudge(&store, usize::MAX, true, 77).unwrap();
+        let r = rejudge(&store, usize::MAX, true, 77, None).unwrap();
         let g = store.lock().unwrap();
         let ops = g.operations_of(OP_REJUDGE, 10).unwrap();
         assert_eq!(ops.len(), 1);
@@ -2853,7 +2994,7 @@ mod tests {
                 mk(30, truth_verdict::OVERLAP, None, None),
             )
         };
-        let r = rejudge(&store, usize::MAX, true, 1).unwrap();
+        let r = rejudge(&store, usize::MAX, true, 1, None).unwrap();
         assert_eq!(r.from_columns, 1);
         assert_eq!(r.unresolvable, 1, "the one row that cannot be re-judged");
         assert_eq!(
@@ -2876,7 +3017,7 @@ mod tests {
         let sess = s.begin_session(app, 0).unwrap();
         let store = Arc::new(std::sync::Mutex::new(s));
         let seg = old_verdict_turn(&store, sess, 10, &[("aspen", 0, 1800), ("me", 400, 1400)]);
-        let r = rejudge(&store, usize::MAX, true, 1).unwrap();
+        let r = rejudge(&store, usize::MAX, true, 1, None).unwrap();
         assert_eq!(r.examined, 0, "no subject, no rule, no walk of the table");
         assert_eq!(verdict_of(&store, seg).0, truth_verdict::OVERLAP);
     }
@@ -2885,18 +3026,113 @@ mod tests {
     fn the_automatic_re_verdict_runs_once_and_only_once() {
         let (store, app, _) = a_store_to_rejudge();
         old_verdict_turn(&store, app, 10, &[("aspen", 0, 1800), ("me", 400, 1400)]);
-        rejudge_once(&store).unwrap();
+        rejudge_once(&store, None).unwrap();
         assert_eq!(verdict_of(&store, 1).0, truth_verdict::SINGLE);
         // A second turn arrives with an old-rule verdict — a row the live
         // pass would never write now, so the only way it exists is somebody
         // putting it there. The automatic pass is done and does not re-run;
         // `recalld truth rejudge` is the route.
         let late = old_verdict_turn(&store, app, 20, &[("aspen", 0, 1800), ("me", 400, 1400)]);
-        rejudge_once(&store).unwrap();
+        rejudge_once(&store, None).unwrap();
         assert_eq!(verdict_of(&store, late).0, truth_verdict::OVERLAP);
         assert_eq!(
-            rejudge(&store, usize::MAX, true, 1).unwrap().changed.len(),
+            rejudge(&store, usize::MAX, true, 1, None)
+                .unwrap()
+                .changed
+                .len(),
             1
+        );
+    }
+
+    // ---- 0.12.3: two bridges ----------------------------------------------
+
+    /// The second own account, which is the case the user actually has: two
+    /// Discord accounts, both theirs, in two clients. Both are linked to the
+    /// pinned "You" voice, and `Audible` must silence both on application
+    /// audio and neither on a microphone.
+    #[test]
+    fn every_account_linked_to_you_is_silent_on_app_audio() {
+        let own = vec!["me-main".to_string(), "me-alt".to_string()];
+        let app = Audible::new(crate::store::KIND_APP, &own);
+        assert!(!app.hears("me-main"));
+        assert!(!app.hears("me-alt"), "an alt is as inaudible as the main");
+        assert!(app.hears("aspen"));
+        assert_eq!(app.silent().len(), 2);
+
+        // A microphone hears the room, and in the room the user is the one
+        // voice that certainly IS there.
+        let mic = Audible::new(crate::store::KIND_MIC, &own);
+        assert!(mic.hears("me-main"));
+        assert!(mic.hears("me-alt"));
+        assert!(mic.silent().is_empty());
+    }
+
+    /// The stronger rule, and the one that needs no link at all: whatever the
+    /// user has told us, the bridge's own account is the local user of the very
+    /// client whose output this recording is, and a client never plays your
+    /// microphone back to you.
+    #[test]
+    fn the_bridges_own_account_is_silent_on_its_own_clients_audio() {
+        let none: Vec<String> = Vec::new();
+        let app = Audible::new(crate::store::KIND_APP, &none).with_bridge_account(Some("me-alt"));
+        assert!(!app.hears("me-alt"));
+        assert!(app.hears("aspen"));
+        assert_eq!(app.silent(), vec!["me-alt".to_string()]);
+
+        // Still not on a microphone.
+        let mic = Audible::new(crate::store::KIND_MIC, &none).with_bridge_account(Some("me-alt"));
+        assert!(mic.hears("me-alt"));
+
+        // And a turn where only the bridge's own account was ringing is
+        // `nobody`, which is what `nobody` has always meant.
+        let cov = coverage(&[span("me-alt", 0, 2_000)], 0, 2_000 * 1_000_000);
+        assert_eq!(verdict(&cov, true, app), Verdict::Nobody);
+    }
+
+    /// Two calls at once, one segment. Unscoped, the two bridges' spans read
+    /// as two people talking across the turn and the verdict is `overlap`;
+    /// scoped to the bridge whose client made the recording, it is the `single`
+    /// it always was.
+    #[test]
+    fn scoping_the_spans_is_the_difference_between_single_and_overlap() {
+        let seg = (0i64, 2_000i64 * 1_000_000);
+        let mixed = [
+            span_from("aspen", 0, 1_900, Some("acct-vesktop")),
+            span_from("someone-else", 100, 1_800, Some("acct-discord")),
+        ];
+        // What 0.12.2 would have computed: two calls braided into one verdict.
+        let cov = coverage(&mixed, seg.0, seg.1);
+        assert_eq!(verdict(&cov, true, Audible::everyone()), Verdict::Overlap);
+
+        // What the daemon computes once the spans are scoped — and the scope
+        // is what the query does, so the test does it the same way.
+        let mine: Vec<TruthSpan> = mixed
+            .iter()
+            .filter(|s| s.account_id.as_deref() == Some("acct-vesktop"))
+            .cloned()
+            .collect();
+        let cov = coverage(&mine, seg.0, seg.1);
+        assert!(matches!(
+            verdict(&cov, true, Audible::everyone()),
+            Verdict::Single { ref user_id, .. } if user_id == "aspen"
+        ));
+        // …and the simultaneous fraction stops claiming a collision that was
+        // never in this recording.
+        assert!(simultaneous_frac(&mine, seg.0, seg.1, Audible::everyone()) < 1e-9);
+        assert!(simultaneous_frac(&mixed, seg.0, seg.1, Audible::everyone()) > 0.5);
+    }
+
+    /// `scope_of` with no picker and no bridges is `Every`, which is what
+    /// keeps `recalld truth rejudge` on an archive doing exactly what 0.12.1
+    /// measured.
+    #[test]
+    fn an_archive_with_no_scoped_span_is_judged_exactly_as_before() {
+        assert_eq!(scope_of("vesktop", &[], None), crate::bridge::Scope::Every);
+        assert_eq!(scope_account(&crate::bridge::Scope::Every), None);
+        assert_eq!(scope_account(&crate::bridge::Scope::Legacy), None);
+        assert_eq!(
+            scope_account(&crate::bridge::Scope::Account("a1".into())),
+            Some("a1")
         );
     }
 }

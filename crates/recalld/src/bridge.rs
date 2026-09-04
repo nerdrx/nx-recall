@@ -204,6 +204,308 @@ impl Role {
 /// refusal is.
 pub const ROLES: [&str; 3] = ["auto", "bridge", "other"];
 
+/// Parse one `[truth] bridge_roles` value, which is either a bare role or
+/// `bridge:<account_id>` (0.12.3).
+///
+/// The account half exists for the one case the source key cannot separate:
+/// **two clients of the same kind**, which share one `sources` row and
+/// therefore one entry here. Naming the account says which bridge's spans that
+/// source's audio carries, which is a different question from "is it muted" and
+/// is the one the verdict scope asks.
+///
+/// A trailing colon with nothing after it is a typo, not "no account", and is
+/// refused for the same reason a misspelled role is: a mute or a scope somebody
+/// thought they had set is worse than an error message.
+pub fn parse_role_spec(s: &str) -> Option<(Role, Option<String>)> {
+    let s = s.trim();
+    match s.split_once(':') {
+        None => Role::parse(s).map(|r| (r, None)),
+        Some((head, account)) => {
+            let account = account.trim();
+            let role = Role::parse(head)?;
+            if account.is_empty() || role != Role::Bridge {
+                return None;
+            }
+            Some((role, Some(account.to_string())))
+        }
+    }
+}
+
+/// The inverse of [`parse_role_spec`], for the config file and the wire.
+pub fn role_spec(role: Role, account: Option<&str>) -> String {
+    match (role, account) {
+        (Role::Bridge, Some(a)) if !a.is_empty() => format!("bridge:{a}"),
+        _ => role.as_str().to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0.12.3: which client, of the two
+// ---------------------------------------------------------------------------
+
+/// What kind of Discord client a RecallBridge plugin is sitting in.
+///
+/// It arrives on the wire, from the plugin's own `IS_VESKTOP` /
+/// `IS_DISCORD_DESKTOP` / `IS_WEB` globals, and it is the *only* thing that can
+/// map a bridge to the PipeWire node its client plays through without asking
+/// the user. On this machine the two nodes are already distinguishable
+/// (FINDINGS §37): Vesktop's is `application.process.binary = vesktop`, the
+/// official client's is `Discord` with `node.name = WEBRTC VoiceEngine`.
+///
+/// `Web` is here because the plugin can say it, not because the daemon can use
+/// it: a browser tab's audio comes out of the browser's node, which is not in
+/// `[truth].sources` and is never a mixed Discord instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ClientKind {
+    Vesktop,
+    Discord,
+    Web,
+}
+
+impl ClientKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClientKind::Vesktop => "vesktop",
+            ClientKind::Discord => "discord",
+            ClientKind::Web => "web",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "vesktop" => Some(ClientKind::Vesktop),
+            "discord" => Some(ClientKind::Discord),
+            "web" => Some(ClientKind::Web),
+            _ => None,
+        }
+    }
+}
+
+/// The `client` object every RecallBridge POST carries since 0.12.3.
+///
+/// Every field is optional and an absent one is never guessed. A line with no
+/// `client` at all is an **older plugin**, and the daemon's answer to that is
+/// the honest one: NULL scope, which every scope matches, i.e. "the only bridge
+/// there was".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientRef {
+    pub kind: Option<ClientKind>,
+    /// The plugin's own Discord account. This is the bridge's identity: two
+    /// clients are two accounts even when they are two copies of one binary.
+    pub account_id: Option<String>,
+    /// Random, generated once per plugin start. Not stored — it changes on
+    /// every reload — but it is what tells a restarted plugin from a second
+    /// one, and `truth.status` shows it.
+    pub instance: Option<String>,
+}
+
+impl ClientRef {
+    /// Read the `client` object off one NDJSON line. Anything malformed is
+    /// simply absent: a truth line whose payload is good must never be refused
+    /// over its provenance, because a refused line is a span that never existed.
+    pub fn parse(v: &Value) -> Self {
+        let Some(c) = v.get("client").and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let s = |k: &str| {
+            c.get(k)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            kind: c
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(ClientKind::parse),
+            account_id: s("account_id"),
+            instance: s("instance"),
+        }
+    }
+
+    /// Is this line scoped at all? A line from an older plugin is not, and
+    /// nothing downstream may pretend otherwise.
+    pub fn is_scoped(&self) -> bool {
+        self.account_id.is_some()
+    }
+}
+
+/// Which PipeWire source a client of this kind plays through.
+///
+/// Matched on the source's match key the way `[truth].sources` is matched
+/// everywhere else — lower-case substrings — because that is the string the
+/// user sees, allows and overrides on. A `discord:` key is a per-user stream
+/// and is never a client.
+pub fn kind_of_source(match_key: &str) -> Option<ClientKind> {
+    if match_key.starts_with("discord:") {
+        return None;
+    }
+    let k = match_key.to_ascii_lowercase();
+    // Vesktop first: its binary is `vesktop`, which contains neither of the
+    // official client's markers, but the reverse test is not safe to assume.
+    if k.contains("vesktop") {
+        return Some(ClientKind::Vesktop);
+    }
+    if k.contains("discord") || k.contains("webrtc") || k.contains("voiceengine") {
+        return Some(ClientKind::Discord);
+    }
+    None
+}
+
+/// Which per-user streams are arriving right now, and from whose bridge.
+///
+/// The set is of `Option<ClientKind>` and the `None` member is load-bearing: it
+/// is an older plugin's streams, which belong to no named client and therefore
+/// explain *every* mixed instance — exactly 0.12.2's behaviour, which is what
+/// an install that has not updated its plugin must keep getting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveKinds {
+    kinds: BTreeSet<Option<ClientKind>>,
+}
+
+impl LiveKinds {
+    pub fn insert(&mut self, kind: Option<ClientKind>) {
+        self.kinds.insert(kind);
+    }
+
+    /// Is anything arriving at all?
+    pub fn any(&self) -> bool {
+        !self.kinds.is_empty()
+    }
+
+    /// Could the live streams be a duplicate of *this* source's audio?
+    ///
+    /// A Vesktop bridge's streams cannot explain the official client's call and
+    /// must never mute it — that is the whole of 0.12.3's half of the rule. An
+    /// unscoped stream explains everything, and a source no kind maps to is
+    /// explained by nothing but an unscoped stream.
+    pub fn explains(&self, source: &str) -> bool {
+        if self.kinds.contains(&None) {
+            return true;
+        }
+        match kind_of_source(source) {
+            Some(k) => self.kinds.contains(&Some(k)),
+            None => false,
+        }
+    }
+
+    /// For `truth.status`, in a stable order.
+    pub fn to_json(&self) -> Value {
+        json!(
+            self.kinds
+                .iter()
+                .map(|k| k.map_or_else(|| Value::Null, |k| json!(k.as_str())))
+                .collect::<Vec<_>>()
+        )
+    }
+}
+
+/// Whose speaking spans a segment's verdict may be judged against (0.12.3).
+///
+/// A span is evidence about the call **its own bridge could see**. With two
+/// bridges in two calls, reading every span that overlaps a turn mixes two
+/// conversations into one verdict, and the daemon has no way to notice: that is
+/// the bug this type closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    /// Every span, whoever sent it. What an install with one bridge has always
+    /// had, what an ambiguous install keeps having, and what every test that is
+    /// not about this rule wants.
+    Every,
+    /// This account's spans, **and every unscoped one**. The `NULL` half is not
+    /// a convenience: a row written before schema v17 came from the only bridge
+    /// there was, so it is evidence about whatever call was being recorded, and
+    /// dropping it would silently un-judge the entire archive.
+    Account(String),
+    /// Only unscoped spans. What a mixed source no live bridge maps to gets:
+    /// the spans on disk belong to somebody else's call, so the honest verdict
+    /// for this audio is `unknown`.
+    Legacy,
+}
+
+impl Scope {
+    pub fn to_json(&self) -> Value {
+        match self {
+            Scope::Every => json!({"scope": "every"}),
+            Scope::Account(a) => json!({"scope": "account", "account_id": a}),
+            Scope::Legacy => json!({"scope": "legacy"}),
+        }
+    }
+}
+
+/// A bridge the daemon has heard from, as `truth.status` and the scope rule
+/// read it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeSeen {
+    pub account_id: String,
+    pub kind: Option<ClientKind>,
+    pub last_span_ns: i64,
+    pub spans: i64,
+    /// Spans started inside the recency window, for the per-minute rate.
+    pub spans_recent: i64,
+}
+
+/// Which bridge's spans a mixed Discord source's audio carries.
+///
+/// The order is the order of certainty, and it is short on purpose:
+///
+/// 1. **The user said so.** `bridge_roles` may name an account, and that is the
+///    only thing that can separate two clients of the same kind.
+/// 2. **Nobody has ever scoped a span.** Then there is one bridge by
+///    construction — the one that predates the field — and the answer is
+///    `Every`, which is 0.12.2 exactly.
+/// 3. **The kind maps.** One bridge of the kind this source belongs to: that
+///    one.
+/// 4. **No bridge of this kind.** The spans on disk are somebody else's call.
+///    `Legacy` — only unscoped spans count, so a scoped-only archive judges
+///    this audio `unknown` rather than against the wrong conversation.
+/// 5. **Two bridges of one kind, and no override.** Ambiguous. `Every`, which
+///    is the pre-0.12.3 behaviour and therefore adds no new wrongness, and
+///    `truth.status` says out loud that it is guessing.
+pub fn scope_for_source(
+    source: &str,
+    bridges: &[BridgeSeen],
+    account_override: Option<&str>,
+) -> Scope {
+    if let Some(a) = account_override.map(str::trim).filter(|a| !a.is_empty()) {
+        return Scope::Account(a.to_string());
+    }
+    if bridges.is_empty() {
+        return Scope::Every;
+    }
+    let Some(kind) = kind_of_source(source) else {
+        return Scope::Every;
+    };
+    let mut of_kind = bridges.iter().filter(|b| b.kind == Some(kind));
+    match (of_kind.next(), of_kind.next()) {
+        (Some(one), None) => Scope::Account(one.account_id.clone()),
+        (None, _) => Scope::Legacy,
+        (Some(_), Some(_)) => Scope::Every,
+    }
+}
+
+/// Are there two live bridges of one kind with nothing saying which is which?
+///
+/// The one warning this subsystem raises, because it is the one state where the
+/// daemon is knowingly mixing two calls into one verdict and no amount of
+/// measurement can separate them.
+pub fn ambiguous_kinds(bridges: &[BridgeSeen], named_accounts: &BTreeSet<String>) -> Vec<String> {
+    let mut counts: BTreeMap<ClientKind, usize> = BTreeMap::new();
+    for b in bridges {
+        if let Some(k) = b.kind
+            && !named_accounts.contains(&b.account_id)
+        {
+            *counts.entry(k).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(k, _)| k.as_str().to_string())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // one instance's timeline
 // ---------------------------------------------------------------------------
@@ -231,6 +533,11 @@ pub struct Verdict {
     pub share: Option<f64>,
     pub active_ms: u64,
     pub muted: bool,
+    /// Is any live per-user stream even *capable* of being a duplicate of this
+    /// client's audio (0.12.3)? False for the official client while only
+    /// Vesktop's bridge is sending, and a false here is a hard "never muted"
+    /// that no share and no `Bridge` role can talk round.
+    pub explained: bool,
     /// One sentence for `truth report` and the Sources card.
     pub why: String,
 }
@@ -245,6 +552,7 @@ impl Verdict {
             "share": self.share,
             "active_ms": self.active_ms,
             "muted": self.muted,
+            "explained": self.explained,
             "why": self.why,
         })
     }
@@ -254,21 +562,41 @@ impl Verdict {
 // the picker
 // ---------------------------------------------------------------------------
 
+/// A bridge the ingest has heard a line from, this run.
+///
+/// In memory and not in the database, because the only thing here the database
+/// cannot answer is `instance` — which is per plugin start and would be a
+/// column of churn. The spans, the counts and the last-seen come from
+/// `truth_speaking`, where they are facts rather than a session's memory.
+#[derive(Debug, Clone, Default)]
+pub struct BridgeLive {
+    pub instance: Option<String>,
+    pub last_seen_ms: i64,
+    pub lines: u64,
+}
+
 #[derive(Debug, Default)]
 struct Inner {
-    /// Buckets in which SOME per-user stream was carrying speech.
-    stream: BTreeSet<u64>,
+    /// Buckets in which SOME per-user stream was carrying speech, per bridge
+    /// kind. `None` is an older plugin's streams, which belong to no named
+    /// client and explain every instance.
+    stream: BTreeMap<Option<ClientKind>, BTreeSet<u64>>,
     mixed: HashMap<i64, Instance>,
     /// Manual overrides, keyed on the source match key because that is the
     /// only thing here that survives a relaunch.
     roles: BTreeMap<String, Role>,
+    /// The account half of a `bridge:<account_id>` override, same key.
+    role_accounts: BTreeMap<String, String>,
+    /// Bridges heard from this run, keyed by (kind, account).
+    seen: BTreeMap<(Option<ClientKind>, String), BridgeLive>,
     /// The last decision and the bucket it was taken in.
     decided_at: u64,
     verdicts: Vec<Verdict>,
-    /// Whether the last decision was taken with streams live. A decision taken
-    /// while nothing was arriving mutes nothing, and must not be reused once
-    /// something is.
-    decided_live: bool,
+    /// Which kinds of stream the last decision was taken against. A decision
+    /// taken while nothing was arriving mutes nothing, and must not be reused
+    /// once something is — nor may a decision taken against Vesktop's streams
+    /// be reused once the official client's start arriving too.
+    decided_live: LiveKinds,
     have_decided: bool,
 }
 
@@ -293,24 +621,47 @@ impl Picker {
     /// silently become a mute.
     pub fn load_roles(&self, roles: &BTreeMap<String, String>) {
         let mut inner = self.lock();
-        inner.roles = roles
-            .iter()
-            .filter_map(|(k, v)| {
-                let role = Role::parse(v)?;
-                (role != Role::Auto).then(|| (k.clone(), role))
-            })
-            .collect();
+        inner.roles.clear();
+        inner.role_accounts.clear();
+        for (k, v) in roles {
+            let Some((role, account)) = parse_role_spec(v) else {
+                continue;
+            };
+            if role == Role::Auto {
+                continue;
+            }
+            inner.roles.insert(k.clone(), role);
+            if let Some(a) = account {
+                inner.role_accounts.insert(k.clone(), a);
+            }
+        }
         inner.have_decided = false;
     }
 
     /// Set one override live. `Auto` removes it, so the map only ever holds
     /// decisions somebody actually made.
-    pub fn set_role(&self, source: &str, role: Role) {
+    ///
+    /// `account` is the 0.12.3 half: the Discord account of the bridge whose
+    /// spans this source's audio carries. It is only meaningful beside
+    /// [`Role::Bridge`] and it is what separates two clients of one kind, which
+    /// share a source row and therefore share this entry.
+    pub fn set_role(&self, source: &str, role: Role, account: Option<&str>) {
         let mut inner = self.lock();
         if role == Role::Auto {
             inner.roles.remove(source);
+            inner.role_accounts.remove(source);
         } else {
             inner.roles.insert(source.to_string(), role);
+            match account.map(str::trim).filter(|a| !a.is_empty()) {
+                Some(a) if role == Role::Bridge => {
+                    inner
+                        .role_accounts
+                        .insert(source.to_string(), a.to_string());
+                }
+                _ => {
+                    inner.role_accounts.remove(source);
+                }
+            }
         }
         // The next `is_muted` re-decides rather than serving the cache: a role
         // the user just set has to act on the next buffer, not a quarter of a
@@ -322,13 +673,53 @@ impl Picker {
         self.lock().roles.get(source).copied().unwrap_or_default()
     }
 
+    /// The account a `bridge:<account_id>` override named for this source, if
+    /// any. What [`scope_for_source`] is given.
+    pub fn role_account(&self, source: &str) -> Option<String> {
+        self.lock().role_accounts.get(source).cloned()
+    }
+
+    /// Every account any override names, for the ambiguity warning: a bridge
+    /// somebody has already pointed at a source is not ambiguous.
+    pub fn named_accounts(&self) -> BTreeSet<String> {
+        self.lock().role_accounts.values().cloned().collect()
+    }
+
     /// Every override that is set, for the wire and for the config file.
     pub fn roles(&self) -> BTreeMap<String, String> {
-        self.lock()
+        let inner = self.lock();
+        inner
             .roles
             .iter()
-            .map(|(k, v)| (k.clone(), v.as_str().to_string()))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    role_spec(*v, inner.role_accounts.get(k).map(String::as_str)),
+                )
+            })
             .collect()
+    }
+
+    /// Record that a bridge sent a line (0.12.3). Unscoped lines — an older
+    /// plugin — are not recorded: there is nothing to tell apart.
+    pub fn saw_bridge(&self, client: &ClientRef, at_ms: i64) {
+        let Some(account) = client.account_id.clone() else {
+            return;
+        };
+        let mut inner = self.lock();
+        let e = inner.seen.entry((client.kind, account)).or_default();
+        if client.instance.is_some() {
+            e.instance.clone_from(&client.instance);
+        }
+        e.last_seen_ms = e.last_seen_ms.max(at_ms);
+        e.lines += 1;
+    }
+
+    /// Every bridge heard from this run, newest first is not the order —
+    /// `truth.status` sorts, and a map keyed by (kind, account) is already
+    /// stable.
+    pub fn bridges_live(&self) -> BTreeMap<(Option<ClientKind>, String), BridgeLive> {
+        self.lock().seen.clone()
     }
 
     /// A buffer of one mixed Discord instance's audio.
@@ -366,11 +757,16 @@ impl Picker {
     }
 
     /// A buffer of one per-user stream's audio.
-    pub fn observe_stream(&self, mono_ns: u64, samples: &[f32]) {
+    ///
+    /// `kind` is the bridge that sent it (0.12.3). Vesktop's streams are
+    /// evidence about Vesktop's client and about nothing else, so they are kept
+    /// apart; `None` is an older plugin's and is evidence about everything,
+    /// which is 0.12.2 unchanged.
+    pub fn observe_stream(&self, kind: Option<ClientKind>, mono_ns: u64, samples: &[f32]) {
         let buckets = active_buckets(mono_ns, samples);
         let now = bucket_of(mono_ns);
         let mut inner = self.lock();
-        inner.stream.extend(buckets);
+        inner.stream.entry(kind).or_default().extend(buckets);
         inner.prune(now);
     }
 
@@ -389,9 +785,9 @@ impl Picker {
     /// arriving right now" — [`crate::peruser::PerUser::any_live`]. It is
     /// passed in rather than read here so this module has no opinion about
     /// where audio comes from and can be tested on timelines alone.
-    pub fn is_muted(&self, session_id: i64, now_mono_ns: u64, streams_live: bool) -> bool {
+    pub fn is_muted(&self, session_id: i64, now_mono_ns: u64, live: &LiveKinds) -> bool {
         let mut inner = self.lock();
-        inner.decide(bucket_of(now_mono_ns), streams_live);
+        inner.decide(bucket_of(now_mono_ns), live);
         inner
             .verdicts
             .iter()
@@ -399,15 +795,15 @@ impl Picker {
     }
 
     /// Every instance and what was decided about it, for `truth.status`.
-    pub fn verdicts(&self, now_mono_ns: u64, streams_live: bool) -> Vec<Verdict> {
+    pub fn verdicts(&self, now_mono_ns: u64, live: &LiveKinds) -> Vec<Verdict> {
         let mut inner = self.lock();
-        inner.decide(bucket_of(now_mono_ns), streams_live);
+        inner.decide(bucket_of(now_mono_ns), live);
         inner.verdicts.clone()
     }
 
     /// `truth.status.audio.mute`.
-    pub fn status(&self, now_mono_ns: u64, streams_live: bool) -> Value {
-        let verdicts = self.verdicts(now_mono_ns, streams_live);
+    pub fn status(&self, now_mono_ns: u64, live: &LiveKinds) -> Value {
+        let verdicts = self.verdicts(now_mono_ns, live);
         let muted: Vec<i64> = verdicts
             .iter()
             .filter(|v| v.muted)
@@ -418,7 +814,11 @@ impl Picker {
             "share_margin": SHARE_MARGIN,
             "window_s": WINDOW_MS as f64 / 1_000.0,
             "min_active_s": MIN_ACTIVE_MS as f64 / 1_000.0,
-            "streams_live": streams_live,
+            "streams_live": live.any(),
+            // 0.12.3: WHOSE streams. `["vesktop"]` and `["vesktop","discord"]`
+            // are different worlds and the mute rule reads them differently,
+            // so a client that shows the mute has to be able to see which.
+            "streams_kinds": live.to_json(),
             "muted_sessions": muted,
             "instances": verdicts.iter().map(Verdict::to_json).collect::<Vec<_>>(),
             "roles": self.roles(),
@@ -434,7 +834,9 @@ impl Inner {
     fn prune(&mut self, now: u64) {
         let cutoff = now.saturating_sub(WINDOW_MS / BUCKET_MS);
         // `split_off` keeps the tail, which is the half we want.
-        self.stream = self.stream.split_off(&cutoff);
+        for set in self.stream.values_mut() {
+            *set = set.split_off(&cutoff);
+        }
         let forget = now.saturating_sub(FORGET_MS / BUCKET_MS);
         self.mixed.retain(|_, i| {
             i.active = i.active.split_off(&cutoff);
@@ -443,15 +845,15 @@ impl Inner {
     }
 
     /// The whole rule, in one place.
-    fn decide(&mut self, now: u64, streams_live: bool) {
+    fn decide(&mut self, now: u64, live: &LiveKinds) {
         if self.have_decided
-            && self.decided_live == streams_live
+            && &self.decided_live == live
             && now.saturating_sub(self.decided_at) < DECIDE_EVERY_MS / BUCKET_MS
         {
             return;
         }
         self.decided_at = now;
-        self.decided_live = streams_live;
+        self.decided_live = live.clone();
         self.have_decided = true;
         self.prune(now);
 
@@ -460,19 +862,41 @@ impl Inner {
         for (session_id, inst) in &self.mixed {
             let role = self.roles.get(&inst.source).copied().unwrap_or(Role::Auto);
             let active_ms = inst.active.len() as u64 * BUCKET_MS;
+            // 0.12.3: only the streams that could be a duplicate of THIS
+            // client's audio. A Vesktop bridge's frames say nothing about the
+            // official client's call, and counting them was the whole bug: two
+            // busy calls score alike, so a share computed against the wrong
+            // streams is not merely uninformative, it is confidently wrong.
+            // `None` — an older plugin — is evidence about every instance, so
+            // it joins whichever set the source maps to.
+            let mine: Vec<&BTreeSet<u64>> = stream
+                .iter()
+                .filter(|(k, _)| match k {
+                    None => true,
+                    Some(k) => Some(*k) == kind_of_source(&inst.source),
+                })
+                .map(|(_, v)| v)
+                .collect();
             let share = (active_ms >= MIN_ACTIVE_MS).then(|| {
                 let hits = inst
                     .active
                     .iter()
                     .filter(|b| {
-                        stream
-                            .range(b.saturating_sub(SKEW_BUCKETS)..=(*b + SKEW_BUCKETS))
-                            .next()
-                            .is_some()
+                        mine.iter().any(|set| {
+                            set.range(b.saturating_sub(SKEW_BUCKETS)..=(*b + SKEW_BUCKETS))
+                                .next()
+                                .is_some()
+                        })
                     })
                     .count();
                 hits as f64 / inst.active.len().max(1) as f64
             });
+            // Whether anything that could explain this instance is arriving at
+            // all. Read per instance and not globally, because with two bridges
+            // "streams are live" is true of the machine and false of this
+            // client — and muting on the machine's answer is 0.12.1's bug with
+            // a second coat of paint.
+            let explained = live.explains(&inst.source);
             rows.push(Verdict {
                 session_id: *session_id,
                 source: inst.source.clone(),
@@ -481,6 +905,7 @@ impl Inner {
                 share,
                 active_ms,
                 muted: false,
+                explained,
                 why: String::new(),
             });
         }
@@ -495,7 +920,7 @@ impl Inner {
         rows.sort_by_key(|v| v.session_id);
         let mut ranked: Vec<(f64, i64)> = rows
             .iter()
-            .filter(|v| v.role == Role::Auto)
+            .filter(|v| v.role == Role::Auto && v.explained)
             .filter_map(|v| v.share.map(|s| (s, v.session_id)))
             .collect();
         ranked.sort_by(|a, b| {
@@ -508,7 +933,10 @@ impl Inner {
         // named it, the measurement does not get to name a second one — an
         // override that left another instance muted "as well" would answer the
         // user's question with half a yes.
-        let named = rows.iter().any(|v| v.role == Role::Bridge);
+        // …and only among the instances these streams could be about: a
+        // `bridge` role on the Vesktop row must not stop the rule naming the
+        // official client while the official client's own bridge is streaming.
+        let named = rows.iter().any(|v| v.role == Role::Bridge && v.explained);
         let winner = match ranked.as_slice() {
             _ if named => None,
             [(share, id), rest @ ..] if *share >= SHARE_BAR => {
@@ -527,6 +955,25 @@ impl Inner {
 
         for v in &mut rows {
             let pct = |s: f64| format!("{:.0}%", s * 100.0);
+            // 0.12.3, and it comes before the role because it is not a
+            // judgement: nothing that is arriving is a recording of this
+            // client, so there is no duplicate to prevent and nothing to
+            // decide. A `bridge` role does not override a fact.
+            if !v.explained {
+                v.muted = false;
+                v.why = if live.any() {
+                    "per-user audio is arriving, but from a bridge in a different Discord \
+                     client — nothing here is a duplicate, so this client keeps recording"
+                        .to_string()
+                } else {
+                    "no per-user stream is arriving; nothing is muted".to_string()
+                };
+                continue;
+            }
+            // Past the guard above, streams that could be about this client are
+            // live by definition. Named rather than inlined so the three arms
+            // below read as the 0.12.2 rule they still are.
+            let streams_live = true;
             match v.role {
                 Role::Other => {
                     v.muted = false;
@@ -639,6 +1086,16 @@ mod tests {
     /// silence contributes to neither side of the share — which is itself why
     /// the rule is measured on VAD-active time rather than on wall time.
     ///
+    /// An older plugin's streams: no `client` on the wire, so no kind, so
+    /// evidence about every instance. Every 0.12.2 test is written against this
+    /// and every one of them still measures what it measured, which is the
+    /// point of the `None` member.
+    fn legacy_live() -> LiveKinds {
+        let mut l = LiveKinds::default();
+        l.insert(None);
+        l
+    }
+
     /// `session` is `None` for the per-user streams' combined timeline.
     fn speak(p: &Picker, session: Option<(i64, &str)>, spans: &[(u64, u64)]) {
         for (start, dur) in spans {
@@ -646,7 +1103,7 @@ mod tests {
             while t < start + dur {
                 match session {
                     Some((id, src)) => p.observe_mixed(id, src, Some("serial:1"), t * MS, &loud()),
-                    None => p.observe_stream(t * MS, &loud()),
+                    None => p.observe_stream(None, t * MS, &loud()),
                 }
                 t += BUCKET_MS;
             }
@@ -654,7 +1111,7 @@ mod tests {
     }
 
     fn share_of(p: &Picker, session: i64, now_ms: u64) -> Option<f64> {
-        p.verdicts(now_ms * MS, true)
+        p.verdicts(now_ms * MS, &legacy_live())
             .into_iter()
             .find(|v| v.session_id == session)
             .and_then(|v| v.share)
@@ -712,7 +1169,7 @@ mod tests {
             "0.8 sits in the empty middle"
         );
 
-        let v = p.verdicts(30_000 * MS, true);
+        let v = p.verdicts(30_000 * MS, &legacy_live());
         let muted: Vec<i64> = v.iter().filter(|v| v.muted).map(|v| v.session_id).collect();
         assert_eq!(muted, vec![1], "only the bridge's client is muted");
         assert!(v[1].why.contains("different call"));
@@ -744,7 +1201,7 @@ mod tests {
         // still not enough to take a call's audio away.
         speak(&p, None, &[(5_000, 1_000)]);
         speak(&p, Some((1, "vesktop")), &[(5_000, 1_000)]);
-        let v = p.verdicts(6_500 * MS, true);
+        let v = p.verdicts(6_500 * MS, &legacy_live());
         assert_eq!(v.len(), 1);
         assert_eq!(
             v[0].share, None,
@@ -759,7 +1216,7 @@ mod tests {
         // Past the bar, the same timeline mutes.
         speak(&p, None, &[(6_000, 2_600)]);
         speak(&p, Some((1, "vesktop")), &[(6_000, 2_600)]);
-        let v = p.verdicts(9_500 * MS, true);
+        let v = p.verdicts(9_500 * MS, &legacy_live());
         assert_eq!(v[0].active_ms, 3_600);
         assert!(v[0].muted, "3 s of explained speech is the bar");
     }
@@ -776,7 +1233,7 @@ mod tests {
         speak(&p, None, &spans);
         speak(&p, Some((1, "vesktop")), &spans);
         assert!(
-            p.is_muted(1, 46_000 * MS, true),
+            p.is_muted(1, 46_000 * MS, &legacy_live()),
             "the bridge's client is muted"
         );
 
@@ -787,7 +1244,7 @@ mod tests {
             Some((2, "vesktop")),
             &[(36_100, 1_300), (40_100, 1_300), (44_100, 1_300)],
         );
-        let v = p.verdicts(46_000 * MS, true);
+        let v = p.verdicts(46_000 * MS, &legacy_live());
         let new = v
             .iter()
             .find(|v| v.session_id == 2)
@@ -815,7 +1272,7 @@ mod tests {
         speak(&p, Some((1, "vesktop")), &[(10_100, 11_800)]);
         speak(&p, Some((2, "Discord")), &[(10_300, 11_000)]);
 
-        let v = p.verdicts(23_000 * MS, true);
+        let v = p.verdicts(23_000 * MS, &legacy_live());
         assert_eq!(v.len(), 2);
         assert!(
             v.iter().all(|r| r.share.unwrap_or(0.0) >= SHARE_BAR),
@@ -829,9 +1286,9 @@ mod tests {
         assert!(v[0].why.contains("too close to call"), "{}", v[0].why);
 
         // And the override is what settles it, which is why it exists.
-        p.set_role("vesktop", Role::Bridge);
-        assert!(p.is_muted(1, 23_000 * MS, true));
-        assert!(!p.is_muted(2, 23_000 * MS, true));
+        p.set_role("vesktop", Role::Bridge, None);
+        assert!(p.is_muted(1, 23_000 * MS, &legacy_live()));
+        assert!(!p.is_muted(2, 23_000 * MS, &legacy_live()));
     }
 
     #[test]
@@ -840,9 +1297,9 @@ mod tests {
         let spans = [(50_000u64, 2_000u64), (53_000, 2_000)];
         speak(&p, None, &spans);
         speak(&p, Some((1, "vesktop")), &spans);
-        assert!(p.is_muted(1, 56_000 * MS, true));
+        assert!(p.is_muted(1, 56_000 * MS, &legacy_live()));
         assert!(
-            !p.is_muted(1, 56_000 * MS, false),
+            !p.is_muted(1, 56_000 * MS, &LiveKinds::default()),
             "the mute exists to stop a duplicate; with no second copy there is none"
         );
     }
@@ -853,23 +1310,26 @@ mod tests {
         let spans = [(60_000u64, 2_000u64), (63_000, 2_000)];
         speak(&p, None, &spans);
         speak(&p, Some((1, "vesktop")), &spans);
-        assert!(p.is_muted(1, 66_000 * MS, true), "the rule is certain");
-
-        p.set_role("vesktop", Role::Other);
         assert!(
-            !p.is_muted(1, 66_000 * MS, true),
+            p.is_muted(1, 66_000 * MS, &legacy_live()),
+            "the rule is certain"
+        );
+
+        p.set_role("vesktop", Role::Other, None);
+        assert!(
+            !p.is_muted(1, 66_000 * MS, &legacy_live()),
             "the user is allowed to be right about their own machine"
         );
-        let v = p.verdicts(66_000 * MS, true);
+        let v = p.verdicts(66_000 * MS, &legacy_live());
         assert_eq!(v[0].role, Role::Other);
         assert!(v[0].why.contains("not the bridge"));
         assert_eq!(v[0].share, Some(1.0), "the rule still says what it thinks");
 
         // And back: `auto` removes the override rather than storing a third
         // state, so the config file only ever holds decisions somebody made.
-        p.set_role("vesktop", Role::Auto);
+        p.set_role("vesktop", Role::Auto, None);
         assert!(p.roles().is_empty());
-        assert!(p.is_muted(1, 66_000 * MS, true));
+        assert!(p.is_muted(1, 66_000 * MS, &legacy_live()));
     }
 
     #[test]
@@ -880,32 +1340,32 @@ mod tests {
         speak(&p, Some((1, "Discord")), &[(70_000, 4_000)]);
         speak(&p, None, &[(78_000, 1_000)]);
         assert!(
-            !p.is_muted(1, 79_500 * MS, true),
+            !p.is_muted(1, 79_500 * MS, &legacy_live()),
             "the automatic rule would never mute this"
         );
 
-        p.set_role("Discord", Role::Bridge);
+        p.set_role("Discord", Role::Bridge, None);
         assert!(
-            p.is_muted(1, 79_500 * MS, true),
+            p.is_muted(1, 79_500 * MS, &legacy_live()),
             "a manual bridge does not wait for evidence"
         );
         assert!(
-            !p.is_muted(1, 79_500 * MS, false),
+            !p.is_muted(1, 79_500 * MS, &LiveKinds::default()),
             "and it is still muted only while something is arriving to duplicate it"
         );
-        let v = p.verdicts(79_500 * MS, true);
+        let v = p.verdicts(79_500 * MS, &legacy_live());
         assert!(v[0].why.contains("has the plugin"));
     }
 
     #[test]
     fn the_override_is_keyed_on_the_source_so_it_survives_a_relaunch() {
         let p = Picker::new();
-        p.set_role("vesktop", Role::Other);
+        p.set_role("vesktop", Role::Other, None);
         // A relaunch: new pid, new `object.serial`, new session row — and the
         // role the user set last week is still theirs.
         speak(&p, None, &[(90_000, 4_000)]);
         speak(&p, Some((77, "vesktop")), &[(90_000, 4_000)]);
-        let v = p.verdicts(95_000 * MS, true);
+        let v = p.verdicts(95_000 * MS, &legacy_live());
         assert_eq!(v[0].role, Role::Other);
         assert!(!v[0].muted, "the role outlived the instance it was set on");
     }
@@ -936,10 +1396,10 @@ mod tests {
         let spans = [(100_000u64, 2_000u64), (103_000, 2_000)];
         speak(&p, None, &spans);
         speak(&p, Some((5, "vesktop")), &spans);
-        assert!(p.is_muted(5, 106_000 * MS, true));
+        assert!(p.is_muted(5, 106_000 * MS, &legacy_live()));
         p.forget(5);
         assert!(
-            p.verdicts(106_000 * MS, true).is_empty(),
+            p.verdicts(106_000 * MS, &legacy_live()).is_empty(),
             "the row id is free to be reused and must carry nothing with it"
         );
     }
@@ -950,10 +1410,10 @@ mod tests {
         let spans = [(200_000u64, 2_000u64), (203_000, 2_000)];
         speak(&p, None, &spans);
         speak(&p, Some((1, "vesktop")), &spans);
-        assert!(p.is_muted(1, 206_000 * MS, true));
+        assert!(p.is_muted(1, 206_000 * MS, &legacy_live()));
         // Half a minute later, with nothing new: the window is empty, the
         // evidence bar is not met, and nothing is muted.
-        assert!(!p.is_muted(1, 240_000 * MS, true));
+        assert!(!p.is_muted(1, 240_000 * MS, &legacy_live()));
     }
 
     /// Where [`SHARE_BAR`] came from. Not an assertion — a measurement, run
@@ -1010,7 +1470,7 @@ mod tests {
                         &call(seed + 5_000, base, 20, density),
                     );
                     let now = (base + 20_000) * MS;
-                    let v = p.verdicts(now, true);
+                    let v = p.verdicts(now, &legacy_live());
                     for r in &v {
                         let Some(s) = r.share else { continue };
                         if r.session_id == 1 {
@@ -1051,5 +1511,266 @@ mod tests {
         buf.extend(quiet());
         // 1_000 ms in is bucket 10; the loud 100 ms sits in bucket 11.
         assert_eq!(active_buckets(1_000 * MS, &buf), vec![11]);
+    }
+
+    // ---- 0.12.3: two bridges ---------------------------------------------
+
+    fn seen(account: &str, kind: Option<ClientKind>) -> BridgeSeen {
+        BridgeSeen {
+            account_id: account.to_string(),
+            kind,
+            last_span_ns: 0,
+            spans: 10,
+            spans_recent: 10,
+        }
+    }
+
+    /// A `bridge_roles` value is a role, or a role and the account whose spans
+    /// that client's audio carries. Anything else is a typo and is refused —
+    /// never quietly read as `auto`, which would be a scope somebody thought
+    /// they had set.
+    #[test]
+    fn a_role_spec_carries_an_account_and_refuses_a_typo() {
+        assert_eq!(parse_role_spec("bridge"), Some((Role::Bridge, None)));
+        assert_eq!(parse_role_spec(" other "), Some((Role::Other, None)));
+        assert_eq!(
+            parse_role_spec("bridge:4711"),
+            Some((Role::Bridge, Some("4711".to_string())))
+        );
+        // An account only means something beside `bridge`.
+        assert_eq!(parse_role_spec("other:4711"), None);
+        assert_eq!(parse_role_spec("auto:4711"), None);
+        // A trailing colon is a typo, not "no account".
+        assert_eq!(parse_role_spec("bridge:"), None);
+        assert_eq!(parse_role_spec("brdige"), None);
+        // And it round-trips through the config file.
+        assert_eq!(role_spec(Role::Bridge, Some("4711")), "bridge:4711");
+        assert_eq!(role_spec(Role::Bridge, None), "bridge");
+        assert_eq!(role_spec(Role::Other, Some("4711")), "other");
+    }
+
+    /// The two clients on this machine, as FINDINGS §37 found them on the
+    /// PipeWire graph.
+    #[test]
+    fn a_source_key_says_which_kind_of_client_it_is() {
+        assert_eq!(kind_of_source("vesktop"), Some(ClientKind::Vesktop));
+        assert_eq!(kind_of_source("Discord"), Some(ClientKind::Discord));
+        assert_eq!(
+            kind_of_source("WEBRTC VoiceEngine"),
+            Some(ClientKind::Discord)
+        );
+        // A per-user stream is not a client, and neither is VRChat.
+        assert_eq!(kind_of_source("discord:4711"), None);
+        assert_eq!(kind_of_source("VRChat.exe"), None);
+    }
+
+    /// The whole of the two-bridge mute rule, as a predicate.
+    #[test]
+    fn live_streams_only_explain_their_own_clients_audio() {
+        let mut vesktop = LiveKinds::default();
+        vesktop.insert(Some(ClientKind::Vesktop));
+        assert!(vesktop.explains("vesktop"));
+        assert!(!vesktop.explains("Discord"));
+
+        // An older plugin says nothing about which client it is in, so its
+        // streams explain everything — 0.12.2 unchanged, which is what an
+        // install that has not updated its plugin must keep getting.
+        let mut legacy = LiveKinds::default();
+        legacy.insert(None);
+        assert!(legacy.explains("vesktop"));
+        assert!(legacy.explains("Discord"));
+
+        // Nothing arriving explains nothing.
+        assert!(!LiveKinds::default().explains("vesktop"));
+        assert!(!LiveKinds::default().any());
+    }
+
+    /// The scope ladder, one case per rule, in the order the rule reads them.
+    #[test]
+    fn the_scope_names_the_bridge_whose_call_this_source_carries() {
+        let two = [
+            seen("acct-vesktop", Some(ClientKind::Vesktop)),
+            seen("acct-discord", Some(ClientKind::Discord)),
+        ];
+        // The kind maps: one bridge of this source's kind, so that one.
+        assert_eq!(
+            scope_for_source("vesktop", &two, None),
+            Scope::Account("acct-vesktop".into())
+        );
+        assert_eq!(
+            scope_for_source("Discord", &two, None),
+            Scope::Account("acct-discord".into())
+        );
+        // The user said so, and that beats the measurement.
+        assert_eq!(
+            scope_for_source("vesktop", &two, Some("acct-discord")),
+            Scope::Account("acct-discord".into())
+        );
+        // Nobody has ever scoped a span: one bridge by construction, and the
+        // answer is 0.12.2's.
+        assert_eq!(scope_for_source("vesktop", &[], None), Scope::Every);
+        // No bridge of this kind. The spans on disk are somebody else's call,
+        // so only the unscoped ones count — which on a scoped-only archive is
+        // none, i.e. `unknown`, and never a verdict about the wrong call.
+        let only_vesktop = [seen("acct-vesktop", Some(ClientKind::Vesktop))];
+        assert_eq!(
+            scope_for_source("Discord", &only_vesktop, None),
+            Scope::Legacy
+        );
+        // Two of one kind and no override: ambiguous. `Every` is the
+        // pre-0.12.3 answer, so it adds no new wrongness — and the status says
+        // out loud that it is guessing.
+        let two_vesktops = [
+            seen("acct-a", Some(ClientKind::Vesktop)),
+            seen("acct-b", Some(ClientKind::Vesktop)),
+        ];
+        assert_eq!(
+            scope_for_source("vesktop", &two_vesktops, None),
+            Scope::Every
+        );
+        assert_eq!(
+            ambiguous_kinds(&two_vesktops, &BTreeSet::new()),
+            vec!["vesktop".to_string()]
+        );
+        // …and naming one of them settles it.
+        let named: BTreeSet<String> = ["acct-a".to_string()].into_iter().collect();
+        assert!(ambiguous_kinds(&two_vesktops, &named).is_empty());
+        assert!(ambiguous_kinds(&two, &BTreeSet::new()).is_empty());
+    }
+
+    /// **The bug this round exists for.** Vesktop is sending per-user audio;
+    /// the official client is in a different call and has a bridge of its own
+    /// that is not streaming. 0.12.2 would measure a share for the official
+    /// client and could mute it. It must not be muted at all: nothing arriving
+    /// is a recording of that client, so there is no duplicate to prevent.
+    #[test]
+    fn a_vesktop_bridges_streams_never_mute_the_official_client() {
+        let p = Picker::new();
+        // Both clients busy on the same schedule — the worst case for the
+        // share, and exactly the state §37 measured at 0.98.
+        for (start, dur) in STREAM_SPANS {
+            let mut t = start;
+            while t < start + dur {
+                p.observe_stream(Some(ClientKind::Vesktop), t * MS, &loud());
+                p.observe_mixed(1, "vesktop", Some("serial:1"), (t + 200) * MS, &loud());
+                p.observe_mixed(2, "Discord", Some("serial:2"), (t + 200) * MS, &loud());
+                t += BUCKET_MS;
+            }
+        }
+        let mut live = LiveKinds::default();
+        live.insert(Some(ClientKind::Vesktop));
+        let v = p.verdicts(30_000 * MS, &live);
+        let vesktop = v.iter().find(|v| v.session_id == 1).unwrap();
+        let discord = v.iter().find(|v| v.session_id == 2).unwrap();
+
+        assert!(vesktop.muted, "the bridge's own client is the duplicate");
+        assert!(vesktop.explained);
+        assert!(
+            !discord.muted,
+            "the official client's call is not in these streams"
+        );
+        assert!(!discord.explained);
+        assert!(
+            discord.why.contains("different Discord client"),
+            "the report has to say why: {}",
+            discord.why
+        );
+        // And the margin that would have stopped 0.12.2 answering at all is
+        // never reached, because the second client is not a candidate.
+        assert!(vesktop.share.unwrap() >= SHARE_BAR);
+    }
+
+    /// A `bridge` role is not a licence to mute a client whose bridge is not
+    /// sending. The role answers "which of the candidates"; `explained`
+    /// answers "is there a candidate", and a fact outranks a preference.
+    #[test]
+    fn a_bridge_role_cannot_mute_a_client_no_stream_is_about() {
+        let p = Picker::new();
+        p.set_role("Discord", Role::Bridge, None);
+        speak(&p, Some((2, "Discord")), &BRIDGE_SPANS);
+        let mut live = LiveKinds::default();
+        live.insert(Some(ClientKind::Vesktop));
+        let v = p.verdicts(30_000 * MS, &live);
+        let discord = v.iter().find(|v| v.session_id == 2).unwrap();
+        assert!(!discord.muted);
+    }
+
+    /// The override that separates two clients of one kind, and the shape it
+    /// takes in the config file.
+    #[test]
+    fn a_role_can_name_the_account_and_survives_a_reload() {
+        let p = Picker::new();
+        p.set_role("vesktop", Role::Bridge, Some("acct-a"));
+        assert_eq!(p.role("vesktop"), Role::Bridge);
+        assert_eq!(p.role_account("vesktop"), Some("acct-a".to_string()));
+        assert_eq!(
+            p.roles().get("vesktop").map(String::as_str),
+            Some("bridge:acct-a")
+        );
+        assert_eq!(
+            p.named_accounts(),
+            ["acct-a".to_string()].into_iter().collect::<BTreeSet<_>>()
+        );
+
+        // Round-tripped through `[truth] bridge_roles`.
+        let q = Picker::new();
+        q.load_roles(&p.roles());
+        assert_eq!(q.role("vesktop"), Role::Bridge);
+        assert_eq!(q.role_account("vesktop"), Some("acct-a".to_string()));
+
+        // `auto` removes both halves.
+        p.set_role("vesktop", Role::Auto, None);
+        assert_eq!(p.role_account("vesktop"), None);
+        assert!(p.roles().is_empty());
+    }
+
+    /// The live registry: which plugins have said anything, and whether the
+    /// one on this account restarted.
+    #[test]
+    fn the_registry_remembers_a_bridge_and_its_instance() {
+        let p = Picker::new();
+        let a = ClientRef {
+            kind: Some(ClientKind::Vesktop),
+            account_id: Some("acct-a".into()),
+            instance: Some("i1".into()),
+        };
+        p.saw_bridge(&a, 1_000);
+        p.saw_bridge(&a, 2_000);
+        // An older plugin says nothing about itself and is not a row: there is
+        // nothing to tell apart.
+        p.saw_bridge(&ClientRef::default(), 3_000);
+
+        let live = p.bridges_live();
+        assert_eq!(live.len(), 1);
+        let row = &live[&(Some(ClientKind::Vesktop), "acct-a".to_string())];
+        assert_eq!(row.instance.as_deref(), Some("i1"));
+        assert_eq!(row.last_seen_ms, 2_000);
+        assert_eq!(row.lines, 2);
+    }
+
+    /// The `client` object, and the rule that a bad one never costs a span.
+    #[test]
+    fn a_client_object_is_read_and_never_refuses_the_line() {
+        let v: Value = serde_json::from_str(
+            r#"{"t_ms":1,"client":{"kind":"vesktop","account_id":"a1","instance":"i9"}}"#,
+        )
+        .unwrap();
+        let c = ClientRef::parse(&v);
+        assert_eq!(c.kind, Some(ClientKind::Vesktop));
+        assert_eq!(c.account_id.as_deref(), Some("a1"));
+        assert!(c.is_scoped());
+
+        // An older plugin: no object at all.
+        let bare: Value = serde_json::from_str(r#"{"t_ms":1}"#).unwrap();
+        assert_eq!(ClientRef::parse(&bare), ClientRef::default());
+        assert!(!ClientRef::parse(&bare).is_scoped());
+
+        // Junk in the object is absent, not an error: a good payload must not
+        // be refused over its provenance.
+        let junk: Value =
+            serde_json::from_str(r#"{"client":{"kind":"ircd","account_id":"  "}}"#).unwrap();
+        let c = ClientRef::parse(&junk);
+        assert_eq!(c.kind, None);
+        assert_eq!(c.account_id, None);
     }
 }

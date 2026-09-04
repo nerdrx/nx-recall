@@ -78,7 +78,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use crate::clock::utc_now_ns;
+use crate::clock::{ns_to_ms, utc_now_ns};
 use crate::store::Store;
 use crate::truth::TruthStats;
 
@@ -206,6 +206,7 @@ pub fn serve(
     token: String,
     port: u16,
     audio: Option<Arc<crate::peruser::PerUser>>,
+    bridge: Option<Arc<crate::bridge::Picker>>,
 ) -> Result<Ingest> {
     if token.trim().is_empty() {
         bail!("refusing to start the truth ingest with an empty token");
@@ -252,11 +253,18 @@ pub fn serve(
                 let stats = Arc::clone(&stats);
                 let token = Arc::clone(&token);
                 let audio = audio.clone();
+                let bridge = bridge.clone();
                 if let Err(e) = std::thread::Builder::new()
                     .name("recalld-truth-conn".into())
                     .spawn(move || {
-                        if let Err(e) = serve_one(&store, &stats, &token, audio.as_deref(), stream)
-                        {
+                        if let Err(e) = serve_one(
+                            &store,
+                            &stats,
+                            &token,
+                            audio.as_deref(),
+                            bridge.as_deref(),
+                            stream,
+                        ) {
                             debug!("a truth ingest connection ended: {e:#}");
                         }
                     })
@@ -302,6 +310,7 @@ fn serve_one(
     stats: &TruthStats,
     token: &str,
     audio: Option<&crate::peruser::PerUser>,
+    bridge: Option<&crate::bridge::Picker>,
     stream: TcpStream,
 ) -> Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
@@ -416,7 +425,7 @@ fn serve_one(
 
     // ---- 0.12.1: audio, which is not a truth line and is not stored like one
     if route == "/v1/discord/audio" {
-        ingest_audio(stats, audio, &body);
+        ingest_audio(stats, audio, bridge, &body);
         return respond(&mut out, Reply::NoContent, None);
     }
 
@@ -444,7 +453,7 @@ fn serve_one(
             stats.rejected.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        match ingest_line(&guard, kind, &v) {
+        match ingest_line(&guard, kind, &v, bridge) {
             Ok(true) => taken += 1,
             Ok(false) => {
                 stats.rejected.fetch_add(1, Ordering::Relaxed);
@@ -482,7 +491,12 @@ enum Line {
 /// unrecognised route — the lines are counted as rejected rather than dropped
 /// in silence, so "I turned it on in the plugin and nothing happened" has a
 /// number attached to it.
-fn ingest_audio(stats: &TruthStats, audio: Option<&crate::peruser::PerUser>, body: &str) {
+fn ingest_audio(
+    stats: &TruthStats,
+    audio: Option<&crate::peruser::PerUser>,
+    bridge: Option<&crate::bridge::Picker>,
+    body: &str,
+) {
     let lines = body.lines().filter(|l| !l.trim().is_empty());
     let Some(audio) = audio.filter(|a| a.accepting()) else {
         let n = lines.count() as u64;
@@ -506,6 +520,12 @@ fn ingest_audio(stats: &TruthStats, audio: Option<&crate::peruser::PerUser>, bod
         };
         match crate::peruser::parse_frame(&v, audio.max_frame_ms()) {
             Ok(frame) => {
+                // A bridge that sends only audio — the plugin's edges are on a
+                // separate queue and may be backed off — is still a bridge, and
+                // `truth.status` has to list it.
+                if let Some(b) = bridge {
+                    b.saw_bridge(&frame.client, ns_to_ms(utc_now_ns()));
+                }
                 if let Err(e) = audio.ingest(frame) {
                     warn!("could not take a per-user audio frame: {e:#}");
                     audio.stats.rejected.fetch_add(1, Ordering::Relaxed);
@@ -532,7 +552,12 @@ fn authorized(header: Option<&str>, token: &str) -> bool {
 
 /// Store one NDJSON line. `Ok(false)` means the line was well-formed JSON but
 /// not a line this endpoint understands — a shape mismatch, not a failure.
-fn ingest_line(store: &Store, kind: Line, v: &Value) -> Result<bool> {
+fn ingest_line(
+    store: &Store,
+    kind: Line,
+    v: &Value,
+    bridge: Option<&crate::bridge::Picker>,
+) -> Result<bool> {
     let Some(t_ms) = v.get("t_ms").and_then(Value::as_i64) else {
         return Ok(false);
     };
@@ -549,6 +574,13 @@ fn ingest_line(store: &Store, kind: Line, v: &Value) -> Result<bool> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(user_id);
     let channel_id = v.get("channel_id").and_then(Value::as_str);
+    // 0.12.3: which of the two plugins sent this. Absent is not an error and
+    // never will be — an older plugin's line is a good line, and its NULL scope
+    // is the honest statement that there was one bridge when it was written.
+    let client = crate::bridge::ClientRef::parse(v);
+    if let Some(b) = bridge {
+        b.saw_bridge(&client, ns_to_ms(utc_now_ns()));
+    }
 
     // Every line teaches us the account exists and what it is calling itself,
     // whichever endpoint it arrived on. A `leave` is still a sighting.
@@ -560,9 +592,9 @@ fn ingest_line(store: &Store, kind: Line, v: &Value) -> Result<bool> {
                 return Ok(false);
             };
             if speaking {
-                store.truth_speaking_start(user_id, name, channel_id, t_ns)?;
+                store.truth_speaking_start(user_id, name, channel_id, t_ns, &client)?;
             } else {
-                store.truth_speaking_stop(user_id, t_ns)?;
+                store.truth_speaking_stop(user_id, t_ns, &client)?;
             }
             Ok(true)
         }
@@ -574,7 +606,7 @@ fn ingest_line(store: &Store, kind: Line, v: &Value) -> Result<bool> {
                 // this the span would run until the 30 s timeout and claim
                 // speech that did not happen.
                 "leave" => {
-                    store.truth_speaking_stop(user_id, t_ns)?;
+                    store.truth_speaking_stop(user_id, t_ns, &client)?;
                     Ok(true)
                 }
                 "join" | "self" => Ok(true),
@@ -662,7 +694,14 @@ mod tests {
     #[test]
     fn an_empty_token_is_refused_rather_than_started_open() {
         let store = Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
-        let started = serve(store, Arc::new(TruthStats::default()), "  ".into(), 0, None);
+        let started = serve(
+            store,
+            Arc::new(TruthStats::default()),
+            "  ".into(),
+            0,
+            None,
+            None,
+        );
         let Err(err) = started else {
             panic!("an empty token must not start a listener");
         };

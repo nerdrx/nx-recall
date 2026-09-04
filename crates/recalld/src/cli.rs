@@ -66,13 +66,33 @@ client is running and you would rather not wait for the measurement.
 
 The key is the source match key `recalld sources` prints — the process binary,
 which is what survives a relaunch. A role set on a source with two copies of
-the same binary running speaks about both of them; leave those on `auto`.")]
+the same binary running speaks about both of them; leave those on `auto`.
+
+Two clients of the SAME kind — two Vesktops — share that one source row, so
+neither the key nor the measurement can separate them. If both carry the plugin,
+name the account whose speaking data that client's turns should be labelled
+from:
+
+  recalld role vesktop bridge --account 482913
+
+`recalld truth report` lists every bridge it has heard from with its account, and
+says so out loud when two of one kind are live with nothing to tell them apart.")]
     Role {
         #[arg(value_name = "MATCH_KEY")]
         match_key: String,
         /// `bridge`, `other`, or `auto`.
         #[arg(value_name = "ROLE")]
         role: String,
+        /// With `bridge`: the Discord account the plugin in that client is
+        /// signed in as (0.12.3).
+        ///
+        /// Only needed when two clients of the SAME kind are running — two
+        /// Vesktops, say — because they share one source row and therefore one
+        /// role. Naming the account says whose speaking spans this client's
+        /// audio is judged against, which is a different question from whether
+        /// it is muted and the one the source key cannot answer.
+        #[arg(long, value_name = "USER_ID")]
+        account: Option<String>,
     },
 
     /// Turn the microphone on or off, or ask what it is doing.

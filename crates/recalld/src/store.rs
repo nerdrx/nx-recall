@@ -98,7 +98,21 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // undo. `colour` is a token from `crate::palette`, not a hex, so the same
 // highlight is legible on both of NX Clear's grounds and in the headset
 // overlay, which has no CSS to resolve one with. See `apply_v15`.
-pub const SCHEMA_VERSION: i64 = 16;
+//
+// ---- 0.12.3 (schema v17): which bridge sent a speaking span ----------------
+// Two nullable columns on `truth_speaking`: `account_id` (the Discord account
+// the RecallBridge plugin was signed in as) and `client_kind` (`vesktop`,
+// `discord`, `web`). They exist because the user runs TWO Discord clients, in
+// two different calls, and once both carry the plugin every span from both
+// arrives in one table. A verdict computed over "every span that overlaps this
+// turn" then mixes two conversations, and nothing on disk could say so.
+//
+// **NULL is not a default, it is a fact**: it means the line came from a plugin
+// that predates the field, i.e. from the only bridge there was, so a NULL span
+// is evidence about whatever was being recorded and every scope matches it.
+// There is no backfill for the same reason there was none for v11 — the answer
+// for a row already on disk is genuinely unknown. See `apply_v17`.
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -1236,6 +1250,12 @@ impl Store {
         // rather than a computation. See `apply_v16`.
         self.apply_v16()?;
         // ---- end 0.12.0 ---------------------------------------------------
+
+        // ---- 0.12.3 (schema v17): whose bridge a speaking span came from ---
+        // Two nullable columns on `truth_speaking`, no backfill. See the
+        // banner at the top of this file and `crate::bridge::Scope`.
+        self.apply_v17()?;
+        // ---- end 0.12.3 ---------------------------------------------------
 
         match current {
             None => {
@@ -6124,27 +6144,55 @@ impl Store {
         Ok(())
     }
 
+    /// Schema v17: which bridge a speaking span came from.
+    ///
+    /// Two nullable columns and one index. No backfill — see the banner at the
+    /// top of this file: NULL means "the only bridge there was", which is a
+    /// fact about the row and not a placeholder for one.
+    fn apply_v17(&self) -> Result<()> {
+        self.add_column_if_missing("truth_speaking", "account_id", "TEXT")?;
+        self.add_column_if_missing("truth_speaking", "client_kind", "TEXT")?;
+        // The open-span lookup is now per bridge, and the roll-up
+        // `truth_bridges` reads is a group over these two columns.
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_truth_speaking_bridge
+                 ON truth_speaking(account_id, t_start_ns);",
+        )?;
+        Ok(())
+    }
+
     /// Open a speaking row, closing anything this user already had open.
     ///
     /// Two starts with no stop between them is a dropped batch, not two
     /// overlapping utterances by one person — so the earlier row is closed at
     /// the later one's start rather than left to run.
+    ///
+    /// **Per bridge since v17.** "This user already had one open" is a question
+    /// about one client's view of them: with two bridges in two calls the same
+    /// account can genuinely be talking in both, and closing Vesktop's span
+    /// because the official client saw a ring light up would cut a real
+    /// utterance short. `IS` rather than `=` so NULL matches NULL, which keeps
+    /// an old plugin's spans a single stream of their own.
     pub fn truth_speaking_start(
         &self,
         user_id: &str,
         name: &str,
         channel_id: Option<&str>,
         t_ns: i64,
+        client: &crate::bridge::ClientRef,
     ) -> Result<i64> {
+        let account = client.account_id.as_deref();
+        let kind = client.kind.map(crate::bridge::ClientKind::as_str);
         self.conn.execute(
             "UPDATE truth_speaking SET t_end_ns = MAX(t_start_ns, ?2)
-             WHERE user_id = ?1 AND t_end_ns IS NULL",
-            params![user_id, t_ns],
+             WHERE user_id = ?1 AND t_end_ns IS NULL AND account_id IS ?3",
+            params![user_id, t_ns, account],
         )?;
         self.conn.execute(
-            "INSERT INTO truth_speaking (user_id, name, channel_id, t_start_ns, t_end_ns)
-             VALUES (?1, ?2, ?3, ?4, NULL)",
-            params![user_id, name, channel_id, t_ns],
+            "INSERT INTO truth_speaking
+                 (user_id, name, channel_id, t_start_ns, t_end_ns, account_id, client_kind)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+            params![user_id, name, channel_id, t_ns, account, kind],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -6152,13 +6200,21 @@ impl Store {
     /// Close this user's open speaking row. A stop with no start is dropped:
     /// there is no span to invent, and inventing one would put speech on the
     /// timeline that nobody reported.
-    pub fn truth_speaking_stop(&self, user_id: &str, t_ns: i64) -> Result<bool> {
+    ///
+    /// Scoped to the bridge that sent the stop, for [`Self::truth_speaking_start`]'s
+    /// reason: one client's `stop` is not evidence about the other's ring.
+    pub fn truth_speaking_stop(
+        &self,
+        user_id: &str,
+        t_ns: i64,
+        client: &crate::bridge::ClientRef,
+    ) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE truth_speaking SET t_end_ns = MAX(t_start_ns, ?2)
              WHERE id = (SELECT id FROM truth_speaking
-                         WHERE user_id = ?1 AND t_end_ns IS NULL
+                         WHERE user_id = ?1 AND t_end_ns IS NULL AND account_id IS ?3
                          ORDER BY t_start_ns DESC LIMIT 1)",
-            params![user_id, t_ns],
+            params![user_id, t_ns, client.account_id.as_deref()],
         )?;
         Ok(n > 0)
     }
@@ -6264,21 +6320,113 @@ impl Store {
     /// open span is reported running to `to_ns` — it is still going as far as
     /// anybody knows, and clipping it there is what keeps coverage ≤ 1.
     pub fn truth_spans_between(&self, from_ns: i64, to_ns: i64) -> Result<Vec<TruthSpan>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT user_id, name, t_start_ns, COALESCE(t_end_ns, ?2)
+        self.truth_spans_between_scoped(from_ns, to_ns, &crate::bridge::Scope::Every)
+    }
+
+    /// [`Self::truth_spans_between`], restricted to one bridge's spans
+    /// (0.12.3).
+    ///
+    /// The three scopes are `crate::bridge::Scope`'s and the SQL is one clause
+    /// each. The clause that matters is the middle one: `account_id IS NULL OR
+    /// account_id = ?` — an unscoped span belongs to every scope, because it
+    /// was written when there was one bridge and it is evidence about whatever
+    /// that bridge could hear. Without that half, upgrading the daemon would
+    /// silently un-judge the whole archive.
+    pub fn truth_spans_between_scoped(
+        &self,
+        from_ns: i64,
+        to_ns: i64,
+        scope: &crate::bridge::Scope,
+    ) -> Result<Vec<TruthSpan>> {
+        let clause = match scope {
+            crate::bridge::Scope::Every => "",
+            crate::bridge::Scope::Account(_) => " AND (account_id IS NULL OR account_id = ?3)",
+            crate::bridge::Scope::Legacy => " AND account_id IS NULL",
+        };
+        let sql = format!(
+            "SELECT user_id, name, t_start_ns, COALESCE(t_end_ns, ?2), account_id, client_kind
                FROM truth_speaking
-              WHERE t_start_ns < ?2 AND COALESCE(t_end_ns, ?2) > ?1
-              ORDER BY t_start_ns ASC, id ASC",
+              WHERE t_start_ns < ?2 AND COALESCE(t_end_ns, ?2) > ?1{clause}
+              ORDER BY t_start_ns ASC, id ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let row = |r: &rusqlite::Row<'_>| {
+            Ok(TruthSpan {
+                user_id: r.get(0)?,
+                name: r.get(1)?,
+                t_start_ns: r.get(2)?,
+                t_end_ns: r.get(3)?,
+                account_id: r.get(4)?,
+                client_kind: r.get(5)?,
+            })
+        };
+        let rows = match scope {
+            crate::bridge::Scope::Account(a) => stmt
+                .query_map(params![from_ns, to_ns, a], row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            _ => stmt
+                .query_map(params![from_ns, to_ns], row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// Every bridge that has ever written a scoped span, with what
+    /// `truth.status` and [`crate::bridge::scope_for_source`] need of it
+    /// (0.12.3).
+    ///
+    /// Read from `truth_speaking` and not from a live registry, deliberately:
+    /// the verdict pass runs against segments recorded hours ago and has to
+    /// know which bridges existed *then*, not which ones happen to be
+    /// connected now. `recent_ns` is the window the per-minute rate is measured
+    /// over.
+    pub fn truth_bridges(
+        &self,
+        now_ns: i64,
+        recent_ns: i64,
+    ) -> Result<Vec<crate::bridge::BridgeSeen>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT account_id, client_kind, MAX(t_start_ns), COUNT(*),
+                    SUM(CASE WHEN t_start_ns >= ?1 THEN 1 ELSE 0 END)
+               FROM truth_speaking
+              WHERE account_id IS NOT NULL
+              GROUP BY account_id, client_kind
+              ORDER BY account_id ASC, client_kind ASC",
         )?;
         Ok(stmt
-            .query_map(params![from_ns, to_ns], |r| {
-                Ok(TruthSpan {
-                    user_id: r.get(0)?,
-                    name: r.get(1)?,
-                    t_start_ns: r.get(2)?,
-                    t_end_ns: r.get(3)?,
+            .query_map(params![now_ns - recent_ns], |r| {
+                Ok(crate::bridge::BridgeSeen {
+                    account_id: r.get(0)?,
+                    kind: r
+                        .get::<_, Option<String>>(1)?
+                        .as_deref()
+                        .and_then(crate::bridge::ClientKind::parse),
+                    last_span_ns: r.get(2)?,
+                    spans: r.get(3)?,
+                    spans_recent: r.get(4)?,
                 })
             })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The mixed Discord sources this install has ever recorded, for the status
+    /// line that says which bridge each one is scoped to.
+    pub fn discord_source_keys(&self, patterns: &[String]) -> Result<Vec<String>> {
+        if patterns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT match_key FROM sources sc
+              WHERE ({}) AND match_key NOT LIKE 'discord:%'
+              ORDER BY match_key ASC",
+            Self::discord_source_clause(patterns.len(), 1)
+        );
+        let binds: Vec<String> = patterns.iter().map(|p| p.to_lowercase()).collect();
+        let refs: Vec<&dyn rusqlite::ToSql> =
+            binds.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_map(refs.as_slice(), |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -6340,7 +6488,8 @@ impl Store {
             return Ok(Vec::new());
         }
         let sql = format!(
-            "SELECT g.id, g.t_start_ns, g.t_end_ns, g.speaker_id, g.overlap_frac, sc.kind
+            "SELECT g.id, g.t_start_ns, g.t_end_ns, g.speaker_id, g.overlap_frac, sc.kind,
+                    sc.match_key
                FROM segments g
                JOIN sessions ss ON ss.id = g.session_id
                JOIN sources  sc ON sc.id = ss.source_id
@@ -6371,6 +6520,7 @@ impl Store {
                     speaker_id: r.get(3)?,
                     overlap_frac: r.get(4)?,
                     kind: r.get(5)?,
+                    source: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -6733,7 +6883,7 @@ impl Store {
     pub fn segments_for_rejudge(&self, limit: usize) -> Result<Vec<RejudgeCandidate>> {
         let mut stmt = self.conn.prepare(
             "SELECT g.id, g.t_start_ns, g.t_end_ns, sc.kind, g.truth_verdict,
-                    g.truth_user_id, g.truth_coverage, g.truth_overlap_frac
+                    g.truth_user_id, g.truth_coverage, g.truth_overlap_frac, sc.match_key
                FROM segments g
                JOIN sessions ss ON ss.id = g.session_id
                JOIN sources  sc ON sc.id = ss.source_id
@@ -6760,6 +6910,7 @@ impl Store {
                         user_id: r.get(5)?,
                         coverage: r.get(6)?,
                         overlap_frac: r.get(7)?,
+                        source: r.get(8)?,
                     })
                 },
             )?
@@ -6816,6 +6967,10 @@ pub struct TruthSpan {
     pub t_start_ns: i64,
     /// An open span is reported clipped to the window it was asked for.
     pub t_end_ns: i64,
+    /// Which bridge reported it (v17). `None` is a plugin that predates the
+    /// field: the only bridge there was.
+    pub account_id: Option<String>,
+    pub client_kind: Option<String>,
 }
 
 /// A segment waiting for a verdict.
@@ -6831,6 +6986,10 @@ pub struct TruthCandidate {
     /// is a fact about the *stream*, not about the call
     /// ([`crate::truth::Audible`]).
     pub kind: String,
+    /// `sources.match_key` (0.12.3) — which Discord client's tap this is, and
+    /// therefore which bridge's speaking spans are evidence about it
+    /// ([`crate::bridge::scope_for_source`]).
+    pub source: String,
 }
 
 /// A verdict already on disk, with everything a re-judge needs to redo it
@@ -6846,6 +7005,11 @@ pub struct RejudgeCandidate {
     pub user_id: Option<String>,
     pub coverage: Option<f64>,
     pub overlap_frac: Option<f64>,
+    /// `sources.match_key` (0.12.3), for the scope. On the archive this is
+    /// almost always answered `Scope::Every` — every span on disk predates the
+    /// field — which is why re-judging an old install moves exactly the rows
+    /// 0.12.1 said it would.
+    pub source: String,
 }
 
 /// A clean turn that might be worth enrolling.
@@ -8906,7 +9070,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(v, 16);
+        assert_eq!(v, 17);
 
         // The columns are back…
         let columns = |table: &str| -> Vec<String> {

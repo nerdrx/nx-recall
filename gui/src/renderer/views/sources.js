@@ -442,6 +442,20 @@ export function mount(root, ctx) {
         text: 'Discord clients heard in the last half-minute. Only the one carrying the plugin is muted while per-user audio arrives — the other one is a different call and keeps recording. If the guess is wrong, say so here; a client you mark “no plugin” is never muted, whatever the measurement says.',
       })
     );
+    // 0.12.3: two plugins can now feed one daemon, and when two of them are the
+    // same kind of client nothing but the user can say which is which. While
+    // that is true the daemon is knowingly pooling two calls into every
+    // verdict, so the card says so where the control that fixes it lives.
+    for (const kind of truth?.bridges?.ambiguous ?? []) {
+      wrap.append(
+        h('p', {
+          class: 'why',
+          dataset: { bridgeAmbiguous: kind },
+          style: 'padding:0 0 8px;max-width:64ch',
+          text: `Two ${kind} clients are both sending, and nothing says which call each one is in. Their speaking data is being pooled, so a turn may be labelled with somebody from the other call. Pick “Has the plugin” below on the one you want the labels to come from.`,
+        })
+      );
+    }
     if (!rows.length) {
       wrap.append(
         h('div', {
@@ -454,6 +468,13 @@ export function mount(root, ctx) {
     }
     for (const r of rows) wrap.append(clientRow(r, mute));
     return wrap;
+  }
+
+  /// Which RecallBridge plugin's word this client's turns are labelled from
+  /// (0.12.3). `null` when nothing maps to it, which is a real state and reads
+  /// as one: this client's turns get no Discord labels at all.
+  function bridgeFor(source) {
+    return (truth?.bridges?.bridges ?? []).find((b) => b.source === source) ?? null;
   }
 
   function clientRow(r, mute) {
@@ -491,6 +512,16 @@ export function mount(root, ctx) {
         h('div', {
           class: 'key',
           text: `${r.instance_key || 'instance unknown'} · ${share}${role === 'auto' ? '' : ' · set by you'}`,
+        }),
+        // 0.12.3. Which plugin speaks for this client — the answer to "why is
+        // this turn labelled with somebody who was not in this call", which is
+        // otherwise unanswerable from anywhere in the app.
+        h('div', {
+          class: 'key',
+          dataset: { bridgeAccount: r.source },
+          text: bridgeFor(r.source)
+            ? `labels from the plugin signed in as ${bridgeFor(r.source).account_id}`
+            : 'no RecallBridge plugin is reporting for this client',
         }),
         h('p', { class: 'why', text: r.why ?? '' })
       ),
