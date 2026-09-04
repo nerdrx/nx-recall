@@ -1,0 +1,24 @@
+# Detached from the daemon's workspace on purpose: this is a measurement
+# harness, not something that ships. `[workspace]` with no members is what
+# stops cargo from adopting it into the workspace two directories up.
+[workspace]
+
+[package]
+name = "livegpu_bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "livegpu_bench"
+path = "main.rs"
+
+[dependencies]
+anyhow = "1.0"
+hound = "3.5"
+libc = "0.2"
+recalld = { path = "../../crates/recalld" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

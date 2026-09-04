@@ -643,6 +643,13 @@ impl Service {
                 "tau": cfg.confidence_tau,
                 "how": (!confidence).then(crate::models::ConfidenceModel::how_to_get_it),
             },
+            // Which device each model runs on, and why (0.12.4, FINDINGS §40).
+            // Always present, like the two blocks around it: "this daemon
+            // measured the question and the answer is the CPU" and "this
+            // daemon is too old to have been asked" are different states, and
+            // a missing key says neither. See `crate::device` — the answer is
+            // a constant because the blocker is upstream, not local.
+            "devices": crate::device::status_json(night_available),
             // The vocabulary is assembled and served; nothing is biased by it.
             // Said here rather than only in the docs, because a client showing
             // a glossary screen must not imply an effect the daemon does not

@@ -1427,6 +1427,50 @@ older daemon" have to be tellable apart, and a missing key says neither:
   against a gate of ≥30% relative and under 5% harmed). Turning it off is a
   supported choice and leaves every `night_text` in place.
 
+### `status.asr.devices` (0.12.4)
+
+Which device each model on the live path runs on, and why. Always present and
+always this shape, for the same reason the two blocks above it are — "this
+daemon measured the question and the answer is the CPU" and "this daemon is old
+enough not to have been asked" are different states:
+
+```json
+"devices": {
+  "live": "cpu",
+  "night": "vulkan",
+  "live_models": [
+    { "model": "silero-vad", "runtime": "onnxruntime", "device": "cpu",
+      "cpu_share_pct": 0.8, "why": "onnxruntime's ROCm provider was removed in 1.23, …" },
+    { "model": "parakeet-tdt-0.6b-v3", "runtime": "sherpa-onnx", "device": "cpu",
+      "cpu_share_pct": 87.5, "why": "sherpa-onnx accepts no AMD execution provider …" }
+  ],
+  "summary": "every model on the live path runs on the CPU. …"
+}
+```
+
+- `live` — the device every live model is on. `"cpu"`, and on an AMD machine it
+  is not going to be anything else; see below.
+- `night` — `"vulkan"` where `models build-night` has been run, `"unavailable"`
+  otherwise. Reported here as well as under `night` because the question a
+  person asks is "is my graphics card doing anything for this", and an answer
+  that omits the one thing that uses it is a misleading answer.
+- `cpu_share_pct` — that model's measured share of the live path's CPU
+  (FINDINGS §40, the user's own 22.8 minutes). A **constant**, not a live
+  counter: it is a property of the models, and a per-turn timer maintaining a
+  number nobody reads is exactly the cost this measurement was about. A client
+  ordering the list by it is ordering by "what would be worth moving".
+- `why` — one sentence per model, but only **two distinct sentences** across the
+  list, because the models split by runtime and each runtime is blocked for its
+  own reason. A UI should fold them rather than repeat them; `recalld status`
+  does.
+
+**What a client should not imply.** There is no setting here and there is not
+going to be one. A UI must not offer a "use the GPU" toggle, or present the CPU
+placement as a default that can be changed: 90% of the live cost is the
+transcriber, the transcriber runs under sherpa-onnx, and sherpa-onnx's provider
+enum has no AMD variant — that is upstream C++, not a flag this daemon withheld.
+The night shift is the GPU feature, and it has its own block.
+
 ### The vote, stated for clients
 
 The daemon never replaces a transcript on the night decoder's word alone. Two

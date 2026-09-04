@@ -17,7 +17,7 @@ your own GPU. Every byte of it on your silicon. Nothing, ever, anywhere else.**
 ![rust](https://img.shields.io/badge/daemon-rust_·_70k_lines-b7410e?style=for-the-badge)
 ![tests](https://img.shields.io/badge/tests-1069_rust_·_175_node_·_192_e2e-2ea44f?style=for-the-badge)
 ![releases](https://img.shields.io/badge/releases-35_in_4_days-7700FF?style=for-the-badge)
-![footprint](https://img.shields.io/badge/live_pipeline-%3C5%25_of_one_core-2ea44f?style=for-the-badge)
+![footprint](https://img.shields.io/badge/live_pipeline-half_of_one_core-2ea44f?style=for-the-badge)
 ![experiments](https://img.shields.io/badge/experiments-38_scripts_·_25_findings-0a0714?style=for-the-badge)
 
 <br>
@@ -79,9 +79,24 @@ you take it off. The network cable stays cold.
 
 <img src="assets/readme/pipeline.svg" width="100%" alt="capture to meaning, one machine, no exits">
 
-Live, per turn, under five percent of one core: PipeWire tap → Silero VAD →
+Live, per turn, about half of one core: PipeWire tap → Silero VAD →
 turn merge → pyannote **overlap gate** → Parakeet-TDT v3 → ERes2Net
 voiceprint → identity ladder → thread → FTS5 and a 384-dimension vector.
+
+All of that is on the CPU, and it stays there. The obvious question — the
+7900 XTX is idle, the night shift already uses it, why is the transcriber on
+four cores? — was measured on 22.8 minutes of real turns and the answer was
+no. Nine tenths of the live cost is Parakeet; Parakeet runs under sherpa-onnx,
+whose provider list is `cuda`, `coreml`, `xnnpack`, `nnapi`, `trt`, `directml`
+and **nothing for AMD**. The two models that *could* move are 1.1% of the bill
+between them and want 19 GB of ROCm math libraries installed system-wide to do
+it. A GPU decoder was built and benchmarked anyway: invoked once per turn it
+was **slower to answer than the CPU it replaced** (1639 ms against 360 ms) and
+not cheaper, because the model load is the cost and a live decoder cannot
+batch it away the way a night shift can. So there is no `live_gpu` setting —
+all three of its states would do the same thing — and `recalld status` says
+which device every model is on and why instead. Full round in
+[FINDINGS §40](spike/FINDINGS.md).
 
 Then the parts that run when nobody is waiting: a **context re-decode** that
 re-reads short turns inside the audio around them, a **cross-check** by a
@@ -149,7 +164,8 @@ failed are listed further down with their numbers.
 | Quarterly model refresh, four newer checkpoints vs Parakeet v3 | **keep v3** — nearest 3.6% vs 3.3% lab WER; qwen3-asr ties on real audio and loses on speed |
 | Hotword biasing toward the roster and glossary | +9.1% recall on rare words against a +20% gate; at strength the glossary leaked into unrelated turns (control WER 8% → 29%). Not shipped |
 | Electron's click-through on Linux | sets no X11 input shape, is a no-op on Wayland — so the caption bar is a native layer-shell surface |
-| Full live pipeline: VAD, gate, ASR, identity, vectors | under 5% of one CPU core |
+| Full live pipeline: VAD, gate, ASR, identity, vectors | 30 CPU seconds per audio minute — **half of one core**, and 90% of it is the transcriber |
+| Moving the live path onto the idle 7900 XTX | **refused.** sherpa-onnx has no AMD provider at all, so the 90% is unreachable; a per-turn whisper Vulkan decoder measured *slower* (1639 ms vs 360 ms) and no cheaper |
 
 ## The graveyard of clever ideas
 
