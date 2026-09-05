@@ -380,6 +380,20 @@ impl Thresholds {
             .unwrap_or(self.global)
     }
 
+    /// The operating point a voice with nothing learned about it answers to.
+    ///
+    /// The ladder needs it to tell "nothing in the bank is close" from "this
+    /// voice's own **fitted** bar is higher than the one everybody else
+    /// answers to" — two decisions that used to be the same one (0.12.2).
+    pub fn global_pair(&self) -> (f32, f32) {
+        self.global
+    }
+
+    /// Has this voice a bar of its own, or is it on the global?
+    pub fn is_fitted(&self, speaker_id: i64) -> bool {
+        self.per_voice.contains_key(&speaker_id)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.per_voice.is_empty()
     }

@@ -8734,6 +8734,70 @@ pub struct CalibrationRow {
     pub embedding: Embedding,
 }
 
+/// A run of voices minted from one source in a short window (0.12.2).
+///
+/// The signature of the failure FINDINGS §46 documents: a per-voice label bar
+/// fitted above a voice's typical own-turn score turns that voice's turns into
+/// mints, each mint seeds a phantom from a fresh recording of the same person,
+/// and a same-evening recording outscores an older bank — so the next turn
+/// matches the phantom or mints another. Twenty in thirty-three minutes on
+/// 2026-09-04.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MintBurst {
+    /// The capture source every mint in the run came from.
+    pub source_key: String,
+    pub first_ns: i64,
+    pub last_ns: i64,
+    /// `(speaker id, name, seed segment)`, in the order they were minted.
+    pub minted: Vec<(i64, String, Option<i64>)>,
+    /// What Discord says the seed turns were: `(voice, name, how many)`,
+    /// commonest first. A burst whose seeds all name one existing voice is the
+    /// cascade; one with no verdicts at all is a room filling up with strangers
+    /// and is reported without the accusation.
+    pub seeds_say: Vec<(i64, String, usize)>,
+    pub seeds_with_a_verdict: usize,
+    /// Where the run's voices ended up, for the ones somebody has already
+    /// merged away: `(voice, name, how many)`, commonest first. A burst whose
+    /// members were all folded into one voice by hand is the same finding
+    /// arriving from the other end, and it is the only evidence a burst leaves
+    /// once the merge has taken its rows away.
+    pub merged_into: Vec<(i64, String, usize)>,
+}
+
+/// A voice that is somebody the bank already knew, split off under a number
+/// (0.12.2). What `identity repair --phantoms` merges away.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhantomVoice {
+    pub speaker_id: i64,
+    pub name: String,
+    /// Prototypes it still holds, and how many of those ground truth condemns.
+    pub prototypes: usize,
+    pub condemned: usize,
+    /// Its live rows, and how many carry a Discord `single` verdict.
+    pub rows: usize,
+    pub covered: usize,
+    /// `(voice, name, rows)` for every voice its covered rows name, commonest
+    /// first.
+    pub says: Vec<(i64, String, usize)>,
+    /// The voice it would be merged into, when one holds a strict majority.
+    pub target: Option<(i64, String)>,
+    /// Why it is not a candidate, when it is not.
+    pub refused: Option<String>,
+}
+
+/// One row's speaker as it was before a bulk correction touched it (0.12.2).
+///
+/// Written into `operations` before the write, which is the whole of what
+/// "reversible" means here: putting a phantom's turns back is replaying this
+/// list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PriorLabel {
+    pub segment_id: i64,
+    pub speaker_id: Option<i64>,
+    pub label_via: Option<String>,
+    pub match_score: Option<f64>,
+}
+
 /// A prototype ground truth says is a recording of somebody else (0.12.0).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CondemnedPrototype {
@@ -9218,6 +9282,328 @@ impl Store {
             .into_iter()
             .filter(|c| Some(c.truth_speaker) != you)
             .collect())
+    }
+
+    /// Runs of `k` or more voices minted from one source inside `window_ns`
+    /// of each other (0.12.2).
+    ///
+    /// A mint is not itself a fault — a stranger joining the call is supposed
+    /// to get a row in the voicebank. What is a fault is a *run* of them whose
+    /// seed turns Discord says were all the same person already in the bank,
+    /// which is the shape of the FINDINGS §46 cascade and the reason this is a
+    /// report rather than an alarm on a single mint.
+    ///
+    /// The seed turn is the earliest live row filed under the voice, which
+    /// survives `identity repair --prototypes` deleting the prototype it made.
+    /// Voices later merged away are included and their run still reported: a
+    /// burst that was cleaned up by hand is exactly the history an operator
+    /// wants to see before it happens again.
+    pub fn mint_bursts(&self, k: usize, window_ns: i64) -> Result<Vec<MintBurst>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            r"SELECT s.id, s.display_name, s.created_at,
+                    g.id, COALESCE(so.match_key, '(no source)'),
+                    d.speaker_id, said.display_name,
+                    s.merged_into, tgt.display_name
+               FROM speakers s
+               LEFT JOIN segments g ON g.id = (
+                    SELECT MIN(x.id) FROM segments x
+                     WHERE x.speaker_id = s.id AND x.deleted_at IS NULL)
+               LEFT JOIN sessions ss ON ss.id = g.session_id
+               LEFT JOIN sources so  ON so.id = ss.source_id
+               LEFT JOIN discord_users d ON d.user_id = g.truth_user_id
+                    AND g.truth_verdict = ?1
+               LEFT JOIN speakers said ON said.id = d.speaker_id
+               LEFT JOIN speakers tgt ON tgt.id = s.merged_into
+              WHERE s.display_name = s.auto_label
+                AND s.auto_label LIKE 'Speaker\_%' ESCAPE '\'
+              ORDER BY s.created_at ASC, s.id ASC",
+        )?;
+        struct Row {
+            id: i64,
+            name: String,
+            at: i64,
+            seed: Option<i64>,
+            source: String,
+            says: Option<(i64, String)>,
+            went_to: Option<(i64, String)>,
+        }
+        let rows = stmt
+            .query_map(params![truth_verdict::SINGLE], |r| {
+                let said: Option<i64> = r.get(5)?;
+                let name: Option<String> = r.get(6)?;
+                let into: Option<i64> = r.get(7)?;
+                let into_name: Option<String> = r.get(8)?;
+                Ok(Row {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    at: r.get(2)?,
+                    seed: r.get(3)?,
+                    source: r.get(4)?,
+                    says: said.zip(name),
+                    went_to: into.zip(into_name),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // A burst is a maximal chain: each mint within `window_ns` of the one
+        // before it, from the same source. Chained rather than a fixed window,
+        // because a cascade paces itself by how often the person talks.
+        let mut out: Vec<MintBurst> = Vec::new();
+        let mut run: Vec<&Row> = Vec::new();
+        let flush = |run: &Vec<&Row>, out: &mut Vec<MintBurst>| {
+            if run.len() < k {
+                return;
+            }
+            let mut tally: Vec<(i64, String, usize)> = Vec::new();
+            let mut went: Vec<(i64, String, usize)> = Vec::new();
+            let mut covered = 0usize;
+            let count = |into: &mut Vec<(i64, String, usize)>, id: i64, name: &str| match into
+                .iter_mut()
+                .find(|(v, ..)| *v == id)
+            {
+                Some((.., n)) => *n += 1,
+                None => into.push((id, name.to_string(), 1)),
+            };
+            for r in run {
+                if let Some((id, name)) = &r.says {
+                    covered += 1;
+                    count(&mut tally, *id, name);
+                }
+                if let Some((id, name)) = &r.went_to {
+                    count(&mut went, *id, name);
+                }
+            }
+            let commonest_first = |v: &mut Vec<(i64, String, usize)>| {
+                v.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)))
+            };
+            commonest_first(&mut tally);
+            commonest_first(&mut went);
+            out.push(MintBurst {
+                source_key: run[0].source.clone(),
+                first_ns: run[0].at,
+                last_ns: run[run.len() - 1].at,
+                minted: run.iter().map(|r| (r.id, r.name.clone(), r.seed)).collect(),
+                seeds_say: tally,
+                seeds_with_a_verdict: covered,
+                merged_into: went,
+            });
+        };
+        for r in &rows {
+            let joins = run
+                .last()
+                .is_some_and(|p| p.source == r.source && r.at - p.at <= window_ns);
+            if !joins {
+                flush(&run, &mut out);
+                run.clear();
+            }
+            run.push(r);
+        }
+        flush(&run, &mut out);
+        out.sort_by(|a, b| {
+            b.minted
+                .len()
+                .cmp(&a.minted.len())
+                .then(a.first_ns.cmp(&b.first_ns))
+        });
+        Ok(out)
+    }
+
+    /// Voices that are not people: an unnamed `Speaker_NN` holding nothing but
+    /// prototypes ground truth condemns, whose rows Discord says are one voice
+    /// the bank already has (0.12.2).
+    ///
+    /// Three conditions, and every one of them is a consistency check with no
+    /// free parameter:
+    ///
+    /// * **unnamed.** `display_name = auto_label` and the label is the minted
+    ///   form. The moment somebody types a name over it, it is a person's voice
+    ///   and this command has no opinion about it.
+    /// * **no prototype stands up.** Every prototype it still holds is one
+    ///   [`Self::condemned_prototypes`] names — its own source turn is a turn
+    ///   Discord says was somebody else. A voice with *zero* prototypes passes
+    ///   vacuously, which is the population `identity repair --prototypes`
+    ///   leaves behind: that command deletes the vectors and cannot touch the
+    ///   labels, so hundreds of a real person's turns stay filed under a number.
+    /// * **the rows agree.** Of its rows carrying a Discord `single` verdict, a
+    ///   strict majority must name one voice, and that voice is the target.
+    ///   Not unanimity: a phantom holding 168 of one person's turns and 2 of
+    ///   another's is still that person's turns, and the two dissenters are
+    ///   relabelled to *their own* verdict rather than following the merge.
+    ///   No majority is a refusal — a voice half of each is not evidence.
+    pub fn phantom_voices(&self, embed_model_id: &str) -> Result<Vec<PhantomVoice>> {
+        let you = self.you_speaker_id()?;
+        let condemned: Vec<i64> = self
+            .condemned_prototypes(embed_model_id)?
+            .into_iter()
+            .map(|c| c.prototype_id)
+            .collect();
+        let mut stmt = self.conn.prepare(
+            r"SELECT s.id, s.display_name,
+                    (SELECT COUNT(*) FROM speaker_prototypes p WHERE p.speaker_id = s.id),
+                    (SELECT COUNT(*) FROM segments g
+                      WHERE g.speaker_id = s.id AND g.deleted_at IS NULL)
+               FROM speakers s
+              WHERE s.merged_into IS NULL
+                AND s.display_name = s.auto_label
+                AND s.auto_label LIKE 'Speaker\_%' ESCAPE '\'
+              ORDER BY s.id",
+        )?;
+        let candidates = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? as usize,
+                    r.get::<_, i64>(3)? as usize,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut protos = self
+            .conn
+            .prepare("SELECT id FROM speaker_prototypes WHERE speaker_id = ?1")?;
+        let mut verdicts = self.conn.prepare(
+            "SELECT d.speaker_id, said.display_name, COUNT(*)
+               FROM segments g
+               JOIN discord_users d ON d.user_id = g.truth_user_id
+               JOIN speakers said ON said.id = d.speaker_id
+              WHERE g.speaker_id = ?1
+                AND g.deleted_at IS NULL
+                AND g.truth_verdict = ?2
+                AND COALESCE(g.truth_coverage, 0.0) >= ?3
+                AND said.merged_into IS NULL
+              GROUP BY d.speaker_id
+              ORDER BY COUNT(*) DESC, d.speaker_id ASC",
+        )?;
+
+        let mut out = Vec::new();
+        for (id, name, n_protos, rows) in candidates {
+            if Some(id) == you {
+                continue;
+            }
+            let held: Vec<i64> = protos
+                .query_map(params![id], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let n_condemned = held.iter().filter(|p| condemned.contains(p)).count();
+            let says: Vec<(i64, String, usize)> = verdicts
+                .query_map(
+                    params![id, truth_verdict::SINGLE, truth_verdict::SINGLE_MIN],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)? as usize,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let covered: usize = says.iter().map(|(.., n)| n).sum();
+            let mut refused = None;
+            if n_condemned < held.len() {
+                refused = Some(format!(
+                    "{} of its {} prototypes stand up to ground truth",
+                    held.len() - n_condemned,
+                    held.len()
+                ));
+            } else if covered == 0 {
+                refused = Some("no row of it carries a Discord verdict".into());
+            }
+            let target = match (&refused, says.first()) {
+                (None, Some((v, n, c))) if *c * 2 > covered && Some(*v) != you && *v != id => {
+                    Some((*v, n.clone()))
+                }
+                _ => None,
+            };
+            if refused.is_none() && target.is_none() {
+                refused = Some("no voice holds a majority of the rows Discord could name".into());
+            }
+            out.push(PhantomVoice {
+                speaker_id: id,
+                name,
+                prototypes: n_protos,
+                condemned: n_condemned,
+                rows,
+                covered,
+                says,
+                target,
+                refused,
+            });
+        }
+        out.sort_by(|a, b| b.rows.cmp(&a.rows).then(a.speaker_id.cmp(&b.speaker_id)));
+        Ok(out)
+    }
+
+    /// Give a phantom's turns back and tombstone it (0.12.2).
+    ///
+    /// Every row it holds is relabelled `label_via = "truth"`: one that carries
+    /// its own Discord `single` verdict goes to **that** verdict's voice, and
+    /// everything else follows the majority target. Then the empty voice is
+    /// merged away, so it stops appearing in the roster, stops being a
+    /// candidate in the ladder, and takes its condemned prototypes with it.
+    ///
+    /// Returns the rows as they were, for the caller to write into
+    /// `operations`. Nothing here is guessed and nothing is deleted: putting it
+    /// back is a matter of replaying that list.
+    pub fn absorb_phantom(
+        &self,
+        phantom: i64,
+        target: i64,
+    ) -> Result<(Vec<PriorLabel>, MergeReport)> {
+        if phantom == target {
+            bail!("cannot absorb speaker {phantom} into itself");
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.speaker_id, g.label_via, g.match_score, d.speaker_id
+               FROM segments g
+               LEFT JOIN discord_users d ON d.user_id = g.truth_user_id
+                    AND g.truth_verdict = ?2
+                    AND COALESCE(g.truth_coverage, 0.0) >= ?3
+               LEFT JOIN speakers said ON said.id = d.speaker_id AND said.merged_into IS NULL
+              WHERE g.speaker_id = ?1 AND g.deleted_at IS NULL
+              ORDER BY g.id",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![phantom, truth_verdict::SINGLE, truth_verdict::SINGLE_MIN],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<f64>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, .., said) in &rows {
+            let to = said.unwrap_or(target);
+            tx.execute(
+                "UPDATE segments
+                    SET speaker_id = ?2, match_score = NULL, label_via = ?3, sweep_at_ns = NULL
+                  WHERE id = ?1",
+                params![id, to, label_via::TRUTH],
+            )?;
+        }
+        tx.commit()?;
+        let prior = rows
+            .into_iter()
+            .map(
+                |(segment_id, speaker_id, label_via, match_score, _)| PriorLabel {
+                    segment_id,
+                    speaker_id,
+                    label_via,
+                    match_score,
+                },
+            )
+            .collect();
+        Ok((prior, self.merge_speakers(phantom, target)?))
     }
 
     /// Which embedding spaces the bank actually holds vectors in. Ordered by
@@ -12543,6 +12929,234 @@ mod tests {
         for other in [ok_p, weak_p, own_p] {
             assert!(!ids.contains(&other.unwrap()));
         }
+    }
+
+    // ---- 0.12.2: mint bursts and the phantoms they leave -----------------
+
+    /// The 2026-09-04 shape, small: a real voice, a linked Discord account, and
+    /// a run of unnamed voices minted from that person's turns.
+    fn a_store_with_a_mint_burst() -> (Store, i64, Vec<i64>) {
+        let s = store();
+        let src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let rowan = s.create_speaker("Rowan", 0).unwrap();
+        s.upsert_discord_user("rowan", "Rowan", 0).unwrap();
+        s.set_discord_link("rowan", Some(rowan), Some(truth_via::MANUAL), 0)
+            .unwrap();
+        let v = Embedding::new("m@1", vec![1.0, 0.0]);
+        let min = 60_000_000_000i64;
+        let mut phantoms = Vec::new();
+        for i in 0..4 {
+            let at = i * min;
+            let p = s.mint_speaker(at).unwrap();
+            let seg = s.insert_segment(sess, at, at + 1, "a.wav", at).unwrap();
+            s.set_segment_speaker(seg, Some(p), Some(0.61)).unwrap();
+            s.set_segment_truth(seg, Some("rowan"), truth_verdict::SINGLE, Some(0.95))
+                .unwrap();
+            s.add_prototype(p, &v, Some(seg), false, 20, at).unwrap();
+            phantoms.push(p);
+        }
+        (s, rowan, phantoms)
+    }
+
+    #[test]
+    fn a_run_of_mints_from_one_person_is_a_burst() {
+        let (s, rowan, phantoms) = a_store_with_a_mint_burst();
+        let bursts = s.mint_bursts(3, 10 * 60_000_000_000).unwrap();
+        assert_eq!(bursts.len(), 1, "{bursts:?}");
+        let b = &bursts[0];
+        assert_eq!(
+            b.minted.iter().map(|(id, ..)| *id).collect::<Vec<_>>(),
+            phantoms
+        );
+        assert_eq!(b.source_key, "Discord");
+        assert_eq!(b.seeds_with_a_verdict, 4);
+        assert_eq!(
+            b.seeds_say,
+            vec![(rowan, "Rowan".to_string(), 4)],
+            "every seed turn is one voice the bank already had"
+        );
+        assert!(b.merged_into.is_empty(), "nobody has cleaned it up yet");
+    }
+
+    #[test]
+    fn a_burst_already_merged_away_by_hand_is_still_reported() {
+        // §44's 24 inherited prototypes: a burst whose voices somebody folded
+        // into one voice keeps no rows of its own, so the seed-verdict column
+        // goes blank and the merge target is the only evidence left.
+        let (s, rowan, phantoms) = a_store_with_a_mint_burst();
+        for p in &phantoms {
+            s.merge_speakers(*p, rowan).unwrap();
+        }
+        let bursts = s.mint_bursts(3, 10 * 60_000_000_000).unwrap();
+        assert_eq!(bursts.len(), 1, "{bursts:?}");
+        assert_eq!(bursts[0].seeds_with_a_verdict, 0, "their rows moved out");
+        assert_eq!(
+            bursts[0].merged_into,
+            vec![(rowan, "Rowan".to_string(), phantoms.len())]
+        );
+    }
+
+    #[test]
+    fn voices_minted_hours_apart_are_not_a_burst() {
+        // The report must not cry wolf over a lobby that grew over an evening.
+        let (s, _, _) = a_store_with_a_mint_burst();
+        assert!(s.mint_bursts(3, 30_000_000_000).unwrap().is_empty());
+        // Nor over two arrivals, however close together.
+        assert!(s.mint_bursts(5, 10 * 60_000_000_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_phantom_is_named_with_the_voice_its_rows_belong_to() {
+        let (s, rowan, phantoms) = a_store_with_a_mint_burst();
+        let found = s.phantom_voices("m@1").unwrap();
+        assert_eq!(found.len(), phantoms.len(), "{found:?}");
+        for p in &found {
+            assert_eq!(p.prototypes, 1);
+            assert_eq!(p.condemned, 1, "its one prototype is a Rowan recording");
+            assert_eq!(p.target, Some((rowan, "Rowan".to_string())), "{p:?}");
+            assert_eq!(p.refused, None);
+        }
+    }
+
+    #[test]
+    fn a_voice_with_a_prototype_that_stands_up_is_left_alone() {
+        // The condition is *every* prototype condemned. One that ground truth
+        // does not contradict is a voice, however few turns it has.
+        let (s, _, phantoms) = a_store_with_a_mint_burst();
+        let v = Embedding::new("m@1", vec![0.0, 1.0]);
+        s.add_prototype(phantoms[0], &v, None, false, 20, 0)
+            .unwrap();
+        let found = s.phantom_voices("m@1").unwrap();
+        let it = found.iter().find(|p| p.speaker_id == phantoms[0]).unwrap();
+        assert_eq!(it.target, None);
+        assert!(
+            it.refused
+                .as_deref()
+                .is_some_and(|r| r.contains("stand up"))
+        );
+    }
+
+    #[test]
+    fn a_named_voice_is_never_a_phantom() {
+        let (s, _, phantoms) = a_store_with_a_mint_burst();
+        s.rename_speaker(phantoms[0], "Somebody", 0).unwrap();
+        let found = s.phantom_voices("m@1").unwrap();
+        assert!(
+            found.iter().all(|p| p.speaker_id != phantoms[0]),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn absorbing_a_phantom_gives_its_turns_back_and_says_what_they_were() {
+        let (s, rowan, phantoms) = a_store_with_a_mint_burst();
+        let ph = phantoms[0];
+        let seg = s
+            .conn
+            .query_row(
+                "SELECT id FROM segments WHERE speaker_id = ?1",
+                params![ph],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        let (prior, merge) = s.absorb_phantom(ph, rowan).unwrap();
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0].segment_id, seg);
+        assert_eq!(prior[0].speaker_id, Some(ph));
+        assert_eq!(prior[0].label_via.as_deref(), Some(label_via::MATCH));
+        assert!(
+            prior[0]
+                .match_score
+                .is_some_and(|v| (v - 0.61).abs() < 1e-6)
+        );
+        assert_eq!(merge.into, rowan);
+        assert_eq!(merge.prototypes, 1, "its prototype comes too");
+
+        let row = s.segment_row(seg).unwrap().unwrap();
+        assert_eq!(row.speaker_id, Some(rowan));
+        assert_eq!(row.label_via.as_deref(), Some(label_via::TRUTH));
+        assert_eq!(row.match_score, None, "there was no comparison to score");
+        assert_eq!(s.resolve_speaker(ph).unwrap(), rowan);
+    }
+
+    #[test]
+    fn a_row_with_its_own_verdict_follows_that_verdict_and_not_the_majority() {
+        // The reason the rule is a majority and not unanimity: a phantom that
+        // stole 168 of one person's turns and 2 of another's is still the first
+        // person's turns, and the two dissenters know who they are.
+        let (s, rowan, phantoms) = a_store_with_a_mint_burst();
+        let aspen = s.create_speaker("Aspen", 0).unwrap();
+        s.upsert_discord_user("aspen", "Aspen", 0).unwrap();
+        s.set_discord_link("aspen", Some(aspen), Some(truth_via::MANUAL), 0)
+            .unwrap();
+        let src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        // Two more of Rowan's turns under the same phantom, so it holds three
+        // of his and one of hers — the live Speaker_71's 168-to-2, in small.
+        for t in [1001i64, 1002] {
+            let g = s.insert_segment(sess, t, t + 1, "h.wav", t).unwrap();
+            s.set_segment_speaker(g, Some(phantoms[0]), Some(0.6))
+                .unwrap();
+            s.set_segment_truth(g, Some("rowan"), truth_verdict::SINGLE, Some(0.95))
+                .unwrap();
+        }
+        let odd = s.insert_segment(sess, 999, 1000, "z.wav", 999).unwrap();
+        s.set_segment_speaker(odd, Some(phantoms[0]), Some(0.6))
+            .unwrap();
+        s.set_segment_truth(odd, Some("aspen"), truth_verdict::SINGLE, Some(0.95))
+            .unwrap();
+
+        let it = s
+            .phantom_voices("m@1")
+            .unwrap()
+            .into_iter()
+            .find(|p| p.speaker_id == phantoms[0])
+            .unwrap();
+        assert_eq!(
+            it.says,
+            vec![(rowan, "Rowan".into(), 3), (aspen, "Aspen".into(), 1)]
+        );
+        assert_eq!(it.target, Some((rowan, "Rowan".to_string())));
+        s.absorb_phantom(phantoms[0], rowan).unwrap();
+        assert_eq!(
+            s.segment_row(odd).unwrap().unwrap().speaker_id,
+            Some(aspen),
+            "Aspen's row went to Aspen, not to the merge target"
+        );
+    }
+
+    #[test]
+    fn a_phantom_no_voice_holds_a_majority_of_is_refused() {
+        let (s, _, phantoms) = a_store_with_a_mint_burst();
+        let aspen = s.create_speaker("Aspen", 0).unwrap();
+        s.upsert_discord_user("aspen", "Aspen", 0).unwrap();
+        s.set_discord_link("aspen", Some(aspen), Some(truth_via::MANUAL), 0)
+            .unwrap();
+        let src = s.upsert_source("Discord", "Discord", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        // One row each way: the phantom already holds one turn Discord calls
+        // Rowan, and now one it calls Aspen.
+        let odd = s.insert_segment(sess, 999, 1000, "z.wav", 999).unwrap();
+        s.set_segment_speaker(odd, Some(phantoms[0]), Some(0.6))
+            .unwrap();
+        s.set_segment_truth(odd, Some("aspen"), truth_verdict::SINGLE, Some(0.95))
+            .unwrap();
+        let it = s
+            .phantom_voices("m@1")
+            .unwrap()
+            .into_iter()
+            .find(|p| p.speaker_id == phantoms[0])
+            .unwrap();
+        assert_eq!(it.covered, 2);
+        assert_eq!(it.target, None, "{it:?}");
+        assert!(
+            it.refused
+                .as_deref()
+                .is_some_and(|r| r.contains("majority")),
+            "{it:?}"
+        );
+        let _ = aspen;
     }
 
     #[test]

@@ -69,6 +69,21 @@ pub enum Decision {
         duration_s: f32,
         words: usize,
     },
+    /// The top candidate cleared the operating point every voice without a
+    /// fitted bar answers to, and failed only its **own learned** bar (0.12.2).
+    ///
+    /// No name, and no new voice either. The distinction this variant exists
+    /// for is the whole of FINDINGS §46: `Mint` means *nothing in the bank is
+    /// close to this*, and a turn that scored 0.61 against a voice whose fitted
+    /// bar is 0.60 is not that. Filing it as a mint seeds a new voice from a
+    /// recording of somebody the bank already knows, and because a same-evening
+    /// recording outscores an older bank, the next turn of that person matches
+    /// the phantom — twenty of them in thirty-three minutes on 2026-09-04.
+    Declined {
+        best_score: f32,
+        /// The bar it missed, so the report can say which number did this.
+        bar: f32,
+    },
     /// The turn came off the user's own microphone, so the speaker is known
     /// before any model runs. This is **provenance, not a match**: the
     /// voicebank is never consulted and `match_score` stays NULL, because a
@@ -211,6 +226,25 @@ pub fn decide_with(
     let runner_up = ranked.get(1).map(|c| c.score).unwrap_or(f32::NEG_INFINITY);
     let margin = top.score - runner_up;
     if top.score < label_threshold || margin < label_margin {
+        // 0.12.2: **a fitted bar declines, it never mints.** A learned bar is
+        // a claim about how confident this voice has to be before it gets its
+        // name — not a claim that the turn came from a stranger. When the top
+        // candidate clears the global operating point and fails only its own
+        // fitted bar, the turn is declined: no label, and no new identity.
+        //
+        // Measured on the 2026-09-04 burst (FINDINGS §46): all ten mints of
+        // the evening prevented, no correct label lost, and the evening's
+        // held-out F-0.5 goes 0.123 → 0.857.
+        let (global_threshold, global_margin) = thresholds.global_pair();
+        if thresholds.is_fitted(top.speaker_id)
+            && top.score >= global_threshold
+            && margin >= global_margin
+        {
+            return Decision::Declined {
+                best_score: top.score,
+                bar: label_threshold,
+            };
+        }
         return mint(Some(top.score));
     }
 
@@ -583,11 +617,14 @@ mod tests {
     #[test]
     fn a_learned_threshold_raises_the_bar_for_one_voice_only() {
         let t = crate::calib::Thresholds::global(cfg().label_threshold, 0.0).with(1, 0.55, 0.0);
-        // Voice 1 at 0.40 used to be a match and is now a mint.
+        // Voice 1 at 0.40 used to be a match and is now a decline. Under
+        // 0.12.1 it was a *mint*, and that is the bug §46 documents: 0.40 is
+        // over the global bar, so whatever this turn is, it is not a stranger.
         assert_eq!(
             decide_with(&cfg(), &t, 0.0, 5.0, 5, &[c(1, 0.40)]),
-            Decision::Mint {
-                best_score: Some(0.40)
+            Decision::Declined {
+                best_score: 0.40,
+                bar: 0.55
             }
         );
         // Voice 2, at the same score, is untouched.
@@ -613,9 +650,11 @@ mod tests {
         let t = crate::calib::Thresholds::global(cfg().label_threshold, 0.0).with(1, 0.35, 0.10);
         assert_eq!(
             decide_with(&cfg(), &t, 0.0, 5.0, 5, &[c(1, 0.60), c(2, 0.58)]),
-            Decision::Mint {
-                best_score: Some(0.60)
-            }
+            Decision::Declined {
+                best_score: 0.60,
+                bar: 0.35
+            },
+            "and it does not invent a third voice either (0.12.2)"
         );
     }
 
@@ -649,6 +688,92 @@ mod tests {
                 enroll: false
             }
         );
+    }
+
+    // ---- 0.12.2: a fitted bar declines, it never mints -------------------
+
+    #[test]
+    fn a_fitted_bar_declines_it_never_mints() {
+        // The 2026-09-04 shape: a voice whose learned bar (0.60) sits above
+        // what its own turns typically score. Under 0.12.1 every one of those
+        // turns was a `Mint` — a new `Speaker_NN` seeded with a recording of
+        // somebody the bank already knew.
+        let t = crate::calib::Thresholds::global(cfg().label_threshold, 0.0).with(1, 0.60, 0.08);
+        assert_eq!(
+            decide_with(&cfg(), &t, 0.0, 5.0, 5, &[c(1, 0.61), c(2, 0.58)]),
+            Decision::Declined {
+                best_score: 0.61,
+                bar: 0.60
+            },
+            "the margin failed, and a fitted margin is not evidence of a stranger"
+        );
+        assert_eq!(
+            decide_with(&cfg(), &t, 0.0, 5.0, 5, &[c(1, 0.52)]),
+            Decision::Declined {
+                best_score: 0.52,
+                bar: 0.60
+            },
+            "the threshold failed, and 0.52 is not what nothing-in-the-bank looks like"
+        );
+    }
+
+    #[test]
+    fn under_the_global_bar_a_fitted_voice_still_mints() {
+        // The rule is narrow on purpose. It says a *fitted* bar is a labelling
+        // decision; it does not say the bank may never grow. A turn that fails
+        // the operating point every unlearned voice answers to is still a turn
+        // nothing in the bank claims.
+        let t = crate::calib::Thresholds::global(cfg().label_threshold, 0.0).with(1, 0.60, 0.0);
+        assert_eq!(
+            decide_with(&cfg(), &t, 0.0, 5.0, 5, &[c(1, 0.34)]),
+            Decision::Mint {
+                best_score: Some(0.34)
+            }
+        );
+    }
+
+    #[test]
+    fn a_voice_with_no_fitted_bar_is_untouched_by_the_rule() {
+        // Voice 2 answers to the global, so there is no "its own bar" to fail
+        // and nothing here can turn its mint into a decline.
+        let t = crate::calib::Thresholds::global(cfg().label_threshold, 0.0).with(1, 0.60, 0.0);
+        assert_eq!(
+            decide_with(&cfg(), &t, 0.0, 5.0, 5, &[c(2, 0.30)]),
+            Decision::Mint {
+                best_score: Some(0.30)
+            }
+        );
+    }
+
+    #[test]
+    fn a_declined_turn_is_still_declined_when_it_is_too_slight() {
+        // The mint bar and the decline are answers to different questions, and
+        // the decline outranks: a one-word grunt that clears the global and
+        // fails a fitted bar is not a `TooSlight` either, because `TooSlight`
+        // means "nothing matched and this is not worth an identity" and
+        // something did nearly match.
+        let t = crate::calib::Thresholds::global(cfg().label_threshold, 0.0).with(1, 0.60, 0.0);
+        assert_eq!(
+            decide_with(&cfg(), &t, 0.0, 1.2, 1, &[c(1, 0.52)]),
+            Decision::Declined {
+                best_score: 0.52,
+                bar: 0.60
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_learned_table_still_cannot_reach_the_new_arm() {
+        // The 0.10.2 equivalence has to survive the rule: with nothing fitted,
+        // `decide` and `decide_with` are the same function, and `Declined` is
+        // unreachable.
+        let t = crate::calib::Thresholds::global(cfg().label_threshold, 0.0);
+        for score in [0.10, 0.34, 0.35, 0.54, 0.55, 0.99] {
+            let ranked = [c(1, score), c(2, score - 0.03)];
+            let d = decide_with(&cfg(), &t, 0.0, 5.0, 5, &ranked);
+            assert_eq!(decide(&cfg(), 0.0, 5.0, 5, &ranked), d);
+            assert!(!matches!(d, Decision::Declined { .. }));
+        }
     }
 
     #[test]

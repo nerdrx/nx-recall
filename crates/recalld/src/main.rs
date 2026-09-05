@@ -4427,17 +4427,21 @@ fn cmd_identity(cfg: &Config, data_dir: &Path, action: Option<IdentityAction>) -
         IdentityAction::Repair {
             foreign,
             prototypes,
+            phantoms,
             apply,
             limit,
-        } => match (foreign, prototypes) {
-            (true, _) => cmd_identity_repair_foreign(cfg, data_dir, apply, limit),
-            (_, true) => cmd_identity_repair_prototypes(data_dir, apply),
+        } => match (foreign, prototypes, phantoms) {
+            (true, ..) => cmd_identity_repair_foreign(cfg, data_dir, apply, limit),
+            (_, true, _) => cmd_identity_repair_prototypes(data_dir, apply),
+            (.., true) => cmd_identity_repair_phantoms(data_dir, apply),
             _ => {
                 println!(
-                    "`identity repair` needs --foreign or --prototypes. Naming what it \
-                     may touch\nis what keeps it from quietly growing a third mode.\n\n  \
+                    "`identity repair` needs --foreign, --prototypes or --phantoms. Naming \
+                     what it may\ntouch is what keeps it from quietly growing another \
+                     mode.\n\n  \
                      --foreign     labels the source prior questions, back to unassigned\n  \
-                     --prototypes  voiceprints whose own turn Discord says was somebody else"
+                     --prototypes  voiceprints whose own turn Discord says was somebody else\n  \
+                     --phantoms    unnamed voices that are somebody you already have"
                 );
                 Ok(())
             }
@@ -4584,6 +4588,17 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
     if let Some((a, s)) = &report.aggregate {
         row(&format!("+ scoring a voice by {}", a.as_str()), s);
     }
+    // The mint path, priced (0.12.2). Every row above scores a decline as a
+    // free non-answer; the live daemon turns one into a new `Speaker_NN` seeded
+    // with the turn's own audio. When the two pairs differ, the difference is
+    // the phantoms the candidate would invent, and `may_install` is not allowed
+    // to see only the first pair — that is how 2026-09-04 happened.
+    if report.baseline_minting != report.baseline || report.candidate_minting != report.candidate {
+        println!("\nthe same two arms with the MINT path in — a decline the daemon would turn");
+        println!("into a new voice is scored as the wrong name, because that is what it is");
+        row("the globals, minting", &report.baseline_minting);
+        row("+ per-voice, minting", &report.candidate_minting);
+    }
     println!(
         "\n  thresholds: {}",
         verdict_line(report.thresholds_swap, &report.proposed.is_empty())
@@ -4679,6 +4694,72 @@ fn cmd_identity_calibrate(cfg: &Config, data_dir: &Path, apply: bool, reset: boo
 
 /// The one repair that is a correctness fix rather than an operating point:
 /// throwing out a prototype that is a recording of somebody else.
+/// `recalld identity repair --phantoms` (0.12.2).
+///
+/// The other half of `--prototypes`: that one deletes the vectors a mint burst
+/// wrote, this one gives the *turns* back. Preview by default, `--apply` writes,
+/// never automatic — the same rule, for the same reason.
+fn cmd_identity_repair_phantoms(data_dir: &Path, apply: bool) -> Result<()> {
+    let store = Store::open(data_dir)?;
+    let now = recalld::clock::utc_now_ns();
+    let report = recalld::identity_learn::repair_phantoms(&store, apply, now)?;
+
+    if let Some(note) = &report.note {
+        println!("{note}.");
+    }
+    if report.found.is_empty() {
+        println!("No unnamed voice in the bank looks like somebody you already have.");
+        return Ok(());
+    }
+    println!(
+        "{:>5}  {:<16}{:>7}{:>11}{:>7}{:>9}  WHAT DISCORD SAYS",
+        "VOICE", "NAME", "PROTOS", "CONDEMNED", "ROWS", "COVERED"
+    );
+    for p in &report.found {
+        let says = if p.says.is_empty() {
+            "—".to_string()
+        } else {
+            p.says
+                .iter()
+                .map(|(_, n, c)| format!("{n} {c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!(
+            "{:>5}  {:<16}{:>7}{:>11}{:>7}{:>9}  {says}",
+            p.speaker_id, p.name, p.prototypes, p.condemned, p.rows, p.covered
+        );
+        match (&p.target, &p.refused) {
+            (Some((v, n)), _) => println!("       → merge into {n} ({v}); {} row(s) move", p.rows),
+            (None, Some(why)) => println!("       → left alone: {why}"),
+            (None, None) => {}
+        }
+    }
+    let movable: usize = report.candidates().map(|p| p.rows).sum();
+    let n = report.candidates().count();
+    println!(
+        "\n{n} voice(s) would be merged away and {movable} row(s) relabelled. A row that \
+         carries its\nown Discord verdict goes to that verdict's voice, not to the majority's."
+    );
+    if apply {
+        println!(
+            "\nMerged {}, relabelled {}, carried {} prototype(s) over. The prior state of \
+             every row\nis in `operations` under `{}`.",
+            report.merged,
+            report.relabelled,
+            report.prototypes_moved,
+            recalld::identity_learn::PHANTOM_OP
+        );
+    } else {
+        println!(
+            "\nNothing was written. `recalld identity repair --phantoms --apply` does it.\n\
+             A merge is a tombstone, not a deletion, and every row's prior speaker is \
+             recorded first."
+        );
+    }
+    Ok(())
+}
+
 fn cmd_identity_repair_prototypes(data_dir: &Path, apply: bool) -> Result<()> {
     let store = Store::open(data_dir)?;
     let now = recalld::clock::utc_now_ns();
@@ -4771,6 +4852,14 @@ fn verdict_line(swap: bool, nothing_proposed: &bool) -> String {
 
 /// How many of the questioned labels the tail prints.
 const AUDIT_TAIL: usize = 20;
+
+/// A mint burst, as the audit counts one (0.12.2). Three is the smallest run
+/// that cannot be two strangers arriving together, and ten minutes is longer
+/// than the gap between two turns of somebody who is talking — so a run that
+/// clears both is a cascade rather than an evening. Both are a *report's*
+/// numbers, not an operating point: nothing is refused or written on them.
+const MINT_BURST_K: usize = 3;
+const MINT_BURST_WINDOW_MIN: i64 = 10;
 
 fn cmd_identity_audit(cfg: &Config, data_dir: &Path) -> Result<()> {
     let store = Store::open(data_dir)?;
@@ -4871,6 +4960,74 @@ fn cmd_identity_audit(cfg: &Config, data_dir: &Path) -> Result<()> {
              is the one command that deletes, and it only removes prototypes whose own\n\
              source turn ground truth says was somebody else."
         );
+    }
+
+    // A cascade, after the fact. FINDINGS §46: a fitted label bar above a
+    // voice's typical own-turn score turns that voice's turns into mints, and
+    // because a same-evening recording outscores an older bank, each phantom
+    // then wins the next turn or mints the one after it. The signature is a
+    // *run* of mints from one source whose seed turns Discord says were all one
+    // person already in the bank, and nothing named it until it had happened.
+    let bursts = store.mint_bursts(MINT_BURST_K, MINT_BURST_WINDOW_MIN * 60_000_000_000)?;
+    println!("\n=== mint bursts ===");
+    println!(
+        "{MINT_BURST_K} or more voices minted from one source, each within \
+         {MINT_BURST_WINDOW_MIN} minutes of\nthe last."
+    );
+    if bursts.is_empty() {
+        println!("\nNone. New voices arrive one at a time, which is what a new person looks like.");
+    }
+    for b in &bursts {
+        let span = (b.last_ns - b.first_ns) as f64 / 60e9;
+        println!(
+            "\n{} minted on {} over {:.0} min, from {}",
+            b.minted.len(),
+            recalld::clock::iso8601(b.first_ns),
+            span,
+            b.source_key
+        );
+        println!(
+            "  {}",
+            b.minted
+                .iter()
+                .map(|(id, n, _)| format!("{n} ({id})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if let [(id, name, n)] = b.merged_into.as_slice()
+            && *n == b.minted.len()
+        {
+            println!(
+                "  All {n} were later merged into {name} ({id}) by hand — the same finding, \
+                 arriving\n  from the other end. FINDINGS §44: those inherited prototypes are \
+                 the ones that\n  match their new voice's own turns least well."
+            );
+        }
+        if b.seeds_with_a_verdict == 0 {
+            println!(
+                "  Discord has no verdict on any of the turns they were minted from, so \
+                 this is\n  reported and not accused: it may simply be a room filling up."
+            );
+            continue;
+        }
+        let says = b
+            .seeds_say
+            .iter()
+            .map(|(v, n, c)| format!("{n} ({v}) × {c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "  the turns they were minted from: {says}  \
+             ({} of {} carry a verdict)",
+            b.seeds_with_a_verdict,
+            b.minted.len()
+        );
+        if b.seeds_say.len() == 1 {
+            println!(
+                "  Every seed turn is one voice you already have. That is the cascade, not \
+                 a crowd:\n  `recalld identity repair --phantoms` gives those turns back."
+            );
+        }
     }
 
     println!("\n=== labels the rule questions ===");

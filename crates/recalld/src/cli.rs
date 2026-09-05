@@ -754,6 +754,11 @@ pub enum IdentityAction {
         /// the voicebank.
         #[arg(long, conflicts_with = "foreign")]
         prototypes: bool,
+        /// Unnamed `Speaker_NN` voices holding nothing but prototypes ground
+        /// truth condemns, whose rows Discord says are one voice you already
+        /// have (0.12.2). Their turns go back and the voice is merged away.
+        #[arg(long, conflicts_with_all = ["foreign", "prototypes"])]
+        phantoms: bool,
         /// Actually write. Without it the command only lists.
         #[arg(long)]
         apply: bool,

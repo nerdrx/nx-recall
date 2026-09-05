@@ -4840,3 +4840,123 @@ every clip is decoded on its own, and the number only bounds a query.
 `live = false` was measured before it was offered rather than defaulted off out
 of caution — see FINDINGS §42. A live mood chip is worth less than a dropped
 turn, and the overnight pass reaches the same row within a day.
+
+## 0.12.5 — a fitted bar declines, it never mints
+
+On the evening of 2026-09-04 the nightly pass installed a per-voice label bar of
+0.41 for Rowan and 0.60/0.08 for two unnamed voices ground truth had never once
+confirmed. Between 21:47 and 22:54 UTC the daemon minted twenty phantom
+`Speaker_NN` voices, every one of them seeded with a recording of Rowan, and
+filed 302 of Rowan's and Aspen's turns under them. Held-out identity fell to
+F-0.5 0.31. The measurement is FINDINGS §46; this is what changed.
+
+### The failure, in one paragraph
+
+`decide_with` had one exit for two different claims. *Nothing in the bank is
+close to this* and *this voice's own learned bar is higher than the one everybody
+else answers to* both returned `Decision::Mint`, and `analysis` seeds a mint with
+the turn's own audio. Because a same-evening recording of a person outscores that
+person's two-day-old bank — 0.614 against 0.544 in the first mint of the burst —
+the next turn of the same person matched the phantom, and either took its name or
+failed the next fitted bar and minted again.
+
+### The rule
+
+A turn that clears the **global** operating point (`[identity].label_threshold`
+and the global margin) and fails only its top candidate's **fitted** bar returns
+the new `Decision::Declined { best_score, bar }`: no name, no new voice, and the
+embedding and transcript are kept exactly as `Mint` kept them. `Mint` now means
+what its doc comment always claimed: nothing in the bank came close.
+
+The rule is deliberately narrow. A voice with no fitted bar cannot reach it, a
+score under the global bar still mints, and the enrol bar is untouched. On the
+2026-09-04 evening it prevents all ten mints the reconstruction reproduces and
+costs zero correct labels; on the archive's two real cold starts it mints 7 of 8
+and 8 of 8 of the voices the shipping path did, with *fewer* wrong labels than
+shipping. Two rules that would also have stopped the cascade — a near-miss slack
+of 0.10, and refusing a label to an unnamed voice with fewer than N prototypes —
+were measured on those same cold starts and **refused**: they turn a stranger's
+first evening into 120 mints.
+
+A new counter, `declined_fitted`, appears alongside `too_slight` in the daemon's
+stats line and in `stats`.
+
+### `identity.calibrate` scores the mint path
+
+`swap_is_safe` compared two label-only scores, in which a decline is a free
+non-answer. It is not free — the live daemon turns one into a voice — and on
+2026-09-04 that arithmetic is what installed the bar: label-only 0.848 → 0.897
+(`may_install`: PASS), the same pair with the mint path in 0.771 → 0.123.
+
+Every arm the pass measures now carries a **second** score, in which a decline
+the ladder would have minted is counted as the wrong name, and a candidate must
+clear both. Two new fields on the report and in `operations`:
+
+```jsonc
+{"baseline_minting": {"n": 1156, "correct": 928, "wrong": 181, "declined": 47, "…": null},
+ "candidate_minting": {"n": 1156, "correct": 884, "wrong": 57, "declined": 215, "…": null}}
+```
+
+The second veto is `swap_is_safe` only, not `may_install`: materiality is a rule
+about not churning an operating point for a row or two, and this is a rule about
+not installing a bar that invents people. A mint-neutral candidate has an
+identical pair and passes.
+
+### `recalld identity audit` → mint bursts
+
+A fifth section, and a report like the other four. It names every run of **three
+or more** voices minted from one source, each within **ten minutes** of the last,
+and says what Discord's verdict was on the turns they were minted from. A run
+whose seed turns all name one voice the bank already has is the cascade and says
+so; a run with no verdicts is reported without the accusation, because a room
+filling up with strangers looks the same from here. Both numbers are a report's
+and nothing is refused or written on them.
+
+### `identity.repair` — now two modes, exactly one required
+
+```jsonc
+{"method": "identity.repair", "params": {"phantoms": true, "apply": false}}
+```
+
+`--prototypes` deletes the *vectors* a burst wrote and cannot touch the *labels*.
+On the live archive that left nineteen unnamed voices holding 304 of two people's
+turns with no prototypes at all — nothing to delete, nothing to re-score, and
+held-out precision reading in the thirties purely from rows filed under a number.
+`--phantoms` is the other half.
+
+A voice is a phantom when all three hold, and each is a consistency check with no
+free parameter:
+
+* it is **unnamed** — `display_name = auto_label` and the label is the minted
+  `Speaker_NN` form. The moment somebody types a name over it, it is a person's
+  voice and this command has no opinion about it;
+* **no prototype it still holds stands up**: every one is condemned by the same
+  check `--prototypes` uses. A voice with zero prototypes passes vacuously, which
+  is precisely the population `--prototypes` leaves behind;
+* **its rows agree**: of the rows carrying a Discord `single` verdict, a strict
+  majority name one voice, and that voice is the target.
+
+Majority rather than unanimity, and the reason is in the write: a row that
+carries **its own** verdict goes to that verdict's voice, not to the target's, so
+a phantom holding 168 of one person's turns and 2 of another's returns 168 and 2
+to their owners. A voice with no majority at all is refused and named in the
+preview. Every relabelled row is stamped `label_via: "truth"` and its
+`match_score` cleared, because nothing was compared.
+
+```jsonc
+{
+  "found": [{"speaker": 71, "name": "Speaker_71", "prototypes": 2, "condemned": 2,
+             "rows": 186, "covered": 170,
+             "says": [{"speaker": 2, "name": "Rowan", "rows": 168},
+                      {"speaker": 25, "name": "Aspen", "rows": 2}],
+             "target": {"speaker": 2, "name": "Rowan"}, "refused": null}],
+  "merged": 16, "relabelled": 302, "prototypes_moved": 2, "note": null
+}
+```
+
+Preview by default, `--apply` writes, **never automatic** — the same rule as
+`--prototypes`, for the same reason. It is reversible: every row's prior
+`(speaker, label_via, match_score)` goes into `operations` under
+`identity.repair_phantoms` before it changes, and the voice is tombstoned rather
+than deleted. `identity.repair` now requires exactly one of `prototypes: true` or
+`phantoms: true`; asking for both, or neither, is a refusal.

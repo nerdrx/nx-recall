@@ -4799,15 +4799,24 @@ impl Service {
     /// meant to preview must not be able to reach the deletion by omitting a
     /// field. Nothing runs this on a timer.
     fn identity_repair(&self, req: &Request) -> Result<Value, Error> {
-        if !req.params["prototypes"].as_bool().unwrap_or(false) {
+        let prototypes = req.params["prototypes"].as_bool().unwrap_or(false);
+        let phantoms = req.params["phantoms"].as_bool().unwrap_or(false);
+        if prototypes == phantoms {
             return Err(Error::params(
-                "identity.repair needs `prototypes: true`; it is the only thing it \
-                 can repair, and naming it is what keeps the deletion deliberate",
+                "identity.repair needs exactly one of `prototypes: true` (voiceprints \
+                 whose own turn Discord says was somebody else) or `phantoms: true` \
+                 (unnamed voices that are somebody you already have); naming which is \
+                 what keeps the write deliberate",
             ));
         }
         let apply = req.params["apply"].as_bool().unwrap_or(false);
         let now = crate::clock::utc_now_ns();
-        Ok(crate::identity_learn::repair_prototypes(&self.store(), apply, now)?.to_json())
+        let store = self.store();
+        Ok(if phantoms {
+            crate::identity_learn::repair_phantoms(&store, apply, now)?.to_json()
+        } else {
+            crate::identity_learn::repair_prototypes(&store, apply, now)?.to_json()
+        })
     }
     // ---- end 0.9.0 --------------------------------------------------------
 }
