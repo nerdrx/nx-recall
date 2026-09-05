@@ -1348,27 +1348,49 @@ impl Pipeline {
         // reading already on somebody's screen. The two switches are both
         // off by default; an install that turns on both is told at start-up
         // that its long turns reach the glass early and are not split.
-        let plan: Vec<(crate::turnsplit::Piece, Option<String>)> = match self
-            .analyzer
-            .as_mut()
-            .filter(|_| self.cfg.identity.split_turns && !self.control.is_paused() && !sliced)
-        {
-            Some(a) => match a.plan_split(&samples) {
-                Ok(p) => p
-                    .pieces
-                    .into_iter()
-                    .map(|(piece, text)| (piece, Some(text)))
-                    .collect(),
-                Err(e) => {
-                    // A detector that fell over must cost a split, never a
-                    // recording. The turn is written whole, as it would have
-                    // been with the switch off.
-                    warn!(session_id, "could not look for a speaker change: {e:#}");
-                    Vec::new()
-                }
-            },
-            None => Vec::new(),
+        // The bank, fetched once under the store lock before any model runs
+        // — [`crate::quality`]'s discipline, for the same reason: a worker
+        // holding the mutex across an ERes2Net pass is how the capture
+        // pipeline's inserts got blocked once already. `None` here is
+        // "nothing to look up", never "look up nothing on purpose": the
+        // segment does not exist yet, so there is no prior prototype of this
+        // very turn to exclude (FINDINGS §52).
+        let split_wanted = self.cfg.identity.split_turns && !self.control.is_paused() && !sliced;
+        let bank: Vec<(i64, Option<i64>, crate::embed::Embedding)> = if split_wanted {
+            let model_id = self
+                .analyzer
+                .as_ref()
+                .map(|a| a.embed_model_id().to_string());
+            match model_id {
+                Some(id) => self
+                    .store
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.prototypes_with_source(&id).ok())
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
         };
+        let plan: Vec<(crate::turnsplit::Piece, Option<String>)> =
+            match self.analyzer.as_mut().filter(|_| split_wanted) {
+                Some(a) => match a.plan_split(&samples, &bank, None) {
+                    Ok(p) => p
+                        .pieces
+                        .into_iter()
+                        .map(|(piece, text)| (piece, Some(text)))
+                        .collect(),
+                    Err(e) => {
+                        // A detector that fell over must cost a split, never a
+                        // recording. The turn is written whole, as it would have
+                        // been with the switch off.
+                        warn!(session_id, "could not look for a speaker change: {e:#}");
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            };
         // ---- 0.13.1: the row is the WHOLE turn, read once more -------------
         // §41 shipped slicing with the row built from the joined slices, and
         // measured what that costs: the joined text disagrees with a

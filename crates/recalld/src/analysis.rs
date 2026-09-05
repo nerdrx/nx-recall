@@ -424,7 +424,27 @@ impl Analyzer {
     /// On, it costs one ERes2Net pass per hop, plus moving the turn's decode
     /// ahead of the row insert. That is what the switch buys its recall with,
     /// and the reason it is measured in FINDINGS §39 rather than assumed.
-    pub fn plan_split(&mut self, samples: &[f32]) -> Result<crate::turnsplit::Plan> {
+    ///
+    /// `bank` is every prototype in this install's voicebank, `(speaker_id,
+    /// source_segment_id, embedding)`, at the moment the caller looked — the
+    /// same shape `Store::prototypes_with_source` returns. `exclude_segment`
+    /// drops any prototype minted from the very segment being planned, so a
+    /// turn already in the bank cannot vote on its own cut (the archive
+    /// resplit path; the live path has no segment id yet and passes `None`).
+    ///
+    /// The bank is not a second detector (FINDINGS §52). `adjacent` still
+    /// finds every candidate boundary on its own distance; the bank is asked
+    /// one yes/no question per candidate — does its own top-1 voice actually
+    /// change here — and a boundary it disagrees with is dropped before
+    /// [`crate::turnsplit::cuts`] ever sees it. An empty bank agrees with
+    /// nothing, so a fresh install with nobody enrolled cuts nothing yet,
+    /// which is the measured shape and not a bug to route around.
+    pub fn plan_split(
+        &mut self,
+        samples: &[f32],
+        bank: &[(i64, Option<i64>, crate::embed::Embedding)],
+        exclude_segment: Option<i64>,
+    ) -> Result<crate::turnsplit::Plan> {
         let (whole, words) = self.asr.transcribe_timed(samples);
         let shape = crate::turnsplit::Shape::from_config(&self.cfg, SAMPLE_RATE);
         let cuts = if self.cfg.split_turns && shape.cuttable(samples.len()) {
@@ -433,7 +453,17 @@ impl Analyzer {
             for w in &windows {
                 vectors.push(self.embedder.embed(&samples[w.from..w.to], SAMPLE_RATE)?);
             }
+            let filtered: Vec<(i64, crate::embed::Embedding)> = bank
+                .iter()
+                .filter(|(_, src, _)| match exclude_segment {
+                    Some(id) => *src != Some(id),
+                    None => true,
+                })
+                .map(|(sp, _, e)| (*sp, e.clone()))
+                .collect();
             let curve = crate::turnsplit::curve(&shape, &windows, &vectors)?;
+            let veto = crate::turnsplit::proto_veto(&shape, &vectors, &filtered)?;
+            let curve = crate::turnsplit::vetoed(curve, &veto);
             crate::turnsplit::cuts(&shape, samples.len(), &curve)
         } else {
             Vec::new()

@@ -2697,9 +2697,12 @@ fn cmd_turns_resplit(
     let models = ModelSet::resolve_at(root, &cfg.models);
     let mut analyzer = recalld::analysis::Analyzer::load(
         &models,
-        // The pass exists BECAUSE the live switch is off by default; making it
-        // read that switch would mean the command could do nothing and not say
-        // why. Every other number in the operating point is the config's.
+        // Forced on rather than reading the config's own switch: an install
+        // with `split_turns` off (by hand, or a fresh one with too few
+        // enrolled voices for the live veto to do anything yet) should still
+        // get this command's answer when it asks directly, not "off, so
+        // nothing to report". Every other number in the operating point is
+        // the config's.
         &recalld::config::IdentityConfig {
             split_turns: true,
             ..cfg.identity.clone()

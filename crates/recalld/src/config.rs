@@ -395,20 +395,34 @@ pub struct IdentityConfig {
     /// May a turn be cut into two rows where the person talking changes
     /// (`crate::turnsplit`)?
     ///
-    /// **Off by default, and that is the measurement rather than caution.**
-    /// A turn ends at silence, so a fast exchange is one row with one label,
-    /// and Discord's own spans say how often: 409 of this install's 515
-    /// `overlap` turns contain a speaker change. The detector below finds
-    /// **41.7%** of the reachable ones within ±0.5 s at 67.9% precision and
-    /// splits 0.87% of turns Discord says are one person — which clears the
-    /// false-split bar and misses the recall bar it was given (≥50%), so it
-    /// ships off with the numbers written down (FINDINGS §39).
+    /// **On by default since 0.12.7, and that is the measurement rather than
+    /// enthusiasm.** §39 shipped this off: `adjacent` alone found 41.7% of
+    /// the reachable changes at 67.9% precision, missing the ≥50% recall bar
+    /// by eight points. §52 found the fix was not a better bar but a second,
+    /// cheaper question: keep an `adjacent` candidate only if the voicebank's
+    /// own top-1 speaker actually disagrees across it (`split_turn_distance`
+    /// at 0.80, `crate::turnsplit::proto_veto`) — a **veto**, never a
+    /// detector, so it never proposes a boundary `adjacent` did not already
+    /// find and never scores one either. That clears **all three** gates
+    /// chronologically held out: 51.0% recall of the reachable changes at
+    /// ±0.5 s at 0.83% false splits on `single` turns (bar ≤1%) — where
+    /// `adjacent` alone at this same 0.80 distance reaches a similar 52.1%
+    /// recall but at 1.31% false splits (§39), over the 1% bar. The veto is
+    /// not what raises recall; it is what makes 0.80 (lower than §39's 0.85)
+    /// affordable, by catching the false splits a lower bar alone would let
+    /// through. Held-out identity precision came out **up**, not merely
+    /// unmoved, after a real `recalld turns resplit --apply` (FINDINGS §52).
     ///
-    /// What it costs when it is on: one ERes2Net pass per 0.25 s of every
-    /// turn — about 4× the identity leg's inference — and the ASR decoded
-    /// through the timestamped binding so a piece's words can be taken by
-    /// time. That is one decoder, not two: `crate::asr::TimedAsr` replaces
-    /// `Asr` when this is on rather than joining it.
+    /// **The cost stated plainly: a bank with fewer than two enrolled voices
+    /// vetoes every boundary.** There is nothing for the top-1 speaker to
+    /// disagree with itself about, so a fresh install cuts nothing until it
+    /// has two people in the voicebank — the same shape as `named` in §39,
+    /// measured rather than routed around. What it costs once it can act: one
+    /// ERes2Net pass per 0.25 s of every turn, one voicebank ranking per
+    /// window, and the ASR decoded through the timestamped binding so a
+    /// piece's words can be taken by time. That is one decoder, not two:
+    /// `crate::asr::TimedAsr` replaces `Asr` when this is on rather than
+    /// joining it.
     pub split_turns: bool,
     /// Length of each comparison window, in seconds. 1.5 measured: 1.0
     /// halves the precision at the same false-split rate, because two
@@ -423,11 +437,16 @@ pub struct IdentityConfig {
     /// exists to be labelled, and a piece the ladder must refuse is a row
     /// with no speaker where there used to be one.
     pub split_turn_min_piece_s: f32,
-    /// `1 - cos` a boundary must reach to be a cut. **Not a similarity and
-    /// not comparable to `label_threshold`**: it is the distance between two
-    /// adjacent windows of the same recording, and on this audio same-speaker
-    /// pairs already score around 0.6. 0.85 is the point where the false-split
-    /// rate on `single` turns crosses under 1%.
+    /// `1 - cos` a boundary must reach to be a *candidate* — the voicebank
+    /// veto still has to agree before it is a cut (`crate::turnsplit::
+    /// proto_veto`). **Not a similarity and not comparable to
+    /// `label_threshold`**: it is the distance between two adjacent windows
+    /// of the same recording, and on this audio same-speaker pairs already
+    /// score around 0.6. §39 fitted 0.85 for `adjacent` running alone; with
+    /// the veto also in force 0.80 is the fit split's best point and the one
+    /// that clears both the recall and false-split gates held out (FINDINGS
+    /// §52) — lower than §39's bar because the veto is a second, independent
+    /// filter, so the distance bar can afford to let more candidates through.
     pub split_turn_distance: f32,
     /// At most this many cuts in one turn. Three measured: recall is still
     /// rising at three (33.2% → 41.7% at ±0.5 s from one) and the false-split
@@ -461,12 +480,12 @@ impl Default for IdentityConfig {
             presence_hard: true,
             vrchat_sources: vec!["vrchat".into()],
             learn: true,
-            // ---- 0.12.4 ----------------------------------------------
-            split_turns: false,
+            // ---- 0.12.4, bar moved and switched on at 0.12.7 (FINDINGS §52) --
+            split_turns: true,
             split_turn_window_s: 1.5,
             split_turn_hop_s: 0.25,
             split_turn_min_piece_s: 1.0,
-            split_turn_distance: 0.85,
+            split_turn_distance: 0.80,
             split_turn_max_cuts: 3,
         }
     }
@@ -2056,13 +2075,14 @@ mod tests {
         assert_eq!(cfg.identity.vrchat_sources, vec!["vrchat".to_string()]);
         // Its mirror, which says the same about Discord and is not duplicated.
         assert_eq!(cfg.truth.sources, vec!["discord", "vesktop"]);
-        // 0.12.4: turn splitting is off, and the operating point behind it is
-        // the measured one rather than a round number (FINDINGS §39).
-        assert!(!cfg.identity.split_turns);
+        // 0.12.4: turn splitting; 0.12.7: on, with the voicebank veto and the
+        // bar it earned rather than the one `adjacent` fitted alone
+        // (FINDINGS §52).
+        assert!(cfg.identity.split_turns);
         assert_eq!(cfg.identity.split_turn_window_s, 1.5);
         assert_eq!(cfg.identity.split_turn_hop_s, 0.25);
         assert_eq!(cfg.identity.split_turn_max_cuts, 3);
-        assert_eq!(cfg.identity.split_turn_distance, 0.85);
+        assert_eq!(cfg.identity.split_turn_distance, 0.80);
         // A piece exists to be labelled, so the floor is the ladder's floor.
         assert_eq!(
             cfg.identity.split_turn_min_piece_s,

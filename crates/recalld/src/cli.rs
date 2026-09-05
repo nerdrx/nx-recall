@@ -1349,13 +1349,17 @@ the window starting there disagree by more than `[identity]
 split_turn_distance`. No piece is ever shorter than the identity ladder's own
 floor, because a piece exists to be labelled.
 
-WHAT IT IS WORTH, MEASURED (FINDINGS \u{00a7}39). At the shipped operating point it
-finds 41.7% of the reachable change points within \u{00b1}0.5 s at 67.9% precision,
-splits 0.87% of turns Discord says are one person, and turns 118 rows that
-were `overlap` or `partial` into `single` pieces the voicebank can be scored
-against. It missed the recall bar it was given, so the LIVE switch
-(`[identity] split_turns`) ships off and this command is how the archive gets
-the benefit anyway.
+WHAT IT IS WORTH, MEASURED (FINDINGS \u{00a7}39, \u{00a7}52). The 0.12.4 detector alone
+found 41.7% of the reachable change points within \u{00b1}0.5 s at 67.9% precision
+and missed the \u{2265}50% recall bar it was given. 0.12.7 added a voicebank veto —
+keep a candidate only if the bank's own top-1 speaker actually differs across
+it — and that clears 51.0% recall at 0.83% false splits, held out, which is
+why the LIVE switch (`[identity] split_turns`) now ships ON. This command
+still exists for two reasons: an install with fewer than two enrolled voices
+gets nothing from the live switch until it does, and an archive recorded
+before 0.12.7 has turns nobody has looked at yet. Either way it turns rows
+that were `overlap` or `partial` into `single` pieces the voicebank can be
+scored against.
 
 The original row survives, shortened to its first piece; the other pieces
 become new rows. Nothing is deleted — not the row, whose id every thread,

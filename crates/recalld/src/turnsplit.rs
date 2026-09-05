@@ -32,8 +32,27 @@
 //!   Discord's spans, and it is high enough that the false-split rate on turns
 //!   Discord says are one person stays under 1%.
 //!
+//! §39 shipped exactly that detector off: it found 41.7% of the reachable
+//! changes at ±0.5 s, eight points under the ≥50% recall bar it was given.
+//! §52 added one more refusal without touching the distance curve at all —
+//! [`proto_veto`] — and it is why the feature ships on:
+//!
+//! * **A candidate the voicebank's own top-1 speaker does not confirm is not
+//!   a cut.** `adjacent` still finds every boundary on distance alone; the
+//!   bank is asked one yes/no question per candidate, never given a score of
+//!   its own, and a boundary it disagrees with never reaches [`cuts`]. That
+//!   is deliberately not `named` from §39, which lost at every threshold
+//!   because it made the bank answer a harder question (does each side name a
+//!   voice *above the label bar*) that a captured window answers wrong with
+//!   total confidence. Whether the argmax flips needs no confidence at all.
+//! * **The cost is an install with fewer than two enrolled voices, stated
+//!   rather than hidden.** An empty or one-voice bank agrees with itself
+//!   about everything, so nothing is ever vetoed *in* — the feature is a
+//!   no-op until it has two people to tell apart, which is the measured
+//!   shape and not a bug to route around.
+//!
 //! Pure: no model, no I/O, no database. The caller hands in the window
-//! embeddings it already had to compute and gets back sample ranges.
+//! embeddings and the bank it already had and gets back sample ranges.
 
 use anyhow::{Context, Result};
 
@@ -140,6 +159,61 @@ pub fn curve(
         out.push((windows[i + step].from, d));
     }
     Ok(out)
+}
+
+/// Where the bank's own top-1 voice differs across a boundary — a **veto**,
+/// never a detector (FINDINGS §52, candidate (d)). Same indexing as
+/// [`curve`]: entry `i` answers for the boundary `curve` reports at that same
+/// index, so the two can be zipped directly.
+///
+/// No magnitude anywhere. `named` (FINDINGS §39) asked the bank two questions
+/// — does each side name a voice above the label bar, and is it a different
+/// one — and lost to `adjacent` at every threshold because a 1.5 s window
+/// spanning a change is captured by one talker and confidently (wrongly)
+/// names them on both sides. This asks the bank only the second question:
+/// *which* voice tops the ranking, never how sure it is. A candidate boundary
+/// the adjacent curve already thinks is a change is kept only if the bank's
+/// own argmax agrees that the two sides are different people.
+///
+/// An empty bank vetoes everything — there is no voice to disagree about, so
+/// nothing passes. That is the measured shape, not a special case: a fresh
+/// install with nobody enrolled yet cuts nothing until it has two voices to
+/// tell apart (FINDINGS §52).
+pub fn proto_veto(
+    shape: &Shape,
+    vectors: &[Embedding],
+    bank: &[(i64, Embedding)],
+) -> Result<Vec<bool>> {
+    let step = shape.window.div_ceil(shape.hop.max(1));
+    if vectors.len() <= step {
+        return Ok(Vec::new());
+    }
+    if bank.is_empty() {
+        return Ok(vec![false; vectors.len() - step]);
+    }
+    let mut top1: Vec<Option<i64>> = Vec::with_capacity(vectors.len());
+    for v in vectors {
+        let ranked = crate::identity::rank_with(v, bank, crate::calib::Aggregate::Max)?;
+        top1.push(ranked.first().map(|c| c.speaker_id));
+    }
+    Ok((0..(vectors.len() - step))
+        .map(|i| matches!((top1[i], top1[i + step]), (Some(a), Some(b)) if a != b))
+        .collect())
+}
+
+/// [`curve`], with every boundary the veto refuses removed.
+///
+/// The veto answers yes or no and contributes no score of its own — that is
+/// the whole difference between a veto and a fourth detector. A boundary it
+/// keeps is scored exactly as `adjacent` scored it; a boundary it refuses
+/// never reaches [`cuts`] at all, whatever the distance said.
+pub fn vetoed(curve: Vec<(usize, f32)>, veto: &[bool]) -> Vec<(usize, f32)> {
+    curve
+        .into_iter()
+        .zip(veto.iter().copied().chain(std::iter::repeat(false)))
+        .filter(|(_, keep)| *keep)
+        .map(|(c, _)| c)
+        .collect()
 }
 
 /// Where to cut, ascending. Empty when the turn stands as it is.
@@ -380,11 +454,17 @@ pub fn resplit(
     apply: bool,
     at_utc_ns: i64,
 ) -> Result<Report> {
-    let candidates = {
+    // The bank, read once for the whole run rather than per turn: nothing in
+    // this pass enrols before the write phase below, so the candidates loop
+    // sees one consistent snapshot instead of a bank that shifts under it
+    // while the resplit itself is being decided (FINDINGS §52).
+    let (candidates, bank) = {
         let guard = store
             .lock()
             .map_err(|_| anyhow::anyhow!("store poisoned"))?;
-        guard.segments_for_resplit(limit)?
+        let candidates = guard.segments_for_resplit(limit)?;
+        let bank = guard.prototypes_with_source(analyzer.embed_model_id())?;
+        (candidates, bank)
     };
     let mut report = Report {
         examined: candidates.len(),
@@ -403,7 +483,7 @@ pub fn resplit(
             report.no_audio += 1;
             continue;
         }
-        let plan = analyzer.plan_split(&samples)?;
+        let plan = analyzer.plan_split(&samples, &bank, Some(c.segment_id))?;
         if plan.wordless {
             report.wordless += 1;
         }
@@ -825,12 +905,89 @@ mod tests {
     #[test]
     fn the_shipped_shape_is_the_measured_one() {
         let cfg = crate::config::IdentityConfig::default();
-        assert!(!cfg.split_turns, "measured off — FINDINGS §39");
+        assert!(
+            cfg.split_turns,
+            "measured on with the proto veto — FINDINGS §52"
+        );
         let s = Shape::from_config(&cfg, 16_000);
         assert_eq!(s.window, 24_000, "1.5 s");
         assert_eq!(s.hop, 4_000, "0.25 s");
         assert_eq!(s.min_piece, 16_000, "the identity gate's own floor");
-        assert_eq!(s.distance, 0.85);
+        assert_eq!(s.distance, 0.80, "the bar with the veto, not §39's 0.85");
         assert_eq!(s.max_cuts, 3);
+    }
+
+    // ---- the proto veto (0.12.7, FINDINGS §52) ----------------------------
+
+    fn ev(speaker: i64, v: &[f32]) -> (i64, Embedding) {
+        (speaker, e(v))
+    }
+
+    #[test]
+    fn an_empty_bank_vetoes_every_boundary() {
+        let s = shape();
+        let w = s.windows_of(4 * RATE);
+        let v = two_voices(w.len(), w.len() / 2);
+        let veto = proto_veto(&s, &v, &[]).unwrap();
+        assert!(!veto.is_empty());
+        assert!(
+            veto.iter().all(|k| !k),
+            "nothing to disagree about, so nothing passes"
+        );
+    }
+
+    #[test]
+    fn the_veto_agrees_when_the_bank_names_two_different_voices() {
+        let s = shape();
+        let w = s.windows_of(4 * RATE);
+        // The turn's own windows change voice halfway through, exactly like
+        // `two_voices`, and the bank has one prototype for each of them.
+        let flip = w.len() / 2;
+        let v = two_voices(w.len(), flip);
+        let bank = vec![ev(1, &[1.0, 0.0]), ev(2, &[0.0, 1.0])];
+        let veto = proto_veto(&s, &v, &bank).unwrap();
+        let step = s.window.div_ceil(s.hop);
+        // Boundaries entirely inside one voice's stretch are refused; the one
+        // that straddles the change is kept.
+        assert!(
+            !veto[0],
+            "both sides are voice 1: nothing to disagree about"
+        );
+        let crossing = flip.saturating_sub(step);
+        assert!(
+            veto[crossing],
+            "the boundary at the change is kept: {veto:?}"
+        );
+    }
+
+    #[test]
+    fn the_veto_refuses_a_boundary_the_bank_reads_as_one_voice() {
+        let s = shape();
+        let w = s.windows_of(4 * RATE);
+        // Every window is the same voice — a register change `adjacent` might
+        // flag, but the bank's own argmax never flips.
+        let v: Vec<_> = (0..w.len()).map(|_| e(&[1.0, 0.02])).collect();
+        let bank = vec![ev(1, &[1.0, 0.0]), ev(2, &[0.0, 1.0])];
+        let veto = proto_veto(&s, &v, &bank).unwrap();
+        assert!(
+            veto.iter().all(|k| !k),
+            "the bank agrees it is one person: {veto:?}"
+        );
+    }
+
+    #[test]
+    fn vetoed_drops_exactly_the_refused_boundaries_and_nothing_else() {
+        let curve = vec![(RATE, 0.9f32), (2 * RATE, 0.9), (3 * RATE, 0.9)];
+        let veto = [false, true, false];
+        assert_eq!(vetoed(curve, &veto), vec![(2 * RATE, 0.9)]);
+    }
+
+    #[test]
+    fn a_short_veto_list_treats_the_missing_tail_as_refused() {
+        // Defensive: `curve` and `proto_veto` are built from the same loop and
+        // should always agree in length, but a caller that hands in a
+        // mismatched pair must not panic or silently keep an unvetted cut.
+        let curve = vec![(RATE, 0.9f32), (2 * RATE, 0.9)];
+        assert_eq!(vetoed(curve, &[true]), vec![(RATE, 0.9)]);
     }
 }
