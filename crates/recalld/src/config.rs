@@ -38,6 +38,33 @@ pub struct CaptureConfig {
     pub queue_seconds: f32,
     /// Requested PipeWire buffer size, in samples at 16 kHz.
     pub quantum: u32,
+    /// How long a source's node may be off the graph and come back — same
+    /// match key, and the same instance when both sides know one — before the
+    /// daemon gives up and closes the session for real (0.13.0, flap
+    /// tolerance; `crate::flap`).
+    ///
+    /// VRChat recreates its playback stream repeatedly (device init, menus, a
+    /// world load); the 2026-09-05 16:07–16:19 UTC run measured gaps of
+    /// milliseconds across 37 reconnects (spike/FINDINGS.md §47). 5 s is
+    /// comfortably past that while still being short enough that an
+    /// application that genuinely quit and a different one launching in its
+    /// place stay distinguishable. `0` disables flap tolerance outright: every
+    /// node removal closes its session immediately, exactly as before 0.13.0.
+    pub flap_grace_ms: u64,
+    /// Once a day, the first time a `VRChat.exe` source is seen, record up to
+    /// 60 s of its ORIGINAL stereo stream — before `resample::downmix` ever
+    /// touches it — to `<data-dir>/probes/vrchat-stereo-<date>.wav`, and
+    /// measure the inter-channel level and time difference of every
+    /// VAD-active window in it (0.13.0, `crate::stereo_probe`).
+    ///
+    /// This does not build the parked azimuth-identity feature
+    /// (spike/FINDINGS.md, "azimuth") — it answers the question that feature
+    /// has been blocked on since the spike: VRChat never ran during the
+    /// original recording window, so no stereo sample of it has ever existed
+    /// to measure. `true` by default: it is a bounded, once-a-day diagnostic
+    /// recording, not a standing capture, and its presence and every file it
+    /// writes are visible in `status`.
+    pub stereo_probe: bool,
 }
 
 impl Default for CaptureConfig {
@@ -45,6 +72,8 @@ impl Default for CaptureConfig {
         Self {
             queue_seconds: 30.0,
             quantum: 1024,
+            flap_grace_ms: 5_000,
+            stereo_probe: true,
         }
     }
 }

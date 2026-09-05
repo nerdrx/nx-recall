@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use crate::allowlist::Allowlist;
 use crate::analysis::AnalysisStats;
 use crate::clock::utc_now_ns;
-use crate::config::{GraphConfig, IdentityConfig, MicConfig, MicMode, RoomConfig};
+use crate::config::{CaptureConfig, GraphConfig, IdentityConfig, MicConfig, MicMode, RoomConfig};
 use crate::enrich::GraphState;
 use crate::pipeline::Stats;
 use crate::queue::EventQueue;
@@ -121,6 +121,18 @@ pub struct Control {
     /// What the assistant worker has done, read back from the rows.
     pub assist_stats: Arc<crate::assist::AssistStats>,
     // ---- end 0.9.0 -------------------------------------------------------
+    // ---- 0.13.0, flap tolerance and the stereo probe ---------------------
+    /// `[capture]`, set once at start-up like `asr` and `night` — neither
+    /// `flap_grace_ms` nor `stereo_probe` has a live switch in the UI, so
+    /// there is nothing here that needs a generation counter.
+    capture: Mutex<CaptureConfig>,
+    /// What the stereo probe found on its last run today, or `null` before
+    /// one has (`status`; `crate::stereo_probe`). The same "measured, not
+    /// assumed" discipline as `storage_json`: a client must be able to tell
+    /// "no probe has run yet" from "the probe ran and found nothing", and a
+    /// missing key or a zeroed block could say neither.
+    stereo_probe_report: Mutex<Option<Value>>,
+    // ---- end 0.13.0 -------------------------------------------------------
 }
 
 impl Control {
@@ -160,6 +172,9 @@ impl Control {
             // 0.9.0.
             assist: Mutex::new(crate::config::AssistConfig::default()),
             assist_stats: Arc::new(crate::assist::AssistStats::default()),
+            // 0.13.0.
+            capture: Mutex::new(CaptureConfig::default()),
+            stereo_probe_report: Mutex::new(None),
         })
     }
 
@@ -455,6 +470,57 @@ impl Control {
         let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
         *this.asr.get_mut().unwrap_or_else(|p| p.into_inner()) = cfg;
         self
+    }
+
+    // ---- 0.13.0: flap tolerance and the stereo probe ----------------------
+
+    pub fn capture(&self) -> CaptureConfig {
+        self.capture
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Point `status` at the running `[capture]` settings. Set before the
+    /// handle is shared, like `with_asr` beside it — neither `flap_grace_ms`
+    /// nor `stereo_probe` is a live switch, so there is nothing to generation
+    /// -count.
+    pub fn with_capture(mut self: Arc<Self>, cfg: CaptureConfig) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
+        *this.capture.get_mut().unwrap_or_else(|p| p.into_inner()) = cfg;
+        self
+    }
+
+    /// The stereo probe (`crate::stereo_probe`) reporting what today's run
+    /// found. Called once, from the capture thread, after the recording and
+    /// its offline analysis both finish.
+    pub fn set_stereo_probe_report(&self, report: Value) {
+        *self
+            .stereo_probe_report
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(report);
+    }
+
+    /// The `capture` block `status` carries: the flap-tolerance settings and
+    /// counter, and the stereo probe's switch plus its last result — `null`
+    /// until one has run today, which is an honest answer a client renders as
+    /// "not probed yet" rather than a zeroed block claiming a clean recording
+    /// that never happened.
+    pub fn capture_json(&self) -> Value {
+        let cfg = self.capture();
+        json!({
+            "flap_grace_ms": cfg.flap_grace_ms,
+            "flaps_absorbed": self.stats.flaps_absorbed.load(Ordering::Relaxed),
+            "stereo_probe": {
+                "enabled": cfg.stereo_probe,
+                "last": self
+                    .stereo_probe_report
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                    .unwrap_or(Value::Null),
+            },
+        })
     }
 
     // ---- the night shift (0.9.0) -----------------------------------------

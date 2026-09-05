@@ -28,6 +28,20 @@ pub enum CaptureEvent {
         session_id: i64,
         mono_ns: u64,
     },
+    /// A flap was absorbed (0.13.0, `crate::flap`): the source's node vanished
+    /// and reappeared inside the grace window, and `capture.rs` kept the SAME
+    /// session id rather than closing it. `mono_ns` is the monotonic stamp of
+    /// the reappearance (what the resumed stream's first buffer will be
+    /// measured against) and `gap_ms` is how long the audio was missing.
+    /// Never dropped by the queue's overflow policy, for the same reason
+    /// `SessionEnd` is not: losing one would leave the pipeline's clock
+    /// anchor stale and the open turn spliced across a hole it never knew
+    /// about.
+    Gap {
+        session_id: i64,
+        mono_ns: u64,
+        gap_ms: u64,
+    },
 }
 
 impl CaptureEvent {
@@ -35,7 +49,7 @@ impl CaptureEvent {
     fn weight(&self) -> usize {
         match self {
             CaptureEvent::Audio(c) => c.samples.len(),
-            CaptureEvent::SessionEnd { .. } => 0,
+            CaptureEvent::SessionEnd { .. } | CaptureEvent::Gap { .. } => 0,
         }
     }
 

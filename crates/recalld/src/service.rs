@@ -894,6 +894,12 @@ impl Service {
             // print. A client that has never heard of it ignores both.
             "room": c.room_json(),
             "room_state": c.room_state(),
+            // Flap tolerance and the stereo azimuth probe (0.13.0). Always
+            // present, like every other feature block here: a client must be
+            // able to tell "the probe has not run today" from "an older
+            // daemon that has never heard of it", and a missing key says
+            // neither.
+            "capture": c.capture_json(),
             // Measured by the retention sweeper, never here: this method is
             // polled every three seconds by every open client and the answer
             // costs a walk of the data directory (0.6.1).

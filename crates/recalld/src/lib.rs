@@ -48,6 +48,7 @@ pub mod enrich;
 /// Local Markdown export (0.10.0). DESIGN §12: files on this disk, nothing else.
 pub mod export;
 pub mod fetch;
+pub mod flap;
 pub mod identity;
 /// Where the audio came from, as evidence about who is on it (0.11.0).
 pub mod identity_prior;
@@ -96,6 +97,7 @@ pub mod service;
 /// Sliced turns (0.12.5): a long turn reaches the glass in pieces.
 pub mod slice;
 pub mod split;
+pub mod stereo_probe;
 pub mod store;
 // ---- 0.12.0 --------------------------------------------------------------
 /// The archive language sweep: the identifier, over the rows captured before

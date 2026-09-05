@@ -31,6 +31,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -47,13 +48,15 @@ use tracing::{debug, error, info, warn};
 
 use crate::allowlist::{Allowlist, Decision, SourceIdent};
 use crate::bus::{Bus, Topic};
-use crate::clock::{monotonic_ns, utc_now_ns};
+use crate::clock::{civil_from_days, monotonic_ns, utc_now_ns};
 use crate::config::{Config, MicConfig, MicMode, RoomConfig, SAMPLE_RATE};
 use crate::control::Control;
+use crate::flap::{FlapTracker, Resume};
 use crate::pipeline::Stats;
 use crate::queue::{AudioChunk, CaptureEvent, EventQueue};
 use crate::resample::{LinearResampler, downmix};
 use crate::room::{ROOM_DISPLAY_NAME, ROOM_MATCH_KEY};
+use crate::stereo_probe;
 use crate::store::{KIND_MIC, KIND_ROOM, Store};
 
 const PLAYBACK_STREAM_CLASS: &str = "Stream/Output/Audio";
@@ -88,6 +91,20 @@ pub const SOURCE_CAPTURING: &str = "capturing";
 pub const SOURCE_STOPPED: &str = "stopped";
 /// The node left the graph — the application closed its stream or quit.
 pub const SOURCE_GONE: &str = "gone";
+/// The node left the graph but a flap is still pending (0.13.0): the daemon
+/// is holding the session open, waiting to see whether the same source
+/// reappears inside `[capture].flap_grace_ms`. Distinct from [`SOURCE_GONE`]
+/// because, from the reader's point of view, capture never actually stopped —
+/// reporting `gone` here would tell a client the conversation ended when the
+/// daemon itself does not yet believe that.
+pub const SOURCE_FLAPPING: &str = "flapping";
+
+/// The match key VRChat's playback stream is keyed under (see
+/// `SourceIdent::match_key`'s Wine escape hatch: `application.process.binary`
+/// is `wine64-preloader` for every Wine program, so the discriminator is
+/// `application.name`, which Wine sets to the PE image name). The stereo probe
+/// (0.13.0, `crate::stereo_probe`) triggers on exactly this key.
+pub const VRCHAT_MATCH_KEY: &str = "VRChat.exe";
 
 /// How long to wait before trying the microphone again after a failed attach.
 /// A device that is not there yet (or was just unplugged) must retry, not spin.
@@ -305,6 +322,18 @@ fn default_source_name(value: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// The calendar date (UTC) `utc_ns` falls on, `YYYY-MM-DD` — the once-a-day
+/// key the stereo probe (0.13.0) is bounded by. UTC rather than local time,
+/// for the same reason every other instant in this file is: a day boundary
+/// that moved with the system clock would make "once a day" mean two probes
+/// on either side of a DST change, which is one more thing than this
+/// diagnostic needs to get right.
+fn utc_date_string(utc_ns: i64) -> String {
+    let days = utc_ns.div_euclid(1_000_000_000 * 86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// The EnumFormat pod asking for 16 kHz mono f32.
 ///
 /// Requesting the target format here is what makes PipeWire's adapter do the
@@ -326,6 +355,36 @@ fn target_format_param() -> Result<Vec<u8>> {
         &spa::pod::Value::Object(obj),
     )
     .map_err(|e| anyhow!("serialising the audio format pod: {e:?}"))?
+    .0
+    .into_inner();
+    Ok(bytes)
+}
+
+/// The EnumFormat pod the stereo probe's stream asks for (0.13.0): 16 kHz,
+/// but STEREO — the whole point of a second stream on the same node is to get
+/// the audio the ordinary tap deliberately downmixes away before a single
+/// sample is measured. If the graph negotiates a different channel count
+/// anyway (some sources are natively mono, or the session manager declines),
+/// `param_changed` corrects `ProbeStreamData::channels` and the probe records
+/// whatever actually arrives — there is no fallback path here the way there is
+/// for the mono tap, because a probe recorded at the wrong channel count is
+/// still useful evidence about what this source's audio actually looks like.
+fn stereo_format_param() -> Result<Vec<u8>> {
+    let mut info = spa::param::audio::AudioInfoRaw::new();
+    info.set_format(spa::param::audio::AudioFormat::F32LE);
+    info.set_rate(SAMPLE_RATE);
+    info.set_channels(stereo_probe::CHANNELS as u32);
+
+    let obj = spa::pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: spa::param::ParamType::EnumFormat.as_raw(),
+        properties: info.into(),
+    };
+    let bytes = spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &spa::pod::Value::Object(obj),
+    )
+    .map_err(|e| anyhow!("serialising the stereo probe's format pod: {e:?}"))?
     .0
     .into_inner();
     Ok(bytes)
@@ -356,6 +415,39 @@ struct Capture {
     match_key: String,
     _stream: pw::stream::StreamRc,
     _listener: pw::stream::StreamListener<StreamData>,
+}
+
+/// State the probe stream's callbacks push into. Deliberately not shared with
+/// [`StreamData`]: this stream never resamples, never downmixes and never
+/// touches the analysis queue — it exists to keep the audio the ordinary tap
+/// throws away, for exactly as long as it takes to fill `cap_interleaved`.
+struct ProbeStreamData {
+    buffer: Arc<std::sync::Mutex<Vec<f32>>>,
+    cap_interleaved: usize,
+    /// Negotiated format, corrected in `param_changed` like `StreamData`'s.
+    /// Read back once the probe finishes recording, so the WAV header and the
+    /// offline analysis use what was actually captured rather than what was
+    /// merely requested.
+    rate: Arc<std::sync::atomic::AtomicU32>,
+    channels: Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// The stereo azimuth probe's own capture (0.13.0, `crate::stereo_probe`): a
+/// second, independent stream on the SAME target node as the ordinary
+/// (mono, downmixed) app tap, requesting the native channel count instead.
+/// Bounded three ways — see the module doc on `crate::stereo_probe` — and torn
+/// down by [`Shared::finalize_probe`] once any bound is hit or the source
+/// itself leaves the graph.
+struct ProbeCapture {
+    node_id: u32,
+    /// `YYYY-MM-DD` (UTC): which day's file this recording belongs to.
+    date: String,
+    started: Instant,
+    buffer: Arc<std::sync::Mutex<Vec<f32>>>,
+    rate: Arc<std::sync::atomic::AtomicU32>,
+    channels: Arc<std::sync::atomic::AtomicU32>,
+    _stream: pw::stream::StreamRc,
+    _listener: pw::stream::StreamListener<ProbeStreamData>,
 }
 
 /// The live microphone tap and everything needed to decide whether it should
@@ -423,6 +515,17 @@ struct Shared {
     room: Room,
     format_param: Vec<u8>,
     quantum: u32,
+    /// Flap tolerance (0.13.0): which sources are mid-flap, and the running
+    /// burst counts for the summary log. `grace() == 0` disables the feature
+    /// outright — see `[capture].flap_grace_ms`.
+    flap: FlapTracker,
+    /// The stereo azimuth probe (0.13.0). `None` when disabled
+    /// (`[capture].stereo_probe = false`) or when no probe is running right
+    /// now — at most one at a time, since there is only ever one VRChat
+    /// instance worth asking the question about in a day.
+    probe: Option<ProbeCapture>,
+    stereo_probe_enabled: bool,
+    data_dir: PathBuf,
 }
 
 impl Shared {
@@ -507,15 +610,41 @@ impl Shared {
         Some(source_id)
     }
 
-    /// Note a node in the sources table and, if allowed, start capturing it.
+    /// A PID-based identity for flap matching: `application.process.id` as a
+    /// string, or `None` when the node carries none. Deliberately NOT
+    /// `NodeInfo::instance_key()` — a flap is by definition a brand new
+    /// PipeWire node, so it always carries a brand new `object.serial`, and
+    /// matching flap identity on that would refuse every flap the feature
+    /// exists to absorb. The pid is what stays put across a reconnect: VRChat's
+    /// wine64-preloader keeps its pid through every one of the stream
+    /// recreations the 2026-09-05 16:07–16:19 UTC run measured
+    /// (spike/FINDINGS.md §47).
+    fn flap_identity(node: &NodeInfo) -> Option<String> {
+        node.ident.process_id.map(|p| format!("pid:{p}"))
+    }
+
+    /// Note a node in the sources table and, if allowed, start capturing it —
+    /// unless it is the same source resuming after a flap (0.13.0), in which
+    /// case the existing session continues rather than a new one opening.
     fn on_node(&mut self, core: &pw::core::CoreRc, node: NodeInfo) {
         let match_key = node.ident.match_key();
         let display_name = node.ident.display_name();
-        let decision = self.allowlist.decide(&match_key);
         let Some(source_id) = self.note_source(&node) else {
             return;
         };
 
+        match self
+            .flap
+            .on_reappear(&match_key, Self::flap_identity(&node), Instant::now())
+        {
+            Resume::Same { session_id, gap } => {
+                self.resume_after_flap(core, &node, &match_key, &display_name, session_id, gap);
+                return;
+            }
+            Resume::Fresh => {}
+        }
+
+        let decision = self.allowlist.decide(&match_key);
         if !decision.captures() {
             info!(
                 node = node.node_id,
@@ -532,6 +661,89 @@ impl Shared {
         }
         // An allowed application starting is what opens a `follow`-mode mic.
         self.sync_taps(core);
+        self.maybe_start_probe(core, &node, &match_key);
+    }
+
+    /// Reattach the ordinary tap's stream to the session a flap left open,
+    /// instead of opening a new one. `attach_stream` itself is unchanged
+    /// between a fresh attach and a resumed one — it never creates the session
+    /// row, `attach` does that, and skipping `attach` is the entire mechanism.
+    fn resume_after_flap(
+        &mut self,
+        core: &pw::core::CoreRc,
+        node: &NodeInfo,
+        match_key: &str,
+        display_name: &str,
+        session_id: i64,
+        gap: Duration,
+    ) {
+        let gap_ms = gap.as_millis() as u64;
+        if let Err(e) = self.attach_stream(core, node, session_id, match_key, display_name) {
+            error!(
+                "re-attaching the flapped stream for {match_key} (node {}): {e:#}",
+                node.node_id
+            );
+            // The stream would not come back up. The session must not sit
+            // open with nothing ever going to feed it again.
+            if let Ok(store) = self.store.lock()
+                && let Err(e) = store.end_session(session_id, utc_now_ns())
+            {
+                error!("could not close session {session_id} after a failed flap reattach: {e:#}");
+            }
+            self.queue.push(CaptureEvent::SessionEnd {
+                session_id,
+                mono_ns: monotonic_ns(),
+            });
+            self.publish_source(match_key, SOURCE_GONE);
+            self.sync_taps(core);
+            return;
+        }
+        self.stats.flaps_absorbed.fetch_add(1, Ordering::Relaxed);
+        self.queue.push(CaptureEvent::Gap {
+            session_id,
+            mono_ns: monotonic_ns(),
+            gap_ms,
+        });
+        info!(
+            node = node.node_id,
+            session = session_id,
+            key = %match_key,
+            gap_ms,
+            "flap absorbed; the same session continues"
+        );
+        self.sync_taps(core);
+    }
+
+    /// Sweep for flap bursts that timed out (close the session for real, one
+    /// summary log line) or settled (nothing to close, one summary log line).
+    /// Driven off the same 250 ms timer as `sync_taps`, because a flap aging
+    /// out is not itself an event — nothing else will ever notice it.
+    fn sweep_flaps(&mut self) {
+        let now = Instant::now();
+        for expired in self.flap.expire(now) {
+            info!(
+                key = %expired.match_key,
+                session = expired.session_id,
+                flaps = expired.flaps,
+                burst_ms = expired.burst_duration.as_millis(),
+                "flap grace window elapsed with nothing reappearing; closing the session \
+                 ({} flap(s) absorbed before it)",
+                expired.flaps
+            );
+            self.queue.push(CaptureEvent::SessionEnd {
+                session_id: expired.session_id,
+                mono_ns: monotonic_ns(),
+            });
+            self.publish_source(&expired.match_key, SOURCE_GONE);
+        }
+        for settled in self.flap.settle(now) {
+            info!(
+                key = %settled.match_key,
+                flaps = settled.flaps,
+                burst_ms = settled.burst_duration.as_millis(),
+                "flap burst absorbed; the source has settled"
+            );
+        }
     }
 
     /// Open the session row, then wire up the stream. If the stream fails to
@@ -722,6 +934,13 @@ impl Shared {
         if self.mic.nodes.remove(&node_id).is_some() {
             self.sync_taps(core);
         }
+        // The stereo probe's own stream, if this was its node — always torn
+        // down outright, never flap-tolerant: it is a bounded, one-shot
+        // diagnostic recording, and a source that flapped mid-probe still
+        // owes the day's probe nothing more than what it managed to capture.
+        if self.probe.as_ref().is_some_and(|p| p.node_id == node_id) {
+            self.finalize_probe("the probed source's node went away");
+        }
         let Some(capture) = self.captures.remove(&node_id) else {
             // Not captured, but still worth announcing: the application quit,
             // and a list that goes on showing it as present is wrong.
@@ -732,20 +951,52 @@ impl Shared {
             self.sync_taps(core);
             return;
         };
+
+        // 0.13.0: flap tolerance. A node leaving the graph is no longer
+        // automatically the end of the session — VRChat recreates its
+        // playback stream repeatedly (device init, menus, a world load), and
+        // the 2026-09-05 16:07–16:19 UTC run measured 19 sessions from one
+        // twelve-minute conversation because every one of those used to close
+        // the session outright (spike/FINDINGS.md §47). `grace() == 0`
+        // disables this and restores the old, immediate-close behaviour.
+        if self.flap.grace() > Duration::ZERO {
+            let identity = gone.as_ref().and_then(Self::flap_identity);
+            info!(
+                node = node_id,
+                session = capture.session_id,
+                key = %capture.match_key,
+                grace_ms = self.flap.grace().as_millis(),
+                "source went away; waiting to see whether it flaps back"
+            );
+            self.flap.start_flap(
+                &capture.match_key,
+                capture.session_id,
+                identity,
+                Instant::now(),
+            );
+            self.publish_source(&capture.match_key, SOURCE_FLAPPING);
+            self.sync_taps(core);
+            return;
+        }
+        self.close_capture(capture, "source went away; closing session");
+        self.sync_taps(core);
+    }
+
+    /// Close a capture for real: end its session, drop the stream, announce
+    /// `gone`. The tail end of the pre-0.13.0 `on_node_removed`, factored out
+    /// so flap tolerance's timeout path (`sweep_flaps`'s `expire`) and a
+    /// disabled-flap-tolerance removal share one place that does it.
+    fn close_capture(&mut self, capture: Capture, reason: &str) {
         info!(
-            node = node_id,
             session = capture.session_id,
             key = %capture.match_key,
-            "source went away; closing session"
+            "{reason}"
         );
-        // Dropping the Capture disconnects the stream. The pipeline writes the
-        // final segment and stamps `ended_at_utc_ns` when it sees this event.
         self.queue.push(CaptureEvent::SessionEnd {
             session_id: capture.session_id,
             mono_ns: monotonic_ns(),
         });
         self.publish_source(&capture.match_key, SOURCE_GONE);
-        self.sync_taps(core);
     }
 
     // ---- microphone ------------------------------------------------------
@@ -1257,6 +1508,220 @@ impl Shared {
             },
         );
     }
+
+    // ---- the stereo azimuth probe (0.13.0) --------------------------------
+    //
+    // A second, independent stream on the same node an ordinary app tap is
+    // already capturing, requesting the native channel count instead of the
+    // mono downmix. See `crate::stereo_probe` for what it is for and why it
+    // exists; everything here is plumbing that opens it, bounds it and hands
+    // its buffer off to be written and measured.
+
+    /// Start today's probe if this node is the one it is for and nothing else
+    /// has already claimed the day. Called after an ordinary attach succeeds,
+    /// never instead of one — the probe is a passenger on a capture the daemon
+    /// was already going to make, not a reason to open a stream on its own.
+    fn maybe_start_probe(&mut self, core: &pw::core::CoreRc, node: &NodeInfo, match_key: &str) {
+        if !self.stereo_probe_enabled || match_key != VRCHAT_MATCH_KEY || self.probe.is_some() {
+            return;
+        }
+        let date = utc_date_string(utc_now_ns());
+        if stereo_probe::already_captured_today(&self.data_dir, &date) {
+            return;
+        }
+        if let Err(e) = self.attach_probe_stream(core, node, &date) {
+            warn!("stereo probe: could not start recording for {date}: {e:#}");
+        }
+    }
+
+    fn attach_probe_stream(
+        &mut self,
+        core: &pw::core::CoreRc,
+        node: &NodeInfo,
+        date: &str,
+    ) -> Result<()> {
+        let target = node
+            .target()
+            .ok_or_else(|| anyhow!("node has neither object.serial nor node.name"))?;
+
+        let mut props = properties! {
+            *pw::keys::MEDIA_TYPE => "Audio",
+            *pw::keys::MEDIA_CATEGORY => "Capture",
+            *pw::keys::MEDIA_ROLE => "Communication",
+            *pw::keys::APP_NAME => "nx-recall",
+            *pw::keys::NODE_NAME => "nx-recall-stereo-probe",
+        };
+        props.insert(*pw::keys::TARGET_OBJECT, target.clone());
+        props.insert(
+            *pw::keys::NODE_LATENCY,
+            format!("{}/{}", self.quantum, SAMPLE_RATE),
+        );
+        props.insert("stream.dont-reconnect", "true");
+
+        let stream = pw::stream::StreamRc::new(core.clone(), "nx-recall-stereo-probe", props)
+            .context("creating the stereo probe stream")?;
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::with_capacity(
+            stereo_probe::max_interleaved_samples(SAMPLE_RATE),
+        )));
+        let rate = Arc::new(std::sync::atomic::AtomicU32::new(SAMPLE_RATE));
+        let channels = Arc::new(std::sync::atomic::AtomicU32::new(
+            stereo_probe::CHANNELS as u32,
+        ));
+        let data = ProbeStreamData {
+            buffer: Arc::clone(&buffer),
+            cap_interleaved: stereo_probe::max_interleaved_samples(SAMPLE_RATE),
+            rate: Arc::clone(&rate),
+            channels: Arc::clone(&channels),
+        };
+        let listener = register_probe_stream(&stream, data)?;
+
+        let stereo_param = stereo_format_param()?;
+        let mut params = [Pod::from_bytes(&stereo_param)
+            .ok_or_else(|| anyhow!("malformed stereo probe format pod"))?];
+        stream
+            .connect(
+                spa::utils::Direction::Input,
+                None,
+                pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+                &mut params,
+            )
+            .context("connecting the stereo probe stream")?;
+
+        info!(
+            node = node.node_id,
+            date,
+            pw_target = %target,
+            "stereo azimuth probe: recording up to {:.0} s of the original stereo stream",
+            stereo_probe::MAX_SECONDS
+        );
+        self.probe = Some(ProbeCapture {
+            node_id: node.node_id,
+            date: date.to_string(),
+            started: Instant::now(),
+            buffer,
+            rate,
+            channels,
+            _stream: stream,
+            _listener: listener,
+        });
+        Ok(())
+    }
+
+    /// Poll the running probe: has it filled its buffer, or run past its wall
+    /// -clock bound? Called from the same 250 ms timer as everything else that
+    /// cannot be driven by a PipeWire callback directly.
+    fn poll_probe(&mut self) {
+        let Some(probe) = self.probe.as_ref() else {
+            return;
+        };
+        let full = probe
+            .buffer
+            .lock()
+            .map(|b| b.len() >= stereo_probe::max_interleaved_samples(SAMPLE_RATE))
+            .unwrap_or(false);
+        let timed_out =
+            probe.started.elapsed() > Duration::from_secs_f32(stereo_probe::MAX_SECONDS * 2.0);
+        if full {
+            self.finalize_probe("filled its buffer");
+        } else if timed_out {
+            // Well past MAX_SECONDS of wall time and still not full: the
+            // source is producing audio slower than real time (or has gone
+            // quiet without leaving the graph). Finalize with whatever there
+            // is rather than holding the stream open indefinitely.
+            self.finalize_probe("ran past its time bound");
+        }
+    }
+
+    /// Stop the probe stream, write the WAV, and hand the recording to a
+    /// background thread for the offline ILD/ITD measurement and the report.
+    ///
+    /// Writing and analysing happen off this thread on purpose: this is the
+    /// PipeWire main loop, and a 60-second WAV plus a VAD pass over it is real
+    /// work that must never cost this loop a deadline. The analysis thread
+    /// runs at the project's standing background priority
+    /// (`pipeline::background_current_thread`) — nice and SCHED_IDLE — the
+    /// same discipline every other one-shot, off-the-critical-path pass in
+    /// this daemon uses.
+    fn finalize_probe(&mut self, reason: &str) {
+        let Some(probe) = self.probe.take() else {
+            return;
+        };
+        let samples = match probe.buffer.lock() {
+            Ok(b) => b.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        let rate = probe.rate.load(Ordering::Relaxed).max(1);
+        let channels = probe.channels.load(Ordering::Relaxed).max(1);
+        let recorded_s = if channels > 0 {
+            samples.len() as f32 / channels as f32 / rate as f32
+        } else {
+            0.0
+        };
+        info!(
+            date = %probe.date,
+            recorded_s,
+            channels,
+            rate,
+            "stereo azimuth probe: {reason}; writing and measuring the recording"
+        );
+        if channels != stereo_probe::CHANNELS as u32 || samples.is_empty() {
+            warn!(
+                date = %probe.date,
+                channels,
+                "stereo azimuth probe: source was not stereo (or produced nothing); \
+                 nothing usable to write"
+            );
+            return;
+        }
+
+        let data_dir = self.data_dir.clone();
+        let control = Arc::clone(&self.control);
+        let date = probe.date.clone();
+        std::thread::spawn(move || {
+            crate::pipeline::background_current_thread(19, &[]);
+            let wav_path = stereo_probe::wav_path(&data_dir, &date);
+            if let Err(e) = stereo_probe::write_stereo_wav(&wav_path, rate, &samples) {
+                warn!(
+                    "stereo azimuth probe: could not write {}: {e:#}",
+                    wav_path.display()
+                );
+                return;
+            }
+            match stereo_probe::analyze(&samples, rate) {
+                Ok(report) => {
+                    let report_path = stereo_probe::report_path(&data_dir, &date);
+                    if let Err(e) = stereo_probe::write_report(&report_path, &date, &report) {
+                        warn!(
+                            "stereo azimuth probe: could not write {}: {e:#}",
+                            report_path.display()
+                        );
+                    }
+                    info!(date, verdict = %report.summary, "stereo azimuth probe: {}", report.summary);
+                    control.set_stereo_probe_report(serde_json::json!({
+                        "date": date,
+                        "wav_path": wav_path.display().to_string(),
+                        "report_path": report_path.display().to_string(),
+                        "duration_s": report.duration_s,
+                        "windows": report.windows.len(),
+                        "usable_for_azimuth": report.usable_for_azimuth,
+                        "summary": report.summary,
+                    }));
+                }
+                Err(e) => {
+                    warn!(
+                        "stereo azimuth probe: could not measure {}: {e:#}",
+                        wav_path.display()
+                    );
+                    control.set_stereo_probe_report(serde_json::json!({
+                        "date": date,
+                        "wav_path": wav_path.display().to_string(),
+                        "error": e.to_string(),
+                    }));
+                }
+            }
+        });
+    }
 }
 
 /// The stream callbacks every capture shares: format negotiation, and the
@@ -1363,6 +1828,84 @@ fn register_stream(
         })
         .register()
         .context("registering stream callbacks")
+}
+
+/// The stereo probe stream's own callbacks (0.13.0). Deliberately not
+/// `register_stream`: this stream must never downmix or resample — that is
+/// the entire audio this module exists to capture — and it never touches the
+/// analysis queue, so there is nothing to share with the ordinary tap beyond
+/// the shape of a PipeWire listener.
+fn register_probe_stream(
+    stream: &pw::stream::StreamRc,
+    data: ProbeStreamData,
+) -> Result<pw::stream::StreamListener<ProbeStreamData>> {
+    stream
+        .add_local_listener_with_user_data(data)
+        .state_changed(|_, _, old, new| {
+            debug!("stereo probe stream {old:?} -> {new:?}");
+        })
+        .param_changed(|_, data, id, param| {
+            let Some(param) = param else { return };
+            if id != spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let Ok((media_type, media_subtype)) = format_utils::parse_format(param) else {
+                return;
+            };
+            if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
+                return;
+            }
+            let mut info = spa::param::audio::AudioInfoRaw::new();
+            if info.parse(param).is_err() {
+                warn!("stereo probe: could not parse the negotiated audio format");
+                return;
+            }
+            data.rate.store(info.rate(), Ordering::Relaxed);
+            data.channels
+                .store(info.channels().max(1), Ordering::Relaxed);
+            info!(
+                "stereo probe capturing at {} Hz, {} ch",
+                info.rate(),
+                info.channels()
+            );
+        })
+        .process(|stream, data| {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            let Some(d) = datas.first_mut() else { return };
+            let offset = d.chunk().offset() as usize;
+            let size = d.chunk().size() as usize;
+            let Some(bytes) = d.data() else { return };
+            let end = (offset + size).min(bytes.len());
+            if end <= offset {
+                return;
+            }
+            let raw = &bytes[offset..end];
+
+            let mut guard = match data.buffer.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if guard.len() >= data.cap_interleaved {
+                // Already full; `poll_probe` has not torn this stream down
+                // yet, but there is nothing left to do here except not grow
+                // the buffer past its bound.
+                return;
+            }
+            let room = data.cap_interleaved - guard.len();
+            let take = (raw.len() / 4).min(room);
+            guard.extend(
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .take(take)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+        })
+        .register()
+        .context("registering the stereo probe stream's callbacks")
 }
 
 /// What `probe` found. Nothing here opens a capture; it is the "what would you
@@ -1785,6 +2328,10 @@ pub fn run(
         },
         format_param: target_format_param()?,
         quantum: cfg.capture.quantum,
+        flap: FlapTracker::new(Duration::from_millis(cfg.capture.flap_grace_ms)),
+        probe: None,
+        stereo_probe_enabled: cfg.capture.stereo_probe,
+        data_dir: control.data_dir.clone(),
     }));
 
     // Node proxies stay bound for the daemon's lifetime so we keep receiving
@@ -1945,6 +2492,11 @@ pub fn run(
             shared_timer.borrow_mut().room.cfg = control_timer.room();
         }
         shared_timer.borrow_mut().sync_taps(&core_timer);
+        // 0.13.0: a flap is not itself an event, so something has to notice
+        // one age out or settle on a clock — this is the same 250 ms tick
+        // that already drives every other polled thing here.
+        shared_timer.borrow_mut().sweep_flaps();
+        shared_timer.borrow_mut().poll_probe();
     });
     let tick = std::time::Duration::from_millis(250);
     if let Err(e) = timer.update_timer(Some(tick), Some(tick)).into_result() {
@@ -2281,6 +2833,10 @@ mod tests {
                 // Never read here: nothing in this test opens a stream.
                 format_param: Vec::new(),
                 quantum: 1024,
+                flap: FlapTracker::new(Duration::from_millis(5_000)),
+                probe: None,
+                stereo_probe_enabled: false,
+                data_dir: dir.to_path_buf(),
             },
             bus,
         )
