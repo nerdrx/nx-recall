@@ -41,9 +41,9 @@ use recalld::truth::{self, TruthStats, TruthStop};
 use recalld::truthnet;
 
 use crate::cli::{
-    AccuracyAction, BackupAction, Cli, Command, GraphAction, IdentityAction, LangAction, MicAction,
-    ModelsAction, MoodAction, NightBackend, NotesAction, SemanticAction, SpeakersAction,
-    TruthAction, TurnsAction,
+    AccuracyAction, BackupAction, CaptureAction, Cli, Command, GraphAction, IdentityAction,
+    LangAction, MicAction, ModelsAction, MoodAction, NightBackend, NotesAction, SemanticAction,
+    SpeakersAction, TruthAction, TurnsAction,
 };
 
 fn main() -> Result<()> {
@@ -73,6 +73,9 @@ fn main() -> Result<()> {
         Command::Run => cmd_run(&cfg, &data_dir, &config_path),
         Command::Probe => cmd_probe(&cfg),
         Command::Sources => cmd_sources(&data_dir),
+        Command::Capture { action } => match action {
+            CaptureAction::Health { days } => cmd_capture_health(&data_dir, days),
+        },
         Command::Allow { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, true),
         Command::Deny { match_key } => cmd_set_rule(&config_path, &data_dir, &match_key, false),
         Command::Role {
@@ -1375,6 +1378,73 @@ fn cmd_sources(data_dir: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `recalld capture health` — reads the `gaps` table directly, like
+/// `cmd_speakers` reads `speakers`: it says nothing about a running daemon
+/// and works on a machine where none is running.
+fn cmd_capture_health(data_dir: &Path, days: i64) -> Result<()> {
+    let store = Store::open(data_dir)?;
+    let now = utc_now_ns();
+    let window_ns = days.max(1) * 86_400 * 1_000_000_000;
+    let health = store.gap_health(now, window_ns)?;
+
+    if health.total == 0 {
+        println!("No gaps in the last {days}d. Capture has been contiguous.");
+        return Ok(());
+    }
+
+    println!(
+        "{} gap(s) in the last {days}d ({:.0}% unexplained)\n",
+        health.total,
+        health.unexplained_share * 100.0
+    );
+
+    println!("BY CAUSE");
+    for (cause, n) in &health.by_cause {
+        let explain = pipeline::GapCause::parse(cause)
+            .map(|c| c.explain())
+            .unwrap_or("(unknown cause — this build is older than the row)");
+        println!("  {:>5}  {:<22}  {}", n, cause, wrap_explain(explain, 68));
+    }
+
+    println!("\nTOP SOURCES");
+    for s in &health.top_sources {
+        println!("  {:>5}  {} ({})", s.count, s.display_name, s.match_key);
+    }
+
+    println!("\nTOP HOURS (UTC)");
+    let mut hours = health.hours.clone();
+    hours.sort_by_key(|h| std::cmp::Reverse(h.total));
+    for h in hours.iter().take(10) {
+        let by_cause: Vec<String> = h.by_cause.iter().map(|(c, n)| format!("{c}={n}")).collect();
+        println!(
+            "  {:>5}  {}  {}",
+            h.total,
+            recalld::clock::iso8601(h.hour_start_ns),
+            by_cause.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Indent every line after the first, so a long explanation does not run
+/// straight into the terminal's right edge on the CLI's fixed-width table.
+fn wrap_explain(s: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut line_len = 0;
+    for (i, word) in s.split_whitespace().enumerate() {
+        if i > 0 && line_len + 1 + word.len() > width {
+            out.push_str("\n                          ");
+            line_len = 0;
+        } else if i > 0 {
+            out.push(' ');
+            line_len += 1;
+        }
+        out.push_str(word);
+        line_len += word.len();
+    }
+    out
 }
 
 fn cmd_set_rule(config_path: &Path, data_dir: &Path, match_key: &str, allowed: bool) -> Result<()> {

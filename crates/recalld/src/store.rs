@@ -150,7 +150,17 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // v18 belongs to a sibling build in the same release; this one is v19 so the
 // two never claim the same number. The migration chain is unconditional and
 // idempotent, so a v17 database moving straight to v19 is the ordinary path.
-pub const SCHEMA_VERSION: i64 = 19;
+//
+// v20 (0.14.0): capture health. One table, `gaps` — every "audio gap:
+// discarded the turn in progress" moment, classified by cause at the instant
+// it happens rather than left as a bare warning in the journal. No backfill:
+// a gap that happened before this build cannot be reclassified, because the
+// evidence it would need (the queue's drop count and the capture thread's own
+// buffer timestamps, at that instant) was never recorded. See `apply_v20`,
+// `crate::pipeline`'s `GapCause`, and FINDINGS §50 for the baseline this
+// replaces — 723 unclassified gaps in one journal window, reconstructed by
+// hand because nothing wrote them down.
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -647,6 +657,64 @@ pub struct TextTruth {
     pub source_kind: String,
     pub duration_ns: i64,
     pub created_ns: i64,
+}
+
+/// One hour's worth of `gaps`, cut by cause (schema v20, 0.14.0). Oldest
+/// first inside [`GapHealth::hours`], so a client can draw a bar row straight
+/// off the list.
+#[derive(Debug, Clone, Default)]
+pub struct GapHour {
+    pub hour_start_ns: i64,
+    pub total: i64,
+    pub by_cause: std::collections::BTreeMap<String, i64>,
+}
+
+/// One source's share of the gaps in a [`GapHealth`] window.
+#[derive(Debug, Clone)]
+pub struct GapSource {
+    pub display_name: String,
+    pub match_key: String,
+    pub count: i64,
+    /// Cut the same way [`GapHealth::by_cause`] is, but for this source
+    /// alone — what the Sources view's Health card draws as one source's bar
+    /// row.
+    pub by_cause: std::collections::BTreeMap<String, i64>,
+}
+
+/// `status.capture.health` and `recalld capture health`, over the same
+/// window (0.14.0). `unexplained_share` is the number that says whether this
+/// feature is doing its job: 0 means every gap this build has seen since the
+/// window opened was classified at the moment it happened.
+#[derive(Debug, Clone, Default)]
+pub struct GapHealth {
+    pub since_ns: i64,
+    pub total: i64,
+    pub by_cause: std::collections::BTreeMap<String, i64>,
+    pub unexplained_share: f64,
+    pub hours: Vec<GapHour>,
+    pub top_sources: Vec<GapSource>,
+}
+
+impl GapHealth {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "since_utc_ns": self.since_ns,
+            "total": self.total,
+            "by_cause": self.by_cause,
+            "unexplained_share": self.unexplained_share,
+            "per_hour": self.hours.iter().map(|h| serde_json::json!({
+                "hour_start_utc_ns": h.hour_start_ns,
+                "total": h.total,
+                "by_cause": h.by_cause,
+            })).collect::<Vec<_>>(),
+            "top_sources": self.top_sources.iter().map(|s| serde_json::json!({
+                "display_name": s.display_name,
+                "match_key": s.match_key,
+                "count": s.count,
+                "by_cause": s.by_cause,
+            })).collect::<Vec<_>>(),
+        })
+    }
 }
 
 /// One `segments.redecode` operation, read back: when a machine rewrote this
@@ -1417,6 +1485,11 @@ impl Store {
         // no-op.
         self.apply_v19()?;
         // ---- end 0.12.4 ---------------------------------------------------
+
+        // ---- 0.14.0 (schema v20): capture health ---------------------------
+        // One table, no backfill. See the banner above `SCHEMA_VERSION`.
+        self.apply_v20()?;
+        // ---- end 0.14.0 ------------------------------------------------------
 
         match current {
             None => {
@@ -6686,6 +6759,180 @@ impl Store {
         Ok(())
     }
 
+    /// Schema v20 (0.14.0): capture health. One table, no backfill — see the
+    /// banner above `SCHEMA_VERSION`.
+    fn apply_v20(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS gaps (
+                 id          INTEGER PRIMARY KEY,
+                 session_id  INTEGER NOT NULL REFERENCES sessions(id),
+                 at_ns       INTEGER NOT NULL,
+                 duration_ns INTEGER NOT NULL,
+                 -- 'flap', 'queue_overflow', 'scheduler_starvation',
+                 -- 'pipewire_xrun', 'session_end', or 'unexplained'. A plain
+                 -- TEXT column and not a foreign key: this is a closed set
+                 -- documented in `crate::pipeline::GapCause`, not data that
+                 -- grows over time.
+                 cause       TEXT    NOT NULL,
+                 -- Free text: which source dropped the buffers, how many, the
+                 -- flap's match key. Never machine-read; only ever printed.
+                 detail      TEXT,
+                 created_ns  INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_gaps_at ON gaps(at_ns);
+             CREATE INDEX IF NOT EXISTS idx_gaps_cause ON gaps(cause, at_ns);
+             CREATE INDEX IF NOT EXISTS idx_gaps_session ON gaps(session_id);",
+        )?;
+        Ok(())
+    }
+
+    /// One gap, recorded at the moment it happens (`at_ns` doubles as the
+    /// write time — a gap is always recorded live, never backfilled). Also
+    /// prunes rows older than `retention_days` — cheap at this volume (a few
+    /// hundred rows a day at most) and it means no separate sweep has to
+    /// know this table exists.
+    pub fn insert_gap(
+        &self,
+        session_id: i64,
+        at_ns: i64,
+        duration_ns: i64,
+        cause: crate::pipeline::GapCause,
+        detail: Option<&str>,
+        retention_days: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO gaps (session_id, at_ns, duration_ns, cause, detail, created_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?2)",
+            params![session_id, at_ns, duration_ns, cause.as_str(), detail],
+        )?;
+        if retention_days > 0 {
+            let cutoff = at_ns.saturating_sub(retention_days * 86_400 * 1_000_000_000);
+            self.conn
+                .execute("DELETE FROM gaps WHERE at_ns < ?1", params![cutoff])?;
+        }
+        Ok(())
+    }
+
+    /// Capture health over the trailing `window_ns` (`status.capture.health`
+    /// uses 24h; `recalld capture health` can widen it). Gaps per hour by
+    /// cause, the top offending sources, the top offending hours, and the
+    /// share whose cause is `unexplained` — the number that says whether this
+    /// table is doing its job.
+    pub fn gap_health(&self, now_ns: i64, window_ns: i64) -> Result<GapHealth> {
+        let since = now_ns.saturating_sub(window_ns);
+        let mut by_cause: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT cause, COUNT(*) FROM gaps WHERE at_ns >= ?1 GROUP BY cause")?;
+            let rows = stmt.query_map(params![since], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (cause, n) = row?;
+                by_cause.insert(cause, n);
+            }
+        }
+        let total: i64 = by_cause.values().sum();
+        let unexplained = by_cause
+            .get(crate::pipeline::GapCause::Unexplained.as_str())
+            .copied()
+            .unwrap_or(0);
+        let unexplained_share = if total > 0 {
+            unexplained as f64 / total as f64
+        } else {
+            0.0
+        };
+
+        // Per-hour buckets, oldest first, so a client can draw a bar row
+        // straight off this without re-sorting.
+        let mut by_hour: std::collections::BTreeMap<i64, std::collections::BTreeMap<String, i64>> =
+            std::collections::BTreeMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT (at_ns / 3600000000000), cause, COUNT(*)
+                 FROM gaps WHERE at_ns >= ?1
+                 GROUP BY 1, cause",
+            )?;
+            let rows = stmt.query_map(params![since], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (hour, cause, n) = row?;
+                by_hour.entry(hour).or_default().insert(cause, n);
+            }
+        }
+        let hours: Vec<GapHour> = by_hour
+            .into_iter()
+            .map(|(hour, causes)| GapHour {
+                hour_start_ns: hour * 3_600_000_000_000,
+                total: causes.values().sum(),
+                by_cause: causes,
+            })
+            .collect();
+
+        // Top offending sources, joined through sessions -> sources, cut by
+        // cause too — the Sources view's Health card draws one stacked bar
+        // per source straight off `by_cause`. A session whose source row is
+        // gone (retention, a stale test fixture) is dropped rather than
+        // guessed at.
+        let mut per_source: std::collections::BTreeMap<
+            (String, String),
+            (i64, std::collections::BTreeMap<String, i64>),
+        > = std::collections::BTreeMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT so.display_name, so.match_key, g.cause, COUNT(*) AS n
+                 FROM gaps g
+                 JOIN sessions se ON se.id = g.session_id
+                 JOIN sources so ON so.id = se.source_id
+                 WHERE g.at_ns >= ?1
+                 GROUP BY so.id, g.cause",
+            )?;
+            let rows = stmt.query_map(params![since], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (display_name, match_key, cause, n) = row?;
+                let entry = per_source
+                    .entry((display_name, match_key))
+                    .or_insert_with(|| (0, std::collections::BTreeMap::new()));
+                entry.0 += n;
+                entry.1.insert(cause, n);
+            }
+        }
+        let mut top_sources: Vec<GapSource> = per_source
+            .into_iter()
+            .map(|((display_name, match_key), (count, by_cause))| GapSource {
+                display_name,
+                match_key,
+                count,
+                by_cause,
+            })
+            .collect();
+        top_sources.sort_by_key(|s| std::cmp::Reverse(s.count));
+        top_sources.truncate(10);
+
+        Ok(GapHealth {
+            since_ns: since,
+            total,
+            by_cause,
+            unexplained_share,
+            hours,
+            top_sources,
+        })
+    }
+
     /// One correction, with everything a measurement needs beside it.
     pub fn insert_text_truth(&self, row: &TextTruth) -> Result<bool> {
         let n = self.conn.execute(
@@ -10023,6 +10270,131 @@ mod tests {
         assert_eq!(rows[0].id, shaky);
     }
 
+    // ---- 0.14.0 (schema v20): capture health --------------------------------
+
+    #[test]
+    fn a_gap_is_counted_by_cause_and_by_hour() {
+        let s = store();
+        let src = s.upsert_source("VRChat.exe", "VRChat.exe", 0).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let hour = 3_600 * 1_000_000_000i64;
+
+        s.insert_gap(
+            sess,
+            hour,
+            50_000_000,
+            crate::pipeline::GapCause::QueueOverflow,
+            Some("queue evicted 2 buffer(s)"),
+            0,
+        )
+        .unwrap();
+        s.insert_gap(
+            sess,
+            hour + 1,
+            200_000_000,
+            crate::pipeline::GapCause::SchedulerStarvation,
+            None,
+            0,
+        )
+        .unwrap();
+        s.insert_gap(
+            sess,
+            2 * hour,
+            5_000_000_000,
+            crate::pipeline::GapCause::Flap,
+            Some("5s of silence"),
+            0,
+        )
+        .unwrap();
+
+        let health = s.gap_health(3 * hour, 24 * hour).unwrap();
+        assert_eq!(health.total, 3);
+        assert_eq!(health.by_cause["queue_overflow"], 1);
+        assert_eq!(health.by_cause["scheduler_starvation"], 1);
+        assert_eq!(health.by_cause["flap"], 1);
+        assert_eq!(health.unexplained_share, 0.0);
+        assert_eq!(health.hours.len(), 2, "two distinct hour buckets");
+        assert_eq!(health.top_sources.len(), 1);
+        assert_eq!(health.top_sources[0].count, 3);
+        assert_eq!(health.top_sources[0].match_key, "VRChat.exe");
+    }
+
+    #[test]
+    fn a_gap_outside_the_window_does_not_count() {
+        let s = store();
+        let src = s.upsert_source("Discord", "Discord", 0).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let hour = 3_600 * 1_000_000_000i64;
+        let now = 100 * hour;
+
+        // Ten hours ago: inside a 24h window, outside a 1h one.
+        s.insert_gap(
+            sess,
+            now - 10 * hour,
+            10_000_000,
+            crate::pipeline::GapCause::SessionEnd,
+            None,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(s.gap_health(now, 24 * hour).unwrap().total, 1);
+        assert_eq!(s.gap_health(now, hour).unwrap().total, 0);
+    }
+
+    #[test]
+    fn retention_prunes_old_gaps_on_the_next_insert() {
+        let s = store();
+        let src = s.upsert_source("mic", "Microphone", 0).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+        let day = 86_400 * 1_000_000_000i64;
+
+        s.insert_gap(
+            sess,
+            0,
+            1_000_000,
+            crate::pipeline::GapCause::SchedulerStarvation,
+            None,
+            7,
+        )
+        .unwrap();
+        // A second insert, 30 days later with a 7-day retention, must prune
+        // the first row rather than let the table grow without bound.
+        s.insert_gap(
+            sess,
+            30 * day,
+            1_000_000,
+            crate::pipeline::GapCause::SchedulerStarvation,
+            None,
+            7,
+        )
+        .unwrap();
+
+        let health = s.gap_health(30 * day, 60 * day).unwrap();
+        assert_eq!(
+            health.total, 1,
+            "the day-0 row aged out under 7-day retention"
+        );
+    }
+
+    #[test]
+    fn gap_cause_round_trips_through_its_string() {
+        for cause in [
+            crate::pipeline::GapCause::Flap,
+            crate::pipeline::GapCause::QueueOverflow,
+            crate::pipeline::GapCause::SchedulerStarvation,
+            crate::pipeline::GapCause::PipewireXrun,
+            crate::pipeline::GapCause::SessionEnd,
+            crate::pipeline::GapCause::Unexplained,
+        ] {
+            assert_eq!(
+                crate::pipeline::GapCause::parse(cause.as_str()),
+                Some(cause)
+            );
+        }
+        assert_eq!(crate::pipeline::GapCause::parse("made_up"), None);
+    }
+
     // ---- Step 1 behaviour, unchanged -------------------------------------
 
     // ---- 0.12.0 (schema v14): which instance a session was -----------------
@@ -10365,7 +10737,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(v, 19);
+        assert_eq!(v, 20);
 
         // The columns are back…
         let columns = |table: &str| -> Vec<String> {

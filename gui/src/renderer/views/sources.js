@@ -40,6 +40,8 @@ export function mount(root, ctx) {
   const exportCard = h('div', { class: 'card', id: 'export-card' });
   const storageCard = h('div', { class: 'card', id: 'storage-card' });
   const backupCard = h('div', { class: 'card', id: 'backup-card' });
+  // Capture health (0.14.0): gaps per hour by cause, one bar row per source.
+  const healthCard = h('div', { class: 'card', id: 'health-card' });
   const captionsCard = h('div', { class: 'card', id: 'captions-card' });
   const body = h(
     'div',
@@ -82,7 +84,12 @@ export function mount(root, ctx) {
     // A backup you can trust (0.13.0). Right under Storage, because it is the
     // other side of the same question — not just how much this costs on disk,
     // but whether a copy of it exists anywhere else.
-    backupCard
+    backupCard,
+    // Capture health (0.14.0): every "audio gap" the daemon has classified in
+    // the last 24h. Under storage for the same reason storage is under
+    // export — this is the last thing on the page, and it is a diagnostic
+    // rather than a decision.
+    healthCard
   );
 
   root.append(
@@ -1272,6 +1279,123 @@ export function mount(root, ctx) {
     }
   }
 
+  // -- capture health (0.14.0) -----------------------------------------------
+  //
+  // `status.capture.health`: gaps per hour by cause, over the trailing 24h.
+  // One stacked bar per source rather than one big number, because "captures
+  // fine" and "vesktop drops every few minutes" both round to the same total
+  // — the point of this card is to say which source, and why.
+
+  const GAP_CAUSES = [
+    { key: 'scheduler_starvation', label: 'Scheduler stall', class: 'bad',
+      hint: 'The capture thread missed its PipeWire deadline under load.',
+      fix: 'Check [runtime].inference_nice / inference_cpus and what else is pinned to those cores.' },
+    { key: 'queue_overflow', label: 'Queue overflow', class: 'warn',
+      hint: 'The inference queue fell behind and dropped buffers.',
+      fix: 'Raise [capture].queue_seconds, or free a CPU core for the inference thread.' },
+    { key: 'flap', label: 'Reconnect', class: 'neutral',
+      hint: "The source's node vanished and came back past the silence threshold.",
+      fix: 'Raise [capture].flap_grace_ms if this app reconnects slower than 5s.' },
+    { key: 'session_end', label: 'Went quiet', class: 'neutral',
+      hint: 'The source stopped sending audio before the daemon saw it disappear.',
+      fix: 'Usually a clean app exit — only worth chasing if it repeats mid-session.' },
+    { key: 'pipewire_xrun', label: 'PipeWire xrun', class: 'neutral',
+      hint: 'PipeWire itself under-ran.',
+      fix: 'Check `pw-top` for the driver’s own xrun count; this daemon cannot read it directly.' },
+    { key: 'unexplained', label: 'Unexplained', class: 'bad',
+      hint: 'The classifier could not attribute this gap.',
+      fix: 'File a bug — this should not happen.' },
+  ];
+
+  function gapBar(byCause, total) {
+    const bar = h('div', { class: 'gap-bar' });
+    if (!total) {
+      bar.append(h('div', { class: 'gap-bar-seg gap-bar-empty' }));
+      return bar;
+    }
+    for (const cause of GAP_CAUSES) {
+      const n = byCause?.[cause.key] ?? 0;
+      if (!n) continue;
+      bar.append(
+        h('div', {
+          class: `gap-bar-seg gap-${cause.class}`,
+          dataset: { cause: cause.key },
+          style: `flex:${n} 0 0`,
+          title: `${cause.label}: ${n}`,
+        })
+      );
+    }
+    return bar;
+  }
+
+  function renderHealth() {
+    clear(healthCard);
+    healthCard.append(h('div', { class: 'card-title', text: 'Capture health' }));
+    const health = store.status?.capture?.health;
+    if (!health) {
+      healthCard.append(
+        h('p', {
+          class: 'rail-hint',
+          style: 'padding:0;max-width:64ch',
+          text: 'Not measured yet — connect to a daemon that has been running long enough to see one status poll.',
+        })
+      );
+      return;
+    }
+    if (!health.total) {
+      healthCard.append(
+        h('p', {
+          class: 'rail-hint',
+          style: 'padding:0;max-width:64ch',
+          text: 'No gaps in the last 24h. Capture has been contiguous.',
+        })
+      );
+      return;
+    }
+    healthCard.append(
+      h('p', {
+        class: 'rail-hint',
+        style: 'padding:0 0 10px;max-width:64ch',
+        text: `${health.total} gap${health.total === 1 ? '' : 's'} in the last 24h across ${health.top_sources?.length ?? 0} source${(health.top_sources?.length ?? 0) === 1 ? '' : 's'}` +
+          (health.unexplained_share > 0 ? ` — ${Math.round(health.unexplained_share * 100)}% unexplained` : ''),
+      })
+    );
+    const rows = h('div', { class: 'gap-rows', id: 'gap-rows' });
+    for (const s of health.top_sources ?? []) {
+      rows.append(
+        h(
+          'div',
+          { class: 'gap-row', dataset: { gapSource: s.match_key } },
+          h('span', { class: 'gap-row-name', text: s.display_name }),
+          gapBar(s.by_cause, s.count),
+          h('span', { class: 'gap-row-count', text: String(s.count) })
+        )
+      );
+    }
+    healthCard.append(rows);
+
+    // The legend: one line per cause actually seen, its meaning and its fix —
+    // the two facts `recalld capture health` prints as one sentence each.
+    const legend = h('div', { class: 'gap-legend', id: 'gap-legend' });
+    for (const cause of GAP_CAUSES) {
+      if (!(health.by_cause?.[cause.key] > 0)) continue;
+      legend.append(
+        h(
+          'div',
+          { class: 'gap-legend-row' },
+          h('span', { class: `gap-swatch gap-${cause.class}` }),
+          h(
+            'span',
+            { class: 'gap-legend-text' },
+            h('b', { text: `${cause.label} (${health.by_cause[cause.key]})` }),
+            h('small', { text: ` ${cause.hint} ${cause.fix}` })
+          )
+        )
+      );
+    }
+    healthCard.append(legend);
+  }
+
   // -- live captions --------------------------------------------------------
   //
   // Six controls and one button. Every one of them is a preference about a
@@ -1464,6 +1588,7 @@ export function mount(root, ctx) {
     renderExport();
     renderStorage();
     renderBackup();
+    renderHealth();
     renderCaptions();
     clear(list);
     // The microphone has its own card above; it must not also appear as a row

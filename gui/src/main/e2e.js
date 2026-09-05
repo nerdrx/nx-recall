@@ -3873,6 +3873,42 @@ export function runE2E(deps) {
       return { rows: s.rows, footer: s.footer, file };
     });
 
+    // 12a.5 — capture health (0.14.0). Gaps per hour by cause, one bar row
+    // per source, with a legend explaining each cause and its fix. The mock
+    // ships a nonzero table on purpose (FINDINGS §50) — a card that only ever
+    // renders "no gaps" would never be photographed doing its actual job.
+    await step('capture-health-card', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      const c = await waitFor('the capture health card', async () => {
+        const c = await js('window.__recallDebug.captureHealth()');
+        return c.rows.length ? c : null;
+      });
+      assert(c.health && c.health.total > 0, `the mock's health block is empty: ${JSON.stringify(c.health)}`);
+      // Every rendered row's count must equal the sum of its bar segments —
+      // the bar is drawn FROM by_cause, so a mismatch means the two drifted.
+      for (const row of c.rows) {
+        const source = c.health.top_sources.find((s) => s.match_key === row.source);
+        assert(source, `rendered a row for a source not in status.capture.health.top_sources: ${row.source}`);
+        assert(row.count === source.count, `${row.source}: bar says ${row.count}, status says ${source.count}`);
+        const causesOnBar = new Set(row.segs);
+        for (const cause of Object.keys(source.by_cause)) {
+          assert(causesOnBar.has(cause), `${row.source}: ${cause} is in by_cause but has no bar segment`);
+        }
+      }
+      // The legend explains every cause actually present, each with a fix.
+      assert(c.legend.length > 0, 'no legend rows rendered');
+      for (const cause of Object.keys(c.health.by_cause)) {
+        if (!c.health.by_cause[cause]) continue;
+        assert(
+          c.legend.some((line) => line.toLowerCase().includes(cause.replace(/_/g, ' ').split(' ')[0])),
+          `the legend does not explain "${cause}": ${JSON.stringify(c.legend)}`
+        );
+      }
+      await js('document.getElementById("health-card").scrollIntoView({block: "end"})');
+      const file = await shot('sources-capture-health');
+      return { total: c.health.total, rows: c.rows.length, file };
+    });
+
     // 12b — the microphone. Off by default and NOT in the application list;
     // enabling it in follow mode has to read as "waiting", not as "recording",
     // because that difference is the whole privacy model (0.6.0).

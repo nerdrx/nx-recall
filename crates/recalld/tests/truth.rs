@@ -151,7 +151,9 @@ fn the_v11_migration_is_idempotent_and_keeps_what_it_wrote() {
     // backfill in it. This test is the thing that says v19's natural key works:
     // `text_truth` is filled from the operations log on every open, so a second
     // open that wrote a second copy of every correction would be caught here.
-    assert_eq!(SCHEMA_VERSION, 19, "0.12.4 is schema v19");
+    //
+    // 0.14.0 takes it to v20: `gaps` (capture health), additive, no backfill.
+    assert_eq!(SCHEMA_VERSION, 20, "0.14.0 is schema v20");
     let dir = temp_dir("schema");
     let mut seg = 0i64;
     // Three opens: the first migrates, the second and third must be no-ops

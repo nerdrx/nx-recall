@@ -461,6 +461,67 @@ distinct positions, or smear around the centre — is what `status` carries.
 Bounded three ways: 60 seconds, once a day, one named application; it is a
 diagnostic recording answering one question, never a standing stereo capture.
 
+## 0.14.0 — capture health
+
+Every "audio gap: discarded the turn in progress" warning used to be exactly
+that — a warning, with a session id and nothing else. Finding out *why* meant
+reading the journal by hand and guessing from what else was running at the
+time (FINDINGS §50: 723 of them in one 26-hour window, reconstructed after
+the fact, effectively 100% unclassified because nothing recorded the
+evidence at the moment it existed). 0.14.0 classifies each one as it happens
+and writes it to a `gaps` table (schema v20) instead.
+
+**Causes**, in `crate::pipeline::GapCause`:
+
+| cause | what it means | the fix |
+|---|---|---|
+| `flap` | a source's node vanished and came back at or above `[vad].min_silence_ms` (§47) | raise `[capture].flap_grace_ms` if this app reconnects slower than the default 5 s |
+| `queue_overflow` | the shared capture→VAD queue was over its sample budget and evicted buffers between this session's chunks | raise `[capture].queue_seconds`, or free a CPU core for the inference thread |
+| `scheduler_starvation` | the gap's own clock arithmetic shows a stall with no matching queue eviction — the capture thread did not get a buffer to PipeWire's `process` callback in time | check `[runtime].inference_nice` / `inference_cpus` and what else is pinned to those cores |
+| `pipewire_xrun` | reserved for PipeWire's own xrun counter | not populated today — `pipewire-rs` 0.10 does not expose it, so a real xrun currently reads as `scheduler_starvation` |
+| `session_end` | the capture side went quiet for more than a second before the daemon saw the node disappear | usually a clean app exit; only worth chasing if it repeats mid-session |
+| `unexplained` | the classifier could not attribute the gap | should not occur; a nonzero share means the classifier missed a case |
+
+A gap is classified with whatever evidence exists **at the instant it is
+discarded** — the queue's own eviction counter, a per-session timestamp of
+the last buffer seen — never reconstructed afterward. There is no backfill: a
+gap from before this build has no row, because the evidence it needs was
+never captured.
+
+`status` carries the block, alongside `flaps_absorbed`:
+
+```json
+"capture": {
+  "flap_grace_ms": 5000,
+  "flaps_absorbed": 18,
+  "stereo_probe": { "...": "..." },
+  "health": {
+    "since_utc_ns": 1788500000000000000,
+    "total": 41,
+    "by_cause": {"flap": 2, "queue_overflow": 6, "scheduler_starvation": 33},
+    "unexplained_share": 0.0,
+    "per_hour": [
+      {"hour_start_utc_ns": 1788541200000000000, "total": 9,
+       "by_cause": {"scheduler_starvation": 9}}
+    ],
+    "top_sources": [
+      {"display_name": "vesktop", "match_key": "vesktop", "count": 18}
+    ]
+  }
+}
+```
+
+`health` covers the trailing 24 hours and is always present, like every other
+capture block: zero gaps and "an older daemon" must never look the same.
+`unexplained_share` is the number worth watching — it is 0.0 on a build where
+the classifier covers every reanchor and flap discard, and any drift away
+from that is a bug.
+
+`recalld capture health [--days N]` reads the `gaps` table directly (no
+running daemon needed, like `recalld speakers`), over a widened window, and
+prints the same numbers plus the top offending sources and the top offending
+hours — the report behind FINDINGS §50's baseline.
+
 - **`status` carries `last_sweep` (0.7.5)**, or `null` before the sweeper has run
   once. The same block is pushed as a `sweep` event on the `status` topic after
   every pass:
