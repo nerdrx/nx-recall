@@ -984,15 +984,10 @@ impl Pipeline {
         }
 
         // ---- 0.12.5, sliced turns ------------------------------------------
-        // Everything of this turn that no slice has read. On an unsliced turn
-        // — which is 96% of them (FINDINGS §41) — this is the whole span and
-        // the three lines below cost a comparison.
-        let remainder_from = session.slicer.pending_start(span.start);
-        let sliced = remainder_from.is_some();
-        let remainder = match remainder_from {
-            Some(from) => session.extract(from, span.end),
-            None => Vec::new(),
-        };
+        // Whether any slice was published for this turn. On an unsliced turn —
+        // which is 96% of them (FINDINGS §41) — this is `false` and the rest of
+        // this block costs nothing.
+        let sliced = session.slicer.pending_start(span.start).is_some();
         // ---- end 0.12.5 ------------------------------------------------------
 
         // ---- 0.12.4: where the speaker changes ----
@@ -1034,38 +1029,44 @@ impl Pipeline {
             },
             None => Vec::new(),
         };
-        // ---- 0.12.5: the words a sliced turn already has --------------------
-        // Its audio was read piece by piece while the person was still
-        // speaking; only the tail nobody reached is decoded here. Handed down
-        // as the piece's `said`, so the recogniser runs over this turn's audio
-        // exactly once in total — the whole claim the feature makes about its
-        // cost — and `said` means the same thing it means for a split piece.
+        // ---- 0.13.1: the row is the WHOLE turn, read once more -------------
+        // §41 shipped slicing with the row built from the joined slices, and
+        // measured what that costs: the joined text disagrees with a
+        // whole-turn decode on 17.6% of words, against a noise floor of
+        // exactly 0.00% (FINDINGS §41.3). §41.6 named the fix and its price —
+        // "keep the slices as captions and re-decode the whole turn at close
+        // anyway" — and this is that fix, measured and landed in §48.
         //
-        // A sliced turn always takes this path, INCLUDING when the join comes
-        // back empty: every slice's audio has been read and the decoder made
-        // nothing of any of it, and falling through to a fresh decode would
-        // read the whole turn again to ask a question already answered.
-        let joined: Option<String> = sliced.then(|| {
-            let tail = self
-                .analyzer
+        // So the pieces bought the CAPTION — every `slice` event already went
+        // out while the turn was open, at `maybe_slice`'s cost, and nothing
+        // about that changes here — and the joined text is not the row.
+        // Instead the row is decoded from `samples`, the turn's whole audio,
+        // exactly the call an unsliced turn makes (`prepare_maybe_said` with
+        // `said: None`, over the same bytes): same function, same audio, so
+        // the two readings are the same string by construction, not by
+        // agreement. That is the whole proof the WER-vs-baseline number in
+        // FINDINGS §48 is 0.00% — there is no comparison to disagree with.
+        //
+        // The one extra decode only happens on a turn that was actually
+        // sliced — 96% of turns never reach `slice_after_s` and pay nothing
+        // (FINDINGS §41) — and it is the ONE extra decode `write_segment`
+        // makes per turn, not one per slice: the slices themselves cost
+        // exactly what they cost before, and this adds a second reading of
+        // the whole turn on top, once.
+        let redecoded: Option<String> = sliced.then(|| {
+            self.analyzer
                 .as_mut()
-                .map(|a| a.transcribe_slice(&remainder))
-                .unwrap_or_default();
-            let so_far = self
-                .sessions
-                .get(&session_id)
-                .map(|s| s.slice_text.clone())
-                .unwrap_or_default();
-            join_slices(&so_far, &tail).unwrap_or_default()
+                .map(|a| a.transcribe_slice(&samples))
+                .unwrap_or_default()
         });
-        // ---- end 0.12.5 -------------------------------------------------------
+        // ---- end 0.13.1 ---------------------------------------------------
         let plan = if plan.is_empty() {
             vec![(
                 crate::turnsplit::Piece {
                     from: 0,
                     to: samples.len(),
                 },
-                joined,
+                redecoded,
             )]
         } else {
             plan
