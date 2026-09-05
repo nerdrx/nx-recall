@@ -106,6 +106,11 @@ pub struct Report {
     /// Held-out scores: the globals, and the proposal.
     pub baseline: Score,
     pub candidate: Score,
+    /// The same two rows with the **mint path** in: a decline the live daemon
+    /// would turn into a new `Speaker_NN` is scored as the wrong name, not as
+    /// a non-answer (0.12.2, FINDINGS §46).
+    pub baseline_minting: Score,
+    pub candidate_minting: Score,
     /// Held-out scores for the projection arm, when one could be fitted.
     pub projection: Option<(Whitening, Score)>,
     pub projection_installed: bool,
@@ -155,6 +160,8 @@ impl Report {
             })).collect::<Vec<_>>(),
             "baseline": score_json(&self.baseline),
             "candidate": score_json(&self.candidate),
+            "baseline_minting": score_json(&self.baseline_minting),
+            "candidate_minting": score_json(&self.candidate_minting),
             "projection": self.projection.as_ref().map(|(w, s)| json!({
                 "shrinkage": w.shrinkage,
                 "power": w.power,
@@ -246,7 +253,7 @@ fn replay(
     row: &CalibrationRow,
     proj: Option<&Projection>,
     agg: calib::Aggregate,
-) -> Result<(Option<i64>, Option<Obs>)> {
+) -> Result<(Option<i64>, Option<Obs>, bool)> {
     let probe = match proj {
         None => row.embedding.clone(),
         Some(p) => p.apply(&row.embedding)?,
@@ -263,24 +270,45 @@ fn replay(
         margin: top.score - ranked.get(1).map(|c| c.score).unwrap_or(f32::NEG_INFINITY),
         truth: row.truth_speaker_id,
     });
-    let label = match crate::identity::decide_with(
+    let decision = crate::identity::decide_with(
         cfg,
         thresholds,
         row.overlap_frac,
         row.duration_s,
         row.words,
         &ranked,
-    ) {
+    );
+    let label = match decision {
         crate::identity::Decision::Matched { speaker_id, .. }
         | crate::identity::Decision::Pinned { speaker_id } => Some(speaker_id),
         // A mint is a decline against ground truth, not a wrong answer:
         // "nobody in the bank" is a different claim from "this person".
         _ => None,
     };
-    Ok((label, obs))
+    let minted = matches!(decision, crate::identity::Decision::Mint { .. });
+    Ok((label, obs, minted))
 }
 
-/// Score a set of rows under one operating point.
+/// A voice that does not exist. Standing in for "whichever `Speaker_NN` this
+/// turn would have minted", which is always the wrong answer to "who is this".
+const A_VOICE_NOBODY_HAS: i64 = i64::MIN;
+
+/// Score a set of rows under one operating point — **twice**.
+///
+/// The first score is the one every round before this one used: a label, or a
+/// decline. The second is the same rows with the **mint path** in, and it is
+/// the finding of §46 that the two are different measurements.
+///
+/// `analysis` does not decline. A turn nothing in the bank claims gets a *new
+/// voice*, seeded with its own audio, and the next turn of the same person
+/// matches that phantom because a same-evening recording outscores an older
+/// bank. Scoring a decline as a free non-answer therefore prices a threshold
+/// change at zero when its real cost is a cascade: on 2026-09-04 the gate saw
+/// a candidate go 0.848 → 0.897 and installed it, and with the mint path in the
+/// same pair is 0.771 → 0.123.
+///
+/// A mint is scored as a label the truth cannot match, because that is what it
+/// is: the turn leaves with a name, and the name is wrong.
 fn judge(
     cfg: &IdentityConfig,
     thresholds: &Thresholds,
@@ -289,8 +317,9 @@ fn judge(
     proj: Option<&Projection>,
     you: Option<i64>,
     agg: calib::Aggregate,
-) -> Result<Score> {
+) -> Result<(Score, Score)> {
     let mut s = Score::default();
+    let mut minting = Score::default();
     for row in rows {
         // The user's own account is not ground truth about audio captured
         // from the user's own Discord client (0.10.1): a client does not play
@@ -298,10 +327,18 @@ fn judge(
         if Some(row.truth_speaker_id) == you {
             continue;
         }
-        let (label, _) = replay(cfg, thresholds, bank, row, proj, agg)?;
+        let (label, _, minted) = replay(cfg, thresholds, bank, row, proj, agg)?;
         s.add(label, row.truth_speaker_id);
+        minting.add(
+            if minted {
+                Some(A_VOICE_NOBODY_HAS)
+            } else {
+                label
+            },
+            row.truth_speaker_id,
+        );
     }
-    Ok(s)
+    Ok((s, minting))
 }
 
 /// Project a whole bank once. Doing it per row would be the same matrix
@@ -310,6 +347,33 @@ fn project_bank(p: &Projection, bank: &Bank) -> Result<Bank> {
     bank.iter()
         .map(|(sp, src, e)| Ok((*sp, *src, p.apply(e)?)))
         .collect()
+}
+
+/// The mint-path veto (0.12.2).
+///
+/// [`calib::swap_is_safe`] on the *mint-aware* pair, and nothing else. It is
+/// deliberately only half of `may_install`: materiality is a rule about not
+/// churning an operating point for a row or two, and this is a rule about not
+/// installing a bar that invents people. A candidate that is mint-neutral has
+/// an identical pair here and passes; one that converts labels into mints loses
+/// precision here even when the label-only pair says it gained some.
+///
+/// Measured, on the pair the 2026-09-04 pass actually installed: label-only
+/// 0.848 → 0.897 (installed), mint-aware 0.771 → 0.123 (refused).
+fn mint_path_is_safe(baseline: &Score, candidate: &Score) -> bool {
+    calib::swap_is_safe(baseline, candidate) || no_worse(baseline, candidate)
+}
+
+/// A candidate that changes nothing about minting is not asked to *improve*
+/// it. `swap_is_safe` wants a strictly better F-beta, which a mint-neutral
+/// threshold change will not have, so the veto has to let an unchanged pair
+/// through or it would refuse every candidate on every install.
+fn no_worse(baseline: &Score, candidate: &Score) -> bool {
+    let (p0, p1) = (baseline.precision(), candidate.precision());
+    if p0.is_finite() && (!p1.is_finite() || p1 + 1e-9 < p0) {
+        return false;
+    }
+    candidate.f_beta(calib::BETA) + 1e-9 >= baseline.f_beta(calib::BETA)
 }
 
 /// Run the pass. `apply` is the only thing that separates the preview from the
@@ -414,13 +478,18 @@ pub fn calibrate(
         candidate.insert(v.speaker_id, v.threshold, v.margin);
     }
 
-    report.baseline = judge(cfg, &globals, &bank, &eval, None, you, base_agg)?;
-    report.candidate = judge(cfg, &candidate, &bank, &eval, None, you, base_agg)?;
+    (report.baseline, report.baseline_minting) =
+        judge(cfg, &globals, &bank, &eval, None, you, base_agg)?;
+    (report.candidate, report.candidate_minting) =
+        judge(cfg, &candidate, &bank, &eval, None, you, base_agg)?;
     // Safe AND worth it: `swap_is_safe` vetoes a precision loss,
     // `improvement_is_material` refuses to move the operating point for a row
-    // or two. Both, or nothing changes.
-    report.thresholds_swap =
-        !report.proposed.is_empty() && calib::may_install(&report.baseline, &report.candidate);
+    // or two. Both, or nothing changes — and both again with the mint path in,
+    // which is the veto §46 added: a bar that turns labels into *mints* looks
+    // free to the first pair and is a cascade in the second.
+    report.thresholds_swap = !report.proposed.is_empty()
+        && calib::may_install(&report.baseline, &report.candidate)
+        && mint_path_is_safe(&report.baseline_minting, &report.candidate_minting);
 
     // ---- step 2: a learned projection ------------------------------------
 
@@ -438,7 +507,7 @@ pub fn calibrate(
                 v: r.embedding.vector.clone(),
             })
             .collect();
-        let inner_base = judge(cfg, &globals, &bank, inner_eval, None, you, base_agg)?;
+        let (inner_base, _) = judge(cfg, &globals, &bank, inner_eval, None, you, base_agg)?;
         let mut best: Option<(f64, Whitening)> = None;
         for w in whitening_grid() {
             let Ok(p) = calib::fit_projection(&model_id, &inner_labelled, w) else {
@@ -447,7 +516,7 @@ pub fn calibrate(
             let Ok(pb) = project_bank(&p, &bank) else {
                 continue;
             };
-            let s = judge(cfg, &globals, &pb, inner_eval, Some(&p), you, base_agg)?;
+            let (s, _) = judge(cfg, &globals, &pb, inner_eval, Some(&p), you, base_agg)?;
             let f = s.f_beta(calib::BETA);
             // The inner baseline has to be beaten before a setting is even a
             // candidate: "the least bad whitening" is not a reason to whiten.
@@ -467,8 +536,9 @@ pub fn calibrate(
                 .collect();
             if let Ok(p) = calib::fit_projection(&model_id, &all, w) {
                 let pb = project_bank(&p, &bank)?;
-                let s = judge(cfg, &globals, &pb, &eval, Some(&p), you, base_agg)?;
-                report.projection_swap = calib::may_install(&report.baseline, &s);
+                let (s, sm) = judge(cfg, &globals, &pb, &eval, Some(&p), you, base_agg)?;
+                report.projection_swap = calib::may_install(&report.baseline, &s)
+                    && mint_path_is_safe(&report.baseline_minting, &sm);
                 report.projection = Some((w, s));
                 if apply && report.projection_swap {
                     let version = now_utc_ns;
@@ -521,15 +591,24 @@ pub fn calibrate(
     //   globals row rather than what the box is actually doing.
     {
         let mut arms: Vec<AggregateArm> = Vec::new();
+        // The mint-path score beside each arm's fitted score (§46): a rule
+        // whose bars convert labels into mints looks like "declined" to the
+        // label gate, so the swap has to clear `mint_path_is_safe` too.
+        let mut minting: Vec<(calib::Aggregate, Score)> = Vec::new();
         let mut grid = calib::aggregate_grid();
         if !grid.contains(&base_agg) {
             grid.insert(0, base_agg);
         }
         for a in grid {
-            let (g, f, thresholds) = if a == base_agg {
+            let (g, f, fm, thresholds) = if a == base_agg {
                 // Step 1 measured exactly this pair. Re-deriving it would be a
                 // second answer to one question.
-                (report.baseline, report.candidate, report.proposed.clone())
+                (
+                    report.baseline,
+                    report.candidate,
+                    report.candidate_minting,
+                    report.proposed.clone(),
+                )
             } else {
                 let obs: Vec<Obs> = fit
                     .iter()
@@ -546,12 +625,11 @@ pub fn calibrate(
                 for v in &props {
                     t.insert(v.speaker_id, v.threshold, v.margin);
                 }
-                (
-                    judge(cfg, &globals, &bank, &eval, None, you, a)?,
-                    judge(cfg, &t, &bank, &eval, None, you, a)?,
-                    props,
-                )
+                let (g, _) = judge(cfg, &globals, &bank, &eval, None, you, a)?;
+                let (f, fm) = judge(cfg, &t, &bank, &eval, None, you, a)?;
+                (g, f, fm, props)
             };
+            minting.push((a, fm));
             arms.push(AggregateArm {
                 rule: a,
                 globals: g,
@@ -561,12 +639,18 @@ pub fn calibrate(
             });
         }
         // The comparison that decides: the challenger's own operating point
-        // against the incumbent's own operating point.
+        // against the incumbent's own operating point — on labels AND on the
+        // mint path.
         let incumbent = arms
             .iter()
             .find(|x| x.incumbent)
             .map(|x| x.fitted)
             .unwrap_or(report.baseline);
+        let incumbent_minting = if arms.iter().any(|x| x.incumbent) {
+            report.candidate_minting
+        } else {
+            report.baseline_minting
+        };
         let best = arms
             .iter()
             .filter(|x| !x.incumbent)
@@ -578,7 +662,13 @@ pub fn calibrate(
             })
             .cloned();
         if let Some(b) = best {
-            report.aggregate_swap = calib::may_install(&incumbent, &b.fitted);
+            let bm = minting
+                .iter()
+                .find(|(r, _)| *r == b.rule)
+                .map(|(_, m)| *m)
+                .unwrap_or_default();
+            report.aggregate_swap = calib::may_install(&incumbent, &b.fitted)
+                && mint_path_is_safe(&incumbent_minting, &bm);
             report.aggregate = Some((b.rule, b.fitted));
             report.aggregate_thresholds = b.thresholds.clone();
             if apply && report.aggregate_swap {
@@ -771,8 +861,8 @@ pub fn repair_prototypes(
             .filter(|r| !consumed.contains(&r.segment_id))
             .collect();
         let repaired: Bank = store.prototypes_with_source_excluding(&model_id, &doomed)?;
-        let before = judge(cfg, &thresholds, &bank, &eval, None, you, agg)?;
-        let after = judge(cfg, &thresholds, &repaired, &eval, None, you, agg)?;
+        let (before, _) = judge(cfg, &thresholds, &bank, &eval, None, you, agg)?;
+        let (after, _) = judge(cfg, &thresholds, &repaired, &eval, None, you, agg)?;
         report.measured = Some((before, after));
     } else {
         report.note = Some("not enough truth to hold anything out".into());
@@ -785,6 +875,133 @@ pub fn repair_prototypes(
             REPAIR_OP,
             &json!(report.condemned.iter().map(|c| c.owner).collect::<Vec<_>>()).to_string(),
             &report.to_json().to_string(),
+            now_utc_ns,
+        )?;
+    }
+    Ok(report)
+}
+
+// ---- 0.12.2: `recalld identity repair --phantoms` ---------------------------
+
+/// The `operations` op the phantom repair writes its prior state under.
+pub const PHANTOM_OP: &str = "identity.repair_phantoms";
+
+/// What one phantom repair found.
+#[derive(Debug, Clone, Default)]
+pub struct PhantomReport {
+    pub found: Vec<crate::store::PhantomVoice>,
+    /// Voices absorbed, rows relabelled, prototypes carried over.
+    pub merged: usize,
+    pub relabelled: usize,
+    pub prototypes_moved: usize,
+    pub note: Option<String>,
+}
+
+impl PhantomReport {
+    /// Only the ones a run would act on.
+    pub fn candidates(&self) -> impl Iterator<Item = &crate::store::PhantomVoice> {
+        self.found.iter().filter(|p| p.target.is_some())
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "found": self.found.iter().map(|p| json!({
+                "speaker": p.speaker_id,
+                "name": p.name,
+                "prototypes": p.prototypes,
+                "condemned": p.condemned,
+                "rows": p.rows,
+                "covered": p.covered,
+                "says": p.says.iter().map(|(v, n, c)| json!({
+                    "speaker": v, "name": n, "rows": c,
+                })).collect::<Vec<_>>(),
+                "target": p.target.as_ref().map(|(v, n)| json!({"speaker": v, "name": n})),
+                "refused": p.refused,
+            })).collect::<Vec<_>>(),
+            "merged": self.merged,
+            "relabelled": self.relabelled,
+            "prototypes_moved": self.prototypes_moved,
+            "note": self.note,
+        })
+    }
+}
+
+/// Give a phantom voice's turns back to the person who spoke them.
+///
+/// ## Why this exists as well as `--prototypes`
+///
+/// `identity repair --prototypes` deletes the *vectors* a mint burst wrote and
+/// cannot touch the *labels*. On the 2026-09-04 archive that left nineteen
+/// unnamed voices holding 304 of Rowan's and Aspen's turns with no prototypes
+/// at all: nothing to delete, nothing to re-score, and held-out precision
+/// reading in the thirties purely from rows filed under a number (FINDINGS
+/// §46). This is the other half, and it is the half the user sees.
+///
+/// The conditions are [`crate::store::phantom_voices`]'s, and every one of them
+/// is a consistency check with no free parameter — the same reason
+/// `--prototypes` is an operator command rather than a nightly job: nothing
+/// here is fitted, so there is nothing to overfit, and nothing here is a
+/// judgement call, so a preview is the whole of the review.
+///
+/// Reversible: every row's prior `(speaker, label_via, match_score)` goes into
+/// `operations` before it changes, and the merge is a tombstone rather than a
+/// deletion.
+pub fn repair_phantoms(store: &Store, apply: bool, now_utc_ns: i64) -> Result<PhantomReport> {
+    let mut report = PhantomReport::default();
+    let Some(model_id) = store.embed_model_ids()?.into_iter().next() else {
+        report.note = Some("no embeddings, so nothing can be condemned".into());
+        return Ok(report);
+    };
+    report.found = store.phantom_voices(&model_id)?;
+    if !apply {
+        return Ok(report);
+    }
+
+    let mut prior = Vec::new();
+    let targets: Vec<i64> = report.candidates().map(|p| p.speaker_id).collect();
+    for id in targets {
+        // Re-read rather than trusting the census: the merge before this one
+        // may have re-pointed a tombstone, and a voice absorbed on the way past
+        // is not absorbed twice.
+        let Some(p) = store
+            .phantom_voices(&model_id)?
+            .into_iter()
+            .find(|p| p.speaker_id == id)
+        else {
+            continue;
+        };
+        let Some((target, _)) = p.target else {
+            continue;
+        };
+        let (rows, merge) = store.absorb_phantom(p.speaker_id, target)?;
+        report.merged += 1;
+        report.relabelled += rows.len();
+        report.prototypes_moved += merge.prototypes;
+        prior.push(json!({
+            "phantom": p.speaker_id,
+            "name": p.name,
+            "target": target,
+            "rows": rows.iter().map(|r| json!({
+                "segment": r.segment_id,
+                "speaker": r.speaker_id,
+                "label_via": r.label_via,
+                "match_score": r.match_score,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    if report.merged > 0 {
+        store.log_operation(
+            PHANTOM_OP,
+            &json!(
+                report
+                    .found
+                    .iter()
+                    .filter(|p| p.target.is_some())
+                    .map(|p| p.speaker_id)
+                    .collect::<Vec<_>>()
+            )
+            .to_string(),
+            &json!({"absorbed": prior, "summary": report.to_json()}).to_string(),
             now_utc_ns,
         )?;
     }
@@ -816,6 +1033,53 @@ pub fn reset(store: &Store, now_utc_ns: i64) -> Result<(usize, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 0.12.2: the gate prices the mint path ----------------------------
+
+    fn score(correct: u64, wrong: u64, declined: u64) -> Score {
+        let mut s = Score::default();
+        for _ in 0..correct {
+            s.add(Some(1), 1);
+        }
+        for _ in 0..wrong {
+            s.add(Some(2), 1);
+        }
+        for _ in 0..declined {
+            s.add(None, 1);
+        }
+        s
+    }
+
+    #[test]
+    fn the_gate_refuses_a_bar_whose_declines_are_really_mints() {
+        // The 2026-09-04 pair, both ways round. On labels alone the candidate
+        // is a clear win: precision 85.6% → 93.3%, F-0.5 0.848 → 0.897, and
+        // `may_install` said yes. With the mint path in — every one of those
+        // 129 extra declines being a new `Speaker_NN` seeded from the turn's
+        // own audio — the same pair is 0.771 → 0.123.
+        let label_only = (score(848, 143, 45), score(804, 58, 174));
+        assert!(
+            calib::may_install(&label_only.0, &label_only.1),
+            "the gate as it was: this is what it installed"
+        );
+        let minting = (score(227, 66, 7), score(35, 246, 19));
+        assert!(
+            !mint_path_is_safe(&minting.0, &minting.1),
+            "and this is the same evening priced honestly"
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_mints_no_more_than_the_incumbent_is_not_asked_to_improve() {
+        // The veto must not refuse every threshold change on every install: a
+        // mint-neutral candidate has an identical pair, and `swap_is_safe`
+        // alone would want a strictly better F-beta it cannot have.
+        let same = score(100, 5, 10);
+        assert!(mint_path_is_safe(&same, &same.clone()));
+        // But one that mints even a little more loses precision, and that is
+        // the whole of the veto.
+        assert!(!mint_path_is_safe(&same, &score(100, 9, 6)));
+    }
 
     #[test]
     fn a_report_with_nothing_in_it_still_renders() {

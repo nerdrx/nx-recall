@@ -655,6 +655,15 @@ impl Analyzer {
             // to be an identity. The embedding is already stored, so a later
             // reassignment or split still has the evidence — only the voicebank
             // is spared a row nobody could ever name (0.6.1).
+            // 0.12.2: the top candidate cleared the global operating point
+            // and failed only its own learned bar. No name, and no phantom.
+            Decision::Declined { best_score, bar } => {
+                debug!(
+                    segment_id,
+                    best_score, bar, "a fitted bar declined the turn: no new voice"
+                );
+                (None, None, false)
+            }
             Decision::TooSlight {
                 duration_s, words, ..
             } => {
@@ -1260,6 +1269,9 @@ pub struct AnalysisStats {
     pub mic_goldens: std::sync::atomic::AtomicU64,
     /// Turns that matched nobody and were too slight to mint a voice (0.6.1).
     pub too_slight: std::sync::atomic::AtomicU64,
+    /// Turns a voice's own **fitted** bar turned down, which under 0.12.2 is a
+    /// decline rather than a new identity (FINDINGS §46).
+    pub declined_fitted: std::sync::atomic::AtomicU64,
     /// Turns that took their name from the turns around them.
     pub proximity_labelled: std::sync::atomic::AtomicU64,
     /// Transcripts re-decoded under a language constraint, either direction.
@@ -1369,6 +1381,9 @@ impl AnalysisStats {
             }
             Decision::TooSlight { .. } => {
                 self.too_slight.fetch_add(1, Ordering::Relaxed);
+            }
+            Decision::Declined { .. } => {
+                self.declined_fitted.fetch_add(1, Ordering::Relaxed);
             }
             Decision::Pinned { .. } => {
                 self.labelled.fetch_add(1, Ordering::Relaxed);
