@@ -938,7 +938,7 @@ mod tests {
         let topics = store.topics(5).unwrap();
         assert_eq!(topics.len(), 1);
         eprintln!("topic: {:?}", topics[0].topic);
-        assert!(store.graph_counts().unwrap().threads_pending == 0);
+        assert!(store.graph_counts(3).unwrap().threads_waiting == 0);
     }
 
     /// The refusal path, which is the one the bake-off was really about: the

@@ -485,6 +485,28 @@ impl Control {
         self
     }
 
+    /// Flip the pass on or off while it is running, and say what it is now.
+    ///
+    /// Live because [`crate::mood::run`] re-reads this handle at the top of
+    /// every loop and [`crate::mood::gate`] re-reads it between rows: turning
+    /// the switch off stops the pass within one row, and turning it on starts
+    /// it at the next look, which is at most a minute away. Nothing is
+    /// interrupted mid-clip — the same rule `set_graph_enabled` follows, for
+    /// the same reason.
+    ///
+    /// `None` leaves a field alone, so a client can flip `enabled` without
+    /// also having an opinion about the capture path.
+    pub fn set_mood(&self, enabled: Option<bool>, live: Option<bool>) -> crate::config::MoodConfig {
+        let mut guard = self.mood.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = enabled {
+            guard.enabled = e;
+        }
+        if let Some(l) = live {
+            guard.live = l;
+        }
+        guard.clone()
+    }
+
     /// Minutes since the last turn was written, or since the daemon started if
     /// none has been.
     ///

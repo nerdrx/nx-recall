@@ -398,6 +398,26 @@ Needs the running daemon: the switch is live and every client has to be told.")]
         action: GraphAction,
     },
 
+    // ---- 0.12.5, the mood pass's own switch ----------------------------
+    /// How a turn sounded: laughter, music, and an emotion tag on the audio
+    /// (docs/PROTOCOL.md "0.12.4 — how a turn sounded").
+    #[command(long_about = "\
+How a turn sounded: laughter, music, and an emotion tag read off the audio
+already on disk. OFF by default — listening to a whole archive is not
+something to start unasked.
+
+  recalld mood        whether it is on, and how much of the archive is read
+  recalld mood on     start listening, overnight, on the niced cores
+  recalld mood off    stop; tags already written stay
+
+Live like every other switch here: `recalld mood on` takes effect within a
+minute, no restart needed, and is written to config.toml so it survives one.")]
+    Mood {
+        #[arg(value_enum, default_value_t = MoodAction::Status)]
+        action: MoodAction,
+    },
+    // ---- end 0.12.5 -------------------------------------------------------
+
     // ---- 0.8.0, the product round -------------------------------------
     /// Ask the transcript a question in your own words.
     // Verbatim: clap would reflow the examples into one paragraph.
@@ -881,6 +901,17 @@ pub enum GraphAction {
     Commitments,
     /// The conversation labels in use.
     Topics,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoodAction {
+    /// Whether the pass is on and how much of the archive it has read.
+    /// Changes nothing.
+    Status,
+    /// Start listening overnight, on the same niced cores as the night shift.
+    On,
+    /// Stop. Tags already written stay; the transcript is never touched.
+    Off,
 }
 
 #[derive(Subcommand, Debug)]

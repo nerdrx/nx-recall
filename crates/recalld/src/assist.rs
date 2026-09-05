@@ -16,9 +16,11 @@
 //! On top of it, one rule of its own: **the enrichment queue comes first.**
 //! Commitments are what somebody is waiting on; a paragraph about last night
 //! and a translation of a turn already on screen are not. So the worker looks
-//! at `graph_counts().threads_pending` and stands down while there is anything
+//! at `graph_counts().threads_waiting` and stands down while there is anything
 //! left to enrich — which is what "runs after the enrichment queue is empty"
-//! means in code.
+//! means in code. **`threads_waiting`, not `threads_pending`** (0.12.5): the
+//! conversations too short for the enrichment worker to ever open are unread
+//! for ever, and yielding to them is yielding to nobody.
 //!
 //! ## Order within the tick
 //!
@@ -107,9 +109,18 @@ pub fn gate(store: &Arc<std::sync::Mutex<Store>>, control: &Arc<Control>) -> Opt
     if let Some(reason) = crate::enrich::gate(control, &graph) {
         return Some(reason);
     }
+    // 0.12.5: `threads_waiting`, not `threads_pending`. The two differ by the
+    // conversations too short for the enrichment worker to ever take, and on
+    // this install that difference was 907 of 919 — so "stand down while the
+    // enrichment queue has anything in it" meant standing down for ever
+    // behind work nobody was going to do. The queue that wins the tie has to
+    // be the queue that empties.
     let pending = {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-        guard.graph_counts().map(|c| c.threads_pending).unwrap_or(0)
+        guard
+            .graph_counts(graph.min_thread_segments)
+            .map(|c| c.threads_waiting)
+            .unwrap_or(0)
     };
     // Promises first — but not promises ONLY. 0.10.1: with a few hundred
     // conversations queued and new ones arriving all evening, "stand down while
@@ -478,7 +489,7 @@ mod tests {
                     .unwrap();
                 crate::threads::assign(&guard, &GraphConfig::default(), id).unwrap();
             }
-            assert!(guard.graph_counts().unwrap().threads_pending > 0);
+            assert!(guard.graph_counts(3).unwrap().threads_waiting > 0);
         }
         // Fresh daemon, never ran: the assistant gets its first pass at once
         // (0.10.1) — the old absolute priority starved it for ever.

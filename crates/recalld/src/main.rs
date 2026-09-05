@@ -42,7 +42,8 @@ use recalld::truthnet;
 
 use crate::cli::{
     AccuracyAction, Cli, Command, GraphAction, IdentityAction, LangAction, MicAction, ModelsAction,
-    NightBackend, NotesAction, SemanticAction, SpeakersAction, TruthAction, TurnsAction,
+    MoodAction, NightBackend, NotesAction, SemanticAction, SpeakersAction, TruthAction,
+    TurnsAction,
 };
 
 fn main() -> Result<()> {
@@ -240,6 +241,9 @@ fn main() -> Result<()> {
         Command::Resume => cmd_pause(&cfg, &data_dir, false),
         Command::Status => cmd_status(&cfg, &data_dir),
         Command::Graph { action } => cmd_graph(&cfg, &data_dir, action),
+        // ---- 0.12.5, the mood pass's own switch -------------------------
+        Command::Mood { action } => cmd_mood(&cfg, &data_dir, action),
+        // ---- end 0.12.5 --------------------------------------------------
         // ---- 0.8.0, the product round ---------------------------------
         Command::Ask { question, limit } => cmd_ask(&cfg, &data_dir, &question.join(" "), limit),
         Command::Notes { action } => cmd_notes(&cfg, &data_dir, action),
@@ -554,7 +558,15 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
             .ok()
     };
     if cfg.graph.enabled {
-        info!("the memory graph's local model is enabled; it runs only while nothing is captured");
+        // 0.12.5: this used to say "runs only while nothing is captured",
+        // which stopped being true when the worker started standing down on
+        // `enrich::gate` instead — it now works between conversations no
+        // matter what is on screen, and only stands down while audio is
+        // still queued for transcription, or while capture is paused.
+        info!(
+            "the memory graph's local model is enabled; it stands down only while \
+             audio is still queued for transcription, or while capture is paused"
+        );
     }
 
     // The accuracy round's idle worker (0.8.0). Started for the same reason
@@ -2880,7 +2892,7 @@ fn cmd_graph(cfg: &Config, data_dir: &Path, action: GraphAction) -> Result<()> {
         "{:<20}{}",
         "local model",
         if config["enabled"].as_bool() == Some(true) {
-            "on — runs only while nothing is being captured"
+            "on — stands down only while audio is queued for transcription, or while paused"
         } else {
             "off (the default)"
         }
@@ -2929,13 +2941,17 @@ fn cmd_graph(cfg: &Config, data_dir: &Path, action: GraphAction) -> Result<()> {
             n("from_llm")
         );
         println!("{:<20}{}", "time references", n("time_refs"));
+        let floor = n("min_thread_segments").max(1);
         println!(
-            "{:<20}{} label(s) over {} of {} conversation(s), {} not looked at yet",
+            "{:<20}{} label(s) over {} of {} conversation(s), {} waiting, {} too short to \
+             read (under {} turns)",
             "topics",
             n("topics"),
             n("threads_enriched"),
             n("threads"),
-            n("threads_pending"),
+            n("threads_waiting"),
+            n("threads_too_short"),
+            floor,
         );
     }
     if let Some(err) = state["last_error"].as_str() {
@@ -2944,6 +2960,53 @@ fn cmd_graph(cfg: &Config, data_dir: &Path, action: GraphAction) -> Result<()> {
     println!("\nNothing here leaves the machine, and nothing acts on a guess.");
     Ok(())
 }
+
+// ---- 0.12.5, the mood pass's own switch ------------------------------------
+
+/// `recalld mood` — how a turn sounded (docs/PROTOCOL.md "0.12.4 — how a turn
+/// sounded"). Over the socket, live and persisted, `graph`'s pattern exactly.
+fn cmd_mood(cfg: &Config, data_dir: &Path, action: MoodAction) -> Result<()> {
+    let out = match action {
+        MoodAction::On => call(cfg, data_dir, "mood.set", json!({"enabled": true}))?,
+        MoodAction::Off => call(cfg, data_dir, "mood.set", json!({"enabled": false}))?,
+        MoodAction::Status => call(cfg, data_dir, "mood.get", json!({}))?,
+    };
+    let on = out["enabled"].as_bool().unwrap_or(false);
+    println!(
+        "{:<20}{}",
+        "the mood pass",
+        if on {
+            "on — listening overnight, on the niced cores"
+        } else {
+            "off (the default)"
+        }
+    );
+    if !out["available"].as_bool().unwrap_or(true) {
+        println!(
+            "{:<20}{}",
+            "decoder",
+            out["how"]
+                .as_str()
+                .unwrap_or("the decoder this needs is not installed")
+        );
+    }
+    // Newest turns first (0.12.5): what somebody just said is what the pass
+    // reaches first, not the tail of a two-year archive.
+    println!(
+        "{:<20}{} read, {} to go — newest first",
+        "backlog",
+        out["read_total"].as_i64().unwrap_or(0),
+        out["backlog"].as_i64().unwrap_or(0),
+    );
+    if !out["rendered"].as_bool().unwrap_or(false)
+        && let Some(why) = out["why"].as_str()
+    {
+        println!("\n{why}");
+    }
+    Ok(())
+}
+
+// ---- end 0.12.5 -------------------------------------------------------------
 
 fn cmd_graph_commitments(cfg: &Config, data_dir: &Path) -> Result<()> {
     let out = call(cfg, data_dir, "commitments.list", json!({}))?;

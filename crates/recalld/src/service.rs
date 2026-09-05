@@ -584,6 +584,10 @@ impl Service {
             "assist.get" => self.assist_get(),
             "assist.set" => self.assist_set(req),
             // ---- end 0.10.2 -------------------------------------------------
+            // ---- 0.12.5, the mood pass's own switch -------------------------
+            "mood.get" => self.mood_get(),
+            "mood.set" => self.mood_set(req),
+            // ---- end 0.12.5 --------------------------------------------------
             "transcript" => self.transcript(req),
             "roster.now" => self.roster_now(),
             "operations.list" => self.operations_list(req),
@@ -764,6 +768,54 @@ impl Service {
                 "last_run_ms": stats.last_run_ms.load(Ordering::Relaxed),
             },
         })
+    }
+
+    /// `mood.get` — the same block `status` carries under `mood`, for a
+    /// client that wants just this and not a full status round trip.
+    fn mood_get(&self) -> Result<Value, Error> {
+        let store = self.store();
+        Ok(self.mood_json(&store))
+    }
+
+    /// `mood.set {enabled?}` (0.12.5) — the night-listening switch.
+    ///
+    /// Live and persisted, `graph.set`'s pattern exactly: the pass
+    /// ([`crate::mood::run`]) re-reads [`Control::mood`] at the top of every
+    /// loop, at most a minute away, so nothing here needs a restart or a
+    /// signal — and persisted because a switch that forgets by morning is not
+    /// a switch a person can rely on.
+    fn mood_set(&self, req: &Request) -> Result<Value, Error> {
+        let enabled = req.opt_bool("enabled")?;
+        if enabled.is_none() {
+            return Err(Error::params("mood.set needs enabled"));
+        }
+        let cfg = self.control.set_mood(enabled, None);
+
+        let mut persisted = false;
+        if let Some(path) = &self.control.config_path {
+            match Config::load(path) {
+                Ok(mut file) => {
+                    file.mood.enabled = cfg.enabled;
+                    match file.save(path) {
+                        Ok(()) => persisted = true,
+                        Err(e) => warn!("could not persist the mood settings: {e:#}"),
+                    }
+                }
+                Err(e) => warn!("could not re-read the config to persist the mood pass: {e:#}"),
+            }
+        }
+        info!(
+            enabled = cfg.enabled,
+            persisted, "the mood pass's switch changed"
+        );
+        // The pass reads the switch at most a minute from now, so a client
+        // would otherwise see nothing move for up to a minute. Say what is
+        // true now, the way `apply_graph` does for its own worker.
+        self.announce_status();
+        let store = self.store();
+        let mut payload = self.mood_json(&store);
+        payload["persisted"] = json!(persisted);
+        Ok(payload)
     }
 
     fn asr_quality_json(&self) -> Value {
@@ -2894,8 +2946,11 @@ impl Service {
     /// Everything the Memory view needs to paint itself once, in one round trip
     /// — the same argument the person page makes.
     fn graph_summary(&self) -> Result<Value, Error> {
-        let counts = self.store().graph_counts().map_err(Error::from)?;
         let cfg = self.control.graph();
+        let counts = self
+            .store()
+            .graph_counts(cfg.min_thread_segments)
+            .map_err(Error::from)?;
         Ok(json!({
             "counts": {
                 "time_refs": counts.time_refs,
@@ -2910,7 +2965,21 @@ impl Service {
                 "topics": counts.topics,
                 "threads": counts.threads,
                 "threads_enriched": counts.threads_enriched,
+                // 0.12.5. `threads_pending` is kept, unchanged, because it is
+                // what an older client reads — but it is NOT the queue, and a
+                // card that draws it as one says "919 waiting" beside a worker
+                // that is honestly idle. The two numbers under it are the
+                // split: `threads_waiting` is `unenriched_threads`' own filter
+                // and is the only one that can reach zero by being worked, and
+                // `threads_too_short` is the remainder, which never will be.
+                // waiting + too_short == pending, always.
                 "threads_pending": counts.threads_pending,
+                "threads_waiting": counts.threads_waiting,
+                "threads_too_short": counts.threads_too_short,
+                // The floor the split was measured at, so a client can write
+                // "under 3 turns" without hard-coding a number that the config
+                // can move underneath it.
+                "min_thread_segments": cfg.min_thread_segments,
             },
             "enrichment": self.control.graph_state().to_json(),
             "config": self.graph_config_json(&cfg),

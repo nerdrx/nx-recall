@@ -1173,7 +1173,26 @@ pub struct GraphCounts {
     pub topics: i64,
     pub threads: i64,
     pub threads_enriched: i64,
+    /// Unenriched conversations with at least one turn that has words.
+    ///
+    /// **Not the worker's queue** — see [`Self::threads_waiting`]. Kept
+    /// because it is the honest answer to "how many are unread", and because
+    /// splitting it is the whole point of the pair below.
     pub threads_pending: i64,
+    /// Unenriched conversations the worker will actually take: `pending`,
+    /// narrowed to those with at least `[graph].min_thread_segments` turns
+    /// that have words. This is [`Store::unenriched_threads`]'s filter, term
+    /// for term.
+    pub threads_waiting: i64,
+    /// The rest of `pending`: unread, and short enough that the worker will
+    /// never read them. `waiting + too_short == pending`.
+    ///
+    /// These exist because 0.12.4 counted `pending` and called it "waiting",
+    /// so a card could say *"919 waiting"* beside a chip that honestly said
+    /// *"idle — nothing left to read"*. Both were true and together they were
+    /// a bug report. A conversation of two turns is not a backlog; it is a
+    /// conversation the model was never going to be shown.
+    pub threads_too_short: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -5521,7 +5540,15 @@ impl Store {
     }
 
     /// How much of the graph exists, in one query per number.
-    pub fn graph_counts(&self) -> Result<GraphCounts> {
+    ///
+    /// `min_thread_segments` is `[graph].min_thread_segments` — the worker's
+    /// own floor, passed in rather than assumed, because the split between
+    /// "waiting" and "too short to read" is only meaningful at the number the
+    /// worker is actually running under. Handing this the default while the
+    /// daemon runs at something else would produce exactly the class of
+    /// report 0.12.5 exists to stop: a table describing a machine nobody is
+    /// running.
+    pub fn graph_counts(&self, min_thread_segments: i64) -> Result<GraphCounts> {
         let one = |sql: &str| -> Result<i64> { Ok(self.conn.query_row(sql, [], |r| r.get(0))?) };
         // Every count is scoped to live segments, for the same reason the reads
         // are: a hidden row must not be counted in a summary the user reads.
@@ -5542,6 +5569,29 @@ impl Store {
         };
         let candidates = by_state(commitment_state::CANDIDATE)?;
         let confirmed = by_state(commitment_state::CONFIRMED)?;
+
+        // Unread conversations with anything to read at all, and the subset
+        // the worker will take. `waiting` is written to be the same predicate
+        // as `unenriched_threads`, because the number on the card and the
+        // number the worker acts on have to be one number: 0.12.4 had two,
+        // and the card spent an evening saying "919 waiting" next to "nothing
+        // left to read".
+        let with_words = "EXISTS (SELECT 1 FROM segments g
+                          WHERE g.thread_id = t.id AND g.deleted_at IS NULL
+                            AND g.text IS NOT NULL AND TRIM(g.text) <> '')";
+        let pending = one(&format!(
+            "SELECT COUNT(*) FROM threads t WHERE t.enriched_at IS NULL AND {with_words}"
+        ))?;
+        let waiting: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM threads t
+             WHERE t.enriched_at IS NULL
+               AND (SELECT COUNT(*) FROM segments g
+                    WHERE g.thread_id = t.id AND g.deleted_at IS NULL
+                      AND g.text IS NOT NULL AND TRIM(g.text) <> '') >= ?1",
+            params![min_thread_segments],
+            |r| r.get(0),
+        )?;
+
         Ok(GraphCounts {
             time_refs: one("SELECT COUNT(*) FROM time_refs t
                  JOIN segments g ON g.id = t.segment_id AND g.deleted_at IS NULL")?,
@@ -5558,11 +5608,14 @@ impl Store {
                  WHERE topic IS NOT NULL AND TRIM(topic) <> ''")?,
             threads: one("SELECT COUNT(*) FROM threads")?,
             threads_enriched: one("SELECT COUNT(*) FROM threads WHERE enriched_at IS NOT NULL")?,
-            threads_pending: one("SELECT COUNT(*) FROM threads t
-                 WHERE t.enriched_at IS NULL
-                   AND EXISTS (SELECT 1 FROM segments g
-                               WHERE g.thread_id = t.id AND g.deleted_at IS NULL
-                                 AND g.text IS NOT NULL AND TRIM(g.text) <> '')")?,
+            threads_pending: pending,
+            threads_waiting: waiting,
+            // Subtracted rather than counted, so the identity
+            // `waiting + too_short == pending` holds by construction and
+            // cannot drift the way two independently-written WHERE clauses
+            // eventually do. It is the arithmetic that makes the card's three
+            // numbers add up.
+            threads_too_short: (pending - waiting).max(0),
         })
     }
 
@@ -6675,10 +6728,12 @@ impl Store {
     /// Schema v18: how a turn sounded.
     ///
     /// Three nullable columns and one index. No backfill — see the banner at
-    /// the top of this file. The index is the pass's own queue, in the shape
-    /// the sweep's is (`mood_at_ns IS NULL`, oldest first), so a walk over a
+    /// the top of this file. The index is the pass's own queue
+    /// (`mood_at_ns IS NULL`, then by capture time), so a walk over a
     /// twenty-thousand-row archive is a range scan rather than a table scan
-    /// every minute for the life of the daemon.
+    /// every minute for the life of the daemon. The queue is drained **newest
+    /// first** ([`Store::segments_for_mood`]); the index serves either
+    /// direction, because a B-tree read backwards is still a range scan.
     fn apply_v18(&self) -> Result<()> {
         self.add_column_if_missing("segments", "mood", "TEXT")?;
         self.add_column_if_missing("segments", "events", "TEXT")?;
@@ -6704,6 +6759,18 @@ impl Store {
     /// §42.5, where "the decoder had no words for this clip" turned out to be
     /// the only proxy on this corpus with enough positives to separate
     /// anything.
+    ///
+    /// **Newest first**, unlike the sweep's queue and unlike every other
+    /// backlog here. What was just said is what somebody opens the transcript
+    /// to look at tonight; the tail of a two-year archive can wait, and at
+    /// RTF 0.08 it will not wait long. The walk stays resumable for exactly
+    /// the reason it did when it ran the other way — the cursor is
+    /// `mood_at_ns IS NULL` and not an offset, so a row stamped by one batch
+    /// is gone from the next one whichever end the pass started at, and a
+    /// daemon killed mid-archive resumes where it stopped rather than at the
+    /// beginning. Rows captured *while* the pass is running are newer than
+    /// anything it has read and are therefore taken first, which is the
+    /// behaviour the ordering is for.
     pub fn segments_for_mood(
         &self,
         min_duration_s: f32,
@@ -6719,7 +6786,7 @@ impl Store {
                    AND g.mood_at_ns IS NULL
                    AND g.audio_path <> ''
                    AND g.t_end_ns - g.t_start_ns >= ?1
-                 ORDER BY g.t_start_ns
+                 ORDER BY g.t_start_ns DESC
                  LIMIT ?2",
             )?
             .query_map(params![min_ns, limit.max(1) as i64], |r| {
@@ -9925,13 +9992,14 @@ mod tests {
 
         // The queue skips the row with no audio, and there is nothing to skip
         // it FOR — this is the filter `mood_counts` has to match term for term.
+        // Newest first: `quiet` starts at 4s and `heard` at 0s.
         let queued: Vec<i64> = s
             .segments_for_mood(1.0, 10)
             .unwrap()
             .into_iter()
             .map(|c| c.id)
             .collect();
-        assert_eq!(queued, vec![heard, quiet]);
+        assert_eq!(queued, vec![quiet, heard]);
         assert_eq!(s.mood_counts(1.0).unwrap(), (2, 0));
 
         // A short row is never queued at all, whatever the floor is doing.
@@ -9992,6 +10060,98 @@ mod tests {
             )
             .unwrap();
         assert_eq!(src_totals, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0.12.5. **The latest thing said is the first thing read.**
+    ///
+    /// The pass used to drain oldest first, which is right for a sweep whose
+    /// output nobody looks at and wrong for this one: the reason to know a
+    /// turn had laughter on it is that somebody is about to open tonight's
+    /// transcript. On an archive with two years in it, oldest-first means the
+    /// row captured five minutes ago is stamped last — after every one of the
+    /// twenty thousand before it.
+    ///
+    /// Two properties, and the second is the one that makes the first safe:
+    /// the head of the queue is the newest unstamped row, and the walk is
+    /// still **resumable** — stamping a batch removes it from the next query,
+    /// so the pass converges on an empty queue from either end and a daemon
+    /// killed halfway does not start again at the top.
+    #[test]
+    fn the_mood_pass_reads_the_newest_turns_first() {
+        let dir = std::env::temp_dir().join(format!("nxr-mood-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).unwrap();
+        let src = s.upsert_source("VRChat.exe", "VRChat.exe", 1).unwrap();
+        let sess = s.begin_session(src, 0).unwrap();
+
+        // Ten seconds of archive, inserted oldest-first so that insertion
+        // order and capture order agree — if the query were falling back on
+        // rowid it would still look right, which is why the assertion below
+        // names the ids rather than counting them.
+        let mut ids = Vec::new();
+        for i in 0..6i64 {
+            let t0 = i * 10_000_000_000;
+            ids.push(
+                s.insert_segment(sess, t0, t0 + 3_000_000_000, &format!("{i}.wav"), 0)
+                    .unwrap(),
+            );
+        }
+
+        let first: Vec<i64> = s
+            .segments_for_mood(1.0, 2)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(
+            first,
+            vec![ids[5], ids[4]],
+            "the pass started at the beginning of history instead of at tonight"
+        );
+
+        // Resumable: stamp what came back and the next batch is the next two
+        // down, never the same two again.
+        for id in &first {
+            s.set_segment_mood(*id, None, None, 1).unwrap();
+        }
+        let second: Vec<i64> = s
+            .segments_for_mood(1.0, 2)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(second, vec![ids[3], ids[2]]);
+
+        // A turn captured WHILE the pass is working is newer than everything
+        // it has read, so it goes to the head of the queue rather than to the
+        // back of a two-year line. This is the whole point of the ordering.
+        let just_now = s
+            .insert_segment(sess, 900_000_000_000, 903_000_000_000, "now.wav", 0)
+            .unwrap();
+        assert_eq!(
+            s.segments_for_mood(1.0, 1).unwrap()[0].id,
+            just_now,
+            "a turn said just now queued behind the archive"
+        );
+
+        // And the queue still empties, which is the property 0.12.4's test
+        // exists to protect and which reordering must not cost.
+        loop {
+            let batch = s.segments_for_mood(1.0, 4).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for c in batch {
+                s.set_segment_mood(c.id, None, None, 1).unwrap();
+            }
+        }
+        assert_eq!(
+            s.mood_counts(1.0).unwrap().0,
+            0,
+            "the backlog never drained"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
