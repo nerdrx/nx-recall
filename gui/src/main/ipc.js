@@ -128,6 +128,15 @@ const ALLOWED = new Set([
   // below — the daemon refuses a path that is not an absolute local one.
   'export.preview',
   'export.run',
+  // A backup you can trust (0.13.0). Reachable from the Backup card's choose
+  // folder / back up now / verify buttons and its schedule switch — none of
+  // it can reach anywhere but the folder the user picked in the dialog below,
+  // the same rule the export methods above already keep.
+  'backup.create',
+  'backup.verify',
+  'backup.restore',
+  'backup.get',
+  'backup.set',
   // The Discord ground-truth bridge (0.9.0), surfaced in the Sources view.
   // Four reads and two writes, all of them behind controls the card offers.
   'truth.status',
@@ -155,7 +164,7 @@ export function broadcast(channel, payload) {
 /// the renderer's own toast is where the whole thing is readable anyway.
 const MAX_NOTIFY = 220;
 
-export function registerIpc({ request, setPaused, getState, showWindow, relaunch, captions, notify, chooseFolder, openFolder }) {
+export function registerIpc({ request, setPaused, getState, showWindow, relaunch, captions, notify, chooseFolder, openFolder, chooseBackupFolder, openBackupFolder }) {
   ipcMain.handle('recall:request', async (_e, method, params) => {
     if (!ALLOWED.has(method)) return { ok: false, err: { code: 'refused', msg: `method ${method} is not exposed to the UI` } };
     try {
@@ -228,4 +237,12 @@ export function registerIpc({ request, setPaused, getState, showWindow, relaunch
   ipcMain.handle('recall:export:chooseFolder', () => chooseFolder());
   ipcMain.handle('recall:export:openFolder', (_e, dir) => openFolder(String(dir ?? '')));
   // ---- end 0.10.0 ----------------------------------------------------------
+
+  // ---- 0.13.0, a backup you can trust ---------------------------------------
+  // Same reasoning as the export folder pair above: the renderer cannot name a
+  // directory itself, only ask for the native dialog and get back what was
+  // picked in it.
+  ipcMain.handle('recall:backup:chooseFolder', () => chooseBackupFolder());
+  ipcMain.handle('recall:backup:openFolder', (_e, dir) => openBackupFolder(String(dir ?? '')));
+  // ---- end 0.13.0 ------------------------------------------------------------
 }

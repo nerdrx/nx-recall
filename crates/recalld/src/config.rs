@@ -1477,6 +1477,37 @@ impl Default for RetentionConfig {
     }
 }
 
+/// The scheduled backup (0.13.0): a periodic `backup create` the night shift's
+/// idle-priority discipline runs unattended, into a folder the user picked
+/// once. `dir: None` means "never scheduled" — the CLI and the socket method
+/// both still work with no `[backup]` section at all, since a person can
+/// always ask for one by hand.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackupConfig {
+    pub enabled: bool,
+    /// Where scheduled backups are written. Each run gets its own
+    /// timestamped subdirectory, so `keep` has generations to prune between.
+    pub dir: Option<PathBuf>,
+    /// How often a scheduled backup runs.
+    pub every_days: u32,
+    /// How many generations under `dir` to keep. The oldest beyond this is
+    /// removed after a new one verifies clean — never before, so a run that
+    /// fails partway never costs the previous good copy.
+    pub keep: u32,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: None,
+            every_days: 7,
+            keep: 4,
+        }
+    }
+}
+
 // ---- 0.9.0 (ground truth from Discord) ------------------------------------
 
 /// Ground truth from Discord (0.9.0): a loopback ingest the Vencord plugin
@@ -1632,6 +1663,10 @@ pub struct Config {
     pub retention: RetentionConfig,
     /// Ground truth from Discord (0.9.0). Off by default.
     pub truth: TruthConfig,
+    /// The scheduled backup (0.13.0). Off (`dir: None`) until a folder is
+    /// chosen — there is no sensible default destination for a copy of
+    /// somebody's recordings, the same reason `[room]` has no default device.
+    pub backup: BackupConfig,
     /// Keyed on the match key (see `allowlist::SourceIdent::match_key`).
     pub rules: BTreeMap<String, Rule>,
 }

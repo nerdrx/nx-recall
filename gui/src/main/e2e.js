@@ -4282,6 +4282,73 @@ export function runE2E(deps) {
 
     // ---- end 0.10.0 --------------------------------------------------------
 
+    // 0.13.0 — a backup you can trust. The drill: back a snapshot up, verify
+    // it clean, corrupt one byte in the copy, and watch verify catch it.
+    await step('backup-creates-and-verifies-a-snapshot', async () => {
+      const dir = join(OUT, `backup${SUFFIX}`);
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      process.env.NX_RECALL_E2E_BACKUP_DIR = dir;
+
+      await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await waitFor('the backup card', async () => js('!!document.getElementById("backup-card")'));
+
+      await js('document.getElementById("backup-choose").click()');
+      await waitFor('the folder to be chosen', async () => {
+        const c = await js('window.__recallDebug.backupCard()');
+        return c.dir.includes(dir) ? c : null;
+      });
+
+      await js('document.getElementById("backup-create").click()');
+      const done = await waitFor(
+        'the backup to finish',
+        async () => {
+          const c = await js('window.__recallDebug.backupCard()');
+          return c.done ? c : null;
+        },
+        { timeout: 20000, every: 200 }
+      );
+      const written = readdirSync(dir);
+      assert(written.includes('recall.db'), `recall.db was not written: ${JSON.stringify(written)}`);
+      assert(written.includes('manifest.json'), `manifest.json was not written: ${JSON.stringify(written)}`);
+      assert(written.includes('manifest.sig'), `manifest.sig was not written: ${JSON.stringify(written)}`);
+      assert(done.openable, 'no way to open the folder after a backup');
+
+      await js('document.getElementById("backup-verify").click()');
+      const clean = await waitFor(
+        'the verify to finish clean',
+        async () => {
+          const c = await js('window.__recallDebug.backupCard()');
+          return c.verifyResult ? c : null;
+        },
+        { timeout: 15000, every: 200 }
+      );
+      assert(/verified clean/i.test(clean.verifyResult), `verify did not report clean: ${clean.verifyResult}`);
+
+      // The drill: corrupt one byte in the copy, and verify must catch it.
+      const dbPath = join(dir, 'recall.db');
+      const bytes = readFileSync(dbPath);
+      bytes[Math.floor(bytes.length / 2)] ^= 0xff;
+      writeFileSync(dbPath, bytes);
+
+      await js('document.getElementById("backup-verify").click()');
+      const corrupted = await waitFor(
+        'the verify to catch the corruption',
+        async () => {
+          const c = await js('window.__recallDebug.backupCard()');
+          return c.verifyResult && !/verified clean/i.test(c.verifyResult) ? c : null;
+        },
+        { timeout: 15000, every: 200 }
+      );
+      assert(/did not verify/i.test(corrupted.verifyResult), `a corrupted backup still verified clean: ${corrupted.verifyResult}`);
+
+      await js('document.getElementById("backup-card").scrollIntoView({block: "start"})');
+      const file = await shot('sources-backup');
+      return { written, verify: clean.verifyResult, corrupted: corrupted.verifyResult, file };
+    });
+
+    // ---- end 0.13.0 ----------------------------------------------------------
+
     // 12d — native widgets Chromium draws outside the page (a <select> option
     // popup above all) take their colours from `color-scheme` and from nothing
     // we can style. It used to be pinned to dark because the app had one ground;

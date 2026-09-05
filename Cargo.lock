@@ -1806,6 +1806,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "sherpa-rs",
  "tar",
  "tokenizers",

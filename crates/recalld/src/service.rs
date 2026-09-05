@@ -597,6 +597,13 @@ impl Service {
             "export.preview" => self.export_preview(req),
             "export.run" => self.export_run(req),
             // ---- end 0.10.0 ----------------------------------------------
+            // ---- 0.13.0, a backup you can trust ---------------------------
+            "backup.create" => self.backup_create(req),
+            "backup.verify" => self.backup_verify(req),
+            "backup.restore" => self.backup_restore(req),
+            "backup.get" => self.backup_get(),
+            "backup.set" => self.backup_set(req),
+            // ---- end 0.13.0 ------------------------------------------------
             other => Err(Error::new(
                 "unknown_method",
                 format!("no method named {other:?}"),
@@ -999,6 +1006,12 @@ impl Service {
             // place, so the reason travels with the refusal.
             "mood": self.mood_json(&store),
             // ---- end 0.12.4 --------------------------------------------------
+            // ---- 0.13.0: the scheduled backup -------------------------------
+            // Always present, like every block on this page: a client must be
+            // able to tell "no backup has ever run" from "an older daemon that
+            // never heard of this", and a missing key says neither.
+            "backup": self.backup_json(&c.backup(), true),
+            // ---- end 0.13.0 --------------------------------------------------
             "segments_total": store.segments_total()?,
             "counters": {
                 "sessions_opened": c.stats.sessions_opened.load(Ordering::Relaxed),
@@ -1622,6 +1635,332 @@ impl Service {
     }
 
     // ---- end 0.10.0 -------------------------------------------------------
+
+    // ---- 0.13.0, a backup you can trust -----------------------------------
+
+    /// The `[runtime]` discipline every heavy background pass runs under —
+    /// nice 19 and no pin by default, same fallback `search.answer` uses when
+    /// nobody has attached one (`attach_answers`), because the socket tests
+    /// build a `Service` with no daemon behind it at all.
+    fn backup_discipline(&self) -> crate::config::RuntimeConfig {
+        self.answers.get().cloned().unwrap_or_default()
+    }
+
+    fn backup_dir_param(req: &Request) -> Result<std::path::PathBuf, Error> {
+        let dir = req.str("dir")?.trim().to_string();
+        if dir.is_empty() {
+            return Err(Error::params("dir must not be empty"));
+        }
+        Ok(std::path::PathBuf::from(dir))
+    }
+
+    /// `backup.create {dir}` — a consistent snapshot, as an operation handle:
+    /// the same shape as `export.run`, for the same reason. Unlike the
+    /// export, this can run for a while over a large `segments/` tree, so it
+    /// is spawned at idle priority — the night shift's own discipline — and
+    /// must never be able to win a scheduling fight against a live capture.
+    fn backup_create(self: &Arc<Self>, req: &Request) -> Result<Value, Error> {
+        let dir = Self::backup_dir_param(req)?;
+        if let Err(e) = crate::backup::check_target(&dir) {
+            return Err(Self::export_error(e));
+        }
+
+        let op = format!("op_{}", self.next_op.fetch_add(1, Ordering::SeqCst));
+        self.ops
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(op.clone(), OpState::Running);
+
+        let this = Arc::clone(self);
+        let op_id = op.clone();
+        let data_dir = self.control.data_dir.clone();
+        let discipline = self.backup_discipline();
+        let spawned = std::thread::Builder::new()
+            .name("recalld-backup".into())
+            .spawn(move || this.run_backup_create(op_id, data_dir, dir, discipline));
+        if let Err(e) = spawned {
+            self.finish_op(&op, OpState::Failed);
+            self.bus.publish(
+                Topic::Ops,
+                "op.failed",
+                json!({"op": op, "kind": "backup.create", "msg": e.to_string()}),
+            );
+            return Err(Error::internal(format!("could not start the backup: {e}")));
+        }
+        Ok(json!({"op": op}))
+    }
+
+    fn run_backup_create(
+        self: Arc<Self>,
+        op: String,
+        data_dir: std::path::PathBuf,
+        dir: std::path::PathBuf,
+        discipline: crate::config::RuntimeConfig,
+    ) {
+        crate::pipeline::background_current_thread(
+            discipline.inference_nice,
+            &discipline.inference_cpus,
+        );
+        let bus = Arc::clone(&self.bus);
+        let op_for_progress = op.clone();
+        let outcome = crate::backup::create(&data_dir, &dir, |done, total| {
+            bus.publish(
+                Topic::Ops,
+                "op.progress",
+                json!({
+                    "op": op_for_progress,
+                    "kind": "backup.create",
+                    "done": done,
+                    "total": total,
+                    "frac": if total == 0 { 1.0 } else { done as f64 / total as f64 },
+                }),
+            );
+        });
+        match outcome {
+            Ok(report) => {
+                self.finish_op(&op, OpState::Done);
+                let payload = json!({
+                    "op": op,
+                    "kind": "backup.create",
+                    "dir": dir.to_string_lossy(),
+                    "files": report.files,
+                    "bytes": report.bytes,
+                    "manifest_sha256": report.manifest_sha256,
+                    "counts": report.counts.map(|c| json!({
+                        "sessions": c.sessions, "speakers": c.speakers, "segments": c.segments,
+                    })),
+                    "created_at_utc_ns": utc_now_ns().to_string(),
+                });
+                info!(%op, dir = %dir.display(), files = report.files, bytes = report.bytes, "backup written");
+                self.control.set_last_backup(payload.clone());
+                self.bus.publish(Topic::Ops, "op.done", payload);
+                self.announce_status();
+            }
+            Err(e) => {
+                warn!(%op, "backup failed: {e:#}");
+                self.finish_op(&op, OpState::Failed);
+                self.bus.publish(
+                    Topic::Ops,
+                    "op.failed",
+                    json!({"op": op, "kind": "backup.create", "msg": format!("{e:#}")}),
+                );
+            }
+        }
+    }
+
+    /// `backup.verify {dir}` — as an operation handle, the same reason
+    /// `backup.create` is one: hashing a multi-gigabyte `segments/` tree is
+    /// not a request that must never take longer than the work it names.
+    fn backup_verify(self: &Arc<Self>, req: &Request) -> Result<Value, Error> {
+        let dir = Self::backup_dir_param(req)?;
+        let op = format!("op_{}", self.next_op.fetch_add(1, Ordering::SeqCst));
+        self.ops
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(op.clone(), OpState::Running);
+
+        let this = Arc::clone(self);
+        let op_id = op.clone();
+        let data_dir = self.control.data_dir.clone();
+        let discipline = self.backup_discipline();
+        let spawned = std::thread::Builder::new()
+            .name("recalld-backup-verify".into())
+            .spawn(move || this.run_backup_verify(op_id, data_dir, dir, discipline));
+        if let Err(e) = spawned {
+            self.finish_op(&op, OpState::Failed);
+            self.bus.publish(
+                Topic::Ops,
+                "op.failed",
+                json!({"op": op, "kind": "backup.verify", "msg": e.to_string()}),
+            );
+            return Err(Error::internal(format!("could not start the verify: {e}")));
+        }
+        Ok(json!({"op": op}))
+    }
+
+    fn run_backup_verify(
+        self: Arc<Self>,
+        op: String,
+        data_dir: std::path::PathBuf,
+        dir: std::path::PathBuf,
+        discipline: crate::config::RuntimeConfig,
+    ) {
+        crate::pipeline::background_current_thread(
+            discipline.inference_nice,
+            &discipline.inference_cpus,
+        );
+        match crate::backup::verify(&data_dir, &dir) {
+            Ok(report) => {
+                self.finish_op(&op, OpState::Done);
+                let payload = json!({
+                    "op": op,
+                    "kind": "backup.verify",
+                    "dir": dir.to_string_lossy(),
+                    "ok": report.ok,
+                    "files_checked": report.files_checked,
+                    "files_bad": report.files_bad,
+                    "files_missing": report.files_missing,
+                    "integrity_check": report.integrity_check,
+                    "signature_valid": report.signature_valid,
+                    "counts_match": report.counts_match,
+                    "manifest_sha256": report.manifest_sha256,
+                });
+                info!(%op, dir = %dir.display(), ok = report.ok, "backup verified");
+                self.bus.publish(Topic::Ops, "op.done", payload);
+            }
+            Err(e) => {
+                warn!(%op, "backup verify failed: {e:#}");
+                self.finish_op(&op, OpState::Failed);
+                self.bus.publish(
+                    Topic::Ops,
+                    "op.failed",
+                    json!({"op": op, "kind": "backup.verify", "msg": format!("{e:#}")}),
+                );
+            }
+        }
+    }
+
+    /// `backup.restore {dir}` — refuses outright unless capture is paused
+    /// (DESIGN's panic-path pause, `pause`/`resume`): a restore under a live
+    /// writer would restore into a database something else is still
+    /// appending to. Runs as an operation handle like the other two, since
+    /// copying the snapshot back costs exactly what `backup.create` did.
+    fn backup_restore(self: &Arc<Self>, req: &Request) -> Result<Value, Error> {
+        if !self.control.is_paused() {
+            return Err(Error::new("refused", crate::backup::RESTORE_REFUSED));
+        }
+        let dir = Self::backup_dir_param(req)?;
+        let op = format!("op_{}", self.next_op.fetch_add(1, Ordering::SeqCst));
+        self.ops
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(op.clone(), OpState::Running);
+
+        let this = Arc::clone(self);
+        let op_id = op.clone();
+        let data_dir = self.control.data_dir.clone();
+        let discipline = self.backup_discipline();
+        let spawned = std::thread::Builder::new()
+            .name("recalld-backup-restore".into())
+            .spawn(move || this.run_backup_restore(op_id, data_dir, dir, discipline));
+        if let Err(e) = spawned {
+            self.finish_op(&op, OpState::Failed);
+            self.bus.publish(
+                Topic::Ops,
+                "op.failed",
+                json!({"op": op, "kind": "backup.restore", "msg": e.to_string()}),
+            );
+            return Err(Error::internal(format!("could not start the restore: {e}")));
+        }
+        Ok(json!({"op": op}))
+    }
+
+    fn run_backup_restore(
+        self: Arc<Self>,
+        op: String,
+        data_dir: std::path::PathBuf,
+        dir: std::path::PathBuf,
+        discipline: crate::config::RuntimeConfig,
+    ) {
+        crate::pipeline::background_current_thread(
+            discipline.inference_nice,
+            &discipline.inference_cpus,
+        );
+        // Checked again here, on the worker thread: the request-time check
+        // above and the copy that is about to start are not atomic, and a
+        // `resume` landing in between must still stop this before it swaps
+        // anything in.
+        if !self.control.is_paused() {
+            self.finish_op(&op, OpState::Failed);
+            self.bus.publish(
+                Topic::Ops,
+                "op.failed",
+                json!({"op": op, "kind": "backup.restore", "msg": crate::backup::RESTORE_REFUSED}),
+            );
+            return;
+        }
+        match crate::backup::restore(&data_dir, &dir) {
+            Ok(report) => {
+                self.finish_op(&op, OpState::Done);
+                info!(%op, dir = %dir.display(), "restored");
+                self.bus.publish(
+                    Topic::Ops,
+                    "op.done",
+                    json!({
+                        "op": op,
+                        "kind": "backup.restore",
+                        "restored_into": report.restored_into.to_string_lossy(),
+                        "previous_kept_as": report.previous_kept_as.map(|p| p.to_string_lossy().to_string()),
+                    }),
+                );
+            }
+            Err(e) => {
+                warn!(%op, "restore failed: {e:#}");
+                self.finish_op(&op, OpState::Failed);
+                self.bus.publish(
+                    Topic::Ops,
+                    "op.failed",
+                    json!({"op": op, "kind": "backup.restore", "msg": format!("{e:#}")}),
+                );
+            }
+        }
+    }
+
+    /// `backup.set {enabled?, dir?, every_days?, keep?}` — the scheduled
+    /// backup's switch, `mood.set`'s pattern exactly: live and persisted, an
+    /// omitted key leaves that field alone.
+    fn backup_set(&self, req: &Request) -> Result<Value, Error> {
+        let enabled = req.opt_bool("enabled")?;
+        let dir = match req.param("dir") {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(_) => Some(Some(std::path::PathBuf::from(req.str("dir")?))),
+        };
+        let every_days = req.opt_i64("every_days")?.map(|v| v.max(1) as u32);
+        let keep = req.opt_i64("keep")?.map(|v| v.max(1) as u32);
+
+        let cfg = self.control.set_backup(enabled, dir, every_days, keep);
+
+        let mut persisted = false;
+        if let Some(path) = &self.control.config_path {
+            match Config::load(path) {
+                Ok(mut file) => {
+                    file.backup = cfg.clone();
+                    match file.save(path) {
+                        Ok(()) => persisted = true,
+                        Err(e) => warn!("could not persist the backup schedule: {e:#}"),
+                    }
+                }
+                Err(e) => {
+                    warn!("could not re-read the config to persist the backup schedule: {e:#}")
+                }
+            }
+        }
+        info!(
+            enabled = cfg.enabled,
+            persisted, "the backup schedule changed"
+        );
+        self.announce_status();
+        Ok(self.backup_json(&cfg, persisted))
+    }
+
+    fn backup_json(&self, cfg: &crate::config::BackupConfig, persisted: bool) -> Value {
+        json!({
+            "enabled": cfg.enabled,
+            "dir": cfg.dir.as_ref().map(|d| d.to_string_lossy().to_string()),
+            "every_days": cfg.every_days,
+            "keep": cfg.keep,
+            "persisted": persisted,
+            "last": self.control.last_backup_json(),
+        })
+    }
+
+    /// `backup.get` — the same block `status` carries under `backup`.
+    fn backup_get(&self) -> Result<Value, Error> {
+        Ok(self.backup_json(&self.control.backup(), true))
+    }
+
+    // ---- end 0.13.0 --------------------------------------------------------
 
     // ---- speakers --------------------------------------------------------
 
@@ -5275,6 +5614,144 @@ mod tests {
     }
 
     // ---- end 0.10.0 -------------------------------------------------------
+
+    // ---- 0.13.0: a backup you can trust ------------------------------------
+
+    fn backup_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("nx-recall-backup-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_backup_creates_and_then_verifies_clean() {
+        let r = rig("backup-roundtrip");
+        a_segment(&r, "one line is enough");
+        let dest = backup_dir("roundtrip");
+
+        let out = call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"backup.create","params":{{"dir":"{}"}}}}"#,
+                dest.display()
+            ),
+        )
+        .unwrap();
+        let op = out["op"].as_str().unwrap().to_string();
+        let evs = drain_op(&r, &op);
+        let done = evs
+            .iter()
+            .find(|e| e["ev"] == json!("op.done"))
+            .unwrap_or_else(|| panic!("no op.done for {op}: {evs:?}"));
+        assert_eq!(done["data"]["kind"], json!("backup.create"));
+        assert!(done["data"]["files"].as_u64().unwrap() >= 1);
+
+        let status = call(&r, r#"{"id":2,"method":"status"}"#).unwrap();
+        assert_ne!(
+            status["backup"]["last"],
+            Value::Null,
+            "status must reflect the backup"
+        );
+
+        let out = call(
+            &r,
+            &format!(
+                r#"{{"id":3,"method":"backup.verify","params":{{"dir":"{}"}}}}"#,
+                dest.display()
+            ),
+        )
+        .unwrap();
+        let op = out["op"].as_str().unwrap().to_string();
+        let evs = drain_op(&r, &op);
+        let done = evs
+            .iter()
+            .find(|e| e["ev"] == json!("op.done"))
+            .unwrap_or_else(|| panic!("no op.done for {op}: {evs:?}"));
+        assert_eq!(done["data"]["ok"], json!(true), "{done:?}");
+        assert_eq!(done["data"]["integrity_check"], json!("ok"));
+        assert_eq!(done["data"]["signature_valid"], json!(true));
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn restore_is_refused_while_capture_is_not_paused() {
+        let r = rig("backup-restore-refused");
+        let e = call(
+            &r,
+            r#"{"id":1,"method":"backup.restore","params":{"dir":"/tmp/wherever"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "refused");
+        assert!(e.msg.contains("paused"), "{}", e.msg);
+    }
+
+    #[test]
+    fn a_paused_restore_swaps_in_a_verified_snapshot() {
+        let r = rig("backup-restore-ok");
+        a_segment(&r, "before the restore");
+        let dest = backup_dir("restore-ok");
+
+        let out = call(
+            &r,
+            &format!(
+                r#"{{"id":1,"method":"backup.create","params":{{"dir":"{}"}}}}"#,
+                dest.display()
+            ),
+        )
+        .unwrap();
+        drain_op(&r, out["op"].as_str().unwrap());
+
+        call(&r, r#"{"id":2,"method":"pause"}"#).unwrap();
+        let out = call(
+            &r,
+            &format!(
+                r#"{{"id":3,"method":"backup.restore","params":{{"dir":"{}"}}}}"#,
+                dest.display()
+            ),
+        )
+        .unwrap();
+        let op = out["op"].as_str().unwrap().to_string();
+        let evs = drain_op(&r, &op);
+        let done = evs
+            .iter()
+            .find(|e| e["ev"] == json!("op.done"))
+            .unwrap_or_else(|| panic!("no op.done for {op}: {evs:?}"));
+        assert_eq!(done["data"]["kind"], json!("backup.restore"));
+
+        let mut bak = r.dir.as_os_str().to_owned();
+        bak.push(".bak");
+        let _ = std::fs::remove_dir_all(std::path::PathBuf::from(bak));
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn backup_set_is_live_and_an_omitted_key_leaves_the_rest_alone() {
+        let r = rig("backup-set");
+        let out = call(&r, r#"{"id":1,"method":"backup.get"}"#).unwrap();
+        assert_eq!(out["enabled"], json!(false));
+
+        let out = call(
+            &r,
+            r#"{"id":2,"method":"backup.set","params":{"enabled":true,"every_days":3}}"#,
+        )
+        .unwrap();
+        assert_eq!(out["enabled"], json!(true));
+        assert_eq!(out["every_days"], json!(3));
+        assert_eq!(
+            out["keep"],
+            json!(4),
+            "keep was not touched, so it kept its default"
+        );
+
+        let out = call(&r, r#"{"id":3,"method":"backup.get"}"#).unwrap();
+        assert_eq!(out["enabled"], json!(true));
+        assert_eq!(out["every_days"], json!(3));
+    }
+
+    // ---- end 0.13.0 ---------------------------------------------------------
 
     // ---- lang.repair (0.7.7) ---------------------------------------------
 
