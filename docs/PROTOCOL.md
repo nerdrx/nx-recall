@@ -5107,26 +5107,63 @@ before this existed. Half a word decoded alone is not a worse reading of that
 word, it is a different word, and it would be written down.
 
 `slice_after_s = 0` turns the feature off, and off is byte-for-byte the
-behaviour before it: no slice is offered, and the turn is decoded whole. **Off is the default**, and a
-client must therefore treat `slice` as an event it may never see. The reason is
-measured rather than cautious: the CPU gate passed at +2.2% and a word reaches
-the glass 1.7 s sooner, but a piece read without the rest of the turn around it
-changes the words — the joined text disagrees with the whole-turn reading on
-17.6% of them, against a noise floor of exactly 0.00% (FINDINGS §41).
+behaviour before it existed: no slice is offered, and the turn is decoded
+whole. A client must still treat `slice` as an event it may never see, on an
+install that has turned the floor down.
+
+**On by default since 0.13.1, at `slice_after_s = 8`** (FINDINGS §48). §41
+shipped this off: the row was built from the joined slices, and that text
+disagreed with a whole-turn decode on 17.6% of words against a noise floor of
+exactly 0.00% — a real cost with no way to tell which reading was actually
+worse. 0.13.1 removes that cost rather than accepting it, by changing what the
+row IS — see "One row at the end" below — so the CPU line is now the only
+thing this knob trades off. At `8` a sliced turn's audio is read one extra
+time in full, and that measured at **+6.4%** CPU per audio minute against a
++10% gate on the same 30-minute archive replay §41 used, while a word still
+reaches the glass at the latency §41 measured (1.7–2.1 s sooner at the
+median, depending on the floor). `6` — where §41's caption numbers were
+taken — slices more of the archive's long turns but costs +11.3%, over the
++10% line though inside a +15% ceiling; `10` and `12` cost less (+3.7%,
++2.6%) and touch fewer turns. Every floor's row is worth exactly the same
+words: see below.
 
 ### One row at the end
 
-When the turn finishes, an ordinary **`segment`** arrives carrying every slice
-joined to the remainder. A client replaces the growing row by matching
-**`(session, t_start_ns)`** — the same key, the same rule and the same reason as
-a partial: a slice has no `id`, because there is no row yet.
+When the turn finishes, an ordinary **`segment`** arrives and replaces the
+growing row by matching **`(session, t_start_ns)`** — the same key, the same
+rule and the same reason as a partial: a slice has no `id`, because there is
+no row yet. The wire contract has not changed since 0.12.5; what changed in
+0.13.1 is what the daemon puts in that `segment`.
+
+**Before 0.13.1, the row was every slice joined to the remainder** — the words
+already on the glass, plus one more decode for whatever was left. That is
+what made the caption cheap (§41's whole claim: a turn's audio is decoded
+once, whether in one piece or six) and also what made it wrong 17.6% of the
+time: a slice read without the rest of the turn around it is a different
+reading of it, not a worse one, but a different one, and joining several
+different readings into one row is not the same claim as the turn being
+decoded whole.
+
+**Since 0.13.1 (FINDINGS §48), the row is the WHOLE turn, read once more.**
+The slices are still decoded exactly as before and still reach the glass at
+the latency §41 measured — nothing about `slice` or `maybe_slice` changed —
+but the joined text is discarded rather than written down. At turn close the
+daemon decodes `samples`, the turn's own whole audio, the same call an
+unsliced turn has always made (`Analyzer::prepare_maybe_said` with `said:
+None`), and that reading becomes the row. Same function, same bytes: the two
+readings are not merely close, they are the same string, because there is
+only one decode of that audio for them to disagree about. That is the whole
+proof behind "0.00% by construction" — measured at exactly 0.00% (bootstrap
+0.00%–0.00%) over the 127 sliced turns of §41's own long-turn sample. The
+price moved from words to CPU: one extra whole-turn decode, once per sliced
+turn, which is the number `slice_after_s` now trades off (see above).
 
 **`[identity] split_turns` wins where they meet.** A turn that was sliced is
 never *also* cut at a speaker change: splitting needs a timed decode of the
 whole turn, which is exactly the decode slicing exists to avoid, so doing both
-would spend the turn twice and throw away the reading already on the glass. Both
-switches are off by default; an install that turns on both gets split turns and
-no slicing of the turns that would be split.
+would spend the turn twice and throw away the reading already on the glass.
+`split_turns` is off by default; an install that turns it on together with
+slicing gets split turns and no slicing of the turns that would be split.
 
 There is no `continues` flag and there are no consecutive rows, and that is the
 load-bearing decision in this feature rather than an implementation detail.

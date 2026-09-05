@@ -1062,21 +1062,31 @@ impl Default for AsrConfig {
 /// pieces, and what it buys is the first piece being readable `slice_after_s`
 /// into the turn instead of at the end of it.
 ///
-/// The price is paid in words, not cycles: a slice is decoded without the
-/// context of the rest of the turn. That is why the cut is only ever made at a
-/// **dip the VAD already found** — never mid-word — and why the joined text is
-/// measured against the whole-turn decode before this ships (FINDINGS §41).
+/// The price used to be paid in words: a slice was decoded without the
+/// context of the rest of the turn, and FINDINGS §41 measured the joined text
+/// disagreeing with a whole-turn decode on 17.6% of words. 0.13.1 (FINDINGS
+/// §48) removed that price rather than accepting it — see
+/// [`Pipeline::write_segment`](crate::pipeline) — by re-decoding the whole
+/// turn once more at close and writing THAT as the row: the pieces still
+/// carry the caption, the row is no longer built from them. What is left to
+/// pay for is CPU alone, and that is what `slice_after_s` now trades off.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptionsConfig {
     /// Slice a turn once it has been running this many seconds, or `0` to never
-    /// slice — which is exactly the behaviour of every version before 0.12.5,
-    /// and which is the default. See [`CaptionsConfig`] and FINDINGS §41 for
-    /// why the measurement did not justify turning it on.
+    /// slice. See [`CaptionsConfig`] and FINDINGS §48.
     ///
-    /// `6.0` is the value the numbers in §41 were taken at, and the one to try
-    /// first. Longer floors disagree with the whole-turn decode less and slice
-    /// fewer turns: 8 s → 16.2%, 10 s → 14.4%, 12 s → 9.5%.
+    /// `8.0` is the shipped default (FINDINGS §48, on the same 30-minute
+    /// archive replay §41 used): **+6.4%** CPU per audio minute against the
+    /// +10% line, with 44% of the archive's long turns (6 s and up) still
+    /// sliced and a word reaching the glass **2.05 s** sooner at the median on
+    /// the turns it touches. `6.0` — the value §41's numbers were taken at —
+    /// slices more of them but costs **+11.3%**, over the +10% line though
+    /// still under the +15% ceiling; `10.0` and `12.0` cost less still
+    /// (+3.7%, +2.6%) but touch fewer turns. Every one of these numbers is
+    /// about CPU only: the row's WORDS are identical to the whole-turn decode
+    /// at every floor, by construction, because the row is always a
+    /// whole-turn decode now.
     ///
     /// It is a floor and not a period: the slice is cut at the first VAD dip
     /// *after* this much speech, so a turn with no pause in it is not sliced at
@@ -1087,37 +1097,31 @@ pub struct CaptionsConfig {
 impl Default for CaptionsConfig {
     fn default() -> Self {
         Self {
-            // OFF, and the reason is measured (FINDINGS §41).
+            // ON since 0.13.1 (FINDINGS §48). §41 shipped this off because the
+            // ROW — the joined slices — disagreed with a whole-turn decode on
+            // 17.6% of words against a 0.00% noise floor, and "the two
+            // readings are both plausible" was not a licence to change a
+            // permanent record for a caption. §41.6 named the fix: keep the
+            // slices as captions, and read the WHOLE turn once more at close
+            // for the row. That is what `write_segment` does now, and it
+            // makes the WER-vs-baseline question trivial rather than merely
+            // small — the row is the exact same `TimedAsr::transcribe_timed`
+            // call over the exact same audio an unsliced turn would have made,
+            // so there is no comparison left for the two readings to disagree
+            // on. Measured at 0.00% (bootstrap 0.00%–0.00%) over the 127
+            // sliced turns of the same 20-minute "long" sample §41 used.
             //
-            // The CPU gate passed with room to spare: **+2.2%** against a +10%
-            // ceiling, because a turn's audio is decoded once whether it was
-            // cut into one piece or six. The latency did what it promised: on a
-            // turn long enough to be sliced, a word reaches the glass **1.7 s**
-            // sooner at the median, and the tail past twelve seconds — 2.2% of
-            // words on those turns — disappears entirely.
-            //
-            // What it did not pass is the transcript. The joined text disagrees
-            // with the whole-turn decode on **17.6%** of words (95% CI
-            // 16.0–22.6%) against a noise floor measured at **exactly 0.00%**,
-            // so the disagreement is entirely real. It is an upper bound on the
-            // damage rather than a measurement of it — reading the diffs by
-            // hand, the two readings are wrong about equally often, and this
-            // archive has no ground truth to break the tie — but "we cannot
-            // tell which is worse" is not a licence to change a permanent
-            // record for a caption.
-            //
-            // The one repair already in the daemon does not reach these rows:
-            // `[asr].context_redecode` only re-reads turns UNDER
-            // `context_redecode_below_s` (2.5 s), and a sliced turn is six
-            // seconds or more by construction.
-            //
-            // So the mechanism ships complete and switched off, for a machine
-            // whose owner would rather have the caption. What would change the
-            // answer is written down in §41: hand-transcribed long turns to say
-            // which reading is actually better, or the CPU budget to re-decode
-            // the whole turn at close and keep the slices as captions only
-            // (~+15%, measured).
-            slice_after_s: 0.0,
+            // What is left to spend is CPU, once per turn rather than once per
+            // slice: 33 of 825 turns in the 30-minute representative sample
+            // were sliced at this floor, and re-decoding each of them whole
+            // measured **+6.4%** against the +10% gate — comfortably inside
+            // it, and inside the +15% ceiling with room to spare even at the
+            // more aggressive 6 s floor §41 was measured at (+11.3%). The
+            // caption side is untouched: `maybe_slice` is the same code
+            // `write_segment` always fed it, so a word still reaches the
+            // glass sooner by exactly what §41 measured (5.4 s → 3.7 s median
+            // at 6 s; 2.05 s sooner at the median at this floor).
+            slice_after_s: 8.0,
         }
     }
 }
@@ -1814,22 +1818,28 @@ impl Config {
              # until the speaker has stopped, so the first word of a thirty-\n\
              # second monologue waits for the last one; past this many seconds\n\
              # the daemon cuts the turn at the next pause the voice detector\n\
-             # finds, reads that piece, and puts it on screen. The pieces are\n\
-             # re-joined into ONE row when the turn ends, so the transcript,\n\
-             # search and the voicebank see exactly what they saw before. Each\n\
-             # piece is read once, so the turn costs the same either way — the\n\
-             # measured cost is +2.2%% CPU, and a word reaches the glass 1.7 s\n\
-             # sooner on a turn long enough to be cut.\n\
+             # finds, reads that piece, and puts it on screen. At the turn's\n\
+             # end the WHOLE turn is read once more and THAT becomes the row —\n\
+             # not the joined pieces — so the transcript, search and the\n\
+             # voicebank see exactly what they would have seen with this off\n\
+             # (spike/FINDINGS.md §48). The pieces still cost one decode each,\n\
+             # so the caption is exactly as cheap as §41 measured it (a word\n\
+             # 1.7-2.1 s sooner on a turn long enough to be cut); the one new\n\
+             # cost is the extra whole-turn read, once per sliced turn.\n\
              #\n\
-             # It is `0` (OFF) because reading a piece without the rest of the\n\
-             # turn around it CHANGES THE WORDS: the joined text disagrees with\n\
-             # the whole-turn reading on 17.6%% of them, and this archive has no\n\
-             # ground truth to say which is right (spike/FINDINGS.md §41). Set\n\
-             # it to 6.0 if you would rather have the caption than the doubt;\n\
-             # a larger number cuts fewer turns and disagrees less. Turning on\n\
-             # `[identity].split_turns` as well stands slicing down for the\n\
-             # turns it would cut: splitting needs a timed decode of the whole\n\
-             # turn, which is the decode slicing exists to avoid.\n\
+             # It is `8.0` because that is the floor the archive replay in §48\n\
+             # measured under the +10%% CPU line (+6.4%%) while still slicing\n\
+             # 44%% of the archive's long turns; `6.0` slices more of them but\n\
+             # costs +11.3%%, over the +10%% line though inside the +15%%\n\
+             # ceiling; `10.0` and `12.0` cost less (+3.7%%, +2.6%%) and touch\n\
+             # fewer turns. Every one of these is a CPU trade-off ONLY — the\n\
+             # row's words are identical to the whole-turn decode at every\n\
+             # floor, by construction, because the row is always a whole-turn\n\
+             # decode now. `0` turns slicing off entirely: no caption arrives\n\
+             # early, and the turn is decoded exactly once, as it always was.\n\
+             # Turning on `[identity].split_turns` as well stands slicing down\n\
+             # for the turns it would cut: splitting needs a timed decode of\n\
+             # the whole turn, which is the decode slicing exists to avoid.\n\
              #\n\
              # `[mood]` reads how a turn SOUNDED off the clips already on\n\
              # disk — laughter, music, and an emotion tag. It is off, it\n\
@@ -1959,25 +1969,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 0.12.4. Both states of the switch, because a setting that is read and
-    /// ignored in one of them is not a setting.
+    /// 0.12.4, redefaulted in 0.13.1. Every state of the switch a person or an
+    /// old file can be in, because a setting that is read and ignored in one
+    /// of them is not a setting.
     #[test]
-    fn the_slice_floor_round_trips_and_zero_survives_the_file() {
+    fn the_slice_floor_round_trips_and_off_still_survives_the_file() {
         let dir = std::env::temp_dir().join(format!("nx-recall-slice-cfg-{}", std::process::id()));
         let path = dir.join("config.toml");
         let _ = std::fs::remove_dir_all(&dir);
 
-        // OFF by default: the CPU gate passed at +2.2% and the transcript gate
-        // did not (FINDINGS §41).
-        assert_eq!(Config::default().captions.slice_after_s, 0.0);
+        // ON by default since 0.13.1: the row is a whole-turn re-decode now,
+        // not the joined slices, so the WER gate that kept this off in §41 is
+        // 0.00% by construction and the only question left is CPU — measured
+        // at +6.4% at this floor against a +10% gate (FINDINGS §48).
+        assert_eq!(Config::default().captions.slice_after_s, 8.0);
 
-        // ON has to survive a save/load — this is the state a person turns on
-        // by hand, and a setting that reverted to the default across a restart
-        // would be a setting that is read and ignored.
+        // OFF has to survive a save/load too — this is the state a person
+        // turns it down to by hand, and a setting that reverted to the
+        // default across a restart would be a setting that is read and
+        // ignored.
         let mut cfg = Config::default();
-        cfg.captions.slice_after_s = 6.0;
+        cfg.captions.slice_after_s = 0.0;
         cfg.save(&path).unwrap();
-        assert_eq!(Config::load(&path).unwrap().captions.slice_after_s, 6.0);
+        assert_eq!(Config::load(&path).unwrap().captions.slice_after_s, 0.0);
 
         // …and so does any other value somebody chose.
         cfg.captions.slice_after_s = 9.5;
@@ -1988,7 +2002,9 @@ mod tests {
     }
 
     /// A config file written before 0.12.4 has no `[captions]` at all, and must
-    /// come back with the feature at its default rather than as an error.
+    /// come back with the feature at its CURRENT default rather than as an
+    /// error or frozen at whatever the default used to be — the same rule
+    /// every other `#[serde(default)]` section in this file follows.
     #[test]
     fn a_config_from_before_slicing_still_loads() {
         let dir = std::env::temp_dir().join(format!("nx-recall-old-cfg-{}", std::process::id()));
@@ -1998,7 +2014,7 @@ mod tests {
         std::fs::write(&path, "[vad]\nthreshold = 0.5\n").unwrap();
 
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.captions.slice_after_s, 0.0);
+        assert_eq!(cfg.captions.slice_after_s, 8.0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

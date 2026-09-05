@@ -108,7 +108,7 @@ fn main() -> Result<()> {
         corpus.display()
     );
 
-    // ---- the two arms, INTERLEAVED per clip --------------------------------
+    // ---- the three arms, INTERLEAVED per clip ------------------------------
     //
     // Not "all of arm A, then all of arm B", which is how this was written
     // first and which measured the machine rather than the feature: two
@@ -117,13 +117,21 @@ fn main() -> Result<()> {
     // CPU-seconds. Run back to back, the same code and the same corpus gave
     // −18.8% on one run and +16.3% on the next.
     //
-    // Interleaving at clip granularity puts both arms under the same clock,
-    // and alternating which one goes first cancels the residual within-pair
-    // ordering bias (the second decode of a clip has its file in page cache).
+    // Interleaving at clip granularity puts all three arms under the same
+    // clock, and rotating which one goes first cancels the residual
+    // within-triple ordering bias (a later decode of a clip has its file in
+    // page cache).
+    //
+    // Arm C (0.13.1, FINDINGS §48) is arm B's captions plus one more thing: at
+    // turn close, the WHOLE turn is decoded again and that reading — not the
+    // joined slices — becomes the row. `redecode_whole_turns` does exactly the
+    // extra work `write_segment` now does and nothing else, so `cpu_redecode`
+    // is the real marginal cost of the fix, not an estimate of it.
     let mut audio_s = 0.0f64;
     let mut base: Vec<Turn> = Vec::new();
     let mut sliced: Vec<Turn> = Vec::new();
-    let (mut cpu_base, mut cpu_slice) = (0.0f64, 0.0f64);
+    let mut redecoded: Vec<Turn> = Vec::new();
+    let (mut cpu_base, mut cpu_slice, mut cpu_redecode) = (0.0f64, 0.0f64, 0.0f64);
     for (i, clip) in clips.iter().enumerate() {
         let samples = read_wav(clip)?;
         audio_s += samples.len() as f64 / SAMPLE_RATE as f64;
@@ -145,16 +153,85 @@ fn main() -> Result<()> {
             ));
             cpu_slice += cpu_seconds() - t;
         };
-        if i % 2 == 0 {
-            arm_a(&mut asr, &mut vad, &mut base);
-            arm_b(&mut asr, &mut vad, &mut sliced);
-        } else {
-            arm_b(&mut asr, &mut vad, &mut sliced);
-            arm_a(&mut asr, &mut vad, &mut base);
+        let mut arm_c = |asr: &mut TimedAsr, vad: &mut SileroVad, out: &mut Vec<Turn>| {
+            let t = cpu_seconds();
+            let mut turns = run_clip(asr, vad, seg_cfg, &cfg, &samples, SLICE_AFTER_S, i);
+            let audio_ext = with_tail_silence(&samples);
+            redecode_whole_turns(asr, &audio_ext, &mut turns);
+            cpu_redecode += cpu_seconds() - t;
+            out.extend(turns);
+        };
+        // Three cyclic rotations of the three arms, chosen by clip index. Not
+        // every one of the six permutations — the original two-arm version
+        // did not try both orderings of a pair either — but every arm leads,
+        // trails and sits in the middle across the corpus in equal measure,
+        // which is what cancels a systematic first-vs-last bias.
+        match i % 3 {
+            0 => {
+                arm_a(&mut asr, &mut vad, &mut base);
+                arm_b(&mut asr, &mut vad, &mut sliced);
+                arm_c(&mut asr, &mut vad, &mut redecoded);
+            }
+            1 => {
+                arm_b(&mut asr, &mut vad, &mut sliced);
+                arm_c(&mut asr, &mut vad, &mut redecoded);
+                arm_a(&mut asr, &mut vad, &mut base);
+            }
+            _ => {
+                arm_c(&mut asr, &mut vad, &mut redecoded);
+                arm_a(&mut asr, &mut vad, &mut base);
+                arm_b(&mut asr, &mut vad, &mut sliced);
+            }
         }
     }
 
     report(&base, &sliced, audio_s, cpu_base, cpu_slice);
+    report_redecode(&base, &redecoded, audio_s, cpu_base, cpu_redecode);
+
+    // ---- the floor that keeps 0.13.1 under the +10% line -------------------
+    //
+    // `SLICE_AFTER_S` (6 s) is where §41's numbers were taken, not necessarily
+    // where 0.13.1 should ship: a higher floor slices a smaller share of the
+    // archive's audio, and the whole marginal cost of re-decoding is
+    // proportional to that share. Same corpus, same clips, re-read once per
+    // floor so each pair of arms is measured under its own thermal window —
+    // §41.2's lesson applies here exactly as it did there.
+    println!("\n# 0.13.1 — CPU by floor, on the representative corpus\n");
+    println!("| `slice_after_s` | CPU s/min | vs off | <= +10%? |");
+    println!("|---:|---:|---:|:---:|");
+    for floor in [SLICE_AFTER_S, 8.0, 10.0, 12.0] {
+        let (mut fa, mut fc) = (0.0f64, 0.0f64);
+        for (i, clip) in clips.iter().enumerate() {
+            let samples = read_wav(clip)?;
+            if i % 2 == 0 {
+                let t = cpu_seconds();
+                let _ = run_clip(&mut asr, &mut vad, seg_cfg, &cfg, &samples, 0.0, i);
+                fa += cpu_seconds() - t;
+                let t = cpu_seconds();
+                let mut turns = run_clip(&mut asr, &mut vad, seg_cfg, &cfg, &samples, floor, i);
+                let audio_ext = with_tail_silence(&samples);
+                redecode_whole_turns(&mut asr, &audio_ext, &mut turns);
+                fc += cpu_seconds() - t;
+            } else {
+                let t = cpu_seconds();
+                let mut turns = run_clip(&mut asr, &mut vad, seg_cfg, &cfg, &samples, floor, i);
+                let audio_ext = with_tail_silence(&samples);
+                redecode_whole_turns(&mut asr, &audio_ext, &mut turns);
+                fc += cpu_seconds() - t;
+                let t = cpu_seconds();
+                let _ = run_clip(&mut asr, &mut vad, seg_cfg, &cfg, &samples, 0.0, i);
+                fa += cpu_seconds() - t;
+            }
+        }
+        let minutes = audio_s / 60.0;
+        let delta = (fc - fa) / fa.max(1e-9);
+        println!(
+            "| {floor} | {:.2} | {:+.1}% | {} |",
+            fc / minutes.max(1e-9),
+            delta * 100.0,
+            if delta <= 0.10 { "yes" } else { "no" }
+        );
+    }
 
     // ---- the WER bound, over the turns slicing actually touches ------------
     if let Some(long) = long {
@@ -172,6 +249,7 @@ fn main() -> Result<()> {
         let mut a: Vec<Turn> = Vec::new();
         let mut a2: Vec<Turn> = Vec::new();
         let mut b: Vec<Turn> = Vec::new();
+        let mut c: Vec<Turn> = Vec::new();
         let mut long_s = 0.0f64;
         for (i, clip) in clips.iter().enumerate() {
             let samples = read_wav(clip)?;
@@ -191,12 +269,29 @@ fn main() -> Result<()> {
             a2.extend(run_clip(
                 &mut asr, &mut vad, seg_cfg, &cfg, &samples, 0.0, i,
             ));
+            // 0.13.1: the row is a whole-turn re-decode, not the joined
+            // slices. Built from a fresh run rather than reusing `b`, so this
+            // is the same code path the daemon takes on a cold turn.
+            let mut c_turns = run_clip(
+                &mut asr,
+                &mut vad,
+                seg_cfg,
+                &cfg,
+                &samples,
+                SLICE_AFTER_S,
+                i,
+            );
+            let audio_ext = with_tail_silence(&samples);
+            redecode_whole_turns(&mut asr, &audio_ext, &mut c_turns);
+            c.extend(c_turns);
         }
         println!("audio: {:.1} min, turns: {}\n", long_s / 60.0, a.len());
         println!("## the noise floor — the same arm, run twice\n");
         wer_report(&a, &a2);
-        println!("\n## slicing — the joined text against the whole-turn decode\n");
+        println!("\n## slicing (joined captions, the pre-0.13.1 row) — vs whole-turn decode\n");
         wer_report(&a, &b);
+        println!("\n## 0.13.1 — whole-turn redecode, vs the same whole-turn decode\n");
+        wer_report(&a, &c);
 
         // ---- the knob ------------------------------------------------------
         //
@@ -321,6 +416,12 @@ struct Turn {
     /// row settling.
     shown_s: Vec<f64>,
     slices: usize,
+    /// The turn's own span, in absolute audio seconds — where `write_segment`
+    /// would extract `samples` from. Kept so a later pass can re-decode the
+    /// WHOLE turn (0.13.1, FINDINGS §48) without re-running the VAD and the
+    /// merger: the span is a fact about the turn, not about which arm read it.
+    span_start_s: f64,
+    span_end_s: f64,
 }
 
 impl Turn {
@@ -348,8 +449,7 @@ fn run_clip(
     let mut slicer = Slicer::default();
     let after = (slice_after_s * SAMPLE_RATE as f32) as u64;
 
-    let mut audio = samples.to_vec();
-    audio.extend(vec![0.0f32; (TAIL_SILENCE_S * SAMPLE_RATE as f32) as usize]);
+    let audio = with_tail_silence(samples);
 
     let sec = |n: u64| n as f64 / SAMPLE_RATE as f64;
     let mut out: Vec<Turn> = Vec::new();
@@ -398,6 +498,8 @@ fn run_clip(
                 spoken_s: Vec::new(),
                 shown_s: Vec::new(),
                 slices: cuts,
+                span_start_s: sec(span.start),
+                span_end_s: sec(span.end),
             };
             // The row, in order: every slice that was published while the
             // person was still talking, then the remainder.
@@ -488,6 +590,8 @@ fn run_clip(
             spoken_s: Vec::new(),
             shown_s: Vec::new(),
             slices: cuts,
+            span_start_s: sec(span.start),
+            span_end_s: sec(span.end),
         };
         for s in open.drain(..) {
             push_raw(&mut turn.raw, &s.raw);
@@ -530,9 +634,130 @@ fn words_of(text: &str, words: &[Word]) -> Vec<String> {
         .collect()
 }
 
+/// Append the tail silence every clip gets before it is fed to the VAD — the
+/// only reason the daemon's own segmenter closes the span at all rather than
+/// on `flush()`. One place, so arm C's re-decode indexes the exact same
+/// buffer `run_clip` scored spans against.
+fn with_tail_silence(samples: &[f32]) -> Vec<f32> {
+    let mut audio = samples.to_vec();
+    audio.extend(vec![0.0f32; (TAIL_SILENCE_S * SAMPLE_RATE as f32) as usize]);
+    audio
+}
+
+/// The one new cost of 0.13.1 (FINDINGS §48): for every turn that was
+/// SLICED, decode its whole span once more and let that reading replace the
+/// joined slices as the row's text.
+///
+/// This is not a simulation of the fix, it IS the fix — the same
+/// `TimedAsr::transcribe_timed` call over the same audio range
+/// `write_segment` now hands `Analyzer::transcribe_slice`, on the turn's own
+/// span rather than the remainder. Returns the CPU time it cost, so the
+/// caller can fold it into the sliced arm's total and report the marginal
+/// price rather than an estimate of it.
+fn redecode_whole_turns(asr: &mut TimedAsr, audio: &[f32], turns: &mut [Turn]) -> f64 {
+    let mut cost = 0.0f64;
+    for t in turns.iter_mut().filter(|t| t.was_sliced()) {
+        let lo = ((t.span_start_s * SAMPLE_RATE as f64) as usize).min(audio.len());
+        let hi = ((t.span_end_s * SAMPLE_RATE as f64) as usize).min(audio.len());
+        if lo >= hi {
+            continue;
+        }
+        let t0 = Instant::now();
+        let (text, _timed) = asr.transcribe_timed(&audio[lo..hi]);
+        cost += t0.elapsed().as_secs_f64();
+        // This IS the row now — not the joined slices. `words`/`spoken_s`/
+        // `shown_s` are left untouched: the captions a person actually saw
+        // arrived exactly when arm B says they did, and this pass changes
+        // only what gets written down, not when the glass lit up.
+        t.raw = text;
+    }
+    cost
+}
+
 // ---------------------------------------------------------------------------
 // the report
 // ---------------------------------------------------------------------------
+
+/// The 0.13.1 headline: the same CPU-per-minute framing as [`report`], but for
+/// the arm whose row is a whole-turn re-decode rather than joined slices. The
+/// latency numbers are deliberately NOT repeated here — arm C's `words`/
+/// `spoken_s`/`shown_s` are byte-for-byte arm B's, because the re-decode
+/// changes what is written down, never when a caption reached the glass
+/// (FINDINGS §48).
+fn report_redecode(
+    base: &[Turn],
+    redecoded: &[Turn],
+    audio_s: f64,
+    cpu_base: f64,
+    cpu_redecode: f64,
+) {
+    let n_sliced = redecoded.iter().filter(|t| t.was_sliced()).count();
+    println!("\n# 0.13.1 — re-decoding the whole turn at close\n");
+    println!(
+        "turns: {} ({n_sliced} sliced and re-decoded whole)",
+        redecoded.len()
+    );
+    println!("audio: {:.1} min\n", audio_s / 60.0);
+
+    println!("## CPU\n");
+    let minutes = audio_s / 60.0;
+    let delta = (cpu_redecode - cpu_base) / cpu_base.max(1e-9);
+    println!("| arm | process CPU s | CPU s per minute of speech |");
+    println!("|---|---:|---:|");
+    println!(
+        "| 0.12.3 (one decode per turn) | {cpu_base:.2} | {:.2} |",
+        cpu_base / minutes.max(1e-9)
+    );
+    println!(
+        "| sliced + whole-turn redecode | {cpu_redecode:.2} | {:.2} |",
+        cpu_redecode / minutes.max(1e-9)
+    );
+    println!(
+        "\nre-decoding adds **{:+.1}%** CPU over 0.12.3\n",
+        delta * 100.0
+    );
+    println!("## gate\n");
+    let ok15 = delta <= 0.15;
+    let ok10 = delta <= 0.10;
+    println!(
+        "- CPU <= +15%: {} ({:+.1}%)",
+        if ok15 { "PASS" } else { "FAIL" },
+        delta * 100.0
+    );
+    println!(
+        "- CPU <= +10% (would need no config change to be the default everywhere): {} ({:+.1}%)",
+        if ok10 {
+            "yes"
+        } else {
+            "no, needs a higher floor"
+        },
+        delta * 100.0
+    );
+
+    // The WER proof: the row is now a fresh `transcribe_timed` over the
+    // turn's own span, the same call the baseline arm makes over the same
+    // audio — so there is no comparison for the two readings to disagree on.
+    // Paired by `key`, exactly like `wer_report`.
+    let mut pairs: Vec<(&Turn, &Turn)> = Vec::new();
+    for r in redecoded.iter().filter(|t| t.was_sliced()) {
+        if let Some(b) = base.iter().find(|b| b.key == r.key) {
+            pairs.push((b, r));
+        }
+    }
+    if !pairs.is_empty() {
+        let (mut refw, mut err) = (0usize, 0usize);
+        for (b, r) in &pairs {
+            let (want, got) = (normalise_words(&b.raw), normalise_words(&r.raw));
+            refw += want.len();
+            err += edits(&got, &want);
+        }
+        println!(
+            "\n## word disagreement, redecoded row vs whole-turn baseline\n\nturns: {}, reference words: {refw}, WER: **{:.2}%**\n",
+            pairs.len(),
+            100.0 * err as f64 / refw.max(1) as f64
+        );
+    }
+}
 
 fn report(base: &[Turn], sliced: &[Turn], audio_s: f64, cpu_base: f64, cpu_slice: f64) {
     let n_sliced = sliced.iter().filter(|t| t.was_sliced()).count();
