@@ -4905,3 +4905,131 @@ On this install the daemon gates at `max_overlap = 0.06` against a default of
 nobody was running. It now takes the caller's `[identity]` config, which is the
 same block `identity.calibrate` and the live ladder read. The wire shape does
 not change; the numbers in it do.
+
+## 0.12.5 — the mood pass gets its own switch, and the enrichment queue its honest split
+
+Two fixes that turned out to be the same bug wearing two faces: a queue count
+that included work the worker was never going to do, and a feature 0.12.4
+shipped with a switch that lived only in `config.toml`.
+
+### `mood.set` / `mood.get`
+
+`[mood].enabled` moves from "edit the file and restart" to a live socket
+switch, `graph.set`'s pattern exactly:
+
+```
+mood.set {"enabled": true}
+→ the same shape as status.mood, plus "persisted": true
+mood.get {}
+→ the same shape as status.mood
+```
+
+Live because `crate::mood::run` re-reads `Control::mood` at the top of every
+loop and `crate::mood::gate` re-reads it between rows — turning the switch off
+stops the pass within one row, and turning it on starts it at the next look,
+at most a minute away. Persisted for the reason `graph.set`'s is: a switch
+that forgets by morning is not a switch a person can rely on. Nothing else
+about the pass moved — `rows_per_run`, `batch_rows`, `min_duration_s` and
+`live` are still `config.toml`-only, same as before.
+
+`recalld mood [on|off|status]` is the CLI surface, over the socket like
+`recalld graph`:
+
+```
+$ recalld mood
+the mood pass         off (the default)
+backlog                0 read, 0 to go — newest first
+
+$ recalld mood on
+the mood pass         on — listening overnight, on the niced cores
+backlog                0 read, 4213 to go — newest first
+```
+
+### The mood pass reads newest-first
+
+`Store::segments_for_mood`'s queue used to walk `t_start_ns` ascending, which
+is right for a sweep nobody looks at and wrong for this one: the reason to
+know a turn carried laughter is that somebody is about to open tonight's
+transcript, and oldest-first means the row captured five minutes ago is
+stamped last — after every one of the twenty thousand before it. The queue now
+reads `ORDER BY g.t_start_ns DESC`. It stays resumable exactly as before —
+`mood_at_ns IS NULL` is the cursor, not an offset, so a batch stamped removes
+itself from the next query whichever end the walk starts from, and a daemon
+killed mid-archive resumes rather than restarting. A turn captured *while* the
+pass is running is newer than anything it has read and goes to the head of the
+queue, which is the behaviour the ordering is for.
+
+`status.mood.backlog` / `.read_total` and `recalld mood`'s own "backlog" line
+describe this same newest-first queue.
+
+### `GraphCounts` splits `threads_pending` into `threads_waiting` and `threads_too_short`
+
+On one real install, `threads_pending` — unenriched conversations with any
+words at all — was 919. The enrichment worker's own queue
+(`Store::unenriched_threads`, gated on `[graph].min_thread_segments`) was 12.
+The other 907 were conversations too short for the worker to ever open, and a
+card that called all 919 "waiting" was describing a backlog nobody was working
+behind a chip that honestly said "idle" — 0.12.4's bug, not 0.12.5's; this is
+the fix.
+
+```json
+"counts": {
+  …
+  "threads_pending": 919,       // kept, unchanged, for an older client
+  "threads_waiting": 12,        // threads_pending, narrowed to unenriched_threads' own filter
+  "threads_too_short": 907,     // the rest: unread, and never going to be read
+  "min_thread_segments": 3      // the floor the split was measured at
+}
+```
+
+`threads_waiting + threads_too_short == threads_pending`, always — the second
+is computed by subtraction from the first rather than by a second WHERE
+clause, so the identity holds by construction rather than by two queries
+happening to agree. `min_thread_segments` travels alongside the pair so a
+client can write "under 3 turns" without a number of its own that the config
+could move out from under it.
+
+`recalld graph`'s own line follows the split:
+
+```
+topics              4 label(s) over 12 of 23 conversation(s), 12 waiting, 907 too short to read (under 3 turns)
+```
+
+And two sentences that used to describe an earlier gate now describe the real
+one (`enrich::gate`): the startup INFO line and `recalld graph`'s own summary
+said the worker "runs only while nothing is being captured", which stopped
+being true when the gate moved to standing down only while audio is still
+queued for transcription, or while capture is paused — no captured
+application in view enters into it at all.
+
+### Follow-up: what still needs config.toml or the CLI
+
+`mood.set` closed one gap — a switch with copy in the GUI and no way to move
+it short of an edit and a restart. It is not the only one. This is a plain
+inventory, not a plan: every `config.rs` section and every `recalld` verb,
+classified so the next pass knows where to spend a socket method rather than
+rediscovering the gap by reading a bug report.
+
+**User-facing** — a person would reasonably expect a control in the GUI, or
+does today: `truth on/off`, `truth audio on/off`. and `sources`/`allow`/`deny`
+already have one and are not listed twice.
+
+| config.rs section | CLI verb(s) | today | gap |
+|---|---|---|---|
+| `[mic]`, `[room]` | `recalld mic`, `recalld room` | live (`mic.set`/`room.set`), in the Sources card | none |
+| `[graph]` | `recalld graph on\|off` | live (`graph.set`), in the Memory card | none |
+| `[mood]` (`enabled`) | `recalld mood on\|off` | live (`mood.set`), in the Memory card | **closed this round** |
+| `[mood]` (`rows_per_run`, `batch_rows`, `min_duration_s`, `live`) | — | `config.toml` only | no control anywhere; `live` in particular trades a live mood chip against dropped-turn risk on the capture path and deserves the same kind of explicit opt-in `[truth].audio` got, not a silent default |
+| `[assist]` (`reminders`, `digest`, `translate_to`, …) | `recalld digest` (read-only) | live (`assist.set`) for the translation half; `reminders`/`digest` themselves have no socket switch | a person cannot turn digests or reminders off from the GUI, only from `config.toml` |
+| `[night]` | — | `config.toml` only; read-only via `status` | the window and the idle threshold that `[mood]` and `[asr].lang_sweep` both borrow have no control at all — moving them means editing a file three features silently depend on |
+| `[asr]` (accuracy round, `lang_sweep`) | `recalld accuracy` | mostly read/measurement; `lang_sweep`'s own enable is `config.toml` only | the switch exists in the daemon and nowhere for a person to flip it |
+| `[truth]` | `recalld truth on\|off`, `recalld truth audio on\|off` | needs a restart to take effect (unlike `graph`/`mood`) — the one already-user-facing switch that is NOT live | the oldest inconsistency in this table; fixing it means finding what in `truthnet`'s listener setup assumes it only runs once at start |
+| `[identity]` | `recalld identity calibrate`, `recalld identity repair` | maintenance: run-on-demand operations, not settings with a state | fine as is — these are one-shot passes over the voicebank, not switches |
+| `[retention]` | — | `config.toml` only; `status.storage` reports what it did | a person cannot see or change how long audio is kept without editing the file; the numbers that decide it are invisible until a sweep happens to log them |
+| `[roster]`, `[socket]`, `[runtime]`, `[vad]`, `[models]`, `[capture]` | `recalld models fetch/status`, `recalld probe` | maintenance / measurement-only: process wiring, model downloads, capture tuning that assumes expert judgement | correctly CLI-only — a GUI control here would be a foot-gun, not a feature |
+
+**Maintenance** (CLI, deliberately not in the GUI): `recalld speakers merge/split/prune/delete`, `recalld identity calibrate/repair`, `recalld turns rejudge`, `recalld models fetch/build-night`. These are corrective operations on the voicebank or the archive, not settings — running one is a decision with a before/after, not a state a card should show as "on".
+
+**Measurement-only** (no switch, by design — see `[mood].live`'s own note above for the shape of the argument): `recalld accuracy report/learn`, `crate::mood::MOOD_IS_MEASURED` (`status.mood.rendered`), the calibration bake-off's `aggregate`/`aggregate_thresholds`. A number here changing what it reports on the next code change is expected; a number here becoming a knob is not, unless a future measurement earns it the way `[mood].live` will if RTF or the live-path budget ever changes.
+
+The two closest to worth doing next, on this inventory: `[truth]` on/off not being live (the inconsistency, since its own `audio` sibling flag reads live-vs-restart the same way `[graph]`/`[mood]` do and a person has no way to tell which is which without reading this table), and `reminders`/`digest` having no switch at all despite `[assist]`'s other half being fully live.

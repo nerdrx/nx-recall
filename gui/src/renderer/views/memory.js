@@ -167,6 +167,11 @@ export function mount(root, ctx) {
   /// 0.10.2: an `assist.set` is in flight, so the three controls are dead until
   /// it answers — the same visible optimistic window the thread stepper has.
   let translatePending = false;
+  /// 0.12.5: a `mood.set` is in flight. Separate from `translatePending` on
+  /// purpose — the display radios and the listening switch are two different
+  /// requests to two different methods, and disabling one while the other is
+  /// in flight would be disabling a control nobody asked anything of.
+  let moodPending = false;
 
   let notes = [];
   let noteBusy = new Set();
@@ -1225,7 +1230,7 @@ export function mount(root, ctx) {
       onclick: () => void setEnabled(!cfg.enabled),
     });
 
-    const chip = chipFor(phase, st);
+    const chip = chipFor(phase, st, summary?.counts);
     enrichCard.append(
       h(
         'div',
@@ -1314,12 +1319,21 @@ export function mount(root, ctx) {
     }
     if (summary?.counts) {
       const c = summary.counts;
+      // 0.12.5: `threads_pending` (unread, period) split into the two things
+      // it always was — `threads_waiting`, the worker's actual queue, and
+      // `threads_too_short`, the conversations under `min_thread_segments`
+      // turns that the worker will never open. A card that called the whole
+      // of `pending` "waiting" was describing a backlog nobody was working.
+      const floor = c.min_thread_segments ?? 3;
       enrichCard.append(
         h('p', {
           class: 'rail-hint',
           id: 'enrich-counts',
           style: 'padding:8px 0 0',
-          text: `${c.threads_enriched} of ${c.threads} conversations read · ${c.threads_pending} waiting · ${c.from_llm} commitments from the model, ${c.from_rules} from pattern matching`,
+          text:
+            `${c.threads_enriched} of ${c.threads} read · ${c.threads_waiting} waiting · ` +
+            `${c.threads_too_short} too short to read (under ${floor} turns) · ` +
+            `${c.from_llm} commitments from the model, ${c.from_rules} from pattern matching`,
         })
       );
     }
@@ -1536,12 +1550,47 @@ export function mount(root, ctx) {
               ? 'off — nothing is listened to'
               : !available
                 ? 'the decoder is not installed'
-                : `${st.read_total ?? 0} turns read · ${st.backlog ?? 0} to go`,
+                // 0.12.5: newest first — what the pass's own queue does now
+                // (`Store::segments_for_mood`), so the header says so rather
+                // than leaving "to go" ambiguous about which end it means.
+                : `${st.read_total ?? 0} turns read · ${st.backlog ?? 0} to go, newest first`,
         })
       )
     );
 
-    const option = (value, label, hint) =>
+    // 0.12.5. The switch itself — live (`mood.set`, picked up by the pass
+    // within a minute, no restart) and persisted to config.toml the way
+    // `graph.set`'s is. The radio group below stays usable either way: it is
+    // a person's standing choice about how a mood WOULD be drawn, and there is
+    // no reason to grey it out just because nothing is being fed to it today.
+    const moodToggle = h('button', {
+      class: 'toggle',
+      role: 'switch',
+      id: 'mood-toggle',
+      'aria-pressed': String(on),
+      'aria-label': on ? 'Stop listening overnight' : 'Listen at night',
+      disabled: !st || moodPending || store.conn.status !== 'connected',
+      onclick: () => void setMood(!on),
+    });
+    moodCard.append(
+      h(
+        'div',
+        { class: 'tune-block', id: 'mood-toggle-row' },
+        h(
+          'span',
+          { class: 'tune-label' },
+          h('b', { text: 'Listen at night' }),
+          h('small', {
+            text: on
+              ? 'Reading laughter, music and tone off audio already on disk, overnight, on the niced cores. Never the GPU.'
+              : 'Off. Laughter, music and a tone tag are read off audio already on disk — overnight, on the same niced cores as the night shift, never the GPU.',
+          })
+        ),
+        moodToggle
+      )
+    );
+
+    const option = (value, label, hint, dim) =>
       h(
         'label',
         { class: `radio-row${mode === value ? ' on' : ''}` },
@@ -1554,7 +1603,17 @@ export function mount(root, ctx) {
           disabled: !live,
           onchange: () => void setAssist({ mood_display: value }),
         }),
-        h('span', {}, h('b', { text: label }), h('small', { text: hint }))
+        h(
+          'span',
+          {},
+          h('b', { text: label }),
+          h('small', { text: hint }),
+          // 0.12.5: the colour half of `tint`/`both` has nothing to draw on
+          // this daemon (`rendered` is false) — a person choosing the option
+          // should be told why it looks the same as `tags` today, in the same
+          // breath as the option rather than in a separate paragraph.
+          dim ? h('small', { class: 'dim', text: 'no colour until the mood reading is measured' }) : null
+        )
       );
 
     moodCard.append(
@@ -1580,9 +1639,10 @@ export function mount(root, ctx) {
           option(
             'tint',
             'Colour the words',
-            'the mood becomes the row’s colour — laughter and music stay chips, because a sound has no colour'
+            'the mood becomes the row’s colour — laughter and music stay chips, because a sound has no colour',
+            !rendered
           ),
-          option('both', 'Both', 'the mood as a chip AND as the row’s colour'),
+          option('both', 'Both', 'the mood as a chip AND as the row’s colour', !rendered),
           option('off', 'Neither', 'the tags are still read and stored, just not drawn')
         )
       )
@@ -1603,14 +1663,15 @@ export function mount(root, ctx) {
       );
     }
 
-    // …and what is missing, if anything is. One line, and it names the switch
-    // rather than describing the feeling of it being off.
+    // …and what is missing, if anything is. The amber notice is gone the
+    // instant the switch is on — it names a problem, and "off" stops being
+    // one the moment a person turns it on.
     if (st && !on) {
       moodCard.append(
         h('p', {
           class: 'mic-warn',
           id: 'mood-off',
-          text: 'Nothing is being listened to: set `enabled = true` under `[mood]` in config.toml. It runs in the same overnight window as the night shift, on the same niced cores, and never touches the GPU.',
+          text: 'Nothing is being listened to. Turn the switch above on to start — the pass runs overnight, on the same niced cores as the night shift, and never touches the GPU.',
         })
       );
     } else if (st && !available) {
@@ -1663,6 +1724,32 @@ export function mount(root, ctx) {
       // `assist` event for a change made anywhere, this window is subscribed
       // to it like any other, and that is the one path — a second path would
       // be a second chance to disagree with the daemon.
+    }
+  }
+
+  /**
+   * `mood.set {enabled}` (0.12.5). Optimistic like `setAssist`: the switch
+   * moves and the amber notice comes or goes the instant a person presses it,
+   * and both go back if the daemon refuses. The daemon also republishes the
+   * whole `status` topic on this change, so a window that missed the reply
+   * (a second client, a reconnect) converges on that instead — this function
+   * only has to get the one that pressed it there without a round trip.
+   */
+  async function setMood(enabled) {
+    if (!store.status) return;
+    const before = store.status.mood ? { ...store.status.mood } : null;
+    store.status = { ...store.status, mood: { ...store.status.mood, enabled } };
+    moodPending = true;
+    renderMood();
+    try {
+      const reply = await ask('mood.set', { enabled });
+      store.status = { ...store.status, mood: { ...store.status.mood, ...reply } };
+    } catch (e) {
+      store.status = { ...store.status, mood: before };
+      toast(`Could not change that — ${e.message}`, 'error');
+    } finally {
+      moodPending = false;
+      renderMood();
     }
   }
 
@@ -1762,7 +1849,12 @@ export function mount(root, ctx) {
   }
 
   /** Three states a person acts on, out of the daemon's five. */
-  function chipFor(phase, st) {
+  // 0.12.5: `idle` used to read `st.walked` to decide between "idle" and
+  // "idle — nothing left to read", which was really asking the wrong
+  // question — a walked queue can still have threads sitting in it. The
+  // right question is the one `threads_waiting` answers: is there anything
+  // left the worker would actually take.
+  function chipFor(phase, st, counts) {
     switch (phase) {
       case 'running':
         return { text: 'reading', cls: 'chip live', live: true };
@@ -1771,10 +1863,9 @@ export function mount(root, ctx) {
       case 'unavailable':
         return { text: 'not installed', cls: 'chip warn' };
       case 'idle':
-        return {
-          text: st?.walked ? 'idle — nothing left to read' : 'idle',
-          cls: 'chip',
-        };
+        return (counts?.threads_waiting ?? 0) > 0
+          ? { text: 'waiting', cls: 'chip warn' }
+          : { text: 'idle — nothing left to read', cls: 'chip' };
       default:
         return { text: 'off', cls: 'chip' };
     }

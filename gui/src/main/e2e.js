@@ -3024,6 +3024,50 @@ export function runE2E(deps) {
       return { why: card.why, sub: card.sub, file };
     });
 
+    // 0.12.5 — the mood pass's own switch. `mood.set` is a real socket method
+    // now, not the test-only `mock.mood`, so this exercises the whole path: a
+    // click flips the switch, `status.mood.enabled` moves, the amber notice
+    // comes and goes with it, and the header starts saying how much has been
+    // read instead of "nothing is listened to".
+    await step('the-mood-switch-turns-listening-on-and-off', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.getElementById("mood-card").scrollIntoView({ block: "start" })');
+      const off = await waitFor('the mood card in its shipped, off state', async () => {
+        const v = await js('window.__recallDebug.mood()');
+        return v.sub ? v : null;
+      });
+      assert(/^off —/.test(off.sub), `the mood card did not ship off: "${off.sub}"`);
+      assert(await js('!!document.getElementById("mood-off")'), 'no notice shown while off');
+      const offShot = await shot('memory-mood-off');
+
+      await js('document.getElementById("mood-toggle").click()');
+      const on = await waitFor('the switch to report on, with counts in the header', async () => {
+        const v = await js('window.__recallDebug.mood()');
+        return v.sub && /read/.test(v.sub) ? v : null;
+      });
+      assert(/newest first/.test(on.sub), `the header does not say the read order: "${on.sub}"`);
+      assert(
+        !(await js('!!document.getElementById("mood-off")')),
+        'the amber notice stayed up once the switch was on'
+      );
+      const onShot = await shot('memory-mood-on');
+
+      // Back off, and the notice returns — the two states are a round trip,
+      // not a one-way door.
+      await js('document.getElementById("mood-toggle").click()');
+      await waitFor('the switch to report off again', async () => {
+        const v = await js('window.__recallDebug.mood()');
+        return v.sub && /^off —/.test(v.sub) ? true : null;
+      });
+      assert(
+        await js('!!document.getElementById("mood-off")'),
+        'the notice did not come back once switched off'
+      );
+
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      return { offSub: off.sub, onSub: on.sub, offShot, onShot };
+    });
+
     // 8 — pause from the TRAY path stops the feed (DESIGN §8, the marquee case)
     await step('tray-pause-stops-feed', async () => {
       await deps.setPaused(true); // exactly what the tray menu item calls
