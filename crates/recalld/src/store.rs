@@ -2757,18 +2757,32 @@ impl Store {
 
     /// Turns waiting for the overnight third reading, newest first.
     ///
-    /// The queue is deliberately narrow: **only rows the cross-check called
-    /// `shaky`**. That is the whole measured case for the feature (FINDINGS
-    /// §12: shaky rows disagree with large-v3 76% of the time against 27% on
-    /// solid ones), and it is also the only place where the cost is justified —
-    /// a third reading of a row two decoders already agree on buys nothing and
-    /// costs a GPU.
+    /// The queue is narrow, but it is two cases, not one:
+    ///
+    /// * **rows the cross-check called `shaky`.** That is the measured case
+    ///   for the feature (FINDINGS §12: shaky rows disagree with large-v3 76%
+    ///   of the time against 27% on solid ones), and it is also the only place
+    ///   where the cost is justified for the *default* decoder — a third
+    ///   reading of a row two decoders already agree on buys nothing and costs
+    ///   a GPU.
+    /// * **rows the light decoder wrote** (0.13.x, `crate::light`), regardless
+    ///   of what the cross-check said. The 110m export trades words for CPU
+    ///   on purpose — that is the whole feature — and shipping it without a
+    ///   guaranteed pass at the day's better decoder would let a game session
+    ///   quietly downgrade the archive with no way back. `light_asr_dir` is
+    ///   [`crate::models::FALLBACK_ASR`]`.dir`; matched as a prefix because
+    ///   `asr_model_id` carries the contract version after an `@`.
     ///
     /// The rest of the filters are the same guards the other two queues carry,
     /// in SQL for the same reason: audio still on disk, a transcript to
     /// compare against, never a row a person has corrected by hand, and a NULL
     /// `night_at_ns` so a row is read once and not every night.
-    pub fn segments_for_night(&self, limit: usize) -> Result<Vec<RedecodeCandidate>> {
+    pub fn segments_for_night(
+        &self,
+        limit: usize,
+        light_asr_dir: &str,
+    ) -> Result<Vec<RedecodeCandidate>> {
+        let light_prefix = format!("{light_asr_dir}%");
         let rows = self
             .conn
             .prepare(
@@ -2776,7 +2790,7 @@ impl Store {
                  FROM segments g
                  WHERE g.deleted_at IS NULL
                    AND g.night_at_ns IS NULL
-                   AND g.asr_confidence = 'shaky'
+                   AND (g.asr_confidence = 'shaky' OR g.asr_model_id LIKE ?2)
                    AND g.text IS NOT NULL AND LENGTH(TRIM(g.text)) > 0
                    AND g.audio_path <> ''
                    AND NOT EXISTS (
@@ -2786,7 +2800,7 @@ impl Store {
                  ORDER BY g.t_start_ns DESC
                  LIMIT ?1",
             )?
-            .query_map(params![limit as i64], |r| {
+            .query_map(params![limit as i64, light_prefix], |r| {
                 Ok(RedecodeCandidate {
                     id: r.get(0)?,
                     session_id: r.get(1)?,
@@ -9946,6 +9960,67 @@ mod tests {
         let sess = s.begin_session(src, 1_000).unwrap();
         s.insert_segment(sess, 1_000, 2_000, "segments/a.wav", 0)
             .unwrap()
+    }
+
+    // ---- light mode (0.13.x): the night shift's coverage -------------------
+
+    /// A row the light decoder wrote reaches the night queue even when the
+    /// cross-check called it `solid` — the guarantee `crate::light`'s module
+    /// docs promise: light mode trades words for CPU, and the archive gets a
+    /// pass at the better decoder back regardless of what agreed with it.
+    #[test]
+    fn a_light_decoded_row_reaches_the_night_queue_even_when_solid() {
+        let s = store();
+        let id = a_segment(&s);
+        s.conn
+            .execute(
+                "UPDATE segments SET text = 'hello there', \
+                 asr_model_id = 'sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8@1', \
+                 asr_confidence = 'solid' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let rows = s
+            .segments_for_night(
+                10,
+                "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "a light row must not need to be shaky first");
+        assert_eq!(rows[0].id, id);
+    }
+
+    /// The ordinary rule is unchanged: a `solid` row from the default decoder
+    /// is not queued, and a `shaky` one still is.
+    #[test]
+    fn a_default_decoded_row_still_follows_the_shaky_only_rule() {
+        let s = store();
+        let solid = a_segment(&s);
+        s.conn
+            .execute(
+                "UPDATE segments SET text = 'a', \
+                 asr_model_id = 'sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8@1', \
+                 asr_confidence = 'solid' WHERE id = ?1",
+                params![solid],
+            )
+            .unwrap();
+        let shaky = a_segment(&s);
+        s.conn
+            .execute(
+                "UPDATE segments SET text = 'b', \
+                 asr_model_id = 'sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8@1', \
+                 asr_confidence = 'shaky' WHERE id = ?1",
+                params![shaky],
+            )
+            .unwrap();
+        let rows = s
+            .segments_for_night(
+                10,
+                "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, shaky);
     }
 
     // ---- Step 1 behaviour, unchanged -------------------------------------

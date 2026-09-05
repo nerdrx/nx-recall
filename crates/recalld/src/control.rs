@@ -140,6 +140,13 @@ pub struct Control {
     /// discipline as `last_sweep`.
     last_backup: Mutex<Option<Value>>,
     // ---- end 0.13.0 -------------------------------------------------------
+    // ---- light mode (0.13.x, `crate::light`) ------------------------------
+    /// What the live path is doing right now: whether the light decoder is
+    /// loaded, and why. Written by the inference thread, which is the only
+    /// place that knows both halves of the answer — the config and the
+    /// captured sources — and read by `status.asr.devices`.
+    light_state: Mutex<crate::light::LightState>,
+    // ---- end light mode -----------------------------------------------
 }
 
 impl Control {
@@ -184,6 +191,7 @@ impl Control {
             stereo_probe_report: Mutex::new(None),
             backup: Mutex::new(crate::config::BackupConfig::default()),
             last_backup: Mutex::new(None),
+            light_state: Mutex::new(crate::light::LightState::default()),
         })
     }
 
@@ -480,6 +488,46 @@ impl Control {
         *this.asr.get_mut().unwrap_or_else(|p| p.into_inner()) = cfg;
         self
     }
+
+    // ---- light mode (0.13.x, `crate::light`) ------------------------------
+
+    /// Change the switch and/or its two tuning knobs, live. The one place
+    /// `asr.light.set` and a hand-edited config agree, for the same reason
+    /// `apply_graph` is the one place `graph.set` and `[graph]` agree.
+    pub fn set_light_mode(
+        &self,
+        mode: Option<crate::config::LightMode>,
+        games: Option<Vec<String>>,
+        gpu_busy_pct: Option<u32>,
+    ) -> crate::config::AsrConfig {
+        let mut guard = self.asr.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(m) = mode {
+            guard.light_mode = m;
+        }
+        if let Some(g) = games {
+            guard.light_mode_games = g;
+        }
+        if let Some(p) = gpu_busy_pct {
+            guard.light_mode_gpu_busy_pct = p.clamp(1, 100);
+        }
+        guard.clone()
+    }
+
+    /// What the inference thread is doing right now, for `status.asr.devices`.
+    pub fn light_state(&self) -> crate::light::LightState {
+        *self.light_state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The inference thread reporting a change. Returns whether it is actually
+    /// a change, so a caller that checks every turn does not publish an
+    /// identical status event every turn.
+    pub fn set_light_state(&self, next: crate::light::LightState) -> bool {
+        let mut guard = self.light_state.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = *guard != next;
+        *guard = next;
+        changed
+    }
+    // ---- end light mode -----------------------------------------------
 
     // ---- 0.13.0: flap tolerance and the stereo probe ----------------------
 

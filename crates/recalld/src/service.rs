@@ -588,6 +588,9 @@ impl Service {
             "mood.get" => self.mood_get(),
             "mood.set" => self.mood_set(req),
             // ---- end 0.12.5 --------------------------------------------------
+            // ---- light mode (0.13.x, `crate::light`) -------------------------
+            "asr.light.set" => self.asr_light_set(req),
+            // ---- end light mode -----------------------------------------------
             "transcript" => self.transcript(req),
             "roster.now" => self.roster_now(),
             "operations.list" => self.operations_list(req),
@@ -825,6 +828,84 @@ impl Service {
         Ok(payload)
     }
 
+    // ---- light mode (0.13.x, `crate::light`) -------------------------------
+
+    /// `asr.light.set {mode?, games?, gpu_busy_pct?}` — the "lighter while a
+    /// game runs" switch.
+    ///
+    /// Live and persisted, `graph.set`'s pattern exactly: the inference
+    /// thread reads [`Control::asr`] fresh on every check
+    /// (`Pipeline::maybe_update_light_mode`, at most a second away), and the
+    /// change is written to `config.toml` so it survives a restart — a switch
+    /// that forgets by morning is not a switch a person can rely on.
+    fn asr_light_set(&self, req: &Request) -> Result<Value, Error> {
+        let mode = match req.opt_str("mode")? {
+            None => None,
+            Some(s) => Some(match s.to_ascii_lowercase().as_str() {
+                "auto" => crate::config::LightMode::Auto,
+                "on" => crate::config::LightMode::On,
+                "off" => crate::config::LightMode::Off,
+                other => {
+                    return Err(Error::params(format!(
+                        "mode must be \"auto\", \"on\" or \"off\", not {other:?}"
+                    )));
+                }
+            }),
+        };
+        let games = match req.param("games") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item.as_str() {
+                        Some(s) => out.push(s.to_ascii_lowercase()),
+                        None => return Err(Error::params("games must be an array of strings")),
+                    }
+                }
+                Some(out)
+            }
+            _ => return Err(Error::params("games must be an array of strings")),
+        };
+        let gpu_busy_pct = req.opt_i64("gpu_busy_pct")?.map(|v| v.clamp(1, 100) as u32);
+        if mode.is_none() && games.is_none() && gpu_busy_pct.is_none() {
+            return Err(Error::params(
+                "asr.light.set needs at least one of mode, games, gpu_busy_pct",
+            ));
+        }
+        let cfg = self
+            .control
+            .set_light_mode(mode, games.clone(), gpu_busy_pct);
+
+        let mut persisted = false;
+        if let Some(path) = &self.control.config_path {
+            match Config::load(path) {
+                Ok(mut file) => {
+                    file.asr.light_mode = cfg.light_mode;
+                    file.asr.light_mode_games = cfg.light_mode_games.clone();
+                    file.asr.light_mode_gpu_busy_pct = cfg.light_mode_gpu_busy_pct;
+                    match file.save(path) {
+                        Ok(()) => persisted = true,
+                        Err(e) => warn!("could not persist the light mode settings: {e:#}"),
+                    }
+                }
+                Err(e) => warn!("could not re-read the config to persist light mode: {e:#}"),
+            }
+        }
+        info!(
+            mode = ?cfg.light_mode,
+            gpu_busy_pct = cfg.light_mode_gpu_busy_pct,
+            persisted,
+            "light mode settings changed"
+        );
+        // The inference thread's own check is at most a second away, but a
+        // client should not have to wait even that long to see the switch
+        // reflect what it just asked for.
+        self.announce_status();
+        let mut payload = self.asr_quality_json();
+        payload["persisted"] = json!(persisted);
+        Ok(payload)
+    }
+
     fn asr_quality_json(&self) -> Value {
         let cfg = self.control.asr();
         let confidence = self
@@ -841,6 +922,20 @@ impl Service {
             .map(|root| crate::models::NightModels::resolve_at(root.clone(), &night))
             .is_some_and(|m| m.present());
         let stats = &self.control.night_stats;
+        // Light mode (0.13.x, `crate::light`): which decoder is live right
+        // now, and why. `None` on a daemon with no analysis models resolved —
+        // there is no transcriber for the switch to describe.
+        let light_state = self.control.light_state();
+        let light_model_dir = if light_state.light {
+            crate::models::FALLBACK_ASR.dir
+        } else {
+            crate::models::DEFAULT_ASR.dir
+        };
+        let light_block = self
+            .control
+            .models_root
+            .as_ref()
+            .map(|_| (light_model_dir, light_state.reason.as_str()));
         json!({
             "context_redecode": cfg.context_redecode,
             "context_redecode_below_s": cfg.context_redecode_below_s,
@@ -856,7 +951,22 @@ impl Service {
             // daemon is too old to have been asked" are different states, and
             // a missing key says neither. See `crate::device` — the answer is
             // a constant because the blocker is upstream, not local.
-            "devices": crate::device::status_json(night_available),
+            "devices": crate::device::status_json(night_available, light_block),
+            // Light mode's own settings and live state, alongside the same
+            // pair the confidence block above carries: what is configured and
+            // what is actually true right now.
+            "light_mode": {
+                "mode": match cfg.light_mode {
+                    crate::config::LightMode::Auto => "auto",
+                    crate::config::LightMode::On => "on",
+                    crate::config::LightMode::Off => "off",
+                },
+                "games": cfg.light_mode_games,
+                "gpu_busy_pct_threshold": cfg.light_mode_gpu_busy_pct,
+                "light": light_state.light,
+                "reason": light_state.reason.as_str(),
+                "model": light_model_dir,
+            },
             // The vocabulary is assembled and served; nothing is biased by it.
             // Said here rather than only in the docs, because a client showing
             // a glossary screen must not imply an effect the daemon does not

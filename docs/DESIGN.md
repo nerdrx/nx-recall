@@ -140,7 +140,7 @@ set). Measured selections:
 | VAD | Silero | ~1 MB | v4/v5 contract auto-detected |
 | Overlap | pyannote segmentation-3.0 | 6 MB | RTF 0.0017 · **MIT** (v1's "gated license" note was wrong — the HF form gates the download, not the license) |
 | Embedding | ERes2Net-en (192-d) | 26 MB | 1.38% EER clean; TitaNet-small equals it, so "small model during VR" costs nothing |
-| ASR (EN) | Parakeet-TDT 110m int8 | 108 MB | 2.0% WER clean, RTF 0.011 |
+| ASR (EN) | Parakeet-TDT 110m int8 | 108 MB | 2.0% WER clean, RTF 0.011 — also light mode's decoder (0.13.x, `[asr].light_mode`, `models fetch --fallback-asr`/`--light`); §49 |
 | ASR (EN, large) | Parakeet-TDT 0.6b int8 | 480 MB | 1.3% WER, RTF 0.026 |
 | ASR (non-EN) | evaluate parakeet-ja / parakeet-v3 **before** Whisper | — | Whisper base: 4× worse WER, hallucinates on all non-speech |
 | Memory graph (optional) | Qwen2.5-3B-Instruct Q4 GGUF, via llama.cpp | 1.9 GB | 9/9 trap rejections, 3.3 s/case on 4 pinned cores ([GRAPH.md](GRAPH.md)) |
@@ -209,6 +209,26 @@ set). Measured selections:
   decoder cannot amortise the model load the way a night batch does. There is
   deliberately **no `live_gpu` setting**: all three of its states would do the
   same thing.
+- **The knob that does exist is a smaller model, not a different device**
+  (0.13.x, "light mode"). If 89.5% of the live cost is one model and the GPU
+  cannot take it, the only other lever is a cheaper model — Parakeet-TDT 110m,
+  already in the catalogue, at RTF 0.011 against the 0.6b-v3 export's 0.026
+  (§10). `[asr].light_mode` swaps to it while a captured source is a game
+  (`[asr].light_mode_games`, seeded with the same `"vrchat"` pattern
+  `[identity].vrchat_sources` already carries), while `gpu_busy_percent`'s 30 s
+  median is sustained-high (smoothed against the ±20-point single-sample noise
+  §12/13 measured), or on a manual switch — and swaps back the moment none of
+  the three holds. Measured on 24.9 minutes of the user's own archive,
+  interleaved per clip against the model it replaces (FINDINGS §48): **-58.0%
+  CPU s/audio-minute**, comfortably past the round's -50% gate in every
+  duration bucket. The price is words, and it is not small on this install —
+  104.5% WER against the 0.6b-v3 reading, because the 110m export is
+  English-only and 83% of this archive's segments are not English (matching
+  the catalogue's own "103% German" note for this export) — which is why the
+  night shift's third reading is unconditional for a light-mode row
+  (`Store::segments_for_night`, §48.3) rather than gated on the ordinary
+  cross-check flag: the archive is never permanently downgraded, only for the
+  hours until the next night window.
 - **Three tiers, not one (0.11.2).** The first night with the night shift, the
   digests, the translator, the cross-check and the truth pass all running, the
   capture thread missed its PipeWire deadlines 658 times in one hour — because

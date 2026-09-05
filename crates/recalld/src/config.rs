@@ -609,6 +609,27 @@ impl Default for GraphConfig {
     }
 }
 
+/// `[asr].light_mode` (0.13.x, `crate::light`): whether the live decoder may
+/// swap to the smaller Parakeet-TDT 110m export while a game is running.
+///
+/// `Auto` is the shipped default because the feature's whole point is to act
+/// without being asked — a person who wants it always on or always off has
+/// `On`/`Off` rather than a config file to hand-edit for the duration of one
+/// session. Serialised lower-case so `light_mode = "auto"` reads the way every
+/// other string switch in this file does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LightMode {
+    /// Follow a captured game source or a sustained-busy GPU
+    /// (`crate::light::decide`).
+    #[default]
+    Auto,
+    /// The light decoder is live, unconditionally.
+    On,
+    /// The multilingual default decoder is live, unconditionally.
+    Off,
+}
+
 /// The accuracy round (0.8.0): what the idle quality worker is allowed to do to
 /// a transcript after the fact.
 ///
@@ -924,6 +945,33 @@ pub struct AsrConfig {
     /// caption with a lost recording.
     pub partial_backlog_max_s: i64,
     // ---- end 0.11.0 --------------------------------------------------------
+
+    // ---- light mode (0.13.x, `crate::light`) -------------------------------
+    /// Swap the live decoder to the smaller Parakeet-TDT 110m export
+    /// (`recalld models fetch --fallback-asr`, also `--light`) while a game is
+    /// running. See `crate::light` for the three ways "while a game is
+    /// running" is decided and `crate::device::status_json` for what the
+    /// running daemon reports about which one fired.
+    ///
+    /// **Ships `off`.** The 110m export reads English only; on this install's
+    /// archive (83% German) it measured 104.5% WER against the full decoder
+    /// (FINDINGS §49) while halving the CPU. That is a trade a person makes
+    /// knowingly from the card, not one a default makes for them — the night
+    /// shift re-reads every light row, but the captions on the glass are live.
+    pub light_mode: LightMode,
+    /// Which captured sources count as a game, in `Auto`. Lower-cased
+    /// substrings matched against a source's match key, the same way
+    /// `[identity].vrchat_sources` matches VRChat — seeded with exactly that
+    /// list, because VRChat is the one game this daemon has ever captured.
+    pub light_mode_games: Vec<String>,
+    /// `gpu_busy_percent`'s 30 s median, at or above which `Auto` treats the
+    /// GPU as sustained-busy (`crate::light::GpuBusyMonitor`). Higher than
+    /// `[night].gpu_busy_max_pct`'s 50 on purpose: that gate is "stand down
+    /// before costing a batch anything", this one is "a game is plausibly
+    /// drawing frames", and a browser video or a compositor animation should
+    /// not be enough to flip the transcriber.
+    pub light_mode_gpu_busy_pct: u32,
+    // ---- end light mode ------------------------------------------------
 }
 
 impl Default for AsrConfig {
@@ -977,6 +1025,11 @@ impl Default for AsrConfig {
             partial_min_ms: 800,
             partial_backlog_max_s: 5,
             // ---- end 0.11.0 -----------------------------------------------
+            // ---- light mode -------------------------------------------------
+            light_mode: LightMode::Off,
+            light_mode_games: vec!["vrchat".into()],
+            light_mode_gpu_busy_pct: 70,
+            // ---- end light mode -----------------------------------------
         }
     }
 }
@@ -2206,6 +2259,35 @@ mod tests {
         assert_eq!(cfg.night.model, "ggml-large-v3-q5_0.bin");
         assert_eq!(cfg.night.whisper_dir, "whisper");
         assert_eq!(cfg.night.gap_s, 1.0);
+    }
+
+    // ---- light mode (0.13.x) ----------------------------------------------
+
+    /// Auto is the shipped default, seeded with the same VRChat pattern
+    /// `[identity].vrchat_sources` already carries, and the GPU threshold is
+    /// above the night shift's own gate for the reason its doc comment gives.
+    #[test]
+    fn light_mode_ships_off_and_its_game_list_is_seeded_from_the_vrchat_pattern() {
+        let cfg = Config::default();
+        assert_eq!(cfg.asr.light_mode, LightMode::Off);
+        assert_eq!(cfg.asr.light_mode_games, vec!["vrchat".to_string()]);
+        assert_eq!(cfg.asr.light_mode_games, cfg.identity.vrchat_sources);
+        assert_eq!(cfg.asr.light_mode_gpu_busy_pct, 70);
+        assert!(cfg.asr.light_mode_gpu_busy_pct > cfg.night.gpu_busy_max_pct);
+    }
+
+    /// All three states of the switch round-trip through TOML the way every
+    /// other lower-case string switch in this file does.
+    #[test]
+    fn light_mode_parses_all_three_states() {
+        for (text, want) in [
+            ("auto", LightMode::Auto),
+            ("on", LightMode::On),
+            ("off", LightMode::Off),
+        ] {
+            let cfg: Config = toml::from_str(&format!("[asr]\nlight_mode = \"{text}\"\n")).unwrap();
+            assert_eq!(cfg.asr.light_mode, want, "parsing light_mode = {text:?}");
+        }
     }
 
     #[test]

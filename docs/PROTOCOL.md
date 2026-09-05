@@ -1527,6 +1527,10 @@ enough not to have been asked" are different states:
     { "model": "parakeet-tdt-0.6b-v3", "runtime": "sherpa-onnx", "device": "cpu",
       "cpu_share_pct": 87.5, "why": "sherpa-onnx accepts no AMD execution provider …" }
   ],
+  // 0.13.x: which ASR export is actually live right now, and why. `null` on a
+  // daemon with no analysis models resolved at all — there is no transcriber
+  // for the question to be about. See "Light mode" below.
+  "light": { "model": "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8", "why": "no game captured and the GPU is not sustained-busy" },
   "summary": "every model on the live path runs on the CPU. …"
 }
 ```
@@ -1552,7 +1556,9 @@ going to be one. A UI must not offer a "use the GPU" toggle, or present the CPU
 placement as a default that can be changed: 90% of the live cost is the
 transcriber, the transcriber runs under sherpa-onnx, and sherpa-onnx's provider
 enum has no AMD variant — that is upstream C++, not a flag this daemon withheld.
-The night shift is the GPU feature, and it has its own block.
+The night shift is the GPU feature, and it has its own block. `devices.light`
+is a different question and it is a real setting — which *export* of the
+transducer is live, still on the CPU either way — see "Light mode" below.
 
 ### The vote, stated for clients
 
@@ -5336,6 +5342,7 @@ already have one and are not listed twice.
 | `[assist]` (`reminders`, `digest`, `translate_to`, …) | `recalld digest` (read-only) | live (`assist.set`) for the translation half; `reminders`/`digest` themselves have no socket switch | a person cannot turn digests or reminders off from the GUI, only from `config.toml` |
 | `[night]` | — | `config.toml` only; read-only via `status` | the window and the idle threshold that `[mood]` and `[asr].lang_sweep` both borrow have no control at all — moving them means editing a file three features silently depend on |
 | `[asr]` (accuracy round, `lang_sweep`) | `recalld accuracy` | mostly read/measurement; `lang_sweep`'s own enable is `config.toml` only | the switch exists in the daemon and nowhere for a person to flip it |
+| `[asr]` (`light_mode`, `light_mode_games`, `light_mode_gpu_busy_pct`) | `recalld models fetch --fallback-asr`/`--light` (fetch only) | live (`asr.light.set`), in the Memory card | **closed by light mode, below** |
 | `[truth]` | `recalld truth on\|off`, `recalld truth audio on\|off` | needs a restart to take effect (unlike `graph`/`mood`) — the one already-user-facing switch that is NOT live | the oldest inconsistency in this table; fixing it means finding what in `truthnet`'s listener setup assumes it only runs once at start |
 | `[identity]` | `recalld identity calibrate`, `recalld identity repair` | maintenance: run-on-demand operations, not settings with a state | fine as is — these are one-shot passes over the voicebank, not switches |
 | `[retention]` | — | `config.toml` only; `status.storage` reports what it did | a person cannot see or change how long audio is kept without editing the file; the numbers that decide it are invisible until a sweep happens to log them |
@@ -5486,3 +5493,85 @@ no daemon reachable at all, the data directory is not in use by anything and
 the restore proceeds directly. `restore` also prints its "this will replace…"
 confirmation and requires `--yes`, the one command here that touches the live
 data directory in a way nothing else in this protocol does.
+## 0.13.x — light mode: a smaller decoder while a game is running
+
+§40 measured the live path's cost and found the lever: 89.5% of it is one
+model, Parakeet-TDT 0.6b-v3, on the one runtime with no route to this
+machine's GPU (`status.asr.devices`, above). The only knob left is a smaller
+model, and `[asr].light_mode` is that knob — see `crate::light` and FINDINGS
+§48 for the measurement.
+
+### `asr.light.set` / `status.asr.light_mode`
+
+```
+asr.light.set {"mode": "on"}
+→ the same shape as status.asr, plus "persisted": true
+```
+
+`status.asr.light_mode`:
+
+```json
+"light_mode": {
+  "mode": "auto",
+  "games": ["vrchat"],
+  "gpu_busy_pct_threshold": 70,
+  "light": false,
+  "reason": "no game captured and the GPU is not sustained-busy",
+  "model": "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+}
+```
+
+- `mode` — the switch: `"off"` (the default — the 110m export reads English only and measured 104.5% WER on a German-heavy archive, FINDINGS §49; a person opts in from the card), `"auto"`, or `"on"`. `asr.light.set`
+  also accepts `games` (an array of lower-cased substrings, matched against a
+  captured source's match key the same way `[identity].vrchat_sources`
+  matches VRChat) and `gpu_busy_pct` (1-100) to move the other two knobs; at
+  least one of `mode`/`games`/`gpu_busy_pct` must be present.
+- `light` / `reason` — what is actually true **right now**, independent of
+  `mode`: whether the smaller decoder is the one loaded, and why. In `auto`
+  this is decided by `crate::light::decide` — a captured source matching
+  `games`, or `gpu_busy_percent`'s 30-second median clearing
+  `gpu_busy_pct_threshold` (FINDINGS §12/13: a single reading swings ±20
+  points at 1 Hz, which is why it is a median over a window and not the last
+  sample) — and it changes on its own, with no request from any client, the
+  moment a game starts or stops. A client that only reads `mode` cannot tell
+  the difference between "auto, and nothing is happening" and "auto, and the
+  transcriber just got smaller"; a client that renders this card should read
+  both.
+- `model` — the export's directory name. `sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`
+  or `sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8`, the same
+  strings `status.asr.devices.light.model` and a row's own `asr_model_id`
+  carry — a client never has to hard-code either name to answer "which one is
+  this daemon running".
+
+Live like `graph.set`/`mood.set`: the inference thread re-checks the switch
+about once a second (`Pipeline::maybe_update_light_mode`) and reloads the
+decoder — a real model load, the same one start-up pays — only when the
+answer changed. Persisted to `config.toml` the same way, so a choice a person
+made does not revert at the next restart. An automatic swap — a game starting,
+or the GPU crossing the threshold — is announced on `Topic::Status` as its own
+`light` event (`{"light": bool, "reason": str}`), because that transition
+happens with no request in flight for `asr.light.set`'s own reply to ride on;
+`status`'s next poll would eventually show it too, but a game starting is
+exactly the moment CPU headroom matters and "eventually" is the wrong answer.
+
+### The gate this feature shipped against
+
+FINDINGS §49: CPU ≥ -50% in light mode (measured -58.0%, on 24.9 minutes of
+the user's own archive, interleaved per clip against the model it replaces).
+The WER cost — 104.5% against the 0.6b-v3 reading as reference, on an archive
+that is 83% non-English, matching the catalogue's own "103% German" note for
+this export — is **reported, not gated**, and the reason it is acceptable
+despite that number is `Store::segments_for_night`'s other half of this round:
+every row `asr_model_id` says was decoded by the light export is queued for
+the night shift's third reading regardless of the cross-check's confidence
+verdict, so a row light mode wrote wrong on a German lobby is not wrong for
+long — the archive is never permanently downgraded, only for the hours between
+the turn and the next night shift window.
+
+### Operator steps
+
+`recalld models fetch --fallback-asr` (also accepts `--light`) installs the
+110m export the switch needs, ~108 MB compressed. Without it, `mode = "on"` or
+an automatic `auto` swap that would otherwise fire logs a warning and the
+default decoder keeps running — light mode never trades a missing optional
+download for losing transcription outright.

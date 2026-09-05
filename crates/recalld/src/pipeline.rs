@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
+use serde_json::json;
 use tracing::{debug, error, info, warn};
 
 use crate::analysis::{
@@ -403,6 +404,18 @@ pub struct Pipeline {
     /// once rather than fifty times a second.
     muted_mixed: std::collections::HashSet<i64>,
     // ---- end 0.12.1 --------------------------------------------------------
+    // ---- light mode (0.13.x, `crate::light`) -------------------------------
+    /// The resolved model set the analyzer was loaded from, kept so the
+    /// inference thread can re-point the ASR leg without re-resolving
+    /// `[models].dir` off disk on every check. `None` exactly when `analyzer`
+    /// is — no models, no light mode.
+    models: Option<ModelSet>,
+    /// The GPU's smoothed busy reading (`crate::light::GpuBusyMonitor`).
+    gpu_busy: crate::light::GpuBusyMonitor,
+    /// When the switch was last evaluated, so a check that would otherwise run
+    /// once per audio chunk runs about once a second instead.
+    light_checked_at: Option<std::time::Instant>,
+    // ---- end light mode ------------------------------------------------
 }
 
 impl Pipeline {
@@ -417,6 +430,9 @@ impl Pipeline {
     ) -> Result<Self> {
         let vad = SileroVad::from_bytes(crate::VAD_MODEL)?;
         let seg_cfg = crate::ingest::segmenter_config(cfg);
+        // Kept alongside the analyzer so light mode can re-point the ASR leg
+        // later without re-resolving `[models].dir` off disk.
+        let mut resolved_models: Option<ModelSet> = None;
         let analyzer = match ModelSet::resolve(&cfg.models) {
             None => {
                 info!("no [models].dir configured: capture and VAD only");
@@ -477,6 +493,7 @@ impl Pipeline {
                     if let Some(note) = analyzer.polyglot_note() {
                         info!("{note}");
                     }
+                    resolved_models = Some(models);
                     Some(analyzer)
                 } else {
                     warn!(
@@ -507,6 +524,9 @@ impl Pipeline {
             discord_side: HashMap::new(),
             bridge: None,
             muted_mixed: std::collections::HashSet::new(),
+            models: resolved_models,
+            gpu_busy: crate::light::GpuBusyMonitor::new(),
+            light_checked_at: None,
         })
     }
 
@@ -558,6 +578,81 @@ impl Pipeline {
         }
     }
 
+    // ---- light mode (0.13.x, `crate::light`) -------------------------------
+    /// Re-evaluate the switch and swap the decoder if the answer changed.
+    ///
+    /// Called from [`Self::on_audio`], which is the inference thread's only
+    /// entry point — the same reason `is_paused` is checked there rather than
+    /// on a timer of its own. Throttled to about once a second: `on_audio` can
+    /// run many times a second and neither a sysfs read nor a session-table
+    /// lookup belongs on that path unthrottled, let alone a model reload.
+    fn maybe_update_light_mode(&mut self) {
+        let Some(models) = self.models.clone() else {
+            // No analysis models resolved at all: there is nothing to swap.
+            return;
+        };
+        let now = std::time::Instant::now();
+        const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+        if self
+            .light_checked_at
+            .is_some_and(|last| now.duration_since(last) < CHECK_EVERY)
+        {
+            return;
+        }
+        self.light_checked_at = Some(now);
+
+        let cfg = self.control.asr();
+        self.gpu_busy.sample(now, crate::night::gpu_busy_pct());
+
+        let game_active = self
+            .sessions
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .any(|id| {
+                self.session_source_key(id)
+                    .is_some_and(|key| crate::light::is_game_source(&cfg.light_mode_games, &key))
+            });
+        let (want_light, reason) = crate::light::decide(
+            cfg.light_mode,
+            game_active,
+            self.gpu_busy.median(),
+            cfg.light_mode_gpu_busy_pct,
+        );
+
+        let changed_report = self.control.set_light_state(crate::light::LightState {
+            light: want_light,
+            reason,
+        });
+
+        let Some(analyzer) = &mut self.analyzer else {
+            return;
+        };
+        match analyzer.set_light(&models, want_light) {
+            Ok(true) => {
+                info!(
+                    light = want_light,
+                    reason = reason.as_str(),
+                    model = analyzer.asr_model_id(),
+                    "light mode switched the live decoder"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!("light mode wanted to switch but could not: {e:#}");
+            }
+        }
+        if changed_report {
+            self.bus.publish(
+                Topic::Status,
+                "light",
+                json!({ "light": want_light, "reason": reason.as_str() }),
+            );
+        }
+    }
+    // ---- end light mode ------------------------------------------------
+
     fn on_audio(&mut self, chunk: AudioChunk) -> Result<()> {
         // Paused: the capture stream keeps running — dropping it would cost a
         // re-negotiation and a lost session — but the audio stops here. Any
@@ -575,6 +670,8 @@ impl Pipeline {
             self.was_paused = false;
             info!("resumed: writing segments again");
         }
+
+        self.maybe_update_light_mode();
 
         // ---- 0.12.1: the de-duplication rule ---------------------------------
         //

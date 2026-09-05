@@ -327,6 +327,52 @@ impl Analyzer {
         self.embedder.model_id()
     }
 
+    /// The transducer's stable identity, stamped on every row it decodes
+    /// (`Prepared::asr_model_id`). What `crate::light` compares against to
+    /// tell whether the light decoder is already the one loaded.
+    pub fn asr_model_id(&self) -> &str {
+        self.asr.model_id()
+    }
+
+    // ---- light mode (0.13.x, `crate::light`) -------------------------------
+    /// Swap the live decoder between the default multilingual export and the
+    /// smaller English-only one, or leave it alone if it is already the one
+    /// asked for.
+    ///
+    /// A real model load — the same `Decoder::load` start-up already pays for
+    /// — so it belongs on the inference thread between turns, never mid-turn
+    /// and never called from a socket handler. `models` is the resolved set
+    /// the daemon started with; only its ASR leg is repointed, at
+    /// [`crate::models::ModelSet::with_asr`].
+    ///
+    /// Returns `Ok(true)` when it actually reloaded, `Ok(false)` when the
+    /// requested decoder was already live, and `Err` when `light` was asked
+    /// for and the 110m export is not installed — the caller keeps whatever
+    /// was already loaded rather than losing transcription over a missing
+    /// optional download.
+    pub fn set_light(&mut self, models: &crate::models::ModelSet, light: bool) -> Result<bool> {
+        let export = if light {
+            &crate::models::FALLBACK_ASR
+        } else {
+            &crate::models::DEFAULT_ASR
+        };
+        if self.asr.model_id().starts_with(export.dir) {
+            return Ok(false);
+        }
+        if !models.has_asr_export(export) {
+            anyhow::bail!(
+                "light mode wants {} but it is not installed under {} — \
+                 `recalld models fetch --fallback-asr` (also `--light`) installs it",
+                export.dir,
+                models.root.display()
+            );
+        }
+        let pointed = models.with_asr(export);
+        self.asr = crate::asr::Decoder::load(&pointed, self.cfg.split_turns)?;
+        Ok(true)
+    }
+    // ---- end light mode -----------------------------------------------
+
     // ---- 0.11.0, partial turns: begin --------------------------------------
     /// Decode an OPEN turn for a provisional caption (`crate::partial`).
     ///

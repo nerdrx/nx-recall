@@ -301,7 +301,8 @@ the daemon is capturing, and a run that is interrupted loses nothing.
 `recalld models fetch --japanese` installs a Japanese decoder and the language
 identifier that routes to it (~605 MB), `--cjk` adds Korean and Chinese (~1.6 GB
 in total);
-`--fallback-asr` installs the English one (~108 MB).")]
+`--fallback-asr` (also `--light`) installs the English one (~108 MB) — the
+same files `[asr].light_mode` loads while a game is running.")]
     Lang {
         #[command(subcommand)]
         action: Option<LangAction>,
@@ -1002,8 +1003,10 @@ pub enum ModelsAction {
         /// Also install the older English-only ASR export (~103 MB). Not part
         /// of the default set: the multilingual default transcribes English
         /// better as well. It exists as the fallback for machines that already
-        /// have it.
-        #[arg(long)]
+        /// have it, and light mode (0.13.x, `[asr].light_mode`) loads the same
+        /// files while a game is running — `--light` fetches the same group
+        /// under the name that switch is asked about.
+        #[arg(long, alias = "light")]
         fallback_asr: bool,
 
         /// Also install the memory graph's local model (~1.9 GB) and the

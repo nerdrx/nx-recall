@@ -782,7 +782,8 @@ pub fn night_batch(
     // one.
     let (candidates, langs, rules): (Vec<RedecodeCandidate>, Vec<Option<String>>, Rules) = {
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
-        let rows = guard.segments_for_night(cfg.max_rows_per_night)?;
+        let rows =
+            guard.segments_for_night(cfg.max_rows_per_night, crate::models::FALLBACK_ASR.dir)?;
         let mut langs = Vec::with_capacity(rows.len());
         for row in &rows {
             langs.push(guard.segment_lang_hint(row.id)?.0);

@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use recalld::config::{NightConfig, SAMPLE_RATE};
+use recalld::models::FALLBACK_ASR;
 use recalld::night::{
     Hours, Readings, Slot, Utterance, Vote, gpu_busy_pct_in, judge_vote, pack, parse_whisper_json,
     split_by_offsets,
@@ -61,7 +62,7 @@ fn the_queue_is_shaky_rows_that_nobody_has_corrected() {
         .expect("op");
 
     let queued: Vec<i64> = store
-        .segments_for_night(10)
+        .segments_for_night(10, FALLBACK_ASR.dir)
         .expect("queue")
         .iter()
         .map(|c| c.id)
@@ -75,9 +76,62 @@ fn the_queue_is_shaky_rows_that_nobody_has_corrected() {
     // nothing at all, which is the case that would otherwise loop for ever.
     store.set_segment_night(shaky, None, 7).expect("stamp");
     assert!(
-        store.segments_for_night(10).expect("queue").is_empty(),
+        store
+            .segments_for_night(10, FALLBACK_ASR.dir)
+            .expect("queue")
+            .is_empty(),
         "a row the night shift has considered leaves the queue"
     );
+}
+
+/// Light mode's guarantee (0.13.x): a row the 110m export decoded is queued
+/// even when nobody flagged it shaky, because that decoder trades words for
+/// CPU by design and the archive is owed a pass at the better one regardless.
+#[test]
+fn a_light_decoded_row_is_queued_even_when_solid() {
+    let store = Store::open_in_memory().expect("store");
+    let source = store.upsert_source("VRChat.exe", "VRChat", 0).expect("src");
+    let session = store.begin_session(source, 0).expect("session");
+    let row = |start: i64, model_id: &str, verdict: Option<&str>| {
+        let id = store
+            .insert_segment(session, start, start + 2_000_000_000, "a.wav", 0)
+            .expect("segment");
+        store
+            .set_segment_analysis(
+                id,
+                &SegmentAnalysis {
+                    text: Some("hallo".into()),
+                    lang: None,
+                    lang_via: None,
+                    asr_model_id: Some(format!("{model_id}@1")),
+                    overlap_frac: None,
+                },
+            )
+            .expect("analysis");
+        if let Some(v) = verdict {
+            store.set_segment_confidence(id, Some(v), 1).expect("flag");
+        }
+        id
+    };
+    let light_solid = row(0, FALLBACK_ASR.dir, Some("solid"));
+    let default_solid = row(
+        3_000_000_000,
+        "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+        Some("solid"),
+    );
+
+    let queued: Vec<i64> = store
+        .segments_for_night(10, FALLBACK_ASR.dir)
+        .expect("queue")
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(
+        queued,
+        vec![light_solid],
+        "the light row is queued despite being solid; the default row is not"
+    );
+    assert!(!queued.contains(&default_solid));
 }
 
 /// A replacement goes through the same door a context re-decode does: the prior

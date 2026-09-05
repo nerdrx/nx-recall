@@ -172,6 +172,10 @@ export function mount(root, ctx) {
   /// requests to two different methods, and disabling one while the other is
   /// in flight would be disabling a control nobody asked anything of.
   let moodPending = false;
+  /// 0.13.x: an `asr.light.set` is in flight, so the radio group is dead until
+  /// it answers — the same visible optimistic window `moodPending` gives the
+  /// listening switch.
+  let lightPending = false;
 
   let notes = [];
   let noteBusy = new Set();
@@ -206,6 +210,11 @@ export function mount(root, ctx) {
   // translation, and a card whose title lied about half its contents would be a
   // worse economy than one more heading.
   const moodCard = h('div', { class: 'card', id: 'mood-card' });
+  // 0.13.x. Directly under "How it sounded": both cards are about what the
+  // live path is doing to CPU and audio it did not choose, and "lighter while
+  // a game runs" is the other half of that question — what decoder is doing
+  // the actual transcribing, not what else rides along with it.
+  const lightCard = h('div', { class: 'card', id: 'light-card' });
   const body = h(
     'div',
     { class: 'view-body view-enter' },
@@ -222,7 +231,8 @@ export function mount(root, ctx) {
     topicsCard,
     enrichCard,
     translateCard,
-    moodCard
+    moodCard,
+    lightCard
   );
 
   root.append(
@@ -1753,6 +1763,106 @@ export function mount(root, ctx) {
     }
   }
 
+  // -- lighter while a game runs (0.13.x) ------------------------------------
+  //
+  // Three states, and all three act: `auto` follows a captured game source or
+  // a sustained-busy GPU (`crate::light`), `on` and `off` pin the decoder
+  // regardless. The card also shows what is true RIGHT NOW — which decoder is
+  // live and why — because "auto" without that line is a setting nobody can
+  // verify did anything.
+
+  const LIGHT_MODES = ['auto', 'on', 'off'];
+
+  function renderLight() {
+    clear(lightCard);
+    const st = store.status?.asr ?? null;
+    const lm = st?.light_mode ?? null;
+    const mode = LIGHT_MODES.includes(lm?.mode) ? lm.mode : 'auto';
+    const live = store.conn.status === 'connected' && !lightPending;
+
+    lightCard.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('div', { class: 'card-title', text: 'Lighter while a game runs' }),
+        h('span', {
+          class: 'sub',
+          id: 'light-sub',
+          text: !st
+            ? 'this daemon is older than 0.13.x'
+            : lm?.light
+              ? `on the smaller decoder — ${lm.reason}`
+              : `on the full decoder — ${lm?.reason ?? 'no game captured and the GPU is not sustained-busy'}`,
+        })
+      )
+    );
+
+    const option = (value, label, hint) =>
+      h(
+        'label',
+        { class: `radio-row${mode === value ? ' on' : ''}` },
+        h('input', {
+          type: 'radio',
+          name: 'light-mode',
+          value,
+          id: `light-mode-${value}`,
+          checked: mode === value || undefined,
+          disabled: !live,
+          onchange: () => void setLight(value),
+        }),
+        h('span', {}, h('b', { text: label }), h('small', { text: hint }))
+      );
+
+    lightCard.append(
+      h(
+        'div',
+        { class: 'tune-block', id: 'light-mode-row' },
+        h(
+          'span',
+          { class: 'tune-label' },
+          h('b', { text: 'Decoder while gaming' }),
+          h('small', {
+            text: 'Swaps the transcriber for a smaller, faster one while a game is running, and swaps back when it is not. It costs some accuracy — the archive still gets a full re-read overnight.',
+          })
+        ),
+        h(
+          'div',
+          { class: 'radio-set', role: 'radiogroup', 'aria-label': 'Lighter while a game runs' },
+          option('auto', 'Auto', 'follow a captured game, or a busy GPU'),
+          option('on', 'Always', 'the smaller decoder, all the time'),
+          option('off', 'Never', 'the full decoder, all the time')
+        )
+      )
+    );
+  }
+
+  /**
+   * `asr.light.set {mode}` (0.13.x). Optimistic like `setMood`: the radio
+   * moves the instant a person presses it and goes back if the daemon
+   * refuses. The daemon republishes the whole `status` topic on this change,
+   * so a second window converges on that instead of this function's reply.
+   */
+  async function setLight(mode) {
+    if (!store.status) return;
+    const before = store.status.asr ? { ...store.status.asr } : null;
+    store.status = {
+      ...store.status,
+      asr: { ...store.status.asr, light_mode: { ...store.status.asr?.light_mode, mode } },
+    };
+    lightPending = true;
+    renderLight();
+    try {
+      const reply = await ask('asr.light.set', { mode });
+      store.status = { ...store.status, asr: { ...store.status.asr, ...reply } };
+    } catch (e) {
+      store.status = { ...store.status, asr: before };
+      toast(`Could not change that — ${e.message}`, 'error');
+    } finally {
+      lightPending = false;
+      renderLight();
+    }
+  }
+
   /// How much of the machine the model may use — the setting that replaced
   /// standing down while you played.
   ///
@@ -2028,6 +2138,7 @@ export function mount(root, ctx) {
   renderEnrichment();
   renderTranslation();
   renderMood();
+  renderLight();
   void load();
 
   return {
@@ -2084,6 +2195,13 @@ export function mount(root, ctx) {
         // is on, whether the model is installed and whether the measurement
         // lets the mood half be drawn, and all three live on `status.mood`.
         renderMood();
+      }
+      // Light mode (0.13.x): the mode, the games list and the gpu threshold
+      // live on `status.asr.light_mode`, and the automatic swap arrives as its
+      // own `light` event folded into the same block (`applyEvent` above) —
+      // both are covered by re-rendering on `status`.
+      if (change?.status) {
+        renderLight();
       }
       if (change?.commitment) {
         const row = commitments.find((c) => c.id === change.commitment.id);
