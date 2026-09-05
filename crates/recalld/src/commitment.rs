@@ -591,7 +591,7 @@ mod tests {
         // …and a purge takes the rows themselves.
         r.store.purge_segments(&[promise]).expect("purge");
         assert!(r.store.time_refs_for(promise).expect("refs").is_empty());
-        assert_eq!(r.store.graph_counts().expect("counts").commitments, 0);
+        assert_eq!(r.store.graph_counts(3).expect("counts").commitments, 0);
     }
 
     #[test]

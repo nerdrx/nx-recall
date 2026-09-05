@@ -734,6 +734,36 @@ function buildHistory() {
       thread: threadFor(32),
     });
   });
+  // 0.12.5: a conversation the enrichment worker will never open — two worded
+  // turns, one short of `min_thread_segments` (3). Every other unenriched
+  // thread this fixture builds happens to clear the floor, which would leave
+  // `threads_too_short` sitting at zero and the split nothing to show. Thread
+  // 599 is outside THREAD_TOPICS on purpose, so it stays unenriched.
+  const shortBase = base - 3 * 3_600_000;
+  ['quick one', 'nvm, found it'].forEach((text, i) => {
+    const t = shortBase + i * 4_000;
+    out.push({
+      id: 1900 + i,
+      session: SESSIONS[0].id,
+      source: 'VRChat.exe',
+      // Speaker 5, deliberately not 2 — `highlight-set-and-clear` uses
+      // speaker 2 as the voice it highlights and clears, and an extra row
+      // under the same id would change what that step counts.
+      speaker: 5,
+      text,
+      t_ms: t,
+      t_ns: String(t) + '000000',
+      dur_ms: 1200,
+      overlap_frac: 0.0,
+      match_score: 0.9,
+      label_via: 'match',
+      lang: 'en',
+      lang_via: 'classified',
+      asr_confidence: 'solid',
+      text_via: 'live',
+      thread: 599,
+    });
+  });
   // 0.12.4: every row carries the two fields, whether or not it was seeded
   // with them. Done here rather than at each of a dozen literals for the
   // reason `segment_json` exists in the daemon: a row missing a key is a row
@@ -1265,9 +1295,11 @@ export function startMock({
     },
     // 0.12.4: the mood pass, as `status.mood` reports it. `enabled` is the
     // pass; `rendered` is the measurement about the MOOD half, and the mock
-    // ships the daemon's answer to it (false) rather than a convenient one.
-    // The e2e driver flips it to exercise the other world.
-    mood: { enabled: true, rendered: false },
+    // ships the daemon's answer to both (off, and not measured) rather than a
+    // convenient one — 0.12.5 made `enabled` a real switch (`mood.set`) and a
+    // fixture that shipped it already on would never exercise turning it on.
+    // The e2e driver flips both to exercise the other worlds.
+    mood: { enabled: false, rendered: false },
     /// Every `segments.correct` this daemon has served, which is where
     /// `accuracy.summary` comes from: the pre-correction text lives in the
     /// record, so a WER estimate is arithmetic over real edits rather than a
@@ -1908,11 +1940,53 @@ export function startMock({
     };
   }
 
+  /// `status.mood`, and `mood.get`'s whole reply — one function, so the card
+  /// and the toggle can never see two different answers to "is it on".
+  ///
+  /// `rendered` is a MEASUREMENT (`crate::mood::MOOD_IS_MEASURED`) and never
+  /// moves with `enabled` — the mock ships it false, matching the daemon's
+  /// shipped default, and a test that wants the other world sets
+  /// `state.mood.rendered = true` directly.
+  function moodStatus() {
+    return {
+      enabled: state.mood.enabled,
+      available: true,
+      how: null,
+      phase: state.mood.enabled ? 'idle' : 'off',
+      rendered: state.mood.rendered,
+      why: state.mood.rendered ? null : MOOD_WHY,
+      live: false,
+      // 0.12.5: newest first — what the daemon's own queue does now
+      // (`Store::segments_for_mood`). Fixed numbers, like the rest of this
+      // fixture's static counters; a real daemon's would fall as the pass runs.
+      backlog: state.mood.enabled ? 340 : 0,
+      read_total: state.mood.enabled ? state.segments.length : 0,
+      counters: {
+        read: state.mood.enabled ? state.segments.length : 0,
+        with_mood: 0,
+        with_event: 0,
+        no_audio: 0,
+        last_run_ms: 0,
+      },
+    };
+  }
+
   function graphCounts() {
     const by = (k) => state.commitments.filter((c) => c.state === k).length;
     const src = (k) => state.commitments.filter((c) => c.source === k).length;
     const threads = new Set(state.segments.map((s) => s.thread).filter((t) => t != null));
     const enriched = new Set(Object.keys(state.topics).map(Number));
+    // 0.12.5: the split behind `crate::store::Store::graph_counts` — of the
+    // threads nobody has read yet, only the ones with at least
+    // `min_thread_segments` worded turns are ones the worker will ever open.
+    // The rest are unread for ever, and a card that calls them "waiting"
+    // beside a chip that honestly says "idle" is the bug this split exists to
+    // fix.
+    const floor = graphConfig().min_thread_segments;
+    const wordedTurns = (t) =>
+      state.segments.filter((s) => s.thread === t && s.text && s.text.trim()).length;
+    const pending = [...threads].filter((t) => !enriched.has(t));
+    const waiting = pending.filter((t) => wordedTurns(t) >= floor).length;
     return {
       time_refs: state.commitments.filter((c) => c.due_raw).length,
       commitments: state.commitments.length,
@@ -1926,8 +2000,27 @@ export function startMock({
       topics: new Set(Object.values(state.topics)).size,
       threads: threads.size,
       threads_enriched: [...enriched].filter((t) => threads.has(t)).length,
-      threads_pending: [...threads].filter((t) => !enriched.has(t)).length,
+      threads_pending: pending.length,
+      threads_waiting: waiting,
+      threads_too_short: pending.length - waiting,
+      min_thread_segments: floor,
     };
+  }
+
+  /// Assign a topic to every thread the worker would actually take
+  /// (`threads_waiting`'s own filter), so a finished batch really has nothing
+  /// left rather than reporting "idle" over an unmoved backlog. Threads under
+  /// the floor (too short to read) are left alone on purpose.
+  function drainWaitingThreads() {
+    const floor = graphConfig().min_thread_segments;
+    const threads = new Set(state.segments.map((s) => s.thread).filter((t) => t != null));
+    const wordedTurns = (t) =>
+      state.segments.filter((s) => s.thread === t && s.text && s.text.trim()).length;
+    for (const t of threads) {
+      if (state.topics[t] == null && wordedTurns(t) >= floor) {
+        state.topics[t] = 'various things';
+      }
+    }
   }
 
   /// Flip the Tier 3 switch, and act like a worker that has been asked to run.
@@ -1971,6 +2064,15 @@ export function startMock({
       if (done >= total) {
         clearInterval(state.enrichTimer);
         state.enrichTimer = null;
+        // 0.12.5: actually drain the queue rather than just counting up to it.
+        // The chip's "idle — nothing left to read" is now conditioned on
+        // `threads_waiting`, which is real backlog — a mock that finished its
+        // batch and left every thread still unenriched would report "waiting"
+        // forever and never reach the state this card has copy for. Threads
+        // under `min_thread_segments` (thread 599, the too-short fixture) are
+        // deliberately left alone: draining them is not this worker's job,
+        // which is the whole point of the split.
+        drainWaitingThreads();
         state.enrichment = { ...state.enrichment, phase: 'idle', thread: null, batch_done: 0, batch_total: 0 };
         emit('ops', 'op.done', { op, kind: 'graph.enrich', done: total, total });
         emit('status', 'graph', { ...state.enrichment });
@@ -2422,18 +2524,7 @@ export function startMock({
       // world the user actually gets. A test that wants the other world sets
       // `state.mood.rendered = true` and gets it, which is the point of having
       // the flag on the wire at all.
-      mood: {
-        enabled: state.mood.enabled,
-        available: true,
-        how: null,
-        phase: state.mood.enabled ? 'idle' : 'off',
-        rendered: state.mood.rendered,
-        why: state.mood.rendered ? null : MOOD_WHY,
-        live: false,
-        backlog: 0,
-        read_total: state.segments.length,
-        counters: { read: state.segments.length, with_mood: 0, with_event: 0, no_audio: 0, last_run_ms: 0 },
-      },
+      mood: moodStatus(),
       segments_total: state.segments.length,
       daemon: daemonId(),
       schema: SCHEMA,
@@ -3616,9 +3707,28 @@ export function startMock({
 
     'assist.get': () => assistState(),
 
+    // ---- 0.12.5: the mood pass's own switch --------------------------------
+
+    'mood.get': () => moodStatus(),
+
+    /// `mood.set {enabled}` — live and, on the real daemon, persisted to
+    /// config.toml (`Service::mood_set`). The mock has no config file to
+    /// write, so "persisted" is simply true: there is nothing here that could
+    /// fail to save.
+    'mood.set'(params) {
+      if (params?.enabled === undefined) {
+        throw err('params', 'mood.set needs enabled');
+      }
+      state.mood.enabled = !!params.enabled;
+      emit('status', 'status', statusPayload());
+      return { ...moodStatus(), persisted: true };
+    },
+
+    // ---- end 0.12.5 ---------------------------------------------------------
+
     /**
-     * `mock.mood {enabled?, rendered?}` — the one method here that is not on
-     * the wire (0.12.4).
+     * `mock.mood {rendered?}` — the one method here that is not on the wire
+     * (0.12.4).
      *
      * `status.mood.rendered` is a MEASUREMENT in the daemon
      * (`crate::mood::MOOD_IS_MEASURED`), not a setting, so there is no request
@@ -3631,9 +3741,10 @@ export function startMock({
      * So the switch lives here, in the fake daemon, prefixed `mock.` so nobody
      * mistakes it for protocol. The real daemon has no such method and a client
      * that called it would get `unknown_method`, which is the right answer.
+     * `enabled` moved to the real `mood.set` in 0.12.5 and is no longer read
+     * here — it is a genuine daemon switch now, not a test-only knob.
      */
     'mock.mood'(params) {
-      if (params?.enabled !== undefined) state.mood.enabled = !!params.enabled;
       if (params?.rendered !== undefined) state.mood.rendered = !!params.rendered;
       // On `status`, the topic every client already has, so the app converges
       // the same way it would on a daemon restart.

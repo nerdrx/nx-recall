@@ -95,6 +95,11 @@ const ALLOWED = new Set([
   // the first time this was left out.
   'assist.get',
   'assist.set',
+  // The mood pass's own switch (0.12.5), reachable from the "How it sounded"
+  // card's "Listen at night" toggle. A write that needs a restart is not a
+  // control, the same argument `graph.set`'s entry above makes.
+  'mood.get',
+  'mood.set',
   // Worlds and turn-taking (0.10.0). Two reads: the Memory view's Worlds card
   // and the person page's "How you talk". A method the UI calls and this set
   // forgets is a card that never renders and says nothing about why.
