@@ -23,6 +23,9 @@ pub mod answer;
 // ---- end 0.11.0 ----
 pub mod arbiter;
 pub mod ask;
+// ---- 0.13.0, a backup you can trust --------------------------------------
+pub mod backup;
+// ---- end 0.13.0 -----------------------------------------------------------
 // ---- 0.9.0, the assistant ------------------------------------------------
 pub mod asr;
 pub mod asr_cjk;

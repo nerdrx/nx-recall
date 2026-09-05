@@ -39,6 +39,7 @@ export function mount(root, ctx) {
   const truthCard = h('div', { class: 'card', id: 'truth-card' });
   const exportCard = h('div', { class: 'card', id: 'export-card' });
   const storageCard = h('div', { class: 'card', id: 'storage-card' });
+  const backupCard = h('div', { class: 'card', id: 'backup-card' });
   const captionsCard = h('div', { class: 'card', id: 'captions-card' });
   const body = h(
     'div',
@@ -77,7 +78,11 @@ export function mount(root, ctx) {
     exportCard,
     // What all of that costs on disk. It belongs on this page because this is
     // where the decisions that grow it are made.
-    storageCard
+    storageCard,
+    // A backup you can trust (0.13.0). Right under Storage, because it is the
+    // other side of the same question — not just how much this costs on disk,
+    // but whether a copy of it exists anywhere else.
+    backupCard
   );
 
   root.append(
@@ -1030,6 +1035,243 @@ export function mount(root, ctx) {
     );
   }
 
+  // -- a backup you can trust (0.13.0) ---------------------------------------
+  //
+  // The same shape the export card already proved: a folder you pick in a
+  // native dialog, one button, no other destination anywhere in reach. The
+  // difference is what goes in the folder — a consistent snapshot rather than
+  // Markdown — and that a restore exists at all, which is deliberately the
+  // one button on this card that is NOT here: a restore replaces the running
+  // install's data, and that is a decision for `recalld backup restore`, not
+  // a click during a session that may still be capturing.
+
+  let backupDir = null;
+  let backupBusy = false;
+  let backupOp = null;
+  let backupProgress = null;
+  let backupDone = null;
+  let backupError = null;
+  let verifyOp = null;
+  let verifyBusy = false;
+  let verifyResult = null;
+  let verifyError = null;
+
+  function backupSchedule() {
+    return store.status?.backup ?? { enabled: false, dir: null, every_days: 7, keep: 4, last: null };
+  }
+
+  function renderBackup() {
+    if (backupCard.contains(document.activeElement) && !backupBusy && !verifyBusy) return;
+    clear(backupCard);
+    const sched = backupSchedule();
+    const canRun = !!backupDir && !backupBusy && store.conn.status === 'connected';
+
+    backupCard.append(
+      h(
+        'div',
+        { class: 'sheet-head' },
+        h('span', { class: 'card-title', text: 'Backup' }),
+        h('span', { class: 'spacer' }),
+        h('button', {
+          class: 'btn small',
+          id: 'backup-choose',
+          text: backupDir ? 'Change folder…' : 'Choose folder…',
+          disabled: backupBusy,
+          onclick: () => void chooseBackupFolder(),
+        })
+      ),
+      h('p', {
+        class: 'mic-warn',
+        id: 'backup-note',
+        text: 'A consistent snapshot to a folder on this disk, and nothing else — the database through SQLite’s own online backup so capture is never paused for it, plus your recordings and voice enrollment, and a manifest that a verify can check byte for byte.',
+      }),
+      h('p', {
+        class: 'rail-hint',
+        id: 'backup-dir',
+        style: 'padding:0 0 10px;max-width:64ch',
+        text: backupDir ? backupDir : 'No folder chosen yet.',
+      }),
+      h(
+        'div',
+        { class: 'sheet-head', style: 'padding-top:4px' },
+        h('button', {
+          class: 'btn small primary',
+          id: 'backup-create',
+          text: backupBusy ? 'Backing up…' : 'Back up now',
+          disabled: !canRun,
+          onclick: () => void createBackup(),
+        }),
+        h('button', {
+          class: 'btn small',
+          id: 'backup-verify',
+          text: verifyBusy ? 'Verifying…' : 'Verify',
+          disabled: !backupDir || verifyBusy || store.conn.status !== 'connected',
+          onclick: () => void verifyBackup(),
+        }),
+        h('span', { class: 'spacer' }),
+        backupDone
+          ? h('button', {
+              class: 'btn small',
+              id: 'backup-open',
+              text: 'Open folder',
+              onclick: () => void window.recall.backupFolder.open(backupDone.dir),
+            })
+          : h('span', {})
+      )
+    );
+
+    if (backupError) {
+      backupCard.append(h('p', { class: 'mic-warn', id: 'backup-error', text: backupError }));
+    }
+    if (backupProgress) {
+      backupCard.append(
+        h('p', {
+          class: 'rail-hint',
+          id: 'backup-progress',
+          style: 'padding:8px 0 0',
+          text: `Backing up ${backupProgress.done} of ${backupProgress.total}…`,
+        })
+      );
+    }
+    if (backupDone) {
+      backupCard.append(
+        h('p', {
+          class: 'rail-hint',
+          id: 'backup-done',
+          style: 'padding:8px 0 0',
+          text: `Wrote ${backupDone.files} file${backupDone.files === 1 ? '' : 's'} (${fmtBytes(backupDone.bytes ?? 0)}) to ${backupDone.dir}. Manifest ${String(backupDone.manifest_sha256 ?? '').slice(0, 12)}…`,
+        })
+      );
+    }
+    if (verifyError) {
+      backupCard.append(h('p', { class: 'mic-warn', id: 'verify-error', text: verifyError }));
+    }
+    if (verifyResult) {
+      backupCard.append(
+        h('p', {
+          class: 'rail-hint',
+          id: 'verify-result',
+          style: 'padding:8px 0 0;max-width:64ch',
+          text: verifyResult.ok
+            ? `Verified clean — ${verifyResult.files_checked} file${verifyResult.files_checked === 1 ? '' : 's'} checked, integrity_check ${verifyResult.integrity_check}, signature ${verifyResult.signature_valid ? 'valid' : 'not valid'}.`
+            : `Did NOT verify — ${verifyResult.files_bad?.length ?? 0} bad, ${verifyResult.files_missing?.length ?? 0} missing, integrity_check ${verifyResult.integrity_check}.`,
+        })
+      );
+    }
+
+    // The last-good line: what the daemon itself remembers, independent of
+    // anything this window did this session — a person reopening the app
+    // still needs to know whether last night's scheduled run actually worked.
+    backupCard.append(
+      h('p', {
+        class: 'rail-hint',
+        id: 'backup-last',
+        style: 'padding:10px 0 0;max-width:64ch',
+        text: sched.last
+          ? `Last backup: ${fmtDate(Number(sched.last.created_at_utc_ns ?? 0) / 1e6 || Date.now())} — ${sched.last.files} file${sched.last.files === 1 ? '' : 's'}, ${fmtBytes(sched.last.bytes ?? 0)}, to ${sched.last.dir}.`
+          : 'No backup has been made yet.',
+      })
+    );
+
+    backupCard.append(
+      h(
+        'div',
+        { class: 'cap-row-ctl', style: 'padding-top:10px' },
+        h(
+          'span',
+          { class: 'cap-label' },
+          h('b', { text: 'Back up automatically' }),
+          h('small', { text: `Every ${sched.every_days} day${sched.every_days === 1 ? '' : 's'}, keeping the last ${sched.keep} — on the same idle schedule as the night shift.` })
+        ),
+        h('span', { class: 'spacer' }),
+        h('button', {
+          class: 'toggle',
+          role: 'switch',
+          id: 'backup-schedule',
+          'aria-pressed': String(!!sched.enabled),
+          'aria-label': 'Back up automatically',
+          disabled: !sched.dir && !sched.enabled,
+          onclick: () => void toggleSchedule(!sched.enabled),
+        })
+      )
+    );
+    if (!sched.dir) {
+      backupCard.append(
+        h('p', {
+          class: 'rail-hint',
+          id: 'backup-schedule-note',
+          style: 'padding:4px 0 0;max-width:64ch',
+          text: 'Choose a folder and back up once by hand first — a schedule needs somewhere to write to.',
+        })
+      );
+    }
+  }
+
+  async function chooseBackupFolder() {
+    const dir = await window.recall.backupFolder.choose();
+    if (!dir) return;
+    backupDir = dir;
+    backupDone = null;
+    backupError = null;
+    verifyResult = null;
+    verifyError = null;
+    renderBackup();
+  }
+
+  async function createBackup() {
+    backupBusy = true;
+    backupError = null;
+    backupDone = null;
+    backupProgress = { done: 0, total: 1 };
+    renderBackup();
+    try {
+      const out = await ask('backup.create', { dir: backupDir });
+      backupOp = out.op;
+      // The op finishes on the event stream; `update` below picks it up.
+    } catch (e) {
+      backupBusy = false;
+      backupOp = null;
+      backupProgress = null;
+      backupError = e.message;
+      toast(`Backup refused — ${e.message}`, 'error');
+      renderBackup();
+    }
+  }
+
+  async function verifyBackup() {
+    verifyBusy = true;
+    verifyError = null;
+    verifyResult = null;
+    renderBackup();
+    try {
+      const out = await ask('backup.verify', { dir: backupDir });
+      verifyOp = out.op;
+    } catch (e) {
+      verifyBusy = false;
+      verifyOp = null;
+      verifyError = e.message;
+      renderBackup();
+    }
+  }
+
+  async function toggleSchedule(next) {
+    const before = backupSchedule();
+    // Optimistic, like every other switch on this page: `backup.set` echoes
+    // the whole block back and the periodic status poll converges regardless.
+    if (store.status) store.status.backup = { ...before, enabled: next };
+    renderBackup();
+    try {
+      const out = await ask('backup.set', { enabled: next, dir: next ? backupDir ?? before.dir : undefined });
+      if (store.status) store.status.backup = out;
+      toast(next ? 'Scheduled backups on.' : 'Scheduled backups off.', 'ok');
+    } catch (e) {
+      if (store.status) store.status.backup = before;
+      toast(`Could not change the schedule — ${e.message}`, 'error');
+    } finally {
+      renderBackup();
+    }
+  }
+
   // -- live captions --------------------------------------------------------
   //
   // Six controls and one button. Every one of them is a preference about a
@@ -1221,6 +1463,7 @@ export function mount(root, ctx) {
     renderTruth();
     renderExport();
     renderStorage();
+    renderBackup();
     renderCaptions();
     clear(list);
     // The microphone has its own card above; it must not also appear as a row
@@ -1379,6 +1622,48 @@ export function mount(root, ctx) {
         }
         renderExport();
       }
+      // ---- 0.13.0 ----------------------------------------------------------
+      // A backup you can trust: `backup.create`'s op finishes the same way
+      // `export.run`'s does, and `backup.verify`'s carries only the terminal
+      // event, since it has no plan to report progress against.
+      if (change?.ops && backupOp) {
+        const live = store.ops.get(backupOp);
+        if (live) {
+          backupProgress = {
+            done: Math.round((live.frac ?? 0) * (backupProgress?.total ?? 1)),
+            total: backupProgress?.total ?? 1,
+          };
+          renderBackup();
+        }
+      }
+      if (change?.opFinished?.kind === 'backup.create' && change.opFinished.op === backupOp) {
+        const d = change.opFinished;
+        backupBusy = false;
+        backupOp = null;
+        backupProgress = null;
+        if (d.failed) {
+          backupError = d.msg ?? 'the backup failed';
+          toast(`Backup failed — ${backupError}`, 'error');
+        } else {
+          backupDone = { files: d.files, bytes: d.bytes, dir: d.dir, manifest_sha256: d.manifest_sha256 };
+          toast(`Backed up ${d.files} file${d.files === 1 ? '' : 's'} to your disk.`, 'ok');
+        }
+        renderBackup();
+      }
+      if (change?.opFinished?.kind === 'backup.verify' && change.opFinished.op === verifyOp) {
+        const d = change.opFinished;
+        verifyBusy = false;
+        verifyOp = null;
+        if (d.failed) {
+          verifyError = d.msg ?? 'the verify failed';
+        } else {
+          verifyResult = d;
+          toast(d.ok ? 'This backup verifies clean.' : 'This backup did NOT verify clean.', d.ok ? 'ok' : 'error');
+        }
+        renderBackup();
+      }
+      if (change?.status) renderBackup();
+      // ---- end 0.13.0 --------------------------------------------------------
       // A link made here or anywhere else, and the periodic status poll that
       // carries whether the plugin is still sending.
       if (change?.truth) void loadTruth();

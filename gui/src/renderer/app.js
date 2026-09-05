@@ -883,6 +883,20 @@ document.addEventListener('keydown', (e) => {
       runDisabled: (document.getElementById('export-run') || {}).disabled ?? null,
       openable: !!document.getElementById('export-open'),
     }),
+    // The backup card (0.13.0): the folder, the last result, the verify
+    // result, and the schedule switch.
+    backupCard: () => ({
+      dir: (document.getElementById('backup-dir') || {}).textContent ?? '',
+      done: (document.getElementById('backup-done') || {}).textContent ?? '',
+      error: (document.getElementById('backup-error') || {}).textContent ?? '',
+      verifyResult: (document.getElementById('verify-result') || {}).textContent ?? '',
+      verifyError: (document.getElementById('verify-error') || {}).textContent ?? '',
+      last: (document.getElementById('backup-last') || {}).textContent ?? '',
+      createDisabled: (document.getElementById('backup-create') || {}).disabled ?? null,
+      verifyDisabled: (document.getElementById('backup-verify') || {}).disabled ?? null,
+      openable: !!document.getElementById('backup-open'),
+      schedulePressed: (document.getElementById('backup-schedule') || {}).getAttribute?.('aria-pressed') ?? null,
+    }),
     // The Discord bridge card.
     truth: () => ({
       chip: (document.getElementById('truth-chip') || {}).textContent ?? null,

@@ -5346,3 +5346,143 @@ already have one and are not listed twice.
 **Measurement-only** (no switch, by design — see `[mood].live`'s own note above for the shape of the argument): `recalld accuracy report/learn`, `crate::mood::MOOD_IS_MEASURED` (`status.mood.rendered`), the calibration bake-off's `aggregate`/`aggregate_thresholds`. A number here changing what it reports on the next code change is expected; a number here becoming a knob is not, unless a future measurement earns it the way `[mood].live` will if RTF or the live-path budget ever changes.
 
 The two closest to worth doing next, on this inventory: `[truth]` on/off not being live (the inconsistency, since its own `audio` sibling flag reads live-vs-restart the same way `[graph]`/`[mood]` do and a person has no way to tell which is which without reading this table), and `reminders`/`digest` having no switch at all despite `[assist]`'s other half being fully live.
+
+## 0.13.0 — a backup you can trust
+
+Additive, like 0.10.0's export: no method, event, field or behaviour described
+above this line changes, and `proto` stays `1`. Every new key is present
+rather than merely absent-when-off, the same rule `status.backup` follows
+below.
+
+### What a snapshot is
+
+`backup create` writes, into one directory on a local filesystem the caller
+names:
+
+- `recall.db` — copied through SQLite's own **online backup API**, against a
+  **second, independent, read-only connection** to the live file. WAL is what
+  makes this safe: a reader never blocks the writer and is never blocked by
+  it, so capture is never paused for this, unlike a restore (below).
+- `segments/`, `goldens/`, `probes/` — by **hard link** where the destination
+  is the same filesystem (a segment clip is never modified after it is
+  written, so a link is exactly as durable a copy as `cp` would make and costs
+  no I/O), and by copy where it is not. Any of the three may simply not exist
+  yet; an empty tier backs up to nothing.
+- `manifest.json` — every file's SHA-256 and byte count, the schema version,
+  and the row counts (`sessions`, `speakers`, `segments`) a restore is checked
+  against.
+- `manifest.sig` — a keyed signature over the manifest bytes, the key kept at
+  `<data-dir>/backup_key` (mode 0600, minted once, never asked for and never
+  transmitted). Its only job is making a hand-edited manifest provably
+  different from a real one — a plain hash alone cannot do that, since
+  anybody can recompute a plain hash over their tampered copy. The manifest's
+  own SHA-256 is also returned to the caller and printed by the CLI, so a
+  person who wants to eyeball it on paper can.
+
+### `backup.create` / `backup.verify` / `backup.restore`
+
+All three are **async operations**, `export.run`'s shape exactly, because
+hashing or copying a multi-gigabyte `segments/` tree is not a request that
+must finish inside the round trip that named it:
+
+```
+backup.create {dir} → {op}
+backup.verify {dir} → {op}
+backup.restore {dir} → {op}
+```
+
+then `op.progress` / `op.done` / `op.failed` on the `ops` topic, `kind` set to
+the method name. Progress is file-granularity for `create`; `verify` and
+`restore` report only the terminal event, since neither has a plan to render
+ahead of time.
+
+- **`backup.create`**'s `op.done` carries `{dir, files, bytes,
+  manifest_sha256, counts: {sessions, speakers, segments} | null,
+  created_at_utc_ns}`. Refuses `err:refused` on the same path guard
+  `export.run` uses (`crate::export::check_dir`, reused rather than
+  reimplemented) — relative, `..`, a volatile runtime directory, or a network
+  mount, identified the same way (`statfs(2)` against the same magic list).
+  Also runs at **idle scheduling priority** on a dedicated thread
+  (`crate::pipeline::background_current_thread`, the night shift's own
+  discipline: `SCHED_IDLE` plus `[runtime].inference_nice`/`inference_cpus`),
+  so a scheduled backup can never win a contest against a live capture.
+
+- **`backup.verify`** re-hashes every file the manifest names, re-checks the
+  signature, opens the copied database **read-only** and runs `PRAGMA
+  integrity_check`, and compares row counts. It changes nothing. `op.done`
+  carries `{dir, ok, files_checked, files_bad: [path], files_missing: [path],
+  integrity_check, signature_valid, counts_match, manifest_sha256}`. `ok` is
+  the AND of all four checks; a client should show `files_bad` and
+  `files_missing` by name rather than only the boolean, the same reason
+  `delete.preview` names rows instead of just a count.
+
+- **`backup.restore`** refuses outright, `err:refused`, unless capture is
+  paused (`pause` / `resume` — the panic-path switch, DESIGN §8) — checked
+  once at the request and again on the worker thread right before anything is
+  copied, since a `resume` landing in the gap between the two must still stop
+  it. A restore under a live writer would restore into a database something
+  else is still appending to, which is not a race this feature is willing to
+  lose quietly.
+
+  It copies the snapshot into a staging directory next to the live one,
+  **verifies the staged copy** (not the source snapshot — a corruption
+  introduced by the copy step itself must be caught too), and only then
+  swaps: the live data directory is renamed to `<data-dir>.bak` (replacing
+  any earlier one) and the staged copy takes its name. Both renames are
+  same-filesystem and therefore atomic. `op.done` carries `{restored_into,
+  previous_kept_as}`; `previous_kept_as` is `null` only when there was
+  nothing at `data-dir` to keep. A snapshot that does not verify clean is
+  never swapped in at all — the daemon's own data directory is left
+  untouched, and the error names which check failed.
+
+### `backup.get` / `backup.set`
+
+The scheduled backup's switch, `mood.set`'s pattern exactly — live and
+persisted, an omitted key leaves that field alone:
+
+```
+backup.set {enabled?, dir?, every_days?, keep?} → the same shape as backup.get, plus persisted: true
+backup.get {} → {enabled, dir, every_days, keep, persisted, last}
+```
+
+`dir` is the folder scheduled runs write timestamped generations into (a
+manual `backup.create` can target any directory it likes and does not touch
+this setting); `every_days` and `keep` are the schedule's period and how many
+generations to retain. `last` is the same object `backup.create`'s `op.done`
+carries, or `null` before any backup — scheduled or by hand — has ever run.
+
+### `status.backup`
+
+Always present, on the same three-second poll as every other block on this
+page:
+
+```json
+"backup": {
+  "enabled": false, "dir": null, "every_days": 7, "keep": 4,
+  "persisted": true,
+  "last": null
+}
+```
+
+`last` becomes the `backup.create` result once one has run. A client renders
+`null` as "no backup yet" — the same "measured, not assumed" discipline
+`status.storage` and `status.last_sweep` already keep, for the same reason: a
+zeroed block here would claim a backup that never happened.
+
+### CLI
+
+```
+recalld backup create <dir>     a consistent snapshot, right now
+recalld backup verify <dir>     re-check one without touching it
+recalld backup restore <dir>    swap it in over the live data dir
+```
+
+`create` and `verify` run in their own process against the data directory
+directly, exactly like `recalld export`, and work whether or not the daemon
+is running. `restore` is the one that asks: if a daemon is reachable on the
+control socket, it is queried for `status.paused` first and the CLI refuses
+with the same sentence the socket method does if capture is not paused; with
+no daemon reachable at all, the data directory is not in use by anything and
+the restore proceeds directly. `restore` also prints its "this will replace…"
+confirmation and requires `--yes`, the one command here that touches the live
+data directory in a way nothing else in this protocol does.

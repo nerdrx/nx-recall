@@ -41,9 +41,9 @@ use recalld::truth::{self, TruthStats, TruthStop};
 use recalld::truthnet;
 
 use crate::cli::{
-    AccuracyAction, Cli, Command, GraphAction, IdentityAction, LangAction, MicAction, ModelsAction,
-    MoodAction, NightBackend, NotesAction, SemanticAction, SpeakersAction, TruthAction,
-    TurnsAction,
+    AccuracyAction, BackupAction, Cli, Command, GraphAction, IdentityAction, LangAction, MicAction,
+    ModelsAction, MoodAction, NightBackend, NotesAction, SemanticAction, SpeakersAction,
+    TruthAction, TurnsAction,
 };
 
 fn main() -> Result<()> {
@@ -110,6 +110,13 @@ fn main() -> Result<()> {
             dry_run,
         ),
         // ---- end 0.10.0 ---------------------------------------------------
+        // ---- 0.13.0, a backup you can trust --------------------------------
+        Command::Backup { action } => match action {
+            BackupAction::Create { dir } => cmd_backup_create(&data_dir, &dir),
+            BackupAction::Verify { dir } => cmd_backup_verify(&data_dir, &dir),
+            BackupAction::Restore { dir, yes } => cmd_backup_restore(&cfg, &data_dir, &dir, yes),
+        },
+        // ---- end 0.13.0 -----------------------------------------------------
         Command::Models { action } => match action {
             ModelsAction::Status { dir } => {
                 cmd_models_status(&cfg, &data_dir, dir.as_deref(), false)
@@ -383,7 +390,9 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     .with_assist(cfg.assist.clone())
     // 0.13.0: flap tolerance's grace window and the stereo probe's switch,
     // both read by `status` — see `Control::capture_json`.
-    .with_capture(cfg.capture.clone());
+    .with_capture(cfg.capture.clone())
+    // 0.13.0: the scheduled backup, live like every other switch on this card.
+    .with_backup(cfg.backup.clone());
     // The three translation settings live in one place rather than being
     // threaded through `segment_json`'s dozen call sites; see `translate::LIVE`.
     // `assist.set` writes the same three, which is what makes them live.
@@ -1233,6 +1242,116 @@ fn cmd_export(
 }
 
 // ---- end 0.10.0 -----------------------------------------------------------
+
+// ---- 0.13.0, a backup you can trust ----------------------------------------
+
+fn cmd_backup_create(data_dir: &Path, dir: &Path) -> Result<()> {
+    if let Err(e) = recalld::backup::check_target(dir) {
+        anyhow::bail!("{e}");
+    }
+    println!(
+        "Backing up {} into {}...",
+        data_dir.display(),
+        dir.display()
+    );
+    let report = recalld::backup::create(data_dir, dir, |done, total| {
+        println!("  {done}/{total}");
+    })?;
+    println!(
+        "\n{} file{}, {} bytes, manifest {}.\nThese are files on your disk and nothing else.",
+        report.files,
+        if report.files == 1 { "" } else { "s" },
+        report.bytes,
+        report.manifest_sha256,
+    );
+    if let Some(c) = &report.counts {
+        println!(
+            "{} session{}, {} speaker{}, {} segment{}.",
+            c.sessions,
+            if c.sessions == 1 { "" } else { "s" },
+            c.speakers,
+            if c.speakers == 1 { "" } else { "s" },
+            c.segments,
+            if c.segments == 1 { "" } else { "s" },
+        );
+    }
+    Ok(())
+}
+
+fn cmd_backup_verify(data_dir: &Path, dir: &Path) -> Result<()> {
+    let report = recalld::backup::verify(data_dir, dir)?;
+    println!("manifest {}", report.manifest_sha256);
+    println!(
+        "signature: {}",
+        if report.signature_valid {
+            "valid"
+        } else {
+            "NOT valid (or no key to check it with)"
+        }
+    );
+    println!(
+        "files: {} checked, {} bad, {} missing",
+        report.files_checked,
+        report.files_bad.len(),
+        report.files_missing.len()
+    );
+    for f in report.files_bad.iter().chain(report.files_missing.iter()) {
+        println!("  ! {f}");
+    }
+    println!("integrity_check: {}", report.integrity_check);
+    println!(
+        "counts match manifest: {}",
+        if report.counts_match { "yes" } else { "no" }
+    );
+    if report.ok {
+        println!("\nOK — this backup verifies clean.");
+        Ok(())
+    } else {
+        anyhow::bail!("this backup did NOT verify clean")
+    }
+}
+
+fn cmd_backup_restore(cfg: &Config, data_dir: &Path, dir: &Path, yes: bool) -> Result<()> {
+    // Refuse over a live, unpaused daemon. A daemon that is not reachable at
+    // all (not running) needs no permission — the data directory is not in
+    // use by anything.
+    let socket_path = config::socket_path(&cfg.socket, data_dir);
+    if let Ok(mut client) = client::Client::connect(&socket_path) {
+        let status = client.call("status", json!({}))?;
+        let paused = status
+            .get("paused")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !paused {
+            anyhow::bail!("{}", recalld::backup::RESTORE_REFUSED);
+        }
+    }
+
+    if !yes {
+        println!(
+            "This will replace {} with the snapshot in {}, keeping the current data as \
+             {}.bak.\nRe-run with --yes to proceed.",
+            data_dir.display(),
+            dir.display(),
+            data_dir.display()
+        );
+        return Ok(());
+    }
+
+    println!("Restoring {} into {}...", dir.display(), data_dir.display());
+    let report = recalld::backup::restore(data_dir, dir)?;
+    println!(
+        "Restored. Previous data directory kept as {}.",
+        report
+            .previous_kept_as
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none — there was nothing there before)".to_string())
+    );
+    Ok(())
+}
+
+// ---- end 0.13.0 -------------------------------------------------------------
 
 fn cmd_sources(data_dir: &Path) -> Result<()> {
     let store = Store::open(data_dir)?;

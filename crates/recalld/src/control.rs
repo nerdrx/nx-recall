@@ -132,6 +132,13 @@ pub struct Control {
     /// "no probe has run yet" from "the probe ran and found nothing", and a
     /// missing key or a zeroed block could say neither.
     stereo_probe_report: Mutex<Option<Value>>,
+    /// The scheduled backup's settings, live like every other switch here —
+    /// a schedule that needs a restart to change is not a schedule.
+    backup: Mutex<crate::config::BackupConfig>,
+    /// What the last `backup create` (scheduled or by hand) actually did, or
+    /// `None` before one has ever run. The same "measured, not assumed"
+    /// discipline as `last_sweep`.
+    last_backup: Mutex<Option<Value>>,
     // ---- end 0.13.0 -------------------------------------------------------
 }
 
@@ -175,6 +182,8 @@ impl Control {
             // 0.13.0.
             capture: Mutex::new(CaptureConfig::default()),
             stereo_probe_report: Mutex::new(None),
+            backup: Mutex::new(crate::config::BackupConfig::default()),
+            last_backup: Mutex::new(None),
         })
     }
 
@@ -521,6 +530,64 @@ impl Control {
                     .unwrap_or(Value::Null),
             },
         })
+    }
+
+    // ---- the scheduled backup (0.13.0) ------------------------------------
+
+    pub fn backup(&self) -> crate::config::BackupConfig {
+        self.backup
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Point the schedule at the running config. Set before the handle is
+    /// shared, like the rest of the wiring.
+    pub fn with_backup(mut self: Arc<Self>, cfg: crate::config::BackupConfig) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("wiring happens before sharing");
+        *this.backup.get_mut().unwrap_or_else(|p| p.into_inner()) = cfg;
+        self
+    }
+
+    /// Flip the schedule on or off, or move it, while the daemon runs — the
+    /// same live-and-persisted pattern as `set_mood`. `None` leaves a field
+    /// alone.
+    pub fn set_backup(
+        &self,
+        enabled: Option<bool>,
+        dir: Option<Option<std::path::PathBuf>>,
+        every_days: Option<u32>,
+        keep: Option<u32>,
+    ) -> crate::config::BackupConfig {
+        let mut guard = self.backup.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = enabled {
+            guard.enabled = e;
+        }
+        if let Some(d) = dir {
+            guard.dir = d;
+        }
+        if let Some(e) = every_days {
+            guard.every_days = e;
+        }
+        if let Some(k) = keep {
+            guard.keep = k;
+        }
+        guard.clone()
+    }
+
+    /// The backup worker (scheduled or by hand) reporting what it just did.
+    pub fn set_last_backup(&self, report: Value) {
+        *self.last_backup.lock().unwrap_or_else(|p| p.into_inner()) = Some(report);
+    }
+
+    /// The `backup.last` block `status` carries, or `null` before any backup
+    /// has run — the same "measured, not assumed" discipline as `last_sweep`.
+    pub fn last_backup_json(&self) -> Value {
+        self.last_backup
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .unwrap_or(Value::Null)
     }
 
     // ---- the night shift (0.9.0) -----------------------------------------

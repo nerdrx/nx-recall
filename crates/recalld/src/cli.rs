@@ -197,6 +197,35 @@ the daemon is running.")]
         dry_run: bool,
     },
     // ---- end 0.10.0 -------------------------------------------------------
+    /// A backup you can trust: create, verify, or restore one.
+    #[command(long_about = "\
+A backup you can trust.
+
+  recalld backup create ~/backups/nx-recall     a consistent snapshot, right now
+  recalld backup verify ~/backups/nx-recall     re-check one without touching it
+  recalld backup restore ~/backups/nx-recall    swap it in over the live data dir
+
+`create` copies `recall.db` through SQLite's own online backup API against a
+second, read-only connection — capture is never paused for it — plus the
+segment audio, the voice goldens and the stereo probes, by hard link where the
+destination is the same filesystem and by copy where it is not. A manifest
+records every file's SHA-256 and is itself signed with a key this daemon
+keeps at `<data-dir>/backup_key`, so a restore can tell a snapshot nobody has
+touched since from one that has.
+
+`verify` re-hashes everything the manifest names, re-checks the signature,
+opens the copied database read-only and runs `PRAGMA integrity_check`, and
+compares row counts. It changes nothing on disk.
+
+`restore` refuses outright unless the daemon is stopped or paused — a restore
+under a live writer would restore into a database something else is still
+appending to. It verifies the snapshot again after copying it, swaps it in
+atomically, and keeps whatever was there before as `<data-dir>.bak`.")]
+    Backup {
+        #[command(subcommand)]
+        action: BackupAction,
+    },
+
     /// Inspect the analysis models.
     Models {
         #[command(subcommand)]
@@ -917,6 +946,32 @@ pub enum MoodAction {
     On,
     /// Stop. Tags already written stay; the transcript is never touched.
     Off,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BackupAction {
+    /// Write a consistent snapshot into this directory (created if needed).
+    /// Runs in this process, whether or not the daemon is running.
+    Create {
+        /// An absolute path to a directory on a local filesystem.
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+    },
+    /// Re-check a snapshot: hashes, `PRAGMA integrity_check`, row counts.
+    /// Reads only.
+    Verify {
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+    },
+    /// Swap a snapshot in over the live data directory. Refuses unless the
+    /// daemon is stopped, or paused with capture quiesced.
+    Restore {
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+        /// Skip the "are you sure" prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

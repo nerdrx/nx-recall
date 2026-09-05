@@ -483,6 +483,39 @@ function openExportFolder(dir) {
 }
 
 // ---------------------------------------------------------------------------
+// The backup folder chooser (0.13.0). Same two-gate shape as the export pair
+// above and for the same reason: the renderer cannot name a directory, only
+// ask for the native chooser and get back what was picked in it, and the
+// daemon checks the path again before writing a byte.
+
+/** Folders the user picked in THIS session, and therefore may reopen. */
+const chosenBackupFolders = new Set();
+
+async function chooseBackupFolder() {
+  if (process.env.NX_RECALL_E2E === '1' && process.env.NX_RECALL_E2E_BACKUP_DIR) {
+    const dir = process.env.NX_RECALL_E2E_BACKUP_DIR;
+    chosenBackupFolders.add(dir);
+    return dir;
+  }
+  const parent = win && !win.isDestroyed() ? win : undefined;
+  const res = await dialog.showOpenDialog(parent, {
+    title: 'Back up to…',
+    properties: ['openDirectory', 'createDirectory'],
+    buttonLabel: 'Back up here',
+  });
+  if (res.canceled || !res.filePaths?.length) return null;
+  const dir = res.filePaths[0];
+  chosenBackupFolders.add(dir);
+  return dir;
+}
+
+function openBackupFolder(dir) {
+  if (!chosenBackupFolders.has(dir)) return false;
+  void shell.openPath(dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 
 async function bootstrap() {
   // Before the first window: themeSource is what makes the renderer's
@@ -538,6 +571,9 @@ async function bootstrap() {
     // 0.10.0: the export's folder chooser. See `chooseExportFolder`.
     chooseFolder: chooseExportFolder,
     openFolder: openExportFolder,
+    // 0.13.0: the backup's own folder chooser. See `chooseBackupFolder`.
+    chooseBackupFolder,
+    openBackupFolder,
   });
 
   startClient();

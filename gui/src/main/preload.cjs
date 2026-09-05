@@ -57,6 +57,14 @@ contextBridge.exposeInMainWorld("recall", {
     open: (dir) => ipcRenderer.invoke("recall:export:openFolder", dir),
   },
 
+  // 0.13.0: a backup you can trust. Same two-channel shape as the export
+  // folder above, for the same reason — everything else the feature does is
+  // ordinary protocol requests (backup.create/verify/restore/get/set).
+  backupFolder: {
+    choose: () => ipcRenderer.invoke("recall:backup:chooseFolder"),
+    open: (dir) => ipcRenderer.invoke("recall:backup:openFolder", dir),
+  },
+
   onState: (fn) => on("recall:state", fn),
   onEvent: (fn) => on("recall:event", fn),
   onResync: (fn) => on("recall:resync", fn),

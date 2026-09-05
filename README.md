@@ -386,6 +386,13 @@ and all four do something.
   code has not yet run against — it ships behind a flag that says exactly that.
 - **Export.** Markdown to a folder on this disk. It refuses network filesystems
   and any file it did not write.
+- **Backup.** A consistent snapshot to a folder on this disk — the database
+  through SQLite's own online backup API so capture is never paused for it,
+  the audio and voice enrollment by hard link or copy, a manifest with a
+  SHA-256 per file and a signature from a key that never leaves the machine.
+  `backup verify` re-checks one without touching it; `backup restore` refuses
+  outright unless capture is paused, and keeps whatever it replaces as
+  `.bak`.
 - **Sources.** Any app you allow, your headset microphone that follows your
   sessions, a room microphone for the people beside you, and Discord's word.
 
@@ -400,6 +407,7 @@ and all four do something.
 | Search vectors | your disk | never |
 | Discord's who-spoke-when | your disk, from a plugin that posts to 127.0.0.1 | never |
 | Markdown exports | a folder you picked, on a local filesystem | never — the daemon refuses network mounts |
+| Backups | a folder you picked, on a local filesystem | never — same network-mount refusal as export |
 | Telemetry, analytics, crash reports | nowhere — they do not exist | n/a |
 
 `models fetch` is the only command in the program that opens a network socket:

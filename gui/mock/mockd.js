@@ -46,6 +46,7 @@
 import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 // The highlight palette, from the renderer's own copy of it rather than a
 // fourth transcription. `speakers.palette` is supposed to be the daemon
 // telling a client which tokens exist, so a mock that carried its own list
@@ -121,6 +122,14 @@ const YOU_SPEAKER = 8;
 /// The header every exported file carries, and the permission slip for
 /// overwriting one (0.10.0). Verbatim from `crate::export::MARKER`.
 const EXPORT_MARKER = '<!-- nx-recall export -->';
+// 0.13.0: the mock's stand-in for the real daemon's per-install signing key
+// (`<data-dir>/backup_key`). Fixed rather than random, because the drill this
+// mock exists to support — corrupt a byte, watch verify fail — needs the
+// signature to be reproducible across the two calls, not secret.
+const MOCK_BACKUP_KEY = Buffer.from('nx-recall-mock-backup-key');
+function sha256(bytes) {
+  return crypto.createHash('sha256').update(bytes).digest('hex');
+}
 
 // What the user says into their own microphone. Lines rather than tones: the
 // point of the mic feed is that these rows render differently, and a reviewer
@@ -1300,6 +1309,9 @@ export function startMock({
     // fixture that shipped it already on would never exercise turning it on.
     // The e2e driver flips both to exercise the other worlds.
     mood: { enabled: false, rendered: false },
+    // 0.13.0: a backup you can trust. Off and unscheduled — the state a fresh
+    // install is in, and the one the card has to be usable from.
+    backup: { enabled: false, dir: null, every_days: 7, keep: 4, last: null },
     /// Every `segments.correct` this daemon has served, which is where
     /// `accuracy.summary` comes from: the pre-correction text lives in the
     /// record, so a WER estimate is arithmetic over real edits rather than a
@@ -1971,6 +1983,19 @@ export function startMock({
     };
   }
 
+  /// `status.backup`, and `backup.get`'s whole reply — one function, so the
+  /// card and the switch can never see two different answers (0.13.0).
+  function backupStatus() {
+    return {
+      enabled: state.backup.enabled,
+      dir: state.backup.dir,
+      every_days: state.backup.every_days,
+      keep: state.backup.keep,
+      persisted: true,
+      last: state.backup.last,
+    };
+  }
+
   function graphCounts() {
     const by = (k) => state.commitments.filter((c) => c.state === k).length;
     const src = (k) => state.commitments.filter((c) => c.source === k).length;
@@ -2525,6 +2550,10 @@ export function startMock({
       // `state.mood.rendered = true` and gets it, which is the point of having
       // the flag on the wire at all.
       mood: moodStatus(),
+      // 0.13.0: a backup you can trust. Always present, `last` null until one
+      // has actually run — the same "measured, not assumed" discipline the
+      // real daemon keeps.
+      backup: backupStatus(),
       segments_total: state.segments.length,
       daemon: daemonId(),
       schema: SCHEMA,
@@ -4157,6 +4186,127 @@ export function startMock({
       });
       return { op, files: plan.files.length, dir: plan.dir };
     },
+
+    // ---- 0.13.0: a backup you can trust -----------------------------------
+    //
+    // This mock really writes the files, for the same reason the export
+    // above does: a card that says "a consistent snapshot on this disk" is
+    // only testable if a snapshot turns up, with a manifest a corrupted copy
+    // can actually fail against.
+
+    'backup.create'(params) {
+      const dir = String(params?.dir ?? '').trim();
+      if (!dir) throw err('bad_params', 'dir is required');
+      if (!path.isAbsolute(dir)) throw err('refused', `the backup directory must be an absolute path; ${dir} is relative`);
+      if (dir === '/run/user' || dir.startsWith('/run/user/') || dir.startsWith('/proc') || dir.startsWith('/sys')) {
+        throw err('refused', `${dir} is not a place files survive — pick a folder in your home directory`);
+      }
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      if (!fs.statSync(dir).isDirectory()) throw err('refused', `${dir} is not a directory`);
+
+      const op = runOp('backup.create', 3, () => {
+        // A stand-in "database": real content, real bytes, real hash — just
+        // not SQLite's own format, which the mock has no reason to speak.
+        const dbBytes = Buffer.from(JSON.stringify({ segments: state.segments.length, speakers: state.speakers.length }));
+        fs.writeFileSync(path.join(dir, 'recall.db'), dbBytes);
+        const files = [{ path: 'recall.db', sha256: sha256(dbBytes), bytes: dbBytes.length }];
+
+        const manifest = {
+          created_at_utc_ns: `${Date.now()}000000`,
+          schema_version: SCHEMA,
+          daemon: daemonId(),
+          counts: { sessions: SESSIONS.length, speakers: state.speakers.length, segments: state.segments.length },
+          files,
+          total_bytes: files.reduce((n, f) => n + f.bytes, 0),
+        };
+        const manifestBytes = Buffer.from(JSON.stringify(manifest));
+        fs.writeFileSync(path.join(dir, 'manifest.json'), manifestBytes);
+        const signature = sha256(Buffer.concat([MOCK_BACKUP_KEY, manifestBytes]));
+        fs.writeFileSync(path.join(dir, 'manifest.sig'), signature);
+
+        const result = {
+          dir,
+          files: files.length,
+          bytes: manifest.total_bytes,
+          manifest_sha256: sha256(manifestBytes),
+          counts: manifest.counts,
+          created_at_utc_ns: manifest.created_at_utc_ns,
+        };
+        state.backup.last = result;
+        emit('status', 'status', statusPayload());
+        return result;
+      });
+      return { op };
+    },
+
+    'backup.verify'(params) {
+      const dir = String(params?.dir ?? '').trim();
+      if (!dir) throw err('bad_params', 'dir is required');
+      const op = runOp('backup.verify', 2, () => {
+        const manifestPath = path.join(dir, 'manifest.json');
+        if (!fs.existsSync(manifestPath)) throw new Error(`${manifestPath} does not exist — this is not a backup`);
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        const manifestBytes = fs.readFileSync(manifestPath);
+        let signatureValid = false;
+        const sigPath = path.join(dir, 'manifest.sig');
+        if (fs.existsSync(sigPath)) {
+          signatureValid = fs.readFileSync(sigPath, 'utf8').trim() === sha256(Buffer.concat([MOCK_BACKUP_KEY, manifestBytes]));
+        }
+        const filesBad = [];
+        const filesMissing = [];
+        for (const f of manifest.files) {
+          const p = path.join(dir, f.path);
+          if (!fs.existsSync(p)) {
+            filesMissing.push(f.path);
+            continue;
+          }
+          const bytes = fs.readFileSync(p);
+          if (sha256(bytes) !== f.sha256 || bytes.length !== f.bytes) filesBad.push(f.path);
+        }
+        const ok = filesBad.length === 0 && filesMissing.length === 0 && signatureValid;
+        return {
+          dir,
+          ok,
+          files_checked: manifest.files.length,
+          files_bad: filesBad,
+          files_missing: filesMissing,
+          integrity_check: filesBad.includes('recall.db') ? 'corrupted' : 'ok',
+          signature_valid: signatureValid,
+          counts_match: true,
+          manifest_sha256: sha256(manifestBytes),
+        };
+      });
+      return { op };
+    },
+
+    'backup.restore'(params) {
+      if (!state.paused) {
+        throw err('refused', 'a restore only runs while capture is paused (`recalld pause`, or the pause button) — restoring under a live writer would restore into a database something else is still appending to');
+      }
+      const dir = String(params?.dir ?? '').trim();
+      if (!dir) throw err('bad_params', 'dir is required');
+      const op = runOp('backup.restore', 2, () => ({
+        restored_into: '(mock data dir)',
+        previous_kept_as: '(mock data dir).bak',
+      }));
+      return { op };
+    },
+
+    'backup.get': () => backupStatus(),
+
+    /// `backup.set {enabled?, dir?, every_days?, keep?}` — live and, on the
+    /// real daemon, persisted to config.toml (`Service::backup_set`). The
+    /// mock has no config file to write, so `persisted` is simply true.
+    'backup.set'(params) {
+      if (params?.enabled !== undefined) state.backup.enabled = !!params.enabled;
+      if (params?.dir !== undefined) state.backup.dir = params.dir === null ? null : String(params.dir);
+      if (params?.every_days !== undefined) state.backup.every_days = Math.max(1, Number(params.every_days) || 1);
+      if (params?.keep !== undefined) state.backup.keep = Math.max(1, Number(params.keep) || 1);
+      emit('status', 'status', statusPayload());
+      return backupStatus();
+    },
+
+    // ---- end 0.13.0 ---------------------------------------------------------
 
     'delete.preview'(params) {
       const rows = matchDelete(params);

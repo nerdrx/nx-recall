@@ -22,8 +22,9 @@ libc = "0.2"
 ort = "2.0.0-rc.13"
 pipewire = { version = "0.10", features = ["v1_2_0"] }
 regex = "1"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 serde_json = "1"
+sha2 = "0.10"
 sherpa-rs = { version = "0.6", features = ["sys"] }
 serde = { version = "1", features = ["derive"] }
 tar = "0.4"
