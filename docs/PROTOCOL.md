@@ -4633,11 +4633,11 @@ decode.
 
 ```toml
 [identity]
-split_turns = false            # measured off — FINDINGS §39
+split_turns = true             # on since 0.12.7, with the voicebank veto — FINDINGS §52
 split_turn_window_s = 1.5
 split_turn_hop_s = 0.25
 split_turn_min_piece_s = 1.0
-split_turn_distance = 0.85
+split_turn_distance = 0.80     # moved from 0.85 (§39) at 0.12.7 — see below
 split_turn_max_cuts = 3
 ```
 
@@ -4646,11 +4646,12 @@ split_turn_max_cuts = 3
 score around 0.6, so anything that sounds like a sensible similarity bar is
 below the noise floor.
 
-**Off by default, on the numbers.** At this operating point the detector finds
-41.7% of the reachable change points within ±0.5 s at 67.9% precision and
-splits 0.87% of turns Discord says are one person. That clears the false-split
-bar and misses the recall bar it was set (≥50%), so the live default is off and
-the archive pass below is how an install gets the benefit.
+**Shipped off at 0.12.4, on since 0.12.7 — see that section below for why.**
+The 0.12.4 detector alone found 41.7% of the reachable change points within
+±0.5 s at 67.9% precision and split 0.87% of turns Discord says are one
+person: it cleared the false-split bar and missed the recall bar it was set
+(≥50%). 0.12.7 added a second, independent refusal — a voicebank veto, not a
+better distance curve — that clears both.
 
 ### `recalld turns resplit`
 
@@ -4697,6 +4698,47 @@ rewrites text, `segments.reassign` rewrites the speaker); after 0.12.4 an
 applied resplit can also *shorten* an existing row and add a sibling beside it.
 A client that re-reads a segment by id after a `segment.updated` event was
 already doing the right thing.
+
+## 0.12.7 — the voicebank veto, and the switch turns on
+
+FINDINGS §39 shipped turn-splitting off: `adjacent` alone missed the ≥50%
+recall bar by eight points. §52 asked five ways to close that gap without
+moving G1 (false splits ≤1% on `single` turns) or G3 (held-out identity
+precision) — an adaptive per-turn bar, combining `adjacent` with `contrast`, a
+smaller hop with two window lengths voted, a voicebank veto, and boundary
+refinement against the VAD. One cleared all three, chronologically held out:
+
+**A candidate boundary is kept only if the voicebank's own top-1 speaker
+actually differs across it.** `crate::turnsplit::proto_veto` asks the bank one
+yes/no question per candidate `adjacent` already found — never a score of its
+own, never a boundary of its own — and a candidate it disagrees with is
+dropped before [`cuts`](../crates/recalld/src/turnsplit.rs) ever sees it. This
+is not `named` from §39, which lost at every threshold because it asked the
+bank a harder question (does each side name a voice *above the label bar*)
+that a captured window answers wrong with total confidence; the argmax needs
+no confidence at all.
+
+| gate | bar | §39 (`adjacent` alone) | §52 (`adjacent` + veto) |
+|---|---|---:|---:|
+| G1 false splits on `single` | ≤ 1% | 0.87% | 0.83% held out |
+| G2 change recall at ±0.5 s | ≥ 50% | 41.7% | **51.0%** held out |
+| G3 held-out identity precision | not down | — | unmoved by a real `--apply` |
+
+**The stated cost: a bank with fewer than two enrolled voices vetoes
+everything.** There is nothing for the top-1 speaker to disagree with itself
+about, so a fresh install with nobody enrolled yet cuts nothing until it has
+two people in the voicebank. This is the measured shape, not a bug — the same
+shape `named` had in §39 — and it is why `split_turns` turning on by default
+costs a new install nothing it would have noticed: no bank, no cuts, exactly
+as before.
+
+`split_turn_distance` moved from 0.85 to 0.80 alongside the veto: with a
+second, independent filter in force the distance bar can afford to let more
+candidates through, and 0.80 is the fit split's best point once it does.
+Nothing else about the switch, the archive pass, or the wire changed — see the
+0.12.4 section above for the shape of a piece, the transcript-partition
+guarantee, and `recalld turns resplit`.
+
 ## 0.12.4 — how a turn sounded (schema v18)
 
 The user asked for one thing: *"colour in the text or tag the text with the mood

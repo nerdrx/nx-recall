@@ -17,8 +17,34 @@ use std::path::PathBuf;
 use recalld::analysis::Analyzer;
 use recalld::asr::normalise_words;
 use recalld::config::{Config, IdentityConfig, SAMPLE_RATE};
+use recalld::embed::Embedding;
 use recalld::ingest::read_wav;
 use recalld::models::ModelSet;
+
+/// The bank the detector's voicebank veto reads (FINDINGS §52): every
+/// prototype, `(speaker_id, source_segment_id, embedding)` — the same shape
+/// `Store::prototypes_with_source` hands the live path. Built from the
+/// analyzer's own embedder over each speaker's whole clip, which is what an
+/// install that has actually enrolled these two people would have on file.
+/// An empty bank vetoes every boundary, so a test of the switch **on** needs
+/// this or it is indistinguishable from the switch being off.
+fn seeded_bank(
+    a: &mut Analyzer,
+    a_clip: &[f32],
+    b_clip: &[f32],
+) -> Vec<(i64, Option<i64>, Embedding)> {
+    let ea = a
+        .prepare(a_clip)
+        .expect("preparing reader A")
+        .embedding
+        .expect("clean solo audio embeds");
+    let eb = a
+        .prepare(b_clip)
+        .expect("preparing reader B")
+        .embedding
+        .expect("clean solo audio embeds");
+    vec![(1, None, ea), (2, None, eb)]
+}
 
 fn models_dir() -> Option<PathBuf> {
     let raw = std::env::var("NXR_MODELS").ok()?;
@@ -35,19 +61,20 @@ fn fixture(name: &str) -> Vec<f32> {
     read_wav(&path).expect("fixture")
 }
 
-/// The bar these fixtures need, and why it is not the shipped 0.85.
+/// The distance bar these fixtures need — which, since §52, **is** the
+/// shipped one.
 ///
-/// The shipped bar is fitted where the false-split rate crosses 1% on **this
-/// install's Discord-decoded audio**, where two 1.5 s windows of the *same*
+/// §39 shipped 0.85, fitted where the false-split rate crosses 1% on this
+/// install's Discord-decoded audio, where two 1.5 s windows of the *same*
 /// person already score `1 - cos ≈ 0.62`. The fixtures are studio LibriSpeech:
 /// the same-speaker floor there is 0.31–0.49 and the cross-speaker peak at the
-/// join is 0.839, so the whole curve sits below a bar calibrated against
-/// Discord's noise. The peak is unmistakable in its own turn — twice the
-/// turn's median — and 0.011 under a threshold that was never measured on this
-/// material (`spike/turnsplit_fixture.py`, FINDINGS §39).
-///
-/// So these tests move the bar and say so, rather than the bar moving to suit
-/// the tests. `the_shipped_bar_does_not_fire_on_studio_audio` pins the fact.
+/// join is 0.839 — under 0.85, over 0.80. §52 moved the shipped bar to 0.80
+/// because the voicebank veto needed the room, and the peak clearing it on a
+/// domain nobody fitted it against is a coincidence worth stating plainly
+/// rather than claiming as design: the veto is what makes the detector travel
+/// (`identity::rank_with`'s argmax carries no domain-specific scale), the
+/// distance bar is still one absolute number and it happens to still work
+/// here. `spike/turnsplit_fixture.py`, FINDINGS §39 and §52.
 const STUDIO_DISTANCE: f32 = 0.80;
 
 fn analyzer_at(split_turns: bool, distance: f32) -> Option<Analyzer> {
@@ -89,9 +116,15 @@ fn with_the_switch_off_a_turn_is_one_row() {
         eprintln!("skipping: set NXR_MODELS=<dir> to run it");
         return;
     };
+    let (a_clip, b_clip) = (fixture("clean_single_0.wav"), fixture("clean_single_1.wav"));
+    let bank = seeded_bank(&mut a, &a_clip, &b_clip);
     let (samples, _) = two_speakers();
-    let plan = a.plan_split(&samples).expect("planning");
-    assert_eq!(plan.pieces.len(), 1, "the default must never cut");
+    let plan = a.plan_split(&samples, &bank, None).expect("planning");
+    assert_eq!(
+        plan.pieces.len(),
+        1,
+        "the switch is off; a full bank must not matter"
+    );
     assert!(!plan.cut());
     assert!(!plan.wordless);
     assert_eq!(plan.pieces[0].0.from, 0);
@@ -112,11 +145,13 @@ fn with_the_switch_on_two_speakers_are_cut_where_they_meet() {
         eprintln!("skipping: set NXR_MODELS=<dir> to run it");
         return;
     };
+    let (a_clip, b_clip) = (fixture("clean_single_0.wav"), fixture("clean_single_1.wav"));
+    let bank = seeded_bank(&mut a, &a_clip, &b_clip);
     let (samples, at) = two_speakers();
-    let plan = a.plan_split(&samples).expect("planning");
+    let plan = a.plan_split(&samples, &bank, None).expect("planning");
     assert!(
         plan.cut(),
-        "two readers back to back must be found: {:?}",
+        "two readers back to back, both enrolled, must be found: {:?}",
         plan.pieces.iter().map(|(_, t)| t).collect::<Vec<_>>()
     );
     let cuts: Vec<f32> = plan
@@ -139,14 +174,36 @@ fn with_the_switch_on_two_speakers_are_cut_where_they_meet() {
     }
 }
 
+/// A cold-start install — the switch is on but nobody has been enrolled yet —
+/// must not cut anything, because the voicebank veto has no second voice to
+/// disagree with (FINDINGS §52). This is the measured shape, not a fallback
+/// path: an empty bank is passed exactly as the live pipeline would pass one
+/// before its first two people exist.
+#[test]
+fn with_no_bank_the_switch_being_on_still_cuts_nothing() {
+    let Some(mut a) = analyzer(true) else {
+        eprintln!("skipping: set NXR_MODELS=<dir> to run it");
+        return;
+    };
+    let (samples, _) = two_speakers();
+    let plan = a.plan_split(&samples, &[], None).expect("planning");
+    assert!(
+        !plan.cut(),
+        "an empty bank must veto every candidate, not just most of them: {:?}",
+        plan.pieces.iter().map(|(_, t)| t).collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn the_pieces_words_are_the_turns_words() {
     let Some(mut a) = analyzer(true) else {
         eprintln!("skipping: set NXR_MODELS=<dir> to run it");
         return;
     };
+    let (a_clip, b_clip) = (fixture("clean_single_0.wav"), fixture("clean_single_1.wav"));
+    let bank = seeded_bank(&mut a, &a_clip, &b_clip);
     let (samples, _) = two_speakers();
-    let split = a.plan_split(&samples).expect("planning");
+    let split = a.plan_split(&samples, &bank, None).expect("planning");
     assert!(split.cut(), "this test is about a turn that was cut");
 
     // The claim the whole design rests on: the pieces' words, concatenated in
@@ -154,7 +211,7 @@ fn the_pieces_words_are_the_turns_words() {
     // cut, none spelled twice. Compared against the same analyzer's own
     // uncut reading of the same audio.
     let mut off = analyzer(false).expect("models were there a moment ago");
-    let whole = off.plan_split(&samples).expect("planning");
+    let whole = off.plan_split(&samples, &[], None).expect("planning");
     let expected = normalise_words(&whole.pieces[0].1);
     let joined: Vec<String> = split
         .pieces
@@ -166,27 +223,47 @@ fn the_pieces_words_are_the_turns_words() {
 }
 
 /// The operating point is fitted to one install's audio, and this pins how far
-/// that goes.
+/// that travels — in both directions.
 ///
-/// The shipped 0.85 does **not** fire on two studio readers glued together —
-/// the join peaks at 0.839. That is not a bug in the detector (the peak is
-/// exactly where the readers meet, and it is twice the turn's own median) and
-/// not a reason to lower the bar to suit a fixture: it is the measured cost of
-/// a threshold calibrated where same-speaker windows score 0.62. If a later
-/// round makes the detector domain-independent — a contrast bar, or a
-/// different extractor — this test is the one that will start failing, and it
-/// should be read as the good news it is.
+/// **Without a bank**, the shipped bar cuts nothing, whatever the distance
+/// curve says: the veto has no second voice to disagree with. **With both
+/// readers enrolled**, it does cut, and at the right place — the join peaks at
+/// 0.839, over the shipped 0.80. That the peak clears a bar fitted on a
+/// different install's Discord audio is not a design claim about the distance
+/// arm (it is still one absolute number, and §39 measured it does *not*
+/// travel at 0.85); it is a measured fact about 0.80 worth pinning so a later
+/// round that moves the bar again sees this test move with it
+/// (`spike/turnsplit_fixture.py`, FINDINGS §39, §52).
 #[test]
-fn the_shipped_bar_does_not_fire_on_studio_audio() {
+fn the_shipped_bar_needs_the_bank_but_not_a_different_bar() {
     let Some(mut a) = analyzer_at(true, IdentityConfig::default().split_turn_distance) else {
         eprintln!("skipping: set NXR_MODELS=<dir> to run it");
         return;
     };
-    let (samples, _) = two_speakers();
+    let (samples, at) = two_speakers();
+
     assert!(
-        !a.plan_split(&samples).expect("planning").cut(),
-        "the shipped bar now fires on LibriSpeech — re-read FINDINGS §39 and \
-         re-measure the false-split rate before celebrating"
+        !a.plan_split(&samples, &[], None).expect("planning").cut(),
+        "an unenrolled install must not cut studio audio either"
+    );
+
+    let (a_clip, b_clip) = (fixture("clean_single_0.wav"), fixture("clean_single_1.wav"));
+    let bank = seeded_bank(&mut a, &a_clip, &b_clip);
+    let plan = a.plan_split(&samples, &bank, None).expect("planning");
+    assert!(
+        plan.cut(),
+        "the shipped 0.80 no longer fires on LibriSpeech once both readers \
+         are enrolled — re-read FINDINGS §52 and re-measure before lowering it"
+    );
+    let cuts: Vec<f32> = plan
+        .pieces
+        .iter()
+        .skip(1)
+        .map(|(p, _)| p.from as f32 / SAMPLE_RATE as f32)
+        .collect();
+    assert!(
+        cuts.iter().any(|c| (c - at).abs() <= 0.5),
+        "a cut within ±0.5 s of {at:.2}s, got {cuts:?}"
     );
 }
 
@@ -197,9 +274,14 @@ fn one_speaker_alone_is_not_cut() {
         return;
     };
     // 5.17 s of one reader: long enough for eight legal cut points and no
-    // reason to take any of them.
-    let samples = fixture("clean_single_0.wav");
-    let plan = a.plan_split(&samples).expect("planning");
+    // reason to take any of them. Enrolled against a second, different
+    // voice — a bank that could in principle disagree, and does not, because
+    // there is only one person in this clip.
+    let a_clip = fixture("clean_single_0.wav");
+    let b_clip = fixture("clean_single_1.wav");
+    let bank = seeded_bank(&mut a, &a_clip, &b_clip);
+    let samples = a_clip;
+    let plan = a.plan_split(&samples, &bank, None).expect("planning");
     assert!(
         !plan.cut(),
         "one voice was cut into {} pieces: {:?}",
