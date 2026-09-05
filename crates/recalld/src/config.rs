@@ -65,6 +65,11 @@ pub struct CaptureConfig {
     /// recording, not a standing capture, and its presence and every file it
     /// writes are visible in `status`.
     pub stereo_probe: bool,
+    /// How long a row in `gaps` (0.14.0, schema v20) is kept before
+    /// `Store::insert_gap` prunes it. `0` keeps everything — capture health is
+    /// small (a few hundred rows a day even on a bad evening), so there is no
+    /// pressure to shorten this the way there is for audio and transcripts.
+    pub gap_retention_days: i64,
 }
 
 impl Default for CaptureConfig {
@@ -74,6 +79,7 @@ impl Default for CaptureConfig {
             quantum: 1024,
             flap_grace_ms: 5_000,
             stereo_probe: true,
+            gap_retention_days: 30,
         }
     }
 }

@@ -932,6 +932,19 @@ document.addEventListener('keydown', (e) => {
       note: (document.getElementById('storage-note') || {}).textContent ?? '',
       footer: (document.getElementById('storage-stat') || {}).textContent ?? '',
     }),
+    // 0.14.0: capture health. One row per source, its bar segments' widths
+    // (as flex-grow, which is what a cause's share actually is), and the
+    // legend lines below.
+    captureHealth: () => ({
+      health: store.status?.capture?.health ?? null,
+      rows: [...document.querySelectorAll('#gap-rows .gap-row')].map((r) => ({
+        source: r.dataset.gapSource,
+        name: r.querySelector('.gap-row-name').textContent,
+        count: Number(r.querySelector('.gap-row-count').textContent),
+        segs: [...r.querySelectorAll('.gap-bar-seg')].map((seg) => seg.dataset.cause).filter(Boolean),
+      })),
+      legend: [...document.querySelectorAll('#gap-legend .gap-legend-row')].map((r) => r.textContent),
+    }),
     // Segments whose speaker was inherited from the turns around them rather
     // than heard: they must read as uncertain, with a "?" that says why.
     proximity: () => {

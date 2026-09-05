@@ -37,6 +37,28 @@ pub enum Command {
     /// Show every source seen so far and its allow flag.
     Sources,
 
+    /// Capture health: every "audio gap" classified by cause (0.14.0).
+    #[command(long_about = "\
+Capture health: every audio gap, classified by cause the moment it happened.
+
+`recalld capture health` reads the `gaps` table (schema v20) directly — it
+works with no daemon running. Each row is one turn discarded because the
+audio under it had a hole: a source flap past the silence threshold, the
+inference queue evicting buffers, the capture thread missing a PipeWire
+deadline, or the source going quiet before its session formally closed. The
+same numbers are in `status.capture.health`, over the trailing 24h; this
+command widens the window and adds the top offending sources and hours.
+
+  recalld capture health           last 24h
+  recalld capture health --days 7  last 7 days
+
+A high `unexplained` share means the classifier saw a gap it could not
+attribute — worth a bug report with the detail column.")]
+    Capture {
+        #[command(subcommand)]
+        action: CaptureAction,
+    },
+
     /// Allow capture of a source, by match key (usually the process binary,
     /// or the PE name for Wine programs).
     Allow {
@@ -917,6 +939,17 @@ pub enum MoodAction {
     On,
     /// Stop. Tags already written stay; the transcript is never touched.
     Off,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CaptureAction {
+    /// Gaps per hour by cause, the top offending sources and hours, and the
+    /// share unexplained.
+    Health {
+        /// Widen the window past the default 24h.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        days: i64,
+    },
 }
 
 #[derive(Subcommand, Debug)]

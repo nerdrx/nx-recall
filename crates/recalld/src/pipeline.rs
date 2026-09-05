@@ -24,6 +24,145 @@ use crate::control::Control;
 use crate::models::ModelSet;
 use crate::queue::{AudioChunk, CaptureEvent, EventQueue};
 use crate::store::{KIND_MIC, Store};
+
+/// Why a turn was discarded across a gap, classified at the moment it
+/// happens (0.14.0, schema v20's `gaps` table).
+///
+/// Closed set, not an open string: a new cause is a code change here and in
+/// `Store::apply_v20`'s comment, never a value invented at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapCause {
+    /// The source's node vanished and came back at or above the silence
+    /// threshold (§47, `crate::flap`): the grace window absorbed the
+    /// reconnect, but the turn in progress still had to go.
+    Flap,
+    /// The shared inference queue was over its sample budget and evicted
+    /// buffers before this session's next chunk arrived
+    /// (`EventQueue::dropped_chunks` moved between the previous chunk and
+    /// this one).
+    QueueOverflow,
+    /// The gap's own timestamp arithmetic (a chunk's `capture_mono_ns`
+    /// against where the sample counter expected to be) shows a stall with
+    /// no matching queue eviction: the capture thread itself did not get a
+    /// buffer to PipeWire's process callback in time, or PipeWire's own
+    /// graph stalled in a way this binding cannot see (see `PipewireXrun`).
+    SchedulerStarvation,
+    /// PipeWire's own xrun count, if the graph ever reports one. Reserved
+    /// and never produced today: `pipewire-rs` 0.10 does not expose the
+    /// driver's xrun counter, so a real xrun currently reads as
+    /// `SchedulerStarvation` instead of this. See FINDINGS §50.
+    PipewireXrun,
+    /// The capture side went quiet — no buffer at all — for longer than the
+    /// VAD's own silence threshold before the session's `SessionEnd`
+    /// arrived: the source stopped producing audio before the daemon was
+    /// told the node was gone.
+    SessionEnd,
+    /// A gap that could not be attributed to any of the above. The
+    /// classifier above never produces this today (every reanchor gap is
+    /// either a queue eviction or a stall, and both flap and session-end
+    /// gaps carry their own evidence) — it exists so a future cause the
+    /// classifier does not yet know about fails safe into a labelled bucket
+    /// instead of silently picking the wrong one.
+    Unexplained,
+}
+
+impl GapCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GapCause::Flap => "flap",
+            GapCause::QueueOverflow => "queue_overflow",
+            GapCause::SchedulerStarvation => "scheduler_starvation",
+            GapCause::PipewireXrun => "pipewire_xrun",
+            GapCause::SessionEnd => "session_end",
+            GapCause::Unexplained => "unexplained",
+        }
+    }
+
+    /// The reverse of [`Self::as_str`], for a CLI reading `cause` values back
+    /// out of the `gaps` table. `None` for a value this build does not know
+    /// — a row written by a newer daemon, say — which the caller renders as
+    /// "unknown cause" rather than guessing.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "flap" => GapCause::Flap,
+            "queue_overflow" => GapCause::QueueOverflow,
+            "scheduler_starvation" => GapCause::SchedulerStarvation,
+            "pipewire_xrun" => GapCause::PipewireXrun,
+            "session_end" => GapCause::SessionEnd,
+            "unexplained" => GapCause::Unexplained,
+            _ => return None,
+        })
+    }
+
+    /// One line explaining the cause and its fix, for the Sources view's
+    /// Health card (0.14.0) and `recalld capture health`.
+    pub fn explain(self) -> &'static str {
+        match self {
+            GapCause::Flap => {
+                "the source vanished and came back past the silence threshold — raise \
+                 [capture].flap_grace_ms if this app reconnects slower than 5 s"
+            }
+            GapCause::QueueOverflow => {
+                "the inference queue fell behind and dropped buffers — raise \
+                 [capture].queue_seconds or free a CPU core for the inference thread"
+            }
+            GapCause::SchedulerStarvation => {
+                "the capture thread missed its PipeWire deadline under load — check \
+                 [runtime].inference_nice/inference_cpus and what else is pinned to \
+                 those cores"
+            }
+            GapCause::PipewireXrun => {
+                "PipeWire itself under-ran — check `pw-top` for the driver's own xrun \
+                 count; this daemon cannot read it directly"
+            }
+            GapCause::SessionEnd => {
+                "the source stopped sending audio before the daemon saw it disappear — \
+                 usually a clean app exit; only worth chasing if it repeats mid-session"
+            }
+            GapCause::Unexplained => {
+                "the classifier could not attribute this gap — file a bug with the \
+                 detail column"
+            }
+        }
+    }
+}
+
+/// How long the capture side may sit silent, after its last buffer, before a
+/// `SessionEnd` counts as a gap rather than an ordinary clean close (0.14.0).
+const SESSION_END_GAP_THRESHOLD_NS: u64 = 1_000_000_000;
+
+/// Write one row to `gaps` and log a failure rather than propagate it: a
+/// health record is diagnostic and must never cost a recording. A free
+/// function, not a method, so it borrows only the two fields it needs
+/// (`self.store`, `self.cfg.capture.gap_retention_days`) rather than all of
+/// `self` — call sites hold a mutable borrow of `self.sessions` at the same
+/// time.
+fn record_gap(
+    store: &Arc<std::sync::Mutex<Store>>,
+    retention_days: i64,
+    session_id: i64,
+    at_ns: i64,
+    duration_ns: i64,
+    cause: GapCause,
+    detail: Option<&str>,
+) {
+    let result = (|| -> Result<()> {
+        let store = store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
+        store.insert_gap(
+            session_id,
+            at_ns,
+            duration_ns,
+            cause,
+            detail,
+            retention_days,
+        )
+    })();
+    if let Err(e) = result {
+        warn!(session_id, "could not record a capture gap: {e:#}");
+    }
+}
 use crate::turns::TurnMerger;
 use crate::vad::{FRAME_SAMPLES, SegmenterConfig, SileroVad, VadState};
 
@@ -166,6 +305,21 @@ struct SessionPipeline {
     /// every decode away and paid for the whole turn again a second later.
     slice_text: String,
     // ---- 0.12.5, sliced turns: end -----------------------------------------
+    // ---- 0.14.0, capture health: begin -------------------------------------
+    /// `EventQueue::dropped_chunks()` as of the last chunk this session saw,
+    /// so the next gap can tell whether the queue evicted something in
+    /// between (`GapCause::QueueOverflow`) or not (`GapCause::
+    /// SchedulerStarvation`). The queue is shared by every session, so this
+    /// is a coarse signal — a drop anywhere counts — but the alternative is
+    /// per-session eviction accounting inside `EventQueue`, which would cost
+    /// every push a lookup for a number only a gap ever reads.
+    last_dropped_chunks_seen: u64,
+    /// `capture_mono_ns` of the last chunk this session saw, so
+    /// `on_session_end` can tell whether the capture side had already gone
+    /// quiet before the `SessionEnd` arrived (`GapCause::SessionEnd`). `0`
+    /// means no chunk has arrived yet.
+    last_chunk_mono_ns: u64,
+    // ---- 0.14.0, capture health: end ---------------------------------------
 }
 
 impl SessionPipeline {
@@ -200,6 +354,10 @@ impl SessionPipeline {
             slicer: crate::slice::Slicer::default(),
             slice_text: String::new(),
             // ---- end 0.12.5 ------------------------------------------------
+            // ---- 0.14.0, capture health --------------------------------------
+            last_dropped_chunks_seen: 0,
+            last_chunk_mono_ns: 0,
+            // ---- end 0.14.0 ---------------------------------------------------
         }
     }
 
@@ -214,9 +372,11 @@ impl SessionPipeline {
     /// counter thinks we are, and re-anchor so later segments are not shifted
     /// by the missing time.
     ///
-    /// Returns whether a gap was found, because re-anchoring the clock is only
-    /// half the answer: see [`Self::discard_across_gap`].
-    fn maybe_reanchor(&mut self, chunk_mono_ns: u64) -> bool {
+    /// Returns the skew in nanoseconds when a gap was found, because
+    /// re-anchoring the clock is only half the answer (see
+    /// [`Self::discard_across_gap`]) and the magnitude is what `gaps.
+    /// duration_ns` records.
+    fn maybe_reanchor(&mut self, chunk_mono_ns: u64) -> Option<i64> {
         let predicted = self
             .anchor
             .mono_ns
@@ -232,9 +392,9 @@ impl SessionPipeline {
                 utc_ns: self.anchor.utc_of(chunk_mono_ns),
             };
             self.anchor_sample = self.received;
-            return true;
+            return Some(skew);
         }
-        false
+        None
     }
 
     /// Throw away everything buffered before a gap.
@@ -403,6 +563,12 @@ pub struct Pipeline {
     /// once rather than fifty times a second.
     muted_mixed: std::collections::HashSet<i64>,
     // ---- end 0.12.1 --------------------------------------------------------
+    /// The capture -> VAD queue (0.14.0), held only to read
+    /// `dropped_chunks()` when classifying a gap. `None` until [`Self::run`]
+    /// is given one; a test `Pipeline` that never calls `run` classifies
+    /// every reanchor gap as `SchedulerStarvation`, which is the safe
+    /// default — it is never wrong to say "no eviction was seen".
+    queue: Option<Arc<EventQueue>>,
 }
 
 impl Pipeline {
@@ -507,6 +673,7 @@ impl Pipeline {
             discord_side: HashMap::new(),
             bridge: None,
             muted_mixed: std::collections::HashSet::new(),
+            queue: None,
         })
     }
 
@@ -532,6 +699,9 @@ impl Pipeline {
     /// Drain `queue` until it closes. Intended to be the body of the inference
     /// thread; a failure on one session is logged and does not stop the rest.
     pub fn run(&mut self, queue: Arc<EventQueue>) {
+        // Held for the life of the thread so a gap can be classified against
+        // the queue's own eviction count (0.14.0). See the `queue` field.
+        self.queue = Some(Arc::clone(&queue));
         while let Some(event) = queue.pop() {
             let result = match event {
                 CaptureEvent::Audio(chunk) => self.on_audio(chunk),
@@ -662,14 +832,51 @@ impl Pipeline {
         // in the right place; discarding what was buffered before the hole is
         // what keeps the words on either side of it out of the same segment
         // (audit finding #21).
-        if entry.maybe_reanchor(chunk.capture_mono_ns) {
+        if let Some(skew_ns) = entry.maybe_reanchor(chunk.capture_mono_ns) {
             entry.discard_across_gap(fresh_state);
             self.stats.gaps_discarded.fetch_add(1, Ordering::Relaxed);
+            // 0.14.0: classify the gap at the moment it happens. The queue is
+            // shared across every session, so "did it evict anything since
+            // this session's last chunk" is the best per-session signal
+            // available without per-session eviction bookkeeping in
+            // `EventQueue` itself.
+            let dropped_now = self.queue.as_ref().map(|q| q.dropped_chunks()).unwrap_or(0);
+            let prior_dropped = entry.last_dropped_chunks_seen;
+            entry.last_dropped_chunks_seen = dropped_now;
+            let (cause, detail) = if dropped_now > prior_dropped {
+                (
+                    GapCause::QueueOverflow,
+                    Some(format!(
+                        "queue evicted {} buffer(s) since this session's previous chunk",
+                        dropped_now - prior_dropped
+                    )),
+                )
+            } else {
+                (GapCause::SchedulerStarvation, None)
+            };
             warn!(
                 session_id = chunk.session_id,
+                cause = cause.as_str(),
+                skew_ms = skew_ns / 1_000_000,
                 "audio gap: discarded the turn in progress rather than splicing across it"
             );
+            record_gap(
+                &self.store,
+                self.cfg.capture.gap_retention_days,
+                chunk.session_id,
+                utc_now_ns(),
+                skew_ns.unsigned_abs() as i64,
+                cause,
+                detail.as_deref(),
+            );
+        } else {
+            entry.last_dropped_chunks_seen = self
+                .queue
+                .as_ref()
+                .map(|q| q.dropped_chunks())
+                .unwrap_or(entry.last_dropped_chunks_seen);
         }
+        entry.last_chunk_mono_ns = chunk.capture_mono_ns;
         entry.ring.extend_from_slice(&chunk.samples);
         entry.received += chunk.samples.len() as u64;
 
@@ -877,11 +1084,23 @@ impl Pipeline {
 
     fn on_session_end(&mut self, session_id: i64, mono_ns: u64) -> Result<()> {
         let mut final_turns = Vec::new();
+        // 0.14.0: was the capture side already quiet before this arrived? A
+        // clean app exit closes within one buffer period of its last audio;
+        // anything longer means the source stopped producing before the
+        // daemon was told the node was gone, which is worth a row of its own
+        // even though nothing here is actually discarded.
+        let mut session_end_gap: Option<u64> = None;
         if let Some(session) = self.sessions.get_mut(&session_id) {
             if let Some(span) = session.segmenter.flush() {
                 final_turns.extend(session.turns.push(span));
             }
             final_turns.extend(session.turns.flush());
+            if session.last_chunk_mono_ns != 0 {
+                let stall = mono_ns.saturating_sub(session.last_chunk_mono_ns);
+                if stall > SESSION_END_GAP_THRESHOLD_NS {
+                    session_end_gap = Some(stall);
+                }
+            }
         }
         for span in final_turns {
             self.write_segment(session_id, span)?;
@@ -903,7 +1122,19 @@ impl Pipeline {
             .lock()
             .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
         store.end_session(session_id, Anchor::at(mono_ns).utc_of(mono_ns))?;
+        drop(store);
         info!(session_id, "session closed");
+        if let Some(stall_ns) = session_end_gap {
+            record_gap(
+                &self.store,
+                self.cfg.capture.gap_retention_days,
+                session_id,
+                utc_now_ns(),
+                stall_ns as i64,
+                GapCause::SessionEnd,
+                Some("capture went quiet before the session's end was seen"),
+            );
+        }
         Ok(())
     }
 
@@ -947,6 +1178,18 @@ impl Pipeline {
                 gap_ms,
                 silence_ms,
                 "flap gap at or above the silence threshold: discarded the turn in progress"
+            );
+            record_gap(
+                &self.store,
+                self.cfg.capture.gap_retention_days,
+                session_id,
+                utc_now_ns(),
+                gap_ms as i64 * 1_000_000,
+                GapCause::Flap,
+                Some(&format!(
+                    "flap grace window absorbed the reconnect but {gap_ms}ms of silence \
+                     was at or above the {silence_ms}ms VAD threshold"
+                )),
             );
         } else {
             debug!(
@@ -1886,7 +2129,7 @@ mod tests {
 
         // Four seconds of audio never arrived.
         assert!(
-            s.maybe_reanchor(5_000_000_000),
+            s.maybe_reanchor(5_000_000_000).is_some(),
             "a gap this size is a gap, and the caller has to be told"
         );
         s.discard_across_gap(VadState_stub());
@@ -1932,7 +2175,7 @@ mod tests {
             voiced_start: 1_200,
             voiced_end: 14_800,
         });
-        assert!(!fine.maybe_reanchor(1_010_000_000));
+        assert!(fine.maybe_reanchor(1_010_000_000).is_none());
         assert_eq!(fine.turns.pending_start(), Some(1_000));
         assert_eq!(fine.ring.len(), 16_000);
     }

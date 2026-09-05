@@ -877,6 +877,30 @@ impl Service {
         })
     }
 
+    /// `capture_json` plus `health` (0.14.0, schema v20): gaps per hour by
+    /// cause over the trailing 24h, the share unexplained, and the top
+    /// offending sources — everything the Sources view's Health card and
+    /// `recalld capture health` both read, on the same query.
+    ///
+    /// A failed query degrades to `null` rather than failing the whole
+    /// `status` call: capture health is diagnostic, and a client rendering
+    /// it must be able to tell "not available" from "zero gaps" the same way
+    /// every other optional block here does.
+    fn capture_json_with_health(&self, store: &Store) -> Value {
+        let mut capture = self.control.capture_json();
+        let health = match store.gap_health(utc_now_ns(), 24 * 3_600 * 1_000_000_000) {
+            Ok(h) => h.to_json(),
+            Err(e) => {
+                warn!("could not compute capture health: {e:#}");
+                Value::Null
+            }
+        };
+        if let Value::Object(ref mut map) = capture {
+            map.insert("health".into(), health);
+        }
+        capture
+    }
+
     fn status_payload(&self) -> anyhow::Result<Value> {
         let c = &self.control;
         let (depth, capacity, dropped_chunks, dropped_samples) = match &c.queue {
@@ -951,7 +975,7 @@ impl Service {
             // able to tell "the probe has not run today" from "an older
             // daemon that has never heard of it", and a missing key says
             // neither.
-            "capture": c.capture_json(),
+            "capture": self.capture_json_with_health(&store),
             // Measured by the retention sweeper, never here: this method is
             // polled every three seconds by every open client and the answer
             // costs a walk of the data directory (0.6.1).

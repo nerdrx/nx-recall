@@ -2457,6 +2457,52 @@ export function startMock({
     return INTERROGATIVES.test(s.replace(/^[^\p{L}\p{N}]+/u, ''));
   }
 
+  /// 0.14.0: `status.capture` — flap tolerance's counters and the stereo
+  /// probe (0.13.0, never wired into the mock before this), plus the Health
+  /// card's `health` block. Nonzero on purpose: a mock that always shows a
+  /// clean bill of health would never exercise the card a bad evening
+  /// actually produces (FINDINGS §50).
+  function captureHealthPayload() {
+    const hourNs = 3_600_000_000_000;
+    const nowNs = BigInt(Date.now()) * 1_000_000n;
+    const hourStart = (h) => (nowNs / BigInt(hourNs) - BigInt(h)) * BigInt(hourNs);
+    return {
+      flap_grace_ms: 5000,
+      flaps_absorbed: 6,
+      stereo_probe: {
+        enabled: true,
+        last: {
+          date: '2026-09-05',
+          wav_path: 'probes/vrchat-stereo-2026-09-05.wav',
+          report_path: 'probes/vrchat-stereo-2026-09-05.txt',
+          duration_s: 47.2,
+          windows: 6,
+          usable_for_azimuth: true,
+          summary: '6 window(s), ILD spread 4.1 dB, ITD spread 210.3 us — turns cluster into distinct positions; the audio carries usable azimuth',
+        },
+      },
+      health: {
+        since_utc_ns: Number(nowNs - 24n * BigInt(hourNs)),
+        total: 41,
+        by_cause: { scheduler_starvation: 27, queue_overflow: 6, flap: 6, session_end: 2 },
+        unexplained_share: 0,
+        per_hour: [2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 4, 6, 9, 8, 5, 2, 0, 0, 0, 0]
+          .map((total, i) => ({
+            hour_start_utc_ns: Number(hourStart(23 - i)),
+            total,
+            by_cause: total ? { scheduler_starvation: Math.round(total * 0.66), queue_overflow: Math.round(total * 0.15), flap: total - Math.round(total * 0.66) - Math.round(total * 0.15) } : {},
+          }))
+          .filter((h) => h.total > 0),
+        top_sources: [
+          { display_name: 'vesktop', match_key: 'vesktop', count: 18, by_cause: { scheduler_starvation: 12, queue_overflow: 4, flap: 2 } },
+          { display_name: 'Discord', match_key: 'Discord', count: 14, by_cause: { scheduler_starvation: 9, queue_overflow: 2, flap: 3 } },
+          { display_name: 'Microphone', match_key: 'mic', count: 7, by_cause: { scheduler_starvation: 5, session_end: 2 } },
+          { display_name: 'VRChat', match_key: 'VRChat.exe', count: 2, by_cause: { scheduler_starvation: 1, queue_overflow: 1 } },
+        ],
+      },
+    };
+  }
+
   function statusPayload() {
     return {
       uptime_s: Math.round((Date.now() - state.startedAt) / 1000),
@@ -2481,6 +2527,8 @@ export function startMock({
       // figure moves as the feed runs, so the footer and the Sources card have
       // something that actually changes to render.
       storage: storagePayload(),
+      // 0.13.0/0.14.0: flap tolerance, the stereo probe, and capture health.
+      capture: captureHealthPayload(),
       // The memory graph's Tier 3 state rides on `status` too, so a client that
       // missed the `graph` event still converges on the truth.
       graph: { ...state.enrichment },
