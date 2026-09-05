@@ -1054,6 +1054,60 @@ impl SemanticLeg {
         Ok(inner.index.search(&qv, limit, within))
     }
 
+    /// The same ranking as [`Self::search`], against **raw** vectors read
+    /// straight from the database rather than the resident matrix — which is
+    /// whitened once the corpus clears [`MIN_WHITENING_ROWS`].
+    ///
+    /// Exists to answer one question on a real archive rather than the
+    /// 48-segment fixture [`Whitening`] was measured on: is the correction
+    /// still worth what it costs to maintain, at this corpus's actual size
+    /// and actual language mix? (`recalld search eval`'s tuning arms,
+    /// FINDINGS §51.) A full scan of `segment_vectors` per call — this is a
+    /// measurement tool, not a hot path.
+    pub fn search_raw(
+        &self,
+        store: &Store,
+        q: &str,
+        limit: usize,
+        within: &Candidates,
+    ) -> Result<Vec<Scored>> {
+        let mut inner = self.lock();
+        let qv = inner.embedder.embed_query(q)?;
+        let model_id = inner.embedder.model_id().to_string();
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT segment_id, vector FROM segment_vectors WHERE model_id = ?1 AND dim = ?2",
+        )?;
+        let rows = stmt.query_map(params![model_id, qv.dim() as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut best: Vec<Scored> = Vec::with_capacity(limit + 1);
+        for row in rows {
+            let (id, blob) = row?;
+            if !within.admits(id) {
+                continue;
+            }
+            let v = Embedding::from_blob(model_id.clone(), &blob)?;
+            let score = dot(&qv.vector, &v.vector);
+            if best.len() == limit
+                && let Some(last) = best.last()
+                && score <= last.score
+            {
+                continue;
+            }
+            let at = best.partition_point(|s| s.score >= score);
+            best.insert(
+                at,
+                Scored {
+                    segment_id: id,
+                    score,
+                },
+            );
+            best.truncate(limit);
+        }
+        Ok(best)
+    }
+
     /// What `status` and `semantic status` report.
     pub fn stats(&self, store: &Store) -> Result<(usize, usize, Coverage)> {
         let mut inner = self.lock();

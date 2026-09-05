@@ -80,6 +80,19 @@ Methods (initial set):
 | `pause` / `resume` | | global capture pause (the panic path; must be instant) |
 | `status` | | uptime, queue depth, drop counters, models loaded |
 
+### `search`'s query is words, never FTS5 syntax (2026-09-05)
+
+`q` is matched literally, word by word — never as `segments_fts`'s own MATCH
+query language. Before this it was passed straight through: a hyphenated
+compound (`escape-menü`) or an English contraction (`what's`) reads to FTS5's
+tokenizer as a column filter or an unterminated string literal, and the whole
+request failed with a raw SQL error rather than a search result. `search.semantic`'s
+hybrid leg already treated that failure as "the keyword leg found nothing" and
+kept going on the vector leg alone (`Service::search_semantic`); plain `search`
+now gets the same literal-words reading up front, by quoting each token, so
+neither leg can be handed a query with syntax in it. Found and fixed measuring
+`search` against 150 real, LLM-generated queries — see FINDINGS §51.
+
 ## Semantic search
 
 `search.semantic` ranks turns by what they **mean** rather than by which words

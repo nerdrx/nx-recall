@@ -950,6 +950,38 @@ impl SegmentFilter {
     }
 }
 
+/// Turn free text into an FTS5 query that can only mean "these words, each
+/// matched literally" — the reading a person typing a sentence into a search
+/// box actually intends.
+///
+/// `segments_fts MATCH` is itself a small query language, not a bag of words:
+/// a bare colon opens a column filter (`escape-menü` becomes "no such column:
+/// menü"; `zehn-jahre-garantiert` becomes "no such column: jahre" — a hyphen
+/// is a word boundary to the tokenizer, so what follows it reads as a second
+/// term, and a term followed by `:` reads as a filter), and an apostrophe
+/// closes a string literal it never opened (`what's`, `it's`: "syntax error
+/// near '''"). None of that is what the words meant, and unlike
+/// `search.semantic`'s hybrid leg — which already treats a MATCH syntax error
+/// as an empty keyword list rather than a failed search
+/// (`Service::search_semantic`) — plain `search` had no such fallback: a
+/// hyphenated compound or an English contraction failed the whole request
+/// (measured on `recalld search eval`'s generated queries, 2026-09-05; see
+/// FINDINGS §51).
+///
+/// Quoting each token closes off every one of those characters at no cost to
+/// what a plain-language query meant: FTS5 tokenises the *contents* of a
+/// quoted string exactly as it would unquoted text, so `"escape-menü"` still
+/// matches `escape` and `menü` adjacent to each other — which is what typing
+/// a hyphenated compound word meant in the first place. An embedded `"` is
+/// doubled per FTS5's own string-literal escape, not stripped, so a query
+/// that happens to contain one still matches its literal words.
+pub(crate) fn fts_query(q: &str) -> String {
+    q.split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The world predicate, spelled once so no read path can spell it differently.
 /// `{n}` is the parameter index carrying [`SegmentFilter::worlds_json`].
 pub(crate) fn world_clause(n: usize) -> String {
@@ -4353,7 +4385,7 @@ impl Store {
                 world_clause(7)
             ),
             params![
-                query,
+                fts_query(query),
                 filter.speaker,
                 filter.session,
                 filter.source,
@@ -4394,7 +4426,7 @@ impl Store {
         let rows = stmt
             .query_map(
                 params![
-                    query,
+                    fts_query(query),
                     filter.speaker,
                     filter.session,
                     filter.source,
@@ -10904,6 +10936,40 @@ mod tests {
             .execute("DELETE FROM segments WHERE id = ?1", params![seg])
             .unwrap();
         assert!(s.search("ephemeral", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fts_query_quotes_every_token_so_special_characters_cannot_be_syntax() {
+        assert_eq!(fts_query("wale"), "\"wale\"");
+        assert_eq!(fts_query("die wale"), "\"die\" \"wale\"");
+        // A bare hyphen reads to the tokenizer as a word boundary followed by
+        // a column filter; quoting removes the filter reading and keeps the
+        // two halves adjacent instead.
+        assert_eq!(fts_query("escape-menü"), "\"escape-menü\"");
+        // An apostrophe would otherwise open a string literal it never
+        // closes.
+        assert_eq!(fts_query("what's up"), "\"what's\" \"up\"");
+        // A literal quote is doubled, not dropped.
+        assert_eq!(fts_query("say \"hi\""), "\"say\" \"\"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn a_hyphenated_or_contracted_query_no_longer_fails_the_whole_search() {
+        let s = store();
+        let seg = a_segment(&s);
+        s.set_segment_analysis(
+            seg,
+            &SegmentAnalysis {
+                text: Some("nochmal im escape-menü tutorial anschauen".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Before `fts_query`, this raised "no such column: menü" and the
+        // search failed outright rather than returning zero or more hits.
+        let hits = s.search("escape-menü", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(s.search("what's this", 10).unwrap().is_empty());
     }
 
     #[test]
