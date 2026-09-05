@@ -93,6 +93,8 @@ pub mod roster;
 pub mod semantic;
 pub mod server;
 pub mod service;
+/// Sliced turns (0.12.5): a long turn reaches the glass in pieces.
+pub mod slice;
 pub mod split;
 pub mod store;
 // ---- 0.12.0 --------------------------------------------------------------

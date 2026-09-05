@@ -4905,3 +4905,115 @@ On this install the daemon gates at `max_overlap = 0.06` against a default of
 nobody was running. It now takes the caller's `[identity]` config, which is the
 same block `identity.calibrate` and the live ladder read. The wire shape does
 not change; the numbers in it do.
+
+## 0.12.5 — sliced turns
+
+Words for a turn that is **still being spoken**, from a turn long enough that
+waiting for it to end is the problem. One new event, no new topic, no new row,
+nothing stored — and one row at the end, exactly as before.
+
+```json
+{"seq": 41871, "ev": "slice", "data": {
+  "session": 3, "source": "VRChat.exe",
+  "speaker": 7, "speaker_hint": "proximity",
+  "t_start_ms": 1772486400123, "t_start_ns": "1772486400123456789",
+  "elapsed_ms": 12400,
+  "text": "and that is why the door behind the bar only works once",
+  "text_so_far": "so the way the portal network actually works is that every instance keeps its own copy of the graph and that is why the door behind the bar only works once",
+  "seq": 1,
+  "final": false
+}}
+```
+
+It rides on the **`segments`** topic, so no client changes its subscription and
+one too old to know the event ignores it (Versioning rules).
+
+### A slice is not a partial, and the difference is one word
+
+The two events are deliberately the same shape, down to the field names, so a
+client that already draws a provisional row draws this one with no new code.
+What they do not share is what the words mean:
+
+| | `partial` (0.11.0) | `slice` (0.12.5) |
+|---|---|---|
+| each event is a reading of | the **whole open turn**, again | **new audio**, once |
+| the row is | **replaced** | **extended** |
+| the words are | provisional, often taken back | final — they are the words the row will carry |
+| cost over an N-second turn | O(N²) — **+553% to +702%** CPU (§20) | O(N) — the turn's audio is decoded once either way |
+| what to draw | `text` | **`text_so_far`** |
+
+**`text_so_far` is what a client renders.** `text` is this slice alone, offered
+so a renderer can animate the newest words without diffing for them. The daemon
+does the joining, and a client that accumulated `text` itself would double a
+piece the moment an event was redelivered.
+
+### Never cut mid-word
+
+`[captions] slice_after_s` is a **floor, not a period**. Past it the daemon
+waits for a dip the VAD has already scored as not-speech (120 ms — under the
+VAD's own 500 ms span close, over its 32 ms frame) and cuts there. A turn with
+no pause in it is never sliced; it ends on the VAD's 30 s cap exactly as it did
+before this existed. Half a word decoded alone is not a worse reading of that
+word, it is a different word, and it would be written down.
+
+`slice_after_s = 0` turns the feature off, and off is byte-for-byte the
+behaviour before it: no slice is offered, and the turn is decoded whole. **Off is the default**, and a
+client must therefore treat `slice` as an event it may never see. The reason is
+measured rather than cautious: the CPU gate passed at +2.2% and a word reaches
+the glass 1.7 s sooner, but a piece read without the rest of the turn around it
+changes the words — the joined text disagrees with the whole-turn reading on
+17.6% of them, against a noise floor of exactly 0.00% (FINDINGS §41).
+
+### One row at the end
+
+When the turn finishes, an ordinary **`segment`** arrives carrying every slice
+joined to the remainder. A client replaces the growing row by matching
+**`(session, t_start_ns)`** — the same key, the same rule and the same reason as
+a partial: a slice has no `id`, because there is no row yet.
+
+**`[identity] split_turns` wins where they meet.** A turn that was sliced is
+never *also* cut at a speaker change: splitting needs a timed decode of the
+whole turn, which is exactly the decode slicing exists to avoid, so doing both
+would spend the turn twice and throw away the reading already on the glass. Both
+switches are off by default; an install that turns on both gets split turns and
+no slicing of the turns that would be split.
+
+There is no `continues` flag and there are no consecutive rows, and that is the
+load-bearing decision in this feature rather than an implementation detail.
+Everything downstream of a turn is a statement about a **whole turn**: the
+speaker embedding is taken over the turn's whole audio (six vectors of six
+fragments are six weaker claims about the same person), the overlap gate decides
+over the whole turn, the context re-decode and the flip arbiter re-read the
+whole turn, and threads, digests, truth verdicts, translation, search and export
+all count turns. Slices that were rows would have made every one of those
+count a monologue as six conversations' worth of evidence. So the pieces are
+**wire events only**, the row is written once, and not one downstream pass
+changes.
+
+The cost of that choice, stated plainly: the words on the glass during a long
+turn are **not durable and not searchable** until the turn ends. A crash
+mid-turn loses them — which is exactly what a crash mid-turn already did.
+
+### The speaker on a slice is a guess or nothing
+
+Identical to a partial, and for the identical reason: the identity ladder only
+labels finished turns, because it needs an embedding and an embedding needs the
+overlap gate's approval over completed audio. So a slice carries the proximity
+hint or nothing at all, `speaker_hint` says which, and the settled `segment`
+carries the real answer.
+
+### Never stored, never replayed
+
+A slice is not a row, not an entry in the replay ring, and not part of
+`events.since`. A client that reconnects mid-turn has missed the slices and will
+get the `segment`, which is the whole turn.
+
+### What a client is expected to do with it
+
+Draw `text_so_far` as **one row that grows**, under the settled rows and outside
+the last-N caption window, with a trailing ellipsis and **settled ink** — a
+slice's words are not in doubt, only the sentence is unfinished. Replace it on
+the matching `segment`. Do not count it, do not file it as a segment, and do not
+let it age out on a partial's staleness rule: slices are minutes apart by
+design, and the bound that is actually true of a growing row is the VAD's 30 s
+turn cap.

@@ -293,6 +293,11 @@ fn pump(
         let msg = f.read()?;
         let changed = match msg["ev"].as_str() {
             Some("segment") => caps.apply(&msg["data"]),
+            // 0.12.4: the same growing row the desktop bar draws. The headset
+            // is the surface it matters most on — a caption you cannot glance
+            // away from is a caption that had better not be twenty seconds
+            // behind the person saying it.
+            Some("slice") => caps.apply_slice(&msg["data"]),
             Some("relabel") => {
                 caps.apply_relabel(&msg["data"]);
                 true
@@ -302,7 +307,10 @@ fn pump(
         if !changed {
             continue;
         }
-        let list: Vec<feed::Turn> = caps.turns().cloned().collect();
+        let mut list: Vec<feed::Turn> = caps.turns().cloned().collect();
+        // Under the settled rows, outside the last-N window: exactly where the
+        // desktop bar and the captions window put it.
+        list.extend(caps.growing().cloned());
         if tx.send(renderer.render(&list, None)).is_err() {
             return Ok(()); // the frame loop went away
         }

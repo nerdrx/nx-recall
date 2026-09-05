@@ -2092,6 +2092,116 @@ export function runE2E(deps) {
         return { seqs: [first.seq, grown.seq], added, provisional: firstText.slice(0, 40), tail: sawTail, file };
       });
 
+      // ---- 0.12.4, sliced turns ------------------------------------------
+      //
+      // The claim: a long turn arrives in PIECES and grows ONE row, on both
+      // grounds, and the row that finally settles is one row carrying every
+      // piece. The failure this is written against is the obvious
+      // implementation — a new row per slice — which would turn one sentence
+      // into three captions and push the rest of the conversation off the bar.
+      await step('a-sliced-turn-grows-one-row-on-both-surfaces', async () => {
+        await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+        await js(`(() => {
+          const b = document.getElementById('follow-btn');
+          if (b && b.getAttribute('aria-pressed') !== 'true') b.click();
+        })()`);
+        await waitFor('the transcript to be following again', async () =>
+          js('window.__recallDebug.scrollback().following')
+        );
+        // The mock's third delivery: three slices of one monologue, then the
+        // row. (The second was the partial turn the step above drove.)
+        process.kill(Number(process.env.NX_RECALL_MOCK_PID), 'SIGUSR2');
+
+        // 1. The first slice appears as a GROWING row — unfinished, but not
+        // hedged: its words came from their own audio at a boundary the VAD
+        // found and will not be taken back.
+        const first = await waitFor(
+          'the first slice',
+          async () => {
+            const p = await capJs('window.__captionsDebug.partial()');
+            return p && p.growing ? p : null;
+          },
+          { timeout: 10000 }
+        );
+        assert(first.ellipsis, 'a growing row does not say the sentence is unfinished');
+        assert(first.text.trim().length > 0, 'the growing row is empty');
+
+        // 2. It GROWS. The distinguishing property against a partial: the text
+        // that was there is still there, with more after it. A renderer that
+        // replaced the row wholesale would pass a "the text changed" assertion
+        // and fail this one.
+        const opening = first.text.replace('…', '').trim().slice(0, 40);
+        let tailWhileOpen = null;
+        const grown = await waitFor(
+          'the row to grow',
+          async () => {
+            const p = await capJs('window.__captionsDebug.partial()');
+            tailWhileOpen = (await js('window.__recallDebug.partial()')).drawn ?? tailWhileOpen;
+            return p && p.growing && p.seq > first.seq && p.text.length > first.text.length ? p : null;
+          },
+          { timeout: 10000 }
+        );
+        assert(
+          grown.text.includes(opening),
+          `the row was rewritten rather than grown — "${opening}" is gone from "${grown.text}"`
+        );
+        const stacked = await capJs('document.querySelectorAll(".cap-row.provisional").length');
+        assert(stacked === 1, `${stacked} growing rows are on screen; one turn is one row`);
+        // Settled ink, unlike a partial. The words are not in doubt.
+        const settledInk = await capJs(
+          '(() => { const el = document.querySelector(".cap-row:not(.provisional) .cap-text"); return el ? getComputedStyle(el).color : null; })()'
+        );
+        assert(
+          !settledInk || settledInk === grown.dim,
+          `a growing row is inked like a guess (${grown.dim} against ${settledInk})`
+        );
+
+        // 3. The transcript's own live tail did the same thing, and is still a
+        // TAIL: outside `#seg-list`, and not counted as a segment.
+        assert(tailWhileOpen, 'the transcript drew no live tail for a turn being sliced');
+        assert(tailWhileOpen.growing, 'the transcript tail is not marked as growing');
+        assert(tailWhileOpen.ellipsis, 'the transcript tail does not say the sentence is unfinished');
+        assert(!tailWhileOpen.inList, 'the transcript tail is inside #seg-list, where it would become "the last segment"');
+        const modelRows = await js('window.__recallDebug.scrollback().rows');
+        assert(
+          tailWhileOpen.counted === modelRows,
+          `the growing tail is being counted as a segment: ${tailWhileOpen.counted} against ${modelRows}`
+        );
+        const file = await shotOf(capWin(), 'captions-sliced');
+
+        // 4. It settles into ONE row carrying the whole monologue — every piece
+        // that was ever on the glass, in order, in one place.
+        const done = await waitFor(
+          'the sliced turn to settle',
+          async () => {
+            const p = await capJs('window.__captionsDebug.partial()');
+            if (p) return null;
+            const rows = await capJs('window.__captionsDebug.rows()');
+            const hits = rows.filter((r) => r.text.includes(opening));
+            return hits.length ? { rows, hits } : null;
+          },
+          { timeout: 20000 }
+        );
+        assert(done.hits.length === 1, `${done.hits.length} rows carry this turn; one turn is one row`);
+        const settled = done.hits[0];
+        assert(!settled.text.includes('…'), `the settled row is still hedged: "${settled.text}"`);
+        // The last slice's words are in the final row: the pieces were JOINED
+        // rather than the last one winning.
+        const lastPiece = grown.text.replace('…', '').trim().slice(-40);
+        assert(
+          settled.text.includes(lastPiece),
+          `the settled row lost a slice — "${lastPiece}" is not in "${settled.text}"`
+        );
+        const tail = await js('window.__recallDebug.partial()');
+        assert(tail.drawn == null, 'the transcript is still drawing a tail after the turn landed');
+        assert(tail.model == null, 'the growing row survived the segment that replaces it');
+        assert(
+          (await js('document.querySelectorAll("#seg-list .seg.partial").length')) === 0,
+          'a growing row leaked into the segment list'
+        );
+        return { seqs: [first.seq, grown.seq], words: settled.text.split(' ').length, file };
+      });
+
       // …and it goes away again through the same toggle the tray offers.
       await step('captions-close-from-the-same-place-they-opened', async () => {
         deps.captions.close();
@@ -2682,11 +2792,18 @@ export function runE2E(deps) {
       const fixture = await js(`(() => {
         const icons = [...document.querySelectorAll('#seg-list [data-sp="1"] .sp-icon')];
         const rows = [...document.querySelectorAll('#seg-list .seg.person-hl')];
+        // KIRA's row, not \`rows[0]\`. Both fixture-highlighted voices (Kira,
+        // violet; Ash, teal) wear the accent, so "the first accented row" is
+        // whichever of them the resident window happens to start with — an
+        // assumption about trimming that this step never meant to make, and
+        // that flipped the moment the feed grew by one row.
+        // data-sp is on the row's .who cell, not on the row itself.
+        const kira = rows.find((r) => r.querySelector('[data-sp="1"]'));
         return {
           kiraIcons: icons.length,
           kiraIcon: icons[0]?.textContent || '',
           accented: rows.length,
-          accentColour: rows[0]?.style.getPropertyValue('--person-hl') || '',
+          accentColour: kira?.style.getPropertyValue('--person-hl') || '',
         };
       })()`);
       assert(fixture.kiraIcons > 0, 'the fixture-highlighted voice shows no icon on the transcript');

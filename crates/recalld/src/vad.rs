@@ -242,6 +242,25 @@ impl Segmenter {
     }
     // ---- 0.11.0, partial turns: end ----------------------------------------
 
+    // ---- 0.12.5, sliced turns: begin ---------------------------------------
+    /// How long the current sub-threshold run is, in samples, or `None` when
+    /// the segmenter is not in speech at all.
+    ///
+    /// This is the segmenter's own `min_silence` countdown read out loud before
+    /// it finishes. A span is only CLOSED after 500 ms of quiet, but the daemon
+    /// knows about every shorter gap on the way there, and a gap of 120 ms is
+    /// already a guarantee of the one thing [`crate::slice`] needs: the
+    /// boundary is not inside a word, because the model scored it as
+    /// not-speech.
+    ///
+    /// Zero while somebody is actually speaking — the last frame was voiced, so
+    /// there is no dip — which is exactly the reading that refuses a cut.
+    pub fn dip_len(&self) -> Option<u64> {
+        self.in_speech
+            .then(|| self.cursor.saturating_sub(self.last_voiced_end))
+    }
+    // ---- 0.12.5, sliced turns: end -----------------------------------------
+
     /// Sample index below which buffered audio can never be needed again.
     pub fn retain_from(&self) -> u64 {
         if self.in_speech {

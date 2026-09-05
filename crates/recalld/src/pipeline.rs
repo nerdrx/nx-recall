@@ -154,6 +154,18 @@ struct SessionPipeline {
     /// borrow the one `SegmentRow` carries.
     source_key: Option<Option<String>>,
     // ---- 0.11.0, partial turns: end ----------------------------------------
+    // ---- 0.12.5, sliced turns: begin ---------------------------------------
+    /// Where the open turn has already been cut, and how often
+    /// (`crate::slice`).
+    slicer: crate::slice::Slicer,
+    /// The words of every slice of the open turn, in order, already joined.
+    ///
+    /// This is the half of the feature that makes it O(N) rather than O(N²):
+    /// a slice's decode is kept, so when the turn ends only the REMAINDER is
+    /// read and the row's text is this plus that. A partial, by contrast, threw
+    /// every decode away and paid for the whole turn again a second later.
+    slice_text: String,
+    // ---- 0.12.5, sliced turns: end -----------------------------------------
 }
 
 impl SessionPipeline {
@@ -184,6 +196,10 @@ impl SessionPipeline {
             partial: crate::partial::PartialState::default(),
             source_key: None,
             // ---- end 0.11.0 -----------------------------------------------
+            // ---- 0.12.5, sliced turns --------------------------------------
+            slicer: crate::slice::Slicer::default(),
+            slice_text: String::new(),
+            // ---- end 0.12.5 ------------------------------------------------
         }
     }
 
@@ -253,6 +269,16 @@ impl SessionPipeline {
         // rather than left to age out on the glass.
         self.partial.reset();
         // ---- end 0.11.0 ---------------------------------------------------
+        // ---- 0.12.5, sliced turns ------------------------------------------
+        // Same reasoning, one step stronger. A client is showing words for a
+        // turn whose audio has a hole in it; no `segment` is coming to replace
+        // them, and the slices already decoded describe speech that is being
+        // thrown away. Keeping `slice_text` would splice the pre-gap words onto
+        // the post-gap turn, which is exactly the splice this whole method
+        // exists to prevent (audit finding #21).
+        self.slicer.reset();
+        self.slice_text.clear();
+        // ---- end 0.12.5 ----------------------------------------------------
     }
 
     fn extract(&self, start: u64, end: u64) -> Vec<f32> {
@@ -663,6 +689,16 @@ impl Pipeline {
         for span in emitted {
             self.write_segment(chunk.session_id, span)?;
         }
+        // ---- 0.12.5, sliced turns: begin ---------------------------------
+        // Before the partial hook and after the finished turns, for the same
+        // reason the partial hook sits where it does: a slice reads the audio
+        // of the turn that is STILL open, which is the audio `trim` is about to
+        // decide to keep. A slice that fires makes the partial that would have
+        // followed it redundant — the words are already on the glass and, this
+        // time, on their way to the row — so the two are never both spent on
+        // the same second of speech.
+        self.maybe_slice(chunk.session_id);
+        // ---- 0.12.5, sliced turns: end -----------------------------------
         // ---- 0.11.0, partial turns: begin --------------------------------
         // After the finished turns and before the ring is trimmed: a partial
         // reads the audio of the turn that is STILL open, which is exactly the
@@ -882,6 +918,18 @@ impl Pipeline {
             return Ok(());
         }
 
+        // ---- 0.12.5, sliced turns ------------------------------------------
+        // Everything of this turn that no slice has read. On an unsliced turn
+        // — which is 96% of them (FINDINGS §41) — this is the whole span and
+        // the three lines below cost a comparison.
+        let remainder_from = session.slicer.pending_start(span.start);
+        let sliced = remainder_from.is_some();
+        let remainder = match remainder_from {
+            Some(from) => session.extract(from, span.end),
+            None => Vec::new(),
+        };
+        // ---- end 0.12.5 ------------------------------------------------------
+
         // ---- 0.12.4: where the speaker changes ----
         //
         // The whole turn, decoded once, and the words handed to each piece by
@@ -893,10 +941,17 @@ impl Pipeline {
         // exists. That is not an optimisation, it is the guarantee that an
         // install which has not asked for this feature does not get a
         // re-ordered pipeline either.
+        //
+        // 0.12.5: and never on a turn that was SLICED. Splitting needs a timed
+        // decode of the whole turn, which is exactly the decode slicing exists
+        // to avoid — doing both would spend the turn twice and throw away the
+        // reading already on somebody's screen. The two switches are both
+        // off by default; an install that turns on both is told at start-up
+        // that its long turns reach the glass early and are not split.
         let plan: Vec<(crate::turnsplit::Piece, Option<String>)> = match self
             .analyzer
             .as_mut()
-            .filter(|_| self.cfg.identity.split_turns && !self.control.is_paused())
+            .filter(|_| self.cfg.identity.split_turns && !self.control.is_paused() && !sliced)
         {
             Some(a) => match a.plan_split(&samples) {
                 Ok(p) => p
@@ -914,13 +969,38 @@ impl Pipeline {
             },
             None => Vec::new(),
         };
+        // ---- 0.12.5: the words a sliced turn already has --------------------
+        // Its audio was read piece by piece while the person was still
+        // speaking; only the tail nobody reached is decoded here. Handed down
+        // as the piece's `said`, so the recogniser runs over this turn's audio
+        // exactly once in total — the whole claim the feature makes about its
+        // cost — and `said` means the same thing it means for a split piece.
+        //
+        // A sliced turn always takes this path, INCLUDING when the join comes
+        // back empty: every slice's audio has been read and the decoder made
+        // nothing of any of it, and falling through to a fresh decode would
+        // read the whole turn again to ask a question already answered.
+        let joined: Option<String> = sliced.then(|| {
+            let tail = self
+                .analyzer
+                .as_mut()
+                .map(|a| a.transcribe_slice(&remainder))
+                .unwrap_or_default();
+            let so_far = self
+                .sessions
+                .get(&session_id)
+                .map(|s| s.slice_text.clone())
+                .unwrap_or_default();
+            join_slices(&so_far, &tail).unwrap_or_default()
+        });
+        // ---- end 0.12.5 -------------------------------------------------------
         let plan = if plan.is_empty() {
             vec![(
                 crate::turnsplit::Piece {
                     from: 0,
                     to: samples.len(),
                 },
-                None,
+                joined,
             )]
         } else {
             plan
@@ -940,6 +1020,17 @@ impl Pipeline {
                 break;
             }
         }
+        // ---- 0.12.5, sliced turns --------------------------------------------
+        // Once per TURN and not per piece: the slicer's state is about the turn
+        // that has just ended, and a split turn is several rows of one turn.
+        // Any growing row a client is showing was replaced by the `segment`
+        // each piece published, by the same `(session, t_start_ns)` key a
+        // partial is replaced by.
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.slicer.reset();
+            session.slice_text.clear();
+        }
+        // ---- end 0.12.5 --------------------------------------------------------
         last
     }
 
@@ -1201,6 +1292,9 @@ impl Pipeline {
         // published before the thing that replaces it.
         self.close_partial_turn(session_id, segment_id, t_end_ns);
         // ---- 0.11.0, partial turns: end --------------------------------------
+        // 0.12.5: the slicer is NOT reset here. This is one PIECE, and a split
+        // turn is several pieces of one turn; the state is about the turn, so
+        // `write_segment` clears it once, after the last piece.
         Ok(())
     }
 }
@@ -1381,6 +1475,148 @@ impl Pipeline {
 }
 
 // ---- 0.11.0, partial turns: end -------------------------------------------
+
+// ---- 0.12.5, sliced turns: begin ------------------------------------------
+
+impl Pipeline {
+    /// Cut the open turn if it has run long enough and the VAD has just found a
+    /// gap, decode the piece, and publish it (docs/PROTOCOL.md "0.12.5 —
+    /// sliced turns").
+    ///
+    /// Returns nothing and raises nothing, exactly like [`Self::maybe_partial`]:
+    /// every branch is a reason to do less work, and the most this is ever
+    /// allowed to cost is one decode of audio that the finished row was going
+    /// to have to read anyway.
+    fn maybe_slice(&mut self, session_id: i64) {
+        let after_s = self.cfg.captions.slice_after_s;
+        if after_s <= 0.0 || self.analyzer.is_none() {
+            return;
+        }
+        // The panic path, checked here as well as in `on_audio` and again after
+        // the decode, for the reason `write_segment` re-checks it: this is a
+        // place words leave the daemon.
+        if self.control.is_paused() {
+            if let Some(s) = self.sessions.get_mut(&session_id) {
+                s.slicer.reset();
+                s.slice_text.clear();
+            }
+            return;
+        }
+        // The backlog rule is `partial`'s, and it applies here for a weaker but
+        // still real reason. A slice does not add decoding to the turn — the
+        // audio is read once either way — but it moves that work EARLIER, and a
+        // thread that is already behind should be catching up rather than
+        // rendering. The queue drops the oldest audio when it overflows, so the
+        // thing a badly-timed caption costs is speech nobody has read yet.
+        if crate::partial::backlog_blocks(
+            self.control
+                .queue
+                .as_ref()
+                .map(|q| q.queued_samples())
+                .unwrap_or(0),
+            SAMPLE_RATE,
+            self.cfg.asr.partial_backlog_max_s,
+        ) {
+            return;
+        }
+
+        let after = (after_s * SAMPLE_RATE as f32) as u64;
+        let Some(session) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let Some(turn_start) = session.open_turn_start() else {
+            return;
+        };
+        // The VAD's cursor and the VAD's dip, never `received`: audio past the
+        // cursor has not been scored, so a cut into it would be a cut the model
+        // never said was safe.
+        let Some(cut) = session.slicer.due(
+            turn_start,
+            session.segmenter.cursor(),
+            session.segmenter.dip_len(),
+            after,
+        ) else {
+            return;
+        };
+        let samples = session.extract(cut.start, cut.end);
+        if samples.is_empty() {
+            return;
+        }
+        let t_start_ns = session.utc_of_sample(turn_start);
+        let elapsed_ms = ((cut.end.saturating_sub(turn_start)) * 1000) / SAMPLE_RATE.max(1) as u64;
+        let (speaker, hint) = session.partial.hint(t_start_ns);
+        let source = self.session_source_key(session_id);
+
+        let Some(analyzer) = self.analyzer.as_mut() else {
+            return;
+        };
+        let text = analyzer.transcribe_slice(&samples);
+        // Re-checked after the decode, the one part of this that takes real
+        // time: a pause landing inside it must not be followed by words
+        // appearing on somebody's screen.
+        if self.control.is_paused() {
+            if let Some(s) = self.sessions.get_mut(&session_id) {
+                s.slicer.reset();
+                s.slice_text.clear();
+            }
+            return;
+        }
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        // The cut is marked whatever the decoder made of it — otherwise it
+        // would be offered again on the very next frame for as long as the dip
+        // lasted — but a slice the decoder made NOTHING of does not count as
+        // read: its audio goes back in front of the remainder and is decoded
+        // again with the words that follow it. Six seconds of speech the model
+        // happened to make nothing of in isolation must not be silently deleted
+        // from the transcript.
+        let read = !crate::asr::normalise_words(&text).is_empty();
+        session.slicer.mark(turn_start, cut, read);
+        if !read {
+            return;
+        }
+        session.slice_text = join_slices(&session.slice_text, &text).unwrap_or_default();
+        let so_far = session.slice_text.clone();
+        let seq = cut.seq;
+        self.bus.publish_ephemeral(
+            Topic::Segments,
+            "slice",
+            crate::slice::slice_json(
+                session_id,
+                source.as_deref(),
+                speaker,
+                hint,
+                t_start_ns,
+                elapsed_ms,
+                &text,
+                &so_far,
+                seq,
+            ),
+        );
+    }
+}
+
+/// Join one more slice's words onto the ones already read.
+///
+/// A plain space, and the reason it is a function rather than a `format!` is
+/// the two empty cases: a slice the decoder made nothing of must not leave a
+/// double space in the middle of a sentence, and a turn whose every slice was
+/// silent must produce `None` rather than `Some("")` — an empty transcript is
+/// stored as NULL, and `" "` would defeat that and put a blank document in the
+/// full-text index.
+fn join_slices(so_far: &str, next: &str) -> Option<String> {
+    let (a, b) = (so_far.trim(), next.trim());
+    let joined = match (a.is_empty(), b.is_empty()) {
+        (true, true) => return None,
+        (true, false) => b.to_string(),
+        (false, true) => a.to_string(),
+        (false, false) => format!("{a} {b}"),
+    };
+    Some(joined)
+}
+
+// ---- 0.12.5, sliced turns: end --------------------------------------------
 
 /// Announce a stored segment on the event stream.
 ///
@@ -1733,4 +1969,79 @@ mod tests {
         // Before the base: the trimmed prefix is simply unavailable.
         assert!(s.extract(0, 500).is_empty());
     }
+
+    // ---- 0.12.5, sliced turns: begin ---------------------------------------
+
+    #[test]
+    fn slices_join_with_one_space() {
+        assert_eq!(
+            join_slices(
+                "so the way the portal network works",
+                "is that every instance"
+            ),
+            Some("so the way the portal network works is that every instance".into())
+        );
+    }
+
+    #[test]
+    fn a_silent_slice_does_not_leave_a_hole_in_the_sentence() {
+        // The decoder makes nothing of a slice that was all breath. Joining it
+        // anyway would put a double space in the middle of a transcript, and
+        // the archive is a record somebody reads.
+        assert_eq!(
+            join_slices("the door behind the bar", ""),
+            Some("the door behind the bar".into())
+        );
+        assert_eq!(
+            join_slices("", "the door behind the bar"),
+            Some("the door behind the bar".into())
+        );
+        assert_eq!(join_slices("  ", "  the door  "), Some("the door".into()));
+    }
+
+    #[test]
+    fn a_turn_whose_every_slice_was_silent_has_no_words_rather_than_a_space() {
+        // `Some("")` would be written into `segments.text` and put a blank
+        // document in the full-text index; an empty transcript is stored as
+        // NULL, and "has a transcript" stays a single IS NOT NULL.
+        assert_eq!(join_slices("", ""), None);
+        assert_eq!(join_slices("  ", "\n\t "), None);
+    }
+
+    #[test]
+    fn the_open_turn_is_forgotten_when_a_gap_throws_its_audio_away() {
+        // A turn half of whose audio is gone is not a turn (audit finding #21),
+        // and the words already read from the near side of the hole must not be
+        // spliced onto the far side of it.
+        let mut s = SessionPipeline::new(
+            VadState_stub(),
+            SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE),
+            TurnMerger::new(24_000, 480_000),
+            0,
+            false,
+            false,
+            None,
+        );
+        let cut = crate::slice::Cut {
+            start: 0,
+            end: 96_000,
+            seq: 0,
+        };
+        s.slicer.mark(0, cut, true);
+        s.slice_text = "words from before the hole".into();
+        assert!(s.slicer.is_open());
+
+        s.discard_across_gap(VadState_stub());
+        assert!(
+            !s.slicer.is_open(),
+            "the open row survived a discarded turn"
+        );
+        assert!(
+            s.slice_text.is_empty(),
+            "pre-gap words survived to be spliced onto the next turn"
+        );
+        assert_eq!(s.slicer.pending_start(0), None);
+    }
+
+    // ---- 0.12.5, sliced turns: end -----------------------------------------
 }

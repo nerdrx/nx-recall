@@ -341,6 +341,26 @@ impl Analyzer {
     }
     // ---- 0.11.0, partial turns: end ----------------------------------------
 
+    // ---- 0.12.5, sliced turns: begin ---------------------------------------
+    /// Decode ONE SLICE of an open turn, or the remainder after the last slice
+    /// (`crate::slice`).
+    ///
+    /// The same recogniser, the same thread and the same contract as
+    /// [`Self::transcribe_partial`] beside it — and a different bargain. A
+    /// partial re-reads the WHOLE open turn every time, so its words are thrown
+    /// away by the next partial and paid for again; a slice reads its own audio
+    /// and nobody else's, exactly once, and the words it produces are the words
+    /// that go on the row. That is the difference between O(N²) and O(N) over a
+    /// turn, and it is the whole claim this feature makes about its cost.
+    ///
+    /// The caller is responsible for the boundary being one the VAD scored as
+    /// not-speech. Handing this half a word is not a worse reading of that
+    /// word, it is a different word, and this method has no way to tell.
+    pub fn transcribe_slice(&mut self, samples: &[f32]) -> String {
+        self.asr.transcribe(samples)
+    }
+    // ---- 0.12.5, sliced turns: end -----------------------------------------
+
     /// All the inference for one turn. Touches no database.
     pub fn prepare(&mut self, samples: &[f32]) -> Result<Prepared> {
         self.prepare_with(samples, Gate::Full)
@@ -434,13 +454,27 @@ impl Analyzer {
 
     /// [`Self::prepare_with`] for audio whose words are already known.
     ///
-    /// The one caller is a piece of a cut turn (0.12.4): the whole turn was
-    /// decoded once, with times, and this piece's words are the ones that
+    /// Two callers, and they arrive from opposite directions.
+    ///
+    /// A piece of a CUT turn (0.12.4, `[identity].split_turns`): the whole turn
+    /// was decoded once, with times, and this piece's words are the ones that
     /// *start* inside it ([`crate::asr::words_in_span`]). Handing them in
     /// rather than decoding the piece is what makes the split lossless — every
     /// word of the turn belongs to exactly one piece by construction, where two
     /// independent decodes could drop a word straddling the cut or spell it
     /// twice — and it is also the cheaper of the two, one decode instead of N.
+    ///
+    /// A SLICED turn (0.12.5, `crate::slice`): the opposite arrangement, and
+    /// the same saving. Its audio was decoded piece by piece while the person
+    /// was still speaking and the pieces joined, so decoding it again here
+    /// would spend the turn's whole cost twice and throw away the reading that
+    /// is already on somebody's screen.
+    ///
+    /// Either way the rest is identical, deliberately: the overlap detector
+    /// still runs, the gate still decides, and the embedding is still taken
+    /// over the WHOLE audio handed in — which is why a sliced turn is joined
+    /// into one row rather than left as several, since six embeddings of six
+    /// fragments are six weaker claims about the same person.
     pub fn prepare_said(&mut self, samples: &[f32], gate: Gate, raw: String) -> Result<Prepared> {
         let duration_s = samples.len() as f32 / SAMPLE_RATE as f32;
         let overlap_frac = self.overlap.overlap_frac(samples)?;

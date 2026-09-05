@@ -334,6 +334,19 @@ select.input option, select.input optgroup {
 .seg.partial .txt { color: var(--clear-muted); }
 .seg-ell { white-space: nowrap; margin-left: 0.15em; color: var(--clear-muted); }
 
+/* 0.12.5 — a GROWING row, from a turn that is being sliced.
+ *
+ * The one visual difference from a partial, and it is the honest one: the ink
+ * goes back to normal. A partial's words are a guess that the next reading may
+ * take back; a slice's words are FINAL — they were decoded from their own audio
+ * at a boundary the VAD found, and they are already the words the settled row
+ * will carry. Muting them would tell the reader to distrust text that is not in
+ * doubt.
+ *
+ * The ellipsis stays, because the thing that IS still unfinished is the
+ * sentence, and that is exactly what it says. */
+.seg.partial.growing .txt { color: var(--clear-ink); }
+
 /* Segments the pipeline itself does not trust: overlapped speech (the identity
    was refused) or a weak match score. They stay readable — the words are still
    the point — but they must never look as settled as a confident line, so the

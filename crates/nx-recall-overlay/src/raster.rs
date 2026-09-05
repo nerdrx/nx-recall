@@ -77,11 +77,24 @@ pub struct RowLines {
 ///   the one place it cannot be missed. A translation of a shaky reading is not
 ///   less doubtful than the reading.
 pub fn row_lines(turn: &Turn, display: TranslationDisplay) -> RowLines {
-    let said = if turn.shaky {
+    let mut said = if turn.shaky {
         format!("≈ {}", turn.text)
     } else {
         turn.text.clone()
     };
+    // 0.12.4: a turn that is still being spoken (`crate::feed::Turn::growing`)
+    // ends in an ellipsis and is otherwise an ordinary row. Deliberately the
+    // ONLY difference — the same font, the same ink, the same ground. A slice's
+    // words were decoded from their own audio at a boundary the VAD found and
+    // will not be taken back, so drawing them as a guess would say something
+    // false; what is unfinished is the sentence, and that is what "…" says.
+    //
+    // On the lead line and not the sub-line, because the sub-line is the
+    // translation of a sentence that has not finished either, and two
+    // ellipses on one row read as a mistake.
+    if turn.growing {
+        said.push('…');
+    }
     let Some((tr_lang, tr_text)) = turn.translation.as_ref() else {
         // The ordinary row, and most rows. One line, no code, nothing implied.
         return RowLines {
@@ -652,6 +665,8 @@ mod tests {
             mine: false,
             colour: None,
             icon: None,
+            // A finished turn. The growing case has its own test in `feed`.
+            growing: false,
             laughed: false,
         }
     }
