@@ -1823,7 +1823,7 @@ mod tests {
         // Thread CPU time, not wall time. This guard asks whether the ALGORITHM
         // is still cheap; wall time answers a different question — how busy the
         // box is — and under `nice 19` on a machine running six other builds it
-        // answered "no" at 620 ms for work that costs 60 ms of CPU. Only the
+        // answered "no" at 620 ms for work costing a fraction of that in CPU. Only the
         // scheduler's contribution is excluded; a slower algorithm still fails.
         fn thread_cpu_ms() -> f64 {
             let mut ts = libc::timespec {
@@ -1834,18 +1834,33 @@ mod tests {
             unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
             ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1e6
         }
-        let c0 = thread_cpu_ms();
-        let hits = ix.search(&q, 50, &Candidates::everything());
-        let ms = thread_cpu_ms() - c0;
+        // CPU time is still not load-independent: neighbours evicting L3 and a
+        // clock that has stopped boosting inflate it by a third or so on a
+        // 32-core box at load 40. So take the best of three samples — the least
+        // disturbed one — rather than a single draw. A slower ALGORITHM is
+        // slower in every sample and gets no help from this.
+        let sample = |ix: &VectorIndex| {
+            let c0 = thread_cpu_ms();
+            let hits = ix.search(&q, 50, &Candidates::everything());
+            (hits, thread_cpu_ms() - c0)
+        };
+        let (hits, first) = sample(&ix);
+        let ms = (1..3).fold(first, |best, _| best.min(sample(&ix).1));
         assert_eq!(hits.len(), 50);
-        // Generous by ~10x against the measured figure (see the module docs):
-        // this is a regression guard on the algorithm, not a benchmark.
+        // Measured 2026-09-05 in the unoptimised test profile `cargo test`
+        // builds: 430-480 ms on a 32-core desktop with the box at load 13-40.
+        // (An optimised build is roughly an order of magnitude faster; the
+        // "tens of milliseconds" in the module docs is that build.) The bar is
+        // ~5x the measured figure: a busy machine does not reach it, the
+        // order-of-magnitude regressions this guard exists for — reading the
+        // matrix back out of SQLite per query, say — still do. This is a
+        // regression guard on the algorithm, not a benchmark.
         assert!(
-            ms < 500.0,
-            "a {n}-vector scan took {ms:.1} ms of CPU — brute force is no longer the right shape"
+            ms < 2500.0,
+            "a {n}-vector scan took {ms:.1} ms of CPU (best of 3) — brute force is no longer the right shape"
         );
         eprintln!(
-            "brute force: {n} x {DIM} = {} MB, {ms:.1} ms",
+            "brute force: {n} x {DIM} = {} MB, {ms:.1} ms (best of 3)",
             ix.bytes() >> 20
         );
     }
