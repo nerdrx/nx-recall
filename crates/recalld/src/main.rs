@@ -376,7 +376,10 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     // 0.12.4: the mood pass, for the same reason again.
     .with_mood(cfg.mood.clone())
     // 0.9.0: reminders, digests and translation, for the same reason again.
-    .with_assist(cfg.assist.clone());
+    .with_assist(cfg.assist.clone())
+    // 0.13.0: flap tolerance's grace window and the stereo probe's switch,
+    // both read by `status` — see `Control::capture_json`.
+    .with_capture(cfg.capture.clone());
     // The three translation settings live in one place rather than being
     // threaded through `segment_json`'s dozen call sites; see `translate::LIVE`.
     // `assist.set` writes the same three, which is what makes them live.

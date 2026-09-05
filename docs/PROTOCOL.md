@@ -200,7 +200,8 @@ a half-described row.
 | `seen` | on the graph, not being captured — either not allowed, or allowed and not yet attached |
 | `capturing` | a capture stream is open on it right now |
 | `stopped` | it was being captured; the capture stopped while the application stayed |
-| `gone` | the node left the graph — the application closed its stream or quit |
+| `flapping` | (0.13.0) the node just left the graph, but the daemon is holding the session open and waiting to see whether the same source reappears within `[capture].flap_grace_ms` — see "Flap tolerance" below |
+| `gone` | the node left the graph — the application closed its stream or quit, or a flap's grace window ran out with nothing reappearing |
 
 Published on: an application first appearing on the graph (**whatever the allowlist
 says about it** — default-deny is only usable if a client can show the user what was
@@ -377,6 +378,88 @@ only *what*.
   the number that tells a user whether the queue is big enough. A gap is never
   spliced: the half-built turn on the near side of it is discarded rather than
   joined to the words on the far side.
+
+### Flap tolerance and the stereo probe (0.13.0)
+
+**The problem.** A source's PipeWire node can vanish and reappear inside a few
+milliseconds — measured on the live box on 2026-09-05: VRChat ran 16:07–16:19
+UTC and the tap logged 37 "capturing … key=VRChat.exe" lines, each on a new
+`pw_target` (a fresh `object.serial` every time — device init, a menu
+transition, a world load all recreate the playback stream), each one followed
+milliseconds later by "source went away; closing session". Before 0.13.0 every
+one of those was a hard stop: the session closed, whatever turn was mid-word
+was discarded, and the next reconnect opened a brand-new session. Nineteen
+sessions and one written segment came out of twelve minutes that was, from the
+person's side, an unbroken conversation.
+
+**The fix.** When a captured source's node disappears, the daemon does not
+close its session immediately. It waits up to `[capture].flap_grace_ms`
+(default 5000; `0` disables the feature and restores the pre-0.13.0 behaviour)
+for a node with the **same match key** — and the same `application.process.id`,
+when both the old and the new node carry one — to reappear. If it does, the
+SAME session id continues: the existing stream is reattached, and the audio
+gap is reported to the pipeline as a marker rather than a new session. The
+turn that was open across the flap is kept if the gap was under
+`[vad].min_silence_ms` (the ordinary silence-join threshold — a flap that
+short reads exactly like a breath); at or above it, the turn in progress is
+discarded the same way any other capture gap discards one, but the session
+itself stays open. If nothing reappears before the grace window elapses, the
+session closes for real, exactly as it always did.
+
+A source's node is matched by `application.process.id`, never by
+`object.serial` — a flap is by definition a *new* node, so it always carries a
+new serial, and matching on that would refuse every flap the feature exists to
+absorb. A node with no pid at all (some Flatpak and remote-desktop clients)
+still gets flap tolerance: an unknown pid on either side of the gap is treated
+as a match rather than a refusal.
+
+Every flap absorbed into an existing session bumps `status.capture.
+flaps_absorbed` by one. The daemon logs **one line per flap burst**, not one
+per flap — a burst is however many flaps happen back to back before the source
+either settles (stays up through a full grace window) or finally gives up —
+because nineteen individual "flap absorbed" lines would be exactly the noise
+this feature is trying to get out of the transcript.
+
+`status` carries the block:
+
+```json
+"capture": {
+  "flap_grace_ms": 5000,
+  "flaps_absorbed": 18,
+  "stereo_probe": {
+    "enabled": true,
+    "last": {
+      "date": "2026-09-05", "wav_path": "probes/vrchat-stereo-2026-09-05.wav",
+      "report_path": "probes/vrchat-stereo-2026-09-05.txt",
+      "duration_s": 47.2, "windows": 6, "usable_for_azimuth": true,
+      "summary": "6 window(s), ILD spread 4.1 dB, ITD spread 210.3 us — turns cluster into distinct positions; the audio carries usable azimuth"
+    }
+  }
+}
+```
+
+`stereo_probe.last` is `null` until a probe has actually run — the same
+"measured, not assumed" discipline as `storage`; a zeroed block would claim a
+recording that never happened.
+
+**The stereo probe.** VRChat is stereo and spatialised, so a voice's left/right
+balance and its tiny inter-channel arrival delay were flagged in the Step 0
+spike as a candidate second identity signal ("azimuth") — and then parked,
+because the spike never had VRChat running long enough to capture a stereo
+sample of it, and every capture this daemon makes deliberately downmixes to
+mono before a single sample is measured. `[capture].stereo_probe` (default
+`true`) answers the question the feature has been blocked on, without building
+azimuth identity itself: once a day, the first time a `VRChat.exe` source is
+seen, the daemon opens a **second**, independent stream on the same node,
+asking for the native channel count instead of the downmix, and records up to
+60 seconds of it to `<data-dir>/probes/vrchat-stereo-<date>.wav`. In the same
+pass it measures the inter-channel level difference (ILD, dB) and
+inter-channel time difference (ITD, µs) of every VAD-active window in the
+recording and writes a short plain-text report beside the wav, and the
+`usable_for_azimuth` verdict — do the per-turn measurements cluster into
+distinct positions, or smear around the centre — is what `status` carries.
+Bounded three ways: 60 seconds, once a day, one named application; it is a
+diagnostic recording answering one question, never a standing stereo capture.
 
 - **`status` carries `last_sweep` (0.7.5)**, or `null` before the sweeper has run
   once. The same block is pushed as a `sweep` event on the `status` topic after

@@ -331,6 +331,14 @@ pub struct Stats {
     /// worth keeping: without it there is no way to tell a room mic that is
     /// recording from one that is merely switched on.
     pub room_segments: AtomicU64,
+    /// Flaps absorbed (0.13.0, `crate::flap`): a source's node vanished and
+    /// reappeared inside the grace window, and the session that was open
+    /// before it left is the same one that is open now. One count per flap,
+    /// not per burst — `status` is the place a burst is a single number too,
+    /// but this is meant to answer "how much of this has been happening",
+    /// which a burst count alone cannot: nineteen absorbed flaps in one burst
+    /// and nineteen absorbed flaps spread across a week read very differently.
+    pub flaps_absorbed: AtomicU64,
 }
 
 /// Which side of the per-user de-duplication rule a session sits on (0.12.2).
@@ -531,6 +539,11 @@ impl Pipeline {
                     session_id,
                     mono_ns,
                 } => self.on_session_end(session_id, mono_ns),
+                CaptureEvent::Gap {
+                    session_id,
+                    mono_ns,
+                    gap_ms,
+                } => self.on_gap(session_id, mono_ns, gap_ms),
             };
             if let Err(e) = result {
                 error!("analysis error: {e:#}");
@@ -891,6 +904,58 @@ impl Pipeline {
             .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
         store.end_session(session_id, Anchor::at(mono_ns).utc_of(mono_ns))?;
         info!(session_id, "session closed");
+        Ok(())
+    }
+
+    /// A flap was absorbed on the capture side (0.13.0, `crate::flap`): the
+    /// source's node vanished and came back inside the grace window, and
+    /// `capture.rs` kept the SAME session id rather than closing it. `mono_ns`
+    /// is the reappearance's monotonic stamp — what the resumed stream's next
+    /// buffer will be measured against — and `gap_ms` is how long the audio
+    /// was actually missing.
+    ///
+    /// Below the VAD's own silence threshold (`[vad].min_silence_ms`) the gap
+    /// reads exactly like an ordinary pause in speech: the session's clock is
+    /// re-anchored so the sample cursor does not drift against wall time, but
+    /// the turn in progress — and the VAD's LSTM state — is left alone. At or
+    /// above the threshold the open turn is discarded the same way any other
+    /// capture gap is (`on_audio`'s own re-anchor path, `discard_across_gap`):
+    /// splicing across a silence that long would join two turns that were
+    /// never one (audit finding #21, and the reason a flap must not become a
+    /// second way to trigger that bug).
+    fn on_gap(&mut self, session_id: i64, mono_ns: u64, gap_ms: u64) -> Result<()> {
+        let Some(entry) = self.sessions.get_mut(&session_id) else {
+            // Nothing has produced a buffer for this session since it opened
+            // (or since its last flap), so there is no `SessionPipeline` yet
+            // to re-anchor. The next `on_audio` builds one fresh, anchored on
+            // that buffer's own stamp — there is nothing stale here to fix.
+            return Ok(());
+        };
+        entry.anchor = crate::clock::Anchor {
+            mono_ns,
+            utc_ns: entry.anchor.utc_of(mono_ns),
+        };
+        entry.anchor_sample = entry.received;
+
+        let silence_ms = self.cfg.vad.min_silence_ms as u64;
+        if gap_ms >= silence_ms {
+            let fresh_state = self.vad.new_state();
+            entry.discard_across_gap(fresh_state);
+            self.stats.gaps_discarded.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                session_id,
+                gap_ms,
+                silence_ms,
+                "flap gap at or above the silence threshold: discarded the turn in progress"
+            );
+        } else {
+            debug!(
+                session_id,
+                gap_ms,
+                silence_ms,
+                "flap gap absorbed under the silence threshold: turn in progress kept"
+            );
+        }
         Ok(())
     }
 
@@ -2044,4 +2109,125 @@ mod tests {
     }
 
     // ---- 0.12.5, sliced turns: end -----------------------------------------
+
+    // ---- 0.13.0, flap tolerance's other half: `Pipeline::on_gap` ----------
+
+    /// A whole `Pipeline`, wired exactly like the daemon's but with no models
+    /// configured — `on_gap` never touches the analysis leg, so there is
+    /// nothing here that needs one.
+    fn test_pipeline(name: &str) -> (Pipeline, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("nx-recall-flap-gap-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(std::sync::Mutex::new(Store::open(&dir).unwrap()));
+        let cfg = Config::default();
+        let control = Control::new(dir.clone(), None, &cfg.allowlist());
+        let bus = Bus::new(16, 16);
+        let pipeline = Pipeline::new(
+            &cfg,
+            store,
+            dir.clone(),
+            Arc::new(Stats::default()),
+            Arc::new(AnalysisStats::default()),
+            control,
+            bus,
+        )
+        .expect("a Pipeline with no models configured must still build");
+        (pipeline, dir)
+    }
+
+    fn open_session(pipeline: &mut Pipeline, session_id: i64) {
+        pipeline.sessions.insert(
+            session_id,
+            SessionPipeline::new(
+                VadState_stub(),
+                SegmenterConfig::from_ms(0.5, 250, 500, 200, 30_000, SAMPLE_RATE),
+                TurnMerger::new(24_000, 480_000),
+                0,
+                false,
+                false,
+                None,
+            ),
+        );
+    }
+
+    #[test]
+    fn a_flap_gap_under_the_silence_threshold_re_anchors_but_keeps_the_turn() {
+        let (mut pipeline, dir) = test_pipeline("under");
+        let session_id = 1;
+        open_session(&mut pipeline, session_id);
+        let s = pipeline.sessions.get_mut(&session_id).unwrap();
+        s.anchor = Anchor {
+            mono_ns: 0,
+            utc_ns: 1_000_000_000,
+        };
+        s.anchor_sample = 0;
+        s.received = 16_000; // 1 s already consumed
+        s.ring = vec![0.25; 1_600]; // some buffered audio, standing in for "a turn in progress"
+        s.ring_base = 0;
+
+        // 500 ms is the default [vad].min_silence_ms; 200 ms must not discard.
+        assert_eq!(pipeline.cfg.vad.min_silence_ms, 500);
+        pipeline.on_gap(session_id, 5_200_000_000, 200).unwrap();
+
+        let s = pipeline.sessions.get(&session_id).unwrap();
+        assert_eq!(
+            s.ring.len(),
+            1_600,
+            "a gap under the silence threshold must not throw the open turn away"
+        );
+        assert_eq!(
+            s.anchor_sample, 16_000,
+            "the clock must still re-anchor so the sample cursor does not drift"
+        );
+        assert_eq!(s.utc_of_sample(16_000), 1_000_000_000 + 5_200_000_000);
+        assert_eq!(
+            pipeline.stats.gaps_discarded.load(Ordering::Relaxed),
+            0,
+            "nothing was discarded"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flap_gap_at_or_above_the_silence_threshold_discards_the_open_turn() {
+        let (mut pipeline, dir) = test_pipeline("over");
+        let session_id = 2;
+        open_session(&mut pipeline, session_id);
+        let s = pipeline.sessions.get_mut(&session_id).unwrap();
+        s.anchor = Anchor {
+            mono_ns: 0,
+            utc_ns: 1_000_000_000,
+        };
+        s.anchor_sample = 0;
+        s.received = 16_000;
+        s.ring = vec![0.25; 1_600];
+        s.ring_base = 0;
+
+        // Exactly at the threshold counts as "at or above": the caller could
+        // otherwise flap forever one millisecond under a real silence and
+        // never once trip the discard.
+        pipeline.on_gap(session_id, 5_500_000_000, 500).unwrap();
+
+        let s = pipeline.sessions.get(&session_id).unwrap();
+        assert!(
+            s.ring.is_empty(),
+            "a gap at the silence threshold must discard the turn in progress, same as any other gap"
+        );
+        assert_eq!(pipeline.stats.gaps_discarded.load(Ordering::Relaxed), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_gap_for_a_session_with_no_open_pipeline_yet_is_a_no_op() {
+        // The resumed stream has not produced a buffer yet, so there is no
+        // `SessionPipeline` to re-anchor. The next `on_audio` starts one fresh.
+        let (mut pipeline, dir) = test_pipeline("no-session");
+        assert!(pipeline.on_gap(999, 1_000, 50).is_ok());
+        assert!(!pipeline.sessions.contains_key(&999));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- end 0.13.0 ---------------------------------------------------------
 }
