@@ -230,10 +230,27 @@ fn main() -> Result<()> {
         } => cmd_name(&data_dir, speaker_id, &display_name),
         Command::Merge { from, into } => cmd_merge(&data_dir, from, into),
         Command::Split { speaker_id } => cmd_split(&cfg, &data_dir, speaker_id),
+        // `recalld search eval` (a literal one-word query of "eval") runs the
+        // search-quality benchmark instead of searching for that word — see
+        // `cli::SearchEvalArgs` for why this is a query check rather than a
+        // real subcommand.
+        Command::Search {
+            query,
+            limit: _,
+            smart: _,
+            eval,
+        } if query == ["eval"] => recalld::searcheval::command(
+            &cfg,
+            &data_dir,
+            eval.regen,
+            eval.eval_dir.as_deref(),
+            eval.eval_count,
+        ),
         Command::Search {
             query,
             limit,
             smart,
+            eval: _,
         } => cmd_search(&cfg, &data_dir, &query.join(" "), limit, smart),
         // Semantic search (0.6.5). Both actions run in THIS process rather than
         // over the socket: the backfill is a long batch job that must be

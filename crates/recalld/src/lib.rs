@@ -95,6 +95,7 @@ pub mod retention;
 /// The room microphone (0.10.0): a second, physical input.
 pub mod room;
 pub mod roster;
+pub mod searcheval;
 pub mod semantic;
 pub mod server;
 pub mod service;

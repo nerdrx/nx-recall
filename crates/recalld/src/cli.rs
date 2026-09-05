@@ -24,6 +24,27 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// Flags for `recalld search eval` (see `searcheval.rs`). Flattened onto
+/// `Command::Search` rather than given its own subcommand, because clap
+/// cannot host a positional catch-all (`QUERY`) and a subcommand on the same
+/// variant; `main.rs` dispatches on `query == ["eval"]` instead.
+#[derive(clap::Args, Debug, Default)]
+pub struct SearchEvalArgs {
+    /// Rebuild the evaluation set from the archive (sampling turns, asking
+    /// the local LLM to phrase a query for each) instead of scoring against
+    /// whatever is already stored.
+    #[arg(long)]
+    pub regen: bool,
+    /// Where the evaluation set (and its report) lives. Defaults to
+    /// `<data-dir>/searcheval` — pass an explicit path to keep it off a real
+    /// archive, e.g. while tuning against a read-only copy.
+    #[arg(long, value_name = "PATH")]
+    pub eval_dir: Option<PathBuf>,
+    /// How many turns to sample when regenerating.
+    #[arg(long, default_value_t = 300)]
+    pub eval_count: usize,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Run the capture daemon in the foreground.
@@ -388,7 +409,9 @@ The prior itself is off until `[identity].source_prior = true`.")]
         speaker_id: i64,
     },
 
-    /// Full-text search over transcripts.
+    /// Full-text search over transcripts. `recalld search eval` (a literal
+    /// query of just that one word) runs the search-quality benchmark
+    /// instead of searching for the word "eval" — see [`SearchEvalArgs`].
     Search {
         #[arg(value_name = "QUERY")]
         query: Vec<String>,
@@ -399,6 +422,8 @@ The prior itself is off until `[identity].source_prior = true`.")]
         /// semantic model — `recalld models fetch --semantic`.
         #[arg(long)]
         smart: bool,
+        #[command(flatten)]
+        eval: SearchEvalArgs,
     },
 
     /// Semantic search: the index behind "what did she say about that world"
