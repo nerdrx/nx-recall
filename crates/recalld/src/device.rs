@@ -126,7 +126,12 @@ pub const LIVE: &[Placement] = &[
 /// live models rather than only under `status.asr.night`, because the question
 /// a person actually asks is "is my graphics card doing anything for this", and
 /// an answer that omits the one thing that uses it is a misleading answer.
-pub fn status_json(night_available: bool) -> Value {
+///
+/// `light` is `None` on a daemon with no analysis models resolved — there is
+/// no transcriber for the switch to apply to — and `Some((model_id, reason))`
+/// otherwise, which is which decoder the transcriber line above actually is
+/// right now and why (0.13.x, `crate::light`).
+pub fn status_json(night_available: bool, light: Option<(&str, &str)>) -> Value {
     let models: Vec<Value> = LIVE
         .iter()
         .map(|p| {
@@ -143,6 +148,7 @@ pub fn status_json(night_available: bool) -> Value {
         "live": "cpu",
         "live_models": models,
         "night": if night_available { "vulkan" } else { "unavailable" },
+        "light": light.map(|(model, reason)| json!({ "model": model, "why": reason })),
         "summary": "every model on the live path runs on the CPU. The 87% of that \
                     cost which is the transcriber goes through sherpa-onnx, which has \
                     no AMD execution provider at all; the two models that could in \
@@ -183,7 +189,7 @@ mod tests {
 
     #[test]
     fn every_model_says_which_device_and_why() {
-        let v = status_json(true);
+        let v = status_json(true, None);
         assert_eq!(v["live"], "cpu");
         assert_eq!(v["night"], "vulkan");
         let models = v["live_models"].as_array().expect("an array");
@@ -197,6 +203,21 @@ mod tests {
 
     #[test]
     fn a_machine_without_the_vulkan_build_says_so() {
-        assert_eq!(status_json(false)["night"], "unavailable");
+        assert_eq!(status_json(false, None)["night"], "unavailable");
+    }
+
+    #[test]
+    fn no_analysis_models_means_no_light_block() {
+        assert_eq!(status_json(true, None)["light"], Value::Null);
+    }
+
+    #[test]
+    fn light_mode_says_which_model_is_live_and_why() {
+        let v = status_json(
+            true,
+            Some(("parakeet-tdt-110m", "a captured source is a game")),
+        );
+        assert_eq!(v["light"]["model"], "parakeet-tdt-110m");
+        assert_eq!(v["light"]["why"], "a captured source is a game");
     }
 }

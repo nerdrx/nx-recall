@@ -1300,6 +1300,12 @@ export function startMock({
     // fixture that shipped it already on would never exercise turning it on.
     // The e2e driver flips both to exercise the other worlds.
     mood: { enabled: false, rendered: false },
+    // 0.13.x: light mode, as `status.asr.light_mode` reports it. `mode` is the
+    // switch (`asr.light.set`); `light`/`reason` are what is actually true
+    // right now — the mock ships `auto` and "clear" (the full decoder), which
+    // is the state a fresh install boots into, and the e2e driver flips both
+    // to exercise the other worlds.
+    light: { mode: 'auto', light: false, reason: 'no game captured and the GPU is not sustained-busy' },
     /// Every `segments.correct` this daemon has served, which is where
     /// `accuracy.summary` comes from: the pre-correction text lives in the
     /// record, so a WER estimate is arithmetic over real edits rather than a
@@ -1971,6 +1977,32 @@ export function startMock({
     };
   }
 
+  /// `status.asr.light_mode`, and `asr.light.set`'s reply merges over the same
+  /// keys — one function, so the card and the switch never see two different
+  /// answers to "which decoder is live". `on`/`off` are unconditional; `auto`
+  /// reads `state.light.light`/`.reason` directly, which `mock.light` (below)
+  /// is how the e2e driver moves without simulating a real game or GPU.
+  function lightStatus() {
+    const mode = state.light.mode;
+    const light = mode === 'on' ? true : mode === 'off' ? false : !!state.light.light;
+    const reason =
+      mode === 'on'
+        ? 'manual: light_mode = on'
+        : mode === 'off'
+          ? 'manual: light_mode = off'
+          : state.light.reason;
+    return {
+      mode,
+      games: ['vrchat'],
+      gpu_busy_pct_threshold: 70,
+      light,
+      reason,
+      model: light
+        ? 'sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8'
+        : 'sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8',
+    };
+  }
+
   function graphCounts() {
     const by = (k) => state.commitments.filter((c) => c.state === k).length;
     const src = (k) => state.commitments.filter((c) => c.source === k).length;
@@ -2525,6 +2557,11 @@ export function startMock({
       // `state.mood.rendered = true` and gets it, which is the point of having
       // the flag on the wire at all.
       mood: moodStatus(),
+      // 0.13.x: light mode. A thin block next to `mood` — the mock does not
+      // simulate a captured game or a busy GPU, so `auto` always reads as the
+      // full decoder, and `mock.light` (below) is how the e2e driver exercises
+      // the other worlds without wiring up either sensor for real.
+      asr: { light_mode: lightStatus() },
       segments_total: state.segments.length,
       daemon: daemonId(),
       schema: SCHEMA,
@@ -3725,6 +3762,39 @@ export function startMock({
     },
 
     // ---- end 0.12.5 ---------------------------------------------------------
+
+    // ---- 0.13.x: light mode --------------------------------------------------
+
+    /// `asr.light.set {mode}` — live and, on the real daemon, persisted to
+    /// config.toml (`Service::asr_light_set`). The mock has no config file to
+    /// write, so "persisted" is simply true.
+    'asr.light.set'(params) {
+      const mode = params?.mode;
+      if (!['auto', 'on', 'off'].includes(mode)) {
+        throw err('params', 'mode must be "auto", "on" or "off"');
+      }
+      state.light.mode = mode;
+      emit('status', 'status', statusPayload());
+      return { light_mode: lightStatus(), persisted: true };
+    },
+
+    /**
+     * `mock.light {light?, reason?}` — the one method here that is not on the
+     * wire, the same shape `mock.mood` is above.
+     *
+     * The real daemon decides `light`/`reason` itself, off a captured source
+     * and a GPU counter this mock has neither of. The e2e driver still has to
+     * see both worlds — the full decoder and the light one — so the switch
+     * lives here, prefixed `mock.` so nobody mistakes it for protocol.
+     */
+    'mock.light'(params) {
+      if (params?.light !== undefined) state.light.light = !!params.light;
+      if (params?.reason !== undefined) state.light.reason = params.reason;
+      emit('status', 'light', { light: !!state.light.light, reason: state.light.reason });
+      return { ...state.light };
+    },
+
+    // ---- end 0.13.x -----------------------------------------------------------
 
     /**
      * `mock.mood {rendered?}` — the one method here that is not on the wire

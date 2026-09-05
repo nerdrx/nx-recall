@@ -3185,6 +3185,68 @@ export function runE2E(deps) {
       return { offSub: off.sub, onSub: on.sub, offShot, onShot };
     });
 
+    // 0.13.x — light mode. `asr.light.set` is a real socket method, so a click
+    // moves the switch and persists it; `mock.light` (test-only, like
+    // `mock.mood`) is how the driver exercises the automatic swap a captured
+    // game or a busy GPU would otherwise trigger, which this mock has neither
+    // of.
+    await step('light-mode-switches-the-decoder-and-says-why', async () => {
+      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.getElementById("light-card").scrollIntoView({ block: "start" })');
+      const auto = await waitFor('the light card in its shipped, auto state', async () => {
+        const v = await js('window.__recallDebug.light()');
+        return v.mode ? v : null;
+      });
+      assert(auto.mode === 'auto', `light mode did not ship auto: ${auto.mode}`);
+      assert(auto.light === false, 'the mock ships the full decoder live');
+      assert(/full decoder/.test(auto.sub), `the card does not say which decoder: "${auto.sub}"`);
+      const autoShot = await shot('memory-light-auto');
+
+      // The manual switch: a click on "Always" pins the light decoder,
+      // unconditionally, through the real `asr.light.set` path.
+      await js('document.getElementById("light-mode-on").click()');
+      const on = await waitFor('the switch to report the light decoder live', async () => {
+        const v = await js('window.__recallDebug.light()');
+        return v.light === true ? v : null;
+      });
+      assert(on.mode === 'on', `the switch did not land on "on": ${on.mode}`);
+      assert(/smaller decoder/.test(on.sub), `the card does not say which decoder: "${on.sub}"`);
+      assert(/manual/.test(on.reason), `the reason does not say it is manual: "${on.reason}"`);
+
+      // Back to auto, then the automatic swap a captured game would cause —
+      // exercised through `mock.light` because this mock simulates neither a
+      // captured source nor a GPU counter.
+      await js('document.getElementById("light-mode-auto").click()');
+      await waitFor('auto to report the full decoder again', async () => {
+        const v = await js('window.__recallDebug.light()');
+        return v.mode === 'auto' && v.light === false ? true : null;
+      });
+      await deps.request('mock.light', {
+        light: true,
+        reason: 'a captured source matches light_mode_games',
+      });
+      const gamed = await waitFor('the automatic swap to reach every window', async () => {
+        const v = await js('window.__recallDebug.light()');
+        return v.light === true ? v : null;
+      });
+      assert(/vrchat|game/i.test(gamed.reason), `the reason does not name a game: "${gamed.reason}"`);
+      assert(/smaller decoder/.test(gamed.sub), `the card did not follow the swap: "${gamed.sub}"`);
+      const gameShot = await shot('memory-light-game');
+
+      // Put the driver back where it found it — auto, full decoder — the same
+      // discipline the mood step above ends on.
+      await deps.request('mock.light', {
+        light: false,
+        reason: 'no game captured and the GPU is not sustained-busy',
+      });
+      await waitFor('the mock world to reset', async () => {
+        const v = await js('window.__recallDebug.light()');
+        return v.light === false ? true : null;
+      });
+      await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
+      return { autoSub: auto.sub, onReason: on.reason, gameReason: gamed.reason, autoShot, gameShot };
+    });
+
     // 8 — pause from the TRAY path stops the feed (DESIGN §8, the marquee case)
     await step('tray-pause-stops-feed', async () => {
       await deps.setPaused(true); // exactly what the tray menu item calls

@@ -181,6 +181,7 @@ failed are listed further down with their numbers.
 | Full live pipeline: VAD, gate, ASR, identity, vectors | 30 CPU seconds per audio minute — **half of one core**, and 90% of it is the transcriber |
 | Moving the live path onto the idle 7900 XTX | **refused.** sherpa-onnx has no AMD provider at all, so the 90% is unreachable; a per-turn whisper Vulkan decoder measured *slower* (1639 ms vs 360 ms) and no cheaper |
 | Cutting a turn where the speaker changes, against Discord's per-user spans | **41.7%** of the reachable change points at ±0.5 s, 67.9% precision, **0.87%** false splits on turns Discord says are one person. Live switch ships off — it missed the 50% recall bar; the archive pass turns 93 unlabellable rows into ground truth and takes identity precision **85.7% → 86.8%** |
+| Light mode: swapping the live decoder to Parakeet-TDT 110m while a game runs, interleaved per clip against the model it replaces, 24.9 minutes of real archive | **-58.0% CPU s/audio-minute** — comfortably past the -50% gate. The words cost is real and not gated: 104.5% WER against the multilingual reading, because 83% of this archive's turns are not English and the 110m export cannot spell German at all. The night shift re-reads every light-mode row unconditionally, so the archive is never permanently downgraded |
 
 ## The graveyard of clever ideas
 

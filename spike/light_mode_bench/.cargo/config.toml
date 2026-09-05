@@ -1,0 +1,7 @@
+# sherpa-rs-sys drops `libsherpa-onnx-c-api.so` beside the binary in the target
+# directory and puts no rpath on it, so the bench does not start. `$ORIGIN` is
+# the same answer `recalld models build-night` gives for whisper.cpp's .so
+# files: the library sits next to the binary that needs it and is found by
+# position rather than by an LD_LIBRARY_PATH the caller has to remember.
+[build]
+rustflags = ["-C", "link-args=-Wl,-rpath,$ORIGIN"]

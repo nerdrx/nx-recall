@@ -63,6 +63,7 @@ pub mod lang;
 pub mod lang_ngrams;
 pub mod langctx;
 pub mod lid;
+pub mod light;
 pub mod llm;
 pub mod models;
 /// 0.12.4: how a turn sounded — SenseVoice's own emotion and event tags,

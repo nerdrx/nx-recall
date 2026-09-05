@@ -119,7 +119,10 @@ impl Group {
     pub fn note(self) -> &'static str {
         match self {
             Group::Speech => "required for transcription and speaker identity",
-            Group::FallbackAsr => "optional — the older English-only ASR export",
+            Group::FallbackAsr => {
+                "optional — the older English-only ASR export, also loaded by light mode \
+                 (`[asr].light_mode`) while a game is running"
+            }
             Group::Graph => {
                 "optional — the memory graph's local model; nothing needs it unless \
                  [graph].enabled is on"

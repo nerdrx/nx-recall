@@ -626,6 +626,37 @@ test('the graph worker state arrives on its own event and on the status block', 
   assert.equal(store.graph.enrichment.phase, 'idle');
 });
 
+test('an automatic light-mode swap arrives on its own event, folded into status.asr', () => {
+  reset();
+  // The daemon's own status still carries the switch and the games list —
+  // an automatic swap only ever changes `light`/`reason`, so this must survive.
+  applyEvent({
+    seq: 1,
+    ev: 'status',
+    data: {
+      queue_depth: 0,
+      asr: { light_mode: { mode: 'auto', games: ['vrchat'], light: false, reason: 'clear' } },
+    },
+  });
+  assert.equal(store.status.asr.light_mode.light, false);
+
+  // A game starts, entirely on the inference thread's own clock: the `light`
+  // event arrives with no round trip through `asr.light.set`.
+  const change = applyEvent({
+    seq: 2,
+    ev: 'light',
+    data: { light: true, reason: 'a captured source matches light_mode_games' },
+  });
+  assert.equal(change.status, true);
+  assert.equal(store.status.asr.light_mode.light, true);
+  assert.equal(store.status.asr.light_mode.reason, 'a captured source matches light_mode_games');
+  // The mode and the games list must not be clobbered by the merge.
+  assert.equal(store.status.asr.light_mode.mode, 'auto');
+  assert.deepEqual(store.status.asr.light_mode.games, ['vrchat']);
+
+  assert.equal(applyEvent({ seq: 3, ev: 'light', data: null }), null);
+});
+
 test('a commitment change is a broadcast the client never does arithmetic on', () => {
   reset();
   store.graph = { counts: { open: 3 }, enrichment: { phase: 'off' }, config: null };

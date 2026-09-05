@@ -1248,6 +1248,19 @@ document.addEventListener('keydown', (e) => {
           tint: r.querySelector('.txt.has-mood')?.className ?? '',
         })),
     }),
+    // 0.13.x: the light mode card — the three-way switch and what the daemon
+    // says is actually true right now. One hook, so a test that flips the
+    // setting and a test that reads the live state cannot be looking at two
+    // different definitions of "on".
+    light: () => ({
+      mode: document.querySelector('input[name="light-mode"]:checked')?.value ?? null,
+      modes: [...document.querySelectorAll('input[name="light-mode"]')].map((r) => r.value),
+      sub: document.getElementById('light-sub')?.textContent ?? '',
+      // What the daemon says, so a test can assert the client obeyed it rather
+      // than asserting its own copy of the rule.
+      light: store.status?.asr?.light_mode?.light ?? null,
+      reason: store.status?.asr?.light_mode?.reason ?? null,
+    }),
     // 0.10.2: the Translation card's three controls, as a person sees them.
     translation: () => ({
       sub: document.getElementById('translate-sub')?.textContent ?? '',

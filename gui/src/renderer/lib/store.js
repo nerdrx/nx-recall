@@ -1398,6 +1398,25 @@ export function applyEvent(evt, opts = {}) {
       return { assist: true };
     }
 
+    // Light mode's own decoder swap (0.13.x) — a game started or stopped, or
+    // the GPU crossed the sustained-busy threshold, entirely on the inference
+    // thread's own clock rather than a person's click. `asr.light.set`'s own
+    // reply already updates `status.asr.light_mode` for the window that
+    // pressed it; this is the one that lets every OTHER window (and the same
+    // one, on the next automatic flip) see it too, without waiting for the
+    // next full status poll.
+    case 'light': {
+      if (!d) return null;
+      store.status = {
+        ...store.status,
+        asr: {
+          ...store.status?.asr,
+          light_mode: { ...store.status?.asr?.light_mode, light: d.light, reason: d.reason },
+        },
+      };
+      return { status: true };
+    }
+
     // A MIC turn that began with a wake phrase became a note (0.8.0). The
     // segment itself arrives separately as an ordinary `segment` event and
     // stays in the transcript — this is a second reading of that turn, not a

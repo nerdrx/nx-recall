@@ -100,6 +100,10 @@ const ALLOWED = new Set([
   // control, the same argument `graph.set`'s entry above makes.
   'mood.get',
   'mood.set',
+  // Light mode (0.13.x), reachable from the Listening card's "Lighter while a
+  // game runs" control. The read rides on `status.asr.light_mode` like every
+  // other switch here — a write that needs a restart is not a control.
+  'asr.light.set',
   // Worlds and turn-taking (0.10.0). Two reads: the Memory view's Worlds card
   // and the person page's "How you talk". A method the UI calls and this set
   // forgets is a card that never renders and says nothing about why.
