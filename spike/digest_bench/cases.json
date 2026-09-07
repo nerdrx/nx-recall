@@ -1,0 +1,470 @@
+{
+  "note": "Synthetic digest gate fixtures. Six low-value eight-turn exchanges must be refused; four newly authored substantive exchanges must be summarised.",
+  "note_names": "Roster labels and all dialogue below are synthetic benchmark data. IDs, expected verdicts, and keyword checks are stable fixtures for run_bench.py.",
+  "cases": [
+    {
+      "id": "de_trap_banter",
+      "names": {
+        "A": "Kira",
+        "B": "Wren"
+      },
+      "lang": "de",
+      "expect": false,
+      "why": "brief backchannel only",
+      "window": [
+        {
+          "who": "A",
+          "text": "ja"
+        },
+        {
+          "who": "B",
+          "text": "ne"
+        },
+        {
+          "who": "A",
+          "text": "lol"
+        },
+        {
+          "who": "B",
+          "text": "ja ok"
+        },
+        {
+          "who": "A",
+          "text": "hm"
+        },
+        {
+          "who": "B",
+          "text": "lol ja"
+        },
+        {
+          "who": "A",
+          "text": "ne echt"
+        },
+        {
+          "who": "B",
+          "text": "ja"
+        }
+      ]
+    },
+    {
+      "id": "en_trap_banter",
+      "names": {
+        "A": "Kira",
+        "B": "Wren"
+      },
+      "lang": "en",
+      "expect": false,
+      "why": "brief backchannel only",
+      "window": [
+        {
+          "who": "A",
+          "text": "yeah"
+        },
+        {
+          "who": "B",
+          "text": "nah"
+        },
+        {
+          "who": "A",
+          "text": "lol"
+        },
+        {
+          "who": "B",
+          "text": "ok"
+        },
+        {
+          "who": "A",
+          "text": "mm"
+        },
+        {
+          "who": "B",
+          "text": "yeah lol"
+        },
+        {
+          "who": "A",
+          "text": "for real"
+        },
+        {
+          "who": "B",
+          "text": "yeah"
+        }
+      ]
+    },
+    {
+      "id": "de_trap_greeting",
+      "names": {
+        "A": "Milo",
+        "B": "Speaker 38"
+      },
+      "lang": "de",
+      "expect": false,
+      "why": "greeting and departure only",
+      "window": [
+        {
+          "who": "A",
+          "text": "hey"
+        },
+        {
+          "who": "B",
+          "text": "hi, na?"
+        },
+        {
+          "who": "A",
+          "text": "alles gut bei dir?"
+        },
+        {
+          "who": "B",
+          "text": "ja passt, und bei dir"
+        },
+        {
+          "who": "A",
+          "text": "auch"
+        },
+        {
+          "who": "B",
+          "text": "ich muss gleich weg"
+        },
+        {
+          "who": "A",
+          "text": "alles klar, bis dann"
+        },
+        {
+          "who": "B",
+          "text": "ciao"
+        }
+      ]
+    },
+    {
+      "id": "mixed_trap_round_callouts",
+      "names": {
+        "A": "You",
+        "B": "Kira"
+      },
+      "lang": "mixed",
+      "expect": false,
+      "why": "short game callouts only",
+      "window": [
+        {
+          "who": "A",
+          "text": "gg"
+        },
+        {
+          "who": "B",
+          "text": "nice one"
+        },
+        {
+          "who": "A",
+          "text": "oof"
+        },
+        {
+          "who": "B",
+          "text": "der war knapp"
+        },
+        {
+          "who": "A",
+          "text": "rematch?"
+        },
+        {
+          "who": "B",
+          "text": "ja los"
+        },
+        {
+          "who": "A",
+          "text": "gg"
+        },
+        {
+          "who": "B",
+          "text": "gg wp"
+        }
+      ]
+    },
+    {
+      "id": "en_trap_backchannel",
+      "names": {
+        "A": "Wren",
+        "B": "Speaker 07"
+      },
+      "lang": "en",
+      "expect": false,
+      "why": "agreement without a substantive topic",
+      "window": [
+        {
+          "who": "A",
+          "text": "mhm"
+        },
+        {
+          "who": "B",
+          "text": "right"
+        },
+        {
+          "who": "A",
+          "text": "totally"
+        },
+        {
+          "who": "B",
+          "text": "for sure"
+        },
+        {
+          "who": "A",
+          "text": "yeah exactly"
+        },
+        {
+          "who": "B",
+          "text": "mhm"
+        },
+        {
+          "who": "A",
+          "text": "true"
+        },
+        {
+          "who": "B",
+          "text": "yep"
+        }
+      ]
+    },
+    {
+      "id": "de_trap_mic_check",
+      "names": {
+        "A": "You",
+        "B": "Milo"
+      },
+      "lang": "de",
+      "expect": false,
+      "why": "microphone check only",
+      "window": [
+        {
+          "who": "A",
+          "text": "hörst du mich"
+        },
+        {
+          "who": "B",
+          "text": "was"
+        },
+        {
+          "who": "A",
+          "text": "jetzt?"
+        },
+        {
+          "who": "B",
+          "text": "ja jetzt"
+        },
+        {
+          "who": "A",
+          "text": "und jetzt noch?"
+        },
+        {
+          "who": "B",
+          "text": "ja passt"
+        },
+        {
+          "who": "A",
+          "text": "ok gut"
+        },
+        {
+          "who": "B",
+          "text": "ja"
+        }
+      ]
+    },
+    {
+      "id": "de_pos_shader",
+      "names": {
+        "A": "Kira",
+        "B": "Speaker 38"
+      },
+      "lang": "de",
+      "expect": true,
+      "summary_contains": [
+        "shader",
+        "avatar",
+        "link",
+        "aspen"
+      ],
+      "open_expected": true,
+      "window": [
+        {
+          "who": "A",
+          "text": "hast du den Shader vom Avatar noch?"
+        },
+        {
+          "who": "B",
+          "text": "ja, der ist von Aspen"
+        },
+        {
+          "who": "A",
+          "text": "kannst du mir den Link schicken?"
+        },
+        {
+          "who": "B",
+          "text": "ich schick ihn morgen"
+        },
+        {
+          "who": "A",
+          "text": "ich will den Shader testen"
+        },
+        {
+          "who": "B",
+          "text": "er braucht etwas Performance"
+        },
+        {
+          "who": "A",
+          "text": "für mein PC-Projekt passt das"
+        },
+        {
+          "who": "B",
+          "text": "dann ist alles gut"
+        }
+      ]
+    },
+    {
+      "id": "en_pos_meetup_recording",
+      "names": {
+        "A": "You",
+        "B": "Wren"
+      },
+      "lang": "en",
+      "expect": true,
+      "summary_contains": [
+        "record",
+        "meetup",
+        "cut",
+        "video"
+      ],
+      "open_expected": true,
+      "window": [
+        {
+          "who": "A",
+          "text": "did anyone record the meetup?"
+        },
+        {
+          "who": "B",
+          "text": "I recorded the video"
+        },
+        {
+          "who": "A",
+          "text": "could you send me a copy?"
+        },
+        {
+          "who": "B",
+          "text": "sure, I will cut it down"
+        },
+        {
+          "who": "A",
+          "text": "the opening talk is the part I need"
+        },
+        {
+          "who": "B",
+          "text": "I will include that section"
+        },
+        {
+          "who": "A",
+          "text": "thanks"
+        },
+        {
+          "who": "B",
+          "text": "no worries"
+        }
+      ]
+    },
+    {
+      "id": "mixed_pos_world_portal",
+      "names": {
+        "A": "Milo",
+        "B": "Kira"
+      },
+      "lang": "mixed",
+      "expect": true,
+      "summary_contains": [
+        "portal",
+        "world",
+        "stairwell",
+        "bar"
+      ],
+      "open_expected": false,
+      "window": [
+        {
+          "who": "A",
+          "text": "which portal is behind the bar?"
+        },
+        {
+          "who": "B",
+          "text": "der im stairwell, wenn das Licht ausgeht"
+        },
+        {
+          "who": "A",
+          "text": "I waited there for ten minutes"
+        },
+        {
+          "who": "B",
+          "text": "the bar portal loops to the same instance"
+        },
+        {
+          "who": "A",
+          "text": "is upstairs a different world?"
+        },
+        {
+          "who": "B",
+          "text": "genau, ein eigener Upload"
+        },
+        {
+          "who": "A",
+          "text": "who built it?"
+        },
+        {
+          "who": "B",
+          "text": "keine Ahnung"
+        }
+      ]
+    },
+    {
+      "id": "de_pos_doku_deadline",
+      "names": {
+        "A": "Speaker 07",
+        "B": "You"
+      },
+      "lang": "de",
+      "expect": true,
+      "summary_contains": [
+        "doku",
+        "dokumentation",
+        "freitag",
+        "deadline"
+      ],
+      "open_expected": true,
+      "window": [
+        {
+          "who": "A",
+          "text": "wie weit bist du mit der Doku?"
+        },
+        {
+          "who": "B",
+          "text": "die Dokumentation ist halb fertig"
+        },
+        {
+          "who": "A",
+          "text": "wann ist die Deadline?"
+        },
+        {
+          "who": "B",
+          "text": "ich mache sie bis Freitag fertig"
+        },
+        {
+          "who": "A",
+          "text": "brauchst du Screenshots?"
+        },
+        {
+          "who": "B",
+          "text": "ja, vom Kamera-Setup"
+        },
+        {
+          "who": "A",
+          "text": "die schicke ich heute Abend"
+        },
+        {
+          "who": "B",
+          "text": "perfekt"
+        }
+      ]
+    }
+  ]
+}

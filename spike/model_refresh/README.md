@@ -1,109 +1,46 @@
-# Model refresh — the standing procedure
+# Model refresh — public procedure
 
-NX Recall pins one ASR checkpoint (`parakeet-tdt-0.6b-v3-int8`, exported
-2025-08-16). sherpa-onnx publishes new exports every few weeks. This directory
-is how that pin gets re-examined on a schedule instead of on a hunch, and the
-rule that decides it is written down *before* the numbers arrive, so a swap is
-never argued into existence after the fact.
-
-Everything lives in `spike/model_refresh.py`. Nothing here touches the live
-store (`~/.local/share/nx-recall`, `~/.config/nx-recall`); the real audio is
-the frozen lobby recording under `spike/clips/`, and downloads land in the
-scratchpad.
+This directory documents a repeatable quarterly check for the pinned ASR
+model. Refresh runs use local, privately configured inputs and write generated
+reports to the local scratch area. Generated transcripts and model outputs are
+private artifacts and are ignored by version control; no real snippets or
+recordings are part of the public repository.
 
 ## Running it
 
-```sh
-cd spike
-P="chrt -i 0 taskset -c 28-31 nice -n 19"
-$P venv/bin/python model_refresh.py discover
-$P venv/bin/python model_refresh.py bench
-$P venv/bin/python model_refresh.py verdict
-```
-
-Four cores, SCHED_IDLE, nice 19 is not a suggestion, and the script is
-deliberately sequential — one model, one decode at a time, no worker pool. The
-box runs a VR session and other agents; more importantly, **a model that only
-clears the RTF bar when it owns the machine has not cleared it** — the daemon
-decodes in the background while the user is in VR. Which four cores is local
-policy (`NXR_CPUS` tells the judge subprocess where to run; keep it matching the
-`taskset` set). Expect the whole thing to take a night; that is the intended
-trade.
-
-- `discover` — lists sherpa-onnx ASR exports newer than the pinned v3 from the
-  GitHub `asr-models` release and `csukuangfj/*` on Hugging Face. It filters
-  against a hard-coded allowlist of *families* (`FAMILIES` in the script):
-  multilingual covering **de and en**, offline, int8, ≤ 1.5 GB. Everything else
-  is counted with the reason it was skipped, so the skips are auditable. Adding
-  a family is a three-line edit; that is the intended way to widen the net.
-  Writes `discover.json`.
-- `bench` — downloads what `discover` picked (via `pardl.py`, 12 ranged
-  connections — the uplink shapes per connection), then runs every candidate
-  *and the incumbent* through the §11 measurements: lab WER on FLEURS German +
-  LibriSpeech English through Opus 24k, RTF, empty-output rate, wrong-language
-  rate on 1.5 s cuts, and — only for candidates that already beat the incumbent
-  on lab WER — the real-audio LLM-judge A/B. Writes `<date>.json` (including
-  every transcript) and `<date>.md` (the table).
-- `verdict` — applies the rule to the newest `<date>.json` and names the
-  criterion that failed. `bench` prints it too.
-
-Expect hours. Cheap transducers finish in minutes; an LLM-decoder model such as
-qwen3-asr is the long pole.
-
-## The rule
-
-A candidate replaces v3 only if **all five** hold:
-
-1. **Pooled lab WER** (de + en full utterances, one pooled error rate) at least
-   **10 % relative** better than v3's.
-2. **RTF ≤ 0.50** on four cores, measured on the real lobby clips.
-3. **Wrong-language rate on 1.5 s cuts ≤ v3's.** This is the criterion that
-   disqualified whisper-turbo in §11: it hallucinated French for an English
-   fragment. Short Denglisch turns are the product's actual input.
-4. **Empty-output rate ≤ v3's + 1 pp.** canary-180m was fast and
-   language-perfect and dropped 11 % of turns; a dropped turn is worse than a
-   wrong one, because nothing in the UI says it happened.
-5. **The real-audio judge prefers it on ≥ 55 % of decided pairs** (ties and
-   identical decodes are not decided pairs).
-
-Anything else: **keep v3**, with the failing criterion named.
-
-Why these five: lab WER alone ranks models on read speech the product never
-sees, so it is a gate and not the decision; RTF and the two failure-rate
-criteria encode the two ways a "better" model has already made things worse
-here; the judge is the only measurement taken on the audio the user actually
-produces. The judge's sample is small and it is used last, as a veto on
-candidates that already won on the lab set — not as a ranking.
-
-## Quarterly
-
-One line, no daemon, no unit file installed — a systemd user timer is the
-tidiest form:
+From `spike/`, run the three stages with the host's preferred low-priority
+settings:
 
 ```sh
-systemd-run --user --on-calendar=quarterly --unit=nx-recall-model-refresh \
-  sh -c 'cd ~/…/nx-recall/spike && for c in discover bench; do chrt -i 0 taskset -c 28-31 nice -n 19 venv/bin/python model_refresh.py $c || exit 1; done'
+python model_refresh.py discover
+python model_refresh.py bench
+python model_refresh.py verdict
 ```
 
-or, as cron: `0 4 1 1,4,7,10 *`. Read the `verdict` line in the generated
-`<date>.md` afterwards; it is the only output that needs a human.
+`discover` selects eligible newer multilingual offline checkpoints. `bench`
+records aggregate lab metrics such as pooled WER, real-time factor, empty
+output rate, and wrong-language rate, then writes generated local artifacts.
+`verdict` applies the replacement rule to the newest local result and names any
+failed criterion.
 
-## Runs so far
+## Replacement rule
 
-- `2026-09-02` — four candidates (omnilingual-asr 300M, qwen3-asr 0.6B, two NeMo
-  multilingual fast-conformers). **Keep v3**; nothing came within 10% relative
-  of it on lab WER. Full write-up in `FINDINGS.md` §15.
+A candidate replaces the incumbent only when all of these gates pass:
 
-## Where the numbers come from
+1. at least 10% relative improvement on pooled lab WER;
+2. real-time factor at most 0.50 on the configured machine;
+3. wrong-language rate on short cuts no worse than the incumbent;
+4. empty-output rate no more than one percentage point above the incumbent;
+5. a blind quality comparison prefers it on at least 55% of decided pairs.
 
-- Lab set: `spike/model_refresh.py:lab_set()` — the same seeded 40 FLEURS German
-  + 40 LibriSpeech English utterances as FINDINGS §11, plus 1.5 s / 3 s cuts, all
-  through Opus 24k.
-- Real set: `spike/clips/*.wav` — 193 single-speaker clips (≈472 s, mean 2.45 s)
-  cut from the user's own 20-minute VRChat lobby recording in §9. §11 sampled
-  240 segments out of the live product database instead; a re-runnable procedure
-  must not depend on what happens to be in the database this quarter, so the
-  refresh uses the frozen clips. Same lobby, same codec path, same crosstalk.
-- Judge: `llama-cli` + Qwen2.5-3B from the scratchpad, grammar-constrained to
-  `{"better": "A"|"B"|"same"}`, blind A/B with the sides flipped at random and
-  the two preceding clips as context.
+The public README records the aggregate historical outcome: keep the incumbent,
+with the nearest candidate at 3.6% versus 3.3% lab WER and slower on real audio.
+Detailed runs, transcripts, prompts, recordings, and model downloads are
+local private artifacts and are intentionally omitted here.
+
+## Scheduling
+
+Run the stages quarterly using an existing scheduler appropriate to the host.
+Keep the generated reports local and review the final verdict line. A public
+release should include only aggregate, non-identifying results and newly
+authored synthetic examples.

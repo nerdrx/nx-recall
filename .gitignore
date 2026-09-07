@@ -39,3 +39,20 @@ spike/clips/
 
 # agent worktrees (created by the harness, never source)
 .claude/worktrees/
+
+# Private research outputs and local credentials
+*.log
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+*.sqlite
+*.sqlite3
+/spike/results.json
+/spike/model_refresh/discover.json
+/spike/model_refresh/????-??-??.json
+/spike/model_refresh/????-??-??.md
