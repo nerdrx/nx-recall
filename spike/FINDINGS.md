@@ -16,7 +16,7 @@ project README; they are not a substitute for the withheld evidence.
 | Overlapped speech in one measured lobby | 9.8% of speech |
 | Daily digest gate | 6/6 low-value traps refused; 4/4 substantive examples summarised |
 | Translation embeddings | 0.948 cosine against the reference set |
-| Quarterly ASR refresh | Keep the incumbent; the nearest candidate measured 3.6% vs 3.3% lab WER and lost on speed |
+| Quarterly ASR refresh | Keep the incumbent; the nearest candidate measured 3.6% vs 3.3% lab WER; qwen3-asr tied on real audio and lost on speed |
 
 These results establish the broad engineering direction: short speech can be
 useful for identity, overlap is a distinct operating concern, and the digest

@@ -96,7 +96,7 @@ not cheaper, because the model load is the cost and a live decoder cannot
 batch it away the way a night shift can. So there is no `live_gpu` setting —
 all three of its states would do the same thing — and `recalld status` says
 which device every model is on and why instead. Full round in
-[FINDINGS §40](spike/FINDINGS.md).
+[public measurement overview](spike/FINDINGS.md).
 
 Then the parts that run when nobody is waiting: a **context re-decode** that
 re-reads short turns inside the audio around them, a **cross-check** by a
@@ -141,7 +141,7 @@ label (0.35, calibrated on real lobbies — the corpus value over-split 3×)
 ## Numbers we actually measured
 
 The measurement harness came first — **38 experiment scripts and twenty-five
-numbered findings** in [`spike/FINDINGS.md`](spike/FINDINGS.md) — and two of
+historical findings**, now condensed into the privacy-safe [`measurement overview`](spike/FINDINGS.md) — and two of
 the original design's core claims died in it before a line of the daemon
 existed. Every feature since has had a gate it had to clear, and the ones that
 failed are listed further down with their numbers.
