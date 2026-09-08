@@ -51,7 +51,11 @@ echo "==> NX Recall $VERSION"
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
     echo "==> cargo build --release"
-    cargo build --release --bin recalld --bin nx-recall-overlay
+    # Keep checkout- and account-specific paths out of panic/debug metadata.
+    # Preserve caller flags so distro/reproducible-build settings still apply.
+    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$ROOT=/usr/src/nx-recall --remap-path-prefix=${HOME:?HOME is unset}=/build/home"
+    cargo build --release --jobs "${CARGO_BUILD_JOBS:-4}" \
+        --bin recalld --bin nx-recall-overlay
 fi
 
 [ -x "$TARGET/recalld" ] || { echo "$TARGET/recalld is missing — build first" >&2; exit 1; }
@@ -67,7 +71,7 @@ done
 
 # The rpath is the whole reason the layout below is what it is.
 if command -v readelf >/dev/null; then
-    RPATH=$(readelf -d "$TARGET/recalld" | sed -n 's/.*R\(UN\)\?PATH).*\[\(.*\)\]/\2/p' | head -1)
+    RPATH=$(readelf -d "$TARGET/recalld" | sed -n '/R.*PATH/{s/.*\[\(.*\)\].*/\1/p;q}')
     case "$RPATH" in
         *'$ORIGIN'*) echo "==> rpath: $RPATH" ;;
         *) echo "!! recalld has no \$ORIGIN rpath ($RPATH) — it will not find its .so files once installed" >&2; exit 1 ;;

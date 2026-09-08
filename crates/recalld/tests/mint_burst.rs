@@ -53,8 +53,8 @@ fn take(who: usize, era: usize, take: usize) -> Embedding {
     Embedding::new(MODEL, v)
 }
 
-const HELVO: usize = 0;
-const EMBER: usize = 1;
+const ROWAN: usize = 0;
+const ASPEN: usize = 1;
 const STRANGER: usize = 2;
 /// Two days ago, and tonight.
 const THEN: usize = 0;
@@ -63,8 +63,8 @@ const NOW: usize = 1;
 /// The speaker ids the fixture uses. 1 and 2 are the two people the bank knows;
 /// 68 is the phantom the nightly pass had already fitted a bar for, which is
 /// where the real evening started.
-const HELVO_ID: i64 = 1;
-const EMBER_ID: i64 = 2;
+const ROWAN_ID: i64 = 1;
+const ASPEN_ID: i64 = 2;
 const PHANTOM_68: i64 = 68;
 
 struct Box_ {
@@ -102,7 +102,7 @@ impl Box_ {
     /// and — this is the part that matters — one phantom already holding a
     /// recording of Rowan from *tonight*.
     fn with_the_bank_of_2026_09_04(mut self, n: usize) -> Self {
-        for (who, id) in [(HELVO, HELVO_ID), (EMBER, EMBER_ID)] {
+        for (who, id) in [(ROWAN, ROWAN_ID), (ASPEN, ASPEN_ID)] {
             for _ in 0..n {
                 let t = self.next_take;
                 self.next_take += 1;
@@ -112,7 +112,7 @@ impl Box_ {
         let t = self.next_take;
         self.next_take += 1;
         self.bank
-            .push((PHANTOM_68, -1 - t as i64, take(HELVO, NOW, t)));
+            .push((PHANTOM_68, -1 - t as i64, take(ROWAN, NOW, t)));
         self
     }
 
@@ -174,7 +174,7 @@ impl Box_ {
     /// that costs correct labels will cost hers.
     fn an_evening(&mut self, turns: usize) {
         for i in 0..turns {
-            self.turn(if i % 3 == 2 { EMBER } else { HELVO });
+            self.turn(if i % 3 == 2 { ASPEN } else { ROWAN });
         }
     }
 
@@ -183,8 +183,8 @@ impl Box_ {
             .iter()
             .filter(|(who, l)| {
                 *l == Some(match who {
-                    &HELVO => HELVO_ID,
-                    _ => EMBER_ID,
+                    &ROWAN => ROWAN_ID,
+                    _ => ASPEN_ID,
                 })
             })
             .count()
@@ -196,8 +196,8 @@ impl Box_ {
             .filter(|(who, l)| {
                 l.is_some_and(|id| {
                     id != match who {
-                        &HELVO => HELVO_ID,
-                        _ => EMBER_ID,
+                        &ROWAN => ROWAN_ID,
+                        _ => ASPEN_ID,
                     }
                 })
             })
@@ -211,7 +211,7 @@ impl Box_ {
 /// tie-break prefers "turn its wrong labels into declines".
 fn the_bars_of_2026_09_04() -> Thresholds {
     Thresholds::global(0.35, 0.0)
-        .with(HELVO_ID, 0.41, 0.0)
+        .with(ROWAN_ID, 0.41, 0.0)
         .with(PHANTOM_68, 0.60, 0.08)
 }
 
@@ -219,10 +219,10 @@ fn the_bars_of_2026_09_04() -> Thresholds {
 /// cannot quietly stop reproducing the failure.
 #[test]
 fn the_fixture_puts_the_scores_where_the_evening_had_them() {
-    let a = take(HELVO, NOW, 300);
-    let same_evening = take(HELVO, NOW, 301);
-    let two_days_old = take(HELVO, THEN, 302);
-    let somebody_else = take(EMBER, NOW, 303);
+    let a = take(ROWAN, NOW, 300);
+    let same_evening = take(ROWAN, NOW, 301);
+    let two_days_old = take(ROWAN, THEN, 302);
+    let somebody_else = take(ASPEN, NOW, 303);
     let cos = |x: &Embedding| (a.cosine(x).unwrap() * 1000.0).round() / 1000.0;
     assert_eq!(
         cos(&same_evening),
