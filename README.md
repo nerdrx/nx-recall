@@ -6,29 +6,63 @@
 
 **The always-on conversation memory for VR and voice chat. Transcription in
 25 languages, persistent speaker identity, a memory graph, search by meaning,
-captions in front of your eyes, and a night shift that re-reads the day on
-your own GPU. Every byte of it on your silicon. Nothing, ever, anywhere else.**
+desktop captions over whatever you are doing, and a night shift that re-reads
+the day on your own GPU. Processing stays on your machine, with no cloud
+transcription or telemetry.**
 
 <br>
 
 ![local](https://img.shields.io/badge/inference-100%25_local-7700FF?style=for-the-badge)
 ![telemetry](https://img.shields.io/badge/telemetry-none._ever.-0a0714?style=for-the-badge)
 ![languages](https://img.shields.io/badge/languages-25-7700FF?style=for-the-badge)
-![rust](https://img.shields.io/badge/daemon-rust_·_70k_lines-b7410e?style=for-the-badge)
-![tests](https://img.shields.io/badge/tests-1069_rust_·_175_node_·_192_e2e-2ea44f?style=for-the-badge)
-![releases](https://img.shields.io/badge/releases-35_in_4_days-7700FF?style=for-the-badge)
-![footprint](https://img.shields.io/badge/live_pipeline-half_of_one_core-2ea44f?style=for-the-badge)
-![experiments](https://img.shields.io/badge/experiments-38_scripts_·_25_findings-0a0714?style=for-the-badge)
 
 <br>
 
 *"wait — what did she say about that world?"*
 
-**Now you know. Forever. And nobody else does.**
+**Find the moment. Remember the conversation.**
 
 </div>
 
 <br>
+
+## Install on Linux
+
+The published desktop build is for **Linux x86-64**. It needs PipeWire and a
+systemd user session. Install the signed release through
+[NX Hub](https://github.com/nerdrx/nx-hub), or download it from the
+[latest NX Recall release](https://github.com/nerdrx/nx-recall/releases/latest).
+NX Hub installs the daemon, desktop client, tray, captions overlay and user
+service under `~/.local`; it leaves your data and models in
+`~/.local/share/nx-recall` alone during updates and uninstall.
+
+After installation, fetch the speech models and start the service once:
+
+```bash
+~/.local/bin/recalld models fetch
+systemctl --user daemon-reload
+systemctl --user enable --now nx-recall
+```
+
+Then choose what Recall may hear. Capture is default-deny:
+
+```bash
+~/.local/bin/recalld probe
+~/.local/bin/recalld allow VRChat.exe
+systemctl --user restart nx-recall
+```
+
+Semantic search and the Memory tab use optional local model sets. Fetch them
+when you want those features:
+
+```bash
+~/.local/bin/recalld models fetch --semantic
+~/.local/bin/recalld models fetch --graph
+```
+
+Desktop captions use a native Wayland layer surface. The OpenXR headset
+overlay is experimental, ships behind `--overlay`, and has not yet been
+validated against a live WiVRn session.
 
 ```console
 $ recalld probe
@@ -411,22 +445,22 @@ and all four do something.
 | Backups | a folder you picked, on a local filesystem | never — same network-mount refusal as export |
 | Telemetry, analytics, crash reports | nowhere — they do not exist | n/a |
 
-`models fetch` is the only command in the program that opens a network socket:
-setup-time, byte-verified against a pinned catalogue, 12-way parallel because
-consumer uplinks shape per-connection (measured: 50 kB/s single vs 13 MB/s
-ranged). The night shift's GPU runtime is *compiled* on your machine from a
-pinned tag, because nobody publishes one for this card. This repo is private
-by design and the software contains **no sharing surface at all** — not a
-missing feature, the [legal architecture](docs/DESIGN.md#12-legal-note).
+Normal capture, transcription, search and enrichment make no outbound network
+connections. Setup commands such as `models fetch` download byte-verified
+model files from a pinned catalogue; `models build-night` also fetches pinned
+source dependencies before compiling the night-shift GPU runtime locally.
+NX Hub separately uses the network to discover and download signed releases.
+The software contains **no transcript or audio sharing surface**; see the
+[legal architecture](docs/DESIGN.md#12-legal-note).
 
 ## The machine room
 
 | | |
 |---|---|
-| Daemon | Rust, 70k lines — PipeWire capture, four ONNX runtimes, one GGUF via llama.cpp, whisper.cpp on Vulkan at night, SQLite WAL, NDJSON socket, one loopback ingest for Discord's word |
+| Daemon | Rust — PipeWire capture, four ONNX runtimes, one GGUF via llama.cpp, whisper.cpp on Vulkan at night, SQLite WAL, NDJSON socket, one loopback ingest for Discord's word |
 | Overlay | Rust — layer-shell captions on Wayland at 0.3–0.5 ms a frame, an OpenXR path behind a flag |
 | Client | Electron, 21k lines, zero runtime dependencies, NX Clear in both grounds |
-| Tests | **1069 Rust + 175 node + 96 headless-compositor steps × 2 themes** — every fix ships with a test that failed on the old code |
+| Tests | Rust, Node and packaged-app compositor coverage in both themes — every fix ships with a test that failed on the old code |
 | Schema | v12, migrated in place from v1 on a live database, every step idempotent, three independent halves where three tracks landed on one number |
 | Models | pyannote gate 6 MB · Parakeet v3 620 MB · ERes2Net 26 MB · e5 135 MB · Qwen 3B 1.9 GB · Canary cross-checker 154 MB · large-v3 q5_0 1.03 GB · arbiters on demand — all pinned to exact bytes |
 | Scheduling | live pipeline at nice 19 on the cores your game does not use; every background pass gated on pause, backlog, and — for the GPU — the busy counter, checked before every batch |
@@ -446,9 +480,12 @@ both themes before a signed tarball leaves the building. Features that fail
 their gate ship as data, or not at all, and their numbers go in the graveyard
 above so the next person does not have to find out twice.
 
-## Ship log
+## Historical development log
 
-Installed by its first user on day one; every finding became a release.
+This is the rapid internal development record, preserved as written. Its
+overlapping clocks and experimental milestones are not a list of releases
+currently downloadable from GitHub. See [GitHub Releases](https://github.com/nerdrx/nx-recall/releases)
+for the supported public builds.
 
 | Version | Clock | What |
 |---|---|---|
@@ -504,7 +541,10 @@ Installed by its first user on day one; every finding became a release.
 | 0.12.5 | +151h | the mood pass gets a live switch (`mood.set`/`mood.get`, `recalld mood on\|off`) instead of a restart, and its queue reads newest-first — what was just said is what tonight's listen reaches first; the enrichment card's "waiting" count stops counting the 907-of-919 conversations too short to ever be read, split out as `threads_waiting` / `threads_too_short` so the number matches the worker that is honestly idle behind it |
 | 0.14.0 | +173h | capture health: 723 "audio gap" warnings in one 26-hour journal window, reconstructed by hand and effectively 100% unexplained — none of them a night-shift priority collision (0.11.2's fix held; nothing else was running) and none logged as a queue overflow, so the evening's simultaneous three-session gaps (23:18:14.055598/633/647, vesktop+Discord+mic in the same 49µs) point at the daemon's own inference thread missing PipeWire's clock, not any one source's fault. Every gap is now classified at the instant it happens — flap, queue overflow, scheduler starvation, or the source going quiet before its session closed — into a `gaps` table (schema v20); `status.capture.health` and `recalld capture health` report gaps per hour by cause and the top offending sources; the Sources view gets a Health card with one bar per source and a one-line fix per cause (FINDINGS §50) |
 
-## Quickstart
+## Build from source
+
+The commands below are for development. The packaged release above is the
+shortest route to a working desktop install.
 
 ```bash
 cargo build --release
