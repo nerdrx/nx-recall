@@ -32,7 +32,10 @@ export function runE2E(deps) {
     if (!w || w.isDestroyed()) throw new Error('no window');
     return w;
   };
-  const js = (code) => win().webContents.executeJavaScript(code, true);
+  const js = async (code) => {
+    try { return await win().webContents.executeJavaScript(code, true); }
+    catch (error) { throw new Error(`${error.message} [renderer expression: ${code.slice(0, 240)}]`); }
+  };
 
   /**
    * The captions window (0.8.3), and JavaScript inside it.
@@ -66,6 +69,8 @@ export function runE2E(deps) {
   const shot = (name) => shotOf(win(), name);
 
   async function step(name, fn) {
+    const only = process.env.NX_RECALL_E2E_ONLY;
+    if (only && ![only, 'connect', 'theme-pass'].includes(name)) return;
     const started = Date.now();
     try {
       const detail = await fn();
@@ -4947,38 +4952,48 @@ export function runE2E(deps) {
     });
 
     await step('016-collections-and-full-saved-range-remain-source-backed', async () => {
+      const targetMoment = moment014 ?? (await deps.request('mock.memory_sources', { action: 'fixture' })).moment;
+      let phase = 'open saved and create collection';
+      try {
       await saved014();
       await js(`document.getElementById('collection-new').click()`);
       await js(`document.getElementById('collection-name').value='E2E collection'; document.getElementById('collection-save').click()`);
       await waitFor('new collection selected',()=>js(`document.getElementById('memory-collection')?.selectedOptions[0]?.textContent.includes('E2E collection')`));
+      phase = 'read created collection';
       const collection=await js(`Number(document.getElementById('memory-collection').value)`);
       await saved014();
-      await js(`document.querySelector('[data-move-moment="${moment014.id}"]').click()`);
+      phase = 'move moment';
+      await js(`document.querySelector('[data-move-moment="${targetMoment.id}"]').click()`);
       await waitFor('move picker',()=>js(`!!document.getElementById('moment-collection')`));
       await js(`document.getElementById('moment-collection').value='${collection}'; document.getElementById('moment-move').click()`);
-      await waitFor('moment moved',async()=> (await readSaved014('moments')).find(m=>m.id===moment014.id)?.collection_id===collection);
-      await waitFor('saved collection controls after move',()=>js(`!!document.getElementById('memory-collection') && !!document.querySelector('[data-move-moment="${moment014.id}"]') && !document.getElementById('moment-collection')`));
+      await waitFor('moment moved',async()=> (await readSaved014('moments')).find(m=>m.id===targetMoment.id)?.collection_id===collection);
+      await waitFor('saved collection controls after move',()=>js(`!!document.getElementById('memory-collection') && !!document.querySelector('[data-move-moment="${targetMoment.id}"]') && !document.getElementById('moment-collection')`));
       await js(`(() => { const filter=document.getElementById('memory-collection'); filter.value='${collection}'; filter.dispatchEvent(new Event('change')); })()`);
-      await waitFor('filtered moment',()=>js(`document.querySelectorAll('[data-saved-kind="moments"]').length===1 && !!document.querySelector('[data-move-moment="${moment014.id}"]')`));
+      await waitFor('filtered moment',()=>js(`document.querySelectorAll('[data-saved-kind="moments"]').length===1 && !!document.querySelector('[data-move-moment="${targetMoment.id}"]')`));
+      phase = 'rename collection';
       await js(`document.getElementById('collection-rename').click(); document.getElementById('collection-name').value='E2E renamed collection'; document.getElementById('collection-save').click()`);
       await waitFor('collection renamed',()=>js(`document.getElementById('memory-collection')?.selectedOptions[0]?.textContent.includes('E2E renamed collection')`));
-      const scope=`[data-saved-kind="moments"][data-saved-id="${moment014.id}"]`;
+      phase = 'open full saved detail';
+      const scope=`[data-saved-kind="moments"][data-saved-id="${targetMoment.id}"]`;
       await clickLabel014(scope,'Open moment');
       await waitFor('full saved moment detail',()=>js(`!!document.getElementById('saved-moment-detail')`));
       const ids=await js(`[...document.querySelectorAll('[data-moment-segment]')].map(r=>Number(r.dataset.momentSegment))`);
-      assert(ids.join()===moment014.segment_ids.join(), 'detail did not show every selected turn');
+      assert(ids.join()===targetMoment.segment_ids.join(), 'detail did not show every selected turn');
+      phase = 'play exact saved range';
       await js(`document.getElementById('saved-moment-play').click()`);
       await waitFor('saved range replay',()=>js(`window.__recallDebug.view()==='transcript' && window.__recallDebug.replay().active`));
       const replayed=await js(`window.__recallDebug.replay().turns.map(t=>t.id)`);
       assert(replayed.join()===ids.join(), `replay widened the saved range: ${replayed} versus ${ids}`);
+      phase = 'reopen saved and delete collection';
       await saved014();
       await js(`(() => { const filter=document.getElementById('memory-collection'); filter.value='${collection}'; filter.dispatchEvent(new Event('change')); })()`);
-      await waitFor('collection controls',()=>js(`!document.getElementById('collection-delete')?.disabled`));
+      await waitFor('collection controls',()=>js(`(() => { const button = document.getElementById('collection-delete'); return !!button && !button.disabled; })()`));
       await js(`document.getElementById('collection-delete').click()`); await clickLabel014('.sheet','Delete collection');
       await waitFor('collection removed',()=>js(`document.getElementById('memory-collection')?.value==='unfiled'`));
-      const record=(await readSaved014('moments')).find(m=>m.id===moment014.id);
+      const record=(await readSaved014('moments')).find(m=>m.id===targetMoment.id);
       assert(record && record.collection_id===null && record.segment_ids.join()===ids.join(), 'collection deletion removed the saved range');
       return {collection,ids,file:await shot('016-unfiled-moments')};
+      } catch (error) { throw new Error(`Collection phase ${phase}: ${error.message}`); }
     });
 
     await step('014-saved-items-edit-and-remove-without-deleting-transcript', async () => {
@@ -5174,6 +5189,7 @@ export function runE2E(deps) {
     const passed = results.filter((r) => r.ok).length;
     const report = {
       when: new Date().toISOString(),
+      ...(process.env.NX_RECALL_E2E_ONLY ? { selection: process.env.NX_RECALL_E2E_ONLY } : {}),
       socket: deps.getUi().conn.socketPath,
       theme: deps.theme?.() ?? null,
       passed,
