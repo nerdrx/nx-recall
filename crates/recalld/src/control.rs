@@ -74,6 +74,7 @@ pub struct Control {
     pub queue: Option<Arc<EventQueue>>,
     pub stats: Arc<Stats>,
     pub analysis: Arc<AnalysisStats>,
+    pub performance: crate::performance::Performance,
     /// The operating point the socket's own identity work reads —
     /// `speakers.split` re-clusters a voicebank and needs the same thresholds
     /// the pipeline was labelling with.
@@ -169,6 +170,7 @@ impl Control {
             queue: None,
             stats: Arc::new(Stats::default()),
             analysis: Arc::new(AnalysisStats::default()),
+            performance: crate::performance::Performance::default(),
             identity: IdentityConfig::default(),
             lang: crate::config::LangConfig::default(),
             models: Mutex::new(Vec::new()),

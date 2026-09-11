@@ -32,7 +32,10 @@ export function runE2E(deps) {
     if (!w || w.isDestroyed()) throw new Error('no window');
     return w;
   };
-  const js = (code) => win().webContents.executeJavaScript(code, true);
+  const js = async (code) => {
+    try { return await win().webContents.executeJavaScript(code, true); }
+    catch (error) { throw new Error(`${error.message} [renderer expression: ${code.slice(0, 240)}]`); }
+  };
 
   /**
    * The captions window (0.8.3), and JavaScript inside it.
@@ -66,6 +69,8 @@ export function runE2E(deps) {
   const shot = (name) => shotOf(win(), name);
 
   async function step(name, fn) {
+    const only = process.env.NX_RECALL_E2E_ONLY;
+    if (only && ![only, 'connect', 'theme-pass'].includes(name)) return;
     const started = Date.now();
     try {
       const detail = await fn();
@@ -4819,6 +4824,30 @@ export function runE2E(deps) {
       return { count, heading, file: await shot('studio-search-keyboard') };
     });
 
+    await step('016-search-groups-safe-matches-audio-and-corrections', async () => {
+      const fixture = await deps.request('mock.search_matches_fixture', {});
+      await js(`document.getElementById('search-all-history').click()`);
+      await waitFor('all history idle', () => js(`document.getElementById('search-results').getAttribute('aria-busy') === 'false'`));
+      await js(`document.getElementById('search-q').value = 'NXmatchCafé'; document.getElementById('search-go').click()`);
+      await waitFor('three fixture matches', () => js(`document.querySelectorAll('#search-results .seg').length === 3 && document.getElementById('search-results').getAttribute('aria-busy') === 'false'`));
+      const state = await js(`(() => ({
+        ids: [...document.querySelectorAll('#search-results .seg')].map(row => Number(row.dataset.hit)),
+        groups: [...document.querySelectorAll('.search-conversation-heading')].map(row => row.dataset.matches),
+        marks: [...document.querySelectorAll('#search-results mark')].map(mark => mark.textContent),
+        safe: !document.querySelector('#search-results img') && document.getElementById('search-results').textContent.includes('<img src=x onerror=alert(1)>'),
+        audio: [...document.querySelectorAll('.search-audio')].map(row => row.textContent)
+      }))()`);
+      assert(JSON.stringify(state.ids) === JSON.stringify([...fixture.ids].reverse()), 'grouping changed keyword ranking');
+      assert(state.groups.length === 1 && state.groups[0] === '3', 'nearby matching turns were not grouped');
+      assert(state.safe && state.marks.length === 3 && state.marks.every(text => text === 'NXmatchCafé'), 'literal markup or Unicode match highlighting is incorrect');
+      assert(state.audio.includes('Text only') && state.audio.includes('Recording linked'), 'retention labels missing');
+      await js(`document.getElementById('search-q').value = 'unsent draft'`);
+      await deps.request('mock.search_matches_correct', { id: fixture.ids[0] });
+      await waitFor('corrected match removed', () => js(`document.querySelectorAll('#search-results .seg').length === 2 && document.getElementById('search-results').getAttribute('aria-busy') === 'false'`));
+      assert(await js(`document.getElementById('search-q').value === 'unsent draft' && !document.getElementById('search-results').textContent.includes('Corrected words')`), 'correction lost the draft or retained a nonmatching row');
+      return { ids: state.ids, file: await shot('search-matches-016') };
+    });
+
     await step('014-all-history-preserves-other-facets-and-context-preserves-results', async () => {
       await js(`(() => { const q = document.getElementById('search-q'); q.value = 'portal yesterday'; document.getElementById('search-ask').click(); })()`);
       await waitFor('explicit date interpretation', () => js(`!!document.querySelector('#ask-pills [data-facet="time"]')`));
@@ -4896,6 +4925,77 @@ export function runE2E(deps) {
       return { ids: record.segment_ids };
     });
 
+    await step('016-history-loads-beyond-one-page-without-moving-the-reader', async () => {
+      const fixture=await deps.request('mock.memory_sources',{action:'history'});
+      await nav014('memory');
+      await js(`document.querySelector('[data-memory-tab="day"]').click()`);
+      await js(`document.getElementById('archive-day').value=${JSON.stringify(fixture.day)}; document.getElementById('archive-day').dispatchEvent(new Event('change'))`);
+      await waitFor('first history page', () => js(`document.querySelectorAll('[data-history-id]').length === 100`));
+      const before = await js(`(() => { const rows=[...document.querySelectorAll('[data-history-id]')]; window.__historyFirst016=rows[0]; const scroller=document.querySelector('.view-body'); scroller.scrollTop=180; return {ids:rows.map(r=>r.dataset.historyId),scroll:scroller.scrollTop}; })()`);
+      await js(`document.getElementById('archive-load-more').click()`);
+      await waitFor('second history page', () => js(`document.querySelectorAll('[data-history-id]').length > 100`));
+      const after = await js(`(() => { const rows=[...document.querySelectorAll('[data-history-id]')]; return {ids:rows.map(r=>r.dataset.historyId),same:rows[0]===window.__historyFirst016,scroll:document.querySelector('.view-body').scrollTop}; })()`);
+      assert(after.same && after.ids.slice(0,100).join()===before.ids.join(), 'loading more rebuilt or reordered previous rows');
+      assert(new Set(after.ids).size===after.ids.length, 'history duplicated a cursor boundary');
+      assert(Math.abs(after.scroll-before.scroll)<=1, `loading more moved the reader: ${before.scroll}→${after.scroll}`);
+      for(let page=0;page<30 && await js(`!document.getElementById('archive-load-more').hidden`);page++) {
+        const count=await js(`document.querySelectorAll('[data-history-id]').length`);
+        await js(`document.getElementById('archive-load-more').click()`);
+        await waitFor('next history page',()=>js(`document.querySelectorAll('[data-history-id]').length>${count} || document.getElementById('archive-load-more').hidden`));
+      }
+      assert(await js(`document.getElementById('archive-load-more').hidden`), 'fixture history did not reach its end');
+      const count=await js(`document.querySelectorAll('[data-history-id]').length`);
+      assert(count===fixture.count && count>200, `history lost turns or remains capped: ${count} of ${fixture.count}`);
+      const ids=await js(`[...document.querySelectorAll('[data-history-id]')].map(row=>Number(row.dataset.historyId))`);
+      assert(ids.join()===fixture.ids.join(),'history reordered tied timestamps or skipped cursor boundaries');
+      return {count,file:await shot('016-continuous-history')};
+    });
+
+    await step('016-collections-and-full-saved-range-remain-source-backed', async () => {
+      const targetMoment = moment014 ?? (await deps.request('mock.memory_sources', { action: 'fixture' })).moment;
+      let phase = 'open saved and create collection';
+      try {
+      await saved014();
+      await js(`document.getElementById('collection-new').click()`);
+      await js(`document.getElementById('collection-name').value='E2E collection'; document.getElementById('collection-save').click()`);
+      await waitFor('new collection selected',()=>js(`document.getElementById('memory-collection')?.selectedOptions[0]?.textContent.includes('E2E collection')`));
+      phase = 'read created collection';
+      const collection=await js(`Number(document.getElementById('memory-collection').value)`);
+      await saved014();
+      phase = 'move moment';
+      await js(`document.querySelector('[data-move-moment="${targetMoment.id}"]').click()`);
+      await waitFor('move picker',()=>js(`!!document.getElementById('moment-collection')`));
+      await js(`document.getElementById('moment-collection').value='${collection}'; document.getElementById('moment-move').click()`);
+      await waitFor('moment moved',async()=> (await readSaved014('moments')).find(m=>m.id===targetMoment.id)?.collection_id===collection);
+      await waitFor('saved collection controls after move',()=>js(`!!document.getElementById('memory-collection') && !!document.querySelector('[data-move-moment="${targetMoment.id}"]') && !document.getElementById('moment-collection')`));
+      await js(`(() => { const filter=document.getElementById('memory-collection'); filter.value='${collection}'; filter.dispatchEvent(new Event('change')); })()`);
+      await waitFor('filtered moment',()=>js(`document.querySelectorAll('[data-saved-kind="moments"]').length===1 && !!document.querySelector('[data-move-moment="${targetMoment.id}"]')`));
+      phase = 'rename collection';
+      await js(`document.getElementById('collection-rename').click(); document.getElementById('collection-name').value='E2E renamed collection'; document.getElementById('collection-save').click()`);
+      await waitFor('collection renamed',()=>js(`document.getElementById('memory-collection')?.selectedOptions[0]?.textContent.includes('E2E renamed collection')`));
+      phase = 'open full saved detail';
+      const scope=`[data-saved-kind="moments"][data-saved-id="${targetMoment.id}"]`;
+      await clickLabel014(scope,'Open moment');
+      await waitFor('full saved moment detail',()=>js(`!!document.getElementById('saved-moment-detail')`));
+      const ids=await js(`[...document.querySelectorAll('[data-moment-segment]')].map(r=>Number(r.dataset.momentSegment))`);
+      assert(ids.join()===targetMoment.segment_ids.join(), 'detail did not show every selected turn');
+      phase = 'play exact saved range';
+      await js(`document.getElementById('saved-moment-play').click()`);
+      await waitFor('saved range replay',()=>js(`window.__recallDebug.view()==='transcript' && window.__recallDebug.replay().active`));
+      const replayed=await js(`window.__recallDebug.replay().turns.map(t=>t.id)`);
+      assert(replayed.join()===ids.join(), `replay widened the saved range: ${replayed} versus ${ids}`);
+      phase = 'reopen saved and delete collection';
+      await saved014();
+      await js(`(() => { const filter=document.getElementById('memory-collection'); filter.value='${collection}'; filter.dispatchEvent(new Event('change')); })()`);
+      await waitFor('collection controls',()=>js(`(() => { const button = document.getElementById('collection-delete'); return !!button && !button.disabled; })()`));
+      await js(`document.getElementById('collection-delete').click()`); await clickLabel014('.sheet','Delete collection');
+      await waitFor('collection removed',()=>js(`document.getElementById('memory-collection')?.value==='unfiled'`));
+      const record=(await readSaved014('moments')).find(m=>m.id===targetMoment.id);
+      assert(record && record.collection_id===null && record.segment_ids.join()===ids.join(), 'collection deletion removed the saved range');
+      return {collection,ids,file:await shot('016-unfiled-moments')};
+      } catch (error) { throw new Error(`Collection phase ${phase}: ${error.message}`); }
+    });
+
     await step('014-saved-items-edit-and-remove-without-deleting-transcript', async () => {
       await saved014();
       const scope = `[data-saved-kind="moments"][data-saved-id="${moment014.id}"]`;
@@ -4914,6 +5014,32 @@ export function runE2E(deps) {
         await clickLabel014(`[data-saved-kind="searches"][data-saved-id="${record.id}"]`, 'Remove'); await clickLabel014('.sheet', 'Remove');
         await waitFor('saved query removed', async () => !(await readSaved014('searches')).some(s => s.id === record.id));
       }
+    });
+
+    await step('016-open-history-and-moment-detail-follow-corrections-and-purges', async () => {
+      const fixture=await deps.request('mock.memory_sources',{action:'fixture'});
+      const id=fixture.ids[0];
+      await nav014('memory'); await js(`document.querySelector('[data-memory-tab="day"]').click()`);
+      await js(`document.getElementById('archive-day').value='2000-01-02'; document.getElementById('archive-day').dispatchEvent(new Event('change'))`);
+      await waitFor('privacy history fixture',()=>js(`!!document.querySelector('[data-history-id="${id}"]')`));
+      await deps.request('mock.memory_sources',{action:'correct',id,text:'Corrected archive privacy fixture'});
+      await waitFor('visible history correction',()=>js(`document.querySelector('[data-history-id="${id}"] [data-source-text]')?.textContent==='Corrected archive privacy fixture'`));
+      await saved014();
+      await clickLabel014(`[data-saved-id="${fixture.moment.id}"][data-saved-kind="moments"]`,'Open moment');
+      await waitFor('privacy detail',()=>js(`document.querySelectorAll('[data-moment-segment]').length===2`));
+      await deps.request('mock.memory_sources',{action:'correct',id,text:'Corrected open detail privacy fixture'});
+      await waitFor('visible detail correction',()=>js(`document.querySelector('[data-moment-segment="${id}"] [data-source-text]')?.textContent==='Corrected open detail privacy fixture'`));
+      await deps.request('mock.memory_sources',{action:'purge',id});
+      await waitFor('purged detail source removed',()=>js(`!document.querySelector('[data-moment-segment="${id}"]') && !document.getElementById('saved-moment-detail').textContent.includes('Corrected open detail privacy fixture')`));
+      await deps.request('mock.memory_sources',{action:'purge',id:fixture.ids[1]});
+      await waitFor('all purged sources disable saved playback',()=>js(`document.querySelectorAll('[data-moment-segment]').length===0 && document.getElementById('saved-moment-play').disabled`));
+      assert(await js(`!document.querySelector('[data-saved-id="${fixture.moment.id}"][data-saved-kind="moments"]')`),'all-purged saved card stayed visible');
+      await clickLabel014('.sheet','Close');
+      await nav014('memory'); await js(`document.querySelector('[data-memory-tab="day"]').click()`);
+      await js(`document.getElementById('archive-day').value='2000-01-02'; document.getElementById('archive-day').dispatchEvent(new Event('change'))`);
+      await waitFor('purged history day empty',()=>js(`document.getElementById('archive-load-more').hidden`));
+      assert(await js(`document.querySelectorAll('[data-history-id]').length===0`),'purged words reappeared from history');
+      return {ids:fixture.ids};
     });
 
     await step('014-sheet-keyboard-traps-and-restores-focus', async () => {
@@ -4941,7 +5067,7 @@ export function runE2E(deps) {
             focused: document.activeElement.dataset.section, visible: originalPanels.filter(p => !p.hidden).map(p => p.dataset.section),
             tabstops: tabs.filter(t => t.tabIndex === 0).length, count: tabs.length };
         })()`);
-        assert(info.count === 4 && info.tabstops === 1, `${view} category tab stops invalid: ${JSON.stringify(info)}`);
+        assert(info.count === (view === 'settings' ? 5 : 4) && info.tabstops === 1, `${view} category tab stops invalid: ${JSON.stringify(info)}`);
         assert(info.selected === last && info.focused === last && info.visible.join() === last, `${view} End key did not select/focus its last category`);
         await js(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true })); document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))`);
         assert(await js(`document.activeElement.dataset.section === ${JSON.stringify(next)}`), `${view} arrow key did not move categories`);
@@ -4987,7 +5113,7 @@ export function runE2E(deps) {
         if (wasCollapsed) await js(`document.getElementById('rail-collapse').click()`);
         for (const width of [760, 1024]) {
           win().setSize(width, 768); await sleep(250);
-          for (const [view, section] of [['transcript', null], ['memory', null], ['settings', 'appearance'], ['settings', 'processing'], ['settings', 'language'], ['settings', 'quality'], ['sources', 'capture'], ['sources', 'captions'], ['sources', 'connections'], ['sources', 'storage']]) {
+          for (const [view, section] of [['transcript', null], ['memory', null], ['settings', 'appearance'], ['settings', 'processing'], ['settings', 'language'], ['settings', 'quality'], ['settings', 'performance'], ['sources', 'capture'], ['sources', 'captions'], ['sources', 'connections'], ['sources', 'storage']]) {
             await js(`window.__recallDebug.go(${JSON.stringify(view)}, ${JSON.stringify(section ? { section } : null)})`);
             await sleep(160);
             const size = await js(`(() => {
@@ -5026,6 +5152,17 @@ export function runE2E(deps) {
       }
     });
 
+    await step('016-performance-shows-measurements-and-honest-empty-state', async () => {
+      await js(`window.__recallDebug.go('settings', {section:'performance'})`);
+      await waitFor('performance measurements', () => js(`document.getElementById('settings-performance')?.textContent.includes('128 MiB')`));
+      const text = await js(`document.getElementById('settings-performance').textContent`);
+      assert(text.includes('No measurements yet'), 'empty capture metrics were presented as zero latency');
+      assert(text.includes('8 ms') && text.includes('12 ms'), 'search percentiles missing');
+      assert(text.includes('Giving recording priority') && text.includes('4 pending'), 'repair state missing');
+      assert(text.includes('0 dropped buffers'), 'drop accounting missing');
+      return {file: await shot('016-performance')};
+    });
+
     // 15 — the app lives in the tray: closing the window hides it, does not
     // quit, and does not take the pause switch away with it (DESIGN §8).
     await step('tray-works-with-window-closed', async () => {
@@ -5052,6 +5189,7 @@ export function runE2E(deps) {
     const passed = results.filter((r) => r.ok).length;
     const report = {
       when: new Date().toISOString(),
+      ...(process.env.NX_RECALL_E2E_ONLY ? { selection: process.env.NX_RECALL_E2E_ONLY } : {}),
       socket: deps.getUi().conn.socketPath,
       theme: deps.theme?.() ?? null,
       passed,

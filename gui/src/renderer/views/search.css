@@ -76,3 +76,11 @@
   .search014 { overflow-y: auto; }
   .search014 .search-workspace { flex: none; height: 320px; }
 }
+
+/* Group separators explain nearby ranked matches without collapsing turns. */
+.search014 .search-conversation-heading { display: grid; gap: 4px; padding: 14px 12px 8px; border-top: 1px solid var(--clear-line-strong); color: var(--clear-ink); font-size: 11px; font-weight: 600; }
+.search014 .search-conversation-heading:first-child { border-top: none; }
+.search014 .search-conversation-heading .sub { font-size: 10px; font-weight: 400; }
+.search014 .search-match { color: inherit; background: var(--violet-soft); text-decoration: underline; text-decoration-color: var(--violet); text-underline-offset: 3px; border-radius: 2px; font-weight: 600; }
+.search014 .search-audio { font-size: 10px; color: var(--clear-muted); }
+.search014 .search-audio.unavailable { font-style: italic; }

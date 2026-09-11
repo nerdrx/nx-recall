@@ -89,6 +89,7 @@ export function mount(root, ctx, arg) {
     h('div', { class: 'search-results-head' }, resultCount, resultStatus), results);
   const context = h('aside', { class: 'card search-context', id: 'search-context', hidden: true, 'aria-label': 'Conversation context' });
   let contextGeneration = 0;
+  let contextIds = [];
   let disposed = false;
   let pending = false;
   let focusedResult = 0;
@@ -281,6 +282,7 @@ export function mount(root, ctx, arg) {
 
   function hideContext() {
     context.hidden = true; contextGeneration++;
+    contextIds = []; clear(context);
     contextEmpty.hidden = false;
     workspace.classList.remove('context-open');
     for (const row of results.querySelectorAll('.seg')) { row.classList.remove('context-selected'); row.removeAttribute('aria-current'); }
@@ -883,7 +885,24 @@ export function mount(root, ctx, arg) {
       );
       return;
     }
-    for (const [index, seg] of lastHits.entries()) results.append(hitRow(seg, modeId, index));
+    // Group only neighboring ranks. Moving a lower-ranked hit beside its
+    // conversation would silently change the search engine's ordering.
+    for (const group of groupSearchHits(lastHits)) {
+      const headingId = `search-conversation-${group.startRank}`;
+      if (group.hits.length > 1) results.append(h('div', {
+        class: 'search-conversation-heading', id: headingId, role: 'heading', 'aria-level': '3',
+        dataset: { conversationGroup: String(group.startRank), matches: String(group.hits.length) },
+      }, h('span', { text: `${fmtDayLabel(group.minMs)} · ${fmtClock(group.minMs).slice(0, 5)}–${fmtClock(group.maxMs).slice(0, 5)}` }),
+      h('span', { class: 'sub', text: `${group.hits.length} matching turns in this conversation` })));
+      for (const [offset, seg] of group.hits.entries()) {
+        const row = hitRow(seg, modeId, group.startRank - 1 + offset);
+        if (group.hits.length > 1) {
+          row.setAttribute('aria-describedby', headingId);
+          row.dataset.conversationGroup = String(group.startRank);
+        }
+        results.append(row);
+      }
+    }
   }
 
   function hitRow(seg, modeId = facetState.mode, index = 0) {
@@ -892,6 +911,7 @@ export function mount(root, ctx, arg) {
     // anywhere else — `look` prefers the store where it has the voice and falls
     // back to what the query answered where it does not.
     const { color, hl, icon } = look(seg);
+    const audio = searchAudioState(seg);
     const row = h('article', {
       class: `seg${isUncertain(seg) ? ' uncertain' : ''}${isShaky(seg) ? ' shaky' : ''}`,
       dataset: { hit: String(seg.id) },
@@ -920,7 +940,7 @@ export function mount(root, ctx, arg) {
       // from the row it takes you to is a result you have to re-read on
       // arrival — and the highlighting still lands on the ORIGINAL, because
       // the words you searched for are the words that were said.
-      translationCell(seg, (t) => highlight(t, facetState.q)),
+      translationCell(seg, (t) => highlight(t, keywordHighlightQuery(seg, modeId, facetState.asked?.query ?? facetState.q))),
       h(
         'span',
         { class: 'meta' },
@@ -935,6 +955,7 @@ export function mount(root, ctx, arg) {
         // and a badge on all of them says nothing.
         modeId === 'both' ? viaBadge(seg.via) : null,
         h('span', { class: 'search-source', text: seg.source ?? 'unknown' }),
+        h('span', { class: `search-audio ${audio.kind}`, text: audio.label, title: audio.description }),
         h('button', { class: 'btn small search-read', 'aria-controls': 'search-context',
           onclick: (e) => { e.stopPropagation(); void openContext(seg, row); } }, 'Read context'),
         // A hit is one line out of a conversation, and the question behind
@@ -949,7 +970,7 @@ export function mount(root, ctx, arg) {
                 class: 'btn small replay-start hit-replay',
                 tabindex: '0',
                 dataset: { replay: String(seg.thread), from: String(seg.id) },
-                title: 'Play this conversation back from this line',
+                title: 'Replay retained audio in this conversation from this line; unavailable turns are skipped',
                 'aria-label': 'Replay this conversation from this line',
                 onclick: (e) => {
                   e.stopPropagation();
@@ -994,6 +1015,7 @@ export function mount(root, ctx, arg) {
       if (row === trigger) row.setAttribute('aria-current', 'true'); else row.removeAttribute('aria-current');
     }
     const my = ++contextGeneration;
+    contextIds = [seg.id];
     context.hidden = false;
     clear(context);
     const close = () => { hideContext(); trigger.focus({ preventScroll: true }); };
@@ -1001,7 +1023,7 @@ export function mount(root, ctx, arg) {
     const closeButton = h('button', { class: 'btn small', 'aria-label': 'Close conversation context', onclick: close }, 'Close');
     const content = h('div', { class: 'search-context-turns', 'aria-live': 'polite', 'aria-busy': 'true' }, 'Loading conversation…');
     context.append(h('div', { class: 'search-context-head' }, h('h2', { text: 'Around this moment' }), closeButton),
-      h('p', { class: 'sub', text: fmtDayLabel(seg.t_ms) }),
+      h('p', { class: 'sub', text: `${fmtDayLabel(seg.t_ms)} · ${searchAudioState(seg).label}`, title: searchAudioState(seg).description }),
       h('div', { class: 'actions' },
         h('button', { class: 'btn', onclick: () => ctx.jumpToSegment(seg) }, 'Open transcript'),
         h('button', { class: 'btn', onclick: () => saveMomentSheet([seg.id]) }, 'Save moment'),
@@ -1014,6 +1036,7 @@ export function mount(root, ctx, arg) {
       clear(content);
       const turns = (res.segments ?? []).sort((a, b) => a.t_ms - b.t_ms || a.id - b.id);
       if (!turns.some((turn) => turn.id === seg.id)) throw new Error('This moment is no longer available.');
+      contextIds = turns.map(turn => turn.id);
       turns.sort((a, b) => a.t_ms - b.t_ms || a.id - b.id);
       for (const turn of turns) content.append(h('article', { class: `search-context-turn${turn.id === seg.id ? ' selected' : ''}` },
         h('div', { class: 'sub', text: `${fmtClock(turn.t_ms)} · ${segmentSpeakerLabel(turn)}` }), translationCell(turn)));
@@ -1027,24 +1050,11 @@ export function mount(root, ctx, arg) {
     }
   }
 
-  // Marks the query inside the hit without ever building HTML from daemon text.
-  function highlight(text, q) {
-    const needle = (q ?? '').trim().toLowerCase();
-    if (!needle) return [text];
-    const out = [];
-    let i = 0;
-    const hay = text.toLowerCase();
-    for (;;) {
-      const at = hay.indexOf(needle, i);
-      if (at < 0) break;
-      if (at > i) out.push(text.slice(i, at));
-      // On the dark ground the mark was bold-and-brighter; on a light one that
-      // vanishes, so it carries the accent wash a chip uses (styles.css .hl).
-      out.push(h('b', { class: 'hl', text: text.slice(at, at + needle.length) }));
-      i = at + needle.length;
-    }
-    out.push(text.slice(i));
-    return out;
+  // Plain text and explicit mark nodes only. Snippets from the daemon are
+  // never HTML, and query punctuation never becomes a regular expression.
+  function highlight(text, query) {
+    return keywordMatchParts(text, query).map(part => part.matched
+      ? h('mark', { class: 'hl search-match', text: part.text }) : part.text);
   }
 
   // Re-run mount() in place: the mode control's availability is baked into
@@ -1073,6 +1083,16 @@ export function mount(root, ctx, arg) {
   return {
     destroy() { disposed = true; contextGeneration++; ticket(); },
     update(change) {
+      if (searchChangeTouches(change, contextIds)) hideContext();
+      if (!pending && searchChangeTouches(change, lastHits.map(hit => hit.id))) {
+        // Refresh the completed search, preserving any unsent input draft.
+        const inputs = [qInput, speakerSel, sourceSel, fromInput, toInput];
+        const draft = inputs.map(input => input.value);
+        const values = [facetState.q, facetState.speaker, facetState.source, facetState.from, facetState.to];
+        inputs.forEach((input, index) => { input.value = values[index] ?? ''; });
+        try { void (facetState.asked ? rerunAsked() : run()); }
+        finally { inputs.forEach((input, index) => { input.value = draft[index]; }); }
+      }
       if (change?.relabel || change?.merged) fillFacets();
       if (change?.sources) fillFacets();
       // The model can arrive while the app is open — a fetch and a daemon
@@ -1153,4 +1173,61 @@ export function searchCountLabel(total, shown) {
   if (!count) return 'No matches';
   if (count > shown) return `${shown} of ${count.toLocaleString()} matches`;
   return `${count.toLocaleString()} ${count === 1 ? 'match' : 'matches'}`;
+}
+
+// FTS treats the query as literal words (including words like AND), not raw
+// query syntax. Match original token ranges, so case folding or decomposed
+// accents cannot shift highlight offsets or drop any of the captured text.
+const SEARCH_WORDS = /[\p{L}\p{N}\p{M}]+/gu;
+const foldSearchWord = word => word.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+export function keywordMatchParts(text, query) {
+  const original = String(text ?? '');
+  const terms = new Set((String(query ?? '').match(SEARCH_WORDS) ?? []).map(foldSearchWord));
+  if (!terms.size) return [{ text: original, matched: false }];
+  const parts = [];
+  let end = 0;
+  for (const match of original.matchAll(SEARCH_WORDS)) {
+    if (!terms.has(foldSearchWord(match[0]))) continue;
+    if (match.index > end) parts.push({ text: original.slice(end, match.index), matched: false });
+    parts.push({ text: match[0], matched: true });
+    end = match.index + match[0].length;
+  }
+  if (end < original.length || !parts.length) parts.push({ text: original.slice(end), matched: false });
+  return parts;
+}
+export function keywordHighlightQuery(segment, mode, query) {
+  return mode === 'keyword' || (mode === 'both' && ['keyword', 'both'].includes(segment.via)) ? query : '';
+}
+export function searchAudioState(segment) {
+  if (segment?.has_audio === false) return { kind: 'unavailable', label: 'Text only',
+    description: 'No retained recording is linked to this turn. Its words are still available.' };
+  if (segment?.has_audio === true) return { kind: 'linked', label: 'Recording linked',
+    description: 'A recording reference is stored. Playback checks whether the file is still available.' };
+  return { kind: 'unknown', label: 'Audio not checked',
+    description: 'This result does not report audio retention. Playback checks availability.' };
+}
+export function groupSearchHits(hits, { maxGapMs = 5 * 60 * 1000 } = {}) {
+  const span = Number.isFinite(maxGapMs) && maxGapMs >= 0 ? maxGapMs : 5 * 60 * 1000;
+  const groups = [];
+  const identity = row => row.thread != null ? `thread:${row.thread}`
+    : row.session != null && row.source ? `session:${JSON.stringify([row.session, row.source])}` : null;
+  for (const [index, hit] of hits.entries()) {
+    const key = identity(hit);
+    const at = Number.isFinite(hit.t_ms) ? hit.t_ms : null;
+    const previous = groups.at(-1);
+    // Bound the entire group, not just adjacent gaps: a chain of five-minute
+    // hops must not turn hours of separate moments into one conversation.
+    if (key && at != null && previous?.identity === key && previous.minMs != null
+      && Math.max(previous.maxMs, at) - Math.min(previous.minMs, at) <= span) {
+      previous.hits.push(hit);
+      previous.minMs = Math.min(previous.minMs, at);
+      previous.maxMs = Math.max(previous.maxMs, at);
+    } else groups.push({ identity: key, startRank: index + 1, minMs: at, maxMs: at, hits: [hit] });
+  }
+  return groups;
+}
+
+export function searchChangeTouches(change, ids) {
+  const changed = new Set([...(change?.purged ?? []), ...(change?.updated ?? []).map(row => row.id)]);
+  return ids.some(id => changed.has(id));
 }

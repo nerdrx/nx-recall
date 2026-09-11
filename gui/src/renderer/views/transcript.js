@@ -978,11 +978,11 @@ export function mount(root, ctx) {
    * are assumed to be resident, because every route into this merges them
    * first (app.js `showThreadInTranscript`).
    */
-  async function startReplay(threadId, { from = null } = {}) {
+  async function startReplay(threadId, { from = null, segments = null } = {}) {
     leaveTheTail();
     highlightThread = Number(threadId);
     setFilter(null);
-    const res = await replay.start(Number(threadId), { from });
+    const res = await replay.start(Number(threadId), { from, ...(segments ? { segments } : {}) });
     if (!res.ok) {
       toast(replay.startError(res.error), 'error');
       return null;

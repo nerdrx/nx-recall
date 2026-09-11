@@ -2072,3 +2072,10 @@ body[data-rail="collapsed"] :is(.rail-item,.quick-switch,.pause-btn,.rail-collap
 
 /* Strong control edges are distinct from quiet decorative separators. */
 input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), select, textarea, .toggle { border-color: var(--control-line); }
+
+/* Process-local measurements, using the same Quiet Studio cards. */
+.performance-grid { margin-top:12px; display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr)); gap:16px; }
+.performance-value { font-size:28px; font-variant-numeric:tabular-nums; margin:12px 0 6px; color:var(--clear-ink); }
+.performance-state { font-size:20px; }
+
+.performance-grid > .card { margin:0; }

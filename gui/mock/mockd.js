@@ -2929,8 +2929,8 @@ export function startMock({
 
   // --- methods ------------------------------------------------------------
 
-  const savedSearches = new Map(), savedMoments = new Map();
-  let nextSavedSearch = 1, nextSavedMoment = 1;
+  const savedSearches = new Map(), savedMoments = new Map(), savedCollections = new Map();
+  let nextSavedSearch = 1, nextSavedMoment = 1, nextSavedCollection = 1;
   function savedMomentPayload(row) {
     const segments = row.segment_ids.map(id=>state.segments.find(s=>s.id===id)).filter(Boolean);
     if(!segments.length) return null;
@@ -4030,6 +4030,67 @@ export function startMock({
       const index = same.findIndex(s => s.id === anchor.id);
       return { anchor: { ...anchor }, segments: same.slice(Math.max(0,index-before),index+after+1).map(s => ({ ...s })) };
     },
+    'mock.memory_sources'(params) {
+      if(params?.action==='history') {
+        const template=state.segments[0], first=Math.max(0,...state.segments.map(row=>row.id))+100;
+        const base=Date.UTC(2000,0,3,12);
+        const rows=Array.from({length:305},(_,offset)=>({...template,id:first+offset,t_ms:base+Math.floor(offset/3)*1000,t_ns:String((base+Math.floor(offset/3)*1000)*1e6),dur_ms:500,thread:989899,session:989899,text:`History cursor fixture ${offset}`,has_audio:false}));
+        state.segments.push(...rows); return {day:'2000-01-03',count:rows.length,ids:rows.map(row=>row.id)};
+      }
+      if(params?.action==='fixture') {
+        const template=state.segments[0]; const id=Math.max(0,...state.segments.map(row=>row.id))+100;
+        const base=Date.UTC(2000,0,2,12);
+        const rows=[0,1].map(offset=>({...template,id:id+offset,t_ms:base+offset*1000,t_ns:String((base+offset*1000)*1e6),dur_ms:500,thread:989898,session:989898,text:`Memory privacy fixture ${offset}`,has_audio:false}));
+        state.segments.push(...rows);
+        const moment={id:nextSavedMoment++,title:'Privacy fixture',note:'Personal note',collection_id:null,created_ms:Date.now(),segment_ids:rows.map(row=>row.id)};
+        savedMoments.set(moment.id,moment);return {moment:savedMomentPayload(moment),ids:rows.map(row=>row.id)};
+      }
+      const id=Number(params?.id),row=state.segments.find(row=>row.id===id);
+      if(!row) throw err('not_found','fixture source not found');
+      if(params.action==='correct') {row.text=String(params.text);emit('segments','segment',{...row});return {id};}
+      if(params.action==='purge') {state.segments=state.segments.filter(row=>row.id!==id);emit('segments','purge',{ids:[id]});return {id};}
+      throw err('params','unknown fixture action');
+    },
+    'history.page'(params) {
+      const from = Date.parse(params?.from), to = Date.parse(params?.to), limit = Number(params?.limit ?? 100);
+      if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to || !Number.isInteger(limit) || limit < 1 || limit > 200) throw err('params','invalid history page');
+      let cursor = null;
+      if (params.cursor) { try { cursor = JSON.parse(params.cursor); } catch { throw err('params','invalid history cursor'); }
+        if (cursor.from !== params.from || cursor.to !== params.to || !Number.isFinite(cursor.time) || !Number.isInteger(cursor.id) || !Number.isInteger(cursor.max)) throw err('params','invalid history cursor'); }
+      const max = cursor?.max ?? Math.max(0,...state.segments.map(row=>row.id));
+      const rows = state.segments.filter(row => row.t_ms >= from && row.t_ms < to && row.id <= max && (!cursor || row.t_ms > cursor.time || (row.t_ms === cursor.time && row.id > cursor.id))).sort((a,b)=>a.t_ms-b.t_ms || a.id-b.id);
+      const page = rows.slice(0,limit), last = page.at(-1);
+      return { segments: page.map(row=>({...row})), next_cursor: rows.length>limit ? JSON.stringify({from:params.from,to:params.to,time:last.t_ms,id:last.id,max}) : null };
+    },
+    'saved.collections.list'() {
+      return {collections:[...savedCollections.values()].map(c=>({...c,count:[...savedMoments.values()].filter(m=>m.collection_id===c.id&&savedMomentPayload(m)).length})).sort((a,b)=>a.name.localeCompare(b.name)||a.id-b.id)};
+    },
+    'saved.collections.save'(params) {
+      const name=String(params?.name??'').trim();
+      if(!name||name.length>120) throw err('params','collection name must contain 1 to 120 characters');
+      const id=params.id==null?nextSavedCollection++:Number(params.id);
+      if(params.id!=null&&!savedCollections.has(id)) throw err('not_found','collection not found');
+      if([...savedCollections.values()].some(c=>c.id!==id&&c.name.toLowerCase()===name.toLowerCase())) throw err('params','a collection with this name already exists');
+      const collection={id,name,created_ms:savedCollections.get(id)?.created_ms??Date.now()}; savedCollections.set(id,collection);
+      return {collection:{...collection,count:[...savedMoments.values()].filter(m=>m.collection_id===id&&savedMomentPayload(m)).length}};
+    },
+    'saved.collections.delete'(params) {
+      const id=Number(params?.id),removed=savedCollections.delete(id);
+      for(const row of savedMoments.values()) if(row.collection_id===id) row.collection_id=null;
+      return {removed};
+    },
+    'saved.moments.get'(params) {
+      const row=savedMoments.get(Number(params?.id)), moment=row?savedMomentPayload(row):null;
+      if(!moment) throw err('not_found','saved moment has no retained source turns');
+      return {moment};
+    },
+    'saved.moments.move'(params) {
+      const row=savedMoments.get(Number(params?.id));
+      if(!row) throw err('not_found','saved moment not found');
+      const target=params.collection_id==null?null:Number(params.collection_id);
+      if(target!=null&&!savedCollections.has(target)) throw err('not_found','collection not found');
+      row.collection_id=target; return {moment:savedMomentPayload(row)};
+    },
     'saved.searches.list'(params) {
       const rows = [...savedSearches.values()].sort((a,b) => b.created_ms-a.created_ms || b.id-a.id);
       return { total: rows.length, searches: structuredClone(rows.slice(Number(params?.offset ?? 0), Number(params?.offset ?? 0)+Math.min(200,Number(params?.limit ?? 100)))) };
@@ -4045,7 +4106,7 @@ export function startMock({
     },
     'saved.searches.delete'(params) { return { removed: savedSearches.delete(Number(params?.id)) }; },
     'saved.moments.list'(params) {
-      const rows = [...savedMoments.values()].map(savedMomentPayload).filter(Boolean).sort((a,b) => b.created_ms-a.created_ms || b.id-a.id);
+      const rows = [...savedMoments.values()].map(savedMomentPayload).filter(Boolean).filter(row=>!Object.hasOwn(params??{},'collection_id')||row.collection_id===(params.collection_id==null?null:Number(params.collection_id))).sort((a,b) => b.created_ms-a.created_ms || b.id-a.id);
       const offset=Number(params?.offset ?? 0); return { total:rows.length,moments:rows.slice(offset,offset+Math.min(200,Number(params?.limit ?? 100))) };
     },
     'saved.moments.save'(params) {
@@ -4062,7 +4123,9 @@ export function startMock({
       if(title.length>180||note.length>4096) throw err('params','title or note too long');
       if(params.id!=null&&!savedMoments.has(Number(params.id))) throw err('not_found','moment not found');
       const id=params.id==null?nextSavedMoment++:Number(params.id);
-      const row={id,title,note,segment_ids:rows.map(r=>r.id),created_ms:savedMoments.get(id)?.created_ms??Date.now()};
+      const collection_id=Object.hasOwn(params,'collection_id')?(params.collection_id==null?null:Number(params.collection_id)):(savedMoments.get(id)?.collection_id??null);
+      if(collection_id!=null&&!savedCollections.has(collection_id)) throw err('not_found','collection not found');
+      const row={id,title,note,collection_id,segment_ids:rows.map(r=>r.id),created_ms:savedMoments.get(id)?.created_ms??Date.now()};
       savedMoments.set(id,row); return {moment:savedMomentPayload(row)};
     },
     'saved.moments.delete'(params) { return {removed:savedMoments.delete(Number(params?.id))}; },
@@ -4253,6 +4316,26 @@ export function startMock({
 
     // Fault injection is available only to the main-process test driver;
     // production renderer IPC does not expose mock methods.
+    'mock.search_matches_fixture'() {
+      const base = state.segments[0];
+      const ids = [];
+      for (let index = 0; index < 3; index++) {
+        const row = { ...base, id: state.nextSegId++, thread: 991016,
+          t_ms: base.t_ms + index * 1000, text: 'NXmatchCafé <img src=x onerror=alert(1)>',
+          has_audio: index === 0, translation: null };
+        state.segments.push(row); ids.push(row.id);
+      }
+      state.segments.sort((a,b) => a.t_ms-b.t_ms || a.id-b.id);
+      return { ids };
+    },
+    'mock.search_matches_correct'(params) {
+      const row = state.segments.find(row => row.id === params.id);
+      if (!row) throw err('params', 'Fixture row missing');
+      row.text = 'Corrected words no longer match';
+      emit('segments', 'segment', { ...row });
+      return { corrected: row.id };
+    },
+
     'mock.search_fail_once'() {
       state.searchFailNext = true;
       return { armed: true };
@@ -4536,6 +4619,14 @@ export function startMock({
       return { paused: false };
     },
 
+    'performance.get': () => ({
+      scope: 'current_process',
+      capture: {samples:0,window:256,latest_ms:null,p50_ms:null,p95_ms:null,max_ms:null},
+      search: {samples:3,window:256,latest_ms:8,p50_ms:8,p95_ms:12,max_ms:12},
+      resident_bytes: 134217728,
+      queue: {seconds:0.25,capacity_seconds:30,dropped_chunks:0,dropped_seconds:0},
+      repair: {state:'waiting_capture',pending:4,completed:12,failed_attempts:0},
+    }),
     status: () => statusPayload(),
   };
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.16.0 — Keep the whole conversation
+
+- Automatically repair the semantic search index in the background, yielding
+  to capture and active inference. Durable pending work resumes after restart;
+  edits and deletions cannot be overwritten by stale model results.
+- Browse a full day of history with stable, bounded pages beyond the previous
+  200-turn preview. Later inserts cannot shift an in-progress history walk.
+- Organize saved moments into collections, inspect their complete saved range,
+  and replay that range directly through the shared player. Collections and
+  bookmarks remain references; source deletion and retention still apply.
+- Highlight literal search matches safely, group nearby ranked hits by
+  conversation, and distinguish linked recordings from text-only results.
+- Add Settings → Performance with bounded rolling transcript/search timings,
+  daemon resident memory, recording queue and dropped-audio counters, and
+  background index repair state. Missing samples remain explicitly unknown.
+- Add schema v23 for saved collections and indexed chronological history.
+
 ## 0.15.0 — Quiet Studio
 
 - Redesigned the desktop around flat reading surfaces, sharper typography, and

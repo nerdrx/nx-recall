@@ -233,6 +233,7 @@ export function mount(root, ctx, options = {}) {
       button.tabIndex = on ? 0 : -1;
     }
     if (tab === 'day' || tab === 'saved') archive?.show(tab);
+    else archive?.hide();
   }
   if (settings) {
     const group = (key, title, intro, ...cards) => h('section', {
@@ -2122,6 +2123,7 @@ export function mount(root, ctx, options = {}) {
 
   return {
     update(change) {
+      archive?.update(change);
       // A note arriving live goes to the top of the list — it is the newest
       // thing you said to yourself, and it is the reason you are looking.
       if (change?.note) {

@@ -50,13 +50,17 @@
 //!
 //! Passage vectors are computed on the inference thread, the same deprioritised
 //! worker the ASR and identity legs run on, right after the transcript exists.
+//! An idle-priority repair worker fills older/corrected text from the durable
+//! queue, sharing the same model and yielding to live analysis and queries.
 //! Never on the capture thread. The query vector is computed on the connection
 //! thread that asked for it, because it is one 1.7 ms forward pass and making
 //! it asynchronous would cost more than it saves.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ort::session::Session;
@@ -563,17 +567,30 @@ pub fn coverage(store: &Store, model_id: &str) -> Result<Coverage> {
 /// transcripts. Both lists survive restart and successful writes dequeue their
 /// row in the same transaction as the vector.
 pub fn pending_segments(store: &Store, model_id: &str, limit: usize) -> Result<Vec<(i64, String)>> {
+    pending_after(store, model_id, limit, 0)
+}
+
+fn pending_after(
+    store: &Store,
+    model_id: &str,
+    limit: usize,
+    after: i64,
+) -> Result<Vec<(i64, String)>> {
     let mut stmt = store.conn().prepare(
         "SELECT g.id,g.text FROM segments g JOIN (
-            SELECT segment_id FROM semantic_dirty
-            UNION SELECT v.segment_id FROM semantic_models m
-                CROSS JOIN segment_vectors v ON v.model_id=m.model_id
-                WHERE m.model_id<>?1 AND m.embedded>0
+            SELECT segment_id FROM (
+                SELECT segment_id FROM semantic_dirty WHERE segment_id > ?3
+                ORDER BY segment_id LIMIT ?2)
+            UNION SELECT segment_id FROM (
+                SELECT segment_id FROM segment_vectors
+                WHERE segment_id > ?3 AND model_id<>?1
+                  AND EXISTS(SELECT 1 FROM semantic_models WHERE model_id<>?1 AND embedded>0)
+                ORDER BY segment_id LIMIT ?2)
          ) pending ON pending.segment_id=g.id
          WHERE g.deleted_at IS NULL AND g.text IS NOT NULL AND trim(g.text,char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> ''
          ORDER BY g.id LIMIT ?2")?;
     Ok(stmt
-        .query_map(params![model_id, limit as i64], |r| {
+        .query_map(params![model_id, limit as i64, after], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?
         .collect::<rusqlite::Result<_>>()?)
@@ -1141,8 +1158,285 @@ impl Fused {
 // the leg, wired to a store
 // ---------------------------------------------------------------------------
 
-/// The whole semantic leg, as the daemon holds it: one model, one resident
-/// matrix, one lock.
+// Archive repair shares the model, but never waits in line ahead of live work.
+struct Foreground<'a>(&'a AtomicUsize);
+impl<'a> Foreground<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+impl Drop for Foreground<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct RepairStatus {
+    state: &'static str,
+    pending: Option<i64>,
+    sampled_at: Option<Instant>,
+    completed: u64,
+    failed_attempts: u64,
+    discarded: u64,
+    retry_at: Option<Instant>,
+}
+impl Default for RepairStatus {
+    fn default() -> Self {
+        Self {
+            state: "not_started",
+            pending: None,
+            sampled_at: None,
+            completed: 0,
+            failed_attempts: 0,
+            discarded: 0,
+            retry_at: None,
+        }
+    }
+}
+
+/// Interruptible shutdown, including an idle worker's polling wait. An already
+/// running model call completes, but its result is not written after stop.
+#[derive(Default)]
+pub struct RepairStop {
+    stopped: AtomicBool,
+    lock: Mutex<()>,
+    wake: Condvar,
+}
+impl RepairStop {
+    pub fn stop(&self) {
+        let _lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.stopped.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+    fn wait(&self, duration: Duration) {
+        let lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = self
+            .wake
+            .wait_timeout_while(lock, duration, |_| !self.stopped.load(Ordering::SeqCst));
+    }
+}
+
+struct Retry {
+    hash: i64,
+    attempts: u32,
+    due: Instant,
+}
+#[derive(Default)]
+struct RepairSchedule {
+    cursor: i64,
+    retries: HashMap<i64, Retry>,
+}
+
+impl RepairSchedule {
+    /// One bounded database batch and at most one forward pass. The closure
+    /// makes scheduling/races testable without downloading a model. None means
+    /// foreground inference won the model lock; the row stays durable/pending.
+    fn step(
+        &mut self,
+        store: &Mutex<Store>,
+        model: &str,
+        status: &Mutex<RepairStatus>,
+        now: Instant,
+        gate: impl Fn() -> Option<&'static str>,
+        embed: impl FnOnce(&str) -> Result<Option<Embedding>>,
+    ) -> Result<Duration> {
+        if let Some(reason) = gate() {
+            let mut status = status.lock().unwrap_or_else(|p| p.into_inner());
+            status.state = reason;
+            status.retry_at = None;
+            return Ok(Duration::from_millis(100));
+        }
+        let rows = {
+            let store = match store.try_lock() {
+                Ok(store) => store,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    status.lock().unwrap_or_else(|p| p.into_inner()).state = "waiting_store";
+                    return Ok(Duration::from_millis(100));
+                }
+            };
+            let pending = coverage(&store, model)?.pending();
+            let mut status = status.lock().unwrap_or_else(|p| p.into_inner());
+            status.pending = Some(pending);
+            status.sampled_at = Some(Instant::now());
+            status.retry_at = None;
+            if let Some(reason) = gate() {
+                status.state = reason;
+                return Ok(Duration::from_millis(100));
+            }
+            if pending == 0 {
+                self.cursor = 0;
+                self.retries.clear();
+                status.state = "idle";
+                return Ok(Duration::from_secs(1));
+            }
+            let mut rows = pending_after(&store, model, 32, self.cursor)?;
+            if rows.is_empty() && self.cursor != 0 {
+                self.cursor = 0;
+                rows = pending_after(&store, model, 32, 0)?;
+            }
+            rows
+        };
+        let mut next_retry = None;
+        let mut candidate = None;
+        for (id, text) in rows {
+            self.cursor = id;
+            if let Some(retry) = self.retries.get(&id) {
+                if retry.hash == text_hash(&text) && retry.due > now {
+                    next_retry =
+                        Some(next_retry.map_or(retry.due, |at: Instant| at.min(retry.due)));
+                    continue;
+                }
+                if retry.hash != text_hash(&text) {
+                    self.retries.remove(&id);
+                }
+            }
+            candidate = Some((id, text));
+            break;
+        }
+        let Some((id, text)) = candidate else {
+            let mut status = status.lock().unwrap_or_else(|p| p.into_inner());
+            status.state = "backoff";
+            status.retry_at = next_retry;
+            // Keep scanning larger queues fairly; no unbounded retry map or
+            // sleep that would prevent newly corrected text being discovered.
+            return Ok(Duration::from_millis(250));
+        };
+        if let Some(reason) = gate() {
+            status.lock().unwrap_or_else(|p| p.into_inner()).state = reason;
+            return Ok(Duration::from_millis(100));
+        }
+        status.lock().unwrap_or_else(|p| p.into_inner()).state = "running";
+        let vector = match embed(&text) {
+            Ok(Some(vector)) => vector,
+            Ok(None) => {
+                status.lock().unwrap_or_else(|p| p.into_inner()).state = "waiting_foreground";
+                return Ok(Duration::from_millis(100));
+            }
+            Err(_) => {
+                let attempts = self
+                    .retries
+                    .get(&id)
+                    .map_or(1, |r| r.attempts.saturating_add(1));
+                let delay =
+                    Duration::from_secs((1u64 << attempts.saturating_sub(1).min(6)).min(60));
+                // Retain bounded retry metadata, never transcript text. Cursor
+                // fairness still holds if an old failure is evicted.
+                if self.retries.len() >= 256 && !self.retries.contains_key(&id) {
+                    if let Some(oldest) = self
+                        .retries
+                        .iter()
+                        .min_by_key(|(_, r)| r.due)
+                        .map(|(&id, _)| id)
+                    {
+                        self.retries.remove(&oldest);
+                    }
+                }
+                self.retries.insert(
+                    id,
+                    Retry {
+                        hash: text_hash(&text),
+                        attempts,
+                        due: now + delay,
+                    },
+                );
+                let mut status = status.lock().unwrap_or_else(|p| p.into_inner());
+                status.failed_attempts += 1;
+                status.state = "backoff";
+                status.retry_at = Some(now + delay);
+                return Ok(Duration::from_millis(100));
+            }
+        };
+        let store = store.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(reason) = gate() {
+            let mut status = status.lock().unwrap_or_else(|p| p.into_inner());
+            status.state = reason;
+            status.discarded += 1;
+            return Ok(Duration::from_millis(100));
+        }
+        let wrote =
+            write_vector(store.conn(), id, &vector, text_hash(&text), Some(&text))?.is_some();
+        self.retries.remove(&id);
+        let mut status = status.lock().unwrap_or_else(|p| p.into_inner());
+        if wrote {
+            status.completed += 1;
+        } else {
+            status.discarded += 1;
+        }
+        status.pending = Some(coverage(&store, model)?.pending());
+        status.sampled_at = Some(Instant::now());
+        status.state = if status.pending == Some(0) {
+            "idle"
+        } else {
+            "running"
+        };
+        Ok(Duration::from_millis(25))
+    }
+}
+
+/// Repair old, edited, or differently-modelled text automatically. The durable
+/// dirty queue is authoritative; stopping/restarting never loses owed work.
+/// Model inference runs outside the store mutex and only at idle CPU priority.
+pub fn run_repair(
+    leg: Arc<SemanticLeg>,
+    store: Arc<Mutex<Store>>,
+    control: Arc<crate::control::Control>,
+    stop: Arc<RepairStop>,
+) {
+    crate::pipeline::background_current_thread(19, &[]);
+    let mut schedule = RepairSchedule::default();
+    let gate = || {
+        if stop.stopped.load(Ordering::SeqCst) {
+            Some("stopped")
+        } else if control.is_paused() {
+            Some("paused")
+        } else if control
+            .queue
+            .as_ref()
+            .is_some_and(|q| q.queued_samples() > 0)
+        {
+            Some("waiting_capture")
+        } else if leg.foreground.load(Ordering::SeqCst) > 0 {
+            Some("waiting_foreground")
+        } else {
+            None
+        }
+    };
+    while !stop.stopped.load(Ordering::SeqCst) {
+        let delay = schedule
+            .step(
+                &store,
+                &leg.model_id,
+                &leg.repair,
+                Instant::now(),
+                gate,
+                |text| {
+                    let Ok(mut embedder) = leg.embedder.try_lock() else {
+                        return Ok(None);
+                    };
+                    if gate().is_some() {
+                        return Ok(None);
+                    }
+                    embedder.embed_passage(text).map(Some)
+                },
+            )
+            .unwrap_or_else(|_| {
+                let mut status = leg.repair.lock().unwrap_or_else(|p| p.into_inner());
+                status.failed_attempts += 1;
+                status.state = "backoff";
+                status.retry_at = Some(Instant::now() + Duration::from_secs(1));
+                Duration::from_secs(1)
+            });
+        stop.wait(delay);
+    }
+    let mut status = leg.repair.lock().unwrap_or_else(|p| p.into_inner());
+    status.state = "stopped";
+    status.retry_at = None;
+}
+
+/// The whole semantic leg, as the daemon holds it: one shared model and one
+/// immutable resident index snapshot.
 ///
 /// Model inference and cached index state have separate locks. Search callers
 /// snapshot DB changes first, then release the store before inference/refits.
@@ -1151,6 +1445,8 @@ pub struct SemanticLeg {
     embedder: Mutex<TextEmbedder>,
     index: Mutex<Arc<VectorIndex>>,
     coverage: Mutex<Option<(i64, Coverage)>>,
+    foreground: AtomicUsize,
+    repair: Mutex<RepairStatus>,
 }
 
 impl SemanticLeg {
@@ -1161,7 +1457,13 @@ impl SemanticLeg {
             model_id,
             embedder: Mutex::new(embedder),
             coverage: Mutex::new(None),
+            foreground: AtomicUsize::new(0),
+            repair: Mutex::new(RepairStatus::default()),
         }
+    }
+
+    pub(crate) fn live_priority(&self) -> impl Drop + '_ {
+        Foreground::new(&self.foreground)
     }
 
     pub fn model_id(&self) -> String {
@@ -1181,6 +1483,7 @@ impl SemanticLeg {
         limit: usize,
         within: &Candidates,
     ) -> Result<Vec<Scored>> {
+        let _priority = Foreground::new(&self.foreground);
         let base = self.prepare_index(snapshot)?;
         let qv = self
             .embedder
@@ -1212,6 +1515,7 @@ impl SemanticLeg {
     /// when the row has nothing to embed, which is not an error — a turn with
     /// no words is a real thing.
     pub fn embed_segment(&self, store: &Store, segment_id: i64) -> Result<bool> {
+        let _priority = Foreground::new(&self.foreground);
         let text: Option<String> = store
             .conn()
             .query_row(
@@ -1230,6 +1534,57 @@ impl SemanticLeg {
             .unwrap_or_else(|p| p.into_inner())
             .embed_passage(&text)?;
         Ok(write_vector(store.conn(), segment_id, &v, text_hash(&text), Some(&text))?.is_some())
+    }
+
+    /// Live capture has priority over archive repair. Never hold the store
+    /// mutex while waiting for, or running, model inference.
+    pub fn embed_live(
+        &self,
+        store: &Mutex<Store>,
+        control: &crate::control::Control,
+        id: i64,
+    ) -> Result<bool> {
+        let _priority = Foreground::new(&self.foreground);
+        if control.is_paused() {
+            return Ok(false);
+        }
+        let text: Option<String> = store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .conn()
+            .query_row(
+                "SELECT text FROM segments WHERE id=?1 AND deleted_at IS NULL",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(text) = text.filter(|t| !t.trim().is_empty()) else {
+            return Ok(false);
+        };
+        let mut embedder = self.embedder.lock().unwrap_or_else(|p| p.into_inner());
+        if control.is_paused() {
+            return Ok(false);
+        }
+        let vector = embedder.embed_passage(&text)?;
+        drop(embedder);
+        let store = store.lock().unwrap_or_else(|p| p.into_inner());
+        if control.is_paused() {
+            return Ok(false);
+        }
+        Ok(write_vector(store.conn(), id, &vector, text_hash(&text), Some(&text))?.is_some())
+    }
+
+    /// Cached worker telemetry; no SQL, model lock or transcript text.
+    pub fn repair_status(&self) -> serde_json::Value {
+        let status = self.repair.lock().unwrap_or_else(|p| p.into_inner());
+        serde_json::json!({
+            "state": status.state, "pending": status.pending,
+            "pending_age_ms": status.sampled_at.map(|at| at.elapsed().as_millis() as u64),
+            "completed": status.completed, "failed_attempts": status.failed_attempts,
+            "discarded": status.discarded,
+            "retry_in_ms": status.retry_at.map(|at| at.saturating_duration_since(Instant::now()).as_millis() as u64).unwrap_or(0),
+        })
     }
 
     /// Rank `limit` segments by meaning, within `within`.
@@ -1260,6 +1615,7 @@ impl SemanticLeg {
         limit: usize,
         within: &Candidates,
     ) -> Result<Vec<Scored>> {
+        let _priority = Foreground::new(&self.foreground);
         let qv = self
             .embedder
             .lock()
@@ -1912,6 +2268,409 @@ mod tests {
 
         migrate_v9(s.conn()).unwrap();
         assert_eq!(coverage(&s, "m@1").unwrap().embedded, 1);
+    }
+
+    /// Isolated SQLite candidate selection, not end-to-end inference speed.
+    #[test]
+    #[ignore = "synthetic repair queue benchmark; run explicitly"]
+    fn repair_candidate_selection_benchmark() {
+        for n in [10_000i64, 100_000] {
+            let store = Store::open_in_memory().unwrap();
+            let source = store.upsert_source("synthetic", "synthetic", 1).unwrap();
+            let session = store.begin_session(source, 1).unwrap();
+            store
+                .conn()
+                .execute(
+                    "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                INSERT INTO segments(session_id,t_start_ns,t_end_ns,audio_path,created_at,text)
+                SELECT ?2,i,i+1,'',i,'synthetic transcript' FROM n",
+                    params![n, session],
+                )
+                .unwrap();
+            let old = "SELECT g.id,g.text FROM segments g JOIN (
+                SELECT segment_id FROM semantic_dirty UNION SELECT v.segment_id FROM semantic_models m
+                CROSS JOIN segment_vectors v ON v.model_id=m.model_id WHERE m.model_id<>?1 AND m.embedded>0
+                ) pending ON pending.segment_id=g.id WHERE g.deleted_at IS NULL AND g.text IS NOT NULL
+                AND trim(g.text)<>'' ORDER BY g.id LIMIT 32";
+            let start = Instant::now();
+            for _ in 0..20 {
+                let mut stmt = store.conn().prepare(old).unwrap();
+                let rows = stmt
+                    .query_map(["m@1"], |r| r.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(rows.len(), 32);
+            }
+            let before = start.elapsed();
+            let start = Instant::now();
+            for _ in 0..20 {
+                assert_eq!(pending_after(&store, "m@1", 32, 0).unwrap().len(), 32);
+            }
+            eprintln!(
+                "repair candidates {n}: 20 reads old={before:?} bounded={:?}; SQLite metadata only, no inference",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn repair_candidates_merge_dirty_and_other_model_in_order_without_skipping() {
+        let (store, ids) = seeded();
+        put_vector(
+            store.conn(),
+            ids[0],
+            &Embedding::new("other@1", vec![1., 0.]),
+            1,
+        )
+        .unwrap();
+        assert_eq!(pending_after(&store, "m@1", 1, 0).unwrap()[0].0, ids[0]);
+        assert_eq!(
+            pending_after(&store, "m@1", 1, ids[0]).unwrap()[0].0,
+            ids[1]
+        );
+        assert!(pending_after(&store, "m@1", 1, ids[1]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn repair_embeds_outside_store_lock_and_resumes_from_durable_queue() {
+        let (store, ids) = seeded();
+        let store = Mutex::new(store);
+        let status = Mutex::new(RepairStatus::default());
+        let now = Instant::now();
+        let mut schedule = RepairSchedule::default();
+        schedule
+            .step(
+                &store,
+                "m@1",
+                &status,
+                now,
+                || None,
+                |text| {
+                    assert!(
+                        store.try_lock().is_ok(),
+                        "inference must not hold SQLite mutex"
+                    );
+                    assert_eq!(text, "the portal world");
+                    Ok(Some(Embedding::new("m@1", vec![1., 0.])))
+                },
+            )
+            .unwrap();
+        assert_eq!(status.lock().unwrap().pending, Some(1));
+        // New worker, no remembered cursor: success is durably dequeued.
+        let mut restarted = RepairSchedule::default();
+        restarted
+            .step(
+                &store,
+                "m@1",
+                &status,
+                now,
+                || None,
+                |text| {
+                    assert_eq!(text, "the fountain");
+                    Ok(Some(Embedding::new("m@1", vec![0., 1.])))
+                },
+            )
+            .unwrap();
+        assert_eq!(status.lock().unwrap().completed, 2);
+        assert_eq!(status.lock().unwrap().pending, Some(0));
+        store
+            .lock()
+            .unwrap()
+            .correct_segment_text(ids[0], "corrected words")
+            .unwrap();
+        restarted
+            .step(
+                &store,
+                "m@1",
+                &status,
+                now,
+                || None,
+                |text| {
+                    assert_eq!(text, "corrected words");
+                    Ok(Some(Embedding::new("m@1", vec![1., 1.])))
+                },
+            )
+            .unwrap();
+        assert_eq!(status.lock().unwrap().pending, Some(0));
+    }
+
+    #[test]
+    fn repair_gates_pause_capture_foreground_and_stop_before_inference() {
+        for reason in ["paused", "waiting_capture", "waiting_foreground", "stopped"] {
+            let (store, _) = seeded();
+            let store = Mutex::new(store);
+            let status = Mutex::new(RepairStatus::default());
+            RepairSchedule::default()
+                .step(
+                    &store,
+                    "m@1",
+                    &status,
+                    Instant::now(),
+                    || Some(reason),
+                    |_| panic!("gate must prevent inference"),
+                )
+                .unwrap();
+            let status = status.lock().unwrap();
+            assert_eq!(status.state, reason);
+            assert_eq!(
+                status.pending, None,
+                "gated worker must not touch the store"
+            );
+            assert_eq!(status.completed, 0);
+        }
+    }
+
+    #[test]
+    fn repair_pause_or_shutdown_during_inference_discards_result() {
+        for reason in ["paused", "stopped"] {
+            let (store, _) = seeded();
+            let store = Mutex::new(store);
+            let status = Mutex::new(RepairStatus::default());
+            let gate = std::cell::Cell::new(None);
+            RepairSchedule::default()
+                .step(
+                    &store,
+                    "m@1",
+                    &status,
+                    Instant::now(),
+                    || gate.get(),
+                    |_| {
+                        gate.set(Some(reason));
+                        Ok(Some(Embedding::new("m@1", vec![1., 0.])))
+                    },
+                )
+                .unwrap();
+            assert_eq!(status.lock().unwrap().discarded, 1);
+            assert_eq!(
+                coverage(&store.lock().unwrap(), "m@1").unwrap().pending(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn repair_edits_and_deletions_during_inference_never_write_stale_vectors() {
+        for delete in [false, true] {
+            let (store, ids) = seeded();
+            let store = Mutex::new(store);
+            let status = Mutex::new(RepairStatus::default());
+            RepairSchedule::default()
+                .step(
+                    &store,
+                    "m@1",
+                    &status,
+                    Instant::now(),
+                    || None,
+                    |_| {
+                        let store = store.lock().unwrap();
+                        if delete {
+                            store.conn().execute(
+                                "UPDATE segments SET deleted_at=1 WHERE id=?1",
+                                [ids[0]],
+                            )?;
+                        } else {
+                            store.correct_segment_text(ids[0], "new words")?;
+                        }
+                        Ok(Some(Embedding::new("m@1", vec![1., 0.])))
+                    },
+                )
+                .unwrap();
+            assert_eq!(status.lock().unwrap().discarded, 1);
+            assert_eq!(status.lock().unwrap().completed, 0);
+            let count: i64 = store
+                .lock()
+                .unwrap()
+                .conn()
+                .query_row("SELECT count(*) FROM segment_vectors", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+    }
+
+    #[test]
+    fn repair_failure_backoff_does_not_starve_other_rows_and_edit_retries_immediately() {
+        let (store, ids) = seeded();
+        let store = Mutex::new(store);
+        let status = Mutex::new(RepairStatus::default());
+        let mut schedule = RepairSchedule::default();
+        let now = Instant::now();
+        schedule
+            .step(
+                &store,
+                "m@1",
+                &status,
+                now,
+                || None,
+                |_| bail!("synthetic failure"),
+            )
+            .unwrap();
+        assert_eq!(schedule.retries[&ids[0]].due, now + Duration::from_secs(1));
+        schedule
+            .step(
+                &store,
+                "m@1",
+                &status,
+                now,
+                || None,
+                |text| {
+                    assert_eq!(text, "the fountain", "a poison row cannot starve the queue");
+                    Ok(Some(Embedding::new("m@1", vec![1., 0.])))
+                },
+            )
+            .unwrap();
+        schedule
+            .step(
+                &store,
+                "m@1",
+                &status,
+                now,
+                || None,
+                |_| panic!("retry not due"),
+            )
+            .unwrap();
+        assert_eq!(status.lock().unwrap().state, "backoff");
+        schedule
+            .step(
+                &store,
+                "m@1",
+                &status,
+                now + Duration::from_secs(1),
+                || None,
+                |_| bail!("still broken"),
+            )
+            .unwrap();
+        assert_eq!(schedule.retries[&ids[0]].due, now + Duration::from_secs(3));
+        store
+            .lock()
+            .unwrap()
+            .correct_segment_text(ids[0], "fixed text")
+            .unwrap();
+        schedule
+            .step(
+                &store,
+                "m@1",
+                &status,
+                now + Duration::from_secs(1),
+                || None,
+                |text| {
+                    assert_eq!(text, "fixed text");
+                    Ok(Some(Embedding::new("m@1", vec![1., 0.])))
+                },
+            )
+            .unwrap();
+        assert_eq!(status.lock().unwrap().pending, Some(0));
+        assert_eq!(status.lock().unwrap().failed_attempts, 2);
+    }
+
+    #[test]
+    fn repair_yields_without_waiting_for_busy_store() {
+        let (store, _) = seeded();
+        let store = Mutex::new(store);
+        let held = store.lock().unwrap();
+        let status = Mutex::new(RepairStatus::default());
+        RepairSchedule::default()
+            .step(
+                &store,
+                "m@1",
+                &status,
+                Instant::now(),
+                || None,
+                |_| panic!("busy store cannot start inference"),
+            )
+            .unwrap();
+        assert_eq!(status.lock().unwrap().state, "waiting_store");
+        assert_eq!(status.lock().unwrap().pending, None);
+        drop(held);
+    }
+
+    #[test]
+    fn repair_error_memory_and_retry_delay_are_bounded() {
+        let (store, ids) = seeded();
+        let store = Mutex::new(store);
+        let status = Mutex::new(RepairStatus::default());
+        let now = Instant::now();
+        let mut schedule = RepairSchedule::default();
+        for id in 100..356 {
+            schedule.retries.insert(
+                id,
+                Retry {
+                    hash: 0,
+                    attempts: 1,
+                    due: now,
+                },
+            );
+        }
+        schedule
+            .step(
+                &store,
+                "m@1",
+                &status,
+                now,
+                || None,
+                |_| bail!("synthetic failure"),
+            )
+            .unwrap();
+        assert_eq!(schedule.retries.len(), 256);
+        schedule.retries.get_mut(&ids[0]).unwrap().attempts = 100;
+        schedule.cursor = 0;
+        schedule
+            .step(
+                &store,
+                "m@1",
+                &status,
+                now + Duration::from_secs(1),
+                || None,
+                |_| bail!("persistent failure"),
+            )
+            .unwrap();
+        assert_eq!(schedule.retries[&ids[0]].due, now + Duration::from_secs(61));
+    }
+
+    #[test]
+    fn repair_model_busy_keeps_row_pending_without_counting_failure() {
+        let (store, _) = seeded();
+        let store = Mutex::new(store);
+        let status = Mutex::new(RepairStatus::default());
+        RepairSchedule::default()
+            .step(
+                &store,
+                "m@1",
+                &status,
+                Instant::now(),
+                || None,
+                |_| Ok(None),
+            )
+            .unwrap();
+        let status = status.lock().unwrap();
+        assert_eq!(status.state, "waiting_foreground");
+        assert_eq!(status.pending, Some(2));
+        assert_eq!(status.failed_attempts, 0);
+    }
+
+    #[test]
+    fn repair_foreground_guard_unwinds_and_stop_interrupts_wait() {
+        let counter = AtomicUsize::new(0);
+        {
+            let _outer = Foreground::new(&counter);
+            {
+                let _inner = Foreground::new(&counter);
+                assert_eq!(counter.load(Ordering::SeqCst), 2);
+            }
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        let stop = Arc::new(RepairStop::default());
+        let worker = Arc::clone(&stop);
+        let (send, recv) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            worker.wait(Duration::from_secs(60));
+            send.send(()).unwrap();
+        });
+        stop.stop();
+        recv.recv_timeout(Duration::from_secs(2))
+            .expect("stop must wake polling wait");
+        join.join().unwrap();
     }
 
     // -- the store round trip ------------------------------------------------
