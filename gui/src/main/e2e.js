@@ -4733,6 +4733,69 @@ export function runE2E(deps) {
     };
     let fixed014, rolling014, moment014;
 
+    await step('0171-speaker-search-large-roster-and-selectors', async () => {
+      const fixture = await deps.request('mock.speaker_search_fixture', {});
+      const input = (id, value) => js(`(() => { const node=document.getElementById(${JSON.stringify(id)}); if(!node) throw new Error('Missing input '+${JSON.stringify(id)}); node.value=${JSON.stringify(value)}; node.dispatchEvent(new Event('input',{bubbles:true})); })()`);
+      const rosterCount = () => js(`document.querySelectorAll('#speaker-list .sp-row').length`);
+      await nav014('speakers');
+      await waitFor('large speaker roster', async () => (await rosterCount()) === fixture.count);
+      await input('speakers-find', 'ELODIE');
+      await waitFor('accent-insensitive speaker match', async () => (await rosterCount()) === 1);
+      assert(await js(`!!document.querySelector('#speaker-list .sp-row[data-speaker="${fixture.first}"]')`), 'accent/case query selected wrong speaker');
+      await input('speakers-find', String(fixture.first));
+      assert(await rosterCount() === 1, 'speaker ID did not narrow the list');
+      await input('speakers-find', 'no-match-qzx-voice');
+      assert(await rosterCount() === 0, 'no-match search retained unrelated voices');
+      assert(await js(`document.getElementById('speakers-matches').textContent.startsWith('0 of ')`), 'no-match count missing');
+      await clickLabel014('.view-body', 'Clear filters');
+      assert(await rosterCount() === fixture.count, 'clear did not restore complete roster');
+      await input('speakers-find', 'elodie');
+      await js(`window.recall.request('speakers.name',{id:${fixture.first},name:'Élodie Searchfixture Updated'})`);
+      await waitFor('live rename under search', () => js(`document.querySelector('#speaker-list .sp-row[data-speaker="${fixture.first}"]')?.textContent.includes('Updated')`));
+      assert(await js(`document.getElementById('speakers-find').value === 'elodie'`), 'live rename cleared speaker query');
+      await js(`document.querySelector('[data-more="${fixture.first}"]').click()`);
+      await js(`document.querySelector('.menu-merge').click()`);
+      await waitFor('merge filter', () => js(`!!document.getElementById('merge-speaker-find')`));
+      assert(await js(`document.querySelectorAll('.sheet [data-merge-into]').length <= 40`), 'merge picker was not bounded');
+      await input('merge-speaker-find', 'RENEE');
+      assert(await js(`!!document.querySelector('.sheet [data-merge-into="${fixture.second}"]')`), 'merge accent query missed target');
+      assert(await js(`!document.querySelector('.sheet [data-merge-into="${fixture.first}"]')`), 'merge picker included its source');
+      await input('merge-speaker-find', 'no-match-qzx-voice');
+      assert(await js(`document.querySelectorAll('.sheet [data-merge-into]').length === 0`), 'merge no-match retained choices');
+      await input('merge-speaker-find', '');
+      assert(await js(`document.querySelectorAll('.sheet [data-merge-into]').length === 40`), 'merge clear did not restore first bounded page');
+      await clickLabel014('.sheet', 'Cancel');
+      for (const [view, selectId] of [['transcript','transcript-filter'],['search','search-speaker']]) {
+        await nav014(view);
+        if(view === 'search') await js(`(() => {const b=document.getElementById('search-advanced');if(b?.getAttribute('aria-expanded')!=='true')b.click();})()`);
+        await waitFor(`${selectId} helper`, () => js(`!!document.getElementById('${selectId}-find')`));
+        await js(`(() => {const s=document.getElementById('${selectId}');s.value='${fixture.first}';s.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+        await input(`${selectId}-find`, 'RENEE');
+        const filtered = await js(`(() => {const s=document.getElementById('${selectId}');return {value:s.value,options:[...s.options].map(o=>({value:o.value,text:o.textContent}))};})()`);
+        assert(filtered.value === String(fixture.first), `${selectId} silently changed selected speaker`);
+        assert(filtered.options.some(o=>o.value === String(fixture.second)), `${selectId} missed accented target`);
+        assert(filtered.options.length < 8, `${selectId} did not filter large roster`);
+        await input(`${selectId}-find`, 'no-match-qzx-voice');
+        assert(await js(`document.getElementById('${selectId}').value === '${fixture.first}'`), `${selectId} lost selection on no matches`);
+        await input(`${selectId}-find`, '');
+        assert(await js(`document.getElementById('${selectId}').options.length >= ${fixture.count}`), `${selectId} clear failed to restore full options`);
+      }
+      await nav014('sources');
+      await js(`document.querySelector('[data-sources-category="connections"]').click()`);
+      const discordId = await waitFor('Discord speaker finder', () => js(`document.querySelector('input[id^="truth-speaker-"][id$="-find"]')?.id`));
+      await input(discordId, 'ELODIE');
+      await js(`window.__speakerFindBefore=document.getElementById(${JSON.stringify(discordId)});window.__speakerFindBefore.focus()`);
+      await deps.request('mock.speaker_search_fixture', {action:'status'});
+      await waitFor('Discord card status repaint', () => js(`document.getElementById(${JSON.stringify(discordId)}) !== window.__speakerFindBefore`));
+      assert(await js(`document.getElementById(${JSON.stringify(discordId)}).value === 'ELODIE' && document.activeElement.id === ${JSON.stringify(discordId)}`), 'Discord status refresh lost query or focus');
+      await input(discordId, '');
+      assert(await js(`document.getElementById(${JSON.stringify(discordId.replace(/-find$/,''))}).options.length > 100`), 'Discord clear failed to restore named voices');
+      await nav014('speakers');
+      await input('speakers-find', 'elodie');
+      const file = await shot('speaker-search-large-roster');
+      return { voices: fixture.count, accentAndId: true, selectionPreserved: true, file };
+    });
+
     await step('017-recognition-review-correct-mark-and-race', async () => {
       const { ids } = await deps.request('mock.review_fixture', {});
       await nav014('memory');

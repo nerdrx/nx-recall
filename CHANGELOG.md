@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.1 — Find the right speaker
+
+- Search the Speakers page by name, voice label, or ID; combine with Named or
+  Unnamed filters, with live result counts and a clear reset. Queries survive
+  live speaker updates.
+- Narrow long speaker selectors in Transcript, Search, and Discord linking
+  without changing the selected identity while typing.
+- Search merge destinations and transcript assignment choices consistently,
+  ignoring case and accents. Large choice lists reveal 40 voices at a time
+  with keyboard navigation and explicit empty states.
+
 ## 0.17.0 — Read, review, and connect
 
 - Search the complete conversation from its transcript boundary, with literal

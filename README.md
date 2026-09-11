@@ -91,6 +91,13 @@ searchable — by word, by meaning, by speaker, by day, by world — and a 1.9 G
 model on four polite CPU cores quietly writes down who promised what, while a
 1 GB model on your GPU re-reads the hard parts at three in the morning.
 
+## Find speakers in 0.17.1
+
+Search the Speakers page by name, voice label, or ID and filter Named / Unnamed
+voices. Long speaker pickers in Transcript, Search, Discord linking, merging,
+and transcript assignment also offer search. Matching ignores case and accents;
+typing in a picker keeps the current identity selected until you choose another.
+
 ## Read, review, and connect in 0.17
 
 Use **Find** on a conversation to search its complete transcript and jump between

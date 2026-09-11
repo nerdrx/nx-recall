@@ -10,6 +10,8 @@ import { h, clear, fmtBytes, fmtDur, fmtFirstSeen, heardOnChips } from '../lib/d
 // and in the transcript's segment sheet, not here: this list is where you find
 // out WHO a voice is, and a colour is something you pin once you already know.
 // What this view owes the feature is showing the mark on every row.
+import { speakerMatches } from '../lib/speaker-match.js';
+import { createSpeakerPicker } from '../lib/speaker-picker.js';
 import { lookOf, iconSpan } from './highlight.js';
 // The sweep preview is a plain-text list in a confirm sheet, so it reads the
 // icon straight off the daemon's row rather than through a look().
@@ -64,10 +66,30 @@ export function splitOutcome(res, label) {
 /** A voice's preview is keyed by its id, so any surface can drive the same one. */
 const previewKey = (spId) => `speaker:${spId}`;
 
+export function filterSpeakers(speakers, query = '', kind = 'all') {
+  return speakers.filter(speaker => {
+    if (kind === 'named' && !isNamed(speaker)) return false;
+    if (kind === 'unnamed' && isNamed(speaker)) return false;
+    return speakerMatches(speaker, query, speaker.name || speaker.auto || `Speaker_${String(speaker.id).padStart(2, '0')}`);
+  });
+}
+
+export function speakerSearchCount(shown, total) {
+  return `${shown} of ${total} voice${total === 1 ? '' : 's'}`;
+}
+
 export function mount(root, ctx) {
   const bannerSlot = h('div', { id: 'onboarding-slot' });
   const list = h('div', { id: 'speaker-list' });
-  const card = h('div', { class: 'card' }, h('div', { class: 'card-title', text: 'Voices' }), list);
+  const find = h('input', { class: 'input', id: 'speakers-find', type: 'search', placeholder: 'Name, voice label, or ID',
+    'aria-label': 'Find speakers by name, voice label, or ID', oninput: () => renderList() });
+  const kind = h('select', { class: 'input', id: 'speakers-filter', 'aria-label': 'Filter named or unnamed voices', onchange: () => renderList() },
+    h('option', { value: 'all', text: 'All voices' }), h('option', { value: 'named', text: 'Named' }), h('option', { value: 'unnamed', text: 'Unnamed' }));
+  const matches = h('span', { class: 'sub', id: 'speakers-matches', role: 'status' });
+  function resetFilters() { find.value = ''; kind.value = 'all'; renderList(); find.focus(); }
+  const controls = h('div', { class: 'speaker-search-controls', role: 'search', 'aria-label': 'Find speakers' }, find, kind,
+    h('button', { class: 'btn small', text: 'Clear filters', onclick: resetFilters }), matches);
+  const card = h('div', { class: 'card' }, h('div', { class: 'card-title', text: 'Voices' }), controls, list);
   const body = h('div', { class: 'view-body view-enter' }, bannerSlot, card);
   const sub = h('span', { class: 'sub', id: 'speakers-sub' });
   // Only ever occupied when there is something to sweep, so the header stays
@@ -359,18 +381,20 @@ export function mount(root, ctx) {
       return;
     }
     clear(list);
-    const rows = [...store.speakers.values()].sort((a, b) => (b.total_ms ?? 0) - (a.total_ms ?? 0));
-    sub.textContent = `${rows.length} voice${rows.length === 1 ? '' : 's'} · ${rows.filter(isNamed).length} named`;
+    const allRows = [...store.speakers.values()].sort((a, b) => (b.total_ms ?? 0) - (a.total_ms ?? 0));
+    const rows = filterSpeakers(allRows, find.value, kind.value);
+    matches.textContent = speakerSearchCount(rows.length, allRows.length);
+    sub.textContent = `${allRows.length} voice${allRows.length === 1 ? '' : 's'} · ${allRows.filter(isNamed).length} named`;
     const badge = document.getElementById('badge-speakers');
-    if (badge) badge.textContent = String(rows.length);
+    if (badge) badge.textContent = String(allRows.length);
 
     if (!rows.length) {
       list.append(
         h(
           'div',
           { class: 'empty' },
-          h('b', { text: 'No voices yet' }),
-          h('p', { text: 'Voices appear here the first time they are heard on an allowed source.' })
+          h('b', { text: allRows.length ? 'No matching voices' : 'No voices yet' }),
+          h('p', { text: allRows.length ? 'Try a different name, voice label, or ID, or clear the filters.' : 'Voices appear here the first time they are heard on an allowed source.' })
         )
       );
       return;
@@ -512,7 +536,10 @@ export function mount(root, ctx) {
     const target = row?.querySelector('.sp-name');
     if (!target) {
       // The banner can ask to rename a voice while the list is elsewhere.
+      if (!store.speakers.has(spId)) return;
+      find.value = ''; kind.value = 'all';
       renderList();
+      if (!list.querySelector(`.sp-row[data-speaker="${spId}"] .sp-name`)) return;
       return startRename(spId, { listen });
     }
     if (listen && !isActive(previewKey(spId))) void togglePreview(spId);
@@ -695,32 +722,20 @@ export function mount(root, ctx) {
 
   function pickMerge(fromId) {
     openSheet((close) => {
-      const others = [...store.speakers.values()].filter((s) => s.id !== fromId);
-      const pick = h('div', { class: 'sp-pick' });
-      for (const sp of others) {
-        pick.append(
-          h(
-            'button',
-            {
-              dataset: { mergeInto: String(sp.id) },
-              onclick: () => {
-                close();
-                doMerge(fromId, sp.id);
-              },
-            },
-            h('span', { class: 'dot', style: `color:${lookOf(sp.id).color}` }),
-            iconSpan(lookOf(sp.id).icon),
-            speakerLabel(sp.id)
-          )
-        );
-      }
+      const picker = createSpeakerPicker({
+        speakers: [...store.speakers.values()], label: speakerLabel, excludeIds: [fromId], id: 'merge-speaker-find',
+        onSelect: intoId => { close(); doMerge(fromId, intoId); },
+        render: (sp, choose) => h('button', { dataset: { mergeInto: String(sp.id) }, onclick: choose },
+          h('span', { class: 'dot', style: `color:${lookOf(sp.id).color}` }),
+          iconSpan(lookOf(sp.id).icon), speakerLabel(sp.id)),
+      });
       return [
         h('h2', { text: `Merge ${speakerLabel(fromId)} into…` }),
         h('p', {
           class: 'sub',
           text: 'Both voices become one identity, retroactively. Merges are recorded and can be undone from the operations log.',
         }),
-        pick,
+        ...picker.nodes,
         h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => close() }, 'Cancel')),
       ];
     });
