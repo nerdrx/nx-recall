@@ -2079,3 +2079,11 @@ input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), select, te
 .performance-state { font-size:20px; }
 
 .performance-grid > .card { margin:0; }
+
+.performance-stages-card { grid-column:1/-1; }
+.performance-table-scroll { overflow-x:auto; }
+.performance-stages { border-collapse:collapse; width:100%; font-size:12px; font-variant-numeric:tabular-nums; }
+.performance-stages caption { text-align:left; margin:12px 0; font-weight:600; }
+.performance-stages th, .performance-stages td { text-align:left; padding:10px 12px 10px 0; border-bottom:1px solid var(--clear-line); }
+.performance-stages thead th { color:var(--clear-muted); }
+.performance-stages tbody th { font-weight:500; }

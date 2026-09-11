@@ -199,7 +199,7 @@ fn search(conn: &Connection, id: i64) -> Result<Value, Error> {
         serde_json::from_str(&row.2).map_err(|e| Error::internal(e.to_string()))?;
     Ok(json!({"id":id,"name":row.0,"query":row.1,"filters":filters,"created_ms":row.3}))
 }
-fn moment(store: &Store, id: i64) -> Result<Option<Value>, Error> {
+pub(crate) fn moment(store: &Store, id: i64) -> Result<Option<Value>, Error> {
     let conn = store.conn();
     let Some((title, note, count, created, collection_id)) = db(conn
         .query_row(

@@ -89,10 +89,12 @@ pub mod proto;
 pub mod proximity;
 pub mod quality;
 pub mod queue;
+pub mod related;
 pub mod reminders;
 pub mod replay;
 pub mod resample;
 pub mod retention;
+pub mod review;
 /// The room microphone (0.10.0): a second, physical input.
 pub mod room;
 pub mod roster;

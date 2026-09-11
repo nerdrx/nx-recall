@@ -1,0 +1,9 @@
+.conversation-find { margin: 0 24px 12px; padding: 12px; border: 1px solid var(--clear-line-strong); background: var(--clear-surface); flex: 0 0 auto; }
+.conversation-find[hidden] { display: none; }
+.conversation-find-controls { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.conversation-find-controls .input { flex: 1; min-width: 160px; }
+.conversation-find-timeline { display: flex; gap: 5px; overflow-x: auto; padding: 8px 0; max-height: 52px; }
+.conversation-find-timeline button { flex: 0 0 auto; }
+.conversation-find-timeline [aria-current=true] { border-color: var(--violet); background: var(--violet-soft); }
+.conversation-find-preview { max-height: 88px; overflow: auto; white-space: pre-wrap; line-height: 1.55; margin: 0; }
+.conversation-find-preview mark { background: var(--violet-soft); color: inherit; text-decoration: underline; }

@@ -518,6 +518,10 @@ impl Service {
             "events.since" => self.events_since(client, req),
             "status" => self.status(),
             "performance.get" => Ok(self.performance()),
+            "saved.moments.related" => crate::related::handle(&self.store(), req),
+            "review.list" | "review.get" | "review.mark" => {
+                crate::review::handle(&self.store(), req)
+            }
             "pause" => self.set_paused(true),
             "resume" => self.set_paused(false),
             "sources.list" => self.sources_list(),
@@ -727,7 +731,7 @@ impl Service {
         });
         json!({"scope": "current_process", "capture": c.performance.capture.snapshot(),
             "search": c.performance.search.snapshot(), "resident_bytes": crate::performance::resident_bytes(),
-            "queue": queue, "repair": self.semantic().map(|leg| leg.repair_status())})
+            "queue": queue, "stages": c.performance.stages(), "repair": self.semantic().map(|leg| leg.repair_status())})
     }
 
     fn status(&self) -> Result<Value, Error> {
@@ -3918,10 +3922,21 @@ impl Service {
     fn segments_correct(&self, req: &Request) -> Result<Value, Error> {
         let segment_id = req.i64("segment_id")?;
         let text = req.str("text")?.to_string();
+        let expected = req.opt_str("expected_text")?;
         let store = self.store();
+        let tx = store
+            .conn()
+            .unchecked_transaction()
+            .map_err(|e| Error::internal(e.to_string()))?;
         let (_, prior_text) = store
             .segment_state(segment_id)
             .map_err(|_| Error::not_found(format!("no segment with id {segment_id}")))?;
+        if expected.is_some_and(|expected| expected != prior_text.as_deref().unwrap_or("")) {
+            return Err(Error::new(
+                "conflict",
+                "This transcript changed while you were editing. Reload it before saving.",
+            ));
+        }
         store
             .correct_segment_text(segment_id, &text)
             .map_err(|e| Error::new("not_found", format!("{e:#}")))?;
@@ -3947,6 +3962,7 @@ impl Service {
             tracing::warn!("could not record the correction as ground truth: {e:#}");
         }
         let row = store.segment_row(segment_id).map_err(Error::from)?;
+        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
         drop(store);
 
         let seq = match &row {
@@ -5601,6 +5617,45 @@ mod tests {
             )
             .unwrap();
         (sess, seg)
+    }
+
+    #[test]
+    fn guarded_correction_rejects_stale_words_without_writing_or_publishing() {
+        let r = rig("guarded-correction-017");
+        let (_, id) = a_segment(&r, "newer words");
+        events(&r);
+        let request = |expected: &str| {
+            json!({"id":1,"method":"segments.correct","params":{
+            "segment_id":id,"text":"my correction","expected_text":expected}})
+            .to_string()
+        };
+        assert_eq!(
+            call(&r, &request("older words")).unwrap_err().code,
+            "conflict"
+        );
+        assert_eq!(
+            r.service
+                .store()
+                .segment_row(id)
+                .unwrap()
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("newer words")
+        );
+        assert!(events(&r).is_empty());
+        call(&r, &request("newer words")).unwrap();
+        assert_eq!(
+            r.service
+                .store()
+                .segment_row(id)
+                .unwrap()
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("my correction")
+        );
+        assert!(events(&r).iter().any(|event| event["ev"] == "segment"));
     }
 
     #[test]

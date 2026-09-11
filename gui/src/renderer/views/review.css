@@ -1,0 +1,12 @@
+.recognition-review { display: grid; gap: 12px; min-width: 0; }
+.recognition-review .review-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+.recognition-review .review-heading h2 { margin: 0 0 6px; }
+.recognition-review .review-list { display: grid; gap: 14px; }
+.recognition-review .review-card { display: grid; gap: 10px; padding: 18px; }
+.recognition-review .review-card p { margin: 0; }
+.recognition-review .review-reason { color: var(--clear-ink); font-size: 13px; }
+.recognition-review .review-card textarea { width: 100%; resize: vertical; min-height: 88px; }
+.recognition-review .review-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.recognition-review .review-problem { color: var(--clear-ink); }
+@media (max-width: 620px) { .recognition-review .review-heading { flex-direction: column; } }
+.recognition-review > p, .recognition-review .review-heading p { margin: 0; }

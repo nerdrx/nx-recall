@@ -620,6 +620,7 @@ impl Pipeline {
                 }
                 if models.complete() {
                     let mut analyzer = Analyzer::load(&models, &cfg.identity)?;
+                    analyzer.attach_performance(Arc::clone(&control.performance));
                     analyzer.set_lang_config(&cfg.lang);
                     // 0.11.0: the Japanese router's switch and operating
                     // point. Set here rather than in `load` because it owns
@@ -732,7 +733,14 @@ impl Pipeline {
             let semantic = self.semantic.clone();
             let _priority = semantic.as_ref().map(|leg| leg.live_priority());
             let result = match event {
-                CaptureEvent::Audio(chunk) => self.on_audio(chunk),
+                CaptureEvent::Audio(chunk) => {
+                    self.control.performance.record_queue_wait(
+                        chunk.capture_mono_ns,
+                        chunk.samples.len(),
+                        crate::clock::monotonic_ns(),
+                    );
+                    self.on_audio(chunk)
+                }
                 CaptureEvent::SessionEnd {
                     session_id,
                     mono_ns,
@@ -1426,7 +1434,7 @@ impl Pipeline {
         let redecoded: Option<String> = sliced.then(|| {
             self.analyzer
                 .as_mut()
-                .map(|a| a.transcribe_slice(&samples))
+                .map(|a| a.transcribe_final(&samples))
                 .unwrap_or_default()
         });
         // ---- end 0.13.1 ---------------------------------------------------
@@ -1497,7 +1505,10 @@ impl Pipeline {
         let rel = segment_path(session_id, session.segment_seq, t_start_ns);
         let abs = self.data_dir.join(&rel);
 
-        write_wav(&abs, &samples).with_context(|| format!("writing {}", abs.display()))?;
+        {
+            let _timer = self.control.performance.audio_write.measure();
+            write_wav(&abs, &samples).with_context(|| format!("writing {}", abs.display()))?;
+        }
 
         let rel_str = rel.to_string_lossy().to_string();
         let segment_id = {
@@ -1655,6 +1666,7 @@ impl Pipeline {
         // lock spans a model wait or forward pass. A failure leaves the durable
         // repair queue intact and never costs a recording.
         if let Some(leg) = self.semantic.clone() {
+            let _timer = self.control.performance.semantic.measure();
             if let Err(e) = leg.embed_live(&self.store, &self.control, segment_id) {
                 warn!(
                     segment_id,

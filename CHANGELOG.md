@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.17.0 — Read, review, and connect
+
+- Search the complete conversation from its transcript boundary, with literal
+  Unicode-safe highlights, next/previous matches, and a clickable match timeline.
+- Add a recognition review inbox for uncertain words, with listening, guarded
+  corrections, revision-aware reviewed state, and clearly scoped correction
+  evidence. Speaker identity uncertainty stays separate.
+- Suggest related saved moments from shared original words, showing the
+  matching words and retained source evidence without requiring another model.
+- Window large day histories using measured row heights: full text and all
+  fetched pages remain available while only nearby/focused rows are mounted.
+- Measure queue wait, recognition, voice analysis, saving, refinement, and live
+  semantic indexing separately in Settings → Performance. Measurements are
+  bounded, process-local, and contain no transcript/query text.
+- Schema v24 adds source-linked review revisions; corrections can reject stale
+  edits using an optional expected-text guard. Quiet Studio and the NX logo stay.
+
 ## 0.16.0 — Keep the whole conversation
 
 - Automatically repair the semantic search index in the background, yielding

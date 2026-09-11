@@ -2930,11 +2930,32 @@ export function startMock({
   // --- methods ------------------------------------------------------------
 
   const savedSearches = new Map(), savedMoments = new Map(), savedCollections = new Map();
+  let nextMemoryFixtureId = 0;
+  function allocateMemoryFixtureIds(count) {
+    const first=Math.max(nextMemoryFixtureId,Math.max(0,...state.segments.map(row=>row.id))+100);
+    nextMemoryFixtureId=first+count; return first;
+  }
   let nextSavedSearch = 1, nextSavedMoment = 1, nextSavedCollection = 1;
   function savedMomentPayload(row) {
     const segments = row.segment_ids.map(id=>state.segments.find(s=>s.id===id)).filter(Boolean);
     if(!segments.length) return null;
     return {...row,segment_ids:segments.map(s=>s.id),segments:segments.map(s=>({...s})),unavailable_count:row.segment_ids.length-segments.length};
+  }
+  const reviewStates = new Map();
+  function reviewState(segment) {
+    const signature = JSON.stringify([segment.text, segment.asr_model_id, segment.asr_confidence, segment.confidence_at_ns, segment.lang_via]);
+    let state = reviewStates.get(segment.id);
+    if (!state || state.signature !== signature) {
+      state = { signature, revision: (state?.revision ?? 0) + 1, reviewed: false };
+      reviewStates.set(segment.id, state);
+    }
+    return state;
+  }
+  function reviewPayload(segment) {
+    return { ...segment, review_revision: reviewState(segment).revision, review_reasons: [
+      ...(segment.asr_confidence === 'shaky' ? ['decoder_disagreement'] : []),
+      ...(segment.lang_via === 'mismatch' ? ['language_mismatch'] : []),
+    ] };
   }
   const methods = {
     subscribe(params, client) {
@@ -3784,6 +3805,7 @@ export function startMock({
       const seg = state.segments.find((s) => s.id === Number(params?.segment_id));
       if (!seg) throw err('not_found', `no segment ${params?.segment_id}`);
       const before = seg.text;
+      if (params.expected_text != null && params.expected_text !== before) throw err('conflict', 'Transcript changed. Refresh before correcting.');
       seg.text = String(params?.text ?? '');
       seg.corrected = true;
       // 0.8.0: a correction is the daemon's only ground truth about how wrong
@@ -4032,13 +4054,13 @@ export function startMock({
     },
     'mock.memory_sources'(params) {
       if(params?.action==='history') {
-        const template=state.segments[0], first=Math.max(0,...state.segments.map(row=>row.id))+100;
+        const template=state.segments[0], first=allocateMemoryFixtureIds(305);
         const base=Date.UTC(2000,0,3,12);
         const rows=Array.from({length:305},(_,offset)=>({...template,id:first+offset,t_ms:base+Math.floor(offset/3)*1000,t_ns:String((base+Math.floor(offset/3)*1000)*1e6),dur_ms:500,thread:989899,session:989899,text:`History cursor fixture ${offset}`,has_audio:false}));
         state.segments.push(...rows); return {day:'2000-01-03',count:rows.length,ids:rows.map(row=>row.id)};
       }
       if(params?.action==='fixture') {
-        const template=state.segments[0]; const id=Math.max(0,...state.segments.map(row=>row.id))+100;
+        const template=state.segments[0]; const id=allocateMemoryFixtureIds(2);
         const base=Date.UTC(2000,0,2,12);
         const rows=[0,1].map(offset=>({...template,id:id+offset,t_ms:base+offset*1000,t_ns:String((base+offset*1000)*1e6),dur_ms:500,thread:989898,session:989898,text:`Memory privacy fixture ${offset}`,has_audio:false}));
         state.segments.push(...rows);
@@ -4062,6 +4084,28 @@ export function startMock({
       const page = rows.slice(0,limit), last = page.at(-1);
       return { segments: page.map(row=>({...row})), next_cursor: rows.length>limit ? JSON.stringify({from:params.from,to:params.to,time:last.t_ms,id:last.id,max}) : null };
     },
+    'mock.review_fixture'() {
+      const id=Math.max(0,...state.segments.map(row=>row.id))+100;
+      const rows=[0,1].map(offset=>({...state.segments[0],id:id+offset,text:`Synthetic recognition review ${offset}`,asr_confidence:'shaky',lang_via:null,has_audio:true,dur_ms:1800,speaker:null}));
+      state.segments.push(...rows); return {ids:rows.map(row=>row.id)};
+    },
+    'review.list'(params) {
+      const limit=params?.limit??30,before=params?.before_id??Number.MAX_SAFE_INTEGER;
+      if(!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(before)||before<=0) throw err('params','invalid review page');
+      const all=state.segments.filter(segment=>segment.id<before && segment.text?.trim() && (segment.asr_confidence==='shaky'||segment.lang_via==='mismatch') && !reviewState(segment).reviewed).sort((a,b)=>b.id-a.id);
+      const items=all.slice(0,limit).map(reviewPayload);
+      return {items,next_before_id:all.length>limit?items.at(-1).id:null};
+    },
+    'review.get'(params) {
+      const segment=state.segments.find(segment=>segment.id===Number(params?.segment_id));
+      if(!segment) throw err('not_found','Review source is unavailable');
+      return {item:reviewPayload(segment)};
+    },
+    'review.mark'(params) {
+      const segment=state.segments.find(segment=>segment.id===Number(params?.segment_id));
+      if(!segment||reviewState(segment).revision!==params?.revision) throw err('conflict','Transcript or evidence changed');
+      reviewState(segment).reviewed=true; return {reviewed:true};
+    },
     'saved.collections.list'() {
       return {collections:[...savedCollections.values()].map(c=>({...c,count:[...savedMoments.values()].filter(m=>m.collection_id===c.id&&savedMomentPayload(m)).length})).sort((a,b)=>a.name.localeCompare(b.name)||a.id-b.id)};
     },
@@ -4083,6 +4127,17 @@ export function startMock({
       const row=savedMoments.get(Number(params?.id)), moment=row?savedMomentPayload(row):null;
       if(!moment) throw err('not_found','saved moment has no retained source turns');
       return {moment};
+    },
+    'saved.moments.related'(params) {
+      const source=savedMomentPayload(savedMoments.get(Number(params?.id)) ?? {segment_ids:[]});
+      if(!source) throw err('not_found','saved moment has no retained source turns');
+      const words=moment=>new Set(moment.segments.flatMap(row=>(row.text.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu)??[])));
+      const query=new Set([...words(source)].slice(0,24));
+      const moments=[...savedMoments.values()].filter(row=>row.id!==source.id).map(savedMomentPayload).filter(Boolean).map(moment=>{
+        const shared_words=[...words(moment)].filter(word=>query.has(word));
+        return {...moment,shared_words,reason:`Shared words: ${shared_words.join(', ')}`};
+      }).filter(moment=>moment.shared_words.length>=2).slice(0,200).sort((a,b)=>b.shared_words.length-a.shared_words.length || b.id-a.id).slice(0,Math.max(1,Math.min(10,Number(params?.limit??5))));
+      return {available:true,method:'shared_words',moments,candidate_limit:200};
     },
     'saved.moments.move'(params) {
       const row=savedMoments.get(Number(params?.id));
@@ -4621,6 +4676,7 @@ export function startMock({
 
     'performance.get': () => ({
       scope: 'current_process',
+      stages: {recognition:{samples:12,window:256,latest_ms:81,p50_ms:80,p95_ms:120,max_ms:140},queue_wait:{samples:20,window:256,latest_ms:4,p50_ms:5,p95_ms:10,max_ms:15}},
       capture: {samples:0,window:256,latest_ms:null,p50_ms:null,p95_ms:null,max_ms:null},
       search: {samples:3,window:256,latest_ms:8,p50_ms:8,p95_ms:12,max_ms:12},
       resident_bytes: 134217728,

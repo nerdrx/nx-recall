@@ -192,6 +192,7 @@ pub enum LanguageFix {
 }
 
 pub struct Analyzer {
+    performance: std::sync::Arc<crate::performance::Performance>,
     overlap: OverlapDetector,
     /// One transducer, behind whichever binding `[identity].split_turns` asked
     /// for at load (0.12.4). See [`crate::asr::Decoder`].
@@ -239,6 +240,7 @@ impl Analyzer {
             anyhow::bail!("analysis models are incomplete: {list}");
         }
         Ok(Self {
+            performance: std::sync::Arc::default(),
             overlap: OverlapDetector::load(&models.segmentation)?,
             asr: crate::asr::Decoder::load(models, cfg.split_turns)?,
             embedder: Embedder::load(models)?,
@@ -323,6 +325,13 @@ impl Analyzer {
         &self.cfg
     }
 
+    pub fn attach_performance(
+        &mut self,
+        performance: std::sync::Arc<crate::performance::Performance>,
+    ) {
+        self.performance = performance;
+    }
+
     pub fn embed_model_id(&self) -> &str {
         self.embedder.model_id()
     }
@@ -383,9 +392,16 @@ impl Analyzer {
     /// recogniser instance the finished turn will go through, on the same
     /// thread, so the feature adds no model and no scheduling surface.
     pub fn transcribe_partial(&mut self, samples: &[f32]) -> String {
+        let _timer = self.performance.partial_recognition.measure();
         self.asr.transcribe(samples)
     }
     // ---- 0.11.0, partial turns: end ----------------------------------------
+
+    /// Final whole-turn re-read after live slicing; counted separately from captions.
+    pub fn transcribe_final(&mut self, samples: &[f32]) -> String {
+        let _timer = self.performance.recognition.measure();
+        self.asr.transcribe(samples)
+    }
 
     // ---- 0.12.5, sliced turns: begin ---------------------------------------
     /// Decode ONE SLICE of an open turn, or the remainder after the last slice
@@ -403,6 +419,7 @@ impl Analyzer {
     /// not-speech. Handing this half a word is not a worse reading of that
     /// word, it is a different word, and this method has no way to tell.
     pub fn transcribe_slice(&mut self, samples: &[f32]) -> String {
+        let _timer = self.performance.partial_recognition.measure();
         self.asr.transcribe(samples)
     }
     // ---- 0.12.5, sliced turns: end -----------------------------------------
@@ -445,12 +462,16 @@ impl Analyzer {
         bank: &[(i64, Option<i64>, crate::embed::Embedding)],
         exclude_segment: Option<i64>,
     ) -> Result<crate::turnsplit::Plan> {
-        let (whole, words) = self.asr.transcribe_timed(samples);
+        let (whole, words) = {
+            let _timer = self.performance.recognition.measure();
+            self.asr.transcribe_timed(samples)
+        };
         let shape = crate::turnsplit::Shape::from_config(&self.cfg, SAMPLE_RATE);
         let cuts = if self.cfg.split_turns && shape.cuttable(samples.len()) {
             let windows = shape.windows_of(samples.len());
             let mut vectors = Vec::with_capacity(windows.len());
             for w in &windows {
+                let _timer = self.performance.speaker_embedding.measure();
                 vectors.push(self.embedder.embed(&samples[w.from..w.to], SAMPLE_RATE)?);
             }
             let filtered: Vec<(i64, crate::embed::Embedding)> = bank
@@ -523,7 +544,10 @@ impl Analyzer {
     ) -> Result<Prepared> {
         let raw = match said {
             Some(text) => text,
-            None => self.asr.transcribe(samples),
+            None => {
+                let _timer = self.performance.recognition.measure();
+                self.asr.transcribe(samples)
+            }
         };
         self.prepare_said(samples, gate, raw)
     }
@@ -553,7 +577,10 @@ impl Analyzer {
     /// fragments are six weaker claims about the same person.
     pub fn prepare_said(&mut self, samples: &[f32], gate: Gate, raw: String) -> Result<Prepared> {
         let duration_s = samples.len() as f32 / SAMPLE_RATE as f32;
-        let overlap_frac = self.overlap.overlap_frac(samples)?;
+        let overlap_frac = {
+            let _timer = self.performance.overlap.measure();
+            self.overlap.overlap_frac(samples)?
+        };
 
         // An empty transcript is stored as NULL rather than "": it keeps the
         // full-text index free of empty documents and makes "has a transcript"
@@ -568,7 +595,10 @@ impl Analyzer {
         };
         let embedding = match refusal {
             Some(_) => None,
-            None => Some(self.embedder.embed(samples, SAMPLE_RATE)?),
+            None => {
+                let _timer = self.performance.speaker_embedding.measure();
+                Some(self.embedder.embed(samples, SAMPLE_RATE)?)
+            }
         };
         Ok(Prepared {
             overlap_frac,
@@ -590,6 +620,7 @@ impl Analyzer {
         prepared: Prepared,
         now_utc_ns: i64,
     ) -> Result<Outcome> {
+        let _timer = self.performance.transcript_commit.measure();
         let Prepared {
             overlap_frac,
             duration_s,
@@ -666,7 +697,10 @@ impl Analyzer {
         // ladder compares. A read failure is not a reason to stop labelling —
         // the fallback is the rule every version before 0.12.0 used.
         let aggregate = learned_aggregate(store, &self.cfg);
-        let ranked = identity::rank_with(&probe, &bank, aggregate)?;
+        let ranked = {
+            let _timer = self.performance.speaker_matching.measure();
+            identity::rank_with(&probe, &bank, aggregate)?
+        };
         // The source-aware prior (0.11.0), between ranking and deciding —
         // which is the only place it can be: it needs the scores to weigh a
         // foreign candidate against a native one, and it has to be able to
@@ -819,6 +853,7 @@ impl Analyzer {
         pin: &PinnedLeg<'_>,
         now_utc_ns: i64,
     ) -> Result<Outcome> {
+        let _timer = self.performance.transcript_commit.measure();
         let Prepared {
             overlap_frac,
             duration_s,
@@ -941,6 +976,8 @@ impl Analyzer {
         outcome: &mut Outcome,
         samples: &[f32],
     ) {
+        let performance = std::sync::Arc::clone(&self.performance);
+        let _timer = performance.refinement.measure();
         // ---- Japanese, Korean, Chinese (`crate::asr_cjk`) ----------------
         //
         // FIRST, before the declared-language correction, because the two

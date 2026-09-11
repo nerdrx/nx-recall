@@ -91,6 +91,18 @@ searchable — by word, by meaning, by speaker, by day, by world — and a 1.9 G
 model on four polite CPU cores quietly writes down who promised what, while a
 1 GB model on your GPU re-reads the hard parts at three in the morning.
 
+## Read, review, and connect in 0.17
+
+Use **Find** on a conversation to search its complete transcript and jump between
+matches. Memory’s **Review** tab offers uncertain words for listening and manual
+correction. It remembers the reviewed version and revisits new text or evidence.
+Saved moment details suggest related moments with explicit shared-word evidence.
+
+Large day histories keep full text while mounting only nearby rows. Arrow keys,
+Home and End move through the loaded history. Settings → Performance breaks
+processing into measured stages, so future speed work can target real delays.
+No global search window or new model dependency is added.
+
 ## Whole conversations in 0.16
 
 Memory now browses the whole day in stable pages and organizes saved moments

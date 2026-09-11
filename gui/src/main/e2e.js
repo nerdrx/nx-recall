@@ -4733,6 +4733,31 @@ export function runE2E(deps) {
     };
     let fixed014, rolling014, moment014;
 
+    await step('017-recognition-review-correct-mark-and-race', async () => {
+      const { ids } = await deps.request('mock.review_fixture', {});
+      await nav014('memory');
+      await js(`document.querySelector('[data-memory-tab="review"]').click()`);
+      const scope = id => `[data-review-id="${id}"]`;
+      await waitFor('recognition review cards', () => js(`!!document.querySelector(${JSON.stringify(scope(ids[0]))})`));
+      await clickLabel014(scope(ids[0]), 'Listen');
+      await waitFor('review audio active', () => js(`document.querySelector(${JSON.stringify(scope(ids[0]))}+' button[aria-pressed]')?.getAttribute('aria-pressed') === 'true'`));
+      await clickLabel014(scope(ids[0]), 'Stop listening');
+      await js(`document.querySelector(${JSON.stringify(scope(ids[0]))}+' textarea').value='Synthetic corrected words'`);
+      await clickLabel014(scope(ids[0]), 'Save correction');
+      await waitFor('corrected review removed', () => js(`!document.querySelector(${JSON.stringify(scope(ids[0]))})`));
+      const corrected = await js(`(async () => (await window.recall.request('review.get', {segment_id:${ids[0]}})).data.item)()`);
+      assert(corrected.text === 'Synthetic corrected words', 'review correction did not persist');
+      await clickLabel014(scope(ids[1]), 'Mark reviewed');
+      await waitFor('unchanged review removed', () => js(`!document.querySelector(${JSON.stringify(scope(ids[1]))})`));
+      const conflict = await js(`window.recall.request('segments.correct', {segment_id:${ids[0]}, text:'must not overwrite', expected_text:'stale source'})`);
+      assert(!conflict.ok && conflict.err?.code === 'conflict', 'stale text unexpectedly overwrote the correction');
+      await js(`window.recall.request('segments.correct', {segment_id:${ids[0]}, text:'Synthetic new revision', expected_text:'Synthetic corrected words'})`);
+      await js(`document.getElementById('review-refresh').click()`);
+      await waitFor('changed revision re-enters inbox', () => js(`document.querySelector(${JSON.stringify(scope(ids[0]))}+' textarea')?.value === 'Synthetic new revision'`));
+      const file = await shot('recognition-review');
+      return { ids, corrected: corrected.text, conflict: conflict.err.code, file };
+    });
+
     await step('014-settings-separates-processing-and-remembers-density', async () => {
       await nav014('memory');
       assert(await js(`!document.getElementById('enrich-card') && !document.getElementById('translate-card')`), 'processing still clutters Memory');
@@ -4930,25 +4955,41 @@ export function runE2E(deps) {
       await nav014('memory');
       await js(`document.querySelector('[data-memory-tab="day"]').click()`);
       await js(`document.getElementById('archive-day').value=${JSON.stringify(fixture.day)}; document.getElementById('archive-day').dispatchEvent(new Event('change'))`);
-      await waitFor('first history page', () => js(`document.querySelectorAll('[data-history-id]').length === 100`));
-      const before = await js(`(() => { const rows=[...document.querySelectorAll('[data-history-id]')]; window.__historyFirst016=rows[0]; const scroller=document.querySelector('.view-body'); scroller.scrollTop=180; return {ids:rows.map(r=>r.dataset.historyId),scroll:scroller.scrollTop}; })()`);
+      await waitFor('first history page', () => js(`document.getElementById('archive-history')?.historyState?.().ids.length === 100`));
+      await js(`document.querySelector('.view-body').scrollTop=180`);
+      await sleep(200);
+      const before=await js(`(() => {window.__historyFirst016=document.querySelector('[data-history-id]');return {ids:document.getElementById('archive-history').historyState().ids,scroll:document.querySelector('.view-body').scrollTop};})()`);
       await js(`document.getElementById('archive-load-more').click()`);
-      await waitFor('second history page', () => js(`document.querySelectorAll('[data-history-id]').length > 100`));
-      const after = await js(`(() => { const rows=[...document.querySelectorAll('[data-history-id]')]; return {ids:rows.map(r=>r.dataset.historyId),same:rows[0]===window.__historyFirst016,scroll:document.querySelector('.view-body').scrollTop}; })()`);
-      assert(after.same && after.ids.slice(0,100).join()===before.ids.join(), 'loading more rebuilt or reordered previous rows');
-      assert(new Set(after.ids).size===after.ids.length, 'history duplicated a cursor boundary');
-      assert(Math.abs(after.scroll-before.scroll)<=1, `loading more moved the reader: ${before.scroll}→${after.scroll}`);
+      await waitFor('second history page', () => js(`document.getElementById('archive-history').historyState().ids.length > 100`));
+      const after=await js(`({ids:document.getElementById('archive-history').historyState().ids,same:window.__historyFirst016.isConnected,scroll:document.querySelector('.view-body').scrollTop})`);
+      assert(after.same && after.ids.slice(0,100).join()===before.ids.join(),'loading more rebuilt visible rows or reordered loaded turns');
+      assert(new Set(after.ids).size===after.ids.length,'history duplicated a cursor boundary');
+      assert(Math.abs(after.scroll-before.scroll)<=1,`loading more moved reader: ${before.scroll}→${after.scroll}`);
       for(let page=0;page<30 && await js(`!document.getElementById('archive-load-more').hidden`);page++) {
-        const count=await js(`document.querySelectorAll('[data-history-id]').length`);
+        const count=await js(`document.getElementById('archive-history').historyState().ids.length`);
         await js(`document.getElementById('archive-load-more').click()`);
-        await waitFor('next history page',()=>js(`document.querySelectorAll('[data-history-id]').length>${count} || document.getElementById('archive-load-more').hidden`));
+        await waitFor('next history page',()=>js(`document.getElementById('archive-history').historyState().ids.length>${count} || document.getElementById('archive-load-more').hidden`));
       }
-      assert(await js(`document.getElementById('archive-load-more').hidden`), 'fixture history did not reach its end');
-      const count=await js(`document.querySelectorAll('[data-history-id]').length`);
-      assert(count===fixture.count && count>200, `history lost turns or remains capped: ${count} of ${fixture.count}`);
-      const ids=await js(`[...document.querySelectorAll('[data-history-id]')].map(row=>Number(row.dataset.historyId))`);
+      const ids=await js(`document.getElementById('archive-history').historyState().ids`);
+      assert(ids.length===fixture.count && ids.length>200,'history remains capped or lost turns');
       assert(ids.join()===fixture.ids.join(),'history reordered tied timestamps or skipped cursor boundaries');
-      return {count,file:await shot('016-continuous-history')};
+      assert(await js(`document.querySelectorAll('[data-history-id]').length<40`),'history DOM grew with loaded data');
+      await js(`document.querySelector('[data-history-id] button').focus(); document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'End',bubbles:true}))`);
+      await waitFor('keyboard reaches final retained turn',()=>js(`document.activeElement.closest('[data-history-id]')?.dataset.historyId===${JSON.stringify(String(fixture.ids.at(-1)))}`));
+      await sleep(200);
+      assert(await js(`document.querySelectorAll('[data-history-id]').length<40`),'end navigation expanded the DOM');
+      await js(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Home',bubbles:true}))`);
+      await waitFor('keyboard returns to first retained turn',()=>js(`document.activeElement.closest('[data-history-id]')?.dataset.historyId===${JSON.stringify(String(fixture.ids[0]))}`));
+      const longText='Full retained words, no clipping. '.repeat(200);
+      await deps.request('mock.memory_sources',{action:'correct',id:fixture.ids.at(-1),text:longText});
+      await js(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'End',bubbles:true}))`);
+      await waitFor('offscreen correction survives remount',()=>js(`document.querySelector('[data-history-id="${fixture.ids.at(-1)}"] [data-source-text]')?.textContent===${JSON.stringify(longText)}`));
+      await sleep(200);
+      assert(await js(`document.querySelector('[data-history-id="${fixture.ids.at(-1)}"]').getBoundingClientRect().height>400`),'long transcript was clipped to an estimated row height');
+      await deps.request('mock.memory_sources',{action:'purge',id:fixture.ids.at(-1)});
+      await waitFor('purged row removed from model and DOM',()=>js(`!document.getElementById('archive-history').historyState().ids.includes(${fixture.ids.at(-1)}) && !document.querySelector('[data-history-id="${fixture.ids.at(-1)}"]')`));
+      assert(await js(`document.activeElement.closest('[data-history-id]')?.dataset.historyId===${JSON.stringify(String(fixture.ids.at(-2)))}`),'purging the focused row stranded keyboard focus');
+      return {count:ids.length,file:await shot('017-windowed-history')};
     });
 
     await step('016-collections-and-full-saved-range-remain-source-backed', async () => {
@@ -5040,6 +5081,30 @@ export function runE2E(deps) {
       await waitFor('purged history day empty',()=>js(`document.getElementById('archive-load-more').hidden`));
       assert(await js(`document.querySelectorAll('[data-history-id]').length===0`),'purged words reappeared from history');
       return {ids:fixture.ids};
+    });
+
+    await step('017-related-moments-show-original-evidence-and-drop-deleted-sources', async () => {
+      // A deleted bookmark must never attach itself to newly allocated fixture IDs.
+      const retired=await deps.request('mock.memory_sources',{action:'fixture'});
+      for(const id of retired.ids) await deps.request('mock.memory_sources',{action:'purge',id});
+      const source=await deps.request('mock.memory_sources',{action:'fixture'});
+      const target=await deps.request('mock.memory_sources',{action:'fixture'});
+      assert(source.ids[0]>retired.ids.at(-1),'purged source IDs were reused by fixture allocation');
+      for(const id of [...source.ids,...target.ids]) await deps.request('mock.memory_sources',{action:'correct',id,text:'Quasar orchard lighthouse original evidence'});
+      await saved014();
+      await clickLabel014(`[data-saved-id="${source.moment.id}"][data-saved-kind="moments"]`,'Open moment');
+      await waitFor('related original evidence',()=>js(`document.querySelector('[data-related-moment="${target.moment.id}"]')?.textContent.includes('Quasar orchard lighthouse original evidence')`));
+      assert(await js(`document.getElementById('saved-moment-related').textContent.includes('200 matching candidates')`),'related scope was not explained');
+      await clickLabel014(`[data-related-moment="${target.moment.id}"]`,'Open related moment');
+      await waitFor('related moment replaces sheet',()=>js(`document.querySelectorAll('.sheet').length===1 && document.querySelector('[data-moment-segment="${target.ids[0]}"]')`));
+      await clickLabel014('.sheet','Close');
+      await clickLabel014(`[data-saved-id="${source.moment.id}"][data-saved-kind="moments"]`,'Open moment');
+      await waitFor('related reopened',()=>js(`!!document.querySelector('[data-related-moment="${target.moment.id}"]')`));
+      for(const id of target.ids) await deps.request('mock.memory_sources',{action:'purge',id});
+      await waitFor('purged related evidence removed',()=>js(`!document.querySelector('[data-related-moment="${target.moment.id}"]') && document.getElementById('saved-moment-related').textContent.includes('No related saved moments found')`));
+      await clickLabel014('.sheet','Close');
+      for(const id of source.ids) await deps.request('mock.memory_sources',{action:'purge',id});
+      return {source:source.moment.id,target:target.moment.id};
     });
 
     await step('014-sheet-keyboard-traps-and-restores-focus', async () => {
@@ -5160,11 +5225,40 @@ export function runE2E(deps) {
       assert(text.includes('8 ms') && text.includes('12 ms'), 'search percentiles missing');
       assert(text.includes('Giving recording priority') && text.includes('4 pending'), 'repair state missing');
       assert(text.includes('0 dropped buffers'), 'drop accounting missing');
+      assert(text.includes('80 ms') && text.includes('120 ms') && text.includes('Do not add these medians'), 'stage measurements or scope explanation missing');
       return {file: await shot('016-performance')};
     });
 
     // 15 — the app lives in the tray: closing the window hides it, does not
     // quit, and does not take the pause switch away with it (DESIGN §8).
+    await step('017-conversation-find-complete-thread-and-keyboard', async () => {
+      await js(`window.__recallDebug.go('transcript')`);
+      await waitFor('conversation find entry', () => js(`!!document.querySelector('.conversation-find-open')`));
+      const expected = await js(`(async () => {
+        const button = document.querySelector('.conversation-find-open');
+        const id = Number(button.closest('[data-thread]').dataset.thread);
+        const response = await window.recall.request('thread.get', {id});
+        const rows = response.data.segments;
+        const word = rows.map(row => row.text.match(/[A-Za-z]{2,}/)?.[0]).find(Boolean);
+        if (!word) throw new Error('Thread fixture needs searchable words');
+        button.click();
+        return {word, count: rows.filter(row => row.text.toLowerCase().includes(word.toLowerCase())).length};
+      })()`);
+      await waitFor('conversation loaded', () => js(`document.querySelector('.conversation-find [role="status"]').textContent.includes('turns in this conversation')`));
+      await js(`(() => { const input = document.getElementById('conversation-find-query'); input.value = ${JSON.stringify(expected.word)}; input.dispatchEvent(new Event('input', {bubbles:true})); })()`);
+      assert(await js(`document.querySelectorAll('.conversation-find-timeline button').length === ${expected.count}`), 'finder did not search all turns returned by thread.get');
+      assert(await js(`!!document.querySelector('.conversation-find-preview mark')`), 'match preview is not highlighted');
+      await js(`document.getElementById('conversation-find-query').dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',bubbles:true}))`);
+      await waitFor('match revealed', () => js(`!!document.querySelector('.seg.hit') && !document.querySelector('.conversation-find').hidden`));
+      await js(`document.getElementById('conversation-find-query').dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',shiftKey:true,bubbles:true}))`);
+      const file = await shot('conversation-find-017');
+      await js(`(() => { const input = document.getElementById('conversation-find-query'); input.value = 'unmatchable017xyz'; input.dispatchEvent(new Event('input', {bubbles:true})); })()`);
+      assert(await js(`document.querySelector('.conversation-find [role="status"]').textContent === 'No matching turns in this conversation.' && document.querySelectorAll('.conversation-find-timeline button').length === 0`), 'empty find state retained old matches');
+      await js(`document.getElementById('conversation-find-query').dispatchEvent(new KeyboardEvent('keydown', {key:'Escape',bubbles:true}))`);
+      assert(await js(`document.querySelector('.conversation-find').hidden`), 'Escape did not close local find');
+      return { ...expected, file };
+    });
+
     await step('tray-works-with-window-closed', async () => {
       const w = win();
       w.close();
