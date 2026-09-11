@@ -1724,3 +1724,118 @@ fn deleting_a_voice_takes_its_commitments_off_the_wire_too() {
         json!(0)
     );
 }
+
+/// Saved items use the same wire dispatch as the desktop, and saved moments
+/// always resolve current source rows rather than copying deleted/corrected text.
+#[test]
+fn saved_searches_moments_and_context_roundtrip_over_the_socket() {
+    let d = Daemon::start("saved-context-v014");
+    let ids = {
+        let store = d.store.lock().unwrap();
+        (0..3)
+            .map(|i| {
+                let t = (i + 1) * 1_000_000_000;
+                let id = store
+                    .insert_segment(d.session, t, t + 500_000_000, "", t)
+                    .unwrap();
+                store
+                    .correct_segment_text(id, &format!("synthetic portal turn {i}"))
+                    .unwrap();
+                id
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut c = d.connect();
+    c.hello();
+    c.subscribe(&["ops"]);
+
+    let filters = json!({"mode":"keyword","source":"fixtures","date":{"kind":"rolling","days":7}});
+    let search = c.call(
+        "saved.searches.save",
+        json!({"name":"Portals this week","query":"portal","filters":filters}),
+    )["search"]
+        .clone();
+    assert!(search["id"].as_i64().unwrap() > 0);
+    let searches = c.call("saved.searches.list", json!({"limit":10}));
+    assert_eq!(searches["total"], 1);
+    assert_eq!(searches["searches"][0]["filters"], filters);
+    assert_eq!(searches["searches"][0]["query"], "portal");
+    let renamed = c.call(
+        "saved.searches.save",
+        json!({"id":search["id"],"name":"Portal notes","query":"portal","filters":filters}),
+    );
+    assert_eq!(renamed["search"]["id"], search["id"]);
+    assert_eq!(c.call("saved.searches.list", json!({}))["total"], 1);
+
+    let context = c.call(
+        "segments.context",
+        json!({"id":ids[1],"before":1,"after":1}),
+    );
+    assert_eq!(context["anchor"]["id"], ids[1]);
+    assert_eq!(
+        context["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        ids
+    );
+    let moment = c.call(
+        "saved.moments.save",
+        json!({"title":"Portal discussion","note":"Synthetic socket test","segment_ids":ids}),
+    )["moment"]
+        .clone();
+    assert_eq!(moment["segment_ids"], json!(ids));
+    assert_eq!(moment["unavailable_count"], 0);
+    c.call(
+        "segments.correct",
+        json!({"segment_id":ids[1],"text":"corrected synthetic portal"}),
+    );
+    let moments = c.call("saved.moments.list", json!({}));
+    assert_eq!(moments["total"], 1);
+    assert_eq!(
+        moments["moments"][0]["segments"][1]["text"],
+        "corrected synthetic portal"
+    );
+
+    let deletion = c.call(
+        "delete.run",
+        json!({"session":d.session,"from":1000,"to":2000}),
+    );
+    let done = c.wait_event("op.done");
+    assert_eq!(done["data"]["op"], deletion["op"]);
+    assert_eq!(done["data"]["removed"], 1);
+    let moments = c.call("saved.moments.list", json!({}));
+    assert_eq!(moments["moments"][0]["id"], moment["id"]);
+    assert_eq!(
+        moments["moments"][0]["segment_ids"],
+        json!([ids[1], ids[2]])
+    );
+    assert_eq!(moments["moments"][0]["unavailable_count"], 1);
+    assert_eq!(
+        c.call_err("segments.context", json!({"id":ids[0]}))["code"],
+        "not_found"
+    );
+    let remaining = c.call(
+        "segments.context",
+        json!({"id":ids[1],"before":10,"after":10}),
+    );
+    assert_eq!(remaining["segments"].as_array().unwrap().len(), 2);
+    assert!(
+        remaining["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["id"] != ids[0])
+    );
+
+    let deletion = c.call("delete.run", json!({"session":d.session}));
+    assert_eq!(c.wait_event("op.done")["data"]["op"], deletion["op"]);
+    assert_eq!(c.call("saved.moments.list", json!({}))["total"], 0);
+    assert_eq!(
+        c.call("saved.searches.delete", json!({"id":search["id"]}))["removed"],
+        true
+    );
+    assert_eq!(c.call("saved.searches.list", json!({}))["total"], 0);
+}

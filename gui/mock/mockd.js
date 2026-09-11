@@ -2929,6 +2929,13 @@ export function startMock({
 
   // --- methods ------------------------------------------------------------
 
+  const savedSearches = new Map(), savedMoments = new Map();
+  let nextSavedSearch = 1, nextSavedMoment = 1;
+  function savedMomentPayload(row) {
+    const segments = row.segment_ids.map(id=>state.segments.find(s=>s.id===id)).filter(Boolean);
+    if(!segments.length) return null;
+    return {...row,segment_ids:segments.map(s=>s.id),segments:segments.map(s=>({...s})),unavailable_count:row.segment_ids.length-segments.length};
+  }
   const methods = {
     subscribe(params, client) {
       const topics = Array.isArray(params?.topics) ? params.topics : [];
@@ -4014,6 +4021,52 @@ export function startMock({
 
     // --- 0.8.0: notes to self ----------------------------------------------
 
+    'segments.context'(params) {
+      const anchor = state.segments.find(s => s.id === Number(params?.id));
+      if (!anchor) throw err('not_found', 'segment not found');
+      const before = Number(params?.before ?? 3), after = Number(params?.after ?? 3);
+      if (![before, after].every(n => Number.isInteger(n) && n >= 0 && n <= 10)) throw err('params', 'before and after must be 0–10');
+      const same = state.segments.filter(s => anchor.thread != null ? s.thread === anchor.thread : s.session === anchor.session).sort((a,b) => a.t_ms-b.t_ms || a.id-b.id);
+      const index = same.findIndex(s => s.id === anchor.id);
+      return { anchor: { ...anchor }, segments: same.slice(Math.max(0,index-before),index+after+1).map(s => ({ ...s })) };
+    },
+    'saved.searches.list'(params) {
+      const rows = [...savedSearches.values()].sort((a,b) => b.created_ms-a.created_ms || b.id-a.id);
+      return { total: rows.length, searches: structuredClone(rows.slice(Number(params?.offset ?? 0), Number(params?.offset ?? 0)+Math.min(200,Number(params?.limit ?? 100)))) };
+    },
+    'saved.searches.save'(params) {
+      const name = String(params?.name ?? '').trim(), query = String(params?.query ?? '').trim();
+      const filters = params?.filters ?? {};
+      if (!name || name.length>120 || query.length>4096 || !filters || Array.isArray(filters) || typeof filters!=='object' || JSON.stringify(filters).length>16384) throw err('params','invalid saved search');
+      if (params.id != null && !savedSearches.has(Number(params.id))) throw err('not_found','saved search not found');
+      const id = params.id == null ? nextSavedSearch++ : Number(params.id);
+      const row = { id, name, query, filters: structuredClone(filters), created_ms: savedSearches.get(id)?.created_ms ?? Date.now() };
+      savedSearches.set(id,row); return { search: structuredClone(row) };
+    },
+    'saved.searches.delete'(params) { return { removed: savedSearches.delete(Number(params?.id)) }; },
+    'saved.moments.list'(params) {
+      const rows = [...savedMoments.values()].map(savedMomentPayload).filter(Boolean).sort((a,b) => b.created_ms-a.created_ms || b.id-a.id);
+      const offset=Number(params?.offset ?? 0); return { total:rows.length,moments:rows.slice(offset,offset+Math.min(200,Number(params?.limit ?? 100))) };
+    },
+    'saved.moments.save'(params) {
+      const ids=params?.segment_ids;
+      if (!Array.isArray(ids)||!ids.length||ids.length>20||new Set(ids).size!==ids.length) throw err('params','choose 1–20 unique consecutive turns');
+      const rows=ids.map(id=>state.segments.find(s=>s.id===id));
+      if(rows.some(r=>!r)) throw err('not_found','source segment unavailable');
+      rows.sort((a,b)=>a.t_ms-b.t_ms||a.id-b.id);
+      const first=rows[0],last=rows.at(-1),thread=first.thread!=null&&rows.every(r=>r.thread===first.thread);
+      if(!thread&&rows.some(r=>r.session!==first.session)) throw err('params','choose one conversation');
+      const contiguous=state.segments.filter(r=>(thread?r.thread===first.thread:r.session===first.session)&& (r.t_ms>first.t_ms||(r.t_ms===first.t_ms&&r.id>=first.id)) && (r.t_ms<last.t_ms||(r.t_ms===last.t_ms&&r.id<=last.id)));
+      if(contiguous.length!==rows.length||Math.max(...rows.map(r=>r.t_ms+r.dur_ms))-first.t_ms>600000) throw err('params','choose a short consecutive range');
+      const title=String(params.title??'').trim(),note=String(params.note??'').trim();
+      if(title.length>180||note.length>4096) throw err('params','title or note too long');
+      if(params.id!=null&&!savedMoments.has(Number(params.id))) throw err('not_found','moment not found');
+      const id=params.id==null?nextSavedMoment++:Number(params.id);
+      const row={id,title,note,segment_ids:rows.map(r=>r.id),created_ms:savedMoments.get(id)?.created_ms??Date.now()};
+      savedMoments.set(id,row); return {moment:savedMomentPayload(row)};
+    },
+    'saved.moments.delete'(params) { return {removed:savedMoments.delete(Number(params?.id))}; },
+
     'notes.list'(params) {
       const want = params?.state;
       if (want != null && !NOTE_STATES.includes(want)) {
@@ -4092,8 +4145,20 @@ export function startMock({
       if (!q) throw err('params', 'q must not be empty');
       const limit = Number(params?.limit ?? 50);
       const interpretation = interpret(q);
+      interpretation.date_explicit = !!(interpretation.from_ns || interpretation.to_ns);
+      if (!interpretation.date_explicit) {
+        if (params.from != null) interpretation.from_ns = String(BigInt(Date.parse(params.from)) * 1000000n);
+        if (params.to != null) interpretation.to_ns = String(BigInt(Date.parse(params.to)) * 1000000n);
+      }
+      if (interpretation.speaker_id == null && params.speaker != null) {
+        interpretation.speaker_id = Number(params.speaker);
+        interpretation.speaker_label = null;
+      }
+      if (!interpretation.world_id && params.world) interpretation.world_id = params.world;
+      interpretation.source = params.source ?? null;
 
       const facets = { limit };
+      if (interpretation.source) facets.source = interpretation.source;
       if (interpretation.speaker_id != null) facets.speaker = interpretation.speaker_id;
       if (interpretation.from_ns) facets.from = Number(interpretation.from_ns) / 1e6;
       if (interpretation.to_ns) facets.to = Number(interpretation.to_ns) / 1e6;

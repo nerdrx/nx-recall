@@ -1,0 +1,30 @@
+/* Search has its own reading rhythm: metadata first, then the full words. */
+.search014 .search-date-scope { align-items: end; gap: 10px; margin-block: 12px; }
+.search014 .search-date-scope .sub { align-self: center; }
+.search-tools { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.search-mode-control { min-width: 0; }
+.search014 .seg-ctl { display: inline-flex; flex-wrap: nowrap; gap: 3px; padding: 3px; border: 1px solid var(--clear-line); border-radius: var(--clear-r-control); }
+.search014 .seg-opt { padding: 6px 12px; }
+.search014 .seg-note { max-width: 56ch; font-size: 12px; }
+.search-workspace { margin-top: 16px; display: flex; align-items: flex-start; gap: 16px; }
+.search-workspace > .card { margin-top: 0; }
+.search-result-card { flex: 1; min-width: 0; }
+.search014 #search-results > .seg { grid-template-columns: auto minmax(0, 1fr); gap: 8px 16px; padding: 16px; }
+.search014 #search-results > .seg .t { font-size: 12px; }
+.search014 #search-results > .seg > .txt { grid-column: 1 / -1; font-size: 15px; line-height: 1.65; overflow-wrap: anywhere; }
+.search014 #search-results > .seg > .meta { grid-column: 1 / -1; flex-wrap: wrap; }
+.search-context { flex: 0 1 42%; min-width: 280px; position: sticky; top: 12px; }
+.search-context[hidden] { display: none; }
+.search-context-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.search-context-head h2 { margin: 0; font-size: 17px; }
+.search-context .actions { justify-content: flex-start; flex-wrap: wrap; margin: 12px 0; }
+.search-context-turns { max-height: 58vh; overflow-y: auto; overscroll-behavior: contain; }
+.search-context-turn { padding: 12px; border-radius: var(--clear-r-control); line-height: 1.65; overflow-wrap: anywhere; }
+.search-context-turn .sub { margin-bottom: 4px; }
+.search-context-turn.selected { background: var(--violet-soft); box-shadow: inset 3px 0 var(--violet); }
+@media (max-width: 1000px) {
+  .search-workspace { flex-direction: column-reverse; }
+  .search-context { width: 100%; min-width: 0; position: static; }
+  .search-result-card { width: 100%; }
+  .search-tools { align-items: flex-start; flex-wrap: wrap; }
+}

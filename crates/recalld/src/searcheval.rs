@@ -607,7 +607,7 @@ pub fn command(
     let leg = SemanticLeg::new(crate::semantic::TextEmbedder::load(&sem)?);
     // Warm the index once, up front, rather than once per query inside score().
     {
-        let _ = leg.stats(&store)?;
+        leg.warm_index(&store)?;
     }
 
     let set = if regen {

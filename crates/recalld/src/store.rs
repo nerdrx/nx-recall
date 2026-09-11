@@ -160,7 +160,9 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // `crate::pipeline`'s `GapCause`, and FINDINGS §50 for the baseline this
 // replaces — 723 unclassified gaps in one journal window, reconstructed by
 // hand because nothing wrote them down.
-pub const SCHEMA_VERSION: i64 = 20;
+// Schemas21–22 add durable semantic bookkeeping and source-linked saved items.
+// Their migrations share this transaction, including the version update.
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -1521,6 +1523,9 @@ impl Store {
         // ---- 0.14.0 (schema v20): capture health ---------------------------
         // One table, no backfill. See the banner above `SCHEMA_VERSION`.
         self.apply_v20()?;
+        // Search bookkeeping and user-created saved items (schemas21–22).
+        crate::semantic::migrate_v21(&self.conn)?;
+        crate::saved::migrate_v22(&self.conn)?;
         // ---- end 0.14.0 ------------------------------------------------------
 
         match current {
@@ -10769,7 +10774,6 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(v, 20);
 
         // The columns are back…
         let columns = |table: &str| -> Vec<String> {

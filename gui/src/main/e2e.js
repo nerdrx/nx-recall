@@ -1011,7 +1011,7 @@ export function runE2E(deps) {
       // so it is not a sixth place and must not be counted as one.
       const rail = await js('document.querySelectorAll(".rail-item[data-view]").length');
       const selected = await js('document.querySelectorAll(\'.rail-item[aria-selected="true"]\').length');
-      assert(rail === 5, `the rail has ${rail} items, not the five it should`);
+      assert(rail === 6, `the rail has ${rail} items, not the six it should`);
       assert(selected === 0, 'a rail item claims to be selected on the person page');
       return { speaker: target, strip: p.strip, sub: p.sub, file: await shot('person-page') };
     });
@@ -1409,7 +1409,7 @@ export function runE2E(deps) {
     // and this is the answer being there at all.
     await step('memory-is-the-fifth-rail-item', async () => {
       const rail = await js('[...document.querySelectorAll(".rail-item[data-view]")].map(b => b.dataset.view)');
-      assert(rail.length === 5, `the rail has ${rail.length} items: ${JSON.stringify(rail)}`);
+      assert(rail.length === 6, `the rail has ${rail.length} items: ${JSON.stringify(rail)}`);
       assert(rail.includes('memory'), `no Memory item in the rail: ${JSON.stringify(rail)}`);
       // Between Search and Sources: it is about what was said, not about what
       // the program is allowed to listen to.
@@ -1422,6 +1422,7 @@ export function runE2E(deps) {
 
       await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
       await waitFor('the memory view', async () => js('window.__recallDebug.view() === "memory"'));
+      await js(`document.querySelector('[data-memory-tab="commitments"]').click()`);
       const railSelected = await js(
         'document.querySelector(\'.rail-item[data-view="memory"]\').getAttribute("aria-selected")'
       );
@@ -1441,6 +1442,7 @@ export function runE2E(deps) {
     // guess, in the row, without hovering anything. A pattern match and a
     // language model are not the same claim.
     await step('commitments-say-which-tier-claimed-them', async () => {
+      await js(`document.querySelector('[data-memory-tab="commitments"]').click()`);
       const m = await js('window.__recallDebug.memory()');
       assert(m.commitments.length >= 2, `only ${m.commitments.length} commitment(s) rendered`);
       const sources = [...new Set(m.commitments.map((c) => c.source))].sort();
@@ -1527,6 +1529,7 @@ export function runE2E(deps) {
     // click away or there is no way to disagree with it.
     await step('a-commitment-opens-its-line-in-the-transcript', async () => {
       await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js(`document.querySelector('[data-memory-tab="commitments"]').click()`);
       await waitFor('the memory view', async () => js('window.__recallDebug.view() === "memory"'));
       // The view mounts empty and fills in from one query, so the list is not
       // there on the first frame.
@@ -2405,7 +2408,7 @@ export function runE2E(deps) {
         `the translation is not the first line: ${JSON.stringify(before.translated.first)}`
       );
 
-      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
       const card = await waitFor('the translation card', async () => {
         const t = await js('window.__recallDebug.translation()');
         return t.target !== null && t.read.length ? t : null;
@@ -2438,7 +2441,7 @@ export function runE2E(deps) {
 
       // …and back, where the original keeps its language code so the reader
       // can see what they are being shown instead of.
-      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
       await js('document.getElementById("translate-display-main").click()');
       await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
       const main = await waitFor('the translation leading again', async () => {
@@ -2449,7 +2452,7 @@ export function runE2E(deps) {
 
       // 2. Setting the target moves the card's own badge, and takes the new
       //    target's chip with it.
-      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
       await js(`(() => {
         const s = document.getElementById('translate-target');
         s.value = 'en';
@@ -2479,7 +2482,7 @@ export function runE2E(deps) {
     });
 
     await step('the-accuracy-card-is-honest-arithmetic', async () => {
-      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
       const a = await waitFor('the accuracy card', async () => {
         const a = await js('window.__recallDebug.accuracy()');
         return a.dash.corrections ? a : null;
@@ -2576,7 +2579,7 @@ export function runE2E(deps) {
     // The assertions below are the new contract, and the negative one is the
     // point of the change: this card must not tell somebody it waits.
     await step('enrichment-is-off-by-default-and-says-what-it-would-cost', async () => {
-      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
       const off = await waitFor('the enrichment card', async () => {
         const m = await js('window.__recallDebug.memory()');
         return m.enrichment.chip ? m.enrichment : null;
@@ -2651,7 +2654,7 @@ export function runE2E(deps) {
       );
       assert(tuned.threadsConfig === 6, `the daemon was not told: ${tuned.threadsConfig}`);
       await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
-      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
       // A remounted card paints its default before `graph.summary` answers, so
       // the wait is for the value itself: settling on 6 is the proof that the
       // daemon, and not this view's optimism, is where it came from.
@@ -2988,7 +2991,7 @@ export function runE2E(deps) {
 
     await step('each-mood-display-mode-changes-what-a-row-wears', async () => {
       const set = async (mode) => {
-        await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+        await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
         await waitFor('the mood card', async () =>
           (await js('window.__recallDebug.mood()')).modes.length ? true : null
         );
@@ -3007,7 +3010,7 @@ export function runE2E(deps) {
       // card is read from THERE — `set()` leaves the driver on the transcript,
       // which is where the row assertions belong and where a `modes` read
       // would correctly find nothing.
-      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
       const modes = await waitFor('the mood card', async () => {
         const m = (await js('window.__recallDebug.mood()')).modes;
         return m.length ? m : null;
@@ -3053,7 +3056,7 @@ export function runE2E(deps) {
       await waitFor('the daemon to say mood is rendered', async () =>
         (await js('window.__recallDebug.mood()')).rendered === true ? true : null
       );
-      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
       await js('document.getElementById("mood-display-both").click()');
       await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
       const v = await waitFor('a tinted row', async () => {
@@ -3118,7 +3121,7 @@ export function runE2E(deps) {
       await waitFor('the daemon to withhold the mood again', async () =>
         (await js('window.__recallDebug.mood()')).rendered === false ? true : null
       );
-      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
       const card = await waitFor('the reason on the card', async () => {
         const v = await js('window.__recallDebug.mood()');
         return v.why ? v : null;
@@ -3147,7 +3150,7 @@ export function runE2E(deps) {
     // comes and goes with it, and the header starts saying how much has been
     // read instead of "nothing is listened to".
     await step('the-mood-switch-turns-listening-on-and-off', async () => {
-      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
       await js('document.getElementById("mood-card").scrollIntoView({ block: "start" })');
       const off = await waitFor('the mood card in its shipped, off state', async () => {
         const v = await js('window.__recallDebug.mood()');
@@ -3191,7 +3194,7 @@ export function runE2E(deps) {
     // game or a busy GPU would otherwise trigger, which this mock has neither
     // of.
     await step('light-mode-switches-the-decoder-and-says-why', async () => {
-      await js('document.querySelector(\'.rail-item[data-view="memory"]\').click()');
+      await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
       await js('document.getElementById("light-card").scrollIntoView({ block: "start" })');
       // Ships OFF: the 110m export reads English only and measured 104.5% WER
       // on this install's German-heavy archive (FINDINGS §49). A person opts
@@ -3331,6 +3334,7 @@ export function runE2E(deps) {
       assert(replayable > 0, 'no search hit offers to replay the conversation it sits in');
       const file = await shot('search');
       await js('document.querySelector("#search-results .seg").click()');
+      await js(`[...document.querySelectorAll('.search-context button')].find(b => b.textContent === 'Open transcript').click()`);
       await waitFor('the transcript to take focus', async () => js('window.__recallDebug.view() === "transcript"'));
       const marked = await waitFor('the hit to be marked', async () => js('!!document.querySelector("#seg-list .seg.hit")'));
       return { hits, facets, replayable, marked, file };
@@ -3386,6 +3390,7 @@ export function runE2E(deps) {
       assert(!outside.held, 'the "oldest" segment was already in the live window — the fixture stopped being a test');
 
       await js(`document.querySelector('#search-results .seg[data-hit="${hitId}"]').click()`);
+      await js(`[...document.querySelectorAll('.search-context button')].find(b => b.textContent === 'Open transcript').click()`);
       await waitFor('the transcript', async () => js('window.__recallDebug.view() === "transcript"'));
       const marked = await waitFor(
         'the hit to be marked in the transcript',
@@ -4675,6 +4680,189 @@ export function runE2E(deps) {
         return { from: bar.text.slice(0, 60), version: bar.version, file };
       });
     }
+
+    // 0.14 — follow the actual UI, then independently read saved records back.
+    const clickLabel014 = (scope, label) => js(`(() => {
+      const button = [...document.querySelectorAll(${JSON.stringify(scope)} + ' button')].find(b => b.textContent.trim() === ${JSON.stringify(label)});
+      if (!button) throw new Error('Missing action: ' + ${JSON.stringify(label)});
+      button.click();
+    })()`);
+    const nav014 = name => js(`document.querySelector('.rail-item[data-view="${name}"]').click()`);
+    const saved014 = async () => {
+      await nav014('memory');
+      await js(`document.querySelector('[data-memory-tab="saved"]').click()`);
+      await waitFor('saved groups', () => js(`document.querySelectorAll('[data-saved-group]').length === 2`));
+    };
+    const readSaved014 = kind => js(`(async () => (await window.recall.request('saved.${kind}.list', {})).data.${kind})()`);
+    const saveSearch014 = async name => {
+      await js(`document.getElementById('search-save').click()`);
+      await js(`document.getElementById('saved-search-name').value = ${JSON.stringify(name)}`);
+      await clickLabel014('.sheet', 'Save search');
+      await waitFor('saved search dialog closed', () => js(`!document.getElementById('saved-search-name')`));
+      return waitFor('saved query on wire', async () => (await readSaved014('searches')).find(r => r.name === name));
+    };
+    let fixed014, rolling014, moment014;
+
+    await step('014-settings-separates-processing-and-remembers-density', async () => {
+      await nav014('memory');
+      assert(await js(`!document.getElementById('enrich-card') && !document.getElementById('translate-card')`), 'processing still clutters Memory');
+      await nav014('settings');
+      assert(await js(`!!document.getElementById('enrich-card') && !!document.getElementById('translate-card') && !!document.getElementById('accuracy-card')`), 'Settings lost an existing processing control');
+      const old = await js(`document.getElementById('settings-density').value`);
+      await js(`(() => { const s = document.getElementById('settings-density'); s.value = 'compact'; s.dispatchEvent(new Event('change')); })()`);
+      await nav014('transcript'); await nav014('settings');
+      assert(await js(`document.getElementById('settings-density').value === 'compact' && document.documentElement.dataset.density === 'compact'`), 'density lost on navigation');
+      await js(`(() => { const s = document.getElementById('settings-density'); s.value = ${JSON.stringify(old)}; s.dispatchEvent(new Event('change')); })()`);
+      return { file: await shot('014-settings') };
+    });
+
+    await step('014-memory-tabs-work-with-keyboard-and-show-day-attribution', async () => {
+      await nav014('memory');
+      await js(`(() => { const tab = document.querySelector('[data-memory-tab="recent"]'); tab.focus(); tab.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true })); })()`);
+      assert(await js(`document.activeElement.dataset.memoryTab === 'day' && document.querySelector('[data-memory-tab="day"]').getAttribute('aria-selected') === 'true'`), 'arrow navigation did not select By day');
+      await waitFor('archive day loaded', () => js(`!!document.querySelector('.archive-content h2')`));
+      assert(await js(`!!document.getElementById('archive-day')`), 'By day has no date control');
+      const count = await js(`document.querySelectorAll('.archive-segment').length`);
+      if (count) assert(await js(`[...document.querySelectorAll('.archive-segment .sub')].every(e => / · /.test(e.textContent))`), 'archive words lost attribution');
+      await js(`document.querySelector('[data-memory-tab="day"]').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }))`);
+      await waitFor('Saved tab loaded', () => js(`document.querySelectorAll('[data-saved-group]').length === 2`));
+      return { count, file: await shot('014-memory-saved') };
+    });
+
+    await step('014-fixed-search-survives-saving-and-reopening', async () => {
+      await nav014('search');
+      const bounds = await js(`(() => { const end = new Date(); const start = new Date(); start.setDate(start.getDate() - 7);
+        const day = d => [d.getFullYear(), String(d.getMonth()+1).padStart(2,'0'), String(d.getDate()).padStart(2,'0')].join('-');
+        document.getElementById('search-q').value = 'portal';
+        document.getElementById('search-speaker').value = ''; document.getElementById('search-source').value = '';
+        const from = document.getElementById('search-from'); const to = document.getElementById('search-to');
+        from.value = day(start); to.value = day(end); from.dispatchEvent(new Event('change'));
+        return { from: from.value, to: to.value }; })()`);
+      await waitFor('fixed portal results', () => js(`document.querySelectorAll('#search-results .seg').length > 0`));
+      fixed014 = await saveSearch014('E2E fixed ' + Date.now());
+      assert(fixed014.filters.date.kind === 'fixed', 'fixed dates were stored as a rolling window');
+      await saved014();
+      await clickLabel014(`[data-saved-kind="searches"][data-saved-id="${fixed014.id}"]`, 'Run search');
+      assert(await js(`document.getElementById('search-from').value === ${JSON.stringify(bounds.from)} && document.getElementById('search-to').value === ${JSON.stringify(bounds.to)} && document.getElementById('search-q').value === 'portal'`), 'reopened search changed its dates or query');
+      return { id: fixed014.id, bounds };
+    });
+
+    await step('014-rolling-search-keeps-relative-date-intent', async () => {
+      await clickLabel014('#search-date-scope', 'Last 7 days');
+      rolling014 = await saveSearch014('E2E rolling ' + Date.now());
+      assert(rolling014.filters.date.kind === 'rolling' && rolling014.filters.date.days === 7, 'relative scope lost when saved');
+      await saved014();
+      await clickLabel014(`[data-saved-kind="searches"][data-saved-id="${rolling014.id}"]`, 'Run search');
+      assert(await js(`document.getElementById('search-q').value === 'portal' && !!document.getElementById('search-from').value`), 'rolling search did not reopen');
+      return { id: rolling014.id };
+    });
+
+    await step('014-all-history-preserves-other-facets-and-context-preserves-results', async () => {
+      await js(`(() => { const q = document.getElementById('search-q'); q.value = 'portal yesterday'; document.getElementById('search-ask').click(); })()`);
+      await waitFor('explicit date interpretation', () => js(`!!document.querySelector('#ask-pills [data-facet="time"]')`));
+      const before = await js(`window.__recallDebug.ask().pills.filter(p => p.facet !== 'time').map(p => [p.facet,p.text])`);
+      await js(`document.getElementById('search-all-history').click()`);
+      await waitFor('all-history results', () => js(`!document.querySelector('#ask-pills [data-facet="time"]') && document.querySelectorAll('#search-results .seg').length > 0`));
+      const after = await js(`window.__recallDebug.ask().pills.filter(p => p.facet !== 'time').map(p => [p.facet,p.text])`);
+      assert(JSON.stringify(before) === JSON.stringify(after), 'all-history altered another interpreted facet');
+      assert(await js(`document.getElementById('search-date-scope').getClientRects().length > 0 && /all history/.test(document.getElementById('search-scope-label').textContent)`), 'active date scope is not visible');
+      const ids = await js(`(() => { window.__searchRows014 = [...document.querySelectorAll('#search-results .seg')]; return window.__searchRows014.map(r => r.dataset.hit); })()`);
+      await js(`document.querySelector('#search-results .seg').click()`);
+      await waitFor('adjacent turns', () => js(`!!document.querySelector('.search-context-turn.selected')`));
+      assert(await js(`window.__recallDebug.view() === 'search' && window.__searchRows014.every(r => r.isConnected)`), 'context replaced the results');
+      await clickLabel014('.search-context', 'Close');
+      assert(await js(`document.activeElement === window.__searchRows014[0] && document.querySelector('.search-context').hidden`), 'close did not return focus to the hit');
+      assert(JSON.stringify(ids) === JSON.stringify(await js(`[...document.querySelectorAll('#search-results .seg')].map(r => r.dataset.hit)`)), 'closing context changed result order');
+      await js(`document.querySelector('#search-results .seg').click()`);
+      await waitFor('context reopened', () => js(`!!document.querySelector('.search-context-turn.selected')`));
+      const normalSize = win().getSize();
+      let narrow;
+      try {
+        win().setSize(1024, 768); await sleep(300);
+        assert(await js(`document.documentElement.scrollWidth <= window.innerWidth && [...document.querySelectorAll('.search014, .search-workspace, .search-result-card, .search-context')].every(e => e.getBoundingClientRect().right <= window.innerWidth + 1)`), 'search/context overflows the supported narrow window');
+        narrow = await shot('014-search-context-1024');
+      } finally { win().setSize(...normalSize); await sleep(200); }
+      return { hits: ids.length, narrow, file: await shot('014-search-context') };
+    });
+
+    await step('014-search-saves-a-contiguous-moment-with-a-personal-note', async () => {
+      await clickLabel014('.search-context', 'Save moment');
+      await waitFor('moment range picker', () => js(`!!document.getElementById('moment-start')`));
+      const chosen = await js(`(() => { const a = document.getElementById('moment-start'), b = document.getElementById('moment-end');
+        if (a.options.length < 2) throw new Error('Fixture has no adjacent turn');
+        a.value = a.options[0].value; b.value = b.options[1].value;
+        document.getElementById('moment-title').value = 'E2E conversation'; document.getElementById('moment-note').value = 'My own note';
+        return [Number(a.value), Number(b.value)]; })()`);
+      await js(`document.getElementById('moment-save').click()`);
+      await waitFor('moment dialog closed', () => js(`!document.getElementById('moment-title')`));
+      moment014 = await waitFor('saved moment on wire', async () => (await readSaved014('moments')).find(m => m.title === 'E2E conversation'));
+      assert(JSON.stringify(moment014.segment_ids) === JSON.stringify(chosen), 'saved range differs from chosen adjacent turns');
+      assert(moment014.note === 'My own note', 'personal note was not stored');
+      return { id: moment014.id, chosen };
+    });
+
+    await step('014-transcript-picker-filters-and-save-moment-is-reachable', async () => {
+      await clickLabel014('.search-context', 'Open transcript');
+      await waitFor('transcript hit', () => js(`!!document.querySelector('#seg-list .seg.hit')`));
+      await js(`(() => { const r = document.querySelector('#seg-list .seg.hit'); r.focus(); r.click(); })()`);
+      await waitFor('speaker filter', () => js(`!!document.getElementById('speaker-find')`));
+      await js(`(() => { const i = document.getElementById('speaker-find'); i.value = 'no-person-with-this-name-014'; i.dispatchEvent(new Event('input')); })()`);
+      assert(await js(`document.querySelectorAll('.sp-pick button').length === 1 && /Unassigned/.test(document.querySelector('.sp-pick').textContent)`), 'speaker filter did not narrow to the unassigned option');
+      await js(`document.getElementById('segment-save-moment').click()`);
+      await waitFor('transcript save moment', () => js(`!!document.getElementById('moment-save')`));
+      assert(await js(`document.getElementById('moment-title').value === ''`), 'transcript text was copied into a saved title');
+      await js(`document.getElementById('moment-title').value = 'E2E transcript entry'; document.getElementById('moment-save').click()`);
+      await waitFor('transcript bookmark persisted', async () => (await readSaved014('moments')).some(m => m.title === 'E2E transcript entry'));
+    });
+
+    await step('014-replay-can-save-a-range-at-the-current-turn', async () => {
+      await nav014('search');
+      await js(`document.getElementById('search-q').value = 'portal'; document.getElementById('search-all-history').click()`);
+      await waitFor('replayable search result', () => js(`!!document.querySelector('#search-results .hit-replay')`));
+      await js(`document.querySelector('#search-results .hit-replay').click()`);
+      await waitFor('conversation replay', () => js(`!!document.getElementById('replay-save-moment') && !document.getElementById('replay-bar')?.hidden`));
+      await js(`document.getElementById('replay-save-moment').click()`);
+      await waitFor('replay moment picker', () => js(`!!document.getElementById('moment-start')`));
+      const selected = await js(`(() => { const start = document.getElementById('moment-start'), end = document.getElementById('moment-end');
+        const anchor = start.value; const index = [...end.options].findIndex(o => o.value === anchor);
+        end.value = end.options[Math.min(end.options.length - 1, index + 1)].value;
+        document.getElementById('moment-title').value = 'E2E replay entry';
+        return { start: Number(start.value), end: Number(end.value) }; })()`);
+      await js(`document.getElementById('moment-save').click()`);
+      const record = await waitFor('replay range persisted', async () => (await readSaved014('moments')).find(m => m.title === 'E2E replay entry'));
+      assert(record.segment_ids[0] === selected.start && record.segment_ids.at(-1) === selected.end, 'replay saved a different range from the picker');
+      return { ids: record.segment_ids };
+    });
+
+    await step('014-saved-items-edit-and-remove-without-deleting-transcript', async () => {
+      await saved014();
+      const scope = `[data-saved-kind="moments"][data-saved-id="${moment014.id}"]`;
+      await clickLabel014(scope, 'Edit');
+      await js(`document.getElementById('saved-edit-title').value = 'E2E renamed'; document.getElementById('saved-edit-note').value = 'Updated personal note'`);
+      await clickLabel014('.sheet', 'Save');
+      await waitFor('renamed saved row', () => js(`document.querySelector(${JSON.stringify(scope)} + ' h3')?.textContent === 'E2E renamed'`));
+      await nav014('search'); await saved014();
+      assert(await js(`document.querySelector(${JSON.stringify(scope)}).textContent.includes('Updated personal note')`), 'edited note did not survive reopening');
+      await clickLabel014(scope, 'Remove'); await clickLabel014('.sheet', 'Remove');
+      await waitFor('bookmark removed', async () => !(await readSaved014('moments')).some(m => m.id === moment014.id));
+      const context = await js(`(async () => (await window.recall.request('segments.context', { id: ${moment014.segment_ids[0]} })).data)()`);
+      assert(context.segments.some(s => s.id === moment014.segment_ids[0]), 'removing a bookmark deleted its source turn');
+      for (const record of [fixed014, rolling014]) {
+        await waitFor('saved search row', () => js(`!!document.querySelector('[data-saved-kind="searches"][data-saved-id="${record.id}"]')`));
+        await clickLabel014(`[data-saved-kind="searches"][data-saved-id="${record.id}"]`, 'Remove'); await clickLabel014('.sheet', 'Remove');
+        await waitFor('saved query removed', async () => !(await readSaved014('searches')).some(s => s.id === record.id));
+      }
+    });
+
+    await step('014-sheet-keyboard-traps-and-restores-focus', async () => {
+      await nav014('search');
+      await js(`document.getElementById('search-save').focus(); document.getElementById('search-save').click()`);
+      assert(await js(`document.activeElement.id === 'saved-search-name'`), 'saved search did not focus its name');
+      await js(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true }))`);
+      assert(await js(`document.activeElement.textContent === 'Save search'`), 'Shift+Tab escaped the sheet');
+      await js(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+      assert(await js(`!document.querySelector('.sheet') && document.activeElement.id === 'search-save'`), 'Escape did not restore the original control focus');
+    });
 
     // 15 — the app lives in the tray: closing the window hides it, does not
     // quit, and does not take the pause switch away with it (DESIGN §8).

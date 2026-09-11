@@ -555,6 +555,13 @@ impl Service {
             // ---- 0.11.0, grounded answers (PROTOCOL "0.11.0") --------------
             "search.answer" => self.search_answer(req),
             // ---- end 0.11.0 ------------------------------------------------
+            "saved.searches.list"
+            | "saved.searches.save"
+            | "saved.searches.delete"
+            | "saved.moments.list"
+            | "saved.moments.save"
+            | "saved.moments.delete"
+            | "segments.context" => crate::saved::handle(&self.store(), req),
             "notes.list" => self.notes_list(req),
             "notes.set_state" => self.notes_set_state(req),
             "person.brief" => self.person_brief(req),
@@ -4064,12 +4071,33 @@ impl Service {
         let limit = req.usize_or("limit", 50)?.clamp(1, 1000);
         let filter = self.filter_of(req)?;
 
-        let store = self.store();
-        let within = semantic::candidates(&store, &filter).map_err(Error::from)?;
         let started = std::time::Instant::now();
-        let scored = leg
-            .search(&store, &q, limit, &within)
+        let (snapshot, within) = {
+            let store = self.store();
+            (
+                leg.snapshot(&store).map_err(Error::from)?,
+                semantic::candidates(&store, &filter).map_err(Error::from)?,
+            )
+        };
+        let snapshot_seq = snapshot.sequence();
+        let mut scored = leg
+            .search_snapshot(snapshot, &q, limit, &within)
             .map_err(|e| Error::new("failed", format!("{e:#}")))?;
+        // Capture and edits may proceed during inference/ranking. Revalidate
+        // the facets and deletion visibility before constructing reply rows.
+        let store = self.store();
+        let current = semantic::candidates(&store, &filter).map_err(Error::from)?;
+        let model_id = leg.model_id();
+        let mut validated = Vec::with_capacity(scored.len());
+        for hit in scored.drain(..) {
+            if current.admits(hit.segment_id)
+                && crate::semantic::vector_current(&store, hit.segment_id, &model_id, snapshot_seq)
+                    .map_err(Error::from)?
+            {
+                validated.push(hit);
+            }
+        }
+        scored = validated;
         let took_ms = started.elapsed().as_secs_f64() * 1000.0;
         let semantic_ids: Vec<i64> = scored.iter().map(|s| s.segment_id).collect();
         let scores: HashMap<i64, f32> = scored.iter().map(|s| (s.segment_id, s.score)).collect();
@@ -4092,7 +4120,11 @@ impl Service {
 
         let fused = semantic::fuse(&keyword_ids, &semantic_ids, semantic::RRF_K);
         let mut hits = Vec::with_capacity(fused.len().min(limit));
-        for f in fused.iter().take(limit) {
+        for f in fused
+            .iter()
+            .filter(|f| current.admits(f.segment_id))
+            .take(limit)
+        {
             let Some(row) = store.segment_row(f.segment_id).map_err(Error::from)? else {
                 continue;
             };
@@ -4422,15 +4454,41 @@ impl Service {
             .into_iter()
             .map(|(id, label)| crate::ask::World { id, label })
             .collect();
-        let interpretation = crate::ask::parse_with_worlds(&q, utc_now_ns(), &named, &worlds);
-
+        let mut interpretation = crate::ask::parse_with_worlds(&q, utc_now_ns(), &named, &worlds);
+        // Visible controls supply defaults, while dates and people explicitly
+        // named in a question keep their meaning. Resolve this BEFORE searching
+        // so grounded answers see precisely the same filtered rows as the UI.
+        let defaults = self.filter_of(req)?;
+        let date_explicit = interpretation.from_ns.is_some() || interpretation.to_ns.is_some();
+        if !date_explicit {
+            interpretation.from_ns = defaults.from;
+            interpretation.to_ns = defaults.to;
+        }
+        if interpretation.speaker_id.is_none() {
+            interpretation.speaker_id = defaults.speaker;
+            interpretation.speaker_label = named
+                .iter()
+                .find(|speaker| Some(speaker.id) == defaults.speaker)
+                .map(|speaker| speaker.label.clone());
+        }
+        let filter_worlds = interpretation
+            .world_id
+            .clone()
+            .map(|id| vec![id])
+            .or(defaults.worlds);
+        if interpretation.world_id.is_none() {
+            interpretation.world_id = req
+                .opt_str("world")?
+                .filter(|w| !w.trim().is_empty())
+                .map(str::to_string);
+        }
         let filter = SegmentFilter {
             speaker: interpretation.speaker_id,
             session: None,
-            source: None,
+            source: defaults.source,
             from: interpretation.from_ns,
             to: interpretation.to_ns,
-            worlds: interpretation.world_id.clone().map(|id| vec![id]),
+            worlds: filter_worlds,
         };
         // ---- end 0.10.0 -------------------------------------------------
         let expression = crate::ask::fts_expression(&interpretation.query);
@@ -4444,6 +4502,8 @@ impl Service {
             "interpretation": {
                 "query": interpretation.query,
                 "speaker_id": interpretation.speaker_id,
+                "source": filter.source,
+                "date_explicit": date_explicit,
                 // Spelled as the voicebank spells it, not as it was typed.
                 "speaker_label": interpretation.speaker_label,
                 // 0.10.0. The id is what a client passes back as the `world`
@@ -4517,11 +4577,30 @@ impl Service {
         // The same fusion `search.semantic` performs, over the parsed facets.
         // The vector leg is given the residual words as a PHRASE — it embeds
         // meaning, and quoting each word for FTS would be noise to it.
-        let store = self.store();
-        let within = crate::semantic::candidates(&store, filter).map_err(Error::from)?;
-        let scored = leg
-            .search(&store, query, limit, &within)
+        let (snapshot, within) = {
+            let store = self.store();
+            (
+                leg.snapshot(&store).map_err(Error::from)?,
+                crate::semantic::candidates(&store, filter).map_err(Error::from)?,
+            )
+        };
+        let snapshot_seq = snapshot.sequence();
+        let mut scored = leg
+            .search_snapshot(snapshot, query, limit, &within)
             .map_err(|e| Error::new("failed", format!("{e:#}")))?;
+        let store = self.store();
+        let current = crate::semantic::candidates(&store, filter).map_err(Error::from)?;
+        let model_id = leg.model_id();
+        let mut validated = Vec::with_capacity(scored.len());
+        for hit in scored.drain(..) {
+            if current.admits(hit.segment_id)
+                && crate::semantic::vector_current(&store, hit.segment_id, &model_id, snapshot_seq)
+                    .map_err(Error::from)?
+            {
+                validated.push(hit);
+            }
+        }
+        scored = validated;
         let semantic_ids: Vec<i64> = scored.iter().map(|s| s.segment_id).collect();
         let scores: HashMap<i64, f32> = scored.iter().map(|s| (s.segment_id, s.score)).collect();
         let keyword_ids: Vec<i64> = match store.search_filtered(expression, filter, limit) {
@@ -4533,7 +4612,11 @@ impl Service {
         };
         let fused = crate::semantic::fuse(&keyword_ids, &semantic_ids, crate::semantic::RRF_K);
         let mut hits = Vec::with_capacity(fused.len().min(limit));
-        for f in fused.iter().take(limit) {
+        for f in fused
+            .iter()
+            .filter(|f| current.admits(f.segment_id))
+            .take(limit)
+        {
             let Some(row) = store.segment_row(f.segment_id).map_err(Error::from)? else {
                 continue;
             };
@@ -5462,6 +5545,40 @@ mod tests {
             )
             .unwrap();
         (sess, seg)
+    }
+
+    #[test]
+    fn search014_visible_facets_apply_before_grounded_answer() {
+        let r = rig("search014-facets");
+        let (_, id) = a_segment(&r, "portal fountain");
+        for method in ["search.ask", "search.answer"] {
+            let out = call(&r, &json!({"id": 1, "method": method, "params": {
+                "q": "portal", "source": "VRChat.exe", "from": "1970-01-01T00:00:00Z", "to": "1970-01-02T00:00:00Z"
+            }}).to_string()).unwrap();
+            assert_eq!(out["hits"][0]["id"], id);
+            assert_eq!(out["interpretation"]["source"], "VRChat.exe");
+            assert_eq!(out["interpretation"]["date_explicit"], false);
+            assert_eq!(out["interpretation"]["to_ns"], "86400000000000");
+            let excluded = call(
+                &r,
+                &json!({"id": 2, "method": method, "params": {
+                    "q": "portal", "source": "another-app"
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            assert!(excluded["hits"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn search014_explicit_question_dates_win_over_visible_defaults() {
+        let r = rig("search014-explicit");
+        let out = call(&r, &json!({"id": 1, "method": "search.ask", "params": {
+            "q": "portal yesterday", "from": "1970-01-01T00:00:00Z", "to": "1970-01-02T00:00:00Z"
+        }}).to_string()).unwrap();
+        assert_eq!(out["interpretation"]["date_explicit"], true);
+        assert_ne!(out["interpretation"]["to_ns"], "86400000000000");
     }
 
     // ---- 0.10.0: the room microphone and the Markdown export -------------

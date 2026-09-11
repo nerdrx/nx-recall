@@ -25,7 +25,7 @@ import { patchSpeakerLabels } from './lib/labels.js';
 // 0.12.0 — the half of a relabel lib/labels.js does not know about, and the
 // look-up the roster brief needs for the voice that just walked in.
 import { lookOf, iconSpan, paintHighlights } from './views/highlight.js';
-import { toast } from './lib/sheets.js';
+import { toast, sheetsOpen } from './lib/sheets.js';
 import { stop as stopPreview, playbackState } from './lib/preview.js';
 import * as replay from './lib/replay.js';
 import * as transcriptView from './views/transcript.js';
@@ -34,12 +34,18 @@ import * as searchView from './views/search.js';
 import * as sourcesView from './views/sources.js';
 import * as personView from './views/person.js';
 import * as memoryView from './views/memory.js';
+import * as settingsView from './views/settings.js';
+
+try {
+  document.documentElement.dataset.density = localStorage.getItem('nx-recall-density') === 'compact' ? 'compact' : 'comfortable';
+} catch { document.documentElement.dataset.density = 'comfortable'; }
 
 const VIEWS = {
   transcript: transcriptView,
   speakers: speakersView,
   search: searchView,
   memory: memoryView,
+  settings: settingsView,
   sources: sourcesView,
   // Not in the rail: the person page is pushed state, reached from a voice and
   // left with Back. The app has five places (docs/GRAPH.md) and this is not one
@@ -48,7 +54,7 @@ const VIEWS = {
 };
 
 /** Views the rail can select. Anything else is pushed. */
-const RAIL_VIEWS = new Set(['transcript', 'speakers', 'search', 'memory', 'sources']);
+const RAIL_VIEWS = new Set(['transcript', 'speakers', 'search', 'memory', 'sources', 'settings']);
 
 const main = document.getElementById('main');
 const footer = document.getElementById('footer');
@@ -117,6 +123,8 @@ function go(name, arg = null) {
   stopPreview();
   // …and any menu it left hanging over a row that is about to stop existing.
   current?.closeMenu?.();
+  current?.destroy?.();
+  current?.unmount?.();
   // Remember the rail view a push came from, so Back is where you were rather
   // than wherever the code happens to think you should be.
   if (!RAIL_VIEWS.has(name) && RAIL_VIEWS.has(currentName)) returnTo = currentName;
@@ -508,6 +516,8 @@ async function showBrief(spId) {
 // ---------------------------------------------------------------------------
 
 function renderFooter() {
+  const detailsOpen = footer.querySelector('details')?.open ?? false;
+  const detailsFocused = document.activeElement === footer.querySelector('summary');
   clear(footer);
   const st = store.conn;
   const online = st.status === 'connected';
@@ -520,7 +530,7 @@ function renderFooter() {
   const text = catching
     ? 'reconnected — still catching up'
     : online
-      ? `connected · ${st.daemon ?? 'recalld'}`
+      ? 'connected · local only'
       : st.status === 'connecting'
         ? 'connecting…'
         : 'daemon offline — retrying';
@@ -565,7 +575,12 @@ function renderFooter() {
     store.paused ? h('span', { class: 'chip warn' }, h('span', { class: 'dot' }), 'capture paused') : null,
     h('span', { class: 'spacer' }),
   ];
-  footer.append(...parts.filter(Boolean));
+  const connection = parts.shift();
+  const capture = !online ? 'Capture status unavailable' : store.paused ? 'Capture paused' : !live ? 'Checking capture status…' : (live.sources_capturing ?? 0) > 0 ? `Capturing ${live.sources_capturing} source${live.sources_capturing === 1 ? '' : 's'}` : 'Ready · no active sources';
+  const detailContent = h('div', { class: 'footer-detail-content' }, ...parts.filter(Boolean));
+  const details = h('details', { class: 'footer-details', open: detailsOpen },
+    h('summary', { text: 'Technical details' }), detailContent);
+  footer.append(connection, h('span', { class: statCls, id: 'capture-stat', text: capture }), h('span', { class: 'spacer' }), details);
 
   for (const [opId, op] of store.ops) {
     footer.append(
@@ -580,7 +595,8 @@ function renderFooter() {
     void opId;
   }
 
-  footer.append(h('span', { class: 'stat', style: 'font-family:var(--mono);opacity:.7' }, st.socketPath ?? ''));
+  detailContent.append(h('span', { class: 'stat', text: st.daemon ?? 'recalld' }), h('span', { class: 'stat', style: 'font-family:var(--mono);opacity:.7' }, st.socketPath ?? ''));
+  if (detailsFocused) details.querySelector('summary').focus();
 }
 
 // The rail counts belong to the model, not to whichever view happens to be
@@ -727,14 +743,15 @@ window.recall.onToast((t) => toast(t.text, t.kind));
 // ---------------------------------------------------------------------------
 
 document.addEventListener('keydown', (e) => {
-  if (e.target.matches?.('input, textarea, select')) return;
-  if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+  if (sheetsOpen()) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
     e.preventDefault();
     go('search');
     current?.focusQuery?.();
     return;
   }
-  const map = { 1: 'transcript', 2: 'speakers', 3: 'search', 4: 'memory', 5: 'sources' };
+  if (e.target.closest?.('input, textarea, select, [contenteditable="true"]')) return;
+  const map = { 1: 'transcript', 2: 'speakers', 3: 'search', 4: 'memory', 5: 'sources', 6: 'settings' };
   if ((e.ctrlKey || e.altKey) && map[e.key]) {
     e.preventDefault();
     go(map[e.key]);

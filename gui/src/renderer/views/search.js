@@ -1,9 +1,8 @@
 // Search — over the transcript, with speaker / source / date facets, in three
 // modes: the words (FTS), the meaning (vectors), or both fused. The mode
 // control and the per-hit `via` marker live in ./semantic.js.
-// A hit is not a destination: clicking one loads the transcript around that
-// moment and highlights it, because "what did she say about that world?" is
-// answered by the conversation, not by the matching line on its own.
+// Open a hit beside the results, with the adjacent turns and a transcript
+// link. The conversation supplies context without losing the result list.
 
 import { h, clear, fmtClock, fmtDay, fmtDayLabel, fmtDate } from '../lib/dom.js';
 import { store, speakerLabel, segmentSpeakerLabel, isUncertain, isShaky, ask } from '../lib/store.js';
@@ -11,8 +10,10 @@ import { moodChips, shakyMark, translationCell } from '../lib/marks.js';
 // 0.12.0 — per-person highlights. The same three helpers the transcript uses,
 // because a hit and the row it takes you to must not disagree about a colour.
 import { look, lookOf, iconSpan, markRow } from './highlight.js';
-import { toast } from '../lib/sheets.js';
+import { openSheet, toast } from '../lib/sheets.js';
 import { defaultMode, modeControl, modeById, requestFor, resultSummary, semanticState, viaBadge } from './semantic.js';
+
+import { saveMomentSheet } from '../lib/saved.js';
 
 export const id = 'search';
 
@@ -26,6 +27,7 @@ function isoDay(d) {
   return `${y}-${m}-${day}`;
 }
 const facetState = {
+  date: { kind: 'rolling', days: 7 },
   q: '',
   speaker: '',
   source: '',
@@ -79,8 +81,13 @@ export function mount(root, ctx, arg) {
   facetState.world = arg?.world ? String(arg.world) : '';
   facetState.worldLabel = arg?.world ? (arg.worldLabel ?? '') : '';
   if (arg?.world) facetState.asked = null;
+  if (arg?.savedSearch) Object.assign(facetState, restoreSavedSearch(arg.savedSearch));
+  if (facetState.date.kind === 'rolling') Object.assign(facetState, resolveSearchDate(facetState.date));
   const results = h('div', { id: 'search-results' });
-  const resultCard = h('div', { class: 'card' }, results);
+  const resultCard = h('div', { class: 'card search-result-card' }, results);
+  const context = h('aside', { class: 'card search-context', hidden: true, 'aria-label': 'Conversation context' });
+  let contextGeneration = 0;
+  let disposed = false;
   const sub = h('span', { class: 'sub', id: 'search-sub', text: 'Everything captured, by word or by meaning.' });
 
   const sem = semanticState(store.status);
@@ -155,13 +162,13 @@ export function mount(root, ctx, arg) {
       id: 'search-advanced',
       'aria-expanded': String(facetState.advanced),
       'aria-controls': 'search-facets',
-      title: 'The speaker, source and date facets, set by hand',
+      title: 'Choose a speaker or source',
       onclick: () => {
         facetState.advanced = !facetState.advanced;
         paintAdvanced();
       },
     },
-    'Advanced'
+    'Filters'
   );
 
   // The front door: one box, one button, and a drawer.
@@ -187,12 +194,71 @@ export function mount(root, ctx, arg) {
     { class: 'facets', id: 'search-facets', hidden: !facetState.advanced },
     h('div', { class: 'facet' }, h('label', { for: 'search-speaker', text: 'Speaker' }), speakerSel),
     h('div', { class: 'facet' }, h('label', { for: 'search-source', text: 'Source' }), sourceSel),
-    h('div', { class: 'facet' }, h('label', { for: 'search-from', text: 'From' }), fromInput),
-    h('div', { class: 'facet' }, h('label', { for: 'search-to', text: 'To' }), toInput),
     h('div', { class: 'facet' }, h('label', { text: ' ' }), h('button', { class: 'btn', id: 'search-go', onclick: () => run() }, 'Search'))
   );
 
-  const body = h('div', { class: 'view-body view-enter' }, h('div', { class: 'card' }, askRow, pills, facets, modes.el), resultCard);
+  const scopeLabel = h('span', { class: 'sub', id: 'search-scope-label', 'aria-live': 'polite' });
+  const allHistory = () => {
+    facetState.date = { kind: 'all' };
+    facetState.from = fromInput.value = '';
+    facetState.to = toInput.value = '';
+    if (facetState.asked) {
+      facetState.asked = { ...withoutSearchDates(facetState.asked), date_explicit: true };
+      void rerunAsked();
+    } else void run();
+    paintScope();
+  };
+  function paintScope() {
+    const it = facetState.asked;
+    scopeLabel.textContent = it?.from_ns || it?.to_ns ? `Searching ${timeLabel(it)}`
+      : facetState.from || facetState.to ? `Searching ${facetState.from || 'the beginning'} → ${facetState.to || 'today'}` : 'Searching all history';
+  }
+  for (const input of [fromInput, toInput]) input.addEventListener('change', () => {
+    facetState.from = fromInput.value;
+    facetState.to = toInput.value;
+    facetState.date = { kind: 'fixed', from: facetState.from, to: facetState.to };
+    if (facetState.asked) {
+      facetState.asked = { ...withoutSearchDates(facetState.asked), date_explicit: true };
+      const bounds = searchDateParams(facetState);
+      if (bounds.from) facetState.asked.from_ns = String(BigInt(Date.parse(bounds.from)) * 1000000n);
+      if (bounds.to) facetState.asked.to_ns = String(BigInt(Date.parse(bounds.to)) * 1000000n);
+      void rerunAsked();
+    } else void run();
+    paintScope();
+  });
+  const dateRow = h('div', { class: 'facets search-date-scope', id: 'search-date-scope' },
+    h('div', { class: 'facet' }, h('label', { for: 'search-from', text: 'From' }), fromInput),
+    h('div', { class: 'facet' }, h('label', { for: 'search-to', text: 'To' }), toInput),
+    h('button', { class: 'btn', id: 'search-all-history', onclick: allHistory }, 'Search all history'),
+    h('button', { class: 'btn', onclick: () => {
+      facetState.date = { kind: 'rolling', days: 7 };
+      Object.assign(facetState, resolveSearchDate(facetState.date));
+      fromInput.value = facetState.from; toInput.value = facetState.to;
+      if (facetState.asked) {
+        facetState.asked = { ...withoutSearchDates(facetState.asked), date_explicit: false };
+        void rerunAsked();
+      } else void run();
+      paintScope();
+    } }, 'Last 7 days'), scopeLabel);
+  const saveSearch = () => openSheet((close) => {
+    const name = h('input', { class: 'input', id: 'saved-search-name', value: qInput.value.trim().slice(0, 120), maxlength: 120 });
+    const save = h('button', { class: 'btn primary', onclick: async () => {
+      if (!name.value.trim()) { name.focus(); return; }
+      save.disabled = true;
+      try {
+        const snapshot = { ...facetState, q: qInput.value, speaker: speakerSel.value, source: sourceSel.value,
+          from: fromInput.value, to: toInput.value, asked: qInput.value === facetState.q ? facetState.asked : null };
+        await ask('saved.searches.save', { name: name.value.trim(), query: snapshot.q, filters: savedSearchFilters(snapshot) });
+        close(); toast('Search saved in Memory.', '');
+      } catch (e) { toast(e.message, 'error'); save.disabled = false; }
+    } }, 'Save search');
+    return [h('h2', { text: 'Save this search' }), h('p', { class: 'sub', text: 'Keep this query and its filters in Memory. Last 7 days stays relative; chosen dates stay fixed.' }),
+      h('label', { for: 'saved-search-name', text: 'Name' }), name,
+      h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => close() }, 'Cancel'), save)];
+  });
+  const body = h('div', { class: 'view-body view-enter search014' }, h('div', { class: 'card' }, askRow, dateRow, pills, facets,
+    h('div', { class: 'search-tools' }, modes.el, h('button', { class: 'btn', id: 'search-save', onclick: saveSearch }, 'Save search'))),
+    h('div', { class: 'search-workspace' }, resultCard, context));
   root.append(
     h('div', { class: 'view-head' }, h('div', {}, h('h1', { text: 'Search' }), sub), h('div', { class: 'spacer' })),
     body
@@ -209,7 +275,26 @@ export function mount(root, ctx, arg) {
    * words are still a perfectly good keyword query, so it falls through to the
    * explicit path and says so once.
    */
+  function acceptInterpretation(interpretation) {
+    facetState.asked = interpretation ?? null;
+    if (interpretation?.date_explicit) {
+      facetState.from = fromInput.value = interpretation.from_ns ? isoDay(new Date(nsToMs(interpretation.from_ns))) : '';
+      facetState.to = toInput.value = interpretation.to_ns ? isoDay(new Date(nsToMs(interpretation.to_ns) - 1)) : '';
+      facetState.date = { kind: 'fixed', from: facetState.from, to: facetState.to };
+    }
+  }
+
+  function askParams() {
+    facetState.speaker = speakerSel.value; facetState.source = sourceSel.value;
+    facetState.from = fromInput.value; facetState.to = toInput.value;
+    return { q: facetState.q, limit: 100, ...searchDateParams(facetState),
+      ...(facetState.speaker ? { speaker: Number(facetState.speaker) } : {}),
+      ...(facetState.source ? { source: facetState.source } : {}),
+      ...(facetState.world ? { world: facetState.world } : {}) };
+  }
+
   async function runAsk() {
+    context.hidden = true; contextGeneration++;
     const my = ticket();
     facetState.q = qInput.value;
     facetState.answer = null;
@@ -227,9 +312,9 @@ export function mount(root, ctx, arg) {
     // guessed wrong about costs a model call it did not need and nothing else.
     const question = looksLikeAQuestion(facetState.q);
     try {
-      const res = await ask(question ? 'search.answer' : 'search.ask', { q: facetState.q, limit: 100 });
+      const res = await ask(question ? 'search.answer' : 'search.ask', askParams());
       if (stale(my)) return undefined;
-      facetState.asked = res.interpretation ?? null;
+      acceptInterpretation(res.interpretation);
       facetState.answer = res.answer ?? null;
       facetState.refused = res.refused ?? null;
       // The mode the daemon chose is the mode the toggle now shows: the control
@@ -249,9 +334,9 @@ export function mount(root, ctx, arg) {
         // this fall through to a plain keyword search.
         if (question) {
           try {
-            const res = await ask('search.ask', { q: facetState.q, limit: 100 });
+            const res = await ask('search.ask', askParams());
             if (stale(my)) return undefined;
-            facetState.asked = res.interpretation ?? null;
+            acceptInterpretation(res.interpretation);
             lastHits = res.hits ?? [];
             renderPills();
             renderHits(res);
@@ -285,6 +370,7 @@ export function mount(root, ctx, arg) {
    * the facet straight back.
    */
   async function rerunAsked() {
+    context.hidden = true; contextGeneration++;
     const my = ticket();
     const it = facetState.asked;
     // Taking a pill off changes which turns were searched, so whatever
@@ -292,9 +378,10 @@ export function mount(root, ctx, arg) {
     facetState.answer = null;
     facetState.refused = null;
     if (!it) return run();
-    const params = { q: it.query ?? '', limit: 100 };
+    const params = { q: it.query ?? '', limit: 100, ...(!it.from_ns && !it.to_ns && it.date_explicit === false ? searchDateParams(facetState) : {}) };
     if (it.speaker_id != null) params.speaker = it.speaker_id;
     if (it.world_id) params.world = it.world_id;
+    if (it.source) params.source = it.source;
     if (it.from_ns) params.from = new Date(nsToMs(it.from_ns)).toISOString();
     if (it.to_ns) params.to = new Date(nsToMs(it.to_ns)).toISOString();
     // An empty query with facets is a browse, and only the keyword leg can
@@ -302,7 +389,8 @@ export function mount(root, ctx, arg) {
     const modeId = params.q.trim() ? modeIdOf(it.mode) : 'keyword';
     try {
       const [method, p] = requestFor(modeId, params);
-      const res = await ask(method, p);
+      const response = await ask(params.q.trim() ? method : 'transcript', p);
+      const res = params.q.trim() ? response : { hits: [...(response.segments ?? [])].reverse(), total: response.segments?.length ?? 0 };
       if (stale(my)) return undefined;
       lastHits = res.hits ?? [];
       renderPills();
@@ -354,6 +442,7 @@ export function mount(root, ctx, arg) {
   }
 
   function renderPills() {
+    paintScope();
     clear(pills);
     const it = facetState.asked;
     // The world pill shows on BOTH paths: a facet the daemon read out of a
@@ -442,6 +531,10 @@ export function mount(root, ctx, arg) {
         )
       );
     }
+    if (it.source) pills.append(pill('source', it.source, 'Only this source — remove to search every source', () => {
+      delete facetState.asked.source;
+      facetState.source = sourceSel.value = '';
+    }));
     if (it.world_id) {
       pills.append(
         pill(
@@ -460,6 +553,10 @@ export function mount(root, ctx, arg) {
         pill('time', timeLabel(it), 'Only this stretch of time — press ✕ to search all of it', () => {
           delete facetState.asked.from_ns;
           delete facetState.asked.to_ns;
+          delete facetState.asked.from_ms; delete facetState.asked.to_ms;
+          facetState.asked.date_explicit = true;
+          facetState.date = { kind: 'all' };
+          facetState.from = fromInput.value = ''; facetState.to = toInput.value = '';
         })
       );
     }
@@ -473,6 +570,7 @@ export function mount(root, ctx, arg) {
   }
 
   async function run() {
+    context.hidden = true; contextGeneration++;
     const my = ticket();
     // An explicit search is a different question from the one that was asked,
     // so the pills go: leaving them up would explain results they did not
@@ -492,7 +590,7 @@ export function mount(root, ctx, arg) {
     // way here, and an empty query is a `params` error on the daemon — so this
     // says "ask me something" rather than showing a red box for a question
     // nobody asked.
-    if (!facetState.q.trim() && !facetState.world && !facetState.speaker && !facetState.source) {
+    if (!hasSearchIntent(facetState, { saved: !!arg?.savedSearch })) {
       lastHits = [];
       clear(results);
       sub.textContent = 'Everything captured, by word or by meaning.';
@@ -502,7 +600,7 @@ export function mount(root, ctx, arg) {
           { class: 'empty' },
           h('b', { text: 'Search everything you have said and heard' }),
           h('p', {
-            text: 'Type a few words, or narrow by speaker, source and date. Results open in the transcript where they were said.',
+            text: 'Type a few words, or narrow by speaker, source and date. Open a result to read the surrounding conversation.',
           })
         )
       );
@@ -512,16 +610,15 @@ export function mount(root, ctx, arg) {
     const params = { q: facetState.q, limit: 100 };
     if (facetState.speaker) params.speaker = Number(facetState.speaker);
     if (facetState.source) params.source = facetState.source;
-    if (facetState.from) params.from = `${facetState.from}T00:00:00Z`;
-    if (facetState.to) params.to = `${facetState.to}T23:59:59Z`;
+    Object.assign(params, searchDateParams(facetState));
     if (facetState.world) params.world = facetState.world;
 
     try {
       // A world with no words is a BROWSE, not a search for nothing: arriving
       // from a world chip, the facet is the whole question and there is no
       // query to rank by. `transcript` takes the same facet and answers it.
-      if (!facetState.q.trim() && facetState.world) {
-        const res = await ask('transcript', { world: facetState.world, limit: 100 });
+      if (!facetState.q.trim()) {
+        const res = await ask('transcript', params);
         if (stale(my)) return;
         lastHits = [...(res.segments ?? [])].reverse();
         renderHits({ total: lastHits.length, hits: lastHits }, 'keyword');
@@ -751,7 +848,7 @@ export function mount(root, ctx, arg) {
       dataset: { hit: String(seg.id) },
       role: 'button',
       tabindex: '0',
-      title: 'Open this moment in the transcript',
+      title: 'Read the surrounding conversation',
     });
     row.append(
       h('span', { class: 't', text: `${fmtDay(seg.t_ms).slice(5)} ${fmtClock(seg.t_ms).slice(0, 5)}` }),
@@ -823,12 +920,44 @@ export function mount(root, ctx, arg) {
     // grounds: an `uncertain` hit is a guess about who spoke, and styles.css
     // deliberately overrides the speaker colour on those.
     markRow(row, hl, { uncertain: isUncertain(seg) });
-    const jump = () => ctx.jumpToSegment(seg);
+    const jump = () => openContext(seg, row);
     row.addEventListener('click', jump);
     row.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') jump();
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); jump(); }
     });
     return row;
+  }
+
+  async function openContext(seg, trigger) {
+    const my = ++contextGeneration;
+    context.hidden = false;
+    clear(context);
+    const close = () => { contextGeneration++; context.hidden = true; trigger.focus(); };
+    context.onkeydown = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+    const closeButton = h('button', { class: 'btn small', 'aria-label': 'Close conversation context', onclick: close }, 'Close');
+    const content = h('div', { class: 'search-context-turns', 'aria-live': 'polite' }, 'Loading conversation…');
+    context.append(h('div', { class: 'search-context-head' }, h('h2', { text: 'Around this moment' }), closeButton),
+      h('p', { class: 'sub', text: fmtDayLabel(seg.t_ms) }),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn', onclick: () => ctx.jumpToSegment(seg) }, 'Open transcript'),
+        h('button', { class: 'btn', onclick: () => saveMomentSheet([seg.id]) }, 'Save moment'),
+        seg.thread != null ? h('button', { class: 'btn', onclick: () => ctx.replayThread?.(seg.thread, { from: seg.id }) }, 'Replay') : null), content);
+    closeButton.focus({ preventScroll: true });
+    try {
+      const res = await ask('segments.context', { id: seg.id, before: 3, after: 3 });
+      if (disposed || my !== contextGeneration || !context.isConnected) return;
+      clear(content);
+      const turns = (res.segments ?? []).sort((a, b) => a.t_ms - b.t_ms || a.id - b.id);
+      if (!turns.some((turn) => turn.id === seg.id)) throw new Error('This moment is no longer available.');
+      turns.sort((a, b) => a.t_ms - b.t_ms || a.id - b.id);
+      for (const turn of turns) content.append(h('article', { class: `search-context-turn${turn.id === seg.id ? ' selected' : ''}` },
+        h('div', { class: 'sub', text: `${fmtClock(turn.t_ms)} · ${segmentSpeakerLabel(turn)}` }), translationCell(turn)));
+      const selected = content.querySelector('.selected');
+      if (selected) content.scrollTop = Math.max(0, selected.offsetTop - content.offsetTop - 80);
+    } catch (e) {
+      if (disposed || my !== contextGeneration || !context.isConnected) return;
+      clear(content); content.append(h('p', { text: `Could not load context: ${e.message}` }));
+    }
   }
 
   // Marks the query inside the hit without ever building HTML from daemon text.
@@ -854,6 +983,7 @@ export function mount(root, ctx, arg) {
   // Re-run mount() in place: the mode control's availability is baked into
   // its buttons, and rebuilding is cheaper to reason about than mutating them.
   function remount() {
+    disposed = true; contextGeneration++; ticket();
     clear(root);
     return mount(root, ctx, arg);
   }
@@ -861,18 +991,20 @@ export function mount(root, ctx, arg) {
   fillFacets();
   paintAdvanced();
   renderPills();
-  if (facetState.q || facetState.speaker || facetState.source || facetState.world) run();
+  if (arg?.savedSearch && facetState.asked) void rerunAsked();
+  else if (arg?.savedSearch || facetState.q || facetState.speaker || facetState.source || facetState.world) run();
   else
     results.append(
       h(
         'div',
         { class: 'empty' },
         h('b', { text: 'Search everything you have said and heard' }),
-        h('p', { text: 'Type a few words, or narrow by speaker, source and date. Results open in the transcript where they were said.' })
+        h('p', { text: 'Type a few words, or narrow by speaker, source and date. Open a result to read the surrounding conversation.' })
       )
     );
 
   return {
+    destroy() { disposed = true; contextGeneration++; ticket(); },
     update(change) {
       if (change?.relabel || change?.merged) fillFacets();
       if (change?.sources) fillFacets();
@@ -896,4 +1028,42 @@ export function lastSearchDate() {
 
 export function noteJump() {
   toast('Opened in the transcript.', '');
+}
+
+// Date intent is persisted separately from resolved bounds: reopening a rolling
+// search next month must not silently search the week when it was saved.
+export function resolveSearchDate(date, now = new Date()) {
+  if (date?.kind === 'rolling') {
+    const start = new Date(now); start.setDate(start.getDate() - (date.days ?? 7));
+    return { from: isoDay(start), to: isoDay(now) };
+  }
+  return date?.kind === 'fixed' ? { from: date.from || '', to: date.to || '' } : { from: '', to: '' };
+}
+export function searchDateParams(state) {
+  const out = {};
+  if (state.from) out.from = new Date(`${state.from}T00:00:00`).toISOString();
+  if (state.to) { const end = new Date(`${state.to}T00:00:00`); end.setDate(end.getDate() + 1); out.to = end.toISOString(); }
+  return out;
+}
+export function withoutSearchDates(interpretation) {
+  const { from_ns, to_ns, from_ms, to_ms, ...rest } = interpretation;
+  return rest;
+}
+export function savedSearchFilters(state) {
+  const { speaker, source, world, worldLabel, mode, date, asked } = state;
+  return { speaker, source, world, worldLabel, mode, date: { ...date }, asked: asked ? (date.kind === 'rolling' && asked.date_explicit === false ? withoutSearchDates(asked) : { ...asked }) : null };
+}
+export function restoreSavedSearch(record, now = new Date()) {
+  const f = record.filters ?? {};
+  const date = ['fixed', 'rolling', 'all'].includes(f.date?.kind) ? f.date : { kind: 'all' };
+  return { q: String(record.query ?? ''), speaker: f.speaker ?? '', source: f.source ?? '', world: f.world ?? '',
+    worldLabel: f.worldLabel ?? '', mode: f.mode ?? 'keyword', date: { ...date }, ...resolveSearchDate(date, now),
+    asked: f.asked ? { ...f.asked } : null, answer: null, refused: null };
+}
+
+// Default dates limit a real query; they do not turn removing the last facet
+// into an unsolicited archive scan. A chosen day or saved browse is explicit.
+export function hasSearchIntent(state, { saved = false } = {}) {
+  return !!(String(state.q ?? '').trim() || state.world || state.speaker || state.source
+    || ((state.date?.kind === 'fixed' || saved) && (state.from || state.to)));
 }

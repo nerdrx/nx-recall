@@ -52,8 +52,9 @@ Then choose what Recall may hear. Capture is default-deny:
 systemctl --user restart nx-recall
 ```
 
-Semantic search and the Memory tab use optional local model sets. Fetch them
-when you want those features:
+Semantic search and model-written conversation summaries use optional local
+model sets. Saved moments, saved searches, and browsing recorded days do not
+require those models. Fetch them when you want the model-assisted features:
 
 ```bash
 ~/.local/bin/recalld models fetch --semantic
@@ -89,6 +90,43 @@ Nothing is recorded until you say so. Then everything you allow becomes
 searchable — by word, by meaning, by speaker, by day, by world — and a 1.9 GB
 model on four polite CPU cores quietly writes down who promised what, while a
 1 GB model on your GPU re-reads the hard parts at three in the morning.
+
+## Find and keep a moment in 0.14
+
+- **Search with a visible date scope.** Choose Last 7 days, All history, or a
+  custom range. Expand a result to read nearby turns from the same conversation
+  without losing the query, or open the source in Transcript. Date-only searches
+  can browse a day without inventing a keyword.
+- **Save what matters.** Save a query with its filters, or bookmark a turn and a
+  short consecutive range with an optional title and personal note. Saved
+  rolling dates are resolved when reopened; fixed dates stay fixed. Memory's
+  Saved tab lets you reopen, edit, remove, and page through saved items.
+- **Browse Memory.** Recent holds summaries, notes, places, and topics; By day
+  pairs summaries with retained transcript previews, including time, speaker,
+  and source. Commitments have their own tab. Missing summaries do not hide
+  the recorded words, and failed loads offer a retry.
+- **A calmer desktop.** Processing, translation, sound interpretation, and
+  recognition-quality controls live in Settings. Choose comfortable or compact
+  spacing there. Capture consent, captions, storage, and backup controls remain
+  in Sources. The footer separates capture status from technical details.
+- **Keyboard access.** Ctrl/Cmd+F opens Search, including from an ordinary input;
+  Ctrl or Alt + 1–6 switches views. Memory tabs support arrow keys. Dialogs keep
+  focus inside while open and return it on close; the speaker picker can filter
+  a long list of voices by name.
+
+Saved moments are references to original turns, not extra recordings. They
+reflect transcript corrections and obey deletion and retention: unavailable
+turns disappear from the saved excerpt, and a moment with no retained source
+turns is omitted. Personal notes are labeled separately from the original words.
+
+The semantic index also does less bookkeeping: metadata-only changes avoid
+rewriting full-text entries, status reads avoid loading/refitting the index, and
+query inference and ranking use an immutable snapshot outside the database
+lock. Transactional vector tracking and final freshness checks protect against
+stale edits and deletions. Corrected archive text is queued durably for the
+existing `recalld semantic backfill` command; this release adds no automatic
+background reindex scheduler. See [CHANGELOG](CHANGELOG.md) for measured scope
+and [PROTOCOL](docs/PROTOCOL.md) for the saved-item APIs.
 
 ## The problem nobody shipped a fix for
 
@@ -339,7 +377,7 @@ defence is layered, each layer measured:
    too.
 7. **Translation** for everything outside the languages you read, into the
    language you choose, with the translation leading and the original as
-   subtext — or the other way round. Three controls on the Memory tab.
+   subtext — or the other way round. Three controls in Settings.
 
 ## Getting it right
 
@@ -349,8 +387,8 @@ its consonants at both ends, so the daemon re-reads short turns inside the
 audio around them, at idle priority, and keeps only the words inside the turn.
 A second, cheaper decoder reads every turn too; where it disagrees the row is
 marked **shaky** and muted rather than silently trusted. Fix a transcript in
-place and three things move: the row, the **measured** figures on the Memory
-tab, and the vocabulary the next turn is checked against.
+place and three things move: the row, the **measured** recognition-quality
+figures in Settings, and the vocabulary the next turn is checked against.
 
 **Ground truth from Discord** closes the loop that every transcription product
 leaves open. Discord's own client knows who is talking, so a Vencord plugin

@@ -8,19 +8,34 @@ import { h, clear } from './dom.js';
 const root = () => document.getElementById('sheet-root');
 
 let openCount = 0;
+let nextSheetId = 0;
 
 /** openSheet(build) — build(close) returns the sheet's children. */
 export function openSheet(build, { onClose } = {}) {
+  const previousFocus = document.activeElement;
+  let closed = false;
   const scrim = h('div', { class: 'scrim', role: 'presentation' });
   const sheet = h('div', { class: 'sheet', role: 'dialog', 'aria-modal': 'true' });
 
   const close = (result) => {
+    if (closed) return;
+    closed = true;
     scrim.remove();
     openCount = Math.max(0, openCount - 1);
     document.removeEventListener('keydown', onKey, true);
+    if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
     if (onClose) onClose(result);
   };
   const onKey = (e) => {
+    if (root().lastElementChild !== scrim) return;
+    if (e.key === 'Tab') {
+      const controls = [...sheet.querySelectorAll('button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select:not(:disabled),a[href]')].filter(el => !el.hidden && el.getClientRects().length);
+      const first = controls[0]; const last = controls.at(-1);
+      if (first && ((!e.shiftKey && (e.target === last || !sheet.contains(e.target))) || (e.shiftKey && (e.target === first || !sheet.contains(e.target))))) {
+        e.preventDefault(); (e.shiftKey ? last : first).focus();
+      }
+      return;
+    }
     if (e.key !== 'Escape') return;
     // This listener is on `document` in the CAPTURE phase, so it runs before
     // anything inside the sheet ever sees the key — which is right for a sheet
@@ -35,6 +50,8 @@ export function openSheet(build, { onClose } = {}) {
   };
 
   sheet.append(...[build(close)].flat().filter(Boolean));
+  const heading = sheet.querySelector('h2,h3');
+  if (heading) { heading.id ||= `sheet-title-${++nextSheetId}`; sheet.setAttribute('aria-labelledby', heading.id); }
   scrim.append(sheet);
   scrim.addEventListener('mousedown', (e) => {
     if (e.target === scrim) close(null);

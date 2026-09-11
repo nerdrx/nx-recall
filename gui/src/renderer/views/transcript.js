@@ -11,6 +11,7 @@
 // direction you are looking.
 
 import { h, clear, fmtClock, fmtDay, fmtDayLabel } from '../lib/dom.js';
+import { saveMomentSheet } from '../lib/saved.js';
 import {
   store,
   speakerLabel,
@@ -297,7 +298,7 @@ export function mount(root, ctx) {
         }
       },
     },
-    h('div', { class: 'replay-controls' }, rPrev, rPlay, rNext, h('span', { class: 'replay-label' }, rWho, rClock), h('span', { class: 'spacer' }), rRate, rClose),
+    h('div', { class: 'replay-controls' }, rPrev, rPlay, rNext, h('span', { class: 'replay-label' }, rWho, rClock), h('span', { class: 'spacer' }), rRate, h('button', { class: 'btn small', id: 'replay-save-moment', onclick: () => { const rs = replay.replayState(); const turn = rs.turns?.[rs.index]; if (turn) void saveMomentSheet([turn.id]); } }, 'Save moment'), rClose),
     rScrub,
     rNote
   );
@@ -1209,6 +1210,7 @@ export function openSegmentSheet(seg, ctx) {
 
   const build = (close) => {
     const pick = h('div', { class: 'sp-pick' });
+    const speakerFind = h('input', { class: 'input', id: 'speaker-find', placeholder: 'Find a person or voice', 'aria-label': 'Find a person or voice', oninput: () => rebuild() });
     const rebuild = () => {
       clear(pick);
       const mk = (spId, label) => {
@@ -1230,7 +1232,10 @@ export function openSegmentSheet(seg, ctx) {
         );
       };
       pick.append(mk(null, 'Unassigned'));
-      for (const sp of [...store.speakers.values()].sort((a, b) => (b.total_ms ?? 0) - (a.total_ms ?? 0))) {
+      const recent = new Map();
+      for (const row of store.segments) if (row.speaker != null) recent.set(row.speaker, Math.max(recent.get(row.speaker) ?? 0, row.t_ms ?? 0));
+      for (const sp of [...store.speakers.values()].sort((a, b) => Number(!!b.name) - Number(!!a.name) || (recent.get(b.id) ?? 0) - (recent.get(a.id) ?? 0) || (b.total_ms ?? 0) - (a.total_ms ?? 0))) {
+        if (speakerFind.value && !speakerLabel(sp.id).toLocaleLowerCase().includes(speakerFind.value.toLocaleLowerCase())) continue;
         pick.append(mk(sp.id, speakerLabel(sp.id)));
       }
     };
@@ -1493,7 +1498,7 @@ export function openSegmentSheet(seg, ctx) {
     });
 
     return [
-      h('h2', { text: 'Reassign or correct' }),
+      h('div', { class: 'sheet-head' }, h('h2', { text: 'Reassign or correct' }), h('button', { class: 'btn small', id: 'segment-save-moment', onclick: () => { close(); void saveMomentSheet([seg.id]); } }, 'Save moment')),
       h('p', {
         class: 'sub',
         // The name's provenance, then — when there is one — the words'. A
@@ -1540,6 +1545,7 @@ export function openSegmentSheet(seg, ctx) {
             )
           : null
       ),
+      speakerFind,
       pick,
       nameRow,
       // Under the naming offer and not inside it: `nameRow` is hidden the

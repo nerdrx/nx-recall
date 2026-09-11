@@ -56,14 +56,14 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use ort::session::Session;
 use ort::value::Tensor;
 use rusqlite::{Connection, OptionalExtension, params};
 use tokenizers::Tokenizer;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::embed::Embedding;
 use crate::store::{SegmentFilter, Store};
@@ -319,6 +319,144 @@ pub fn migrate_v9(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Durable mutation tracking and a resumable dirty-text queue (schema v21).
+/// All trigger work participates in the statement that changed the transcript.
+pub fn migrate_v21(conn: &Connection) -> Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='semantic_state')",
+        [],
+        |r| r.get(0),
+    )?;
+    if exists {
+        return Ok(());
+    }
+    conn.execute_batch("SAVEPOINT semantic_v21")?;
+    let result = (|| -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE semantic_state (
+                id INTEGER PRIMARY KEY CHECK(id=1), seq INTEGER NOT NULL,
+                deletions INTEGER NOT NULL, eligible INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO semantic_state(id,seq,deletions) SELECT 1, COALESCE(MAX(seq),0), 0 FROM segment_vectors;
+             CREATE TABLE semantic_models(model_id TEXT PRIMARY KEY, embedded INTEGER NOT NULL);
+             CREATE TABLE semantic_dirty (
+                segment_id INTEGER PRIMARY KEY REFERENCES segments(id) ON DELETE CASCADE);
+             CREATE INDEX idx_segment_vectors_global_seq ON segment_vectors(seq);
+             INSERT INTO semantic_dirty SELECT id FROM segments
+                WHERE deleted_at IS NULL AND text IS NOT NULL AND trim(text,char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> '';
+             DROP TRIGGER IF EXISTS segments_fts_update;
+             CREATE TRIGGER segments_fts_update AFTER UPDATE OF text ON segments
+                WHEN old.text IS NOT new.text BEGIN
+                INSERT INTO segments_fts(segments_fts,rowid,text) VALUES('delete',old.id,old.text);
+                INSERT INTO segments_fts(rowid,text) VALUES(new.id,new.text);
+             END;
+             CREATE TRIGGER semantic_vector_insert AFTER INSERT ON segment_vectors BEGIN
+                INSERT INTO semantic_models VALUES(new.model_id,1)
+                    ON CONFLICT(model_id) DO UPDATE SET embedded=embedded+1;
+                UPDATE semantic_state SET seq=seq+1 WHERE id=1;
+                UPDATE segment_vectors SET seq=(SELECT seq FROM semantic_state WHERE id=1)
+                    WHERE segment_id=new.segment_id;
+                DELETE FROM semantic_dirty WHERE segment_id=new.segment_id;
+             END;
+             CREATE TRIGGER semantic_vector_update AFTER UPDATE OF vector,model_id,dim,text_hash
+                ON segment_vectors BEGIN
+                UPDATE semantic_models SET embedded=embedded-1 WHERE model_id=old.model_id;
+                INSERT INTO semantic_models VALUES(new.model_id,1)
+                    ON CONFLICT(model_id) DO UPDATE SET embedded=embedded+1;
+                UPDATE semantic_state SET seq=seq+1, deletions=deletions+
+                    (old.model_id IS NOT new.model_id OR old.dim IS NOT new.dim) WHERE id=1;
+                UPDATE segment_vectors SET seq=(SELECT seq FROM semantic_state WHERE id=1)
+                    WHERE segment_id=new.segment_id;
+                DELETE FROM semantic_dirty WHERE segment_id=new.segment_id;
+             END;
+             CREATE TRIGGER semantic_vector_delete AFTER DELETE ON segment_vectors BEGIN
+                UPDATE semantic_models SET embedded=embedded-1 WHERE model_id=old.model_id;
+                UPDATE semantic_state SET seq=seq+1,deletions=deletions+1 WHERE id=1;
+                INSERT OR IGNORE INTO semantic_dirty SELECT id FROM segments
+                    WHERE id=old.segment_id AND deleted_at IS NULL AND trim(text,char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> '';
+             END;
+             CREATE TRIGGER semantic_text_insert AFTER INSERT ON segments BEGIN
+                UPDATE semantic_state SET seq=seq+1,
+                    eligible=eligible+coalesce(new.deleted_at IS NULL AND trim(new.text,char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288))<>'',0) WHERE id=1;
+                INSERT OR IGNORE INTO semantic_dirty SELECT new.id
+                    WHERE new.deleted_at IS NULL AND trim(new.text,char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> '';
+             END;
+             CREATE TRIGGER semantic_text_update AFTER UPDATE OF text,deleted_at ON segments
+                WHEN old.text IS NOT new.text OR old.deleted_at IS NOT new.deleted_at BEGIN
+                UPDATE semantic_state SET seq=seq+1,
+                    eligible=eligible+coalesce(new.deleted_at IS NULL AND trim(new.text,char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288))<>'',0)
+                      -coalesce(old.deleted_at IS NULL AND trim(old.text,char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288))<>'',0) WHERE id=1;
+                DELETE FROM segment_vectors WHERE segment_id=new.id;
+                DELETE FROM semantic_dirty WHERE segment_id=new.id;
+                INSERT OR IGNORE INTO semantic_dirty SELECT new.id
+                    WHERE new.deleted_at IS NULL AND trim(new.text,char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> '';
+             END;
+             CREATE TRIGGER semantic_text_delete BEFORE DELETE ON segments BEGIN
+                DELETE FROM segment_vectors WHERE segment_id=old.id;
+                DELETE FROM semantic_dirty WHERE segment_id=old.id;
+                UPDATE semantic_state SET seq=seq+1,
+                    eligible=eligible-coalesce(old.deleted_at IS NULL AND trim(old.text,char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288))<>'',0) WHERE id=1;
+             END;"
+        )?;
+        // One migration-only hash reconciliation. Future edits invalidate the
+        // vector transactionally, so no background batch rehashes the archive.
+        let mut stmt = conn.prepare(
+            "SELECT v.segment_id,g.text,v.text_hash FROM segment_vectors v
+            JOIN segments g ON g.id=v.segment_id WHERE g.deleted_at IS NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for (id, text, hash) in rows {
+            if text
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty() && text_hash(t) == hash)
+            {
+                conn.execute(
+                    "DELETE FROM semantic_dirty WHERE segment_id=?1",
+                    params![id],
+                )?;
+            } else {
+                conn.execute(
+                    "DELETE FROM segment_vectors WHERE segment_id=?1",
+                    params![id],
+                )?;
+            }
+        }
+        conn.execute_batch("DELETE FROM segment_vectors WHERE segment_id NOT IN
+                (SELECT id FROM segments WHERE deleted_at IS NULL AND trim(text,char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288))<>'');
+            DELETE FROM semantic_models;
+            INSERT INTO semantic_models SELECT model_id,COUNT(*) FROM segment_vectors GROUP BY model_id;
+            UPDATE semantic_state SET eligible=(SELECT COUNT(*) FROM segments
+                WHERE deleted_at IS NULL AND trim(text,char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288))<>'') WHERE id=1;")?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE semantic_v21")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO semantic_v21; RELEASE semantic_v21");
+            Err(e)
+        }
+    }
+}
+
+fn mutation_state(conn: &Connection) -> Result<(i64, i64)> {
+    Ok(conn.query_row(
+        "SELECT seq,deletions FROM semantic_state WHERE id=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
+}
+
 /// Stable, cheap, and deliberately not cryptographic: this only has to notice
 /// that a transcript changed, and it is stored as an i64 in SQLite.
 ///
@@ -336,28 +474,42 @@ pub fn text_hash(text: &str) -> i64 {
 
 /// Write (or replace) one segment's vector.
 pub fn put_vector(conn: &Connection, segment_id: i64, v: &Embedding, hash: i64) -> Result<i64> {
-    let next: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM segment_vectors",
-        [],
-        |r| r.get(0),
-    )?;
-    conn.execute(
-        "INSERT INTO segment_vectors (segment_id, seq, vector, model_id, dim, text_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(segment_id) DO UPDATE SET
-             seq = excluded.seq, vector = excluded.vector,
-             model_id = excluded.model_id, dim = excluded.dim,
-             text_hash = excluded.text_hash",
+    write_vector(conn, segment_id, v, hash, None)?.context("vector was not written")
+}
+
+fn write_vector(
+    conn: &Connection,
+    segment_id: i64,
+    v: &Embedding,
+    hash: i64,
+    expected_text: Option<&str>,
+) -> Result<Option<i64>> {
+    // A trigger allocates the durable sequence in this same atomic statement.
+    // The optional text predicate rejects an inference result whose words
+    // were corrected/deleted by another process while the model was running.
+    let changed = conn.execute(
+        "INSERT INTO segment_vectors (segment_id,seq,vector,model_id,dim,text_hash)
+         SELECT ?1,0,?2,?3,?4,?5 WHERE ?6 IS NULL OR EXISTS(
+            SELECT 1 FROM segments WHERE id=?1 AND deleted_at IS NULL AND text=?6)
+         ON CONFLICT(segment_id) DO UPDATE SET vector=excluded.vector,
+            model_id=excluded.model_id,dim=excluded.dim,text_hash=excluded.text_hash",
         params![
             segment_id,
-            next,
             v.to_blob(),
             v.model_id,
             v.dim() as i64,
-            hash
+            hash,
+            expected_text
         ],
     )?;
-    Ok(next)
+    if changed == 0 {
+        return Ok(None);
+    }
+    Ok(Some(conn.query_row(
+        "SELECT seq FROM segment_vectors WHERE segment_id=?1",
+        params![segment_id],
+        |r| r.get(0),
+    )?))
 }
 
 /// [`put_vector`] against a store rather than a raw connection. The backfill
@@ -386,75 +538,45 @@ impl Coverage {
 }
 
 pub fn coverage(store: &Store, model_id: &str) -> Result<Coverage> {
-    let conn = store.conn();
-    let eligible: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM segments WHERE deleted_at IS NULL AND text IS NOT NULL AND text <> ''",
-        [],
-        |r| r.get(0),
-    )?;
-    let embedded: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM segments g
-         JOIN segment_vectors v ON v.segment_id = g.id
-         WHERE g.deleted_at IS NULL AND g.text IS NOT NULL AND g.text <> ''
-           AND v.model_id = ?1",
-        params![model_id],
-        |r| r.get(0),
-    )?;
+    let eligible =
+        store
+            .conn()
+            .query_row("SELECT eligible FROM semantic_state WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+    let embedded = store
+        .conn()
+        .query_row(
+            "SELECT embedded FROM semantic_models WHERE model_id=?1",
+            params![model_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
     Ok(Coverage { eligible, embedded })
 }
 
 /// The next batch of segments needing a vector, oldest first.
 ///
-/// "Needing" is three cases in one query and they are the whole resumability
-/// story: never embedded, embedded by a different model, or embedded from text
-/// that has since been corrected or re-decoded. Because the answer is derived
-/// from the database rather than from a cursor the caller carries, a backfill
-/// that is killed halfway simply asks again and gets the rest.
+/// The indexed dirty queue tracks new/corrected text; the model index adds
+/// vectors written in a different embedding space. No batch hashes existing
+/// transcripts. Both lists survive restart and successful writes dequeue their
+/// row in the same transaction as the vector.
 pub fn pending_segments(store: &Store, model_id: &str, limit: usize) -> Result<Vec<(i64, String)>> {
-    let conn = store.conn();
-    let mut stmt = conn.prepare(
-        "SELECT g.id, g.text FROM segments g
-         LEFT JOIN segment_vectors v ON v.segment_id = g.id
-         WHERE g.deleted_at IS NULL AND g.text IS NOT NULL AND g.text <> ''
-           AND (v.segment_id IS NULL OR v.model_id <> ?1)
-         ORDER BY g.id ASC
-         LIMIT ?2",
-    )?;
-    let mut rows: Vec<(i64, String)> = stmt
+    let mut stmt = store.conn().prepare(
+        "SELECT g.id,g.text FROM segments g JOIN (
+            SELECT segment_id FROM semantic_dirty
+            UNION SELECT v.segment_id FROM semantic_models m
+                CROSS JOIN segment_vectors v ON v.model_id=m.model_id
+                WHERE m.model_id<>?1 AND m.embedded>0
+         ) pending ON pending.segment_id=g.id
+         WHERE g.deleted_at IS NULL AND g.text IS NOT NULL AND trim(g.text,char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> ''
+         ORDER BY g.id LIMIT ?2")?;
+    Ok(stmt
         .query_map(params![model_id, limit as i64], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?
-        .collect::<rusqlite::Result<_>>()?;
-    if rows.len() >= limit {
-        return Ok(rows);
-    }
-    // Then the stale ones. Split from the query above rather than OR-ed into
-    // it because `text_hash` has to be recomputed in Rust to be compared, and
-    // making SQLite do the easy 99% first keeps the scan off the hot path.
-    let mut stmt = conn.prepare(
-        "SELECT g.id, g.text, v.text_hash FROM segments g
-         JOIN segment_vectors v ON v.segment_id = g.id
-         WHERE g.deleted_at IS NULL AND g.text IS NOT NULL AND g.text <> ''
-           AND v.model_id = ?1
-         ORDER BY g.id ASC",
-    )?;
-    let stale = stmt.query_map(params![model_id], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
-        ))
-    })?;
-    for row in stale {
-        let (id, text, hash) = row?;
-        if text_hash(&text) != hash {
-            rows.push((id, text));
-            if rows.len() >= limit {
-                break;
-            }
-        }
-    }
-    Ok(rows)
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -469,11 +591,11 @@ pub fn pending_segments(store: &Store, model_id: &str, limit: usize) -> Result<V
 /// the same 147 MB back out of SQLite per query is an order of magnitude
 /// slower, so the matrix is loaded once and kept.
 ///
-/// Coherency is not hand-waved. `seq` (see [`migrate_v9`]) gives an
-/// append-and-update watermark that survives writes from *another process* —
-/// which the backfill is — and a row count catches deletions, the one change a
-/// watermark cannot see. Anything unexpected reloads from scratch; being slow
+/// `seq` and the deletion generation (see [`migrate_v21`]) survive writes
+/// from other processes and count-neutral replacements. Deletion changes
+/// invalidate the resident matrix independently of its row count. Anything unexpected reloads from scratch; being slow
 /// once is always better than answering from a stale matrix.
+#[derive(Clone)]
 pub struct VectorIndex {
     model_id: String,
     dim: usize,
@@ -484,6 +606,7 @@ pub struct VectorIndex {
     /// always holds the raw vector.
     data: Vec<f32>,
     seq: i64,
+    deletions: i64,
     whitening: Option<Whitening>,
     /// How many rows were resident when the whitening was last estimated. 0
     /// means never.
@@ -635,6 +758,83 @@ fn orthogonalise(v: &mut [f32], basis: &[Vec<f32>]) {
     }
 }
 
+/// Database reads are copied under the store lock; transforms and ranking
+/// happen afterward against an immutable snapshot.
+struct IndexUpdate {
+    seq: i64,
+    deletions: i64,
+    reset: bool,
+    rows: Vec<(i64, Vec<u8>, i64)>,
+}
+
+impl IndexUpdate {
+    fn read(index: &VectorIndex, conn: &Connection) -> Result<Self> {
+        let (seq, deletions) = mutation_state(conn)?;
+        let mut reset = deletions != index.deletions || seq < index.seq;
+        if seq == index.seq && !reset {
+            return Ok(Self {
+                seq,
+                deletions,
+                reset,
+                rows: Vec::new(),
+            });
+        }
+        // Re-fitting must start with raw vectors, never a second whitening of
+        // an already transformed matrix. Only growth needs this count.
+        if index.whitening.is_some() && !reset {
+            let total: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM segment_vectors WHERE model_id=?1 AND dim=?2",
+                params![index.model_id, index.dim as i64],
+                |r| r.get(0),
+            )?;
+            reset = total as usize >= index.fitted_at + index.fitted_at / 2;
+        }
+        let mut stmt = conn.prepare(
+            "SELECT segment_id,vector,seq FROM segment_vectors
+            WHERE model_id=?1 AND dim=?2 AND seq>?3 ORDER BY seq,segment_id",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    index.model_id,
+                    index.dim as i64,
+                    if reset { 0 } else { index.seq }
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(Self {
+            seq,
+            deletions,
+            reset,
+            rows,
+        })
+    }
+}
+
+pub struct SearchSnapshot {
+    base: Arc<VectorIndex>,
+    update: IndexUpdate,
+}
+
+impl SearchSnapshot {
+    pub fn sequence(&self) -> i64 {
+        self.update.seq
+    }
+}
+
+/// A correction or deletion during inference must not return a current text
+/// ranked by a superseded vector. Runs only for the bounded scored hit list.
+pub fn vector_current(store: &Store, id: i64, model_id: &str, sequence: i64) -> Result<bool> {
+    Ok(store.conn().query_row(
+        "SELECT EXISTS(SELECT 1 FROM segment_vectors v
+        JOIN segments g ON g.id=v.segment_id WHERE v.segment_id=?1
+        AND v.model_id=?2 AND v.seq<=?3 AND g.deleted_at IS NULL)",
+        params![id, model_id, sequence],
+        |r| r.get(0),
+    )?)
+}
+
 /// One scored row from the vector scan.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Scored {
@@ -651,6 +851,7 @@ impl VectorIndex {
             at: HashMap::new(),
             data: Vec::new(),
             seq: 0,
+            deletions: 0,
             whitening: None,
             fitted_at: 0,
         }
@@ -720,29 +921,25 @@ impl VectorIndex {
 
     /// Bring the matrix up to date with the database, cheaply when it can be.
     pub fn refresh(&mut self, conn: &Connection) -> Result<()> {
-        let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM segment_vectors WHERE model_id = ?1 AND dim = ?2",
-            params![self.model_id, self.dim as i64],
-            |r| r.get(0),
-        )?;
-        // A shrinking table means rows were deleted, and a watermark cannot see
-        // a row that is no longer there. Start again.
-        if (total as usize) < self.ids.len() {
+        let update = IndexUpdate::read(self, conn)?;
+        self.apply_update(update)?;
+        Ok(())
+    }
+
+    fn apply_update(&mut self, update: IndexUpdate) -> Result<()> {
+        if update.reset {
             self.clear();
         }
-        self.load_since(conn)?;
-        // The correction is estimated from the corpus, so it has to be
-        // re-estimated as the corpus grows — but only rarely, and only once it
-        // is worth estimating at all.
-        if self.should_refit() {
-            // A new estimate has to be fitted to RAW vectors, and the matrix
-            // holds transformed ones — so re-estimating means reloading from
-            // SQLite, which is where the raw ones live. Only when there is
-            // something to undo: before the first fit the matrix is already raw.
-            if self.whitening.is_some() {
-                self.clear();
-                self.load_since(conn)?;
+        for (id, blob, _) in update.rows {
+            let v = Embedding::from_blob(self.model_id.clone(), &blob)?;
+            if v.dim() != self.dim {
+                continue;
             }
+            self.insert(id, &self.prepared(&v.vector));
+        }
+        self.seq = update.seq;
+        self.deletions = update.deletions;
+        if self.should_refit() {
             self.fit_whitening();
         }
         Ok(())
@@ -775,48 +972,6 @@ impl VectorIndex {
         self.whitening = Some(w);
     }
 
-    /// Load every row past the watermark, transforming as it goes.
-    fn load_since(&mut self, conn: &Connection) -> Result<()> {
-        let mut stmt = conn.prepare(
-            "SELECT segment_id, vector, seq FROM segment_vectors
-             WHERE model_id = ?1 AND dim = ?2 AND seq > ?3
-             ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map(params![self.model_id, self.dim as i64, self.seq], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        })?;
-        let mut loaded = 0usize;
-        for row in rows {
-            let (id, blob, seq) = row?;
-            let v = Embedding::from_blob(self.model_id.clone(), &blob)?;
-            if v.dim() != self.dim {
-                warn!(
-                    segment_id = id,
-                    "skipping a {}-dimension vector in a {}-dimension index",
-                    v.dim(),
-                    self.dim
-                );
-                continue;
-            }
-            let prepared = self.prepared(&v.vector);
-            self.insert(id, &prepared);
-            self.seq = self.seq.max(seq);
-            loaded += 1;
-        }
-        if loaded > 0 {
-            debug!(
-                loaded,
-                resident = self.ids.len(),
-                "semantic index refreshed"
-            );
-        }
-        Ok(())
-    }
-
     /// Fold one freshly written vector in without touching the database.
     pub fn note(&mut self, segment_id: i64, v: &Embedding, _seq: i64) {
         if v.model_id != self.model_id || v.dim() != self.dim {
@@ -824,7 +979,7 @@ impl VectorIndex {
         }
         let prepared = self.prepared(&v.vector);
         self.insert(segment_id, &prepared);
-        // Only load_since may advance the database scan watermark. A live
+        // Only apply_update may advance the database scan watermark. A live
         // write can arrive before the first refresh after restart, or after
         // an external backfill wrote other rows. Skipping straight to this
         // write's sequence would permanently hide every intervening vector.
@@ -989,32 +1144,68 @@ impl Fused {
 /// The whole semantic leg, as the daemon holds it: one model, one resident
 /// matrix, one lock.
 ///
-/// Behind a single mutex on purpose. The model is 118 MB of weights and the
-/// matrix is up to ~150 MB; two of either would be a real cost, and the work
-/// each request does under the lock is one 1.7 ms forward pass plus a scan.
+/// Model inference and cached index state have separate locks. Search callers
+/// snapshot DB changes first, then release the store before inference/refits.
 pub struct SemanticLeg {
-    inner: Mutex<Inner>,
-}
-
-struct Inner {
-    embedder: TextEmbedder,
-    index: VectorIndex,
+    model_id: String,
+    embedder: Mutex<TextEmbedder>,
+    index: Mutex<Arc<VectorIndex>>,
+    coverage: Mutex<Option<(i64, Coverage)>>,
 }
 
 impl SemanticLeg {
     pub fn new(embedder: TextEmbedder) -> Self {
-        let index = VectorIndex::empty(embedder.model_id().to_string(), DIM);
+        let model_id = embedder.model_id().to_string();
         Self {
-            inner: Mutex::new(Inner { embedder, index }),
+            index: Mutex::new(Arc::new(VectorIndex::empty(model_id.clone(), DIM))),
+            model_id,
+            embedder: Mutex::new(embedder),
+            coverage: Mutex::new(None),
         }
     }
 
     pub fn model_id(&self) -> String {
-        self.lock().embedder.model_id().to_string()
+        self.model_id.clone()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    pub fn snapshot(&self, store: &Store) -> Result<SearchSnapshot> {
+        let base = Arc::clone(&self.index.lock().unwrap_or_else(|p| p.into_inner()));
+        let update = IndexUpdate::read(&base, store.conn())?;
+        Ok(SearchSnapshot { base, update })
+    }
+
+    pub fn search_snapshot(
+        &self,
+        snapshot: SearchSnapshot,
+        q: &str,
+        limit: usize,
+        within: &Candidates,
+    ) -> Result<Vec<Scored>> {
+        let base = self.prepare_index(snapshot)?;
+        let qv = self
+            .embedder
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .embed_query(q)?;
+        Ok(base.search(&base.prepare_query(&qv.vector), limit, within))
+    }
+
+    /// Explicit warm-up for offline evaluation; status never calls this.
+    pub fn warm_index(&self, store: &Store) -> Result<()> {
+        self.prepare_index(self.snapshot(store)?)?;
+        Ok(())
+    }
+
+    fn prepare_index(&self, snapshot: SearchSnapshot) -> Result<Arc<VectorIndex>> {
+        let SearchSnapshot { mut base, update } = snapshot;
+        if update.reset || !update.rows.is_empty() {
+            Arc::make_mut(&mut base).apply_update(update)?;
+            let mut cached = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            if base.seq >= cached.seq {
+                *cached = Arc::clone(&base);
+            }
+        }
+        Ok(base)
     }
 
     /// Embed one segment's transcript and store the vector. Returns `false`
@@ -1033,11 +1224,12 @@ impl SemanticLeg {
         let Some(text) = text.filter(|t| !t.trim().is_empty()) else {
             return Ok(false);
         };
-        let mut inner = self.lock();
-        let v = inner.embedder.embed_passage(&text)?;
-        let seq = put_vector(store.conn(), segment_id, &v, text_hash(&text))?;
-        inner.index.note(segment_id, &v, seq);
-        Ok(true)
+        let v = self
+            .embedder
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .embed_passage(&text)?;
+        Ok(write_vector(store.conn(), segment_id, &v, text_hash(&text), Some(&text))?.is_some())
     }
 
     /// Rank `limit` segments by meaning, within `within`.
@@ -1048,13 +1240,7 @@ impl SemanticLeg {
         limit: usize,
         within: &Candidates,
     ) -> Result<Vec<Scored>> {
-        let mut inner = self.lock();
-        inner.index.refresh(store.conn())?;
-        let qv = inner.embedder.embed_query(q)?;
-        // The query has to go through exactly the transform the stored rows
-        // went through, or the dot product compares two different spaces.
-        let qv = inner.index.prepare_query(&qv.vector);
-        Ok(inner.index.search(&qv, limit, within))
+        self.search_snapshot(self.snapshot(store)?, q, limit, within)
     }
 
     /// The same ranking as [`Self::search`], against **raw** vectors read
@@ -1074,9 +1260,12 @@ impl SemanticLeg {
         limit: usize,
         within: &Candidates,
     ) -> Result<Vec<Scored>> {
-        let mut inner = self.lock();
-        let qv = inner.embedder.embed_query(q)?;
-        let model_id = inner.embedder.model_id().to_string();
+        let qv = self
+            .embedder
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .embed_query(q)?;
+        let model_id = self.model_id.clone();
         let conn = store.conn();
         let mut stmt = conn.prepare(
             "SELECT segment_id, vector FROM segment_vectors WHERE model_id = ?1 AND dim = ?2",
@@ -1113,14 +1302,14 @@ impl SemanticLeg {
 
     /// What `status` and `semantic status` report.
     pub fn stats(&self, store: &Store) -> Result<(usize, usize, Coverage)> {
-        let mut inner = self.lock();
-        inner.index.refresh(store.conn())?;
-        let model_id = inner.embedder.model_id().to_string();
-        Ok((
-            inner.index.len(),
-            inner.index.bytes(),
-            coverage(store, &model_id)?,
-        ))
+        let seq = mutation_state(store.conn())?.0;
+        let mut cached = self.coverage.lock().unwrap_or_else(|p| p.into_inner());
+        if cached.as_ref().is_none_or(|(at, _)| *at != seq) {
+            *cached = Some((seq, coverage(store, &self.model_id)?));
+        }
+        let coverage = cached.as_ref().unwrap().1;
+        let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+        Ok((index.len(), index.bytes(), coverage))
     }
 }
 
@@ -1252,8 +1441,9 @@ pub fn backfill(
                 continue;
             }
             let v = embedder.embed_passage(text)?;
-            put_vector(&tx, *segment_id, &v, text_hash(text))?;
-            report.embedded += 1;
+            if write_vector(&tx, *segment_id, &v, text_hash(text), Some(text))?.is_some() {
+                report.embedded += 1;
+            }
         }
         tx.commit()?;
         report.batches += 1;
@@ -1645,6 +1835,19 @@ mod tests {
                 s.correct_segment_text(id, "portal world").unwrap();
                 // Rewind to a database this build has never written, and take
                 // v9's table away with it.
+                for trigger in [
+                    "semantic_vector_insert",
+                    "semantic_vector_update",
+                    "semantic_vector_delete",
+                    "semantic_text_insert",
+                    "semantic_text_update",
+                    "semantic_text_delete",
+                ] {
+                    s.conn()
+                        .execute_batch(&format!("DROP TRIGGER {trigger}"))
+                        .unwrap();
+                }
+                s.conn().execute_batch("DROP TABLE semantic_dirty; DROP TABLE semantic_models; DROP TABLE semantic_state;").unwrap();
                 s.conn()
                     .execute_batch(&format!(
                         "DROP TABLE segment_vectors;
@@ -1896,6 +2099,443 @@ mod tests {
         let mut ix = VectorIndex::empty("m@1", 2);
         ix.refresh(s.conn()).unwrap();
         assert_eq!(ix.len(), 0, "cosine across models is a meaningless number");
+    }
+
+    #[test]
+    fn v21_same_count_replacement_survives_deleted_latest_sequence() {
+        let (s, ids) = seeded();
+        let v = Embedding::new("m@1", vec![1.0, 0.0]);
+        let first = put_vector(s.conn(), ids[0], &v, 1).unwrap();
+        let mut index = VectorIndex::empty("m@1", 2);
+        index.refresh(s.conn()).unwrap();
+        s.purge_segments(&[ids[0]]).unwrap();
+        let next = put_vector(s.conn(), ids[1], &v, 2).unwrap();
+        assert!(next > first);
+        index.refresh(s.conn()).unwrap();
+        assert_eq!(index.ids, vec![ids[1]]);
+        s.conn().execute("DELETE FROM segment_vectors", []).unwrap();
+        assert!(put_vector(s.conn(), ids[1], &v, 3).unwrap() > next);
+    }
+
+    #[test]
+    fn v21_model_replacement_removes_old_space_even_when_count_stays_equal() {
+        let (s, ids) = seeded();
+        put_vector(s.conn(), ids[0], &Embedding::new("m@1", vec![1.0, 0.0]), 1).unwrap();
+        let mut index = VectorIndex::empty("m@1", 2);
+        index.refresh(s.conn()).unwrap();
+        put_vector(s.conn(), ids[0], &Embedding::new("m@2", vec![0.0, 1.0]), 1).unwrap();
+        put_vector(s.conn(), ids[1], &Embedding::new("m@1", vec![1.0, 0.0]), 1).unwrap();
+        index.refresh(s.conn()).unwrap();
+        assert_eq!(index.ids, vec![ids[1]]);
+        assert_eq!(coverage(&s, "m@1").unwrap().embedded, 1);
+        assert_eq!(coverage(&s, "m@2").unwrap().embedded, 1);
+    }
+
+    #[test]
+    fn v21_dirty_queue_and_coverage_follow_edits_deletes_and_undo() {
+        let (s, ids) = seeded();
+        let v = Embedding::new("m@1", vec![1.0, 0.0]);
+        put_vector(s.conn(), ids[0], &v, text_hash("the portal world")).unwrap();
+        assert_eq!(
+            coverage(&s, "m@1").unwrap(),
+            Coverage {
+                eligible: 2,
+                embedded: 1
+            }
+        );
+        s.correct_segment_text(ids[0], "corrected fountain")
+            .unwrap();
+        assert_eq!(
+            coverage(&s, "m@1").unwrap(),
+            Coverage {
+                eligible: 2,
+                embedded: 0
+            }
+        );
+        assert_eq!(pending_segments(&s, "m@1", 1).unwrap()[0].0, ids[0]);
+        put_vector(s.conn(), ids[0], &v, text_hash("corrected fountain")).unwrap();
+        s.soft_delete_segments(&[ids[0]], 999).unwrap();
+        assert_eq!(
+            coverage(&s, "m@1").unwrap(),
+            Coverage {
+                eligible: 1,
+                embedded: 0
+            }
+        );
+        s.conn()
+            .execute(
+                "UPDATE segments SET deleted_at=NULL WHERE id=?1",
+                params![ids[0]],
+            )
+            .unwrap();
+        assert_eq!(
+            coverage(&s, "m@1").unwrap(),
+            Coverage {
+                eligible: 2,
+                embedded: 0
+            }
+        );
+        assert_eq!(pending_segments(&s, "m@1", 1).unwrap()[0].0, ids[0]);
+        assert!(pending_segments(&s, "m@1", 0).unwrap().is_empty());
+        s.correct_segment_text(ids[0], " \n\t\u{a0}\u{2003}")
+            .unwrap();
+        assert_eq!(coverage(&s, "m@1").unwrap().eligible, 1);
+        assert_eq!(pending_segments(&s, "m@1", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn v21_metadata_changes_do_not_touch_fts_or_semantic_index() {
+        let (s, ids) = seeded();
+        let v = Embedding::new("m@1", vec![1.0, 0.0]);
+        put_vector(s.conn(), ids[0], &v, text_hash("the portal world")).unwrap();
+        let before = mutation_state(s.conn()).unwrap();
+        let writes = s.conn().total_changes();
+        s.conn()
+            .execute(
+                "UPDATE segments SET mood='calm' WHERE id=?1",
+                params![ids[0]],
+            )
+            .unwrap();
+        assert_eq!(
+            s.conn().total_changes() - writes,
+            1,
+            "only the metadata row changes"
+        );
+        assert_eq!(mutation_state(s.conn()).unwrap(), before);
+        assert_eq!(s.search("portal", 10).unwrap().len(), 1);
+        s.correct_segment_text(ids[0], "changed words").unwrap();
+        assert!(s.search("portal", 10).unwrap().is_empty());
+        assert_eq!(s.search("changed", 10).unwrap().len(), 1);
+        s.conn()
+            .execute("UPDATE segments SET text=NULL WHERE id=?1", params![ids[0]])
+            .unwrap();
+        assert!(s.search("changed", 10).unwrap().is_empty());
+        s.correct_segment_text(ids[0], "restored words").unwrap();
+        assert_eq!(s.search("restored", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn v21_inflight_vectors_and_results_cannot_outlive_their_text() {
+        let (s, ids) = seeded();
+        let v = Embedding::new("m@1", vec![1.0, 0.0]);
+        let seq = write_vector(
+            s.conn(),
+            ids[0],
+            &v,
+            text_hash("the portal world"),
+            Some("the portal world"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(vector_current(&s, ids[0], "m@1", seq).unwrap());
+        s.correct_segment_text(ids[0], "new words").unwrap();
+        assert!(!vector_current(&s, ids[0], "m@1", seq).unwrap());
+        assert!(
+            write_vector(s.conn(), ids[0], &v, 1, Some("the portal world"))
+                .unwrap()
+                .is_none()
+        );
+        let next = write_vector(
+            s.conn(),
+            ids[0],
+            &v,
+            text_hash("new words"),
+            Some("new words"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!vector_current(&s, ids[0], "m@1", seq).unwrap());
+        assert!(vector_current(&s, ids[0], "m@1", next).unwrap());
+        s.soft_delete_segments(&[ids[0]], 999).unwrap();
+        assert!(!vector_current(&s, ids[0], "m@1", next).unwrap());
+        assert!(
+            write_vector(s.conn(), ids[0], &v, 1, Some("new words"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn v21_mutations_rollback_with_the_transcript_statement() {
+        let (s, ids) = seeded();
+        let before = mutation_state(s.conn()).unwrap();
+        {
+            let tx = s.conn().unchecked_transaction().unwrap();
+            put_vector(&tx, ids[0], &Embedding::new("m@1", vec![1.0, 0.0]), 1).unwrap();
+            // Dropping without commit must restore counters and the dirty row.
+        }
+        assert_eq!(mutation_state(s.conn()).unwrap(), before);
+        assert_eq!(coverage(&s, "m@1").unwrap().embedded, 0);
+        assert_eq!(pending_segments(&s, "m@1", 10).unwrap().len(), 2);
+        migrate_v21(s.conn()).unwrap();
+        assert_eq!(mutation_state(s.conn()).unwrap(), before);
+    }
+
+    #[test]
+    fn v21_reconciles_a_v20_archive_and_rolls_back_a_failed_migration() {
+        let dir = std::env::temp_dir().join(format!(
+            "nx-semantic-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Store::open(&dir).unwrap();
+        let source = s.upsert_source("synthetic", "synthetic", 1).unwrap();
+        let session = s.begin_session(source, 1).unwrap();
+        let ids: Vec<_> = (0..2)
+            .map(|i| {
+                let id = s.insert_segment(session, i, i + 1, "", i).unwrap();
+                s.correct_segment_text(id, "original text").unwrap();
+                id
+            })
+            .collect();
+        for trigger in [
+            "semantic_vector_insert",
+            "semantic_vector_update",
+            "semantic_vector_delete",
+            "semantic_text_insert",
+            "semantic_text_update",
+            "semantic_text_delete",
+        ] {
+            s.conn()
+                .execute_batch(&format!("DROP TRIGGER {trigger}"))
+                .unwrap();
+        }
+        s.conn()
+            .execute_batch(
+                "DROP TABLE semantic_dirty; DROP TABLE semantic_models; DROP TABLE semantic_state;
+            DROP INDEX idx_segment_vectors_global_seq;
+            DROP TRIGGER segments_fts_update;
+            CREATE TRIGGER segments_fts_update AFTER UPDATE ON segments BEGIN
+                INSERT INTO segments_fts(segments_fts,rowid,text) VALUES('delete',old.id,old.text);
+                INSERT INTO segments_fts(rowid,text) VALUES(new.id,new.text);
+            END;
+            UPDATE schema_version SET version=20;",
+            )
+            .unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            s.conn()
+                .execute(
+                    "INSERT INTO segment_vectors VALUES(?1,?2,?3,'m@1',2,?4)",
+                    params![
+                        id,
+                        7 + i as i64,
+                        Embedding::new("m@1", vec![1.0, 0.0]).to_blob(),
+                        text_hash("original text")
+                    ],
+                )
+                .unwrap();
+        }
+        s.correct_segment_text(ids[1], "corrected text").unwrap();
+        s.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_migration BEFORE DELETE ON segment_vectors
+            BEGIN SELECT RAISE(ABORT,'test migration rollback'); END;",
+            )
+            .unwrap();
+        let path = s.conn().path().unwrap().to_string();
+        drop(s);
+        assert!(Store::open(&dir).is_err());
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT version FROM schema_version", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            20
+        );
+        assert!(
+            !conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='semantic_state')",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        let trigger: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='segments_fts_update'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !trigger.contains("UPDATE OF text"),
+            "FTS DDL rolls back too"
+        );
+        conn.execute_batch("DROP TRIGGER reject_migration").unwrap();
+        drop(conn);
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(
+            coverage(&s, "m@1").unwrap(),
+            Coverage {
+                eligible: 2,
+                embedded: 1
+            }
+        );
+        assert_eq!(
+            pending_segments(&s, "m@1", 10).unwrap(),
+            vec![(ids[1], "corrected text".into())]
+        );
+        assert!(
+            put_vector(
+                s.conn(),
+                ids[1],
+                &Embedding::new("m@1", vec![1.0, 0.0]),
+                text_hash("corrected text")
+            )
+            .unwrap()
+                > 8
+        );
+        let writes = s.conn().total_changes();
+        s.conn()
+            .execute("UPDATE segments SET mood='calm'", [])
+            .unwrap();
+        assert_eq!(s.conn().total_changes() - writes, 2);
+        assert_eq!(s.search("corrected", 10).unwrap().len(), 1);
+        drop(s);
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(coverage(&s, "m@1").unwrap().embedded, 2);
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v21_sequences_are_unique_across_connections_and_survive_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "nx-semantic-v21-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Store::open(&dir).unwrap();
+        let source = s.upsert_source("synthetic", "synthetic", 1).unwrap();
+        let session = s.begin_session(source, 1).unwrap();
+        let ids: Vec<_> = (0..2)
+            .map(|i| {
+                let id = s.insert_segment(session, i, i + 1, "", i).unwrap();
+                s.correct_segment_text(id, "synthetic").unwrap();
+                id
+            })
+            .collect();
+        let path = s.conn().path().unwrap().to_string();
+        let handles: Vec<_> = ids
+            .iter()
+            .map(|&id| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let conn = Connection::open(path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    (0..20)
+                        .map(|_| {
+                            put_vector(
+                                &conn,
+                                id,
+                                &Embedding::new("m@1", vec![1.0, 0.0]),
+                                text_hash("synthetic"),
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut sequences: Vec<_> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        sequences.sort_unstable();
+        sequences.dedup();
+        assert_eq!(sequences.len(), 40);
+        let last = *sequences.last().unwrap();
+        s.conn().execute("DELETE FROM segment_vectors", []).unwrap();
+        drop(s);
+        let s = Store::open(&dir).unwrap();
+        assert!(
+            put_vector(s.conn(), ids[0], &Embedding::new("m@1", vec![1.0, 0.0]), 1).unwrap() > last
+        );
+        assert_eq!(coverage(&s, "m@1").unwrap().embedded, 1);
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v21_index_update_can_be_applied_after_the_database_is_closed() {
+        let (s, ids) = seeded();
+        put_vector(s.conn(), ids[0], &Embedding::new("m@1", vec![1.0, 0.0]), 1).unwrap();
+        let mut index = VectorIndex::empty("m@1", 2);
+        let update = IndexUpdate::read(&index, s.conn()).unwrap();
+        drop(s);
+        index.apply_update(update).unwrap();
+        assert_eq!(
+            index.search(&[1.0, 0.0], 1, &Candidates::everything())[0].segment_id,
+            ids[0]
+        );
+    }
+
+    /// No recordings or models; measures database work only. Run explicitly:
+    /// cargo test -p recalld --lib v21_synthetic_index_benchmark -- --ignored --nocapture
+    #[test]
+    #[ignore = "synthetic indexing benchmark; run explicitly"]
+    fn v21_synthetic_index_benchmark() {
+        for n in [10_000usize, 100_000] {
+            let s = Store::open_in_memory().unwrap();
+            let source = s.upsert_source("synthetic", "synthetic", 1).unwrap();
+            let session = s.begin_session(source, 1).unwrap();
+            let tx = s.conn().unchecked_transaction().unwrap();
+            tx.execute(
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                INSERT INTO segments(session_id,t_start_ns,t_end_ns,audio_path,created_at,text)
+                SELECT ?2,i,i+1,'',i,'synthetic transcript' FROM n",
+                params![n as i64, session],
+            )
+            .unwrap();
+            let v = Embedding::new("m@1", vec![1.0, 0.0]);
+            tx.execute(
+                "INSERT INTO segment_vectors(segment_id,seq,vector,model_id,dim,text_hash)
+                SELECT id,0,?1,'m@1',2,?2 FROM segments",
+                params![v.to_blob(), text_hash("synthetic transcript")],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            let started = std::time::Instant::now();
+            for _ in 0..1000 {
+                put_vector(s.conn(), 1, &v, 1).unwrap();
+            }
+            let write_us = started.elapsed().as_secs_f64() * 1000.0;
+            let started = std::time::Instant::now();
+            for _ in 0..1000 {
+                assert_eq!(coverage(&s, "m@1").unwrap().embedded, n as i64);
+            }
+            let coverage_us = started.elapsed().as_secs_f64() * 1000.0;
+            s.conn()
+                .execute(
+                    "UPDATE segments SET text='corrected transcript' WHERE id<=100",
+                    [],
+                )
+                .unwrap();
+            let started = std::time::Instant::now();
+            assert_eq!(pending_segments(&s, "m@1", 100).unwrap().len(), 100);
+            let pending_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let started = std::time::Instant::now();
+            s.conn()
+                .execute("UPDATE segments SET mood='calm'", [])
+                .unwrap();
+            let metadata_ms = started.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "{}",
+                serde_json::json!({"rows":n,"vector_write_mean_us":write_us,
+                "coverage_mean_us":coverage_us,"pending_100_ms":pending_ms,"metadata_update_ms":metadata_ms,
+                "scope":"synthetic SQLite; excludes model inference and real recordings"})
+            );
+        }
     }
 
     /// The measurement the brute force rests on. 100k x 384 f32 is 147 MB; if

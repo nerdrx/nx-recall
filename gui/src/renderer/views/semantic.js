@@ -99,7 +99,7 @@ export function modeControl({ selected, available, how, onSelect }) {
       : `${how} Until then, Keyword search covers everything captured.`;
   }
   paint(selected);
-  return { el: h('div', {}, row, note), paint };
+  return { el: h('div', { class: 'search-mode-control' }, row, note), paint };
 }
 
 /**

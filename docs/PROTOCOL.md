@@ -5728,3 +5728,110 @@ the turn and the next night shift window.
 an automatic `auto` swap that would otherwise fire logs a warning and the
 default decoder keeps running — light mode never trades a missing optional
 download for losing transcription outright.
+
+## 0.14.0 — saved recall and context (schema v22)
+
+Additive methods; `proto` remains `1`. Schema v21 introduces semantic
+bookkeeping; v22 introduces `saved_searches`, `saved_moments`, and ordered
+`saved_moment_segments` source references. The desktop moves processing,
+translation, mood, light mode, vocabulary, and accuracy controls from Memory to
+Settings; their existing protocol methods are unchanged.
+
+### `segments.context`
+
+Parameters: `{ "id": 123, "before": 3, "after": 3 }`. `id` is a positive
+visible segment ID. `before` and `after` default to 3 and each accept 0–10.
+Returns `{ "anchor": <segment>, "segments": [<segment>, ...] }`, using the
+ordinary segment wire shape. The chronological list includes the anchor and
+nearby visible turns from its thread, or its source session when no thread is
+assigned. Deleted or missing anchors return `not_found`. This reads existing
+source text; it does not generate a summary or require a language model.
+
+### Saved searches
+
+| Method | Parameters | Reply |
+|---|---|---|
+| `saved.searches.list` | `{limit?: 100, offset?: 0}` | `{searches: [...], total: N}` |
+| `saved.searches.save` | `{id?, name, query?, filters?}` | `{search: {...}}` |
+| `saved.searches.delete` | `{id}` | `{removed: bool}` |
+
+A search record contains `id`, `name`, `query`, `filters`, and `created_ms`.
+Omitting `id` creates a record; including it updates an existing record without
+changing creation time. A missing update target returns `not_found`. The name
+is trimmed, required, and at most 120 characters; query text is trimmed and at
+most 4096 characters. `filters` defaults to `{}` and must be a JSON object whose
+serialized representation is at most 16 KiB. The daemon stores filters as
+client data; it does not run the search when saving or validate GUI filter
+semantics.
+
+The desktop uses this filter shape:
+
+```json
+{
+  "speaker": "",
+  "source": "",
+  "world": "",
+  "worldLabel": "",
+  "mode": "keyword",
+  "date": { "kind": "rolling", "days": 7 },
+  "asked": null
+}
+```
+
+`date` may instead be `{ "kind": "all" }` or
+`{ "kind": "fixed", "from": "2026-09-01", "to": "2026-09-11" }`.
+Fixed boundaries are local calendar dates, with the selected final day included
+by querying through the next local midnight. Rolling boundaries are resolved
+when reopened; explicit dates from a natural-language interpretation stay
+fixed. `asked` may carry the existing query interpretation. The client preserves
+speaker/source/world facets and search mode when reopening.
+
+### Saved moments
+
+| Method | Parameters | Reply |
+|---|---|---|
+| `saved.moments.list` | `{limit?: 100, offset?: 0}` | `{moments: [...], total: N}` |
+| `saved.moments.save` | `{id?, segment_ids: [...], title?, note?}` | `{moment: {...}}` |
+| `saved.moments.delete` | `{id}` | `{removed: bool}` |
+
+A moment contains `id`, `title`, `note`, `segment_ids`, `segments`,
+`created_ms`, and `unavailable_count`. Source segments use the ordinary wire
+shape; no captured text or audio is duplicated into the saved-item tables.
+`title` and `note` default to empty strings, are trimmed, and are limited to
+180 and 4096 characters respectively. The note is a user annotation, separate
+from the original transcript.
+
+Saving accepts 1–20 unique positive segment IDs, validated transactionally as a
+consecutive range of visible turns in one conversation or source session, with
+a total span no greater than ten minutes. Input IDs are sorted chronologically.
+Missing/deleted source rows return `not_found`; invalid ranges return
+`params`. Updating replaces the referenced range, title, and note and
+preserves creation time. A failed save leaves the existing record intact.
+
+Listing reads current source rows, so corrections appear immediately and
+deleted turns are not exposed. `segment_ids` and `segments` contain only visible
+sources; `unavailable_count` counts original references no longer available.
+Moments with no visible source turns are omitted from both the list and total.
+Hard deletion cascades source references and removes a moment when its last
+reference is deleted. Removing a saved item never deletes the transcript.
+
+Both list methods default to 100 records, accept `limit` 1–200 and a nonnegative
+`offset`, and order by newest creation time then descending ID. The desktop
+provides independent pagination for moments and searches. Delete replies are
+idempotent: deleting an absent item returns `removed: false`.
+
+### Semantic bookkeeping (schema v21)
+
+Transactional state tracks vector writes and deletion generations, per-model
+coverage, and dirty transcript text. Text changes invalidate obsolete vectors
+and queue affected visible rows; metadata-only changes do not rewrite FTS text.
+Search operates on immutable snapshots with inference, whitening, and ranking
+outside the store lock, then validates candidate freshness, deletion state, and
+facets against current rows. Status reads use cached index state rather than
+loading or refitting the index.
+
+The existing semantic backfill command consumes resumable archived dirty work;
+new live turns retain their existing pipeline. There is no new automatic
+background reindex scheduler. Cold/delta database reads still hold the store
+lock, and concurrent snapshot replacement can temporarily duplicate resident
+matrix memory. No query protocol shape or model accuracy guarantee changes.

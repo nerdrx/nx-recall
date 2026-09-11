@@ -1,0 +1,52 @@
+# Changelog
+
+## 0.14.0 — Find and keep a moment
+
+### Desktop
+
+- Visible Last 7 days, All history, and custom Search scope; date-only browsing;
+  nearby conversation context without leaving results; stale-response guards.
+- Saved queries preserve filters and rolling/fixed date intent. Saved moments
+  reference consecutive transcript turns and carry optional titles and personal
+  notes. Reopen, edit, remove, and paginate saved items in Memory.
+- Memory is organized into Recent, By day, Saved, and Commitments. Day browsing
+  includes summaries and retained words with time, speaker, and source;
+  unavailable summaries do not block transcript access.
+- Processing, language, sound, and recognition-quality controls move to
+  Settings. Sources retains capture, captions, storage, and backups. Density
+  preference, shortcut help, clear capture status, and expandable diagnostics.
+- Searchable speaker picker, keyboard Memory tabs, dialog focus containment and
+  restoration, and Ctrl/Cmd+F from ordinary input fields.
+- Existing NX branding and both themes are preserved.
+
+### Correctness and performance
+
+- Schema 21 adds transactional vector mutation/deletion tracking, exact coverage
+  counters, and a durable dirty-text queue. Text edits invalidate stale vectors;
+  metadata-only edits avoid full-text index rewrites.
+- Immutable semantic snapshots move query inference, whitening, and ranking
+  outside the database lock. Final freshness, deletion, and facet validation
+  prevent stale results; status no longer loads/refits the search index.
+- Schema 22 adds local saved queries and source-referencing moments. Deleted
+  source text is not copied into saved tables; moments with no retained source
+  turns are omitted from listing. Existing source retention still applies.
+
+A model-free debug-build benchmark on the actual in-memory migrated schema
+measured mean vector writes of **65.75 / 69.40 μs**, coverage reads of
+**9.79 / 9.66 μs**, and fetching 100 dirty rows in **0.406 / 0.393 ms**, at
+10,000 / 100,000 synthetic rows respectively (2026-09-11). These are database
+operation measurements with synthetic 2D vectors, not end-to-end speedups;
+model inference, disk/fsync, recordings, and GUI work are excluded. Reproduce
+with `cargo test -p recalld --lib v21_synthetic_index_benchmark -- --ignored --nocapture`.
+
+Cold index/delta reads still take the database lock, and replacing immutable
+snapshots can temporarily increase matrix memory. Archived dirty text resumes
+through `recalld semantic backfill`; there is no new automatic background
+reindex scheduler and no ASR/GPU speedup claim.
+
+## 0.13.2
+
+- Fixed semantic results missing after restart or external backfill.
+- Bounded large desktop socket replies before parsing and reduced fragmented
+  reply copying.
+- Included the approved NX wordmark in the desktop and README.

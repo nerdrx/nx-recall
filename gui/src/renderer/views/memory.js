@@ -29,6 +29,7 @@ import { store, speakerLabel, ask, applyAssist, MOOD_MODES } from '../lib/store.
 // speaker id and nothing else.
 import { lookOn, lookOf, iconSpan } from './highlight.js';
 import { toast } from '../lib/sheets.js';
+import { mountArchive } from './memory-archive.js';
 
 export const id = 'memory';
 
@@ -158,7 +159,8 @@ function who(p) {
   return p.name || p.auto || speakerLabel(p.speaker_id);
 }
 
-export function mount(root, ctx) {
+export function mount(root, ctx, options = {}) {
+  const settings = options?.settings === true;
   let summary = null;
   let commitments = [];
   let topics = [];
@@ -215,35 +217,50 @@ export function mount(root, ctx) {
   // a game runs" is the other half of that question — what decoder is doing
   // the actual transcribing, not what else rides along with it.
   const lightCard = h('div', { class: 'card', id: 'light-card' });
-  const body = h(
-    'div',
-    { class: 'view-body view-enter' },
-    // 0.9.0. Above the commitments on purpose: what happened is the thing you
-    // came here to be reminded of, and what is still owed is what you do about
-    // it. The card is absent entirely until there is something in it.
-    digestCard,
-    openCard,
-    notesCard,
-    // The correction loop, in the order it happens (see the note at the top).
-    accuracyCard,
-    vocabCard,
-    worldsCard,
-    topicsCard,
-    enrichCard,
-    translateCard,
-    moodCard,
-    lightCard
-  );
-
-  root.append(
-    h(
-      'div',
-      { class: 'view-head' },
-      h('div', {}, h('h1', { text: 'Memory' }), sub),
-      h('div', { class: 'spacer' })
-    ),
-    body
-  );
+  const body = h('div', { class: 'view-body view-enter' });
+  let archive = null;
+  const recentPanel = h('section', { id: 'memory-recent', role: 'tabpanel' }, digestCard, notesCard, worldsCard, topicsCard);
+  const commitmentPanel = h('section', { id: 'memory-commitments', role: 'tabpanel', hidden: true }, openCard);
+  const archivePanel = h('section', { id: 'memory-archive', role: 'tabpanel', hidden: true });
+  const tabs = h('div', { class: 'memory-tabs', role: 'tablist', 'aria-label': 'Memory sections' });
+  function selectTab(tab) {
+    recentPanel.hidden = tab !== 'recent';
+    commitmentPanel.hidden = tab !== 'commitments';
+    archivePanel.hidden = !['day', 'saved'].includes(tab);
+    for (const button of tabs.children) {
+      const on = button.dataset.memoryTab === tab;
+      button.setAttribute('aria-selected', String(on));
+      button.tabIndex = on ? 0 : -1;
+    }
+    if (tab === 'day' || tab === 'saved') archive?.show(tab);
+  }
+  if (settings) {
+    body.append(
+      h('h2', { text: 'Processing', class: 'settings-group-title' }), enrichCard, lightCard,
+      h('h2', { text: 'Language and sound', class: 'settings-group-title' }), translateCard, moodCard,
+      h('h2', { text: 'Recognition quality', class: 'settings-group-title' }), vocabCard, accuracyCard
+    );
+  } else {
+    for (const [tab, label] of [['recent', 'Recent'], ['day', 'By day'], ['saved', 'Saved'], ['commitments', 'Commitments']]) {
+      tabs.append(h('button', { class: 'btn', role: 'tab', dataset: { memoryTab: tab },
+        'aria-controls': tab === 'recent' ? 'memory-recent' : tab === 'commitments' ? 'memory-commitments' : 'memory-archive',
+        'aria-selected': String(tab === 'recent'), tabindex: tab === 'recent' ? '0' : '-1',
+        onclick: () => selectTab(tab), onkeydown: (e) => {
+          const buttons = [...tabs.children];
+          let index = buttons.indexOf(e.currentTarget);
+          if (e.key === 'ArrowRight') index = (index + 1) % buttons.length;
+          else if (e.key === 'ArrowLeft') index = (index + buttons.length - 1) % buttons.length;
+          else if (e.key === 'Home') index = 0;
+          else if (e.key === 'End') index = buttons.length - 1;
+          else return;
+          e.preventDefault(); buttons[index].click(); buttons[index].focus();
+        } }, label));
+    }
+    body.append(tabs, recentPanel, archivePanel, commitmentPanel);
+    archive = mountArchive(archivePanel, ctx, digestRow);
+  }
+  root.append(h('div', { class: 'view-head' },
+    h('div', {}, h('h1', { text: settings ? 'Settings' : 'Memory' }), sub)), body);
 
   // -- yesterday (0.9.0) ----------------------------------------------------
   //
@@ -2011,6 +2028,7 @@ export function mount(root, ctx) {
   }
 
   function renderSub() {
+    if (settings) { sub.textContent = 'Local processing, language, and recognition preferences'; return; }
     const c = summary?.counts;
     if (!c) {
       sub.textContent = 'loading';
@@ -2029,64 +2047,20 @@ export function mount(root, ctx) {
    * store.js follows for the same reason.
    */
   async function loadAccuracyRound() {
+    // Each surface asks only for the data it displays. A missing optional
+    // method never takes down neighboring cards.
+    if (settings) {
+      await Promise.all([
+        ask('accuracy.summary').then((r) => { accuracy = r; }).catch(() => { accuracy = null; }).then(renderAccuracy),
+        ask('vocab.get').then((r) => { vocab = r; store.vocab = r; }).catch(() => { vocab = null; }).then(renderVocab),
+        ask('assist.get').then(applyAssist).catch(() => {}).then(renderTranslation),
+      ]);
+      return;
+    }
     await Promise.all([
-      ask('notes.list', { limit: 100 })
-        .then((r) => {
-          notes = r.notes ?? [];
-        })
-        .catch(() => {
-          notes = [];
-        })
-        .then(renderNotes),
-      ask('accuracy.summary')
-        .then((r) => {
-          accuracy = r;
-        })
-        .catch(() => {
-          accuracy = null;
-        })
-        .then(renderAccuracy),
-      ask('vocab.get')
-        .then((r) => {
-          vocab = r;
-          store.vocab = r;
-        })
-        .catch(() => {
-          vocab = null;
-        })
-        .then(renderVocab),
-      // 0.9.0. Its own slice for the same reason the three above have theirs:
-      // a daemon older than 0.9.0 answers `unknown_method`, and one missing
-      // method must not blank the cards next to it.
-      ask('digest.list', { limit: 40 })
-        .then((r) => {
-          digests = r.digests ?? [];
-        })
-        .catch(() => {
-          digests = [];
-        })
-        .then(renderDigests),
-      // 0.10.2. Its own slice for the same reason every one above it has one:
-      // a daemon older than 0.10.2 answers `unknown_method` here, and the card
-      // says so rather than blanking the enrichment card beside it. This is
-      // also what puts the LANGUAGE LIST in the model — the resync fetches it
-      // too, but a view mounted between resyncs would otherwise draw a
-      // selector with nothing in it.
-      ask('assist.get')
-        .then((r) => {
-          applyAssist(r);
-        })
-        .catch(() => {})
-        .then(renderTranslation),
-      // 0.10.0. Its own slice for the same reason every one above it has one.
-      ask('worlds.list', { limit: 12 })
-        .then((r) => {
-          worlds = r.worlds ?? [];
-        })
-        .catch(() => {
-          worlds = [];
-        })
-        .then(renderWorlds),
+      ask('notes.list', { limit: 100 }).then((r) => { notes = r.notes ?? []; }).catch(() => { notes = []; }).then(renderNotes),
+      ask('digest.list', { limit: 40 }).then((r) => { digests = r.digests ?? []; }).catch(() => { digests = []; }).then(renderDigests),
+      ask('worlds.list', { limit: 12 }).then((r) => { worlds = r.worlds ?? []; }).catch(() => { worlds = []; }).then(renderWorlds),
     ]);
   }
 
@@ -2095,8 +2069,8 @@ export function mount(root, ctx) {
     try {
       const [s, list, tops] = await Promise.all([
         ask('graph.summary'),
-        ask('commitments.list'),
-        ask('topics.list'),
+        settings ? Promise.resolve({ commitments: [] }) : ask('commitments.list'),
+        settings ? Promise.resolve({ topics: [] }) : ask('topics.list'),
       ]);
       summary = s;
       commitments = list.commitments ?? [];
@@ -2172,7 +2146,7 @@ export function mount(root, ctx) {
       // A correction anywhere moves the accuracy figures, and a corrected
       // segment arrives as an ordinary `segment` update. Re-asking is one small
       // query and is always right; guessing at the arithmetic would not be.
-      if (change?.updated?.some((s) => s.corrected)) {
+      if (settings && change?.updated?.some((s) => s.corrected)) {
         ask('accuracy.summary')
           .then((a) => {
             accuracy = a;
@@ -2212,6 +2186,7 @@ export function mount(root, ctx) {
       if (change?.relabel) renderCommitments();
     },
     reload: load,
+    destroy() { archive?.destroy(); },
     // 0.9.0: a reminder, from a toast or from an OS notification, lands on its
     // row. Returns null when the note is not in the list, which is how the
     // controller knows to say so rather than scrolling to nothing.
@@ -2228,6 +2203,7 @@ export function mount(root, ctx) {
    * notification that lands on the row and one that lands on an empty card.
    */
   function focusNote(noteId) {
+    if (!settings) selectTab('recent');
     pendingFocus = noteId;
     return applyFocus();
   }
