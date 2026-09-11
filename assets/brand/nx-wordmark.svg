@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1098 552" width="63.652" height="32" role="img" aria-label="NX">
+  <title>NX wordmark</title>
+  <!-- Outlined Geist 900 lowercase nx, tracking -0.125em. See README.md. -->
+  <g fill="currentColor" transform="translate(-56 552) scale(1 -1)">
+    <path d="M56 0V540H230L238 368L214 370Q220 439 244.5 478.5Q269 518 306.5 535.0Q344 552 390 552Q446 552 487.5 528.0Q529 504 552.0 458.5Q575 413 575 347V0H381V280Q381 319 376.5 346.5Q372 374 358.5 388.5Q345 403 319 403Q282 403 266.0 371.0Q250 339 250 280V0Z" />
+    <path d="M551.0 0 739.0 272 553.0 540H753.0L851.0 386L947.0 540H1151.0L965.0 272L1154.0 0H954.0L855.0 160L755.0 0Z" />
+  </g>
+</svg>

@@ -63,8 +63,17 @@
   background: var(--clear-surface);
   border-right: 1px solid var(--clear-line);
 }
-.rail-brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px var(--sp-2); }
+.rail-brand { display: flex; align-items: center; gap: 16px; padding: 4px 6px var(--sp-2); }
 .rail-brand img { width: 30px; height: 30px; display: block; }
+.rail-brand .nx-wordmark { display: block; width: 58px; height: auto; padding: 16px 0; box-sizing: content-box; }
+.rail-brand .nx-wordmark img { display: block; width: 58px; height: auto; }
+.rail-brand .nx-wordmark .nx-wordmark-light { display: none; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .rail-brand .nx-wordmark-violet { display: none; }
+  :root:not([data-theme="light"]) .rail-brand .nx-wordmark-light { display: block; }
+}
+:root[data-theme="dark"] .rail-brand .nx-wordmark-violet { display: none; }
+:root[data-theme="dark"] .rail-brand .nx-wordmark-light { display: block; }
 .rail-brand b { display: block; font-size: 15px; font-weight: 640; letter-spacing: -0.01em; }
 .rail-brand small {
   display: block; color: var(--clear-muted);

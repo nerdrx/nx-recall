@@ -63,7 +63,9 @@ export class RecallClient extends EventEmitter {
     this.autoReconnect = autoReconnect;
 
     this.sock = null;
-    this.buf = '';
+    this.frameParts = [];
+    this.frameBytes = 0;
+    this.frameRejected = false;
     this.nextId = 1;
     this.pending = new Map(); // id → {resolve, reject, timer}
     this.status = 'offline';
@@ -202,7 +204,9 @@ export class RecallClient extends EventEmitter {
     this.sock.removeAllListeners();
     this.sock.destroy();
     this.sock = null;
-    this.buf = '';
+    this.frameParts = [];
+    this.frameBytes = 0;
+    this.frameRejected = false;
     this.catchingUp = false;
     this.queued = [];
     this._failPending(err || new Error('daemon connection closed'));
@@ -232,11 +236,31 @@ export class RecallClient extends EventEmitter {
   // -- framing -------------------------------------------------------------
 
   _onData(chunk) {
-    this.buf += chunk;
-    let nl;
-    while ((nl = this.buf.indexOf('\n')) >= 0) {
-      const line = this.buf.slice(0, nl).trim();
-      this.buf = this.buf.slice(nl + 1);
+    if (this.frameRejected) return;
+    let start = 0;
+    while (start < chunk.length) {
+      const nl = chunk.indexOf('\n', start);
+      const part = chunk.slice(start, nl < 0 ? chunk.length : nl);
+      // Check every frame BEFORE parsing, including complete frames in one
+      // read. Count UTF-8 bytes, not UTF-16 code units. The socket's decoder
+      // preserves characters split across reads.
+      this.frameBytes += Buffer.byteLength(part, 'utf8');
+      if (this.frameBytes > MAX_FRAME_BYTES) {
+        this.frameParts = [];
+        this.frameBytes = 0;
+        this.frameRejected = true;
+        this.emit('warn', 'oversized frame from daemon — dropping connection');
+        if (this.sock) this.sock.destroy();
+        return;
+      }
+      if (part) this.frameParts.push(part);
+      if (nl < 0) return;
+      // Join once per complete frame. Repeated concatenation + newline scans
+      // otherwise copy/scan a large audio reply again on every socket read.
+      const line = this.frameParts.join('').trim();
+      this.frameParts = [];
+      this.frameBytes = 0;
+      start = nl + 1;
       if (!line) continue;
       let msg;
       try {
@@ -246,11 +270,6 @@ export class RecallClient extends EventEmitter {
         continue;
       }
       this._dispatch(msg);
-    }
-    // A daemon that never sends a newline must not grow us without bound.
-    if (this.buf.length > MAX_FRAME_BYTES) {
-      this.emit('warn', 'oversized frame from daemon — dropping connection');
-      if (this.sock) this.sock.destroy();
     }
   }
 
