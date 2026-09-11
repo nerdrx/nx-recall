@@ -29,6 +29,7 @@ import { store, speakerLabel, ask, applyAssist, MOOD_MODES } from '../lib/store.
 // speaker id and nothing else.
 import { lookOn, lookOf, iconSpan } from './highlight.js';
 import { toast } from '../lib/sheets.js';
+import { mountReview } from './review.js';
 import { mountArchive } from './memory-archive.js';
 
 export const id = 'memory';
@@ -219,12 +220,17 @@ export function mount(root, ctx, options = {}) {
   const lightCard = h('div', { class: 'card', id: 'light-card' });
   const body = h('div', { class: 'view-body view-enter' });
   let archive = null;
+  let review = null;
+  const reviewPanel = h('section', { id: 'memory-review', role: 'tabpanel', hidden: true });
   const recentPanel = h('section', { id: 'memory-recent', role: 'tabpanel' }, digestCard, notesCard, worldsCard, topicsCard);
   const commitmentPanel = h('section', { id: 'memory-commitments', role: 'tabpanel', hidden: true }, openCard);
   const archivePanel = h('section', { id: 'memory-archive', role: 'tabpanel', hidden: true });
   const tabs = h('div', { class: 'memory-tabs', role: 'tablist', 'aria-label': 'Memory sections' });
   function selectTab(tab) {
     recentPanel.hidden = tab !== 'recent';
+    reviewPanel.hidden = tab !== 'review';
+    if (tab === 'review') review?.show?.();
+    else review?.hide?.();
     commitmentPanel.hidden = tab !== 'commitments';
     archivePanel.hidden = !['day', 'saved'].includes(tab);
     for (const button of tabs.children) {
@@ -247,9 +253,9 @@ export function mount(root, ctx, options = {}) {
       group('quality', 'Recognition quality', 'Teach names and terms, then see what transcript corrections have improved.', vocabCard, accuracyCard)
     );
   } else {
-    for (const [tab, label] of [['recent', 'Recent'], ['day', 'By day'], ['saved', 'Saved'], ['commitments', 'Commitments']]) {
+    for (const [tab, label] of [['recent', 'Recent'], ['day', 'By day'], ['saved', 'Saved'], ['review', 'Review'], ['commitments', 'Commitments']]) {
       tabs.append(h('button', { class: 'btn', role: 'tab', dataset: { memoryTab: tab },
-        'aria-controls': tab === 'recent' ? 'memory-recent' : tab === 'commitments' ? 'memory-commitments' : 'memory-archive',
+        'aria-controls': tab === 'recent' ? 'memory-recent' : tab === 'commitments' ? 'memory-commitments' : tab === 'review' ? 'memory-review' : 'memory-archive',
         'aria-selected': String(tab === 'recent'), tabindex: tab === 'recent' ? '0' : '-1',
         onclick: () => selectTab(tab), onkeydown: (e) => {
           const buttons = [...tabs.children];
@@ -262,7 +268,8 @@ export function mount(root, ctx, options = {}) {
           e.preventDefault(); buttons[index].click(); buttons[index].focus();
         } }, label));
     }
-    body.append(tabs, recentPanel, archivePanel, commitmentPanel);
+    body.append(tabs, recentPanel, archivePanel, reviewPanel, commitmentPanel);
+    review = mountReview(reviewPanel, ctx);
     archive = mountArchive(archivePanel, ctx, digestRow);
   }
   root.append(h('div', { class: 'view-head' },
@@ -2124,6 +2131,7 @@ export function mount(root, ctx, options = {}) {
   return {
     update(change) {
       archive?.update(change);
+      review?.update(change);
       // A note arriving live goes to the top of the list — it is the newest
       // thing you said to yourself, and it is the reason you are looking.
       if (change?.note) {
@@ -2193,7 +2201,7 @@ export function mount(root, ctx, options = {}) {
       if (change?.relabel) renderCommitments();
     },
     reload: load,
-    destroy() { archive?.destroy(); },
+    destroy() { archive?.destroy(); review?.destroy(); },
     // 0.9.0: a reminder, from a toast or from an OS notification, lands on its
     // row. Returns null when the note is not in the list, which is how the
     // controller knows to say so rather than scrolling to nothing.

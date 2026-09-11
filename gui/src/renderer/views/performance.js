@@ -5,6 +5,27 @@ export function formatLatency(value) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '—';
   return value >= 1000 ? `${(value / 1000).toFixed(2)} s` : `${Math.round(value)} ms`;
 }
+export const STAGE_LABELS = [
+  ['queue_wait', 'Audio queue wait'], ['recognition', 'Primary speech recognition'],
+  ['partial_recognition', 'Live caption recognition'], ['overlap', 'Overlapping voices check'],
+  ['speaker_embedding', 'Voice features'], ['speaker_matching', 'Speaker ranking'],
+  ['transcript_commit', 'Transcript and identity save'], ['refinement', 'Language and speaker refinement'], ['audio_write', 'Audio file write'],
+  ['semantic', 'Live search indexing'],
+];
+function stageTable(stages) {
+  const table = h('table', { class: 'performance-stages' },
+    h('caption', { text: 'Recent processing calls' }),
+    h('thead', {}, h('tr', {}, ...['Stage', 'Median', '95th percentile', 'Samples'].map(text => h('th', { scope: 'col', text })))),
+    h('tbody', {}, ...STAGE_LABELS.map(([key, label]) => h('tr', {}, h('th', { scope: 'row', text: label }),
+      h('td', { text: formatLatency(stages?.[key]?.p50_ms) }), h('td', { text: formatLatency(stages?.[key]?.p95_ms) }),
+      h('td', { text: String(stages?.[key]?.samples ?? 0) })))));
+  return h('section', { class: 'card performance-stages-card', id: 'performance-stages' },
+    h('h3', { class: 'card-title', text: 'Where processing time goes' }),
+    h('p', { class: 'sub', text: 'Measured on your recording workload. Each stage keeps its latest 256 calls, including failed calls. Empty rows have no measurements yet.' }),
+    h('div', { class: 'performance-table-scroll', tabindex: '0', role: 'region', 'aria-label': 'Processing stage measurements' }, table),
+    h('p', { class: 'sub', text: 'Stages handle different work and can overlap: transcript and identity save includes speaker ranking. Do not add these medians into a total. Queue wait ends when a captured buffer begins processing; audio-to-transcript also includes turn closing.' }));
+}
+
 export function mountPerformance() {
   const status = h('p', { class: 'sub', role: 'status', text: 'Open Performance to load measurements.' });
   const content = h('div', { class: 'performance-grid' });
@@ -40,6 +61,7 @@ export function mountPerformance() {
       content.replaceChildren(
         latency('Audio to transcript', data.capture, 'From the end of a recorded turn to its stored transcript. Includes waiting and recognition; excludes screen rendering.'),
         latency('Search response', data.search, 'Time spent serving search requests, including answers and failed requests. Excludes network and screen rendering.'),
+        stageTable(data.stages),
         h('section', { class: 'card' }, h('h3', { class: 'card-title', text: 'Recording queue' }),
           h('p', { class: 'performance-value', text: q ? `${Number(q.seconds).toFixed(2)} s` : '—' }),
           h('p', { class: 'sub', text: q ? `${Number(q.capacity_seconds).toFixed(1)} s capacity · ${q.dropped_chunks} dropped buffers (${Number(q.dropped_seconds).toFixed(2)} s)` : 'Recording queue is not attached.' }),

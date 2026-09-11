@@ -153,7 +153,7 @@ fn the_v11_migration_is_idempotent_and_keeps_what_it_wrote() {
     // open that wrote a second copy of every correction would be caught here.
     //
     // 0.14.0 takes it to v20: `gaps` (capture health), additive, no backfill.
-    assert_eq!(SCHEMA_VERSION, 23, "0.16.0 is schema v23");
+    assert_eq!(SCHEMA_VERSION, 24, "0.17.0 is schema v24");
     let dir = temp_dir("schema");
     let mut seg = 0i64;
     // Three opens: the first migrates, the second and third must be no-ops

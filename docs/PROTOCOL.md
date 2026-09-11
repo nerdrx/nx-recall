@@ -5882,3 +5882,44 @@ attempt counts, and retry delay. It keeps no text. Repair yields to capture,
 foreground inference and busy database access, backs off on failures, and
 resumes the durable dirty queue after restart. An in-flight model call finishes
 on pause/shutdown but its result is discarded.
+
+
+## 0.17.0 — recognition review and related moments (schema v24)
+
+`proto` remains 1. The review table stores source IDs, revisions and review state,
+not copied transcript/audio. Changes to words, decoder/language confidence or
+source visibility update the revision. Speaker metadata changes do not reopen
+word review. Migration backfills currently flagged visible words.
+
+| Method | Parameters | Reply |
+|---|---|---|
+| `review.list` | `{limit?:30,before_id?}` | `{items:[segment + review_revision + review_reasons],next_before_id}` |
+| `review.get` | `{segment_id}` | `{item:segment + review_revision}` |
+| `review.mark` | `{segment_id,revision}` | `{reviewed:true}` or `conflict` |
+| `saved.moments.related` | `{id,limit?:5}` | `{available:true,method:"shared_words",moments:[...],candidate_limit:200}` |
+
+Review limits are 1–100, newest IDs first. Reasons are `decoder_disagreement`
+(`asr_confidence=shaky`) and `language_mismatch`. A reviewed item reappears only
+when source text/evidence changes. Correction uses existing `segments.correct`,
+which now accepts optional `expected_text`; stale words produce `conflict`
+without changing the transcript or publishing an event. The comparison and
+write share a transaction. After correction, clients may fetch the new review
+revision before marking it; never mark a revision inferred from client state.
+
+Related moments use up to 24 normalized original-word tokens of length≥4,
+excluding a small common-word list. Indexed FTS retrieves at most 200 candidate
+moments; exact source-token overlap then ranks them, requiring at least two
+shared tokens. Overlapping saved ranges are excluded. Personal notes/titles
+are not matching input. Each result includes the ordinary saved moment plus
+`shared_words` (up to six) and `reason`. This is bounded lexical suggestion,
+not exhaustive semantic similarity. Limits are 1–10; hidden/deleted sources
+cannot contribute evidence or returned text. No extra model is required.
+
+`performance.get.stages` maps `queue_wait`, `recognition`,
+`partial_recognition`, `overlap`, `speaker_embedding`, `speaker_matching`,
+`transcript_commit`, `refinement`, `audio_write`, and `semantic` to the existing
+bounded latency shape. Queue wait measures captured buffer end to processing
+entry using monotonic time. Recognition separates primary final passes from
+live caption calls. Finalization includes nested speaker ranking; refinement
+includes language/speaker follow-up work. Stages have different sample counts
+and may overlap: their medians are not additive. Missing samples remain null.

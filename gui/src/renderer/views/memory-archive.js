@@ -1,6 +1,7 @@
 import { h, clear, fmtDate, fmtClock } from '../lib/dom.js';
 import { ask, segmentSpeakerLabel } from '../lib/store.js';
 import { toast, openSheet, confirmSheet } from '../lib/sheets.js';
+import { windowedHistory } from '../lib/windowed-history.js';
 
 // Local calendar boundaries deliberately use setDate, including DST days.
 export function dayRange(day) {
@@ -41,6 +42,8 @@ export function mountArchive(root, ctx, digestRow) {
   const sourceRows = new Map();
   const purged = new Set();
   let revision = 0;
+  let history = null;
+  let relatedRefresh = null;
   const offsets = { moments: 0, searches: 0 };
   const button = (label, action, attrs = {}) => h('button', { class: 'btn small', onclick: action, ...attrs }, label);
   function error(box, message, retry) {
@@ -60,6 +63,8 @@ export function mountArchive(root, ctx, digestRow) {
   function update(change) {
     if (change?.purged?.length || change?.updated?.length) revision++;
     const referenced = change?.purged?.length ? new Set([...sourceRows.keys(), ...[...root.querySelectorAll('[data-source-ids]')].flatMap(row=>JSON.parse(row.dataset.sourceIds))]) : null;
+    relatedRefresh?.(change);
+    history?.update(change);
     for (const id of change?.purged ?? []) {
       if (referenced.has(id)) purged.add(id);
       for (const item of sourceRows.get(id) ?? []) item.node.remove();
@@ -78,6 +83,9 @@ export function mountArchive(root, ctx, digestRow) {
       if (item.node.isConnected) item.node.querySelector('[data-source-attribution]').textContent = archiveAttribution(item.segment);
     }
     if (change?.purged?.length) {
+      for (const row of document.querySelectorAll('[data-related-moment]')) {
+        if (JSON.parse(row.dataset.sourceIds || '[]').some(id => change.purged.includes(id))) row.remove();
+      }
       for (const row of root.querySelectorAll('[data-saved-kind="moments"]')) {
         if (JSON.parse(row.dataset.sourceIds || '[]').every(id=>purged.has(id))) row.remove();
       }
@@ -91,6 +99,8 @@ export function mountArchive(root, ctx, digestRow) {
         document.getElementById('saved-moment-play').disabled = count === 0;
       }
     }
+    const historyStatus = root.querySelector('#archive-history-status');
+    if (historyStatus && history) historyStatus.textContent = historyStatus.textContent.replace(/^\d+ turns? shown/, `${history.count} turn${history.count===1?'':'s'} shown`);
     pruneRows();
   }
   function pruneRows() {
@@ -103,6 +113,7 @@ export function mountArchive(root, ctx, digestRow) {
   async function show(next) {
     mode = next;
     const ticket = ++generation;
+    history?.destroy(); history = null;
     clear(root);
     pruneRows(); purged.clear();
     const content = h('div', { class: 'archive-content', 'aria-live': 'polite' });
@@ -123,7 +134,8 @@ export function mountArchive(root, ctx, digestRow) {
       const range = dayRange(selectedDay);
       const more = button('Load more turns', () => void loadPage(), { id: 'archive-load-more' });
       const refresh = button('Refresh day', () => void show('day'), { id: 'archive-refresh' });
-      content.append(summaryBox, h('h2', { text: 'Recorded words' }), h('p', { class: 'sub', text: 'Read this day in order. Refresh the day to include new recordings.' }), historyList, historyStatus, historyError, more, refresh);
+      content.append(summaryBox, h('h2', { text: 'Recorded words' }), h('p', { class: 'sub', text: 'Read this day in order. Use arrow keys on a turn to move between loaded turns; Home and End reach the first and last. Refresh the day to include new recordings.' }), historyList, historyStatus, historyError, more, refresh);
+      history = windowedHistory(historyList, root.closest('.view-body') ?? root, segment => sourceRow(segment,{dataset:{historyId:segment.id}}), pruneRows);
       async function loadPage() {
         if (loading || finished || dead || ticket !== generation) return;
         loading = true; more.disabled = true; more.textContent = 'Loading…'; historyError.textContent = '';
@@ -134,11 +146,8 @@ export function mountArchive(root, ctx, digestRow) {
           if (dead || ticket !== generation) return;
           const scroller = root.closest('.view-body');
           const scroll = scroller?.scrollTop;
-          for (const segment of uniqueHistoryRows(reply.segments ?? [], seen)) {
-            const row = sourceRow(segment,{dataset:{historyId:segment.id}});
-            if (row) historyList.append(row);
-          }
-          loaded = historyList.children.length;
+          history.append(uniqueHistoryRows(reply.segments ?? [], seen).filter(segment => !purged.has(segment.id)));
+          loaded = history.count;
           cursor = reply.next_cursor ?? null; finished = cursor == null;
           historyStatus.textContent = loaded ? `${loaded} turn${loaded === 1 ? '' : 's'} shown${finished ? ' · end of this day' : ' · more available'}` : 'No retained transcript for this day.';
           more.hidden = finished;
@@ -242,13 +251,40 @@ export function mountArchive(root, ctx, digestRow) {
     catch (e) { toast(`Could not open this moment — ${e.message}`, 'error'); return; }
     if (dead || mode !== 'saved' || ticket !== generation) return;
     const record = reply.moment;
-    openSheet(close => [h('h2', { text: record.title || 'Saved moment' }),
+    let relatedAlive = true, relatedRequest = 0;
+    const relatedSourceIds = new Set(record.segment_ids);
+    const related = h('section', { id: 'saved-moment-related', 'aria-label': 'Related saved moments' });
+    let closeCurrent;
+    openSheet(close => { closeCurrent=close; return [h('h2', { text: record.title || 'Saved moment' }),
       record.note ? h('div', {}, h('span', { class: 'sub', text: 'Personal note' }), h('p', { text: record.note })) : null,
       h('p', { class: 'sub', id: 'saved-moment-count', text: `${record.segments.filter(s=>!purged.has(s.id)).length} retained turns · playback includes only this saved range` }),
       record.unavailable_count ? h('p', { class: 'sub', text: `${record.unavailable_count} original turn(s) no longer retained.` }) : null,
       h('div', { id: 'saved-moment-detail' }, ...record.segments.map(segment => { const row=sourceRow(segment,{dataset:{momentSegment:segment.id}},false); if(row) row.append(button('Open in transcript',()=>{close();ctx.jumpToSegment(segment);})); return row; })),
+      related,
       h('div', { class: 'sheet-actions' }, button('Close', () => close()),
-        button('Play saved range', () => { close(); void ctx.replayMoment?.(record.id); }, { id: 'saved-moment-play' }))], { onClose: pruneRows });
+        button('Play saved range', () => { close(); void ctx.replayMoment?.(record.id); }, { id: 'saved-moment-play' }))]; }, { onClose: () => { relatedAlive=false; relatedRefresh=null; pruneRows(); } });
+    async function loadRelated() {
+      const request=++relatedRequest;
+      clear(related); related.append(h('h3',{text:'Related saved moments'}), h('p',{class:'sub',text:'Finding shared words in original transcripts…'}));
+      try {
+        let reply, began;
+        do { began=revision; reply=await ask('saved.moments.related',{id,limit:5}); } while(began!==revision && relatedAlive && !dead && ticket===generation);
+        if (!relatedAlive || dead || ticket!==generation || request!==relatedRequest) return;
+        clear(related); related.append(h('h3',{text:'Related saved moments'}),h('p',{class:'sub',text:'Lightweight suggestions from shared original words, without a model or personal notes. Up to 24 query words and 200 matching candidates are considered; results are not exhaustive.'}));
+        if (!reply.available) related.append(h('p',{class:'sub',text:'Related moments are unavailable.'}));
+        else if (!reply.moments?.length) related.append(h('p',{class:'sub',text:'No related saved moments found.'}));
+        relatedSourceIds.clear(); record.segment_ids.forEach(id=>relatedSourceIds.add(id));
+        for (const moment of reply.moments ?? []) {
+          moment.segments?.forEach(segment=>relatedSourceIds.add(segment.id));
+          const row=h('article',{class:'card saved-item',dataset:{relatedMoment:moment.id,sourceIds:JSON.stringify(moment.segments?.map(s=>s.id)??[])}},h('h4',{text:moment.title || 'Saved moment'}),h('p',{class:'sub',text:moment.reason || 'Shared original words'}));
+          const first=moment.segments?.find(segment=>!purged.has(segment.id));
+          if (!first) continue;
+          row.append(sourceRow(first,{},false),button('Open related moment',()=>{closeCurrent();void openMoment(moment.id);}));related.append(row);
+        }
+      } catch(e) { if(relatedAlive && !dead && ticket===generation && request===relatedRequest)error(related,`Related moments could not be loaded — ${e.message}`,()=>void loadRelated()); }
+    }
+    relatedRefresh = change => { if ([...(change?.purged??[]),...(change?.updated??[]).map(row=>row.id)].some(id=>relatedSourceIds.has(id))) void loadRelated(); };
+    void loadRelated();
   }
   function editCollection(record = null) {
     openSheet(close => {
@@ -303,5 +339,5 @@ export function mountArchive(root, ctx, digestRow) {
         h('div', { class: 'sheet-actions' }, button('Cancel', () => close()), save)];
     });
   }
-  return { show, update, hide() { mode = null; generation++; }, destroy() { dead = true; generation++; sourceRows.clear(); purged.clear(); } };
+  return { show, update, hide() { mode = null; generation++; history?.destroy(); history=null; }, destroy() { dead = true; generation++; history?.destroy(); history=null; sourceRows.clear(); purged.clear(); } };
 }

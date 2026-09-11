@@ -1,0 +1,20 @@
+// Run: node gui/bench/history-window.mjs
+import { performance } from 'node:perf_hooks';
+import { HeightIndex } from '../src/renderer/lib/windowed-history.js';
+const index=new HeightIndex();
+const start=performance.now();
+index.append(Array.from({length:50000},(_,id)=>({id})));
+for(let i=0;i<index.rows.length;i++)index.measure(i,80+(i%31)*15);
+index.rebuild();
+const buildMs=performance.now()-start;
+const offsets=Array.from({length:10000},(_,i)=>(i*7919)%index.total);
+let checksum=0;
+const lookupStart=performance.now();
+for(const offset of offsets)checksum+=index.at(offset);
+const lookupMs=performance.now()-lookupStart;
+const scanStart=performance.now();
+let reference=0;
+for(const offset of offsets)reference+=index.offsets.findIndex((y,i)=>y<=offset && index.offsets[i+1]>offset);
+const scanMs=performance.now()-scanStart;
+if(checksum!==reference)throw Error('Lookup mismatch');
+console.log(JSON.stringify({rows:index.rows.length,lookups:offsets.length,buildMs,lookupMs,linearReferenceMs:scanMs,checksum},null,2));

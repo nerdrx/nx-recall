@@ -162,8 +162,9 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // hand because nothing wrote them down.
 // Schemas21–22 add durable semantic bookkeeping and source-linked saved items.
 // Schema23 adds saved collections and an indexed chronological history walk.
-// Their migrations share this transaction, including the version update.
-pub const SCHEMA_VERSION: i64 = 23;
+// Schema24 adds revision-guarded review state referencing source segments.
+// Migration helpers complete before the stored schema version is advanced.
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -1528,6 +1529,7 @@ impl Store {
         crate::semantic::migrate_v21(&self.conn)?;
         crate::saved::migrate_v22(&self.conn)?;
         crate::saved::migrate_v23(&self.conn)?;
+        crate::review::migrate_v24(&self.conn)?;
         // ---- end 0.14.0 ------------------------------------------------------
 
         match current {
@@ -11210,6 +11212,9 @@ mod tests {
                 .execute_batch(
                     "DROP INDEX IF EXISTS idx_segments_label_via;
                      ALTER TABLE segments DROP COLUMN label_via;
+                     DROP TRIGGER IF EXISTS recognition_review_insert;
+                     DROP TRIGGER IF EXISTS recognition_review_update;
+                     DROP TABLE IF EXISTS recognition_review;
                      ALTER TABLE segments DROP COLUMN lang_via;
                      ALTER TABLE speakers DROP COLUMN languages;
                      UPDATE schema_version SET version = 4;",

@@ -11,6 +11,7 @@
 // direction you are looking.
 
 import { h, clear, fmtClock, fmtDay, fmtDayLabel } from '../lib/dom.js';
+import { mountConversationFind } from '../lib/conversation-find.js';
 import { saveMomentSheet } from '../lib/saved.js';
 import {
   store,
@@ -325,7 +326,16 @@ export function mount(root, ctx) {
     rNote
   );
 
-  root.append(head, replayBar, body);
+  const conversationFind = mountConversationFind({ request: ask, jump: ctx.jumpToSegment,
+    reveal(id) {
+      const row = list.querySelector(`.seg[data-seg="${id}"]`);
+      if (!row) return false;
+      leaveTheTail();
+      for (const hit of list.querySelectorAll('.seg.hit')) hit.classList.remove('hit');
+      row.classList.add('hit'); reveal(row); return true;
+    },
+  });
+  root.append(head, conversationFind.panel, replayBar, body);
   body.addEventListener('scroll', onScroll, { passive: true });
 
   // -- rendering ------------------------------------------------------------
@@ -411,7 +421,8 @@ export function mount(root, ctx) {
       // conversation, so it is where "play it back" belongs. Quiet until the
       // hairline is hovered or focused: a row of buttons down the page would
       // be louder than the separators themselves.
-      replayButton(seg.thread, { className: 'thread-sep-replay' })
+      replayButton(seg.thread, { className: 'thread-sep-replay' }),
+      h('button', { class: 'btn small conversation-find-open', text: 'Find', 'aria-label': 'Find in this conversation', onclick: e => conversationFind.open(seg.thread, e.currentTarget) })
     );
   }
 
@@ -1111,7 +1122,8 @@ export function mount(root, ctx) {
   }
 
   return {
-    update,
+    update(change) { conversationFind.update(change); update(change); },
+    destroy() { conversationFind.destroy(); },
     /** Search results jump here: scroll the segment into view and mark it. */
     focusSegment(segId) {
       leaveTheTail();

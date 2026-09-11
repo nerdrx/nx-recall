@@ -104,3 +104,29 @@ took 1,221.13 ms vs 3.36 ms. This measures queue-selection SQL only, without mod
 inference, audio, disk I/O, or screen rendering. It is not an end-to-end speedup
 claim. Scheduling regressions separately verify unlocked inference, pause/stop,
 capture/store priority, durable resume, bounded backoff and stale-result guards.
+
+
+## 0.17: conversation finder, review inbox, and windowed history
+
+Recorded words keep all fetched cursor pages in order, but mount only the viewport plus 600px on either side and any focused turn. ResizeObserver records each full, naturally wrapped card's height. No transcript truncation or fixed row height is introduced. Measured offsets support binary lookup; page append and deletion preserve the reading anchor. Arrow keys and Home/End cross virtual row boundaries. Purging a focused turn moves focus to its retained neighbor.
+
+`#archive-history.historyState()` exposes loaded IDs, rendered IDs, and measurements for integration validation. The existing 305-turn cursor test still checks every source ID and tied timestamp order, then checks bounded DOM, offscreen correction, long text, and focused deletion.
+
+Node model benchmark (`node gui/bench/history-window.mjs`, local run): 50,000 variable-height rows built in 15.1ms; 10,000 binary viewport lookups in 0.79ms versus 220.8ms for linear reference lookup. Both compute identical result checksums. This measures the layout index only, not browser rendering or daemon query latency. Browser validation remains required for end-to-end claims.
+
+Related moments use retained source-word overlap, explain the 24-query-word / 200-candidate limit, show original evidence, and open the selected saved range in one replacement dialog. Personal notes are excluded from matching; no generated summary or semantic completeness claim is made. Corrections and purges invalidate displayed related evidence.
+
+
+Conversation Find loads the complete `thread.get` result rather than searching
+only the current transcript window. It uses literal text/grapheme ranges, next
+and previous matches, and a timestamp timeline. Controlled jumps preserve the
+finder state across transcript remounts; other navigation closes it. Edits and
+purges invalidate stale loaded results, including replies already in flight.
+
+Review is an explicit Memory tab, loaded only while visible. It reuses the shared
+audio player and existing correction measurements. Typed drafts are retained
+with a warning when remote edits arrive; purges remove the card and its draft.
+Reviewed state is revision guarded, and a correction sends the expected original
+text before marking the new revision. No automatic edits or unmeasured accuracy
+claims are made. Performance stages require real captured workload to populate;
+synthetic layout benchmarks do not measure ASR speed or hardware accuracy.
