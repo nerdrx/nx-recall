@@ -10,7 +10,7 @@ test('all-history drops dates without changing query, speaker, world, source or 
 test('rolling saved searches resolve at reopen time', () => {
   const record = { query: 'portal', filters: { date: { kind: 'rolling', days: 7 }, speaker: '7', source: 'mic', mode: 'both' } };
   const restored = restoreSavedSearch(record, new Date(2026, 9, 12, 12));
-  assert.equal(restored.from, '2026-10-05'); assert.equal(restored.to, '2026-10-12');
+  assert.equal(restored.from, '2026-10-06'); assert.equal(restored.to, '2026-10-12');
   assert.equal(restored.speaker, '7'); assert.equal(restored.source, 'mic'); assert.equal(restored.mode, 'both');
 });
 test('fixed saved searches retain their exact calendar dates', () => {
@@ -51,4 +51,32 @@ test('a chosen archive day and a saved rolling browse work without keywords', ()
   assert.equal(hasSearchIntent(state), true);
   assert.equal(hasSearchIntent({ ...state, date: { kind: 'rolling' } }, { saved: true }), true);
   assert.equal(hasSearchIntent({ q: '  ', date: { kind: 'all' } }), false, 'an empty all-history query does not scan everything');
+});
+
+test('rolling calendar days include today exactly once', () => {
+  const now = new Date(2026, 8, 11, 12);
+  assert.deepEqual(resolveSearchDate({ kind: 'rolling', days: 1 }, now), { from: '2026-09-11', to: '2026-09-11' });
+  assert.deepEqual(resolveSearchDate({ kind: 'rolling', days: 7 }, now), { from: '2026-09-05', to: '2026-09-11' });
+  for (const days of [undefined, 0, -1, 1.5, '7', NaN, Infinity, 3651]) {
+    assert.deepEqual(resolveSearchDate({ kind: 'rolling', days }, now), { from: '2026-09-05', to: '2026-09-11' });
+  }
+});
+test('rolling days cover complete local calendar days across both DST changes', () => {
+  const old = process.env.TZ;
+  process.env.TZ = 'Europe/Berlin';
+  try {
+    const spring = new Date(2026, 2, 29, 12);
+    const oneDay = searchDateParams(resolveSearchDate({ kind: 'rolling', days: 1 }, spring));
+    assert.deepEqual(oneDay, { from: '2026-03-28T23:00:00.000Z', to: '2026-03-29T22:00:00.000Z' });
+    const springWeek = resolveSearchDate({ kind: 'rolling', days: 7 }, spring);
+    assert.deepEqual(springWeek, { from: '2026-03-23', to: '2026-03-29' });
+    const springBounds = searchDateParams(springWeek);
+    assert.equal((Date.parse(springBounds.to) - Date.parse(springBounds.from)) / 3600000, 167);
+    const autumnWeek = resolveSearchDate({ kind: 'rolling', days: 7 }, new Date(2026, 9, 25, 12));
+    assert.deepEqual(autumnWeek, { from: '2026-10-19', to: '2026-10-25' });
+    const autumnBounds = searchDateParams(autumnWeek);
+    assert.equal((Date.parse(autumnBounds.to) - Date.parse(autumnBounds.from)) / 3600000, 169);
+  } finally {
+    if (old == null) delete process.env.TZ; else process.env.TZ = old;
+  }
 });

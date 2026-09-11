@@ -31,8 +31,7 @@ const facetState = {
   q: '',
   speaker: '',
   source: '',
-  from: isoDay(new Date(Date.now() - 7 * 86400e3)),
-  to: isoDay(new Date()),
+  ...resolveSearchDate({ kind: 'rolling', days: 7 }),
   // `null` until the first mount, then whichever mode the daemon can serve.
   // Sticky like the rest of the facets: a person who chose Keyword meant it.
   mode: null,
@@ -1034,7 +1033,11 @@ export function noteJump() {
 // search next month must not silently search the week when it was saved.
 export function resolveSearchDate(date, now = new Date()) {
   if (date?.kind === 'rolling') {
-    const start = new Date(now); start.setDate(start.getDate() - (date.days ?? 7));
+    // Today counts as one of the days. Calendar arithmetic also preserves
+    // local midnight across daylight-saving changes. Malformed saved filters
+    // fall back to a week rather than producing invalid or unbounded dates.
+    const days = Number.isInteger(date.days) && date.days >= 1 && date.days <= 3650 ? date.days : 7;
+    const start = new Date(now); start.setDate(start.getDate() - (days - 1));
     return { from: isoDay(start), to: isoDay(now) };
   }
   return date?.kind === 'fixed' ? { from: date.from || '', to: date.to || '' } : { from: '', to: '' };
