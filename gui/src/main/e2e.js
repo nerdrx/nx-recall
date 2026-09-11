@@ -4779,7 +4779,24 @@ export function runE2E(deps) {
         assert(await js(`document.getElementById('${selectId}').value === '${fixture.first}'`), `${selectId} lost selection on no matches`);
         await input(`${selectId}-find`, '');
         assert(await js(`document.getElementById('${selectId}').options.length >= ${fixture.count}`), `${selectId} clear failed to restore full options`);
+        await js(`(() => {const s=document.getElementById('${selectId}');s.value='';s.dispatchEvent(new Event('change',{bubbles:true}));})()`);
       }
+      await nav014('transcript');
+      await waitFor('transcript row for assignment', () => js(`!!document.querySelector('#seg-list .seg')`));
+      await js(`document.querySelector('#seg-list .seg').click()`);
+      await waitFor('actual segment assignment sheet', () => js(`!!document.querySelector('.sheet #speaker-find') && !!document.getElementById('segment-save')`));
+      await input('speaker-find', 'ELODIE');
+      await js(`(() => {const f=document.getElementById('speaker-find');f.focus();f.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}));})()`);
+      assert(await js(`document.activeElement?.dataset.speakerChoice === '${fixture.first}'`), 'assignment ArrowDown missed accented match');
+      await js(`document.activeElement.click()`);
+      assert(await js(`document.activeElement?.dataset.speakerChoice === '${fixture.first}' && document.activeElement.getAttribute('aria-pressed') === 'true'`), 'assignment selection lost focus or pressed state');
+      await waitFor('named assignment controls', () => js(`document.getElementById('name-voice-row').hidden && !document.getElementById('highlight-row').hidden`));
+      await input('speaker-find', String(fixture.first + 3));
+      await js(`(() => {const f=document.getElementById('speaker-find');f.focus();f.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}));document.activeElement.click();})()`);
+      await waitFor('unnamed assignment controls', () => js(`!document.getElementById('name-voice-row').hidden && document.getElementById('name-voice-hint').textContent.includes('${fixture.first + 3}') && !document.getElementById('highlight-row').hidden`));
+      await js(`document.querySelector('#speaker-find-choices [data-speaker-choice="null"]').click()`);
+      await waitFor('unassigned controls', () => js(`document.getElementById('name-voice-row').hidden && document.getElementById('highlight-row').hidden`));
+      await clickLabel014('.sheet', 'Cancel');
       await nav014('sources');
       await js(`document.querySelector('[data-sources-category="connections"]').click()`);
       const discordId = await waitFor('Discord speaker finder', () => js(`document.querySelector('input[id^="truth-speaker-"][id$="-find"]')?.id`));

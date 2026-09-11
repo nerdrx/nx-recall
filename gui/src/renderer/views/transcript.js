@@ -1410,7 +1410,7 @@ export function openSegmentSheet(seg, ctx) {
     paintHlRow();
     // The picker above can move this segment to another unnamed voice; the
     // offer follows the picked voice, not the row's original one.
-    pick.addEventListener('click', () =>
+    speakerPicker.list.addEventListener('click', () =>
       queueMicrotask(() => {
         paintNameRow();
         paintHlRow();
@@ -1439,7 +1439,7 @@ export function openSegmentSheet(seg, ctx) {
         // other one, and the hint below reflects the store once it has.
         toast(`Named ${name}. Every turn of that voice now says so.`, 'ok');
         nameInput.value = '';
-        setTimeout(paintNameRow, 50);
+        setTimeout(() => { paintNameRow(); speakerPicker.refresh(); paintHlRow(); }, 50);
       } catch (e) {
         toast(`Could not name that voice — ${e.message}`, 'error');
       } finally {
