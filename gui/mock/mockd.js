@@ -4084,6 +4084,15 @@ export function startMock({
       const page = rows.slice(0,limit), last = page.at(-1);
       return { segments: page.map(row=>({...row})), next_cursor: rows.length>limit ? JSON.stringify({from:params.from,to:params.to,time:last.t_ms,id:last.id,max}) : null };
     },
+    'mock.speaker_search_fixture'(params) {
+      if(params?.action==='status'){emit('status','status',statusPayload());return {sent:true};}
+      const first=Math.max(...state.speakers.map(row=>row.id))+1000;
+      const rows=Array.from({length:200},(_,index)=>({id:first+index,name:index===0?'Élodie Searchfixture':index===1?'Renée Searchfixture':index%2===0?`Roster person ${index}`:null,auto:`Speaker_${first+index}`,first_seen:Date.now()}));
+      state.speakers.push(...rows);
+      const segment={...state.segments[0],id:Math.max(...state.segments.map(row=>row.id))+100,speaker:first,text:'Synthetic roster discovery',has_audio:false};
+      state.segments.push(segment); emit('segments','segment',segment);
+      return {first,second:first+1,count:state.speakers.length};
+    },
     'mock.review_fixture'() {
       const id=Math.max(0,...state.segments.map(row=>row.id))+100;
       const rows=[0,1].map(offset=>({...state.segments[0],id:id+offset,text:`Synthetic recognition review ${offset}`,asr_confidence:'shaky',lang_via:null,has_audio:true,dur_ms:1800,speaker:null}));

@@ -1,3 +1,4 @@
+import { searchableSpeakerSelect } from '../lib/searchable-select.js';
 // Live transcript — the view the app is for. Segments stream in as they are
 // transcribed; anything the pipeline itself refused to identify is visibly
 // muted and carries a "?" that says why; clicking any segment opens the
@@ -12,6 +13,7 @@
 
 import { h, clear, fmtClock, fmtDay, fmtDayLabel } from '../lib/dom.js';
 import { mountConversationFind } from '../lib/conversation-find.js';
+import { createSpeakerPicker } from '../lib/speaker-picker.js';
 import { saveMomentSheet } from '../lib/saved.js';
 import {
   store,
@@ -206,9 +208,12 @@ export function mount(root, ctx) {
     h('option', { value: '' }, 'Everyone')
   );
 
+  const speakerPicker = searchableSpeakerSelect(speakerFilter, { label: 'Find a speaker to filter the transcript' });
+
   /** Drive the existing Everyone/speaker filter from anywhere else in the UI. */
   function setFilter(spId) {
     filterSpeaker = spId ?? null;
+    speakerPicker.reset();
     speakerFilter.value = spId == null ? '' : String(spId);
     repaint();
   }
@@ -220,7 +225,7 @@ export function mount(root, ctx) {
     h('div', { class: 'spacer' }),
     liveChip,
     dateInput,
-    speakerFilter,
+    speakerPicker.element,
     followBtn
   );
 
@@ -701,10 +706,11 @@ export function mount(root, ctx) {
       // `color-scheme` note at the top of tokens.css). The emoji renders.
       const ic = lookOf(sp.id).icon;
       speakerFilter.append(
-        h('option', { value: String(sp.id) }, ic ? `${ic} ${speakerLabel(sp.id)}` : speakerLabel(sp.id))
+        h('option', { value: String(sp.id), dataset: { speakerAuto: sp.auto ?? '' } }, ic ? `${ic} ${speakerLabel(sp.id)}` : speakerLabel(sp.id))
       );
     }
     speakerFilter.value = cur;
+    speakerPicker.refresh();
   }
 
   function nearBottom() {
@@ -1233,37 +1239,18 @@ export function openSegmentSheet(seg, ctx) {
   let picked = seg.speaker ?? null;
 
   const build = (close) => {
-    const pick = h('div', { class: 'sp-pick' });
-    const speakerFind = h('input', { class: 'input', id: 'speaker-find', placeholder: 'Find a person or voice', 'aria-label': 'Find a person or voice', oninput: () => rebuild() });
-    const rebuild = () => {
-      clear(pick);
-      const mk = (spId, label) => {
-        // `lookOf(null)` is the muted grey "Unassigned" has always had, and no
-        // icon — the same two answers this line gave before highlights existed.
-        const { color, icon } = lookOf(spId);
-        return h(
-          'button',
-          {
-            'aria-pressed': String(picked === spId),
-            onclick: () => {
-              picked = spId;
-              rebuild();
-            },
-          },
-          h('span', { class: 'dot', style: `color:${color}` }),
-          iconSpan(icon),
-          label
-        );
-      };
-      pick.append(mk(null, 'Unassigned'));
-      const recent = new Map();
-      for (const row of store.segments) if (row.speaker != null) recent.set(row.speaker, Math.max(recent.get(row.speaker) ?? 0, row.t_ms ?? 0));
-      for (const sp of [...store.speakers.values()].sort((a, b) => Number(!!b.name) - Number(!!a.name) || (recent.get(b.id) ?? 0) - (recent.get(a.id) ?? 0) || (b.total_ms ?? 0) - (a.total_ms ?? 0))) {
-        if (speakerFind.value && !speakerLabel(sp.id).toLocaleLowerCase().includes(speakerFind.value.toLocaleLowerCase())) continue;
-        pick.append(mk(sp.id, speakerLabel(sp.id)));
-      }
-    };
-    rebuild();
+    const recent = new Map();
+    for (const row of store.segments) if (row.speaker != null) recent.set(row.speaker, Math.max(recent.get(row.speaker) ?? 0, row.t_ms ?? 0));
+    const choices = [...store.speakers.values()].sort((a, b) => Number(!!b.name) - Number(!!a.name) || (recent.get(b.id) ?? 0) - (recent.get(a.id) ?? 0) || (b.total_ms ?? 0) - (a.total_ms ?? 0));
+    const speakerPicker = createSpeakerPicker({
+      speakers: choices, label: speakerLabel, selected: picked, allowUnassigned: true,
+      onSelect: id => { picked = id; },
+      render: (sp, choose) => {
+        const id = sp?.id ?? null;
+        const { color, icon } = lookOf(id);
+        return h('button', { onclick: choose }, h('span', { class: 'dot', style: `color:${color}` }), iconSpan(icon), speakerLabel(id));
+      },
+    });
 
     // ------------------------------------------------------------------
     // "Fix this" (0.8.0)
@@ -1423,7 +1410,7 @@ export function openSegmentSheet(seg, ctx) {
     paintHlRow();
     // The picker above can move this segment to another unnamed voice; the
     // offer follows the picked voice, not the row's original one.
-    pick.addEventListener('click', () =>
+    speakerPicker.list.addEventListener('click', () =>
       queueMicrotask(() => {
         paintNameRow();
         paintHlRow();
@@ -1452,7 +1439,7 @@ export function openSegmentSheet(seg, ctx) {
         // other one, and the hint below reflects the store once it has.
         toast(`Named ${name}. Every turn of that voice now says so.`, 'ok');
         nameInput.value = '';
-        setTimeout(paintNameRow, 50);
+        setTimeout(() => { paintNameRow(); speakerPicker.refresh(); paintHlRow(); }, 50);
       } catch (e) {
         toast(`Could not name that voice — ${e.message}`, 'error');
       } finally {
@@ -1569,8 +1556,7 @@ export function openSegmentSheet(seg, ctx) {
             )
           : null
       ),
-      speakerFind,
-      pick,
+      ...speakerPicker.nodes,
       nameRow,
       // Under the naming offer and not inside it: `nameRow` is hidden the
       // moment a voice has a name, and a highlight is for exactly the voice

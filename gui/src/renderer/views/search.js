@@ -1,3 +1,4 @@
+import { searchableSpeakerSelect } from '../lib/searchable-select.js';
 // Search — over the transcript, with speaker / source / date facets, in three
 // modes: the words (FTS), the meaning (vectors), or both fused. The mode
 // control and the per-hit `via` marker live in ./semantic.js.
@@ -140,6 +141,7 @@ export function mount(root, ctx, arg) {
   });
 
   const speakerSel = h('select', { class: 'input', id: 'search-speaker' });
+  const speakerPicker = searchableSpeakerSelect(speakerSel, { label: 'Find a speaker for search results' });
   const sourceSel = h('select', { class: 'input', id: 'search-source' });
   const fromInput = h('input', { class: 'input', id: 'search-from', type: 'date', value: facetState.from });
   const toInput = h('input', { class: 'input', id: 'search-to', type: 'date', value: facetState.to });
@@ -148,9 +150,10 @@ export function mount(root, ctx, arg) {
     clear(speakerSel);
     speakerSel.append(h('option', { value: '' }, 'Anyone'));
     for (const sp of [...store.speakers.values()].sort((a, b) => (b.total_ms ?? 0) - (a.total_ms ?? 0))) {
-      speakerSel.append(h('option', { value: String(sp.id) }, speakerLabel(sp.id)));
+      speakerSel.append(h('option', { value: String(sp.id), dataset: { speakerAuto: sp.auto ?? '' } }, speakerLabel(sp.id)));
     }
     speakerSel.value = facetState.speaker;
+    speakerPicker.refresh();
 
     clear(sourceSel);
     sourceSel.append(h('option', { value: '' }, 'Any source'));
@@ -201,7 +204,7 @@ export function mount(root, ctx, arg) {
   const facets = h(
     'div',
     { class: 'facets', id: 'search-facets', hidden: !facetState.advanced },
-    h('div', { class: 'facet' }, h('label', { for: 'search-speaker', text: 'Speaker' }), speakerSel),
+    h('div', { class: 'facet' }, h('label', { for: 'search-speaker', text: 'Speaker' }), speakerPicker.element),
     h('div', { class: 'facet' }, h('label', { for: 'search-source', text: 'Source' }), sourceSel),
     h('div', { class: 'facet' }, h('label', { text: ' ' }), h('button', { class: 'btn', id: 'search-go', onclick: () => run() }, 'Apply filters'))
   );

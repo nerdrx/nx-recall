@@ -2087,3 +2087,10 @@ input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), select, te
 .performance-stages th, .performance-stages td { text-align:left; padding:10px 12px 10px 0; border-bottom:1px solid var(--clear-line); }
 .performance-stages thead th { color:var(--clear-muted); }
 .performance-stages tbody th { font-weight:500; }
+
+/* Search long speaker pickers without replacing native selection behavior. */
+.searchable-speaker-select { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.searchable-speaker-select > .input, .searchable-speaker-select > select { width: 100%; min-width: 0; }
+.view-head .searchable-speaker-select { width: 190px; flex-shrink: 1; }
+.speaker-select-status { font-size: 11px; max-width: 240px; }
+.sp-actions .searchable-speaker-select { width: 190px; }

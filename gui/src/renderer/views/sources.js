@@ -1,3 +1,4 @@
+import { searchableSpeakerSelect } from '../lib/searchable-select.js';
 // Sources — the allowlist. DESIGN §0: capture is DEFAULT-DENY, apps are opted
 // in and never out, so this view has to read as "nothing is listened to unless
 // you said so": denied rows are the quiet default state, allowed rows are the
@@ -588,6 +589,9 @@ export function mount(root, ctx, arg = {}) {
   }
 
   function renderTruth() {
+    const searches = [...truthCard.querySelectorAll('.searchable-speaker-select input')].map(input => ({
+      id: input.id, value: input.value, focused: document.activeElement === input, start: input.selectionStart, end: input.selectionEnd,
+    }));
     clear(truthCard);
     const brief = store.status?.truth ?? null;
     const enabled = truth?.enabled ?? brief?.enabled ?? false;
@@ -661,6 +665,12 @@ export function mount(root, ctx, arg = {}) {
       list.append(truthRow(u, named));
     }
     truthCard.append(list);
+    for (const saved of searches) {
+      const input = [...truthCard.querySelectorAll('.searchable-speaker-select input')].find(input => input.id === saved.id);
+      if (!input) continue;
+      input.value = saved.value; input.dispatchEvent(new Event('input'));
+      if (saved.focused && !input.disabled) { input.focus({ preventScroll: true }); input.setSelectionRange(saved.start, saved.end); }
+    }
   }
 
   function truthRow(u, named) {
@@ -669,6 +679,7 @@ export function mount(root, ctx, arg = {}) {
       'select',
       {
         class: 'cap-select',
+        id: `truth-speaker-${u.user_id}`,
         dataset: { truthLink: u.user_id },
         disabled: truthPending === u.user_id,
         onchange: (e) => setTruthLink(u, e.target.value),
@@ -685,6 +696,7 @@ export function mount(root, ctx, arg = {}) {
         return h('option', {
           value: String(sp.id),
           selected: sp.id === u.speaker,
+          dataset: { speakerAuto: sp.auto ?? '' },
           text: `${ic ? `${ic} ` : ''}${sp.name ?? sp.auto}`,
         });
       }),
@@ -711,7 +723,7 @@ export function mount(root, ctx, arg = {}) {
         h('span', { class: 'key', text: ` ${u.segments ?? 0} turn${u.segments === 1 ? '' : 's'}${u.via === 'truth' ? ' · linked automatically' : u.via === 'manual' ? ' · linked by you' : ''}` })
       ),
       h('span', { class: 'spacer' }),
-      h('span', { class: 'sp-actions' }, select)
+      h('span', { class: 'sp-actions' }, searchableSpeakerSelect(select, { label: `Find a speaker to link ${u.name ?? u.user_id}` }).element)
     );
     return row;
   }

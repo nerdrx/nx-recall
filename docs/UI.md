@@ -130,3 +130,18 @@ Reviewed state is revision guarded, and a correction sends the expected original
 text before marking the new revision. No automatic edits or unmeasured accuracy
 claims are made. Performance stages require real captured workload to populate;
 synthetic layout benchmarks do not measure ASR speed or hardware accuracy.
+
+## 0.17.1: speaker discovery
+
+Speakers has a persistent query field and All / Named / Unnamed filters. Matching
+uses all space-separated terms across the display name, automatic voice label,
+and numeric identity, ignoring case and accents. Live list updates preserve the
+query and input focus; an explicit onboarding action can clear filters to reveal
+the requested voice.
+
+Transcript, Search, and Discord link selectors show a search field when there
+are at least 12 voices. Filtering retains the selected identity and the unfiltered
+Everyone / Anyone / Link choice; typing never submits or changes an identity.
+Arrow Down enters the native selector and Escape clears its query. Discord
+status refreshes preserve the query and caret. Merge and assignment sheets use
+the same matching with 40 choices per page, keyboard navigation, and result counts.
