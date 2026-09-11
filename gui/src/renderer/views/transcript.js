@@ -64,6 +64,28 @@ const LOAD_MARGIN = 320;
 /** How close to the bottom counts as "back on the tail". */
 const TAIL_MARGIN = 8;
 
+/**
+ * One render pass's conversation labels. Index participants lazily, only when
+ * that pass actually draws a conversation seam. Scanning the entire window
+ * for every seam makes a history repaint quadratic in its row count.
+ * Speaker labels remain live; only membership/order is shared within a pass.
+ */
+export function threadNameResolver(segments, label) {
+  let participants = null;
+  return (threadId) => {
+    if (!participants) {
+      participants = new Map();
+      for (const segment of segments) {
+        if (segment.thread == null || segment.speaker == null) continue;
+        let speakers = participants.get(segment.thread);
+        if (!speakers) participants.set(segment.thread, speakers = new Set());
+        speakers.add(segment.speaker);
+      }
+    }
+    return Array.from(participants.get(threadId) ?? [], label);
+  };
+}
+
 export function mount(root, ctx) {
   let filterSpeaker = null;
   let lastYou = store.mic.you_speaker;
@@ -360,13 +382,13 @@ export function mount(root, ctx) {
    * the state down a pass, which is what lets a PREPENDED page be separated by
    * the same rules as a repaint and then hand its state to the seam.
    */
-  function nodeWalker(state) {
+  function nodeWalker(state, names = threadNameResolver(store.segments, speakerLabel)) {
     const walk = separatorWalker(state);
     return (seg) => {
       const at = walk(seg);
       const out = [];
       if (at.day) out.push(h('div', { class: 'day-sep', text: fmtDayLabel(seg.t_ms) }));
-      if (at.thread) out.push(threadSep(seg));
+      if (at.thread) out.push(threadSep(seg, names(seg.thread)));
       return out;
     };
   }
@@ -380,8 +402,7 @@ export function mount(root, ctx) {
    * captured. The names are the people in the new conversation, because "a
    * conversation started" is only useful if it says whose.
    */
-  function threadSep(seg) {
-    const names = threadNames(seg.thread);
+  function threadSep(seg, names) {
     return h(
       'div',
       { class: 'thread-sep', dataset: { thread: String(seg.thread) } },
@@ -414,16 +435,6 @@ export function mount(root, ctx) {
       },
       'Replay'
     );
-  }
-
-  /** Who is in a thread, as far as the loaded window can see. */
-  function threadNames(threadId) {
-    const seen = [];
-    for (const s of store.segments) {
-      if (s.thread !== threadId || s.speaker == null) continue;
-      if (!seen.includes(s.speaker)) seen.push(s.speaker);
-    }
-    return seen.map((id) => speakerLabel(id));
   }
 
   function segRow(seg, isNew = false) {
@@ -882,6 +893,7 @@ export function mount(root, ctx) {
     if (!change) return;
     if (change.added) {
       const stick = following() && nearBottom();
+      const names = threadNameResolver(store.segments, speakerLabel);
       for (const seg of change.added) {
         if (filterSpeaker != null && seg.speaker !== filterSpeaker) continue;
         const lastRow = list.querySelector('.seg:last-of-type');
@@ -894,7 +906,7 @@ export function mount(root, ctx) {
           day: lastSeg ? fmtDay(lastSeg.t_ms) : null,
           thread: lastSeg?.thread ?? null,
           seen: !!lastSeg,
-        });
+        }, names);
         // Where the MODEL filed it decides where the row goes. A late turn — a
         // mic segment that closed after an app segment that started later, a
         // row the daemon re-read — lands before the rows it precedes, not at

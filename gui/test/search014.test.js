@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { hasSearchIntent, resolveSearchDate, searchDateParams, withoutSearchDates, savedSearchFilters, restoreSavedSearch } from '../src/renderer/views/search.js';
+import { nextSearchResult, searchCountLabel, hasSearchIntent, resolveSearchDate, searchDateParams, withoutSearchDates, savedSearchFilters, restoreSavedSearch } from '../src/renderer/views/search.js';
 
 test('all-history drops dates without changing query, speaker, world, source or mode', () => {
   const input = { query: 'portal', speaker_id: 7, source: 'VRChat.exe', world_id: 'wrld_x', mode: 'hybrid', from_ns: '12', to_ns: '34', from_ms: 0, to_ms: 1 };
@@ -79,4 +79,21 @@ test('rolling days cover complete local calendar days across both DST changes', 
   } finally {
     if (old == null) delete process.env.TZ; else process.env.TZ = old;
   }
+});
+
+test('keyboard navigation traverses result boundaries without accidental wraparound', () => {
+  assert.equal(nextSearchResult(0, 'ArrowUp', 3), 0);
+  assert.equal(nextSearchResult(0, 'ArrowDown', 3), 1);
+  assert.equal(nextSearchResult(2, 'ArrowDown', 3), 2);
+  assert.equal(nextSearchResult(1, 'Home', 3), 0);
+  assert.equal(nextSearchResult(1, 'End', 3), 2);
+  assert.equal(nextSearchResult(0, 'ArrowDown', 0), null);
+  assert.equal(nextSearchResult(0, 'Enter', 3), null, 'opening context does not move focus to another hit');
+});
+test('result count distinguishes a capped page from all matches', () => {
+  assert.equal(searchCountLabel(240, 100), '100 of 240 matches');
+  assert.equal(searchCountLabel(1, 1), '1 match');
+  assert.equal(searchCountLabel(0, 0), 'No matches');
+  assert.equal(searchCountLabel(undefined, 4), '4 matches');
+  assert.equal(searchCountLabel(0, 4), '4 matches', 'a malformed total cannot hide rendered hits');
 });

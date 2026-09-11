@@ -26,6 +26,7 @@ import { patchSpeakerLabels } from './lib/labels.js';
 // look-up the roster brief needs for the voice that just walked in.
 import { lookOf, iconSpan, paintHighlights } from './views/highlight.js';
 import { toast, sheetsOpen } from './lib/sheets.js';
+import { openQuickSwitch } from './lib/quick-switch.js';
 import { stop as stopPreview, playbackState } from './lib/preview.js';
 import * as replay from './lib/replay.js';
 import * as transcriptView from './views/transcript.js';
@@ -140,6 +141,9 @@ function go(name, arg = null) {
   clear(main);
   current = VIEWS[name].mount(main, ctx, arg);
   document.body.dataset.view = name;
+  const heading = main.querySelector('h1');
+  if (heading) { heading.id = 'view-title'; main.setAttribute('aria-labelledby', heading.id); }
+  for (const button of document.querySelectorAll('.rail-item[data-view]')) button.tabIndex = button.dataset.view === (name === 'person' ? returnTo : name) ? 0 : -1;
 }
 
 /** A voice → the person behind it (docs/GRAPH.md). */
@@ -291,6 +295,8 @@ function renderPause() {
   pauseBtn.dataset.paused = String(store.paused);
   pauseBtn.disabled = !online || store.pausePending;
   pauseLabel.textContent = store.paused ? 'Resume capture' : 'Pause capture';
+  pauseBtn.setAttribute('aria-label', pauseLabel.textContent);
+  pauseBtn.title = pauseLabel.textContent;
   pauseIco.innerHTML = store.paused ? ICON_RESUME : ICON_PAUSE;
   pauseHint.textContent = !online
     ? 'The daemon is not answering, so capture cannot be changed from here.'
@@ -742,8 +748,53 @@ window.recall.onToast((t) => toast(t.text, t.kind));
 // keyboard
 // ---------------------------------------------------------------------------
 
+const collapse = document.getElementById('rail-collapse');
+function setRail(compact) {
+  document.body.dataset.rail = compact ? 'collapsed' : 'expanded';
+  collapse.setAttribute('aria-expanded', String(!compact));
+  collapse.setAttribute('aria-label', compact ? 'Expand navigation' : 'Collapse navigation');
+  collapse.title = compact ? 'Expand navigation' : 'Collapse navigation';
+  collapse.firstElementChild.textContent = compact ? '⇥' : '⇤';
+  try { localStorage.setItem('nx-recall-rail', compact ? 'collapsed' : 'expanded'); } catch { /* session-only fallback */ }
+}
+let compactRail = false;
+try { compactRail = localStorage.getItem('nx-recall-rail') === 'collapsed'; } catch { /* default expanded */ }
+setRail(compactRail);
+collapse.addEventListener('click', () => setRail(document.body.dataset.rail !== 'collapsed'));
+document.querySelector('.skip-link').addEventListener('click', e => { e.preventDefault(); main.focus(); });
+document.querySelector('.rail-nav').addEventListener('keydown', e => {
+  const buttons = [...document.querySelectorAll('.rail-item[data-view]')];
+  let at = buttons.indexOf(e.target);
+  if (at < 0) return;
+  if (e.key === 'ArrowDown') at = (at + 1) % buttons.length;
+  else if (e.key === 'ArrowUp') at = (at + buttons.length - 1) % buttons.length;
+  else if (e.key === 'Home') at = 0;
+  else if (e.key === 'End') at = buttons.length - 1;
+  else return;
+  e.preventDefault(); buttons[at].click(); buttons[at].focus();
+});
+function quickSwitch() {
+  if (sheetsOpen()) return;
+  const navigate = (name, arg) => () => { go(name, arg); main.focus(); };
+  const commands = [
+    { label: 'Transcript', description: 'Read the live conversation', keywords: 'live recent words', shortcut: 'Alt 1', run: navigate('transcript') },
+    { label: 'Speakers', description: 'Name and manage voices', keywords: 'people voices identity', shortcut: 'Alt 2', run: navigate('speakers') },
+    { label: 'Search', description: 'Find a past conversation', keywords: 'find transcript words', shortcut: 'Ctrl F', run: () => { go('search'); current?.focusQuery?.(); } },
+    { label: 'Memory', description: 'Summaries, places, and topics', keywords: 'recent archive', shortcut: 'Alt 4', run: navigate('memory') },
+    { label: 'Saved moments and searches', description: 'Return to something you kept', keywords: 'bookmarks memory notes', run: () => { go('memory'); main.querySelector('[data-memory-tab="saved"]')?.click(); main.focus(); } },
+    { label: 'Sources', description: 'Choose what Recall may hear', keywords: 'capture microphone apps consent', shortcut: 'Alt 5', run: navigate('sources', { section: 'capture' }) },
+    { label: 'Storage and backups', description: 'Manage retained audio and exports', keywords: 'delete disk export', run: navigate('sources', { section: 'storage' }) },
+    { label: 'Settings', description: 'Appearance and preferences', keywords: 'density appearance', shortcut: 'Alt 6', run: navigate('settings', { section: 'appearance' }) },
+    { label: 'Processing', description: 'Local models and resource use', keywords: 'settings models cpu recognition', run: navigate('settings', { section: 'processing' }) },
+  ];
+  openQuickSwitch(commands, query => { go('search', { savedSearch: { query, filters: { date: { kind: 'all' }, mode: 'keyword' } } }); current?.focusQuery?.(); });
+}
+document.getElementById('quick-switch').addEventListener('click', quickSwitch);
+document.getElementById('quick-switch').querySelector('kbd').textContent = /Mac/i.test(navigator.platform) ? '⌘ K' : 'Ctrl K';
+
 document.addEventListener('keydown', (e) => {
   if (sheetsOpen()) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); quickSwitch(); return; }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
     e.preventDefault();
     go('search');
