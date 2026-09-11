@@ -235,10 +235,15 @@ export function mount(root, ctx, options = {}) {
     if (tab === 'day' || tab === 'saved') archive?.show(tab);
   }
   if (settings) {
+    const group = (key, title, intro, ...cards) => h('section', {
+      id: `settings-${key}`, class: 'settings-panel', role: 'tabpanel',
+      'aria-labelledby': `settings-tab-${key}`, dataset: { settingsPanel: key }, hidden: true,
+    }, h('header', { class: 'settings-panel-head' },
+      h('h2', { text: title, class: 'settings-group-title' }), h('p', { class: 'sub', text: intro })), ...cards);
     body.append(
-      h('h2', { text: 'Processing', class: 'settings-group-title' }), enrichCard, lightCard,
-      h('h2', { text: 'Language and sound', class: 'settings-group-title' }), translateCard, moodCard,
-      h('h2', { text: 'Recognition quality', class: 'settings-group-title' }), vocabCard, accuracyCard
+      group('processing', 'Processing', 'Choose how Recall reads conversations and how much processing it uses while you play.', enrichCard, lightCard),
+      group('language', 'Language & sound', 'Choose your reading languages and what Recall shows alongside the original words.', translateCard, moodCard),
+      group('quality', 'Recognition quality', 'Teach names and terms, then see what transcript corrections have improved.', vocabCard, accuracyCard)
     );
   } else {
     for (const [tab, label] of [['recent', 'Recent'], ['day', 'By day'], ['saved', 'Saved'], ['commitments', 'Commitments']]) {

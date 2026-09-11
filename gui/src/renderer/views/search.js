@@ -82,11 +82,17 @@ export function mount(root, ctx, arg) {
   if (arg?.world) facetState.asked = null;
   if (arg?.savedSearch) Object.assign(facetState, restoreSavedSearch(arg.savedSearch));
   if (facetState.date.kind === 'rolling') Object.assign(facetState, resolveSearchDate(facetState.date));
-  const results = h('div', { id: 'search-results' });
-  const resultCard = h('div', { class: 'card search-result-card' }, results);
-  const context = h('aside', { class: 'card search-context', hidden: true, 'aria-label': 'Conversation context' });
+  const results = h('div', { id: 'search-results', role: 'region', 'aria-label': 'Search results', 'aria-busy': 'false' });
+  const resultCount = h('h2', { id: 'search-result-count', text: 'Your results', 'aria-live': 'polite', 'aria-atomic': 'true' });
+  const resultStatus = h('span', { class: 'sub', id: 'search-result-status', role: 'status', 'aria-live': 'polite' });
+  const resultCard = h('section', { class: 'card search-result-card', 'aria-label': 'Matching moments' },
+    h('div', { class: 'search-results-head' }, resultCount, resultStatus), results);
+  const context = h('aside', { class: 'card search-context', id: 'search-context', hidden: true, 'aria-label': 'Conversation context' });
   let contextGeneration = 0;
   let disposed = false;
+  let pending = false;
+  let focusedResult = 0;
+  let retrySearch = () => run();
   const sub = h('span', { class: 'sub', id: 'search-sub', text: 'Everything captured, by word or by meaning.' });
 
   const sem = semanticState(store.status);
@@ -123,10 +129,12 @@ export function mount(root, ctx, arg) {
     class: 'input',
     id: 'search-q',
     type: 'search',
-    placeholder: 'ask it — “what did Kira say yesterday about the portal”',
+    placeholder: 'Words, a person, or a question…',
+    'aria-describedby': 'search-keyboard-hint',
     value: facetState.q,
     onkeydown: (e) => {
       if (e.key === 'Enter') runAsk();
+      if (e.key === 'ArrowDown' && !pending && lastHits.length) { e.preventDefault(); focusResult(0); }
     },
   });
 
@@ -174,9 +182,10 @@ export function mount(root, ctx, arg) {
   const askRow = h(
     'div',
     { class: 'facets ask-row' },
-    h('div', { class: 'facet grow' }, h('label', { for: 'search-q', text: 'Ask' }), qInput),
-    h('div', { class: 'facet' }, h('label', { text: ' ' }), h('button', { class: 'btn primary', id: 'search-ask', onclick: () => runAsk() }, 'Ask')),
-    h('div', { class: 'facet' }, h('label', { text: ' ' }), advancedBtn)
+    h('div', { class: 'facet grow' }, h('label', { for: 'search-q', text: 'Search your conversations' }), qInput),
+    h('button', { class: 'btn primary', id: 'search-ask', onclick: () => runAsk() }, 'Ask'),
+    advancedBtn,
+    h('button', { class: 'btn', id: 'search-save', onclick: () => saveSearch() }, 'Save search')
   );
 
   function paintAdvanced() {
@@ -193,7 +202,7 @@ export function mount(root, ctx, arg) {
     { class: 'facets', id: 'search-facets', hidden: !facetState.advanced },
     h('div', { class: 'facet' }, h('label', { for: 'search-speaker', text: 'Speaker' }), speakerSel),
     h('div', { class: 'facet' }, h('label', { for: 'search-source', text: 'Source' }), sourceSel),
-    h('div', { class: 'facet' }, h('label', { text: ' ' }), h('button', { class: 'btn', id: 'search-go', onclick: () => run() }, 'Search'))
+    h('div', { class: 'facet' }, h('label', { text: ' ' }), h('button', { class: 'btn', id: 'search-go', onclick: () => run() }, 'Apply filters'))
   );
 
   const scopeLabel = h('span', { class: 'sub', id: 'search-scope-label', 'aria-live': 'polite' });
@@ -255,13 +264,55 @@ export function mount(root, ctx, arg) {
       h('label', { for: 'saved-search-name', text: 'Name' }), name,
       h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => close() }, 'Cancel'), save)];
   });
-  const body = h('div', { class: 'view-body view-enter search014' }, h('div', { class: 'card' }, askRow, dateRow, pills, facets,
-    h('div', { class: 'search-tools' }, modes.el, h('button', { class: 'btn', id: 'search-save', onclick: saveSearch }, 'Save search'))),
-    h('div', { class: 'search-workspace' }, resultCard, context));
+  const contextEmpty = h('aside', { class: 'search-context-empty', 'aria-label': 'Conversation reader' },
+    h('span', { class: 'search-reader-label', text: 'CONVERSATION' }),
+    h('h2', { text: 'Read the conversation.' }),
+    h('p', { text: 'Choose a result to read the turns around it. Your query and results stay here.' }),
+    h('p', { class: 'sub', id: 'search-keyboard-hint', text: '↑ ↓ move through results · Enter opens context' }));
+  const workspace = h('div', { class: 'search-workspace' }, resultCard, context, contextEmpty);
+  const body = h('div', { class: 'view-body view-enter search014' },
+    h('section', { class: 'card search-toolbar', 'aria-label': 'Search and filters' }, askRow,
+      h('div', { class: 'search-refine' }, dateRow, modes.el), pills, facets),
+    h('div', { class: 'search-summary' }, sub), workspace);
   root.append(
-    h('div', { class: 'view-head' }, h('div', {}, h('h1', { text: 'Search' }), sub), h('div', { class: 'spacer' })),
-    body
+    h('div', { class: 'view-head' }, h('div', {}, h('h1', { text: 'Search' }),
+      h('span', { class: 'sub', text: 'Find the words. Stay with the conversation.' }))), body
   );
+
+  function hideContext() {
+    context.hidden = true; contextGeneration++;
+    contextEmpty.hidden = false;
+    workspace.classList.remove('context-open');
+    for (const row of results.querySelectorAll('.seg')) { row.classList.remove('context-selected'); row.removeAttribute('aria-current'); }
+  }
+  function beginSearch(retry) {
+    hideContext(); pending = true; retrySearch = retry;
+    results.setAttribute('aria-busy', 'true');
+    resultStatus.textContent = 'Searching…';
+    resultCount.textContent = 'Finding matches';
+    clear(results);
+    results.append(h('div', { class: 'search-loading', text: 'Looking through your captured conversations…' }));
+  }
+  function endSearch() {
+    pending = false; results.setAttribute('aria-busy', 'false');
+    resultStatus.textContent = '';
+  }
+  function searchError(title, message) {
+    endSearch(); lastHits = []; clear(results);
+    resultCount.textContent = 'Search unavailable';
+    sub.textContent = 'Your query and filters are ready to try again.';
+    results.append(h('div', { class: 'empty search-feedback', role: 'alert' },
+      h('b', { text: title }), h('p', { text: message }),
+      h('button', { class: 'btn', onclick: () => retrySearch() }, 'Try again')));
+  }
+  function focusResult(index) {
+    const rows = [...results.querySelectorAll('.seg')];
+    if (pending || !rows.length) return;
+    focusedResult = Math.max(0, Math.min(rows.length - 1, index));
+    rows.forEach((row, at) => { row.tabIndex = at === focusedResult ? 0 : -1; });
+    rows[focusedResult].focus({ preventScroll: true });
+    rows[focusedResult].scrollIntoView({ block: 'nearest' });
+  }
 
   // -- run ------------------------------------------------------------------
 
@@ -293,7 +344,7 @@ export function mount(root, ctx, arg) {
   }
 
   async function runAsk() {
-    context.hidden = true; contextGeneration++;
+    beginSearch(() => runAsk());
     const my = ticket();
     facetState.q = qInput.value;
     facetState.answer = null;
@@ -341,7 +392,8 @@ export function mount(root, ctx, arg) {
             renderHits(res);
             return undefined;
           } catch (again) {
-            if (again.code !== 'unknown_method') throw again;
+            if (stale(my)) return undefined;
+            if (again.code !== 'unknown_method') { searchError('That question could not be asked', again.message); return undefined; }
           }
         }
         facetState.asked = null;
@@ -353,10 +405,7 @@ export function mount(root, ctx, arg) {
       facetState.answer = null;
       facetState.refused = null;
       renderPills();
-      clear(results);
-      results.append(
-        h('div', { class: 'empty' }, h('b', { text: 'That question could not be asked' }), h('p', { text: `${e.message}. The daemon may be restarting — try again in a moment.` }))
-      );
+      searchError('That question could not be asked', e.message);
     }
     return undefined;
   }
@@ -369,7 +418,7 @@ export function mount(root, ctx, arg) {
    * the facet straight back.
    */
   async function rerunAsked() {
-    context.hidden = true; contextGeneration++;
+    beginSearch(() => rerunAsked());
     const my = ticket();
     const it = facetState.asked;
     // Taking a pill off changes which turns were searched, so whatever
@@ -396,10 +445,7 @@ export function mount(root, ctx, arg) {
       renderHits(res, modeId);
     } catch (e) {
       if (stale(my)) return undefined;
-      clear(results);
-      results.append(
-        h('div', { class: 'empty' }, h('b', { text: 'Search failed' }), h('p', { text: e.message }))
-      );
+      searchError('Search failed', e.message);
     }
     return undefined;
   }
@@ -569,7 +615,7 @@ export function mount(root, ctx, arg) {
   }
 
   async function run() {
-    context.hidden = true; contextGeneration++;
+    beginSearch(() => run());
     const my = ticket();
     // An explicit search is a different question from the one that was asked,
     // so the pills go: leaving them up would explain results they did not
@@ -590,6 +636,7 @@ export function mount(root, ctx, arg) {
     // says "ask me something" rather than showing a red box for a question
     // nobody asked.
     if (!hasSearchIntent(facetState, { saved: !!arg?.savedSearch })) {
+      endSearch(); resultCount.textContent = 'Your results';
       lastHits = [];
       clear(results);
       sub.textContent = 'Everything captured, by word or by meaning.';
@@ -639,10 +686,7 @@ export function mount(root, ctx, arg) {
         toast('Smart search needs a model this daemon does not have. Searching by words.', '');
         return run();
       }
-      clear(results);
-      results.append(
-        h('div', { class: 'empty' }, h('b', { text: 'Search failed' }), h('p', { text: `${e.message}. The daemon may be restarting — try again in a moment.` }))
-      );
+      searchError('Search failed', e.message);
     }
   }
 
@@ -805,6 +849,9 @@ export function mount(root, ctx, arg) {
   }
 
   function renderHits(res, modeId = facetState.mode) {
+    endSearch(); focusedResult = 0;
+    resultCount.textContent = searchCountLabel(res.total, lastHits.length);
+    resultStatus.textContent = lastHits.length ? '↑ ↓ to explore' : '';
     clear(results);
     sub.textContent = resultSummary(modeId, res, facetState.asked?.query ?? facetState.q);
     // The card is built AFTER the hits exist in `lastHits` and appended BEFORE
@@ -828,26 +875,30 @@ export function mount(root, ctx, arg) {
           // ones are on and where to take them off.
           facetState.asked
             ? h('p', { class: 'sub', text: 'Or take one of the pills above off — the daemon may have read more into the question than you meant.' })
-            : null
+            : null,
+          (facetState.from || facetState.to || facetState.asked?.from_ns || facetState.asked?.to_ns)
+            ? h('button', { class: 'btn', onclick: allHistory }, 'Search all history') : null,
+          h('button', { class: 'btn', onclick: () => { facetState.advanced = true; paintAdvanced(); speakerSel.focus(); } }, 'Adjust filters')
         )
       );
       return;
     }
-    for (const seg of lastHits) results.append(hitRow(seg, modeId));
+    for (const [index, seg] of lastHits.entries()) results.append(hitRow(seg, modeId, index));
   }
 
-  function hitRow(seg, modeId = facetState.mode) {
+  function hitRow(seg, modeId = facetState.mode, index = 0) {
     // A hit is very often about a voice the live window has already trimmed, so
     // the row's own `speaker_colour`/`speaker_icon` matter more here than
     // anywhere else — `look` prefers the store where it has the voice and falls
     // back to what the query answered where it does not.
     const { color, hl, icon } = look(seg);
-    const row = h('div', {
+    const row = h('article', {
       class: `seg${isUncertain(seg) ? ' uncertain' : ''}${isShaky(seg) ? ' shaky' : ''}`,
       dataset: { hit: String(seg.id) },
-      role: 'button',
-      tabindex: '0',
-      title: 'Read the surrounding conversation',
+      tabindex: index === 0 ? '0' : '-1',
+      'aria-label': `Result ${index + 1}: ${segmentSpeakerLabel(seg)}, ${fmtDayLabel(seg.t_ms)}`,
+      'aria-keyshortcuts': 'ArrowUp ArrowDown Home End Enter Space',
+      title: 'Enter to read context; arrow keys move through results',
     });
     row.append(
       h('span', { class: 't', text: `${fmtDay(seg.t_ms).slice(5)} ${fmtClock(seg.t_ms).slice(0, 5)}` }),
@@ -883,7 +934,9 @@ export function mount(root, ctx, arg) {
         // Only in Both: in the single-leg modes every row arrived the same way
         // and a badge on all of them says nothing.
         modeId === 'both' ? viaBadge(seg.via) : null,
-        h('span', { class: 'chip', text: seg.source ?? 'unknown' }),
+        h('span', { class: 'search-source', text: seg.source ?? 'unknown' }),
+        h('button', { class: 'btn small search-read', 'aria-controls': 'search-context',
+          onclick: (e) => { e.stopPropagation(); void openContext(seg, row); } }, 'Read context'),
         // A hit is one line out of a conversation, and the question behind
         // clicking it is usually "what was going on there". This plays that
         // conversation FROM THIS LINE — not from the top, because the line is
@@ -891,10 +944,9 @@ export function mount(root, ctx, arg) {
         // older than threading has no conversation to play.
         seg.thread != null
           ? h(
-              'span',
+              'button',
               {
                 class: 'btn small replay-start hit-replay',
-                role: 'button',
                 tabindex: '0',
                 dataset: { replay: String(seg.thread), from: String(seg.id) },
                 title: 'Play this conversation back from this line',
@@ -919,22 +971,35 @@ export function mount(root, ctx, arg) {
     // grounds: an `uncertain` hit is a guess about who spoke, and styles.css
     // deliberately overrides the speaker colour on those.
     markRow(row, hl, { uncertain: isUncertain(seg) });
-    const jump = () => openContext(seg, row);
+    const jump = () => { if (!pending) void openContext(seg, row); };
     row.addEventListener('click', jump);
+    row.addEventListener('focus', () => {
+      focusedResult = index;
+      for (const sibling of results.querySelectorAll('.seg')) sibling.tabIndex = sibling === row ? 0 : -1;
+    });
     row.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); jump(); }
+      if (e.target !== row || pending) return;
+      const next = nextSearchResult(index, e.key, lastHits.length);
+      if (next != null) { e.preventDefault(); focusResult(next); }
+      else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); jump(); }
     });
     return row;
   }
 
   async function openContext(seg, trigger) {
+    if (pending) return;
+    contextEmpty.hidden = true; workspace.classList.add('context-open');
+    for (const row of results.querySelectorAll('.seg')) {
+      row.classList.toggle('context-selected', row === trigger);
+      if (row === trigger) row.setAttribute('aria-current', 'true'); else row.removeAttribute('aria-current');
+    }
     const my = ++contextGeneration;
     context.hidden = false;
     clear(context);
-    const close = () => { contextGeneration++; context.hidden = true; trigger.focus(); };
+    const close = () => { hideContext(); trigger.focus({ preventScroll: true }); };
     context.onkeydown = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
     const closeButton = h('button', { class: 'btn small', 'aria-label': 'Close conversation context', onclick: close }, 'Close');
-    const content = h('div', { class: 'search-context-turns', 'aria-live': 'polite' }, 'Loading conversation…');
+    const content = h('div', { class: 'search-context-turns', 'aria-live': 'polite', 'aria-busy': 'true' }, 'Loading conversation…');
     context.append(h('div', { class: 'search-context-head' }, h('h2', { text: 'Around this moment' }), closeButton),
       h('p', { class: 'sub', text: fmtDayLabel(seg.t_ms) }),
       h('div', { class: 'actions' },
@@ -945,6 +1010,7 @@ export function mount(root, ctx, arg) {
     try {
       const res = await ask('segments.context', { id: seg.id, before: 3, after: 3 });
       if (disposed || my !== contextGeneration || !context.isConnected) return;
+      content.setAttribute('aria-busy', 'false');
       clear(content);
       const turns = (res.segments ?? []).sort((a, b) => a.t_ms - b.t_ms || a.id - b.id);
       if (!turns.some((turn) => turn.id === seg.id)) throw new Error('This moment is no longer available.');
@@ -955,7 +1021,9 @@ export function mount(root, ctx, arg) {
       if (selected) content.scrollTop = Math.max(0, selected.offsetTop - content.offsetTop - 80);
     } catch (e) {
       if (disposed || my !== contextGeneration || !context.isConnected) return;
-      clear(content); content.append(h('p', { text: `Could not load context: ${e.message}` }));
+      content.setAttribute('aria-busy', 'false');
+      clear(content); content.append(h('p', { role: 'alert', text: `Could not load context: ${e.message}` }),
+        h('button', { class: 'btn', onclick: () => openContext(seg, trigger) }, 'Try again'));
     }
   }
 
@@ -1069,4 +1137,20 @@ export function restoreSavedSearch(record, now = new Date()) {
 export function hasSearchIntent(state, { saved = false } = {}) {
   return !!(String(state.q ?? '').trim() || state.world || state.speaker || state.source
     || ((state.date?.kind === 'fixed' || saved) && (state.from || state.to)));
+}
+
+// Clamp at the ends instead of wrapping past the start of a reading list.
+export function nextSearchResult(index, key, count) {
+  if (!Number.isInteger(count) || count <= 0) return null;
+  if (key === 'Home') return 0;
+  if (key === 'End') return count - 1;
+  if (key === 'ArrowDown') return Math.min(count - 1, index + 1);
+  if (key === 'ArrowUp') return Math.max(0, index - 1);
+  return null;
+}
+export function searchCountLabel(total, shown) {
+  const count = Number.isFinite(total) ? Math.max(shown, total) : shown;
+  if (!count) return 'No matches';
+  if (count > shown) return `${shown} of ${count.toLocaleString()} matches`;
+  return `${count.toLocaleString()} ${count === 1 ? 'match' : 'matches'}`;
 }

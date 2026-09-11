@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.15.0 — Quiet Studio
+
+- Redesigned the desktop around flat reading surfaces, sharper typography, and
+  restrained NX accents in both themes.
+- Collapsible sidebar with persistent preference, narrow-window layout, named
+  icon controls, skip link, and keyboard navigation.
+- Ctrl/Cmd+K Quick switch finds views by name or alias and searches retained
+  conversations directly.
+- Focused Settings and Sources categories preserve controls while switching.
+- Compact Search controls, independent result/context panes, explicit loading
+  and retry states, accurate counts, and keyboard/native result actions.
+- Unified Memory, speaker-list, saved-item, input, and focus styling; removed
+  the small 0.14 shared-style override files.
+- Conversation labels share one participant index per render pass instead of
+  repeatedly scanning the loaded transcript. The synthetic benchmark validates
+  equivalent labels and reports lookup timings; it excludes DOM/layout work.
+- No database migration, capture-policy change, or model dependency.
+
 ## 0.14.0 — Find and keep a moment
 
 ### Desktop

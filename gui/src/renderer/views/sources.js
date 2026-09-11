@@ -25,11 +25,13 @@ import {
   isNamed,
 } from '../lib/store.js';
 import { toast } from '../lib/sheets.js';
+import { mountSections } from '../lib/section-nav.js';
 import { CAPTION_RANGES, normalizeCaptionSettings } from '../lib/captions.js';
 
 export const id = 'sources';
+let lastSection = 'capture';
 
-export function mount(root, ctx) {
+export function mount(root, ctx, arg = {}) {
   const list = h('div', { id: 'source-list' });
   const sub = h('span', { class: 'sub', id: 'sources-sub' });
   const micCard = h('div', { class: 'card mic-card', id: 'mic-card' });
@@ -91,6 +93,19 @@ export function mount(root, ctx) {
     // rather than a decision.
     healthCard
   );
+
+  const section = (title, text, ...cards) => h('section', {},
+    h('header', { class: 'settings-panel-head' }, h('h2', { text: title }), h('p', { class: 'sub', text })), ...cards);
+  mountSections(body, {
+    id: 'sources', label: 'Source categories', initial: arg?.section ?? lastSection,
+    sections: [
+      { id: 'capture', title: 'Capture', hint: 'Microphones & applications', panel: section('Choose what Recall can hear', 'Recording is always your choice. Changes apply immediately.', micCard, roomCard, list.closest('.card')) },
+      { id: 'captions', title: 'Captions', hint: 'Live reading window', panel: section('Live captions', 'Tune the reading window that follows your conversation.', captionsCard) },
+      { id: 'connections', title: 'Connections', hint: 'Names from Discord', panel: section('Connect names to voices', 'Use your Discord connection to improve speaker labels.', truthCard) },
+      { id: 'storage', title: 'Storage & backups', hint: 'Retention, export & health', panel: section('Keep your archive in shape', 'Control retention, export your words, and verify a backup.', storageCard, backupCard, exportCard, healthCard) },
+    ],
+    onSelect(key) { lastSection = key; },
+  });
 
   root.append(
     h('div', { class: 'view-head' }, h('div', {}, h('h1', { text: 'Sources' }), sub), h('div', { class: 'spacer' })),

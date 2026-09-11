@@ -1,30 +1,6 @@
-/* NX Recall — NX Clear (nx-hub/docs/DESIGN.md §14, v1.7).
- *
- * This app used to be deep space: a drifting nebula behind real glass, lit
- * gradient edges, angular 3–6px corners, violet everywhere. That sheet is gone
- * from this file — not overridden, deleted. §§1–13 stay normative for the
- * immersive apps; NX Hub moved to Clear (v0.14.0) and Recall follows it.
- *
- *   ground    — a chosen off-white with a faint violet bias (light), true
- *               #000000 (dark). Flat, plus at most one soft corner bloom.
- *   depth     — one soft diffuse shadow + a 1px solid --clear-line hairline.
- *               On the dark variant a shadow cannot fall on black, so the
- *               hairline carries the separation alone (§14.1, amended).
- *   geometry  — rounded: 20px panels/sheets, 14px cards, 11px controls and
- *               rows, 9px micro-tags. Pills return, for chips and toggles.
- *   accent    — #7700FF is a spark, never a field: the primary action, the
- *               active rail item, focus, the mark, the update notice.
- *   cyan      — a value colour and nothing else: capture that is live right
- *               now. Green is success, amber attention, red danger.
- *
- * Themes: light on bare :root; the dark block is written twice — once under
- * prefers-color-scheme so no choice follows the OS, once under
- * :root[data-theme="dark"] so an explicit stamp wins in both directions.
- * Components read tokens; only tokens change between themes.
- *
- * NX Recall's one app-specific identity signal is --recall-live ("audio is
- * being captured right now"). On Clear it is the theme's readable cyan: brand
- * #00e5ff measures 1.6:1 on white and is not a colour you can put words in.
+/* NX Recall Quiet Studio. Shared semantic tokens for both themes.
+ * Flat reading surfaces, restrained brand color, and shadows only for floating UI.
+ * Speaker/mood/status colors retain their established meaning and contrast.
  */
 
 :root {
@@ -35,22 +11,22 @@
   color-scheme: light;
 
   /* --------------------------------------------- neutrals (DESIGN §14.1) -- */
-  --clear-bg: #fafafc;          /* page ground — off-white, faint violet bias */
+  --clear-bg: #f6f6f7;          /* page ground — off-white, faint violet bias */
   --clear-surface: #ffffff;     /* cards, panels, sheets, menus */
-  --clear-tile: #faf9fd;        /* recessed row / well fill */
-  --clear-ink: #1a1823;         /* body text — never pure #000 */
+  --clear-tile: #f4f4f6;        /* recessed row / well fill */
+  --clear-ink: #24242b;         /* body text — never pure #000 */
   /* §14.1 prints #78748a for muted; measured, that is 4.30:1 on --clear-tile
      and under AA for the 11–13px secondary text this app is full of. Darkened
      until it clears 4.5:1 on every surface it is allowed to sit on, including
      --violet-soft (4.70:1), which rows use when they are selected. */
-  --clear-muted: #6c687e;
+  --clear-muted: #62626f;
   /* Ornament ONLY — separators, inert marks, disabled glyphs. It never carries
      a word anyone has to read, but it still clears 3:1 on bg/surface/tile.
      (It does NOT clear 3:1 on --violet-soft in dark, so nothing faint is ever
      placed on an accent wash.) */
   --clear-faint: #8b8799;
-  --clear-line: #ece9f4;        /* the 1px hairline — solid, low contrast */
-  --clear-line-strong: #ddd8ea; /* inputs and rules, where it must survive on white */
+  --clear-line: #e3e3e8;        /* the 1px hairline — solid, low contrast */
+  --clear-line-strong: #b3b3bf; /* inputs and rules, where it must survive on white */
   --clear-line-accent: #ded0ff; /* a hairline warmed toward the accent */
 
   /* ---------------------------------------------------- identity (§8, §14) */
@@ -61,8 +37,8 @@
      would put a sub-AA band across the top of every primary button. The
      gradient stays; its light stop is the darkest violet that still clears AA
      under white (5.12:1). */
-  --accent-fill: linear-gradient(180deg, #8c37ff 0%, var(--violet) 100%);
-  --accent-fill-hover: linear-gradient(180deg, #9a4dff 0%, #8412ff 100%);
+  --accent-fill: var(--violet);
+  --accent-fill-hover: #6800df;
   --on-accent: #ffffff;
 
   /* ------------------------------------------------ status (§1 semantics) */
@@ -105,25 +81,25 @@
   --mood-s: 46%;
   --mood-l: 30%;
 
-  /* ------------------------------------------- geometry — ROUNDED (§14.2) */
-  --clear-r-panel: 20px;        /* sheets, the onboarding banner */
-  --clear-r-card: 14px;         /* cards, menus */
-  --clear-r-control: 11px;      /* buttons, inputs, rows, list items */
-  --clear-r-mini: 9px;          /* micro-tags, inline marks — band floor */
+  /* Quiet Studio geometry: modest corners, pills for compact metadata. */
+  --clear-r-panel: 14px;        /* sheets, the onboarding banner */
+  --clear-r-card: 10px;         /* cards, menus */
+  --clear-r-control: 7px;      /* buttons, inputs, rows, list items */
+  --clear-r-mini: 5px;          /* micro-tags, inline marks — band floor */
   --clear-r-chip: 999px;        /* pills: chips and toggles ONLY */
 
   /* ------------------------------------------------------------ elevation */
-  --clear-shadow-card: 0 1px 2px rgba(40, 20, 90, 0.05), 0 4px 12px -4px rgba(40, 20, 90, 0.1);
+  --clear-shadow-card: none;
   --clear-shadow-lift: 0 2px 4px rgba(40, 20, 90, 0.06), 0 12px 26px -10px rgba(40, 20, 90, 0.16);
   --clear-shadow-pop: 0 24px 60px -20px rgba(40, 20, 90, 0.35), 0 6px 20px -8px rgba(40, 20, 90, 0.18);
   /* §14.1 prints the spread ring first, but a 3px spread listed before a 1px
      one paints over it and the violet never renders. Same two bands, ordered
      so both are visible. */
   --clear-focus: 0 0 0 2px var(--violet), 0 0 0 5px var(--violet-soft);
+  --control-line: var(--clear-faint);
 
-  /* One soft off-screen bloom, light theme only. Dark stays flat: §13 forbids
-     anything large, bright and fixed on an OLED ground. */
-  --clear-bloom: radial-gradient(58% 40% at 100% 0%, rgba(119, 0, 255, 0.055), transparent 68%);
+  /* Flat grounds keep attention on conversation text in both themes. */
+  --clear-bloom: none;
   /* The only real backdrop-filter left in the app: the sheet scrim, which is
      the one layer that floats over live content. */
   --blur-scrim: blur(8px);
@@ -164,27 +140,27 @@
 }
 
 /* The dark variant leans OLED (§14.1, amended 2026-09-01): the ground is
-   #000000, surfaces lift to #121017, and every card keeps its 1px hairline
+   #000000, surfaces lift to #141418, and every card keeps its 1px hairline
    because a shadow cannot fall on black. Written twice on purpose — once for
    "follow the OS", once for the explicit stamp. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
     --clear-bg: #000000;
-    --clear-surface: #121017;
-    --clear-tile: #17141f;
+    --clear-surface: #141418;
+    --clear-tile: #1b1b21;
     --clear-ink: #f4f3f8;
-    --clear-muted: #9c98ab;
+    --clear-muted: #aaaab8;
     --clear-faint: #6a6678;
-    --clear-line: #262330;
-    --clear-line-strong: #302c3d;
+    --clear-line: #303039;
+    --clear-line-strong: #5d5d70;
     --clear-line-accent: #3d2f5c;
 
     --violet: #a566ff;
     --violet-2: #c79bff;
     --violet-soft: #241a38;
-    --accent-fill: linear-gradient(180deg, var(--violet-2) 0%, var(--violet) 100%);
-    --accent-fill-hover: linear-gradient(180deg, #d6b3ff 0%, #b47dff 100%);
+    --accent-fill: var(--violet);
+    --accent-fill-hover: #bd8cff;
     /* White on #a566ff is 3.53:1. The ink that reads on this accent is dark. */
     --on-accent: #140b22;
 
@@ -204,7 +180,7 @@
     --sp-plate-line-l: 30%;
     --mood-l: 79%;
 
-    --clear-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 12px -4px rgba(0, 0, 0, 0.5);
+    --clear-shadow-card: none;
     --clear-shadow-lift: 0 2px 6px rgba(0, 0, 0, 0.5), 0 12px 26px -10px rgba(0, 0, 0, 0.6);
     --clear-shadow-pop: 0 24px 60px -20px rgba(0, 0, 0, 0.6), 0 6px 20px -8px rgba(0, 0, 0, 0.5);
 
@@ -216,20 +192,20 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
   --clear-bg: #000000;
-  --clear-surface: #121017;
-  --clear-tile: #17141f;
+  --clear-surface: #141418;
+  --clear-tile: #1b1b21;
   --clear-ink: #f4f3f8;
-  --clear-muted: #9c98ab;
+  --clear-muted: #aaaab8;
   --clear-faint: #6a6678;
-  --clear-line: #262330;
-  --clear-line-strong: #302c3d;
+  --clear-line: #303039;
+  --clear-line-strong: #5d5d70;
   --clear-line-accent: #3d2f5c;
 
   --violet: #a566ff;
   --violet-2: #c79bff;
   --violet-soft: #241a38;
-  --accent-fill: linear-gradient(180deg, var(--violet-2) 0%, var(--violet) 100%);
-  --accent-fill-hover: linear-gradient(180deg, #d6b3ff 0%, #b47dff 100%);
+  --accent-fill: var(--violet);
+  --accent-fill-hover: #bd8cff;
   --on-accent: #140b22;
 
   --cyan: #00e5ff;
@@ -248,7 +224,7 @@
   --sp-plate-line-l: 30%;
   --mood-l: 79%;
 
-  --clear-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 12px -4px rgba(0, 0, 0, 0.5);
+  --clear-shadow-card: none;
   --clear-shadow-lift: 0 2px 6px rgba(0, 0, 0, 0.5), 0 12px 26px -10px rgba(0, 0, 0, 0.6);
   --clear-shadow-pop: 0 24px 60px -20px rgba(0, 0, 0, 0.6), 0 6px 20px -8px rgba(0, 0, 0, 0.5);
 

@@ -4251,7 +4251,18 @@ export function startMock({
       };
     },
 
+    // Fault injection is available only to the main-process test driver;
+    // production renderer IPC does not expose mock methods.
+    'mock.search_fail_once'() {
+      state.searchFailNext = true;
+      return { armed: true };
+    },
+
     search(params) {
+      if (state.searchFailNext) {
+        state.searchFailNext = false;
+        throw err('failed', 'The search service briefly became unavailable.');
+      }
       const q = String(params?.q ?? '').trim().toLowerCase();
       let rows = state.segments;
       if (q) rows = rows.filter((s) => s.text.toLowerCase().includes(q));

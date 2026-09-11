@@ -91,6 +91,24 @@ searchable — by word, by meaning, by speaker, by day, by world — and a 1.9 G
 model on four polite CPU cores quietly writes down who promised what, while a
 1 GB model on your GPU re-reads the hard parts at three in the morning.
 
+## Quiet Studio in 0.15
+
+A complete desktop design pass keeps the focus on conversations: flat surfaces,
+clearer typography, a collapsible sidebar, and more useful reading space in
+both light and dark themes. **Ctrl/Cmd+K** opens Quick switch for destinations,
+actions, or a search across retained conversations.
+
+Settings and Sources now have focused categories, so recording controls,
+processing, language, and archive care have clear homes. Search pairs a compact
+query bar with separately scrolling results and conversation context, native
+context/replay buttons, keyboard navigation, and retryable error states.
+Memory and Speakers share the quieter list and heading system.
+
+Conversation labels also avoid repeated scans of the transcript window. See
+[the UI guide](docs/UI.md) for architecture, keyboard behavior, accessibility,
+and the reproducible synthetic lookup benchmark. Capture consent, saved items,
+models, retention, and on-disk data keep their established behavior.
+
 ## Find and keep a moment in 0.14
 
 - **Search with a visible date scope.** Choose Last 7 days, All history, or a

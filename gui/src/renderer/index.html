@@ -18,15 +18,15 @@
     <title>NX Recall</title>
     <link rel="stylesheet" href="./tokens.css" />
     <link rel="stylesheet" href="./styles.css" />
-    <link rel="stylesheet" href="./views/search014.css" />
-    <link rel="stylesheet" href="./views/memory014.css" />
-    <link rel="stylesheet" href="./release014.css" />
+    <link rel="stylesheet" href="./views/search.css" />
   </head>
   <body>
+    <a class="skip-link" href="#main">Skip to content</a>
     <!-- NX Clear (DESIGN §14): there is no living background any more. The
          drifting nebula, the vignette and the anti-banding noise film all
          belonged to the deep-space ground and went with it; the page is a flat
-         token colour with one soft off-screen bloom, painted on <body>. -->
+         token colour with one soft off-screen bloom, painted on <body>
+    <a class="skip-link" href="#main">Skip to content</a>. -->
     <div class="shell">
       <!-- The daemon can replace itself under a running window (0.5.3). When it
            comes back as a different version this says so above every view, not
@@ -41,32 +41,34 @@
 
       <nav class="rail" aria-label="Views">
         <div class="rail-brand">
-          <img src="../../assets/icons/48x48.png" alt="" width="30" height="30" />
-          <span>
-            <span class="nx-wordmark" role="img" aria-label="NX">
-              <img class="nx-wordmark-violet" src="../../assets/brand/nx-wordmark-violet.svg" alt="" />
-              <img class="nx-wordmark-light" src="../../assets/brand/nx-wordmark-light.svg" alt="" />
-            </span>
-            <small>Recall · local only</small>
+          <span class="nx-wordmark" role="img" aria-label="NX">
+            <img class="nx-wordmark-violet" src="../../assets/brand/nx-wordmark-violet.svg" alt="" />
+            <img class="nx-wordmark-light" src="../../assets/brand/nx-wordmark-light.svg" alt="" />
           </span>
+          <span class="brand-caption"><b>Recall</b><small>Your conversations, kept close</small></span>
         </div>
+        <button class="quick-switch" id="quick-switch" aria-label="Quick switch, Control or Command K" title="Quick switch · Ctrl/Cmd+K">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/></svg>
+          <span>Quick switch</span><kbd>⌘ K</kbd>
+        </button>
+        <span class="rail-section-label">Workspace</span>
 
         <div class="rail-nav" role="tablist" aria-orientation="vertical">
-          <button class="rail-item" role="tab" title="Transcript · Ctrl/Alt+1" data-view="transcript" aria-selected="true">
+          <button class="rail-item" role="tab" title="Transcript · Ctrl/Alt+1" data-view="transcript" aria-label="Transcript" aria-controls="main" aria-selected="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
               <path d="M4 5h16M4 10h11M4 15h16M4 20h8" stroke-linecap="square" />
             </svg>
             <span>Transcript</span>
             <span class="badge" id="badge-transcript">0</span>
           </button>
-          <button class="rail-item" role="tab" title="Speakers · Ctrl/Alt+2" data-view="speakers" aria-selected="false">
+          <button class="rail-item" role="tab" title="Speakers · Ctrl/Alt+2" data-view="speakers" aria-label="Speakers" aria-controls="main" aria-selected="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
               <path d="M4 20v-2a4 4 0 0 1 4-4h3a4 4 0 0 1 4 4v2M6 7.5a3.5 3.5 0 1 0 7 0 3.5 3.5 0 0 0-7 0M17 13h1a3 3 0 0 1 3 3v2M17 5.2a2.8 2.8 0 1 1 0 5.6" stroke-linecap="square" />
             </svg>
             <span>Speakers</span>
             <span class="badge" id="badge-speakers">0</span>
           </button>
-          <button class="rail-item" role="tab" title="Search · Ctrl/Alt+3" data-view="search" aria-selected="false">
+          <button class="rail-item" role="tab" title="Search · Ctrl/Alt+3" data-view="search" aria-label="Search" aria-controls="main" aria-selected="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
               <path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14M16 16l4.5 4.5" stroke-linecap="square" />
             </svg>
@@ -78,21 +80,21 @@
                because it is not a detail of any of the other four. The glyph is
                a speech bubble with a thread through it — what was said, and
                what was made of it. -->
-          <button class="rail-item" role="tab" title="Memory · Ctrl/Alt+4" data-view="memory" aria-selected="false">
+          <button class="rail-item" role="tab" title="Memory · Ctrl/Alt+4" data-view="memory" aria-label="Memory" aria-controls="main" aria-selected="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
               <path d="M4 5h16v11H9l-5 4z M8 9h8M8 12.5h5" stroke-linecap="square" />
             </svg>
             <span>Memory</span>
             <span class="badge" id="badge-memory">0</span>
           </button>
-          <button class="rail-item" role="tab" title="Sources · Ctrl/Alt+5" data-view="sources" aria-selected="false">
+          <button class="rail-item" role="tab" title="Sources · Ctrl/Alt+5" data-view="sources" aria-label="Sources" aria-controls="main" aria-selected="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
               <path d="M4 8v8M8 5v14M12 9v6M16 3v18M20 8v8" stroke-linecap="square" />
             </svg>
             <span>Sources</span>
             <span class="badge" id="badge-sources">0</span>
           </button>
-          <button class="rail-item" role="tab" data-view="settings" aria-selected="false" title="Settings · Ctrl/Alt+6">
+          <button class="rail-item" role="tab" data-view="settings" aria-label="Settings" aria-controls="main" aria-selected="false" title="Settings · Ctrl/Alt+6">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6M16 14v6" /></svg>
             <span>Settings</span>
           </button>
@@ -107,7 +109,7 @@
              somebody's game — so this, the tray, and `nx-recall --captions`
              are the three ways in. -->
         <div class="rail-actions">
-          <button class="rail-item rail-action" id="captions-btn" data-action="captions" aria-pressed="false">
+          <button class="rail-item rail-action" id="captions-btn" aria-label="Open live captions" title="Open live captions" data-action="captions" aria-pressed="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
               <path d="M3 5h18v12H3z M7 10h4M7 13h7M14 10h3" stroke-linecap="square" />
             </svg>
@@ -116,6 +118,9 @@
         </div>
 
         <!-- Pause surface #2 (the tray dropdown is #1) — DESIGN §8. -->
+        <button class="rail-collapse" id="rail-collapse" aria-label="Collapse navigation" title="Collapse navigation" aria-expanded="true">
+          <span aria-hidden="true">⇤</span><span class="collapse-label">Collapse sidebar</span>
+        </button>
         <div class="rail-pause">
           <button class="pause-btn" id="pause-btn" data-paused="false" disabled>
             <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" id="pause-ico">
@@ -128,7 +133,7 @@
         </div>
       </nav>
 
-      <main class="main" id="main"></main>
+      <main class="main" id="main" tabindex="-1"></main>
 
       <footer class="footer" id="footer"></footer>
     </div>

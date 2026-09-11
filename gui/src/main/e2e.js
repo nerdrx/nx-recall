@@ -2409,6 +2409,7 @@ export function runE2E(deps) {
       );
 
       await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
+      await js(`document.querySelector('button[data-settings-category="language"]').click()`);
       const card = await waitFor('the translation card', async () => {
         const t = await js('window.__recallDebug.translation()');
         return t.target !== null && t.read.length ? t : null;
@@ -2442,6 +2443,7 @@ export function runE2E(deps) {
       // …and back, where the original keeps its language code so the reader
       // can see what they are being shown instead of.
       await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
+      await js(`document.querySelector('button[data-settings-category="language"]').click()`);
       await js('document.getElementById("translate-display-main").click()');
       await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
       const main = await waitFor('the translation leading again', async () => {
@@ -2453,6 +2455,7 @@ export function runE2E(deps) {
       // 2. Setting the target moves the card's own badge, and takes the new
       //    target's chip with it.
       await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
+      await js(`document.querySelector('button[data-settings-category="language"]').click()`);
       await js(`(() => {
         const s = document.getElementById('translate-target');
         s.value = 'en';
@@ -2483,6 +2486,7 @@ export function runE2E(deps) {
 
     await step('the-accuracy-card-is-honest-arithmetic', async () => {
       await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
+      await js(`document.querySelector('button[data-settings-category="quality"]').click()`);
       const a = await waitFor('the accuracy card', async () => {
         const a = await js('window.__recallDebug.accuracy()');
         return a.dash.corrections ? a : null;
@@ -2580,6 +2584,7 @@ export function runE2E(deps) {
     // point of the change: this card must not tell somebody it waits.
     await step('enrichment-is-off-by-default-and-says-what-it-would-cost', async () => {
       await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
+      await js(`document.querySelector('button[data-settings-category="processing"]').click()`);
       const off = await waitFor('the enrichment card', async () => {
         const m = await js('window.__recallDebug.memory()');
         return m.enrichment.chip ? m.enrichment : null;
@@ -2655,6 +2660,7 @@ export function runE2E(deps) {
       assert(tuned.threadsConfig === 6, `the daemon was not told: ${tuned.threadsConfig}`);
       await js('document.querySelector(\'.rail-item[data-view="speakers"]\').click()');
       await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
+      await js(`document.querySelector('button[data-settings-category="processing"]').click()`);
       // A remounted card paints its default before `graph.summary` answers, so
       // the wait is for the value itself: settling on 6 is the proof that the
       // daemon, and not this view's optimism, is where it came from.
@@ -2992,6 +2998,7 @@ export function runE2E(deps) {
     await step('each-mood-display-mode-changes-what-a-row-wears', async () => {
       const set = async (mode) => {
         await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
+        await js(`document.querySelector('button[data-settings-category="language"]').click()`);
         await waitFor('the mood card', async () =>
           (await js('window.__recallDebug.mood()')).modes.length ? true : null
         );
@@ -3011,6 +3018,7 @@ export function runE2E(deps) {
       // which is where the row assertions belong and where a `modes` read
       // would correctly find nothing.
       await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
+      await js(`document.querySelector('button[data-settings-category="language"]').click()`);
       const modes = await waitFor('the mood card', async () => {
         const m = (await js('window.__recallDebug.mood()')).modes;
         return m.length ? m : null;
@@ -3057,6 +3065,7 @@ export function runE2E(deps) {
         (await js('window.__recallDebug.mood()')).rendered === true ? true : null
       );
       await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
+      await js(`document.querySelector('button[data-settings-category="language"]').click()`);
       await js('document.getElementById("mood-display-both").click()');
       await js('document.querySelector(\'.rail-item[data-view="transcript"]\').click()');
       const v = await waitFor('a tinted row', async () => {
@@ -3122,6 +3131,7 @@ export function runE2E(deps) {
         (await js('window.__recallDebug.mood()')).rendered === false ? true : null
       );
       await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
+      await js(`document.querySelector('button[data-settings-category="language"]').click()`);
       const card = await waitFor('the reason on the card', async () => {
         const v = await js('window.__recallDebug.mood()');
         return v.why ? v : null;
@@ -3151,6 +3161,7 @@ export function runE2E(deps) {
     // read instead of "nothing is listened to".
     await step('the-mood-switch-turns-listening-on-and-off', async () => {
       await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
+      await js(`document.querySelector('button[data-settings-category="language"]').click()`);
       await js('document.getElementById("mood-card").scrollIntoView({ block: "start" })');
       const off = await waitFor('the mood card in its shipped, off state', async () => {
         const v = await js('window.__recallDebug.mood()');
@@ -3195,6 +3206,7 @@ export function runE2E(deps) {
     // of.
     await step('light-mode-switches-the-decoder-and-says-why', async () => {
       await js('document.querySelector(\'.rail-item[data-view="settings"]\').click()');
+      await js(`document.querySelector('button[data-settings-category="processing"]').click()`);
       await js('document.getElementById("light-card").scrollIntoView({ block: "start" })');
       // Ships OFF: the 110m export reads English only and measured 104.5% WER
       // on this install's German-heavy archive (FINDINGS §49). A person opts
@@ -3789,6 +3801,7 @@ export function runE2E(deps) {
     // 12 — sources: default-deny visuals and a live toggle
     await step('sources-toggle', async () => {
       await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await js(`document.querySelector('button[data-sources-category="capture"]').click()`);
       await waitFor('the source list', async () => js('document.querySelectorAll("#source-list .src-row").length > 0'));
       const denied = await js('document.querySelectorAll("#source-list .src-row.denied").length');
       assert(denied > 0, 'no source renders as denied — default-deny has no visual');
@@ -3809,6 +3822,7 @@ export function runE2E(deps) {
     // of the main process, because a setting that only exists in a renderer is
     // a setting that is gone the next time the window is opened.
     await step('the-captions-card-really-sets-the-captions', async () => {
+      await js(`document.querySelector('button[data-sources-category="captions"]').click()`);
       const card = await waitFor('the captions card', async () => {
         const c = await js('window.__recallDebug.captions()');
         return c.card ? c : null;
@@ -3855,6 +3869,7 @@ export function runE2E(deps) {
     // one of them shrinks on its own.
     await step('storage-card-and-footer', async () => {
       await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await js(`document.querySelector('button[data-sources-category="storage"]').click()`);
       const s = await waitFor('the storage card', async () => {
         const s = await js('window.__recallDebug.storage()');
         return s.rows.length ? s : null;
@@ -3884,6 +3899,7 @@ export function runE2E(deps) {
     // renders "no gaps" would never be photographed doing its actual job.
     await step('capture-health-card', async () => {
       await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await js(`document.querySelector('button[data-sources-category="storage"]').click()`);
       const c = await waitFor('the capture health card', async () => {
         const c = await js('window.__recallDebug.captureHealth()');
         return c.rows.length ? c : null;
@@ -3919,6 +3935,7 @@ export function runE2E(deps) {
     // because that difference is the whole privacy model (0.6.0).
     await step('mic-card-is-off-and-separate', async () => {
       await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await js(`document.querySelector('button[data-sources-category="capture"]').click()`);
       await waitFor('the microphone card', async () => js('!!document.getElementById("mic-card")'));
 
       // It sits above the application list, not in it.
@@ -4083,6 +4100,7 @@ export function runE2E(deps) {
 
     await step('mic-off-stops-it', async () => {
       await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await js(`document.querySelector('button[data-sources-category="capture"]').click()`);
       await waitFor('the microphone card', async () => js('!!document.getElementById("mic-card")'));
       const before = (await js('window.__recallDebug.mic()')).state;
       assert(before === 'following:active', `expected an active microphone, saw ${before}`);
@@ -4115,6 +4133,7 @@ export function runE2E(deps) {
     // fresh install is in, and the one the card has to be usable from.
     await step('room-card-needs-a-device-before-it-can-do-anything', async () => {
       await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await js(`document.querySelector('button[data-sources-category="capture"]').click()`);
       await waitFor('the room card', async () => js('!!document.getElementById("room-card")'));
 
       // It sits beside the microphone's card, not in the application list.
@@ -4153,6 +4172,7 @@ export function runE2E(deps) {
 
     await step('room-mic-turns-on-once-a-device-is-picked', async () => {
       await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await js(`document.querySelector('button[data-sources-category="capture"]').click()`);
       await waitFor('the room card', async () => js('!!document.getElementById("room-card")'));
       await waitFor('the device picker', async () => (await js('window.__recallDebug.room()')).devices.length > 0);
       // Pick the desk mic — the second option, i.e. NOT the system default.
@@ -4213,6 +4233,7 @@ export function runE2E(deps) {
     // what is arriving, from whom, and how the voicebank is doing against it.
     await step('discord-card-links-a-user-and-scores-the-voicebank', async () => {
       await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await js(`document.querySelector('button[data-sources-category="connections"]').click()`);
       await waitFor('the Discord card', async () => js('!!document.getElementById("truth-card")'));
       const before = await waitFor('the Discord users', async () => {
         const t = await js('window.__recallDebug.truth()');
@@ -4259,6 +4280,7 @@ export function runE2E(deps) {
     // role that is read and ignored is a blocker and not a footnote.
     await step('the-discord-card-says-which-client-is-muted-and-lets-you-move-it', async () => {
       await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await js(`document.querySelector('button[data-sources-category="connections"]').click()`);
       const shown = await waitFor('the Discord clients', async () => {
         const t = await js('window.__recallDebug.truth()');
         return t.clients.length ? t : null;
@@ -4332,6 +4354,7 @@ export function runE2E(deps) {
       process.env.NX_RECALL_E2E_EXPORT_DIR = dir;
 
       await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await js(`document.querySelector('button[data-sources-category="storage"]').click()`);
       await waitFor('the export card', async () => js('!!document.getElementById("export-card")'));
       const card = await js('window.__recallDebug.exportCard()');
       // The sentence that licenses the feature at all.
@@ -4404,6 +4427,7 @@ export function runE2E(deps) {
       process.env.NX_RECALL_E2E_BACKUP_DIR = dir;
 
       await js('document.querySelector(\'.rail-item[data-view="sources"]\').click()');
+      await js(`document.querySelector('button[data-sources-category="storage"]').click()`);
       await waitFor('the backup card', async () => js('!!document.getElementById("backup-card")'));
 
       await js('document.getElementById("backup-choose").click()');
@@ -4552,6 +4576,7 @@ export function runE2E(deps) {
       assert(light.scheme === 'light', `the light stamp declares color-scheme "${light.scheme}"`);
       assert(dark.scheme === 'dark', `the dark stamp declares color-scheme "${dark.scheme}"`);
       // §14.1 as amended: Clear's dark variant is grounded at true black.
+      assert(light.ground === 'rgb(246, 246, 247)', `the light ground is ${light.ground}, not #f6f6f7`);
       assert(dark.ground === 'rgb(0, 0, 0)', `the dark ground is ${dark.ground}, not #000000`);
       // The speaker hue band is the same identity on both grounds; only its
       // lightness moves, which is what keeps a voice's colour meaning one thing.
@@ -4707,6 +4732,7 @@ export function runE2E(deps) {
       await nav014('memory');
       assert(await js(`!document.getElementById('enrich-card') && !document.getElementById('translate-card')`), 'processing still clutters Memory');
       await nav014('settings');
+      await js(`document.querySelector('button[data-settings-category="appearance"]').click()`);
       assert(await js(`!!document.getElementById('enrich-card') && !!document.getElementById('translate-card') && !!document.getElementById('accuracy-card')`), 'Settings lost an existing processing control');
       const old = await js(`document.getElementById('settings-density').value`);
       await js(`(() => { const s = document.getElementById('settings-density'); s.value = 'compact'; s.dispatchEvent(new Event('change')); })()`);
@@ -4755,6 +4781,42 @@ export function runE2E(deps) {
       await clickLabel014(`[data-saved-kind="searches"][data-saved-id="${rolling014.id}"]`, 'Run search');
       assert(await js(`document.getElementById('search-q').value === 'portal' && !!document.getElementById('search-from').value`), 'rolling search did not reopen');
       return { id: rolling014.id };
+    });
+
+    await step('studio-search-keyboard-counts-and-retry', async () => {
+      await js(`document.getElementById('search-mode-keyword').click()`);
+      await waitFor('keyword search settled', () => js(`document.getElementById('search-results').getAttribute('aria-busy') === 'false'`));
+      await deps.request('mock.search_fail_once', {});
+      const busy = await js(`(() => {
+        document.getElementById('search-q').value = 'portal';
+        document.getElementById('search-go').click();
+        return { busy: document.getElementById('search-results').getAttribute('aria-busy'), message: document.getElementById('search-result-status').textContent };
+      })()`);
+      assert(busy.busy === 'true' && /Searching/.test(busy.message), 'the in-flight search has no visible or accessible loading state');
+      await waitFor('actionable search error', () => js(`!!document.querySelector('#search-results .search-feedback[role="alert"] button')`));
+      assert(await js(`document.getElementById('search-q').value === 'portal' && document.getElementById('search-results').getAttribute('aria-busy') === 'false'`), 'search failure lost the query or left it busy');
+      await clickLabel014('#search-results', 'Try again');
+      const count = await waitFor('retry results', () => js(`document.getElementById('search-results').getAttribute('aria-busy') === 'false' && document.querySelectorAll('#search-results .seg').length`));
+      assert(count > 1, 'fixture needs at least two results for keyboard navigation');
+      const heading = await js(`document.getElementById('search-result-count').textContent`);
+      assert(heading.startsWith(String(count)) && /match/.test(heading), `count does not explain the displayed page: ${heading}`);
+      assert(await js(`document.querySelector('#search-results .seg').tagName === 'ARTICLE' && document.querySelector('#search-results .search-read').tagName === 'BUTTON'`), 'result mixes nested button roles instead of native context actions');
+      const key = value => js(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(value)}, bubbles: true }))`);
+      await js(`document.getElementById('search-q').focus()`); await key('ArrowDown');
+      assert(await js(`document.activeElement === document.querySelectorAll('#search-results .seg')[0]`), 'Down from query did not enter results');
+      await key('ArrowDown');
+      assert(await js(`document.activeElement === document.querySelectorAll('#search-results .seg')[1]`), 'Down did not move to the next result');
+      await key('End');
+      assert(await js(`document.activeElement === [...document.querySelectorAll('#search-results .seg')].at(-1)`), 'End did not select the last result');
+      await key('Home'); await key('ArrowUp');
+      assert(await js(`document.activeElement === document.querySelectorAll('#search-results .seg')[0]`), 'Up wrapped away from the first result');
+      await key('Enter');
+      await waitFor('keyboard context', () => js(`!!document.querySelector('.search-context-turn.selected')`));
+      assert(await js(`document.querySelector('#search-results .seg').getAttribute('aria-current') === 'true'`), 'open context is not identified on its source result');
+      assert(await js(`document.querySelector('.search-workspace').getBoundingClientRect().bottom <= document.querySelector('.main').getBoundingClientRect().bottom + 1`), 'reading panes extend below the available workspace instead of scrolling internally');
+      await clickLabel014('.search-context', 'Close');
+      assert(await js(`document.activeElement === document.querySelector('#search-results .seg')`), 'Close lost keyboard position');
+      return { count, heading, file: await shot('studio-search-keyboard') };
     });
 
     await step('014-all-history-preserves-other-facets-and-context-preserves-results', async () => {
@@ -4862,6 +4924,106 @@ export function runE2E(deps) {
       assert(await js(`document.activeElement.textContent === 'Save search'`), 'Shift+Tab escaped the sheet');
       await js(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
       assert(await js(`!document.querySelector('.sheet') && document.activeElement.id === 'search-save'`), 'Escape did not restore the original control focus');
+    });
+
+    await step('014-settings-and-sources-categories-keep-controls-and-keyboard-focus', async () => {
+      const summaries = [];
+      for (const [view, first, last, next] of [['settings', 'appearance', 'quality', 'processing'], ['sources', 'capture', 'storage', 'captions']]) {
+        await js(`window.__recallDebug.go(${JSON.stringify(view)}, { section: ${JSON.stringify(first)} })`);
+        const info = await js(`(() => {
+          const nav = document.querySelector('.section-nav');
+          const tabs = [...nav.querySelectorAll('[role="tab"]')];
+          const originalPanels = [...document.querySelectorAll('.section-panel')];
+          window.__sectionControl014 = document.querySelector(${JSON.stringify(view === 'settings' ? '#settings-density' : '#mic-card')});
+          const tab = tabs.find(t => t.dataset.section === ${JSON.stringify(first)});
+          tab.focus(); tab.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }));
+          return { selected: nav.querySelector('[aria-selected="true"]').dataset.section,
+            focused: document.activeElement.dataset.section, visible: originalPanels.filter(p => !p.hidden).map(p => p.dataset.section),
+            tabstops: tabs.filter(t => t.tabIndex === 0).length, count: tabs.length };
+        })()`);
+        assert(info.count === 4 && info.tabstops === 1, `${view} category tab stops invalid: ${JSON.stringify(info)}`);
+        assert(info.selected === last && info.focused === last && info.visible.join() === last, `${view} End key did not select/focus its last category`);
+        await js(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true })); document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))`);
+        assert(await js(`document.activeElement.dataset.section === ${JSON.stringify(next)}`), `${view} arrow key did not move categories`);
+        await js(`document.querySelector('.section-nav [data-section="${first}"]').click()`);
+        assert(await js(`window.__sectionControl014 === document.querySelector(${JSON.stringify(view === 'settings' ? '#settings-density' : '#mic-card')})`), `${view} navigation remounted an existing control`);
+        summaries.push({ view, ...info });
+      }
+      return summaries;
+    });
+
+    await step('014-quick-switch-filters-and-opens-a-settings-category', async () => {
+      await nav014('transcript');
+      await js(`document.getElementById('quick-switch').focus(); document.getElementById('quick-switch').click()`);
+      await waitFor('quick switch input', () => js(`document.activeElement.id === 'quick-switch-input'`));
+      await js(`(() => { const input = document.getElementById('quick-switch-input'); input.value = 'Processing'; input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+      const names = await js(`[...document.querySelectorAll('.quick-result')].map(b => b.textContent)`);
+      assert(names.length > 0 && names.some(name => /processing/i.test(name)), `quick switch did not find Processing: ${JSON.stringify(names)}`);
+      await js(`document.querySelector('.quick-result').click()`);
+      await waitFor('processing settings selected', () => js(`window.__recallDebug.view() === 'settings' && document.querySelector('.section-nav [aria-selected="true"]')?.dataset.section === 'processing'`));
+      assert(await js(`!document.getElementById('quick-switch-input')`), 'quick switch stayed open after navigation');
+      await js(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true }))`);
+      await waitFor('keyboard quick switch', () => js(`!!document.getElementById('quick-switch-input')`));
+      await js(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))`);
+      assert(await js(`document.activeElement === document.querySelector('.quick-result')`), 'quick switch ArrowDown did not focus the first result');
+      await js(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }))`);
+      assert(await js(`document.activeElement.id === 'quick-switch-input'`), 'quick switch ArrowUp did not return to the input');
+      await js(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))`);
+      await waitFor('keyboard command opens transcript', () => js(`!document.getElementById('quick-switch-input') && window.__recallDebug.view() === 'transcript'`));
+      await js(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true }))`);
+      await waitFor('quick switch reopened', () => js(`!!document.getElementById('quick-switch-input')`));
+      await js(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+      assert(await js(`!document.getElementById('quick-switch-input')`), 'Escape did not close quick switch');
+      return { names, file: await shot('014-quiet-settings') };
+    });
+
+    await step('014-quiet-layout-fits-760-and-1024-without-horizontal-overflow', async () => {
+      const normalSize = win().getSize();
+      const normalMinimum = win().getMinimumSize();
+      const wasCollapsed = await js(`document.body.dataset.rail === 'collapsed'`);
+      const layouts = [];
+      try {
+        win().setMinimumSize(600, 500);
+        if (wasCollapsed) await js(`document.getElementById('rail-collapse').click()`);
+        for (const width of [760, 1024]) {
+          win().setSize(width, 768); await sleep(250);
+          for (const [view, section] of [['transcript', null], ['memory', null], ['settings', 'appearance'], ['settings', 'processing'], ['settings', 'language'], ['settings', 'quality'], ['sources', 'capture'], ['sources', 'captions'], ['sources', 'connections'], ['sources', 'storage']]) {
+            await js(`window.__recallDebug.go(${JSON.stringify(view)}, ${JSON.stringify(section ? { section } : null)})`);
+            await sleep(160);
+            const size = await js(`(() => {
+              const main = document.getElementById('main');
+              return { viewport: innerWidth, document: document.documentElement.scrollWidth, main: main.clientWidth, content: main.scrollWidth,
+                selected: document.querySelector('.section-nav [aria-selected="true"]')?.dataset.section ?? null };
+            })()`);
+            assert(size.document <= size.viewport + 1, `${view}/${section} overflows viewport at ${width}: ${JSON.stringify(size)}`);
+            assert(size.content <= size.main + 1, `${view}/${section} overflows content at ${width}: ${JSON.stringify(size)}`);
+            if (section) assert(size.selected === section, `${view} selected ${size.selected}, expected ${section}`);
+            layouts.push({ width, view, section, ...size });
+          }
+          await shot(`014-quiet-sources-${width}`);
+        }
+      } finally {
+        win().setMinimumSize(...normalMinimum); win().setSize(...normalSize);
+        if (wasCollapsed !== await js(`document.body.dataset.rail === 'collapsed'`)) await js(`document.getElementById('rail-collapse').click()`);
+        await sleep(200);
+      }
+      return layouts;
+    });
+
+    await step('014-collapsed-navigation-survives-renderer-reload', async () => {
+      const collapsed = await js(`document.body.dataset.rail === 'collapsed'`);
+      try {
+        if (!collapsed) await js(`document.getElementById('rail-collapse').click()`);
+        assert(await js(`document.body.dataset.rail === 'collapsed' && document.getElementById('rail-collapse').getAttribute('aria-expanded') === 'false'`), 'collapse did not update layout and accessible state');
+        await nav014('settings');
+        assert(await js(`document.body.dataset.rail === 'collapsed'`), 'navigation reset collapsed state');
+        await new Promise(resolve => { win().webContents.once('did-finish-load', resolve); win().webContents.reload(); });
+        await waitFor('reloaded app ready', () => js(`!!window.__recallDebug && !!document.querySelector('#seg-list')`), { timeout: 15000 });
+        assert(await js(`document.body.dataset.rail === 'collapsed'`), 'collapsed preference did not survive reload');
+        return { file: await shot('014-quiet-collapsed') };
+      } finally {
+        if (collapsed !== await js(`document.body.dataset.rail === 'collapsed'`)) await js(`document.getElementById('rail-collapse').click()`);
+      }
     });
 
     // 15 — the app lives in the tray: closing the window hides it, does not
