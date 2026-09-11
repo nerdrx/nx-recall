@@ -526,9 +526,20 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     // The socket, the roster and the sweeper are all optional: none of them is
     // allowed to cost the daemon its capture, so a failure here is a warning.
     let service = Service::new(Arc::clone(&store), Arc::clone(&control), Arc::clone(&bus));
-    if let Some(leg) = semantic {
-        service.attach_semantic(leg);
+    if let Some(leg) = &semantic {
+        service.attach_semantic(Arc::clone(leg));
     }
+    let repair_stop = Arc::new(recalld::semantic::RepairStop::default());
+    let repair_thread = semantic.and_then(|leg| {
+        let store = Arc::clone(&store);
+        let control = Arc::clone(&control);
+        let stop = Arc::clone(&repair_stop);
+        std::thread::Builder::new()
+            .name("semantic-repair".into())
+            .spawn(move || recalld::semantic::run_repair(leg, store, control, stop))
+            .map_err(|e| warn!("could not start semantic repair: {e}"))
+            .ok()
+    });
     // ---- 0.11.0: `search.answer` runs its own model call, under the same
     // `[runtime]` discipline every other one does. ----
     service.attach_answers(cfg.runtime.clone());
@@ -876,6 +887,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
     sweep_stop.stop();
     reminder_stop.stop();
     assist_stop.stop();
+    repair_stop.stop();
     if let Some(s) = socket {
         s.shutdown();
     }
@@ -900,6 +912,7 @@ fn cmd_run(cfg: &Config, data_dir: &Path, config_path: &Path) -> Result<()> {
         // 0.9.0.
         reminder_thread,
         assist_thread,
+        repair_thread,
     ]
     .into_iter()
     .flatten()

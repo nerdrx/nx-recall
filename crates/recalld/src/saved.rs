@@ -32,6 +32,125 @@ pub fn migrate_v22(conn: &Connection) -> AnyResult<()> {
     )?;
     Ok(())
 }
+/// Collections are organizational references, never independent copies of source content.
+pub fn migrate_v23(conn: &Connection) -> AnyResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS saved_collections (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+      created_ms INTEGER NOT NULL);",
+    )?;
+    let has_column = conn
+        .prepare("PRAGMA table_info(saved_moments)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "collection_id");
+    if !has_column {
+        conn.execute_batch("ALTER TABLE saved_moments ADD COLUMN collection_id INTEGER REFERENCES saved_collections(id) ON DELETE SET NULL;")?;
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_saved_moments_collection ON saved_moments(collection_id,created_ms,id);
+      CREATE INDEX IF NOT EXISTS idx_history_visible ON segments(t_start_ns,id) WHERE deleted_at IS NULL;")?;
+    Ok(())
+}
+
+/// A cursor carries nanoseconds as an opaque JSON string, never a JS number.
+/// The snapshot ID bound prevents later inserts from shifting the walk.
+pub fn history_page(store: &Store, req: &Request) -> Result<Value, Error> {
+    let from = clock::parse_iso8601(req.str("from")?)
+        .ok_or_else(|| Error::params("from must be an ISO timestamp"))?;
+    let to = clock::parse_iso8601(req.str("to")?)
+        .ok_or_else(|| Error::params("to must be an ISO timestamp"))?;
+    if from >= to {
+        return Err(Error::params("from must precede to"));
+    }
+    let limit = req.opt_i64("limit")?.unwrap_or(100);
+    if !(1..=200).contains(&limit) {
+        return Err(Error::params("limit must be 1–200"));
+    }
+    let conn = store.conn();
+    let tx = db(conn.unchecked_transaction())?;
+    let (last_ns, last_id, max_id) = if let Some(cursor) = req.opt_str("cursor")? {
+        if cursor.len() > 512 {
+            return Err(Error::params("invalid history cursor"));
+        }
+        let v: Value =
+            serde_json::from_str(cursor).map_err(|_| Error::params("invalid history cursor"))?;
+        let n = |key| {
+            v.get(key)
+                .and_then(Value::as_i64)
+                .ok_or_else(|| Error::params("invalid history cursor"))
+        };
+        if n("from")? != from || n("to")? != to {
+            return Err(Error::params("cursor belongs to another date range"));
+        }
+        let tuple = (n("time")?, n("id")?, n("max")?);
+        if tuple.0 < from || tuple.0 >= to || tuple.1 <= 0 || tuple.2 < tuple.1 {
+            return Err(Error::params("invalid history cursor"));
+        }
+        tuple
+    } else {
+        (
+            from,
+            -1,
+            db(
+                conn.query_row("SELECT COALESCE(MAX(id),0) FROM segments", [], |r| {
+                    r.get::<_, i64>(0)
+                }),
+            )?,
+        )
+    };
+    let mut stmt=db(conn.prepare("SELECT id,t_start_ns FROM segments WHERE deleted_at IS NULL AND t_start_ns>=?1 AND t_start_ns<?2 AND id<=?3 AND (t_start_ns,id)>(?4,?5) ORDER BY t_start_ns,id LIMIT ?6"))?;
+    let ids = db(db(stmt.query_map(
+        params![from, to, max_id, last_ns, last_id, limit + 1],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    ))?
+    .collect::<rusqlite::Result<Vec<_>>>())?;
+    let has_more = ids.len() > limit as usize;
+    let page = &ids[..ids.len().min(limit as usize)];
+    let mut segments = Vec::new();
+    for (id, _) in page {
+        if let Some(row) = store.segment_row(*id)? {
+            segments.push(segment_json(&row));
+        }
+    }
+    let cursor = if has_more {
+        page.last().map(|(id, time)| {
+            json!({"from":from,"to":to,"time":time,"id":id,"max":max_id}).to_string()
+        })
+    } else {
+        None
+    };
+    drop(stmt);
+    db(tx.commit())?;
+    Ok(json!({"segments":segments,"next_cursor":cursor}))
+}
+fn collection(conn: &Connection, id: i64) -> Result<Value, Error> {
+    let row = db(conn
+        .query_row(
+            "SELECT name,created_ms FROM saved_collections WHERE id=?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional())?
+    .ok_or_else(|| Error::not_found("collection not found"))?;
+    let count:i64=db(conn.query_row("SELECT COUNT(*) FROM saved_moments m WHERE collection_id=?1 AND EXISTS(SELECT 1 FROM saved_moment_segments r JOIN segments s ON s.id=r.segment_id WHERE r.moment_id=m.id AND s.deleted_at IS NULL)",[id],|r|r.get(0)))?;
+    Ok(json!({"id":id,"name":row.0,"created_ms":row.1,"count":count}))
+}
+fn collection_param(conn: &Connection, req: &Request) -> Result<Option<i64>, Error> {
+    let id = if req.params.get("collection_id").is_some_and(Value::is_null) {
+        None
+    } else {
+        req.opt_i64("collection_id")?
+    };
+    if let Some(id) = id {
+        if id <= 0 {
+            return Err(Error::params("collection_id must be positive or null"));
+        }
+        collection(conn, id)?;
+    }
+    Ok(id)
+}
+
 fn db<T>(r: rusqlite::Result<T>) -> Result<T, Error> {
     r.map_err(|e| Error::internal(e.to_string()))
 }
@@ -82,9 +201,9 @@ fn search(conn: &Connection, id: i64) -> Result<Value, Error> {
 }
 fn moment(store: &Store, id: i64) -> Result<Option<Value>, Error> {
     let conn = store.conn();
-    let Some((title, note, count, created)) = db(conn
+    let Some((title, note, count, created, collection_id)) = db(conn
         .query_row(
-            "SELECT title,note,original_count,created_ms FROM saved_moments WHERE id=?1",
+            "SELECT title,note,original_count,created_ms,collection_id FROM saved_moments WHERE id=?1",
             [id],
             |r| {
                 Ok((
@@ -92,6 +211,7 @@ fn moment(store: &Store, id: i64) -> Result<Option<Value>, Error> {
                     r.get::<_, String>(1)?,
                     r.get::<_, i64>(2)?,
                     r.get::<_, i64>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
                 ))
             },
         )
@@ -118,7 +238,7 @@ fn moment(store: &Store, id: i64) -> Result<Option<Value>, Error> {
     }
     Ok(Some(
         json!({"id":id,"title":title,"note":note,"segment_ids":visible,"segments":segments,
-        "created_ms":created,"unavailable_count":count-segments.len() as i64}),
+        "created_ms":created,"unavailable_count":count-segments.len() as i64,"collection_id":collection_id}),
     ))
 }
 /// Nearby *visible* turns of the same conversation (or source session).
@@ -170,6 +290,66 @@ pub fn handle(store: &Store, req: &Request) -> Result<Value, Error> {
     let conn = store.conn();
     match req.method.as_str() {
         "segments.context" => context(store, req),
+        "history.page" => history_page(store, req),
+        "saved.collections.list" => {
+            let mut stmt =
+                db(conn
+                    .prepare("SELECT id FROM saved_collections ORDER BY name COLLATE NOCASE,id"))?;
+            let ids = db(db(stmt.query_map([], |r| r.get::<_, i64>(0)))?
+                .collect::<rusqlite::Result<Vec<_>>>())?;
+            let rows = ids
+                .into_iter()
+                .map(|id| collection(conn, id))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(json!({"collections":rows}))
+        }
+        "saved.collections.save" => {
+            let name = text(req, "name", 120, true)?;
+            let existing = req.opt_i64("id")?;
+            let duplicate:bool=db(conn.query_row("SELECT EXISTS(SELECT 1 FROM saved_collections WHERE name=?1 COLLATE NOCASE AND id<>?2)",params![name,existing.unwrap_or(-1)],|r|r.get(0)))?;
+            if duplicate {
+                return Err(Error::params("a collection with this name already exists"));
+            }
+            let id = if let Some(id) = existing {
+                if db(conn.execute(
+                    "UPDATE saved_collections SET name=?1 WHERE id=?2",
+                    params![name, id],
+                ))? == 0
+                {
+                    return Err(Error::not_found("collection not found"));
+                }
+                id
+            } else {
+                db(conn.execute(
+                    "INSERT INTO saved_collections(name,created_ms) VALUES(?1,?2)",
+                    params![name, clock::utc_now_ns() / 1_000_000],
+                ))?;
+                conn.last_insert_rowid()
+            };
+            Ok(json!({"collection":collection(conn,id)?}))
+        }
+        "saved.collections.delete" => {
+            let removed = db(conn.execute(
+                "DELETE FROM saved_collections WHERE id=?1",
+                [positive(req, "id")?],
+            ))? > 0;
+            Ok(json!({"removed":removed}))
+        }
+        "saved.moments.get" => Ok(
+            json!({"moment":moment(store,positive(req,"id")?)?.ok_or_else(||Error::not_found("saved moment has no retained source turns"))?}),
+        ),
+        "saved.moments.move" => {
+            let id = positive(req, "id")?;
+            let target = collection_param(conn, req)?;
+            if db(conn.execute(
+                "UPDATE saved_moments SET collection_id=?1 WHERE id=?2",
+                params![target, id],
+            ))? == 0
+            {
+                return Err(Error::not_found("saved moment not found"));
+            }
+            Ok(json!({"moment":moment(store,id)?}))
+        }
         "saved.searches.list" => {
             let (limit, offset) = page(req)?;
             let mut stmt = db(conn.prepare(
@@ -219,10 +399,14 @@ pub fn handle(store: &Store, req: &Request) -> Result<Value, Error> {
         }
         "saved.moments.list" => {
             let (limit, offset) = page(req)?;
-            let mut stmt=db(conn.prepare("SELECT m.id FROM saved_moments m WHERE EXISTS(SELECT 1 FROM saved_moment_segments r JOIN segments g ON g.id=r.segment_id WHERE r.moment_id=m.id AND g.deleted_at IS NULL) ORDER BY created_ms DESC,id DESC LIMIT ?1 OFFSET ?2"))?;
+            let scoped = req.params.get("collection_id").is_some();
+            let target = collection_param(conn, req)?;
+            let mut stmt=db(conn.prepare("SELECT m.id FROM saved_moments m WHERE (?3=0 OR m.collection_id IS ?4) AND EXISTS(SELECT 1 FROM saved_moment_segments r JOIN segments g ON g.id=r.segment_id WHERE r.moment_id=m.id AND g.deleted_at IS NULL) ORDER BY created_ms DESC,id DESC LIMIT ?1 OFFSET ?2"))?;
             let ids = db(
-                db(stmt.query_map(params![limit, offset], |r| r.get::<_, i64>(0)))?
-                    .collect::<rusqlite::Result<Vec<_>>>(),
+                db(stmt.query_map(params![limit, offset, scoped, target], |r| {
+                    r.get::<_, i64>(0)
+                }))?
+                .collect::<rusqlite::Result<Vec<_>>>(),
             )?;
             let mut rows = Vec::new();
             for id in ids {
@@ -230,7 +414,7 @@ pub fn handle(store: &Store, req: &Request) -> Result<Value, Error> {
                     rows.push(row)
                 }
             }
-            let total:i64=db(conn.query_row("SELECT COUNT(*) FROM saved_moments m WHERE EXISTS(SELECT 1 FROM saved_moment_segments r JOIN segments g ON g.id=r.segment_id WHERE r.moment_id=m.id AND g.deleted_at IS NULL)",[],|r|r.get(0)))?;
+            let total:i64=db(conn.query_row("SELECT COUNT(*) FROM saved_moments m WHERE (?1=0 OR m.collection_id IS ?2) AND EXISTS(SELECT 1 FROM saved_moment_segments r JOIN segments g ON g.id=r.segment_id WHERE r.moment_id=m.id AND g.deleted_at IS NULL)",params![scoped,target],|r|r.get(0)))?;
             Ok(json!({"moments":rows,"total":total}))
         }
         "saved.moments.save" => {
@@ -297,6 +481,13 @@ pub fn handle(store: &Store, req: &Request) -> Result<Value, Error> {
                 db(conn.execute("INSERT INTO saved_moments(title,note,original_count,created_ms) VALUES(?1,?2,?3,?4)",params![title,note,rows.len() as i64,clock::utc_now_ns()/1_000_000]))?;
                 conn.last_insert_rowid()
             };
+            if req.params.get("collection_id").is_some() {
+                let target = collection_param(conn, req)?;
+                db(conn.execute(
+                    "UPDATE saved_moments SET collection_id=?1 WHERE id=?2",
+                    params![target, id],
+                ))?;
+            }
             for (ordinal, row) in rows.iter().enumerate() {
                 db(conn.execute("INSERT INTO saved_moment_segments(moment_id,segment_id,ordinal) VALUES(?1,?2,?3)",params![id,row.id,ordinal as i64]))?;
             }
@@ -546,5 +737,195 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(path);
+    }
+    #[test]
+    fn collections_crud_move_filter_and_retention() {
+        let (s, ids) = seed();
+        let c=call(&s,"saved.collections.save",json!({"name":"Projects"})).unwrap()["collection"]["id"].as_i64().unwrap();
+        let m = call(
+            &s,
+            "saved.moments.save",
+            json!({"segment_ids":[ids[0],ids[1]],"collection_id":c,"note":"Personal"}),
+        )
+        .unwrap()["moment"]["id"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(
+            call(&s, "saved.collections.list", json!({})).unwrap()["collections"][0]["count"],
+            1
+        );
+        assert_eq!(
+            call(&s, "saved.moments.list", json!({"collection_id":null})).unwrap()["total"],
+            0
+        );
+        call(&s, "saved.collections.save", json!({"id":c,"name":"Plans"})).unwrap();
+        assert!(call(&s, "saved.collections.save", json!({"name":"plans"})).is_err());
+        assert!(
+            call(
+                &s,
+                "saved.moments.move",
+                json!({"id":m,"collection_id":999})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            call(&s, "saved.moments.get", json!({"id":m})).unwrap()["moment"]["collection_id"],
+            c
+        );
+        call(
+            &s,
+            "saved.moments.save",
+            json!({"id":m,"segment_ids":[ids[0],ids[1]],"note":"Changed"}),
+        )
+        .unwrap();
+        assert_eq!(
+            call(&s, "saved.moments.get", json!({"id":m})).unwrap()["moment"]["collection_id"],
+            c
+        );
+        s.soft_delete_segments(&[ids[0]], 2).unwrap();
+        let visible = call(&s, "saved.moments.get", json!({"id":m})).unwrap();
+        assert_eq!(visible["moment"]["segment_ids"], json!([ids[1]]));
+        assert_eq!(visible["moment"]["unavailable_count"], 1);
+        call(
+            &s,
+            "saved.moments.move",
+            json!({"id":m,"collection_id":null}),
+        )
+        .unwrap();
+        assert_eq!(
+            call(&s, "saved.moments.list", json!({"collection_id":null})).unwrap()["total"],
+            1
+        );
+        call(&s, "saved.moments.move", json!({"id":m,"collection_id":c})).unwrap();
+        call(&s, "saved.collections.delete", json!({"id":c})).unwrap();
+        assert!(
+            call(&s, "saved.moments.get", json!({"id":m})).unwrap()["moment"]["collection_id"]
+                .is_null()
+        );
+        s.conn()
+            .execute(
+                "DELETE FROM segments WHERE id IN (?1,?2)",
+                params![ids[0], ids[1]],
+            )
+            .unwrap();
+        assert!(call(&s, "saved.moments.get", json!({"id":m})).is_err());
+        assert_eq!(
+            call(&s, "saved.moments.list", json!({})).unwrap()["total"],
+            0
+        );
+    }
+    #[test]
+    fn history_cursor_ties_deletions_and_later_inserts_do_not_skip_or_duplicate() {
+        let (s, ids) = seed();
+        s.conn()
+            .execute("UPDATE segments SET t_start_ns=1000000000", [])
+            .unwrap();
+        let params = json!({"from":"1970-01-01T00:00:00Z","to":"1970-01-02T00:00:00Z","limit":2});
+        let first = call(&s, "history.page", params.clone()).unwrap();
+        assert_eq!(
+            first["segments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            ids[..2]
+        );
+        let session = s.segment_row(ids[0]).unwrap().unwrap().session_id;
+        let late = s
+            .insert_segment(session, 1000000000, 2000000000, "", 1)
+            .unwrap();
+        s.soft_delete_segments(&[ids[2]], 2).unwrap();
+        let mut next = params.clone();
+        next["cursor"] = first["next_cursor"].clone();
+        let second = call(&s, "history.page", next.clone()).unwrap();
+        assert_eq!(
+            second["segments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![ids[3]]
+        );
+        assert!(second["next_cursor"].is_null());
+        next["to"] = json!("1970-01-03T00:00:00Z");
+        assert_eq!(call(&s, "history.page", next).unwrap_err().code, "params");
+        let all = call(
+            &s,
+            "history.page",
+            json!({"from":"1970-01-01T00:00:00Z","to":"1970-01-02T00:00:00Z","limit":200}),
+        )
+        .unwrap();
+        assert!(
+            all["segments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == late)
+        );
+    }
+    #[test]
+    fn history_and_collections_survive_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "nx-history-collections-reopen-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let (cursor, last, collection_id) = {
+            let s = Store::open(&path).unwrap();
+            let source = s.upsert_source("synthetic", "Synthetic", 1).unwrap();
+            let session = s.begin_session(source, 1).unwrap();
+            let a = s.insert_segment(session, 1, 2, "", 1).unwrap();
+            let b = s.insert_segment(session, 1, 3, "", 1).unwrap();
+            let c=call(&s,"saved.collections.save",json!({"name":"Keep"})).unwrap()["collection"]["id"].as_i64().unwrap();
+            call(
+                &s,
+                "saved.moments.save",
+                json!({"segment_ids":[a,b],"collection_id":c}),
+            )
+            .unwrap();
+            let page = call(
+                &s,
+                "history.page",
+                json!({"from":"1970-01-01T00:00:00Z","to":"1970-01-02T00:00:00Z","limit":1}),
+            )
+            .unwrap();
+            (page["next_cursor"].clone(), b, c)
+        };
+        {
+            let s = Store::open(&path).unwrap();
+            let page=call(&s,"history.page",json!({"from":"1970-01-01T00:00:00Z","to":"1970-01-02T00:00:00Z","limit":1,"cursor":cursor})).unwrap();
+            assert_eq!(page["segments"][0]["id"], last);
+            assert_eq!(
+                call(
+                    &s,
+                    "saved.moments.list",
+                    json!({"collection_id":collection_id})
+                )
+                .unwrap()["total"],
+                1
+            );
+        }
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn collections_migration_is_idempotent_on_v22_and_reopen() {
+        let (s, ids) = seed();
+        s.conn().execute_batch("DROP INDEX idx_saved_moments_collection; ALTER TABLE saved_moments DROP COLUMN collection_id; DROP TABLE saved_collections; DROP INDEX idx_history_visible; UPDATE schema_version SET version=22;").unwrap();
+        migrate_v23(s.conn()).unwrap();
+        let c=call(&s,"saved.collections.save",json!({"name":"Migrated"})).unwrap()["collection"]["id"].as_i64().unwrap();
+        call(
+            &s,
+            "saved.moments.save",
+            json!({"segment_ids":[ids[0]],"collection_id":c}),
+        )
+        .unwrap();
+        migrate_v23(s.conn()).unwrap();
+        assert_eq!(
+            call(&s, "saved.moments.list", json!({"collection_id":c})).unwrap()["total"],
+            1
+        );
     }
 }

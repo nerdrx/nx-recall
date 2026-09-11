@@ -1177,6 +1177,9 @@ test('a re-published row older than the window is not news', () => {
   assert.deepEqual(store.segments.map((s) => s.id), before, 'the window is unchanged');
   assert.ok(!store.segById.has(3), 'the old row is not held');
   assert.ok(!change?.added, 'nothing was added');
+  assert.equal(change.outside, true);
+  assert.equal(change.updated[0].id, 3, 'archive consumers can invalidate corrected results');
+  assert.equal(change.updated[0].text_via, 'context');
   assert.equal(store.speakers.get(1).segments, 6, 'no double count: three arrivals, one re-publish');
   assert.equal(store.appended, 3);
   // …but a row that belongs INSIDE the window (a late turn) is still filed in order.

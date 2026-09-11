@@ -161,8 +161,9 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // replaces — 723 unclassified gaps in one journal window, reconstructed by
 // hand because nothing wrote them down.
 // Schemas21–22 add durable semantic bookkeeping and source-linked saved items.
+// Schema23 adds saved collections and an indexed chronological history walk.
 // Their migrations share this transaction, including the version update.
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -1523,9 +1524,10 @@ impl Store {
         // ---- 0.14.0 (schema v20): capture health ---------------------------
         // One table, no backfill. See the banner above `SCHEMA_VERSION`.
         self.apply_v20()?;
-        // Search bookkeeping and user-created saved items (schemas21–22).
+        // Search bookkeeping and user-created saved items (schemas21–23).
         crate::semantic::migrate_v21(&self.conn)?;
         crate::saved::migrate_v22(&self.conn)?;
+        crate::saved::migrate_v23(&self.conn)?;
         // ---- end 0.14.0 ------------------------------------------------------
 
         match current {

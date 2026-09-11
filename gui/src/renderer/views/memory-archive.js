@@ -27,20 +27,84 @@ export function archiveAttribution(segment) {
   return `${when} · ${segmentSpeakerLabel(segment)} · ${segment.source || 'Unknown source'}`;
 }
 
+export function uniqueHistoryRows(rows, seen) {
+  return rows.filter(row => { if (seen.has(row.id)) return false; seen.add(row.id); return true; });
+}
+
 export function mountArchive(root, ctx, digestRow) {
   let generation = 0;
   let selectedDay = localDay();
   let mode = null;
   let dead = false;
+  let collectionFilter = 'all';
+  let collections = [];
+  const sourceRows = new Map();
+  const purged = new Set();
+  let revision = 0;
   const offsets = { moments: 0, searches: 0 };
   const button = (label, action, attrs = {}) => h('button', { class: 'btn small', onclick: action, ...attrs }, label);
   function error(box, message, retry) {
     clear(box); box.append(h('p', { role: 'alert', text: message }), button('Try again', retry));
   }
+  function sourceRow(segment, attrs = {}, open = true) {
+    if (purged.has(segment.id)) return null;
+    segment = { ...segment };
+    const row = h('article', { class: 'card archive-segment', ...attrs, dataset: { ...attrs.dataset, sourceSegment: segment.id } },
+      h('p', { class: 'sub', dataset: { sourceAttribution: '' }, text: archiveAttribution(segment) }),
+      h('p', { dataset: { sourceText: '' }, text: segment.text ?? '' }),
+      open ? button('Open in transcript', () => ctx.jumpToSegment(segment)) : null);
+    if (!sourceRows.has(segment.id)) sourceRows.set(segment.id,new Set());
+    sourceRows.get(segment.id).add({node:row,segment});
+    return row;
+  }
+  function update(change) {
+    if (change?.purged?.length || change?.updated?.length) revision++;
+    const referenced = change?.purged?.length ? new Set([...sourceRows.keys(), ...[...root.querySelectorAll('[data-source-ids]')].flatMap(row=>JSON.parse(row.dataset.sourceIds))]) : null;
+    for (const id of change?.purged ?? []) {
+      if (referenced.has(id)) purged.add(id);
+      for (const item of sourceRows.get(id) ?? []) item.node.remove();
+      sourceRows.delete(id);
+    }
+    for (const segment of change?.updated ?? []) {
+      purged.delete(segment.id);
+      for (const item of sourceRows.get(segment.id) ?? []) {
+        if (!item.node.isConnected) continue;
+        Object.assign(item.segment,segment);
+        item.node.querySelector('[data-source-text]').textContent = item.segment.text ?? '';
+        item.node.querySelector('[data-source-attribution]').textContent = archiveAttribution(item.segment);
+      }
+    }
+    if (change?.relabel) for (const entries of sourceRows.values()) for (const item of entries) {
+      if (item.node.isConnected) item.node.querySelector('[data-source-attribution]').textContent = archiveAttribution(item.segment);
+    }
+    if (change?.purged?.length) {
+      for (const row of root.querySelectorAll('[data-saved-kind="moments"]')) {
+        if (JSON.parse(row.dataset.sourceIds || '[]').every(id=>purged.has(id))) row.remove();
+      }
+      const status = root.querySelector('#archive-history-status');
+      const count = root.querySelectorAll('[data-history-id]').length;
+      if (status) status.textContent = status.textContent.replace(/^\d+ turns? shown/,`${count} turn${count===1?'':'s'} shown`);
+      const detail = document.getElementById('saved-moment-detail');
+      if (detail) {
+        const count = detail.querySelectorAll('[data-moment-segment]').length;
+        document.getElementById('saved-moment-count').textContent = `${count} retained turns · deleted sources are removed immediately`;
+        document.getElementById('saved-moment-play').disabled = count === 0;
+      }
+    }
+    pruneRows();
+  }
+  function pruneRows() {
+    // Keep only rendered rows; cleared days and closed dialogs release their nodes.
+    for (const [id,entries] of sourceRows) {
+      for (const item of entries) if (!item.node.isConnected) entries.delete(item);
+      if (!entries.size) sourceRows.delete(id);
+    }
+  }
   async function show(next) {
     mode = next;
     const ticket = ++generation;
     clear(root);
+    pruneRows(); purged.clear();
     const content = h('div', { class: 'archive-content', 'aria-live': 'polite' });
     if (mode === 'day') {
       const input = h('input', { type: 'date', id: 'archive-day', value: selectedDay, 'aria-label': 'Archive day', onchange: () => {
@@ -49,40 +113,86 @@ export function mountArchive(root, ctx, digestRow) {
       const move = (days) => { const date = new Date(`${selectedDay}T12:00:00`); date.setDate(date.getDate() + days); selectedDay = localDay(date); void show('day'); };
       root.append(h('div', { class: 'archive-toolbar' }, button('Previous day', () => move(-1)), input, button('Next day', () => move(1)), button('Today', () => { selectedDay = localDay(); void show('day'); })), content);
       content.append(h('p', { class: 'sub', text: 'Loading this day…' }));
-      try {
-        const range = dayRange(selectedDay);
-        const [summary, transcript] = await Promise.allSettled([
-          ask('digest.list', { day: selectedDay, limit: 100 }),
-          ask('transcript', { ...range, limit: 200 }),
-        ]);
+      clear(content);
+      const summaryBox = h('section', { class: 'archive-summaries' }, h('h2', { text: 'Conversations on this day' }), h('p', { class: 'sub', text: 'Loading summaries…' }));
+      const historyList = h('div', { id: 'archive-history' });
+      const historyStatus = h('p', { class: 'sub', id: 'archive-history-status', role: 'status' });
+      const historyError = h('p', { role: 'alert', id: 'archive-history-error' });
+      let cursor = null, loading = false, loaded = 0, finished = false;
+      const seen = new Set();
+      const range = dayRange(selectedDay);
+      const more = button('Load more turns', () => void loadPage(), { id: 'archive-load-more' });
+      const refresh = button('Refresh day', () => void show('day'), { id: 'archive-refresh' });
+      content.append(summaryBox, h('h2', { text: 'Recorded words' }), h('p', { class: 'sub', text: 'Read this day in order. Refresh the day to include new recordings.' }), historyList, historyStatus, historyError, more, refresh);
+      async function loadPage() {
+        if (loading || finished || dead || ticket !== generation) return;
+        loading = true; more.disabled = true; more.textContent = 'Loading…'; historyError.textContent = '';
+        try {
+          let reply, began;
+          do { began = revision; reply = await ask('history.page', { ...range, limit: 100, ...(cursor ? { cursor } : {}) }); }
+          while (began !== revision && !dead && ticket === generation);
+          if (dead || ticket !== generation) return;
+          const scroller = root.closest('.view-body');
+          const scroll = scroller?.scrollTop;
+          for (const segment of uniqueHistoryRows(reply.segments ?? [], seen)) {
+            const row = sourceRow(segment,{dataset:{historyId:segment.id}});
+            if (row) historyList.append(row);
+          }
+          loaded = historyList.children.length;
+          cursor = reply.next_cursor ?? null; finished = cursor == null;
+          historyStatus.textContent = loaded ? `${loaded} turn${loaded === 1 ? '' : 's'} shown${finished ? ' · end of this day' : ' · more available'}` : 'No retained transcript for this day.';
+          more.hidden = finished;
+          if (scroller && scroll != null) scroller.scrollTop = scroll;
+        } catch (e) {
+          if (dead || ticket !== generation) return;
+          historyError.textContent = `Recorded words could not be loaded — ${e.message}`;
+          more.textContent = 'Retry recorded words';
+        } finally {
+          loading = false;
+          if (!dead && ticket === generation) { more.disabled = false; if (!historyError.textContent) more.textContent = 'Load more turns'; }
+        }
+      }
+      void ask('digest.list', { day: selectedDay, limit: 100 }).then(reply => {
         if (dead || ticket !== generation) return;
-        clear(content);
-        const digests = summary.status === 'fulfilled' ? summary.value.digests ?? [] : [];
-        const segments = transcript.status === 'fulfilled' ? transcript.value.segments ?? [] : [];
-        if (summary.status === 'rejected' && transcript.status === 'rejected') throw transcript.reason;
-        content.append(h('h2', { text: 'Conversations on this day' }));
-        if (digests.length) content.append(h('div', { class: 'card digest-list' }, ...digests.map(digestRow)));
-        else if (summary.status === 'rejected') content.append(h('p', { role: 'alert', text: `Summaries could not be loaded — ${summary.reason.message}` }), button('Retry summaries', () => void show('day')));
-        else content.append(h('p', { class: 'sub', text: 'No summaries for this day. Recorded words are available below when retained.' }));
-        content.append(h('h2', { text: 'Recorded words' }));
-        if (transcript.status === 'rejected') content.append(h('p', { role: 'alert', text: `Recorded words could not be loaded — ${transcript.reason.message}` }), button('Retry recorded words', () => void show('day')));
-        else if (!segments.length) content.append(h('p', { class: 'empty', text: 'No retained transcript for this day.' }));
-        for (const segment of segments) content.append(h('div', { class: 'card archive-segment' },
-          h('span', { class: 'sub', text: archiveAttribution(segment) }),
-          h('p', { text: segment.text ?? '' }), button('Open in transcript', () => ctx.jumpToSegment(segment))));
-        if (segments.length >= 200 || digests.length >= 100) content.append(h('p', { class: 'sub', text: 'Showing a preview of this day. Open Search to explore all retained words.' }),
-          button('Search this day', () => ctx.go('search', { savedSearch: { query: '', filters: { date: { kind: 'fixed', from: selectedDay, to: selectedDay } } } })));
-      } catch (e) { if (!dead && ticket === generation) error(content, `Could not load this day — ${e.message}`, () => void show('day')); }
+        clear(summaryBox); summaryBox.append(h('h2', { text: 'Conversations on this day' }));
+        const digests = reply.digests ?? [];
+        if (digests.length) summaryBox.append(h('div', { class: 'card digest-list' }, ...digests.map(digestRow)));
+        else summaryBox.append(h('p', { class: 'sub', text: 'No summaries for this day. Recorded words remain available below.' }));
+        if (digests.length >= 100) summaryBox.append(h('p', { class: 'sub', text: 'Showing the first 100 summaries; all retained turns can be browsed below.' }));
+      }).catch(e => { if (!dead && ticket === generation) error(summaryBox, `Summaries could not be loaded — ${e.message}`, () => void show('day')); });
+      await loadPage();
       return;
     }
     root.append(h('p', { class: 'sub', text: 'Saved locally. Removing a bookmark keeps the original transcript.' }), content);
     content.append(h('p', { class: 'sub', text: 'Loading saved items…' }));
+    const began = revision;
     const results = await Promise.allSettled([
-      ask('saved.moments.list', { limit: SAVED_PAGE, offset: offsets.moments }),
+      ask('saved.moments.list', { limit: SAVED_PAGE, offset: offsets.moments, ...(collectionFilter === 'all' ? {} : { collection_id: collectionFilter === 'unfiled' ? null : Number(collectionFilter) }) }),
       ask('saved.searches.list', { limit: SAVED_PAGE, offset: offsets.searches }),
+      ask('saved.collections.list'),
     ]);
     if (dead || ticket !== generation) return;
+    if (began !== revision) { void show('saved'); return; }
     clear(content);
+    if (results[2].status === 'fulfilled') {
+      collections = results[2].value.collections ?? [];
+      if (!['all','unfiled'].includes(collectionFilter) && !collections.some(c => String(c.id) === collectionFilter)) {
+        collectionFilter = 'all'; offsets.moments = 0; void show('saved'); return;
+      }
+      const filter = h('select', { id: 'memory-collection', class: 'input', 'aria-label': 'Moment collection', onchange: () => { collectionFilter = filter.value; offsets.moments = 0; void show('saved'); } },
+        h('option', { value: 'all', text: 'All moments' }), h('option', { value: 'unfiled', text: 'Unfiled' }),
+        ...collections.map(c => h('option', { value: c.id, text: `${c.name} (${c.count})` })));
+      filter.value = collectionFilter;
+      const selected = collections.find(c => String(c.id) === collectionFilter);
+      content.append(h('div', { class: 'archive-toolbar collection-toolbar' }, filter,
+        button('New collection', () => editCollection(), { id: 'collection-new' }),
+        button('Rename collection', () => editCollection(selected), { id: 'collection-rename', disabled: !selected }),
+        button('Delete collection', async () => {
+          if (!selected || !await confirmSheet({ title: `Delete ${selected.name}?`, body: 'Saved moments move to Unfiled. Their source turns and notes stay.', confirmLabel: 'Delete collection' })) return;
+          try { await ask('saved.collections.delete', { id: selected.id }); collectionFilter = 'unfiled'; offsets.moments = 0; if (!dead && mode === 'saved') void show('saved'); }
+          catch (e) { toast(`Could not delete the collection — ${e.message}`, 'error'); }
+        }, { id: 'collection-delete', disabled: !selected })));
+    } else content.append(h('p', { role: 'alert', text: `Collections could not be loaded — ${results[2].reason.message}` }));
     for (const [index, kind, label] of [[0, 'moments', 'Saved moments'], [1, 'searches', 'Saved searches']]) {
       const box = h('section', { class: 'saved-group', dataset: { savedGroup: kind } }, h('h2', { text: label }));
       content.append(box);
@@ -99,20 +209,20 @@ export function mountArchive(root, ctx, digestRow) {
         button('Next page', () => { offsets[kind] = paging.next; void show('saved'); }, { disabled: !paging.hasMore })));
       if (!rows.length) box.append(h('p', { class: 'empty', text: kind === 'moments' ? 'Save a moment from a transcript turn or search result to keep it here.' : 'Save a search from Search to return to its query and filters.' }));
       for (const record of rows) {
-        const row = h('article', { class: 'card saved-item', dataset: { savedId: record.id, savedKind: kind } });
+        const row = h('article', { class: 'card saved-item', dataset: { savedId: record.id, savedKind: kind, ...(kind === 'moments' ? { sourceIds: JSON.stringify(record.segment_ids) } : {}) } });
         const title = kind === 'moments' ? record.title || 'Saved moment' : record.name;
         row.append(h('h3', { text: title }));
         if (kind === 'moments') {
           if (record.note) row.append(h('span', { class: 'sub', text: 'Personal note' }), h('p', { text: record.note }));
           const first = record.segments?.[0];
-          if (first) row.append(h('span', { class: 'sub', text: `Original transcript · ${archiveAttribution(first)}` }), h('p', { text: first.text ?? '' }));
+          if (first) row.append(h('span', { class: 'sub', text: 'Original transcript' }), sourceRow(first,{class:'saved-source-preview'},false));
           else row.append(h('p', { class: 'sub', text: 'The original words are no longer retained.' }));
         } else row.append(h('p', { text: record.query }));
         if (kind === 'moments' && record.unavailable_count > 0) row.append(h('p', { class: 'sub', text: `${record.unavailable_count} original turn(s) are no longer retained.` }));
         row.append(h('div', { class: 'archive-toolbar' },
           button(kind === 'moments' ? 'Open moment' : 'Run search', () => {
             if (kind === 'searches') ctx.go('search', { savedSearch: record });
-            else if (record.segments?.length) ctx.jumpToSegment(record.segments[0]);
+            else if (record.segments?.length) void openMoment(record.id);
             else toast('The original words are no longer retained. Your saved title and note remain.');
           }, { disabled: kind === 'moments' && !record.segments?.length }),
           button('Edit', () => edit(kind, record)), button('Remove', async () => {
@@ -120,9 +230,60 @@ export function mountArchive(root, ctx, digestRow) {
             try { await ask(`saved.${kind}.delete`, { id: record.id }); if (!dead && mode === 'saved') void show('saved'); }
             catch (e) { toast(`Could not remove it — ${e.message}`, 'error'); }
           })));
+        if (kind === 'moments') row.append(button('Move to collection', () => moveMoment(record), { dataset: { moveMoment: record.id } }));
         box.append(row);
       }
     }
+  }
+  async function openMoment(id) {
+    const ticket = generation;
+    let reply, began;
+    try { do { began = revision; reply = await ask('saved.moments.get', { id }); } while (began !== revision && !dead && ticket === generation); }
+    catch (e) { toast(`Could not open this moment — ${e.message}`, 'error'); return; }
+    if (dead || mode !== 'saved' || ticket !== generation) return;
+    const record = reply.moment;
+    openSheet(close => [h('h2', { text: record.title || 'Saved moment' }),
+      record.note ? h('div', {}, h('span', { class: 'sub', text: 'Personal note' }), h('p', { text: record.note })) : null,
+      h('p', { class: 'sub', id: 'saved-moment-count', text: `${record.segments.filter(s=>!purged.has(s.id)).length} retained turns · playback includes only this saved range` }),
+      record.unavailable_count ? h('p', { class: 'sub', text: `${record.unavailable_count} original turn(s) no longer retained.` }) : null,
+      h('div', { id: 'saved-moment-detail' }, ...record.segments.map(segment => { const row=sourceRow(segment,{dataset:{momentSegment:segment.id}},false); if(row) row.append(button('Open in transcript',()=>{close();ctx.jumpToSegment(segment);})); return row; })),
+      h('div', { class: 'sheet-actions' }, button('Close', () => close()),
+        button('Play saved range', () => { close(); void ctx.replayMoment?.(record.id); }, { id: 'saved-moment-play' }))], { onClose: pruneRows });
+  }
+  function editCollection(record = null) {
+    openSheet(close => {
+      const name = h('input', { id: 'collection-name', class: 'input', value: record?.name ?? '', maxlength: '120' });
+      const problem = h('p', { role: 'alert' });
+      const save = button('Save collection', async () => {
+        if (!name.value.trim()) { problem.textContent = 'Give the collection a name.'; return; }
+        save.disabled = true;
+        try {
+          const reply = await ask('saved.collections.save', { ...(record ? { id: record.id } : {}), name: name.value.trim() });
+          close(); collectionFilter = String(reply.collection.id); offsets.moments = 0; if (!dead && mode === 'saved') void show('saved');
+        } catch (e) { problem.textContent = e.message; save.disabled = false; }
+      }, { id: 'collection-save' });
+      return [h('h2', { text: record ? 'Rename collection' : 'New collection' }), h('label', { for: 'collection-name', text: 'Name' }), name, problem,
+        h('div', { class: 'sheet-actions' }, button('Cancel', () => close()), save)];
+    });
+  }
+  async function moveMoment(record) {
+    let available;
+    try { available = (await ask('saved.collections.list')).collections ?? []; }
+    catch (e) { toast(e.message, 'error'); return; }
+    if (dead || mode !== 'saved') return;
+    openSheet(close => {
+      const select = h('select', { class: 'input', id: 'moment-collection' }, h('option', { value: '', text: 'Unfiled' }), ...available.map(c => h('option', { value: c.id, text: c.name })));
+      select.value = record.collection_id == null ? '' : String(record.collection_id);
+      const problem = h('p', { role: 'alert' });
+      const move = button('Move moment', async () => {
+        move.disabled = true;
+        try { await ask('saved.moments.move', { id: record.id, collection_id: select.value ? Number(select.value) : null }); close(); if (!dead && mode === 'saved') void show('saved'); }
+        catch (e) { problem.textContent = e.message; move.disabled = false; }
+      }, { id: 'moment-move' });
+      return [h('h2', { text: 'Move saved moment' }), h('label', { for: 'moment-collection', text: 'Collection' }), select,
+        h('p', { class: 'sub', text: 'Create a collection from Memory if you need a new destination.' }), problem,
+        h('div', { class: 'sheet-actions' }, button('Cancel', () => close()), move)];
+    });
   }
   function edit(kind, record) {
     openSheet((close) => {
@@ -142,5 +303,5 @@ export function mountArchive(root, ctx, digestRow) {
         h('div', { class: 'sheet-actions' }, button('Cancel', () => close()), save)];
     });
   }
-  return { show, destroy() { dead = true; generation++; } };
+  return { show, update, hide() { mode = null; generation++; }, destroy() { dead = true; generation++; sourceRows.clear(); purged.clear(); } };
 }

@@ -43,3 +43,10 @@ test('archive attribution includes a local clock, speaker and capture source', a
   assert.match(archiveAttribution({ t_ms: ms, speaker: null, source: 'Discord' }), /13:14:15 · unknown voice · Discord$/);
   assert.match(archiveAttribution({ t_ms: null, source: '' }), /^Time unavailable · unknown voice · Unknown source$/);
 });
+
+test('append history deduplicates repeated pages without dropping tied timestamps', async () => {
+  const { uniqueHistoryRows } = await import('../src/renderer/views/memory-archive.js');
+  const seen = new Set();
+  assert.deepEqual(uniqueHistoryRows([{id:1,t_ms:10},{id:2,t_ms:10}],seen).map(r=>r.id),[1,2]);
+  assert.deepEqual(uniqueHistoryRows([{id:2,t_ms:10},{id:3,t_ms:10},{id:3,t_ms:10}],seen).map(r=>r.id),[3]);
+});

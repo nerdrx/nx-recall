@@ -362,6 +362,12 @@ impl SessionPipeline {
         }
     }
 
+    fn mono_of_sample(&self, sample: u64) -> Option<u64> {
+        let delta = sample as i128 - self.anchor_sample as i128;
+        let ns = self.anchor.mono_ns as i128 + delta * 1_000_000_000 / SAMPLE_RATE as i128;
+        u64::try_from(ns).ok()
+    }
+
     fn utc_of_sample(&self, sample: u64) -> i64 {
         let delta = sample as i64 - self.anchor_sample as i64;
         let ns = (delta as i128 * 1_000_000_000i128) / SAMPLE_RATE as i128;
@@ -723,6 +729,8 @@ impl Pipeline {
         // the queue's own eviction count (0.14.0). See the `queue` field.
         self.queue = Some(Arc::clone(&queue));
         while let Some(event) = queue.pop() {
+            let semantic = self.semantic.clone();
+            let _priority = semantic.as_ref().map(|leg| leg.live_priority());
             let result = match event {
                 CaptureEvent::Audio(chunk) => self.on_audio(chunk),
                 CaptureEvent::SessionEnd {
@@ -1481,6 +1489,7 @@ impl Pipeline {
 
         let t_start_ns = session.utc_of_sample(span.start + piece.from as u64);
         let t_end_ns = session.utc_of_sample(span.start + piece.to as u64);
+        let audio_end_mono_ns = session.mono_of_sample(span.start + piece.to as u64);
         session.segment_seq += 1;
         let is_mic = session.is_mic;
         let is_room = session.is_room;
@@ -1614,18 +1623,39 @@ impl Pipeline {
                 .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
             store.set_segment_speaker_via(segment_id, Some(speaker_id), None, Some(via))?;
         }
-        // The text vector, after the transcript exists and before the event
-        // goes out. On THIS thread on purpose: it is the deprioritised worker
-        // the ASR and identity legs already run on, one forward pass is ~2 ms
-        // against ASR's tens, and doing it anywhere else would either put model
-        // work on the capture thread or need a second copy of the weights. A
-        // failure costs a search result, never a recording.
-        if let Some(leg) = self.semantic.clone() {
-            let store = self
+        // Finalized audio end -> committed transcript, using capture's
+        // monotonic anchor (never wall clock). Wordless/failed analyses do not
+        // masquerade as zero-latency successful transcriptions.
+        if let Some(end) = audio_end_mono_ns {
+            let has_text = self
                 .store
                 .lock()
-                .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
-            if let Err(e) = leg.embed_segment(&store, segment_id) {
+                .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?
+                .conn()
+                .query_row(
+                    "SELECT text FROM segments WHERE id=?1 AND deleted_at IS NULL",
+                    [segment_id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+                .is_some_and(|text| !text.trim().is_empty());
+            if has_text {
+                if let Some(elapsed) = crate::clock::monotonic_ns().checked_sub(end) {
+                    self.control
+                        .performance
+                        .capture
+                        .record_ms(elapsed as f64 / 1_000_000.0);
+                }
+            }
+        }
+        // The text vector, after the transcript exists and before the event
+        // goes out, on the same worker as ASR and identity. Live work has
+        // priority over archive repair and shares its model weights. No store
+        // lock spans a model wait or forward pass. A failure leaves the durable
+        // repair queue intact and never costs a recording.
+        if let Some(leg) = self.semantic.clone() {
+            if let Err(e) = leg.embed_live(&self.store, &self.control, segment_id) {
                 warn!(
                     segment_id,
                     "could not embed a segment for semantic search: {e:#}"
@@ -2156,6 +2186,14 @@ mod tests {
         assert_eq!(s.utc_of_sample(0), 1_700_000_000_000_000_000);
         assert_eq!(s.utc_of_sample(16_000), 1_700_000_001_000_000_000);
         assert_eq!(s.utc_of_sample(8_000), 1_700_000_000_500_000_000);
+        assert_eq!(s.mono_of_sample(8_000), Some(500_000_000));
+        // Clock correction cannot change elapsed capture latency.
+        s.anchor.utc_ns = 0;
+        assert_eq!(s.mono_of_sample(8_000), Some(500_000_000));
+        s.anchor.mono_ns = 5_000_000_000;
+        s.anchor_sample = 16_000;
+        assert_eq!(s.mono_of_sample(24_000), Some(5_500_000_000));
+        assert_eq!(s.mono_of_sample(8_000), Some(4_500_000_000));
     }
 
     // The VAD state is opaque; tests that only exercise clock arithmetic borrow

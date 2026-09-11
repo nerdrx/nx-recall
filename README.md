@@ -91,6 +91,19 @@ searchable — by word, by meaning, by speaker, by day, by world — and a 1.9 G
 model on four polite CPU cores quietly writes down who promised what, while a
 1 GB model on your GPU re-reads the hard parts at three in the morning.
 
+## Whole conversations in 0.16
+
+Memory now browses the whole day in stable pages and organizes saved moments
+into collections. Open a saved moment to read or replay its complete range.
+Search highlights literal matches, groups nearby results, and labels audio
+references without promising that an unavailable recording can play.
+
+The semantic index repairs itself when capture is idle, with durable progress
+across restarts and safeguards against stale edits. **Settings → Performance**
+shows measured delays, daemon memory, queued and dropped audio, and repair state.
+Latency summaries retain the latest 256 measurements per category and reset
+with the daemon; they contain no query or transcript text.
+
 ## Quiet Studio in 0.15
 
 A complete desktop design pass keeps the focus on conversations: flat surfaces,

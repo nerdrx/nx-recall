@@ -498,10 +498,26 @@ impl Service {
     /// Dispatch one request. `client` is the connection it came in on, which
     /// only the subscription methods care about.
     pub fn handle(self: &Arc<Self>, client: &Arc<Client>, req: &Request) -> Result<Value, Error> {
+        let started = std::time::Instant::now();
+        let result = self.dispatch(client, req);
+        if matches!(
+            req.method.as_str(),
+            "search" | "search.semantic" | "search.ask" | "search.answer"
+        ) {
+            self.control
+                .performance
+                .search
+                .record_ms(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        result
+    }
+
+    fn dispatch(self: &Arc<Self>, client: &Arc<Client>, req: &Request) -> Result<Value, Error> {
         match req.method.as_str() {
             "subscribe" => self.subscribe(client, req),
             "events.since" => self.events_since(client, req),
             "status" => self.status(),
+            "performance.get" => Ok(self.performance()),
             "pause" => self.set_paused(true),
             "resume" => self.set_paused(false),
             "sources.list" => self.sources_list(),
@@ -561,6 +577,12 @@ impl Service {
             | "saved.moments.list"
             | "saved.moments.save"
             | "saved.moments.delete"
+            | "saved.moments.get"
+            | "saved.moments.move"
+            | "saved.collections.list"
+            | "saved.collections.save"
+            | "saved.collections.delete"
+            | "history.page"
             | "segments.context" => crate::saved::handle(&self.store(), req),
             "notes.list" => self.notes_list(req),
             "notes.set_state" => self.notes_set_state(req),
@@ -692,6 +714,22 @@ impl Service {
 
     // ---- status and pause ------------------------------------------------
 
+    fn performance(&self) -> Value {
+        let c = &self.control;
+        let rate = crate::config::SAMPLE_RATE as f64;
+        let queue = c.queue.as_ref().map(|q| {
+            json!({
+                "seconds": q.queued_samples() as f64 / rate,
+                "capacity_seconds": q.capacity_samples() as f64 / rate,
+                "dropped_chunks": q.dropped_chunks(),
+                "dropped_seconds": q.dropped_samples() as f64 / rate,
+            })
+        });
+        json!({"scope": "current_process", "capture": c.performance.capture.snapshot(),
+            "search": c.performance.search.snapshot(), "resident_bytes": crate::performance::resident_bytes(),
+            "queue": queue, "repair": self.semantic().map(|leg| leg.repair_status())})
+    }
+
     fn status(&self) -> Result<Value, Error> {
         self.status_payload().map_err(Error::from)
     }
@@ -719,6 +757,7 @@ impl Service {
             "indexed": coverage.embedded,
             "eligible": coverage.eligible,
             "pending": coverage.pending(),
+            "repair": leg.repair_status(),
         }))
     }
 
@@ -5520,6 +5559,23 @@ mod tests {
             panic!("not a request: {line}");
         };
         rig.service.handle(&rig.client, &req)
+    }
+
+    #[test]
+    fn performance_counts_searches_without_counting_its_own_reads() {
+        let r = rig("performance-016");
+        let empty = call(&r, r#"{"id":1,"method":"performance.get"}"#).unwrap();
+        assert_eq!(empty["search"]["samples"], 0);
+        assert!(empty["capture"]["p50_ms"].is_null());
+        assert!(empty["queue"].is_null());
+        assert!(call(&r, r#"{"id":2,"method":"search"}"#).is_err());
+        let after = call(&r, r#"{"id":3,"method":"performance.get"}"#).unwrap();
+        assert_eq!(after["search"]["samples"], 1);
+        assert!(after["search"]["latest_ms"].as_f64().unwrap() >= 0.0);
+        assert_eq!(
+            call(&r, r#"{"id":4,"method":"performance.get"}"#).unwrap()["search"],
+            after["search"]
+        );
     }
 
     fn events(rig: &Rig) -> Vec<Value> {

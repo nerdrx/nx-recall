@@ -79,6 +79,7 @@ const ctx = {
   showThreadInTranscript,
   // 0.9.2: the same jump, but playing. Four surfaces reach it.
   replayThread,
+  replayMoment,
   back,
   toast,
   resync,
@@ -168,6 +169,21 @@ function searchWorld(worldId, label) {
 /** Leave a pushed view for the rail view it was opened from. */
 function back() {
   go(RAIL_VIEWS.has(returnTo) ? returnTo : 'speakers');
+}
+
+/** Fetch the retained saved range and replay only its source rows. */
+async function replayMoment(id) {
+  try {
+    const { moment } = await ask('saved.moments.get', { id });
+    const rows = moment?.segments ?? [];
+    if (!rows.length) { toast('This saved moment no longer has visible turns.', 'error'); return null; }
+    mergeSegments(rows);
+    go('transcript');
+    return (await current?.startReplay?.(rows[0].thread ?? 0, { segments: rows })) ?? null;
+  } catch (error) {
+    toast(`Could not replay this moment — ${error.message}`, 'error');
+    return null;
+  }
 }
 
 /**
@@ -785,6 +801,7 @@ function quickSwitch() {
     { label: 'Sources', description: 'Choose what Recall may hear', keywords: 'capture microphone apps consent', shortcut: 'Alt 5', run: navigate('sources', { section: 'capture' }) },
     { label: 'Storage and backups', description: 'Manage retained audio and exports', keywords: 'delete disk export', run: navigate('sources', { section: 'storage' }) },
     { label: 'Settings', description: 'Appearance and preferences', keywords: 'density appearance', shortcut: 'Alt 6', run: navigate('settings', { section: 'appearance' }) },
+    { label: 'Performance', description: 'Measured delays, memory and recording health', keywords: 'settings speed latency queue dropped index repair', run: navigate('settings', { section: 'performance' }) },
     { label: 'Processing', description: 'Local models and resource use', keywords: 'settings models cpu recognition', run: navigate('settings', { section: 'processing' }) },
   ];
   openQuickSwitch(commands, query => { go('search', { savedSearch: { query, filters: { date: { kind: 'all' }, mode: 'keyword' } } }); current?.focusQuery?.(); });

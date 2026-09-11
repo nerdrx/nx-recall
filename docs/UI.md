@@ -67,3 +67,40 @@ calendar dates, transcript labels, and established frontend behaviors.
 private synthetic daemon inside headless gamescope. It covers light/dark,
 760/1024-pixel layouts, keyboard behavior, categories, collapsed navigation,
 search context, and the existing recording/privacy workflows.
+
+
+## 0.16: full history, collections, and measurements
+
+Memory History requests `history.page` in 100-turn pages. The opaque cursor
+binds the requested date range and a maximum row ID; later captures cannot
+shift subsequent pages. The history index follows `(t_start_ns,id)` and filters
+deleted rows. Saved collections use schema v23; deleting a collection unfiles
+its moments without deleting source content. Saved moment detail fetches fresh
+visible segments, and replay passes exactly that range to the shared player.
+
+Search preserves individual result order and navigation while giving adjacent
+nearby hits a conversation heading. Literal highlights are DOM text/mark nodes,
+never query-generated HTML. A linked audio path is labelled “Recording linked”,
+not verified playable audio; actual playback retains its normal checks.
+
+Settings Performance polls only while its category is open. `performance.get`
+reports rolling nearest-rank p50/p95, latest and maximum over at most 256 samples.
+Audio-to-transcript uses the captured monotonic sample endpoint to the stored
+nonempty transcript before semantic enrichment. Search timings cover daemon
+request handling (including failed searches and answer generation), excluding
+transport and rendering. Resident memory is Linux VmRSS for recalld alone;
+queue/drop counters are current-process capture data. No samples render as an
+em dash, and failed refreshes label retained data stale. All measurements reset
+at daemon restart and keep no transcript/query text.
+
+
+### Synthetic repair-queue benchmark
+
+Run `cargo test -p recalld --lib repair_candidate_selection_benchmark -- --ignored --nocapture`.
+The fixture inserts synthetic transcript rows into in-memory SQLite and compares
+20 candidate reads using the old full UNION against bounded branch reads. On
+this development machine, 10,000 pending rows took 133.36 ms vs 4.79 ms; 100,000
+took 1,221.13 ms vs 3.36 ms. This measures queue-selection SQL only, without model
+inference, audio, disk I/O, or screen rendering. It is not an end-to-end speedup
+claim. Scheduling regressions separately verify unlocked inference, pause/stop,
+capture/store priority, durable resume, bounded backoff and stale-result guards.

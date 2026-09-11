@@ -274,12 +274,15 @@ function finish() {
  *
  * Never throws: this is called straight out of a click.
  */
-export async function start(thread, { from = null, rate = null } = {}) {
+export async function start(thread, { from = null, rate = null, segments = null } = {}) {
   close();
   const gen = ++run;
   let res;
   try {
-    res = await ask('replay.get', { thread });
+    // A saved range was fetched fresh by the controller; never widen it by
+    // asking for the whole conversation. Audio still uses the normal retained
+    // segments.audio path and the one shared player.
+    res = segments == null ? await ask('replay.get', { thread }) : { turns: segments };
   } catch (e) {
     st = { ...blank(), error: e.code ?? 'failed' };
     emit();

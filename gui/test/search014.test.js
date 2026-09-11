@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { nextSearchResult, searchCountLabel, hasSearchIntent, resolveSearchDate, searchDateParams, withoutSearchDates, savedSearchFilters, restoreSavedSearch } from '../src/renderer/views/search.js';
+import { keywordMatchParts, keywordHighlightQuery, groupSearchHits, searchAudioState, searchChangeTouches, nextSearchResult, searchCountLabel, hasSearchIntent, resolveSearchDate, searchDateParams, withoutSearchDates, savedSearchFilters, restoreSavedSearch } from '../src/renderer/views/search.js';
 
 test('all-history drops dates without changing query, speaker, world, source or mode', () => {
   const input = { query: 'portal', speaker_id: 7, source: 'VRChat.exe', world_id: 'wrld_x', mode: 'hybrid', from_ns: '12', to_ns: '34', from_ms: 0, to_ms: 1 };
@@ -96,4 +96,50 @@ test('result count distinguishes a capped page from all matches', () => {
   assert.equal(searchCountLabel(0, 0), 'No matches');
   assert.equal(searchCountLabel(undefined, 4), '4 matches');
   assert.equal(searchCountLabel(0, 4), '4 matches', 'a malformed total cannot hide rendered hits');
+});
+
+test('keyword ranges preserve Unicode offsets and original markup as literal text', () => {
+  const text = '😀 Café cafe\u0301 İSTANBUL <img src=x> scatter cat';
+  const parts = keywordMatchParts(text, 'cafe istanbul img cat');
+  assert.equal(parts.map(p => p.text).join(''), text);
+  assert.deepEqual(parts.filter(p => p.matched).map(p => p.text), ['Café', 'cafe\u0301', 'İSTANBUL', 'img', 'cat']);
+  assert.deepEqual(keywordMatchParts('literal [.*] text', '[.*]'), [{text:'literal [.*] text', matched:false}]);
+  assert.deepEqual(keywordMatchParts('', ''), [{text:'', matched:false}]);
+});
+test('only lexical matches receive keyword emphasis', () => {
+  for (const via of ['keyword', 'both']) assert.equal(keywordHighlightQuery({via}, 'both', 'portal'), 'portal');
+  assert.equal(keywordHighlightQuery({via:'semantic'}, 'both', 'portal'), '');
+  assert.equal(keywordHighlightQuery({}, 'smart', 'portal'), '');
+  assert.equal(keywordHighlightQuery({}, 'keyword', 'portal'), 'portal');
+});
+test('conversation groups preserve every rank and bound the entire conversation span', () => {
+  const hits = [0, 4, 8].map((minute,index) => ({id:index,thread:1,t_ms:minute*60000}));
+  const groups = groupSearchHits(hits);
+  assert.deepEqual(groups.map(g => g.hits.length), [2,1], 'nearby chains cannot grow indefinitely');
+  assert.deepEqual(groups.flatMap(g => g.hits), hits);
+  assert.deepEqual(groups.map(g => g.startRank), [1,3]);
+  const reordered = [hits[2],hits[0],hits[1]];
+  assert.deepEqual(groupSearchHits(reordered).map(g => g.hits.map(h => h.id)), [[2],[0,1]]);
+  assert.deepEqual(hits.map(h => h.id), [0,1,2]);
+});
+test('grouping separates identities and never pulls a later rank across another conversation', () => {
+  const hits = [{id:1,thread:1,t_ms:0},{id:2,thread:2,t_ms:1},{id:3,thread:1,t_ms:2}];
+  assert.equal(groupSearchHits(hits).length,3);
+  assert.equal(groupSearchHits([{t_ms:0},{t_ms:1}]).length,2);
+  assert.equal(groupSearchHits([{session:1,source:'mic',t_ms:0},{session:1,source:'loop',t_ms:1}]).length,2);
+  assert.equal(groupSearchHits([{session:1,source:'mic',t_ms:0},{session:1,source:'mic',t_ms:1}]).length,1);
+  assert.equal(groupSearchHits([{thread:1,t_ms:0},{thread:1,t_ms:300001}]).length,2);
+});
+test('audio retention never promises file availability', () => {
+  assert.equal(searchAudioState({has_audio:false}).label,'Text only');
+  assert.equal(searchAudioState({has_audio:true}).label,'Recording linked');
+  assert.equal(searchAudioState({}).label,'Audio not checked');
+  assert.match(searchAudioState({has_audio:true}).description,/checks whether the file/);
+});
+test('only corrections and purges touching displayed rows invalidate a search', () => {
+  assert.equal(searchChangeTouches({updated:[{id:7}]},[7,8]),true);
+  assert.equal(searchChangeTouches({outside:true,updated:[{id:7}]},[7]),true);
+  assert.equal(searchChangeTouches({purged:[8]},[7,8]),true);
+  assert.equal(searchChangeTouches({added:[{id:7}]},[7]),false);
+  assert.equal(searchChangeTouches({updated:[{id:9}]},[7]),false);
 });

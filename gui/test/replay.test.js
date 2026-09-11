@@ -291,3 +291,14 @@ test('a search hit replays from its own line, not from the top', async () => {
   await replay.start(8, { from: 999 });
   assert.equal(replay.replayState().index, 0);
 });
+
+test('saved range playback never widens to its surrounding conversation', async () => {
+  const asked = world({ turns: [turn(1,0,30),turn(2,40,30),turn(3,80,30),turn(4,120,30)] });
+  const selected = [turn(2,40,30),turn(3,80,30)];
+  const result = await replay.start(77, { segments: selected });
+  assert.equal(result.turns, 2);
+  await until('saved range ended', state => state.phase === 'ended');
+  assert.deepEqual(replay.replayState().turns.map(row => row.id), [2,3]);
+  assert.equal(asked.some(([method]) => method === 'replay.get'), false);
+  assert.deepEqual([...new Set(asked.filter(([method]) => method === 'segments.audio').map(([,params]) => params.id))].sort((a,b)=>a-b), [2,3]);
+});

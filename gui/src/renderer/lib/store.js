@@ -1131,7 +1131,7 @@ export function applyEvent(evt, opts = {}) {
       // re-published turn against its speaker a second time. Not in view, not
       // ours to show — the tail is one query away if the reader goes there.
       const head = store.segments[0];
-      if (head && typeof d.t_ms === 'number' && d.t_ms < head.t_ms) return withPartial({ outside: true });
+      if (head && typeof d.t_ms === 'number' && d.t_ms < head.t_ms) return withPartial({ outside: true, updated: [d] });
       store.appended += 1;
       bumpCount(d.speaker, +1, d.dur_ms);
       // The window is somewhere else entirely — the date picker rebuilt it on

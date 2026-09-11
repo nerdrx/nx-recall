@@ -5835,3 +5835,50 @@ new live turns retain their existing pipeline. There is no new automatic
 background reindex scheduler. Cold/delta database reads still hold the store
 lock, and concurrent snapshot replacement can temporarily duplicate resident
 matrix memory. No query protocol shape or model accuracy guarantee changes.
+
+
+## 0.16.0 — whole conversations (schema v23)
+
+`proto` remains 1. Additive, local methods:
+
+| Method | Parameters | Reply |
+|---|---|---|
+| `history.page` | `{from,to,limit?:100,cursor?}` | `{segments:[...],next_cursor:string or null}` |
+| `saved.moments.get` | `{id}` | `{moment:{...}}` |
+| `saved.moments.move` | `{id,collection_id:id or null}` | `{moment:{...}}` |
+| `saved.collections.list` | `{}` | `{collections:[{id,name,created_ms,count}]}` |
+| `saved.collections.save` | `{id?,name}` | `{collection:{...}}` |
+| `saved.collections.delete` | `{id}` | `{removed:bool}` |
+| `performance.get` | `{}` | process-local measurements described below |
+
+History boundaries are ISO timestamps, inclusive `from` and exclusive `to`.
+Limits accept 1–200. Treat the cursor as opaque and reuse the exact boundaries;
+it fixes a maximum segment ID and advances by nanosecond timestamp plus ID.
+Deleted rows are filtered on each read. Refresh without a cursor to include
+later recordings. History returns the ordinary full segment wire shape.
+
+Moments add `collection_id`. Saving with an omitted collection preserves the
+existing membership; null unfiles. Listing moments accepts `collection_id`:
+omitted means all, null means unfiled, a positive ID scopes to that collection.
+Collection names are trimmed, required, up to 120 characters, unique under
+SQLite NOCASE. Deleting a collection unfiles its moments without deleting them.
+Moment detail returns visible full segments in saved order; a missing or wholly
+deleted source range returns `not_found`. Existing retention rules apply.
+
+`performance.get` returns `scope:"current_process"`, `capture` and `search`
+latency objects `{samples,window,latest_ms,p50_ms,p95_ms,max_ms}`, nullable
+`resident_bytes`, nullable `queue:{seconds,capacity_seconds,dropped_chunks,
+dropped_seconds}`, and nullable `repair`. Latency samples are finite,
+nonnegative and limited to the newest 256 per category. Empty statistics are
+null rather than zero. Percentiles use nearest rank. Capture timing uses a
+monotonic clock from finalized audio end to stored nonempty transcript, before
+semantic enrichment. Search covers request dispatch including errors and
+answer generation, excluding transport/rendering. Memory is recalld VmRSS,
+excluding Electron and child models. A missing capture queue is null.
+
+`repair` is also included in `status.semantic` when its model is loaded. It
+reports state, sampled pending count and its age, completed/failed/discarded
+attempt counts, and retry delay. It keeps no text. Repair yields to capture,
+foreground inference and busy database access, backs off on failures, and
+resumes the durable dirty queue after restart. An in-flight model call finishes
+on pause/shutdown but its result is discarded.
