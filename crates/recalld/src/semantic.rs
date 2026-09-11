@@ -818,13 +818,16 @@ impl VectorIndex {
     }
 
     /// Fold one freshly written vector in without touching the database.
-    pub fn note(&mut self, segment_id: i64, v: &Embedding, seq: i64) {
+    pub fn note(&mut self, segment_id: i64, v: &Embedding, _seq: i64) {
         if v.model_id != self.model_id || v.dim() != self.dim {
             return;
         }
         let prepared = self.prepared(&v.vector);
         self.insert(segment_id, &prepared);
-        self.seq = self.seq.max(seq);
+        // Only load_since may advance the database scan watermark. A live
+        // write can arrive before the first refresh after restart, or after
+        // an external backfill wrote other rows. Skipping straight to this
+        // write's sequence would permanently hide every intervening vector.
     }
 
     /// Top `limit` rows by cosine, among the segments `within` admits.
@@ -1840,6 +1843,44 @@ mod tests {
         s.purge_segments(&[ids[0]]).unwrap();
         ix.refresh(s.conn()).unwrap();
         assert_eq!(ix.len(), 0);
+    }
+
+    #[test]
+    fn a_live_vector_before_first_refresh_preserves_the_existing_archive() {
+        let (s, ids) = seeded();
+        let old = Embedding::new("m@1", vec![1.0, 0.0]);
+        let live = Embedding::new("m@1", vec![0.0, 1.0]);
+        put_vector(s.conn(), ids[0], &old, 1).unwrap();
+        let mut ix = VectorIndex::empty("m@1", 2);
+        let seq = put_vector(s.conn(), ids[1], &live, 2).unwrap();
+        ix.note(ids[1], &live, seq);
+
+        ix.refresh(s.conn()).unwrap();
+        assert_eq!(ix.len(), 2, "the archive survives the first live write");
+        assert_eq!(
+            ix.search(&old.vector, 1, &Candidates::everything())[0].segment_id,
+            ids[0]
+        );
+    }
+
+    #[test]
+    fn a_live_vector_does_not_skip_an_external_update_between_refreshes() {
+        let (s, ids) = seeded();
+        put_vector(s.conn(), ids[0], &Embedding::new("m@1", vec![1.0, 0.0]), 1).unwrap();
+        let mut ix = VectorIndex::empty("m@1", 2);
+        ix.refresh(s.conn()).unwrap();
+
+        // A backfill updates an existing vector, then live capture writes its
+        // next vector before the daemon searches or reports index statistics.
+        put_vector(s.conn(), ids[0], &Embedding::new("m@1", vec![0.0, 1.0]), 2).unwrap();
+        let live = Embedding::new("m@1", vec![1.0, 0.0]);
+        let seq = put_vector(s.conn(), ids[1], &live, 3).unwrap();
+        ix.note(ids[1], &live, seq);
+        ix.refresh(s.conn()).unwrap();
+
+        let hits = ix.search(&[0.0, 1.0], 1, &Candidates::everything());
+        assert_eq!(hits[0].segment_id, ids[0]);
+        assert!((hits[0].score - 1.0).abs() < 1e-6);
     }
 
     #[test]
