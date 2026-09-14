@@ -1,4 +1,3 @@
-import { mountVoice } from './voice.js';
 import { mountPerformance } from './performance.js';
 import { h } from '../lib/dom.js';
 import { mount as mountMemory } from './memory.js';
@@ -36,21 +35,21 @@ export function mount(root, ctx, arg = {}) {
       h('dl', { class: 'settings-shortcuts' },
         h('dt', {}, h('kbd', { text: 'Ctrl / ⌘ + K' })), h('dd', { text: 'Quick switch to a view or search' }),
         h('dt', {}, h('kbd', { text: 'Ctrl / ⌘ + F' })), h('dd', { text: 'Open Search from any view' }),
-        h('dt', {}, h('kbd', { text: 'Ctrl / Alt + 1–6' })), h('dd', { text: 'Switch between the six main views' }),
+        h('dt', {}, h('kbd', { text: 'Ctrl / Alt + 1–7' })), h('dd', { text: 'Switch between the seven main views' }),
         h('dt', {}, h('kbd', { text: 'Arrow keys' })), h('dd', { text: 'Move between Settings categories or Memory tabs' }),
         h('dt', {}, h('kbd', { text: 'Esc' })), h('dd', { text: 'Close a dialog or cancel an inline edit' }))),
   );
   const performance = mountPerformance();
-  const voice = mountVoice();
+  const voicePanel = h('section', { class:'settings-panel',dataset:{settingsPanel:'voice'},hidden:true },h('h2',{text:'Lanalu'}),h('p',{class:'sub',text:'Local Voice now has its own place in the sidebar, including written messages and diagnostics.'}),h('button',{id:'settings-open-lanalu',class:'btn primary',text:'Open Lanalu',onclick:()=>ctx.go('lanalu')}));
   const navigation = mountSections(body, {
     id: 'settings', label: 'Settings categories', initial: arg?.section ?? arg?.category ?? lastCategory,
     sections: SETTINGS_CATEGORIES.map(category => ({
       id: category.key, title: category.title, hint: category.hint,
-      panel: category.key === 'appearance' ? appearance : category.key === 'performance' ? performance.panel : category.key === 'voice' ? voice.panel : body.querySelector(`[data-settings-panel="${category.key}"]`),
+      panel: category.key === 'appearance' ? appearance : category.key === 'performance' ? performance.panel : category.key === 'voice' ? voicePanel : body.querySelector(`[data-settings-panel="${category.key}"]`),
     })),
     related: h('div', { class: 'section-related' }, h('p', { class: 'sub', text: 'Looking for recording controls?' }),
       h('button', { class: 'btn', id: 'settings-open-sources', onclick: () => ctx.go('sources') }, 'Capture, captions & backups')),
-    onSelect(key) { voice.setActive(key === 'voice'); performance.setActive(key === 'performance'); lastCategory = key; body.dataset.settingsCategory = key; },
+    onSelect(key) { performance.setActive(key === 'performance'); lastCategory = key; body.dataset.settingsCategory = key; },
   });
-  return { ...controller, selectCategory: navigation.select, destroy() { voice.destroy(); performance.destroy(); controller.destroy?.(); } };
+  return { ...controller, selectCategory: navigation.select, destroy() { performance.destroy(); controller.destroy?.(); } };
 }

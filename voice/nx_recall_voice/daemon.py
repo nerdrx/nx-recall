@@ -11,6 +11,7 @@ import time
 import tomllib
 
 from .audio import Audio, Devices, command
+from .control import Control
 from .local import run_local
 from .routing import Router
 
@@ -43,7 +44,7 @@ def load_config(path):
     config.setdefault("wake_words", ["lanalu", "lana lu", "lana lou", "chatgpt", "chat gpt"])
     config.setdefault("vesktop_profile", "~/.config/vesktop")
     config.setdefault("llama_binary", "~/.local/share/nx-recall/models/llama-voice/llama-server")
-    config.setdefault("llm_model", "~/.local/share/nx-recall/models/qwen2.5-3b-instruct-q4_k_m.gguf")
+    config.setdefault("llm_model", "~/.local/share/nx-recall/models/qwen3.5-4b-q4_k_m.gguf")
     config.setdefault("instructions", "You are Lanalu, a warm, concise local voice assistant in NX Recall.")
     if config["mode"] not in ("wakeword", "always") or config["audio_mode"] not in ("local", "vesktop"):
         raise ValueError("Invalid voice or audio mode")
@@ -72,8 +73,8 @@ class LocalDevices:
         pass
 
 
-async def run(config):
-    status = Status()
+async def run(config, status=None, text_queue=None):
+    status = status or Status()
     parent = os.getppid()
     attempt = 0
     while os.getppid() == parent:
@@ -100,15 +101,12 @@ async def run(config):
                 if task is not None and task.done():
                     await task
                     raise RuntimeError('Voice worker stopped')
-                if not ready and task:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-                    task = None
-                    await audio.close()
-                    status('waiting_for_vesktop_streams', connected=False)
-                if ready and not task:
+                if not task:
+                    # Private buses stay available without a call, so typed turns can run.
                     await audio.start()
-                    task = asyncio.create_task(run_local(config, audio, status))
+                    task = asyncio.create_task(run_local(config, audio, status, text_queue))
+                if status.data.get('audio_ready') != bool(ready):
+                    status('audio_ready' if ready else 'waiting_for_vesktop_streams', audio_ready=bool(ready))
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             raise
@@ -119,20 +117,27 @@ async def run(config):
             if task:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-            try:
-                if audio:
-                    await audio.close()
-            finally:
+            # One broken cleanup must not skip restoring the remaining owned resources
+            # or escape the reconnect loop. Preserve the last failure for diagnostics.
+            for component, cleanup in [('audio', audio.close if audio else None),
+                                       ('routing', router.restore if router else None),
+                                       ('devices', devices.close)]:
+                if cleanup is None:
+                    continue
                 try:
-                    if router:
-                        await router.restore()
-                finally:
-                    await devices.close()
+                    await cleanup()
+                except Exception as exc:
+                    status('cleanup_failed', connected=False, cleanup_component=component,
+                           cleanup_error=type(exc).__name__)
         await asyncio.sleep(min(30, 2 ** min(attempt, 5)))
 
 
 async def serve(config):
-    task = asyncio.create_task(run(config))
+    status = Status()
+    queue = asyncio.Queue(maxsize=1)
+    control = Control(runtime() / 'control.sock', queue, status)
+    await control.start()
+    task = asyncio.create_task(run(config, status, queue))
     for signum in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(signum, task.cancel)
     try:
@@ -140,7 +145,8 @@ async def serve(config):
     except asyncio.CancelledError:
         pass
     finally:
-        Status()('stopped', connected=False)
+        await control.close()
+        status('stopped', connected=False)
 
 
 def main():

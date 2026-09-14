@@ -569,7 +569,7 @@ pub struct GraphConfig {
     ///
     /// **Off, and off is the default.** GRAPH.md: "Off by default. Its switch
     /// sits next to the mic's, with equally plain copy." Turning it on costs a
-    /// 1.9 GB model on disk and `llm_threads` pinned cores at nice 19 — and
+    /// 2.74 GB model on disk and `llm_threads` pinned cores at nice 19 — and
     /// once it is on it runs, including while a game is being captured (0.7.2,
     /// see `crate::enrich`). Never in the capture path.
     pub enabled: bool,
@@ -586,7 +586,7 @@ pub struct GraphConfig {
     /// is not gaming at all.
     pub gpu_layers: i32,
     /// Ceiling on one model call, in seconds, after which the child is killed.
-    /// Generous next to a 3.3 s median because a cold page-in of 1.9 GB is not
+    /// Allows cold model page-in and background CPU contention, but is not
     /// a hang — but finite, because a wedged child holding its cores is.
     pub llm_timeout_s: u64,
     /// Conversations per enrichment batch. The worker stops between batches to
@@ -628,7 +628,7 @@ impl Default for GraphConfig {
             min_thread_segments: 3,
             llm_window_turns: 12,
             max_queue_seconds: 5,
-            llm_model: "qwen2.5-3b-instruct-q4_k_m.gguf".into(),
+            llm_model: crate::models::GRAPH_MODEL_FILE.into(),
             llama_dir: "llama".into(),
         }
     }
@@ -2277,10 +2277,26 @@ mod tests {
         assert_eq!(cfg.graph.llm_threads, 4);
         // The GPU belongs to whatever is drawing frames.
         assert_eq!(cfg.graph.gpu_layers, 0);
-        assert_eq!(cfg.graph.llm_model, "qwen2.5-3b-instruct-q4_k_m.gguf");
+        assert_eq!(cfg.graph.llm_model, crate::models::GRAPH_MODEL_FILE);
         assert_eq!(cfg.graph.llama_dir, "llama");
         assert_eq!(cfg.graph.min_thread_segments, 3);
         assert_eq!(cfg.graph.max_queue_seconds, 5);
+    }
+
+    #[test]
+    fn explicit_legacy_or_custom_graph_paths_are_not_migrated() {
+        for model in [
+            "qwen2.5-3b-instruct-q4_k_m.gguf",
+            "custom/private-model.gguf",
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "[graph]\nllm_model = {model:?}\nllama_dir = \"custom-runtime\"\nllm_threads = 17\n"
+            ))
+            .unwrap();
+            assert_eq!(config.graph.llm_model, model);
+            assert_eq!(config.graph.llama_dir, "custom-runtime");
+            assert_eq!(config.graph.llm_threads, 17);
+        }
     }
 
     /// The night shift's defaults carry two separate facts, and both are

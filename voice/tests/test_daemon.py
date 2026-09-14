@@ -1,9 +1,11 @@
 import tempfile
+import asyncio
 from pathlib import Path
 import unittest
 from unittest.mock import patch
 
 from nx_recall_voice.daemon import LocalDevices, load_config
+from nx_recall_voice import daemon
 
 
 class DaemonTests(unittest.IsolatedAsyncioTestCase):
@@ -16,6 +18,81 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                     load_config(path)
             path.write_text('mode="always"')
             self.assertEqual(load_config(path)["mode"], "always")
+            self.assertTrue(load_config(path)["llm_model"].endswith("qwen3.5-4b-q4_k_m.gguf"))
+
+    async def test_transient_start_and_cleanup_errors_still_retry(self):
+        started_again = asyncio.Event()
+        attempts = []
+        closes = []
+        class Devices:
+            def __init__(self, config):
+                self.number = len(attempts)
+                attempts.append(self.number)
+            async def start(self):
+                if self.number == 0:
+                    raise OSError("synthetic PipeWire disconnect")
+                started_again.set()
+                await asyncio.Future()
+            async def close(self):
+                closes.append(self.number)
+                if self.number == 0:
+                    raise OSError("synthetic unavailable PipeWire cleanup")
+        with patch.object(daemon, "LocalDevices", Devices), \
+                patch.object(daemon, "Status", lambda: lambda *args, **kwargs: None):
+            task = asyncio.create_task(daemon.run({"audio_mode": "local"}))
+            try:
+                await asyncio.wait_for(started_again.wait(), 3)
+            finally:
+                task.cancel()
+                result = await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(attempts, [0, 1])
+        self.assertEqual(closes, [0, 1])
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+
+    async def test_cancel_attempts_every_cleanup_and_keeps_cancellation(self):
+        waiting = asyncio.Event()
+        cleaned = []
+        class Devices:
+            incoming = "synthetic_incoming"
+            microphone = "synthetic_mic"
+            def __init__(self, **kwargs):
+                pass
+            async def start(self):
+                pass
+            async def close(self):
+                cleaned.append("devices")
+        class Router:
+            def __init__(self, *args, **kwargs):
+                self.restores = 0
+            async def restore(self):
+                self.restores += 1
+                if self.restores > 1:
+                    cleaned.append("router")
+                    raise OSError("synthetic graph gone")
+            async def reconcile(self):
+                waiting.set()
+                return {"ready": False}
+        class Audio:
+            def __init__(self, devices):
+                pass
+            async def start(self):
+                await asyncio.Future()
+            async def close(self):
+                cleaned.append("audio")
+                raise OSError("synthetic playback gone")
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(daemon, "runtime", lambda: Path(directory)), \
+                patch.object(daemon, "Devices", Devices), patch.object(daemon, "Router", Router), \
+                patch.object(daemon, "Audio", Audio), \
+                patch.object(daemon, "Status", lambda: lambda *args, **kwargs: None):
+            task = asyncio.create_task(daemon.run({"audio_mode": "vesktop", "vesktop_profile": "/synthetic"}))
+            try:
+                await asyncio.wait_for(waiting.wait(), 1)
+            finally:
+                task.cancel()
+                result = await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(cleaned, ["audio", "router", "devices"])
+        self.assertIsInstance(result[0], asyncio.CancelledError)
 
     async def test_local_devices_only_read_defaults_and_reject_monitor_mic(self):
         calls = []

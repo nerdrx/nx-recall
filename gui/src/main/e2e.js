@@ -110,7 +110,7 @@ export function runE2E(deps) {
     await sleep(1200); // first paint + boot() queries
 
     await step('018-local-voice-settings-stay-local-and-save', async () => {
-      await js(`window.__recallDebug.go('settings', {section:'voice'})`);
+      await js(`window.__recallDebug.go('lanalu')`);
       await waitFor('voice config loaded', () => js(`document.getElementById('voice-wake-words')?.value.includes('lanalu')`));
       assert(await js(`document.getElementById('settings-voice').textContent.includes('do not identify who is speaking')`), 'wake-name scope missing');
       await js(`(() => { const el=document.getElementById('voice-audio-mode'); el.value='local'; el.dispatchEvent(new Event('change')); })()`);
@@ -134,9 +134,9 @@ export function runE2E(deps) {
     await step('018-local-voice-setup-onboarding', async () => {
       const original = await js(`window.recall.voice.state()`);
       await js(`window.recall.voice.save({tts_model_path:'/nonexistent/nx-recall-e2e-voice.onnx'})`);
-      await js(`window.__recallDebug.go('settings', {section:'voice'})`);
+      await js(`window.__recallDebug.go('lanalu')`);
       await waitFor('voice setup visible',()=>js(`document.getElementById('voice-setup')?.checkVisibility()`));
-      assert(await js(`document.getElementById('settings-voice').textContent.includes('about 2 GB')`),'download size missing');
+      assert(await js(`document.getElementById('settings-voice').textContent.includes('about 3 GB')`),'download size missing');
       await waitFor('missing voice component',()=>js(`document.getElementById('voice-missing').textContent.includes('Amy voice')`));
       const state=await js(`window.recall.voice.state()`);
       if(state.setupAvailable) {
@@ -150,6 +150,32 @@ export function runE2E(deps) {
       await js(`window.recall.voice.save({tts_model_path:${JSON.stringify(original.config.tts_model_path)}})`);
       assert(!(await js(`window.recall.voice.state()`)).running,'setup started voice');
       return {file,fakeSetupCancel:state.setupAvailable};
+    });
+
+    await step('018-lanalu-primary-text-and-debug', async () => {
+      await js(`document.querySelector('.rail-item[data-view="lanalu"]').click()`);
+      await waitFor('Lanalu tab',()=>js(`document.body.dataset.view==='lanalu' && document.getElementById('voice-wake-words')?.value`));
+      assert(await js(`document.querySelector('#main h1').textContent==='Lanalu'`),'primary heading missing');
+      const state=await js(`window.recall.voice.state()`);
+      await waitFor('configured models',()=>js(`document.getElementById('lanalu-models')?.textContent.includes('Qwen3.5 4B')`));
+      assert(await js(`document.getElementById('lanalu-models').textContent.includes('Parakeet 110M')`),'recognition model missing');
+      if(state.available){
+        await waitFor('start voice enabled',()=>js(`![...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Start Local Voice').disabled`));
+        await js(`[...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Start Local Voice').click()`);
+        await waitFor('fake voice running',()=>js(`window.recall.voice.state().then(s=>s.running)`));
+        await js(`document.getElementById('lanalu-message').value='Synthetic hello';document.getElementById('lanalu-send').click()`);
+        await waitFor('typed reply visible',()=>js(`document.getElementById('lanalu-reply').textContent.includes('Synthetic local reply')`));
+        const debug=await js(`window.recall.voice.debug()`);
+        assert(!JSON.stringify(debug).includes('Synthetic hello'),'message leaked into debug');
+        await js(`[...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Stop Local Voice').click()`);
+        await waitFor('fake voice stopped',()=>js(`window.recall.voice.state().then(s=>!s.running)`));
+      }
+      await js(`document.getElementById('lanalu-debug').click()`);
+      await waitFor('debug window',()=>deps.voiceDebug()?.webContents && !deps.voiceDebug().webContents.isLoading());
+      await waitFor('debug data',()=>deps.voiceDebug().webContents.executeJavaScript(`document.getElementById('debug-data').textContent.includes('components')`));
+      assert(await deps.voiceDebug().webContents.executeJavaScript(`document.getElementById('debug-summary').textContent.includes('Qwen3.5 4B')`),'debug model missing');
+      const debugFile=await shotOf(deps.voiceDebug(),'018-lanalu-debug');deps.voiceDebug().close();
+      return {file:await shot('018-lanalu-primary'),debugFile,typed:state.available};
     });
 
     // 1 — the socket handshake actually completed

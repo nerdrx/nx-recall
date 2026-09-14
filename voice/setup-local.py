@@ -18,10 +18,10 @@ MODELS = Path.home() / '.local/share/nx-recall/models'
 STT = 'sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8'
 STT_FILES = {'encoder.int8.onnx': 131113202, 'decoder.int8.onnx': 3955863,
              'joiner.int8.onnx': 1411403, 'tokens.txt': 9953}
-# Match Recall's shared model catalogue rather than replacing its quantization.
-QWEN = ('https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/'
-        'f302c64a2269a69fb27b2f9473b362f5bb8e78d8/Qwen2.5-3B-Instruct-Q4_K_M.gguf',
-        1929903264, '9c9f56a391a3abbd5b89d0245bf6106081bcc3173119d4229235dd9d23253f94')
+# Pinned publisher quantization shared with Recall's local model catalogue.
+QWEN = ('https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/'
+        'e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf',
+        2740937888, '00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4')
 LLAMA = ('https://github.com/ggml-org/llama.cpp/releases/download/b10950/'
          'llama-b10950-bin-ubuntu-vulkan-x64.tar.gz', 30162811,
          '08f03f2b6b0cabac54017fa837c94d2def77de59b69a2de3ad392e79192703ba')
@@ -165,7 +165,7 @@ def install_models(models=MODELS):
     install_archive(LLAMA, models / 'llama-voice', 'llama', llama_complete, 'llama-server')
     progress('llama', 100)
     progress('language_model', 0)
-    target = models / 'qwen2.5-3b-instruct-q4_k_m.gguf'
+    target = models / 'qwen3.5-4b-q4_k_m.gguf'
     download(QWEN[0], target, *QWEN[1:], 'language_model')
     progress('language_model', 100)
     progress('speech_model', 0)
@@ -186,7 +186,7 @@ def check_ready(models=MODELS, runtime=None):
     """Read-only install validation; no imports that load models or audio devices."""
     runtime = runtime or Path.home() / '.local/share/nx-recall/voice'
     python = runtime / 'venv/bin/python'
-    target = models / 'qwen2.5-3b-instruct-q4_k_m.gguf'
+    target = models / 'qwen3.5-4b-q4_k_m.gguf'
     checks = {
         'runtime': python.is_file(),
         'llama': llama_complete(models / 'llama-voice'),

@@ -125,10 +125,15 @@ has to have run before a client can read the annotations.
 
 ### Tier 3 — understood, tiny local LLM, opt-in and jailed — **shipped in 0.7.0**
 
+**Current default (0.18.1): Qwen3.5 4B Q4_K_M**, about 2.74 GB, with
+thinking disabled for bounded structured output. Explicit older or custom
+model settings remain supported. The original benchmark below records the
+0.7.0 selection; it is not a benchmark of the current default.
+
 Commitment extraction done properly, topic naming that reads like a human wrote
 it, and pre-conversation briefs ("last time: you owed her the shader link").
 
-- **Tiny by requirement, not by concession** (user constraint: ~4 CPU cores,
+- **Original 0.7.0 selection:** (then-target: ~4 CPU cores,
   GPU only if it must). Budget: ≤ 3B parameters, Q4 GGUF, ≤ ~2 GB on disk.
   **Bake-off done (spike/graph_bench, 20 gold cases incl. 9 traps, de/en/mixed,
   4 pinned cores at nice 19): Qwen2.5-3B-Instruct Q4 wins** — 9/9 trap
@@ -152,7 +157,7 @@ it, and pre-conversation briefs ("last time: you owed her the shader link").
   `[graph] gpu_layers` for ROCm offload exists but the default is 0.
 - No network, no torch; the model is fetched once by `models fetch` like
   everything else, byte-verified. **It is an optional asset group** —
-  `models fetch --graph`, ~1.95 GB, and `models status` lists it under its own
+  `models fetch --graph`, ~2.76 GB, and `models status` lists it under its own
   "OPTIONAL" heading so a machine that never asked for it is not reported as
   incomplete.
 - **A child process, not a linked library.** `crate::llm` shells out to

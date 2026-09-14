@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createServer } from 'node:net';
 import { EventEmitter } from 'node:events';
-import { normalizeVoiceConfig, voiceDefaults, voiceToml, createVoiceController } from '../src/main/voice.js';
+import { normalizeVoiceConfig, voiceDefaults, voiceToml, createVoiceController, sendVoiceText, voiceModelLabels } from '../src/main/voice.js';
 import { voiceStateLabel } from '../src/renderer/views/voice.js';
 
 test('voice accepts only fixed local settings and encodes TOML safely', () => {
@@ -55,7 +56,7 @@ test('voice status does not claim listening before worker readiness', () => {
 function touch(path) { mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, 'fixture'); }
 function installFixture(home) {
   const base = voiceDefaults(home), models = join(home, '.local/share/nx-recall/models');
-  for (const path of [join(home, '.local/share/nx-recall/voice/venv/bin/python'), join(models, 'llama-voice/llama-server'), join(models, 'qwen2.5-3b-instruct-q4_k_m.gguf'), base.tts_model_path, base.tts_model_path + '.json', ...['encoder.int8.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'tokens.txt'].map(name=>join(base.stt_model_dir,name))]) touch(path);
+  for (const path of [join(home, '.local/share/nx-recall/voice/venv/bin/python'), join(models, 'llama-voice/llama-server'), join(models, 'qwen3.5-4b-q4_k_m.gguf'), base.tts_model_path, base.tts_model_path + '.json', ...['encoder.int8.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'tokens.txt'].map(name=>join(base.stt_model_dir,name))]) touch(path);
 }
 
 test('setup requires packaged script, reports all missing components, and rejects voice start', t => {
@@ -88,4 +89,32 @@ test('setup has one owned process, bounded sanitized progress, and never starts 
   installFixture(dir); worker.emit('exit',0);
   assert.equal(voice.state().available,true); assert.equal(voice.state().running,false); assert.equal(voice.state().preparing,false);
   voice.setup(); await voice.stop(); assert.equal(voice.state().preparing,false);
+});
+
+
+test('typed requests use bounded local socket protocol and return a visible reply', async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'nx-voice-text-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  const socketPath=join(dir,'control.sock');
+  const server=createServer(socket=>{let input='';socket.on('data',chunk=>{input+=chunk;if(input.includes('\n')){assert.deepEqual(JSON.parse(input),{type:'text',text:'Hello Lanalu'});socket.end(JSON.stringify({ok:true})+'\n'+JSON.stringify({type:'reply',text:'Hello, locally.'})+'\n');}});});
+  await new Promise(resolve=>server.listen(socketPath,resolve));t.after(()=>server.close());
+  assert.deepEqual(await sendVoiceText(socketPath,'Hello Lanalu'),{ok:true,text:'Hello, locally.'});
+  await assert.rejects(sendVoiceText(socketPath,''),/1–2000/);
+  await assert.rejects(sendVoiceText(socketPath,'x'.repeat(2001)),/1–2000/);
+});
+
+
+test('debug retains stopped worker state, routes and error without transcript fields',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'nx-voice-debug-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));installFixture(dir);
+  const worker=new EventEmitter();worker.pid=2147483647;worker.stderr=new EventEmitter();worker.kill=()=>{setImmediate(()=>worker.emit('exit',0));return true;};
+  const voice=createVoiceController({userData:join(dir,'data'),home:dir,runtime:dir,spawnWorker:()=>worker});voice.start();
+  const statusFile=join(dir,'nx-recall-voice/status.json');mkdirSync(join(statusFile,'..'),{recursive:true});
+  writeFileSync(statusFile,JSON.stringify({pid:worker.pid,event:'retrying',error:'BrokenPipeError',retry_seconds:2,routes:{ready:false,playback:1,capture:0},transcript:'PRIVATE SENTENCE',input_kind:'text',error_stage:'playback',updated_at:1}));
+  await voice.stop();const debug=voice.debug();
+  assert.equal(debug.state,'retrying');assert.equal(debug.running,false);assert.equal(debug.routes.playback,1);assert.equal(debug.retry_seconds,2);assert.match(debug.lastError,/BrokenPipeError/);assert.ok(!JSON.stringify(debug).includes('PRIVATE SENTENCE'));
+});
+
+ test('model labels describe configured models without exposing custom paths', () => {
+  const base=voiceDefaults('/example');
+  assert.deepEqual(voiceModelLabels(base), {llm:'Qwen3.5 4B · Q4_K_M',stt:'Parakeet 110M · English',tts:'Piper Amy · English'});
+  assert.deepEqual(voiceModelLabels({...base,stt_model_dir:'/private/model',tts_model_path:'/private/voice.onnx'}), {llm:'Qwen3.5 4B · Q4_K_M',stt:'Custom recognition model',tts:'Custom Piper voice'});
 });

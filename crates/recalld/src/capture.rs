@@ -2450,8 +2450,10 @@ pub fn run(
         .add_listener_local()
         .error(move |id, _seq, res, message| {
             error!("PipeWire error on object {id}: {message} ({res})");
-            if id == pw::core::PW_ID_CORE {
-                // The daemon went away. Stop cleanly instead of spinning.
+            if capture_connection_lost(id, res) {
+                // ENOENT/ESTALE can arrive on the core when a stream vanishes
+                // between registry discovery and binding. Only a broken
+                // connection means PipeWire went away; node churn is normal.
                 if let Some(l) = core_weak.upgrade() {
                     l.quit();
                 }
@@ -2524,9 +2526,23 @@ pub fn run(
     Ok(())
 }
 
+fn capture_connection_lost(id: u32, res: i32) -> bool {
+    id == pw::core::PW_ID_CORE && res == -libc::EPIPE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disappearing_streams_do_not_stop_capture() {
+        for code in [libc::ENOENT, libc::ESTALE] {
+            assert!(!capture_connection_lost(pw::core::PW_ID_CORE, -code));
+            assert!(!capture_connection_lost(22, -code));
+        }
+        assert!(capture_connection_lost(pw::core::PW_ID_CORE, -libc::EPIPE));
+        assert!(!capture_connection_lost(22, -libc::EPIPE));
+    }
 
     fn situation<'a>(
         enabled: bool,

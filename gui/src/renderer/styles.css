@@ -2099,3 +2099,14 @@ input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), select, te
 .voice-field { display: grid; gap: 8px; margin-block: 16px; max-width: 620px; }
 .voice-field select, .voice-field input { width: 100%; min-width: 0; }
 .voice-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-block: 14px; }
+
+.lanalu-body > .settings-panel { width: 100%; max-width: 1000px; margin-inline: auto; }
+.lanalu-message-card textarea { margin-top: 10px; }
+.voice-debug-body { margin: 0; padding: 24px; overflow: auto; }
+.voice-debug-body pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.7; }
+
+.lanalu-reply { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; }
+
+.lanalu-header-art { width: 280px; height: 140px; object-fit: contain; margin-left: auto; border-radius: 8px; }
+@media(max-width:800px) { .lanalu-header-art { width: 180px; height: 90px; } }
+@media(max-width:600px) { .lanalu-header-art { display:none; } }

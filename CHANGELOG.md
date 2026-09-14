@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.18.1 — A home for Lanalu
+
+- Upgrade Lanalu and the optional Recall memory model to Qwen3.5 4B, with thinking disabled for direct, bounded replies.
+
+- Lanalu has a dedicated navigation tab, typed input and a separate diagnostic window.
+- Clock the private virtual audio devices even when no physical output drives their graph, fixing silent or stalled voice playback.
+- Keep capture running when PipeWire reports a vanished stream during audio routing; only a broken core connection ends capture.
+- Retry voice routing failures even when cleanup also encounters unavailable audio devices, and preserve failure details after stopping.
+- Introduce Lanalu with newly generated cinematic README artwork and keep the full technical reference in the documentation.
+
 ## 0.18.0 — Local voice, shared memory
 
 - **Local Voice in Recall.** Start and stop Lanalu from Settings, with optional

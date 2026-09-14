@@ -64,7 +64,7 @@ pub enum Group {
     Speech,
     /// The English-only ASR export that was the default up to 0.5.5.
     FallbackAsr,
-    /// The memory graph's Tier 3 (GRAPH.md): a ≤3B Q4 GGUF and the llama.cpp
+    /// The memory graph's Tier 3 (GRAPH.md): a compact Q4 GGUF and the llama.cpp
     /// binaries to run it. **Optional and off by default** — `[graph].enabled`
     /// ships false, and a machine that never turns it on never needs these.
     Graph,
@@ -224,6 +224,24 @@ pub const NIGHT_VULKAN_HEADERS_TAG: &str = "v1.4.313";
 pub const NIGHT_SPIRV_HEADERS_TAG: &str = "vulkan-sdk-1.4.313.0";
 /// Where the built runtime goes, under the models root.
 pub const NIGHT_DIR: &str = "whisper";
+
+/// Default local memory model, shared with NX Recall Voice.
+pub const GRAPH_MODEL_FILE: &str = "qwen3.5-4b-q4_k_m.gguf";
+pub const GRAPH_MODEL_BYTES: u64 = 2_740_937_888;
+/// Verified upstream LFS SHA-256; fetch also pins its immutable repository revision.
+pub const GRAPH_MODEL_SHA256: &str =
+    "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4";
+
+/// Keep existing explicit legacy configurations visible to size/status checks.
+/// These are not part of a new `--graph` download.
+pub const LEGACY_GRAPH_ASSETS: &[RemoteAsset] = &[RemoteAsset {
+    role: "graph.llm.legacy",
+    url: "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+    download_bytes: 1_929_903_264,
+    install: Install::File("qwen2.5-3b-instruct-q4_k_m.gguf"),
+    group: Group::Graph,
+    files: &[("qwen2.5-3b-instruct-q4_k_m.gguf", 1_929_903_264)],
+}];
 
 // ---- the dedicated translator (0.11.0) ------------------------------------
 
@@ -676,27 +694,15 @@ pub const REMOTE_ASSETS: &[RemoteAsset] = &[
         group: Group::Translator,
         files: &[("nllb-200-distilled-600m-int8/tokenizer.json", 17_331_224)],
     },
-    // ---- the memory graph's Tier 3 (GRAPH.md) -----------------------------
-    //
-    // Optional, and the flag is `models fetch --graph`. Two assets, ~1.95 GB
-    // together, for a feature that ships switched off — so a fresh install
-    // never pays for them and `models status` lists them as not required.
-    //
-    // The model is the bake-off's winner (spike/graph_bench, 20 gold cases
-    // including 9 traps, four pinned cores at nice 19): Qwen2.5-3B-Instruct Q4
-    // took 9/9 trap rejections and 9/9 on who-and-what, at 3.3 s/case. The 1.5B
-    // was faster and gullible (5/9 traps); a missed promise costs a shrug and
-    // an invented one poisons the feature.
+    // Optional local memory model. Explicit legacy/custom model paths remain
+    // unchanged; the previous model stays in LEGACY_GRAPH_ASSETS for status.
     RemoteAsset {
         role: "graph.llm",
-        url: "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf",
-        download_bytes: 1_929_903_264,
-        // Renamed on install for the same reason the embedding is: the config
-        // default names this file, and that name must not drift with whatever
-        // the upstream repository calls it this year.
-        install: Install::File("qwen2.5-3b-instruct-q4_k_m.gguf"),
+        url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
+        download_bytes: GRAPH_MODEL_BYTES,
+        install: Install::File(GRAPH_MODEL_FILE),
         group: Group::Graph,
-        files: &[("qwen2.5-3b-instruct-q4_k_m.gguf", 1_929_903_264)],
+        files: &[(GRAPH_MODEL_FILE, GRAPH_MODEL_BYTES)],
     },
     // The runtime, as an upstream release binary. Deliberately not a build
     // dependency: `crate::llm` shells out to `llama-cli` exactly as the bake-off
@@ -1398,6 +1404,7 @@ pub fn total_download_bytes(extra: &[Group]) -> u64 {
 pub fn expected_bytes(relative: &str) -> Option<u64> {
     REMOTE_ASSETS
         .iter()
+        .chain(LEGACY_GRAPH_ASSETS)
         .flat_map(|a| a.files)
         .find(|(p, _)| *p == relative)
         .map(|(_, n)| *n)

@@ -11,6 +11,7 @@ import re
 import time
 
 from .audio import Audio
+from .control import TextTurn
 def contains_wake_word(text, words):
     normalized = ' '.join(re.findall(r'\w+', text.casefold()))
     phrases = (' '.join(re.findall(r'\w+', word.casefold())) for word in words)
@@ -98,7 +99,8 @@ class LocalModel:
 
     async def answer(self, messages):
         result = await self.request("POST", "/v1/chat/completions", {
-            "messages": messages, "max_tokens": 160, "temperature": .6, "stream": False})
+            "messages": messages, "max_tokens": 160, "temperature": .6, "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False}, "reasoning_effort": "none"})
         text = result["choices"][0]["message"]["content"]
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
         return text[:1200]
@@ -148,7 +150,7 @@ class VoiceActivity:
         return onset, None
 
 
-async def run_local(config, audio, status):
+async def run_local(config, audio, status, text_queue=None):
     from .speech import Speech
     from .recall import RecallClient
     speech = Speech(config)
@@ -156,6 +158,8 @@ async def run_local(config, audio, status):
     recall = RecallClient(config.get("recall_socket"))
     history = []
     turn = None
+    text_queue = text_queue or asyncio.Queue(maxsize=1)
+    reading = typed = None
     def new_vad():
         return VoiceActivity(config.get("local_vad_threshold", .012),
                              config.get("silence_duration_ms", 650),
@@ -165,25 +169,32 @@ async def run_local(config, audio, status):
     speaking = False
     echo_until = 0.0
 
-    async def respond(pcm, end_ns):
+    def remember(text, reply):
+        history.extend([{"role": "user", "content": text[:1600]}, {"role": "assistant", "content": reply}])
+        del history[:-8]
+
+    async def respond(pcm=None, end_ns=None, typed_text=None, response=None):
         nonlocal speaking, echo_until
         started = time.monotonic()
+        stage = "recognition"
+        result_error = "turn_failed"
         try:
-            text = (await speech.transcribe(pcm)).strip()
+            text = typed_text if typed_text is not None else (await speech.transcribe(pcm)).strip()
             if not text:
                 return
-            if config.get("mode", "wakeword") == "wakeword" and not contains_wake_word(text, config["wake_words"]):
+            if typed_text is None and config.get("mode", "wakeword") == "wakeword" and not contains_wake_word(text, config["wake_words"]):
                 status("wake_word_not_detected")
                 return
-            status("local_thinking", recognized_characters=len(text))
+            status("local_thinking", recognized_characters=len(text), input_kind="text" if typed_text is not None else "voice")
             speaker = None
-            if config.get('audio_mode') == 'vesktop':
+            if typed_text is None and config.get('audio_mode') == 'vesktop':
                 try:
                     span = voiced_time_span(pcm, end_ns, config.get('local_vad_threshold', .012))
                     if span is not None:
                         speaker = await recall.identify(*span, source='vesktop')
                 except Exception as exc:
                     status('recall_identity_unavailable', error=type(exc).__name__)
+            stage = "memory"
             hits = []
             try:
                 hits = await recall.retrieve(text, limit=4)
@@ -200,25 +211,34 @@ async def run_local(config, audio, status):
                 system += '\nRecall confidently matched this voice to the assigned name: ' + json.dumps(speaker['name']) + '. Use the name naturally, not in every reply.'
             else:
                 system += '\nThe current speaker is unknown. Do not infer or guess their name from memory excerpts.'
+            stage = "generation"
             reply = await model.answer([{"role": "system", "content": system}, *history,
                                         {"role": "user", "content": text}])
             if not reply:
                 return
+            if response is not None and not response.done():
+                remember(text, reply)
+                response.set_result({'type': 'reply', 'text': reply})
+            stage = "synthesis"
             pcm_out = await speech.synthesize(reply)
             audio.begin_item("local-turn")
             status("local_speaking", recall_hits=len(hits), latency_ms=int((time.monotonic()-started)*1000))
             speaking = True
+            stage = "playback"
             await audio.write(pcm_out)
             speaking = False
             echo_until = time.monotonic() + .4
-            history.extend([{"role": "user", "content": text[:1600]}, {"role": "assistant", "content": reply}])
-            del history[:-8]
+            if response is None:
+                remember(text, reply)
             status("local_listening")
         except asyncio.CancelledError:
+            result_error = "interrupted"
             raise
         except Exception as exc:
-            status("local_turn_failed", error=type(exc).__name__)
+            status("local_turn_failed", error=type(exc).__name__, error_stage=stage)
         finally:
+            if response is not None and not response.done():
+                response.set_result({'type': 'result', 'error': result_error})
             speaking = False
 
     try:
@@ -228,10 +248,29 @@ async def run_local(config, audio, status):
         await Audio.stop_process(audio.capture)
         await audio.start()
         status("local_listening", backend="local", connected=True, mode=config.get("mode"))
+        reading = asyncio.create_task(audio.read())
+        typed = asyncio.create_task(text_queue.get())
         while True:
             if model.process.returncode is not None:
                 raise RuntimeError("Local model stopped")
-            pcm = await audio.read()
+            done, _ = await asyncio.wait([reading, typed], return_when=asyncio.FIRST_COMPLETED)
+            if typed in done:
+                request = typed.result()
+                text = request.text if isinstance(request, TextTurn) else request
+                response = request.response if isinstance(request, TextTurn) else None
+                typed = asyncio.create_task(text_queue.get())
+                if turn and not turn.done():
+                    turn.cancel()
+                    await asyncio.gather(turn, return_exceptions=True)
+                await audio.clear()
+                if config.get('audio_mode') == 'local':
+                    echo_until = time.monotonic() + .4
+                vad = new_vad()
+                turn = asyncio.create_task(respond(typed_text=text, response=response), name="nx-recall-text-turn")
+            if reading not in done:
+                continue
+            pcm = reading.result()
+            reading = asyncio.create_task(audio.read())
             if config.get('audio_mode') == 'local' and (speaking or time.monotonic() < echo_until):
                 # Normal speakers need half-duplex echo protection. Vesktop remains full-duplex.
                 vad = new_vad()
@@ -248,6 +287,18 @@ async def run_local(config, audio, status):
                     await asyncio.gather(turn, return_exceptions=True)
                 turn = asyncio.create_task(respond(utterance, time.time_ns()), name="nx-recall-voice-turn")
     finally:
+        if typed and typed.done() and not typed.cancelled() and typed.exception() is None:
+            request = typed.result()
+            if isinstance(request, TextTurn) and not request.response.done():
+                request.response.set_result({'type': 'result', 'error': 'interrupted'})
+        for pending in (reading, typed):
+            if pending:
+                pending.cancel()
+        await asyncio.gather(*(p for p in (reading, typed) if p), return_exceptions=True)
+        while not text_queue.empty():
+            request = text_queue.get_nowait()
+            if isinstance(request, TextTurn) and not request.response.done():
+                request.response.set_result({'type': 'result', 'error': 'interrupted'})
         if turn:
             turn.cancel()
             await asyncio.gather(turn, return_exceptions=True)

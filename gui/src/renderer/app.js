@@ -35,6 +35,7 @@ import * as searchView from './views/search.js';
 import * as sourcesView from './views/sources.js';
 import * as personView from './views/person.js';
 import * as memoryView from './views/memory.js';
+import * as lanaluView from './views/voice.js';
 import * as settingsView from './views/settings.js';
 
 try {
@@ -47,6 +48,7 @@ const VIEWS = {
   search: searchView,
   memory: memoryView,
   settings: settingsView,
+  lanalu: lanaluView,
   sources: sourcesView,
   // Not in the rail: the person page is pushed state, reached from a voice and
   // left with Back. The app has five places (docs/GRAPH.md) and this is not one
@@ -55,7 +57,7 @@ const VIEWS = {
 };
 
 /** Views the rail can select. Anything else is pushed. */
-const RAIL_VIEWS = new Set(['transcript', 'speakers', 'search', 'memory', 'sources', 'settings']);
+const RAIL_VIEWS = new Set(['transcript', 'speakers', 'search', 'memory', 'sources', 'settings', 'lanalu']);
 
 const main = document.getElementById('main');
 const footer = document.getElementById('footer');
@@ -800,6 +802,7 @@ function quickSwitch() {
     { label: 'Saved moments and searches', description: 'Return to something you kept', keywords: 'bookmarks memory notes', run: () => { go('memory'); main.querySelector('[data-memory-tab="saved"]')?.click(); main.focus(); } },
     { label: 'Sources', description: 'Choose what Recall may hear', keywords: 'capture microphone apps consent', shortcut: 'Alt 5', run: navigate('sources', { section: 'capture' }) },
     { label: 'Storage and backups', description: 'Manage retained audio and exports', keywords: 'delete disk export', run: navigate('sources', { section: 'storage' }) },
+    { label: 'Lanalu', description: 'Talk or write to your local assistant', keywords: 'voice chat assistant text debug', shortcut: 'Alt 7', run: navigate('lanalu') },
     { label: 'Settings', description: 'Appearance and preferences', keywords: 'density appearance', shortcut: 'Alt 6', run: navigate('settings', { section: 'appearance' }) },
     { label: 'Performance', description: 'Measured delays, memory and recording health', keywords: 'settings speed latency queue dropped index repair', run: navigate('settings', { section: 'performance' }) },
     { label: 'Processing', description: 'Local models and resource use', keywords: 'settings models cpu recognition', run: navigate('settings', { section: 'processing' }) },
@@ -819,7 +822,7 @@ document.addEventListener('keydown', (e) => {
     return;
   }
   if (e.target.closest?.('input, textarea, select, [contenteditable="true"]')) return;
-  const map = { 1: 'transcript', 2: 'speakers', 3: 'search', 4: 'memory', 5: 'sources', 6: 'settings' };
+  const map = { 1: 'transcript', 2: 'speakers', 3: 'search', 4: 'memory', 5: 'sources', 6: 'settings', 7: 'lanalu' };
   if ((e.ctrlKey || e.altKey) && map[e.key]) {
     e.preventDefault();
     go(map[e.key]);

@@ -51,6 +51,7 @@ let client = null;
 let statusTimer = null;
 let quitting = false;
 let voice = null;
+let voiceDebugWindow = null;
 let voiceQuitPending = false;
 
 // Everything the tray renders. Kept here, not in the renderer, precisely so a
@@ -520,6 +521,16 @@ function openBackupFolder(dir) {
 
 // ---------------------------------------------------------------------------
 
+function openVoiceDebug() {
+  if(voiceDebugWindow && !voiceDebugWindow.isDestroyed()){voiceDebugWindow.show();voiceDebugWindow.focus();return true;}
+  voiceDebugWindow=new BrowserWindow({width:780,height:640,title:'Lanalu · Debug',backgroundColor:groundColor(),
+    webPreferences:{preload:join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}});
+  voiceDebugWindow.setMenu(null);
+  voiceDebugWindow.loadFile(join(__dirname,'../renderer/voice-debug.html'));
+  voiceDebugWindow.on('closed',()=>{voiceDebugWindow=null;});
+  return true;
+}
+
 async function bootstrap() {
   // Before the first window: themeSource is what makes the renderer's
   // `prefers-color-scheme` report, and the window's own backgroundColor is read
@@ -538,13 +549,17 @@ async function bootstrap() {
   });
 
   const voiceOptions = { userData: app.getPath('userData') };
-  if (process.env.NX_RECALL_E2E === '1') voiceOptions.spawnWorker = (await import('./e2e.js')).spawnVoiceTestWorker;
+  if (process.env.NX_RECALL_E2E === '1') {
+    voiceOptions.spawnWorker = (await import('./e2e.js')).spawnVoiceTestWorker;
+    voiceOptions.sendText = async () => ({ok:true,text:'Synthetic local reply. Your typed message reached Lanalu.'});
+  }
   voice = createVoiceController(voiceOptions);
   if (voice.state().config.autostart) {
     try { voice.start(); } catch (error) { console.warn('[recall] Local Voice could not start:', error.message); }
   }
   registerIpc({
     voice,
+    openVoiceDebug,
     request: (method, params) => client.request(method, params),
     setPaused,
     getState: () => ({
@@ -599,6 +614,7 @@ async function bootstrap() {
     const { runE2E } = await import('./e2e.js');
     runE2E({
       getWindow: () => win,
+      voiceDebug: () => voiceDebugWindow,
       getUi: () => ui,
       setPaused,
       buildTrayMenu,

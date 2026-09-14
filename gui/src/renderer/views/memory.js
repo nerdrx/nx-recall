@@ -1280,7 +1280,7 @@ export function mount(root, ctx, options = {}) {
           'span',
           { class: 'mic-title' },
           h('span', { class: 'name', text: 'Reading your conversations, locally' }),
-          h('span', { class: 'key', text: cfg.llm_model ?? 'qwen2.5-3b-instruct-q4_k_m.gguf' })
+          h('span', { class: 'key', text: cfg.llm_model ?? 'qwen3.5-4b-q4_k_m.gguf' })
         ),
         h('span', { class: 'spacer' }),
         h('span', { class: chip.cls, id: 'enrich-chip' }, h('span', { class: `dot${chip.live ? ' pulse' : ''}` }), chip.text),

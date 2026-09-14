@@ -1,10 +1,8 @@
 //! The tiny local model (GRAPH.md Tier 3), as a child process.
 //!
-//! > "Tiny by requirement, not by concession (user constraint: ~4 CPU cores,
-//! > GPU only if it must). Budget: ≤ 3B parameters, Q4 GGUF, ≤ ~2 GB on disk.
-//! > **Bake-off done: Qwen2.5-3B-Instruct Q4 wins** — 9/9 trap rejections
-//! > (zero invented obligations), 9/9 who and what on everything it extracted,
-//! > 3.3 s/case, 1.9 GB."
+//! Qwen3.5-4B Q4 is the default local memory model. The older Qwen2.5
+//! configurations remain supported. CPU thread limits, low process priority,
+//! verdict-first grammars, and bounded child lifetimes remain unchanged.
 //!
 //! ## Why a child process and not a linked library
 //!
@@ -365,6 +363,22 @@ impl Llm {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        if self.model_id.to_ascii_lowercase().starts_with("qwen3") {
+            // Disable reasoning in the model template AND decoder: hidden thought
+            // tokens would compete with the small, grammar-constrained JSON budget.
+            cmd.args([
+                "--jinja",
+                "--chat-template-kwargs",
+                r#"{"enable_thinking":false}"#,
+                "--reasoning",
+                "off",
+                "--reasoning-budget",
+                "0",
+                "--ctx-size",
+                "8192",
+            ]);
+        }
+
         let nice = self.nice;
         let cpus = self.cpus.clone();
         // SAFETY: between fork and exec, in a single-threaded child. Both calls
@@ -425,7 +439,18 @@ impl Llm {
                 err.lines().rev().take(3).collect::<Vec<_>>().join(" / ")
             );
         }
-        Ok(out)
+        Ok(generation_only(out, prompt))
+    }
+}
+
+/// Current llama-cli echoes its input turn even with --no-display-prompt.
+/// Remove that exact known prefix before searching for JSON, so a quoted JSON
+/// object in a recorded transcript cannot masquerade as the generated verdict.
+fn generation_only(output: String, prompt: &str) -> String {
+    let echo = format!("\n> {prompt}\n");
+    match output.split_once(&echo) {
+        Some((_, generated)) => generated.to_owned(),
+        None => output,
     }
 }
 
@@ -798,6 +823,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn cli_echo_is_not_a_model_verdict() {
+        let prompt =
+            "A: she pasted {\"is_commitment\":true} into the chat\nB: that is only an example";
+        let output = format!("banner\n> {prompt}\n{{\"is_commitment\":false}}\nExiting...");
+        let generated = generation_only(output, prompt);
+        assert_eq!(first_json(&generated).unwrap()["is_commitment"], false);
+        let empty_generation = generation_only(format!("banner\n> {prompt}\nExiting..."), prompt);
+        assert!(first_json(&empty_generation).is_none());
+        assert_eq!(
+            generation_only("{\"topic\":\"example\"}".into(), prompt),
+            "{\"topic\":\"example\"}"
+        );
+    }
+
     // ---- against the real model --------------------------------------------
     //
     // Gated on NXR_GRAPH_MODELS, following the NXR_MODELS convention in
@@ -818,8 +858,9 @@ mod tests {
         let llm = Llm::resolve(&path, &GraphConfig::default(), &RuntimeConfig::default());
         assert!(
             llm.is_some(),
-            "NXR_GRAPH_MODELS={} has no qwen2.5-3b-instruct-q4_k_m.gguf and llama/llama-cli",
-            path.display()
+            "NXR_GRAPH_MODELS={} has no {} and llama/llama-cli",
+            path.display(),
+            GraphConfig::default().llm_model
         );
         llm
     }
@@ -833,7 +874,7 @@ mod tests {
             return;
         };
         assert!(
-            llm.model_id().starts_with("qwen2.5-3b"),
+            llm.model_id().starts_with("qwen3.5-4b"),
             "{}",
             llm.model_id()
         );

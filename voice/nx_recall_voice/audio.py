@@ -82,7 +82,10 @@ class Devices:
                     "pactl", "load-module", "module-null-sink", f"sink_name={name}",
                     "rate=24000", "channels=2" if stereo else "channels=1",
                     "channel_map=front-left,front-right" if stereo else "channel_map=mono",
-                    f"sink_properties=device.description={label} priority.session=0 priority.driver=0 lanalu.bridge.owner={self.owner}"))
+                    # A zero driver priority leaves an isolated bus unclocked.
+                    # Keep it below hardware drivers, with default-device priority zero.
+                    # Keep owned buses clocked across playback teardown and idle gaps.
+                    f"sink_properties=device.description={label} priority.session=0 priority.driver=1 node.always-process=true lanalu.bridge.owner={self.owner}"))
                 await self.save_refs()
             self.modules.append(await command(
                 "pactl", "load-module", "module-remap-source",

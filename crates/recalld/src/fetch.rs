@@ -46,7 +46,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::ModelsConfig;
 use crate::models::{
-    EntryState, Group, Install, ModelEntry, ModelSet, REMOTE_ASSETS, RemoteAsset, SemanticModel,
+    EntryState, Group, Install, LEGACY_GRAPH_ASSETS, ModelEntry, ModelSet, REMOTE_ASSETS,
+    RemoteAsset, SemanticModel,
 };
 
 /// Read timeout for a single chunk. The whole download has no deadline — a
@@ -162,7 +163,8 @@ impl FetchOptions {
     }
 
     fn wants(&self, asset: &RemoteAsset) -> bool {
-        asset.default() || self.extra_groups().contains(&asset.group)
+        asset.role != "graph.llm.legacy"
+            && (asset.default() || self.extra_groups().contains(&asset.group))
     }
 }
 
@@ -182,7 +184,7 @@ pub fn fetch_models(root: &Path, cfg: &ModelsConfig, opts: &FetchOptions) -> Res
     fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
 
     let mut report = FetchReport::default();
-    for asset in REMOTE_ASSETS {
+    for asset in REMOTE_ASSETS.iter().chain(LEGACY_GRAPH_ASSETS) {
         // An asset already on disk at the catalogued size is reported whether
         // it is part of the default set or not — the old English-only export
         // does not vanish from an existing install just because it stopped
@@ -977,10 +979,11 @@ mod tests {
         // — and whisper.cpp's own model repository for the night shift's GGML
         // file (0.9.0). A URL that drifts off this list is a supply-chain
         // change and has to be a visible diff.
-        const HOSTS: [&str; 6] = [
+        const HOSTS: [&str; 7] = [
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/",
             "https://github.com/ggml-org/llama.cpp/releases/download/",
             "https://huggingface.co/bartowski/",
+            "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/",
             "https://huggingface.co/Xenova/multilingual-e5-small/resolve/",
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/",
             // 0.11.0: the transformers.js mirror of NLLB-200-distilled-600M,
@@ -1178,18 +1181,22 @@ mod tests {
         let llm = REMOTE_ASSETS
             .iter()
             .find(|a| a.role == "graph.llm")
-            .expect("the bake-off's winner is catalogued");
+            .expect("the current model is catalogued");
         assert_eq!(llm.group, Group::Graph);
-        assert!(!llm.default(), "a fresh install must not fetch 1.9 GB");
-        // The exact figure the model weighs, checked byte for byte by the fetch.
-        assert_eq!(llm.download_bytes, 1_929_903_264);
-        assert_eq!(
-            llm.install,
-            Install::File("qwen2.5-3b-instruct-q4_k_m.gguf")
+        assert!(
+            !llm.url.contains("/resolve/main/"),
+            "graph model revision must be immutable"
         );
+        assert!(
+            !llm.default(),
+            "a default transcription install must not fetch the graph model"
+        );
+        // The exact figure the model weighs, checked byte for byte by the fetch.
+        assert_eq!(llm.download_bytes, crate::models::GRAPH_MODEL_BYTES);
+        assert_eq!(llm.install, Install::File(crate::models::GRAPH_MODEL_FILE));
         assert_eq!(
-            expected_bytes("qwen2.5-3b-instruct-q4_k_m.gguf"),
-            Some(1_929_903_264)
+            expected_bytes(crate::models::GRAPH_MODEL_FILE),
+            Some(crate::models::GRAPH_MODEL_BYTES)
         );
 
         let rt = REMOTE_ASSETS
@@ -1209,7 +1216,20 @@ mod tests {
         // The config's defaults have to name what the catalogue installs, or
         // `models status` and the daemon would look in different places.
         let graph = crate::config::GraphConfig::default();
-        assert_eq!(graph.llm_model, "qwen2.5-3b-instruct-q4_k_m.gguf");
+        assert_eq!(graph.llm_model, crate::models::GRAPH_MODEL_FILE);
+        assert_eq!(
+            expected_bytes("qwen2.5-3b-instruct-q4_k_m.gguf"),
+            Some(1_929_903_264)
+        );
+        let legacy = &LEGACY_GRAPH_ASSETS[0];
+        let opts = FetchOptions {
+            graph: true,
+            ..FetchOptions::default()
+        };
+        assert!(
+            !opts.wants(legacy),
+            "upgrades must not redownload the old model"
+        );
         assert_eq!(graph.llama_dir, "llama");
         // Optional, but not the only optional thing any more: semantic search
         // adds two, and this assertion is about the ASR leg.
@@ -1358,7 +1378,7 @@ mod tests {
         // flag and not a default.
         assert_eq!(
             total_download_bytes(&[Group::Graph]),
-            base + 1_929_903_264 + 16_701_436
+            base + crate::models::GRAPH_MODEL_BYTES + 16_701_436
         );
         assert_eq!(expected_bytes("eres2net_en.onnx"), Some(26_485_263));
         assert_eq!(expected_bytes("no/such/model.onnx"), None);

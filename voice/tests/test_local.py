@@ -43,9 +43,12 @@ class FakeAudio:
 
 class VoiceTests(unittest.IsolatedAsyncioTestCase):
     async def start_worker(self, mode="vesktop", texts=None, identity_error=False, trigger="wakeword"):
+        self.text_queue = asyncio.Queue(maxsize=1)
         self.audio = FakeAudio()
         self.statuses = asyncio.Queue()
         self.transcriptions = 0
+        self.model_gate = asyncio.Event()
+        self.model_gate.set()
         self.model_messages = []
         self.model_closed = False
         pending = list(texts or ["Lanalu say hello"])
@@ -65,6 +68,7 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             async def start(self):
                 pass
             async def answer(self, messages):
+                await test.model_gate.wait()
                 test.model_messages.append(messages)
                 return "Hello."
             async def close(self):
@@ -85,7 +89,7 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(patcher.stop)
         config = {"audio_mode": mode, "mode": trigger, "wake_words": ["lanalu"], "silence_duration_ms": 40}
         self.worker = asyncio.create_task(local.run_local(config, self.audio,
-                    lambda event, **fields: self.statuses.put_nowait((event, fields))))
+                    lambda event, **fields: self.statuses.put_nowait((event, fields)), self.text_queue))
         self.addAsyncCleanup(self.stop_worker)
         await self.wait_status("local_listening")
 
@@ -151,6 +155,63 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
         self.assertEqual(self.transcriptions, 1)
 
+    async def test_typed_turn_without_audio_bypasses_wake_and_stt(self):
+        await self.start_worker()
+        self.text_queue.put_nowait("What do you remember?")
+        fields = await self.wait_status("local_thinking")
+        await self.wait_status("local_speaking")
+        self.assertEqual(fields['input_kind'], 'text')
+        self.assertEqual(self.transcriptions, 0)
+        self.assertEqual(self.model_messages[0][-1]['content'], 'What do you remember?')
+        self.assertIn('speaker is unknown', self.model_messages[0][0]['content'])
+        self.assertNotIn('What do you remember?', str(fields))
+
+    async def test_typed_reply_arrives_before_blocked_audio_playback(self):
+        await self.start_worker()
+        response = asyncio.get_running_loop().create_future()
+        self.text_queue.put_nowait(local.TextTurn('private question', response))
+        reply = await asyncio.wait_for(response, 1)
+        self.assertEqual(reply, {'type': 'reply', 'text': 'Hello.'})
+        self.assertFalse(self.audio.release.is_set())
+
+    async def test_visible_typed_reply_stays_in_history_when_playback_interrupted(self):
+        await self.start_worker()
+        response = asyncio.get_running_loop().create_future()
+        self.text_queue.put_nowait(local.TextTurn('first question', response))
+        await asyncio.wait_for(response, 1)
+        self.text_queue.put_nowait('follow up')
+        async with asyncio.timeout(1):
+            while len(self.model_messages) < 2:
+                await asyncio.sleep(0)
+        self.assertEqual(self.model_messages[1][-3:], [
+            {'role': 'user', 'content': 'first question'},
+            {'role': 'assistant', 'content': 'Hello.'},
+            {'role': 'user', 'content': 'follow up'}])
+
+    async def test_typed_turn_interrupts_spoken_reply(self):
+        await self.start_worker()
+        await self.utterance()
+        await self.wait_status("local_speaking")
+        self.text_queue.put_nowait("Another question")
+        await self.wait_status("local_thinking")
+        self.assertTrue(self.audio.write_cancelled)
+        self.assertEqual(self.audio.clears, 1)
+
+    async def test_typed_interruption_ignores_local_speaker_echo_tail(self):
+        await self.start_worker(mode='local')
+        await self.utterance()
+        await self.wait_status('local_speaking')
+        self.model_gate.clear()
+        self.text_queue.put_nowait('next question')
+        await self.wait_status('local_thinking')
+        for _ in range(3):
+            self.audio.frames.put_nowait(VOICE)
+        async with asyncio.timeout(1):
+            while self.audio.reads < 8:
+                await asyncio.sleep(0)
+        self.assertEqual(self.audio.clears, 1)
+        self.assertEqual(self.transcriptions, 1)
+
     async def test_model_cleanup_even_when_audio_clear_fails(self):
         await self.start_worker()
         async def fail():
@@ -158,6 +219,18 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         self.audio.clear = fail
         await self.stop_worker()
         self.assertTrue(self.model_closed)
+
+    async def test_model_request_disables_thinking_for_fast_spoken_replies(self):
+        model = local.LocalModel({})
+        requests = []
+        async def request(method, path, payload):
+            requests.append(payload)
+            return {'choices': [{'message': {'content': 'Hello.'}}]}
+        model.request = request
+        self.assertEqual(await model.answer([{'role': 'user', 'content': 'Hello'}]), 'Hello.')
+        self.assertEqual(requests[0]['chat_template_kwargs'], {'enable_thinking': False})
+        self.assertEqual(requests[0]['reasoning_effort'], 'none')
+        self.assertEqual(requests[0]['max_tokens'], 160)
 
     def test_vad_cap_on_onset_and_sustained_speech(self):
         vad = local.VoiceActivity(max_seconds=.04)
