@@ -106,8 +106,11 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         config = {"audio_mode": mode, "mode": trigger, "recognition_source": recognition, "wake_words": ["lanalu"], "silence_duration_ms": 40}
-        self.worker = asyncio.create_task(local.run_local(config, self.audio,
-                    lambda event, **fields: self.statuses.put_nowait((event, fields)), self.text_queue))
+        self.heard = []
+        def status(event, **fields):
+            self.statuses.put_nowait((event, fields))
+        status.record_heard = lambda *args: self.heard.append(args)
+        self.worker = asyncio.create_task(local.run_local(config, self.audio, status, self.text_queue))
         self.addAsyncCleanup(self.stop_worker)
         await self.wait_status("local_listening")
 
@@ -131,11 +134,23 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         await self.utterance()
         await self.wait_status("wake_word_not_detected")
         self.assertFalse(self.model_messages)
+        self.assertEqual(self.heard, [("ordinary conversation", "local", False, "wake_name_missing")])
         await self.utterance()
         await self.wait_status("recall_identity_unavailable")
         await self.wait_status("local_speaking")
         self.assertIn("speaker is unknown", self.model_messages[0][0]["content"])
         self.assertEqual(self.transcriptions, 2)
+
+    async def test_heard_keeps_empty_voice_but_not_typed_input(self):
+        await self.start_worker(texts=[""])
+        await self.utterance()
+        async with asyncio.timeout(1):
+            while not self.heard:
+                await asyncio.sleep(.01)
+        self.assertEqual(self.heard, [("", "local", False, "no_words")])
+        await self.text_queue.put("private typed text")
+        await self.wait_status("local_speaking")
+        self.assertEqual(len(self.heard), 1)
 
     async def test_always_mode_accepts_speech_without_wake_phrase(self):
         await self.start_worker(texts=["ordinary conversation"], trigger="always")
@@ -249,6 +264,7 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_status('local_speaking')
         self.assertEqual(self.transcriptions, 0)
         self.assertEqual(len(self.shared_requests), 1)
+        self.assertEqual(self.heard, [('Lanalu say hello', 'recall', True, 'reply')])
         bounds, options = self.shared_requests[0]
         self.assertEqual(bounds[1] - bounds[0], 60_000_000)
         self.assertEqual(options['source'], 'vesktop')

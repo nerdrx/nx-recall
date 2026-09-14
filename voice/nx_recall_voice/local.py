@@ -217,9 +217,16 @@ async def run_local(config, audio, status, text_queue=None):
                        matched_segments=len(recognized['segment_ids']), wait_ms=recognized['wait_ms'], recognition_error=None)
             else:
                 text = (await speech.transcribe(pcm)).strip()
+            wake_detected = contains_wake_word(text, config["wake_words"])
+            wake_missing = config.get("mode", "wakeword") == "wakeword" and not wake_detected
+            if typed_text is None:
+                record_heard = getattr(status, "record_heard", None)
+                if callable(record_heard):
+                    record_heard(text, config.get("recognition_source", "recall"), wake_detected,
+                                 "no_words" if not text else "wake_name_missing" if wake_missing else "reply")
             if not text:
                 return
-            if typed_text is None and config.get("mode", "wakeword") == "wakeword" and not contains_wake_word(text, config["wake_words"]):
+            if typed_text is None and wake_missing:
                 status("wake_word_not_detected")
                 return
             status("local_thinking", recognized_characters=len(text), input_kind="text" if typed_text is not None else "voice")

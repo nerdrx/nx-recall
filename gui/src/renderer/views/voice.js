@@ -31,6 +31,15 @@ export function voiceAudioLevels(state, now = Date.now() / 1000) {
     outputLabel: !state.running || state.stopping ? 'Output stopped' : !outputFresh ? 'No recent output measurement' : output > 0 ? 'Writing generated audio' : 'No generated audio',
   };
 }
+export function heardRows(heard) {
+  if (!Array.isArray(heard)) return [];
+  return heard.slice(-6).reverse().map(item => ({
+    text: typeof item?.text === 'string' ? item.text.slice(0,2000) : '',
+    source: item?.source === 'recall' ? 'Recall recognition' : item?.source === 'local' ? 'Separate recognition' : 'Recognition',
+    timestamp: Number.isFinite(item?.timestamp) && item.timestamp > 0 && item.timestamp < 8640000000000 ? item.timestamp : null,
+    decision: ({reply:'Passed to Lanalu',wake_name_missing:'Wake name missed — no reply',no_words:'No words recognized'})[item?.decision] || 'Recognition received',
+  }));
+}
 export function voiceStateLabel(state) {
   if (state.stopping) return 'Stopping…';
   if (state.preparing) {
@@ -61,6 +70,21 @@ export function mountVoice(api = window.recall.voice) {
     h('div', {}, h('label', {for:inputLevel.id,text:'Audio reaching Lanalu'}),inputLevel,inputState),
     h('div', {}, h('label', {for:outputLevel.id,text:'Lanalu output'}),outputLevel,outputState),
     h('p', {class:'sub',text:'Levels show audio, not recognized speech. Output shows audio written by Lanalu, not confirmation that another app receives it.'}));
+  const heardList = h('div', {id:'lanalu-heard-list',class:'lanalu-heard-list'});
+  const heardState = h('p', {id:'lanalu-heard-state',class:'sub',role:'status','aria-live':'polite'});
+  const heardCard = h('section', {class:'card',id:'lanalu-heard'},h('h3',{class:'card-title',text:'What Lanalu heard'}),
+    h('p',{class:'sub',text:'The last six recognized turns, newest first. Check the words and whether the wake name passed. This view clears when Local Voice stops; Recall’s saved transcript is separate.'}),heardState,heardList);
+  let heardSignature = '';
+  function clearHeard(text) { heardList.replaceChildren(); heardSignature = ''; heardState.textContent = text; }
+  function renderHeard(items) {
+    const rows = heardRows(items), signature = JSON.stringify(rows);
+    heardState.textContent = rows.length ? 'Recent recognition · not an accuracy score' : 'Waiting for recognized words…';
+    if (signature === heardSignature) return;
+    heardSignature = signature;
+    heardList.replaceChildren(...rows.map(row => h('article', {class:'lanalu-heard-turn'},
+      h('p',{class:'sub'},row.source, row.timestamp ? ' · '+new Date(row.timestamp*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : ''),
+      h('p',{class:'lanalu-heard-text',text:row.text || 'No words recognized.'}),h('p',{class:'sub',text:row.decision}))));
+  }
   let sending=false;
   const reply=h('div',{id:'lanalu-reply',class:'lanalu-reply',role:'log','aria-live':'polite'});
   const messageStatus=h('p',{class:'sub',role:'status','aria-live':'polite'});
@@ -120,6 +144,7 @@ export function mountVoice(api = window.recall.voice) {
       h('div', { class: 'voice-actions' }, setup, start, stop, debug), setupHelp, missing,
       h('label', { for: 'voice-autostart' }, autostart, ' Start with Recall'),
       h('p', { class: 'sub', text: 'Runs while NX Recall is open, including in the tray. Quitting Recall stops the conversation.' })),
+    heardCard,
     h('section',{class:'card lanalu-message-card'},h('h3',{class:'card-title',text:'Write to Lanalu'}),
       h('label',{for:'lanalu-message',text:'Your message'}),message,
       h('p',{id:'lanalu-message-help',class:'sub',text:'Typed requests bypass wake names. Lanalu replies here and through the selected voice output. In Virtual in/out mode, people in the call can hear the answer. Ctrl/Cmd+Enter to send.'}),
@@ -145,6 +170,7 @@ export function mountVoice(api = window.recall.voice) {
     const levels = voiceAudioLevels(current);
     inputLevel.value = levels.input; outputLevel.value = levels.output;
     inputState.textContent = levels.inputLabel; outputState.textContent = levels.outputLabel;
+    if (!current.running || current.stopping) clearHeard('Start Local Voice to see recognized words.');
     paintVoiceChoice();
     voiceSetup.disabled=busy || saveFeedback.pending || voiceSaveFeedback.pending || current.running || current.preparing || !current.setupAvailable;
     models.replaceChildren(...Object.entries(current.models || {}).flatMap(([key, value]) => [h('dt', { text: ({llm:'Replies',stt:'Speech recognition',tts:'Voice'})[key] || key }), h('dd', { text: value })]));
@@ -201,7 +227,17 @@ export function mountVoice(api = window.recall.voice) {
         await loadDevices();
       }
       render();
-    } catch { if (!destroyed) { error.textContent = 'Local Voice status is unavailable.'; render(); } }
+      if (current.running && !current.stopping) {
+        try {
+          const result = await api.heard();
+          if (destroyed || !active || ticket !== generation || !current.running || current.stopping) return;
+          if (result?.ok !== true || !Array.isArray(result.heard)) throw new Error('Unavailable');
+          renderHeard(result.heard);
+        } catch {
+          if (!destroyed && active && ticket === generation && current.running && !current.stopping) clearHeard('Recognized words are unavailable. Open Debug to check Local Voice.');
+        }
+      }
+    } catch { if (!destroyed) { error.textContent = 'Local Voice status is unavailable.'; clearHeard('Recognized words are unavailable.'); render(); } }
     finally { if (!destroyed && active && ticket === generation) timer = setTimeout(refresh, 1500); }
   }
   render();

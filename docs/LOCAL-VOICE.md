@@ -2,6 +2,12 @@
 
 NX Recall can host Lanalu as a local voice assistant. The desktop app owns the worker and its lifecycle; no extra bridge service or paid API is required. Start and stop it in the **Lanalu** tab.
 
+## See what Lanalu understood
+
+The **What Lanalu heard** card in her tab shows the latest six completed voice recognitions, newest first. Each entry shows the words, recognition source, time and whether the turn passed the wake-name check. Missed wake names are shown even when no reply follows. “Passed to Lanalu” means the turn was accepted for processing, not that a reply succeeded or that its meaning was understood correctly. Words appear after a spoken turn is recognized, not word by word while you speak.
+
+This small view lives only in the voice worker's memory and clears when Local Voice stops. It does not put recognized text into Debug or diagnostic files. Recall's normal archive still follows its separately configured capture and retention settings. Typed messages appear in the written conversation instead.
+
 ## Which virtual device goes where?
 
 In the selected voice client, use **NX Recall - Call audio to Lanalu** as its output and **NX Recall - Lanalu microphone** as its input. Recall attaches these routes automatically while Virtual in/out is active.

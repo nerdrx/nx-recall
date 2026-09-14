@@ -1,5 +1,6 @@
 """NX Recall's local voice worker, started and stopped by the desktop app."""
 import argparse
+from collections import deque
 import asyncio
 import fcntl
 import json
@@ -25,6 +26,16 @@ def runtime():
 class Status:
     def __init__(self):
         self.data = {"pid": os.getpid(), "backend": "local", "network_enabled": False}
+        self._heard = deque(maxlen=6)
+
+    def record_heard(self, text, source, wake_detected, decision):
+        # Deliberately separate from persisted/logged diagnostic fields.
+        self._heard.append({"text": text[:2000], "timestamp": time.time(),
+                            "source": source, "wake_detected": bool(wake_detected),
+                            "decision": decision})
+
+    def heard(self):
+        return [dict(turn) for turn in self._heard]
 
     def __call__(self, event, **fields):
         self.data.update(fields, event=event, updated_at=time.time())

@@ -38,6 +38,39 @@ export function sendVoiceText(socketPath, text) {
   });
 }
 
+// Explicit private read: recognized words never enter state snapshots or Debug logs.
+export function readVoiceHeard(socketPath) {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(socketPath); socket.setEncoding('utf8');
+    let buffer = '', settled = false;
+    const finish = (error, heard) => {
+      if (settled) return; settled = true; socket.destroy();
+      error ? reject(new Error(error)) : resolve({ok:true, heard});
+    };
+    socket.setTimeout(2000, () => finish('Heard words are temporarily unavailable.'));
+    socket.once('connect', () => socket.write(JSON.stringify({type:'heard'}) + '\n'));
+    socket.on('data', chunk => {
+      buffer += chunk;
+      if (Buffer.byteLength(buffer) > 98304) return finish('Invalid heard-words response.');
+      if (!buffer.includes('\n')) return;
+      try {
+        const result = JSON.parse(buffer.slice(0, buffer.indexOf('\n')));
+        if (result.ok !== true || !Array.isArray(result.heard) || result.heard.length > 6) throw new Error();
+        const heard = result.heard.map(row => {
+          if (!row || typeof row.text !== 'string' || [...row.text].length > 2000 ||
+              !Number.isFinite(row.timestamp) || row.timestamp <= 0 ||
+              !['recall','local'].includes(row.source) || typeof row.wake_detected !== 'boolean' ||
+              !['reply','wake_name_missing','no_words'].includes(row.decision)) throw new Error();
+          return {text:row.text,timestamp:row.timestamp,source:row.source,wake_detected:row.wake_detected,decision:row.decision};
+        });
+        finish(null, heard);
+      } catch { finish('Invalid heard-words response.'); }
+    });
+    socket.once('error', () => finish('Heard words are temporarily unavailable.'));
+    socket.once('end', () => finish('Heard words are temporarily unavailable.'));
+  });
+}
+
 export function voiceDefaults(home = homedir()) {
   return { backend: 'local', autostart: false, audio_mode: 'vesktop', recognition_source: 'recall', mode: 'wakeword',
     tts_backend: 'piper', tts_speed: 1.0, piper_noise_scale: 0.667, kokoro_voice: 'af_heart',
@@ -235,6 +268,12 @@ export function createVoiceController({ userData, home = homedir(), runtime = pr
     const result=await sendText(join(runtime,'nx-recall-voice/control.sock'),text);
     record('typed_reply_received'); return result;
   }
+  async function heard() {
+    const worker = child;
+    if (!worker || stopping) return {ok:true,heard:[]};
+    const result = await readVoiceHeard(join(runtime,'nx-recall-voice/control.sock'));
+    return child === worker && !stopping ? result : {ok:true,heard:[]};
+  }
   function debug() {
     const snapshot=state();
     return {running:snapshot.running, preparing:snapshot.preparing, stopping:snapshot.stopping,
@@ -242,5 +281,5 @@ export function createVoiceController({ userData, home = homedir(), runtime = pr
       state:snapshot.status?.event || (child?'starting':'stopped'),connected:snapshot.status?.connected || false,
       lastError,recognition_source:snapshot.status?.recognition_source || config.recognition_source,recognition_error:snapshot.status?.recognition_error || null,recognition_wait_ms:snapshot.status?.recognition_wait_ms ?? null,audio_ready:!!snapshot.status?.audio_ready,error_stage:snapshot.status?.error_stage || null,lastUpdated:snapshot.status?.updated_at || null, routes:snapshot.status?.routes || null, retry_seconds:snapshot.status?.retry_seconds ?? null, latency_ms:snapshot.status?.latency_ms ?? null, input_kind:snapshot.status?.input_kind || null,events:[...events]};
   }
-  return { state, save, devices, start, setup, stop, send, debug };
+  return { state, save, devices, start, setup, stop, send, heard, debug };
 }

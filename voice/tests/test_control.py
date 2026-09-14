@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from nx_recall_voice.control import Control
+from nx_recall_voice.daemon import Status
 
 
 class ControlTests(unittest.IsolatedAsyncioTestCase):
@@ -69,6 +70,28 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             result = await self.request(b'{"type":"text","text":"hello"}\n')
         self.assertEqual(result, {'ok': False, 'error': 'forbidden'})
         self.assertTrue(self.queue.empty())
+
+    async def test_heard_single_bounded_frame_while_disconnected(self):
+        self.control.status = Status()
+        self.control.status.data['connected'] = False
+        for index in range(8):
+            self.control.status.record_heard('\0' * 2500, 'recall', False, 'wake_name_missing')
+        reader, writer = await asyncio.open_unix_connection(self.path, limit=98304)
+        writer.write(b'{"type":"heard"}\n')
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.readline(), 1)
+        self.assertLess(len(raw), 98304)
+        result = json.loads(raw)
+        self.assertTrue(result['ok'])
+        self.assertEqual(len(result['heard']), 6)
+        self.assertTrue(all(len(turn['text']) == 2000 for turn in result['heard']))
+        self.assertEqual(await asyncio.wait_for(reader.read(), 1), b'')
+        self.assertTrue(self.queue.empty())
+        writer.close()
+        await writer.wait_closed()
+        self.assertEqual((await self.request(b'{"type":"heard","text":"extra"}\n'))['error'], 'invalid_request')
+        with patch('nx_recall_voice.control.os.getuid', return_value=-1):
+            self.assertEqual((await self.request(b'{"type":"heard"}\n'))['error'], 'forbidden')
 
     async def test_close_removes_socket(self):
         await self.control.close()

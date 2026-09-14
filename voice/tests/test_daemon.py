@@ -10,6 +10,24 @@ from nx_recall_voice import daemon
 
 
 class DaemonTests(unittest.IsolatedAsyncioTestCase):
+    def test_heard_is_bounded_memory_only_and_snapshot_is_detached(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(daemon, 'runtime', lambda: Path(directory)), patch.object(daemon.logging, 'info') as log:
+            status = daemon.Status()
+            status('local_listening')
+            for index in range(9):
+                status.record_heard(str(index) + 'private heard text' * 200, 'local', False, 'wake_name_missing')
+            turns = status.heard()
+            self.assertEqual(len(turns), 6)
+            self.assertTrue(turns[0]['text'].startswith('3'))
+            self.assertTrue(all(len(turn['text']) == 2000 and turn['timestamp'] > 0 for turn in turns))
+            turns[0]['text'] = 'mutated'
+            self.assertNotEqual(status.heard()[0]['text'], 'mutated')
+            status.audio_levels({'audio_input_peak': .2})
+            self.assertNotIn('private heard text', (Path(directory) / 'status.json').read_text())
+            self.assertNotIn('private heard text', repr(status.data))
+            self.assertNotIn('private heard text', repr(log.call_args_list))
+            self.assertEqual(list(Path(directory).iterdir()), [Path(directory) / 'status.json'])
+
     def test_audio_meter_preserves_turn_state_without_logging(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(daemon, 'runtime', lambda: Path(directory)), patch.object(daemon.logging, 'info') as log:
             status = daemon.Status()

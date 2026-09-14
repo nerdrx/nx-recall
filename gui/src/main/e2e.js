@@ -195,7 +195,8 @@ export function runE2E(deps) {
         await js(`(async()=>{
           const {mountVoice}=await import('./views/voice.js');
           window.__meterState={running:true,available:true,config:{audio_mode:'vesktop',mode:'wakeword',wake_words:['Lanalu']},status:{event:'listening'}};
-          window.__meterController=mountVoice({state:async()=>window.__meterState,devices:async()=>({sources:[],sinks:[]})});
+          window.__heardFixture={ok:true,heard:[]};
+          window.__meterController=mountVoice({state:async()=>window.__meterState,devices:async()=>({sources:[],sinks:[]}),heard:async()=>window.__heardFixture});
           window.__meterController.panel.hidden=false;
           document.getElementById('main').replaceChildren(window.__meterController.panel);
           window.__meterController.setActive(true);
@@ -207,11 +208,21 @@ export function runE2E(deps) {
         await waitFor('signal meter',()=>js(`document.getElementById('lanalu-input-level').value===.45 && document.getElementById('lanalu-input-state').textContent==='Receiving audio signal' && document.getElementById('lanalu-output-level').value===.25`));
         assert(await js(`!!document.querySelector('label[for="lanalu-input-level"]') && document.getElementById('lanalu-input-level').getAttribute('aria-describedby')==='lanalu-input-state'`),'meter has no accessible label');
         const file=await shot('023-lanalu-audio-levels');
+        await waitFor('heard waiting state',()=>js(`document.getElementById('lanalu-heard-state').textContent==='Waiting for recognized words…'`));
+        await js(`window.__heardFixture={ok:true,heard:[{text:'La nalu, hello.',source:'recall',timestamp:Date.now()/1000-1,decision:'reply'},{text:'<img src=x onerror=alert(1)> nonono',source:'local',timestamp:Date.now()/1000,decision:'wake_name_missing'}]};window.__meterController.setActive(true)`);
+        await waitFor('heard words and wake decision',()=>js(`document.getElementById('lanalu-heard-list').textContent.includes('Wake name missed — no reply') && document.getElementById('lanalu-heard-list').textContent.includes('Passed to Lanalu')`));
+        assert(await js(`document.querySelector('.lanalu-heard-text').textContent==='<img src=x onerror=alert(1)> nonono' && !document.querySelector('#lanalu-heard-list img')`),'recognized text was not rendered safely/newest-first');
+        await js(`document.getElementById('lanalu-heard').scrollIntoView({block:'start'})`);
+        const heardFile=await shot('024-lanalu-heard');
+        await js(`window.__heardFixture={ok:false};window.__meterController.setActive(true)`);
+        await waitFor('heard failure clears old text',()=>js(`!document.getElementById('lanalu-heard-list').textContent && document.getElementById('lanalu-heard-state').textContent.includes('unavailable')`));
         await js(`window.__meterState.status.audio_levels_at=1;window.__meterController.setActive(true)`);
         await waitFor('old peak cleared',()=>js(`document.getElementById('lanalu-input-level').value===0 && document.getElementById('lanalu-input-state').textContent.includes('No recent input')`));
-        return {file,silence:true,signal:true,stale:true,accessible:true};
+        await js(`window.__meterState.running=false;window.__meterController.setActive(true)`);
+        await waitFor('stopped heard cleared',()=>js(`!document.getElementById('lanalu-heard-list').textContent && document.getElementById('lanalu-heard-state').textContent.startsWith('Start Local Voice')`));
+        return {file,heardFile,silence:true,signal:true,stale:true,accessible:true,heardSafe:true,heardCleared:true};
       } finally {
-        await js(`window.__meterController?.destroy();window.__meterController?.panel.remove();delete window.__meterController;delete window.__meterState`);
+        await js(`window.__meterController?.destroy();window.__meterController?.panel.remove();delete window.__meterController;delete window.__meterState;delete window.__heardFixture`);
       }
     });
 

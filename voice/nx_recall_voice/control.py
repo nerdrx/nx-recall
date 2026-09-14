@@ -55,9 +55,12 @@ class Control:
                     raise ValueError('Invalid frame')
                 data = json.loads(raw)
                 text = data.get('text') if isinstance(data, dict) else None
-                if not isinstance(text, str) or not text.strip() or len(text) > 2000 or data.get('type') != 'text':
+                if isinstance(data, dict) and data == {'type': 'heard'}:
+                    snapshot = getattr(self.status, 'heard', None)
+                    result = {'ok': True, 'heard': snapshot() if callable(snapshot) else []}
+                elif not isinstance(text, str) or not text.strip() or len(text) > 2000 or data.get('type') != 'text':
                     raise ValueError('Invalid request')
-                if not self.status.data.get('connected'):
+                elif not self.status.data.get('connected'):
                     result['error'] = 'not_ready'
                 elif self.queue.full():
                     result['error'] = 'busy'
@@ -65,7 +68,7 @@ class Control:
                     response = asyncio.get_running_loop().create_future()
                     self.queue.put_nowait(TextTurn(text.strip(), response))
                     result = {'ok': True}
-            writer.write(json.dumps(result).encode() + b'\n')
+            writer.write(json.dumps(result, ensure_ascii=False).encode() + b'\n')
             await writer.drain()
             if response is not None:
                 try:

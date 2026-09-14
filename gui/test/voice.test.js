@@ -6,7 +6,19 @@ import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { EventEmitter } from 'node:events';
 import { normalizeVoiceConfig, voiceDefaults, voiceToml, createVoiceController, sendVoiceText, voiceModelLabels } from '../src/main/voice.js';
-import { voiceStateLabel, voiceAudioLevels } from '../src/renderer/views/voice.js';
+import { voiceStateLabel, voiceAudioLevels, heardRows } from '../src/renderer/views/voice.js';
+
+test('heard turns are bounded newest-first with explicit wake decisions', () => {
+  const result=heardRows(Array.from({length:8},(_,index)=>({text:String(index),source:'recall',timestamp:index+1,decision:'wake_name_missing'})));
+  assert.equal(result.length,6);assert.equal(result[0].text,'7');assert.equal(result[5].text,'2');
+  assert.equal(result[0].decision,'Wake name missed — no reply');
+  assert.equal(result[0].source,'Recall recognition');
+  assert.deepEqual(heardRows(null),[]);
+  const [malformed]=heardRows([{text:'x'.repeat(3000),timestamp:Infinity,source:'arbitrary',decision:'arbitrary'}]);
+  assert.equal(malformed.text.length,2000);assert.equal(malformed.timestamp,null);assert.equal(malformed.source,'Recognition');
+  assert.equal(heardRows([{decision:'reply'}])[0].decision,'Passed to Lanalu');
+  assert.equal(heardRows([{decision:'no_words'}])[0].decision,'No words recognized');
+});
 
 test('voice meters distinguish actual audio, silence, stale input and stopped workers', () => {
   const state = {running:true,status:{event:'listening',audio_levels_at:100,audio_input_read_at:100,audio_input_peak:.25,audio_output_peak:.5}};
