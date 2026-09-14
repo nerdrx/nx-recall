@@ -279,8 +279,8 @@ select.input option, select.input optgroup {
   border-radius: 50%; background: var(--clear-faint);
   transition: transform var(--dur) var(--ease-spring), background var(--dur) var(--ease-soft);
 }
-.toggle[aria-pressed="true"] { background: var(--accent-fill); border-color: transparent; }
-.toggle[aria-pressed="true"]::after { transform: translateX(18px); background: var(--on-accent); }
+.toggle[aria-pressed="true"], .toggle[aria-checked="true"] { background: var(--accent-fill); border-color: transparent; }
+.toggle[aria-pressed="true"]::after, .toggle[aria-checked="true"]::after { transform: translateX(18px); background: var(--on-accent); }
 .toggle:disabled { opacity: 0.45; cursor: default; }
 
 /* ------------------------------------------------------------ transcript - */
@@ -1167,7 +1167,7 @@ button.sp-num:focus-visible { outline: none; box-shadow: var(--clear-focus); }
   /* The live dot and the toggle knob carry information; they simply stop
      moving rather than disappearing. */
   .dot.pulse { opacity: 1; }
-  .toggle[aria-pressed="true"]::after { transform: translateX(18px); }
+  .toggle[aria-pressed="true"]::after, .toggle[aria-checked="true"]::after { transform: translateX(18px); }
 }
 
 /* ------------------------------------------ the Memory view (0.7.0) ----- */
@@ -2114,3 +2114,4 @@ input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), select, te
 /* A write reports its outcome beside the control that initiated it. */
 .mutation-feedback[data-state="error"] { color: var(--clear-danger); }
 .mutation-feedback[data-state="pending"] { color: var(--text); }
+#lanalu-voice-style input[type="range"] { accent-color: var(--violet); }

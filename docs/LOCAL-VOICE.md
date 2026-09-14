@@ -15,9 +15,17 @@ Open the **Lanalu** tab directly from the navigation rail. Typed requests bypass
 
 The **Debug** button opens a separate window with worker state, component readiness, routing counts and recent diagnostic events. This view excludes conversation text and credentials. A stopped worker retains its last failure so it can be diagnosed.
 
+## Voice sound
+
+In **Lanalu → Voice**, choose Amy or Kokoro, then adjust speaking speed (0.6–1.5×). Amy also offers a voice-variation control. This changes synthesis variation, not a named emotion or a trained personality. Stop Local Voice before changing settings, save, then start it again.
+
+Kokoro offers Heart, Bella, Sarah and Nicole. Its optional setup downloads about 350 MB and installs about 401 MB; it reuses the existing local speech runtime. Allow 5 GB free for a fresh setup including Kokoro. Amy remains the small, fast default. On the tested machine, an 8.9-second Amy sample took 0.21 seconds to synthesize warm; a 6.6-second Heart sample took about 0.65 seconds with six synthesis threads. Its first sentence was available in about 0.14 seconds. Playback consumes native sentence chunks as they arrive instead of waiting for the entire reply. These synthesis timings exclude speech recognition and reply generation. Voice quality is subjective; compare the voices at a normal speed before choosing.
+
+All voice synthesis stays local. Changing voice does not clone or enroll a person's voice. Virtual in/out sends the selected generated voice to the connected client; ordinary local mode uses the selected output device.
+
 ## Local speech and memory
 
-By default, Lanalu reuses **Recall recognition**: it reads the words Recall has already recognized for the same live input and utterance. It does not run a second speech decoder. Choose **Separate recognition** to use the optional local Parakeet 110M decoder instead. Both modes use Qwen3.5 4B through llama.cpp Vulkan and Piper Amy synthesis using downloaded local models. Wake phrases (“Lanalu” or “Chat GPT” by default) are recognized locally. Always-listening mode responds to each detected utterance. PCM, transcripts and retrieved records never go to a cloud API; no API credentials are read by this worker.
+By default, Lanalu reuses **Recall recognition**: it reads the words Recall has already recognized for the same live input and utterance. It does not run a second speech decoder. Choose **Separate recognition** to use the optional local Parakeet 110M decoder instead. Both modes use Qwen3.5 4B through llama.cpp Vulkan and a selected local synthesis model. Amy uses Piper; optional Heart, Bella, Sarah and Nicole voices use Kokoro. Wake phrases (“Lanalu” or “Chat GPT” by default) are recognized locally. When Lanalu is a configured wake name, its split and phonetic forms “La nalu”, “Lana Lu”, “Lana Lou” and “Lana Loo” are accepted too; unrelated words are not fuzzy-matched. Always-listening mode responds to each detected utterance. PCM, transcripts and retrieved records never go to a cloud API; no API credentials are read by this worker.
 
 Shared recognition waits up to eight seconds for a complete, stable transcript match. It accepts only the exact source and live utterance time range, including a small allowance for Recall's normal 200 ms speech padding. Split transcript segments are joined in time order; a segment is not reused for a later question. Wider merged turns, stale text, unrelated sources and ambiguous matches are rejected rather than guessed. This conservative matching can skip an utterance when Recall's segmentation differs substantially from Lanalu's local activity detector.
 

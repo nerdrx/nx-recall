@@ -14,7 +14,14 @@ from .audio import Audio
 from .control import TextTurn
 def contains_wake_word(text, words):
     normalized = ' '.join(re.findall(r'\w+', text.casefold()))
-    phrases = (' '.join(re.findall(r'\w+', word.casefold())) for word in words)
+    phrases = {' '.join(re.findall(r'\w+', word.casefold())) for word in words}
+    # Recognizers split the name differently and spell its final syllable
+    # phonetically. Keep this family explicit; fuzzy matching ordinary words
+    # would wake the assistant during unrelated conversation.
+    lanalu_forms = {'lanalu', 'lanalou', 'lanaloo', 'lanalau'}
+    if any(phrase.replace(' ', '') in lanalu_forms for phrase in phrases):
+        if re.search(r'(?<!\w)la\s*na\s*(?:lu|lou|loo|lau)(?!\w)', normalized):
+            return True
     return any(phrase and re.search(r'(?<!\w)' + re.escape(phrase) + r'(?!\w)', normalized) for phrase in phrases)
 
 
@@ -201,8 +208,10 @@ async def run_local(config, audio, status, text_queue=None):
                 async def input_guard():
                     return expected is not None and await current_binding() == expected
                 status('waiting_for_recall_transcript', recognition_source='recall', recognition_error=None)
+                observed = (end_ns - len(pcm) * 1_000_000_000 // 48000, end_ns)
                 recognized = await recall.recognize(*span, source=source, capture_source=capture_source,
-                                                    input_guard=input_guard if source == 'vesktop' else None)
+                                                    input_guard=input_guard if source == 'vesktop' else None,
+                                                    capture_window=observed)
                 text = recognized['text']
                 status('recall_transcript_received', recognized_characters=len(text),
                        matched_segments=len(recognized['segment_ids']), wait_ms=recognized['wait_ms'], recognition_error=None)
@@ -248,19 +257,25 @@ async def run_local(config, audio, status, text_queue=None):
                 remember(text, reply)
                 response.set_result({'type': 'reply', 'text': reply})
             stage = "synthesis"
-            pcm_out = await speech.synthesize(reply)
-            audio.begin_item("local-turn")
-            status("local_speaking", recall_hits=len(hits), latency_ms=int((time.monotonic()-started)*1000))
-            speaking = True
-            stage = "playback"
-            await audio.write(pcm_out)
+            async with contextlib.aclosing(speech.synthesize_stream(reply)) as chunks:
+                async for pcm_out in chunks:
+                    if not pcm_out:
+                        continue
+                    if not speaking:
+                        audio.begin_item("local-turn")
+                        status("local_speaking", recall_hits=len(hits), latency_ms=int((time.monotonic()-started)*1000))
+                        speaking = True
+                    stage = "playback"
+                    await audio.write(pcm_out)
+                    stage = "synthesis"
             speaking = False
             echo_until = time.monotonic() + .4
             if response is None:
                 remember(text, reply)
             status("local_listening")
         except RecognitionUnavailable as exc:
-            status('recognition_unavailable', recognition_source='recall', recognition_error=exc.code)
+            status('recognition_unavailable', recognition_source='recall', recognition_error=exc.code,
+                   **exc.diagnostics)
         except asyncio.CancelledError:
             result_error = "interrupted"
             raise
@@ -269,11 +284,14 @@ async def run_local(config, audio, status, text_queue=None):
         finally:
             if response is not None and not response.done():
                 response.set_result({'type': 'result', 'error': result_error})
+            if speaking:
+                echo_until = time.monotonic() + .4
             speaking = False
 
     try:
         status("loading_local_models", backend="local", connected=False)
         await model.start()
+        await speech.warmup()
         # Drop startup audio backlog so speech timestamps align with Recall.
         await Audio.stop_process(audio.capture)
         await audio.start()

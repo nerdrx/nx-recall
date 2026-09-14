@@ -105,6 +105,35 @@ class SharedRecognitionTests(unittest.IsolatedAsyncioTestCase):
     async def wrong_binding(self):
         return False
 
+    def test_quiet_native_tail_inside_observed_audio_is_accepted_without_widening_core(self):
+        native = dict(self.row, t_start_ns=str(self.start - 200_000_000),
+                      t_end_ns=str(self.end + 650_000_000))
+        self.assertIsNone(_recognized([native], self.start, self.end, 'vesktop'))
+        window = (self.start - 300_000_000, self.end + 650_000_000)
+        self.assertEqual(_recognized([native], self.start, self.end, 'vesktop', capture_window=window)['text'], 'Lanalu hello')
+        unrelated = dict(native, t_end_ns=str(self.end + 1_500_000_000))
+        self.assertIsNone(_recognized([unrelated], self.start, self.end, 'vesktop', capture_window=window))
+        self.assertIsNone(_recognized([dict(native, source='discord')], self.start, self.end, 'vesktop', capture_window=window))
+        self.assertIsNone(_recognized([native], self.start, self.end, 'vesktop', consumed=[7], capture_window=window))
+
+    async def test_timeout_reports_only_numeric_alignment_diagnostics(self):
+        native = dict(self.row, t_start_ns=str(self.start - 2_000_000_000))
+        client = self.client([[native]])
+        with self.assertRaises(RecognitionUnavailable) as caught:
+            await client.recognize(self.start, self.end, source='vesktop', input_guard=verified_input, wait_seconds=.1)
+        values = caught.exception.diagnostics
+        self.assertEqual(values['recognition_candidate_count'], 1)
+        self.assertEqual(values['recognition_start_offset_ms'], -2000)
+        self.assertTrue(all(type(value) is int for value in values.values()))
+
+    async def test_captured_window_cannot_expand_to_unrelated_historical_audio(self):
+        client = self.client([[self.row]])
+        with self.assertRaises(RecognitionUnavailable) as caught:
+            await client.recognize(self.start, self.end, source='vesktop', input_guard=verified_input,
+                                   capture_window=(self.start - 10_000_000_000, self.end))
+        self.assertEqual(caught.exception.code, 'invalid_interval')
+        self.assertEqual(self.calls, [])
+
     async def test_stale_interval_is_rejected_before_rpc(self):
         client = self.client([[self.row]])
         with self.assertRaises(RecognitionUnavailable) as caught:

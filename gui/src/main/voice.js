@@ -40,6 +40,8 @@ export function sendVoiceText(socketPath, text) {
 
 export function voiceDefaults(home = homedir()) {
   return { backend: 'local', autostart: false, audio_mode: 'vesktop', recognition_source: 'recall', mode: 'wakeword',
+    tts_backend: 'piper', tts_speed: 1.0, piper_noise_scale: 0.667, kokoro_voice: 'af_heart',
+    kokoro_model_dir: join(home, '.local/share/nx-recall/models/voices/kokoro-multi-lang-v1_0'),
     wake_words: ['lanalu', 'chat gpt'], local_source: '', local_sink: '',
     vesktop_profile: join(home, '.config/vesktop'),
     stt_model_dir: join(home, '.local/share/nx-recall/models/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8'),
@@ -48,7 +50,7 @@ export function voiceDefaults(home = homedir()) {
 export function voiceModelLabels(config) {
   return { llm: 'Qwen3.5 4B · Q4_K_M',
     stt: config.recognition_source === 'recall' ? 'Recall’s configured recognition model' : config.stt_model_dir.endsWith('/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8') ? 'Parakeet 110M · English' : 'Custom recognition model',
-    tts: config.tts_model_path.endsWith('/en_US-amy-medium.onnx') ? 'Piper Amy · English' : 'Custom Piper voice' };
+    tts: config.tts_backend === 'kokoro' ? `Kokoro ${({af_heart:'Heart',af_bella:'Bella',af_sarah:'Sarah',af_nicole:'Nicole'})[config.kokoro_voice]} · English` : config.tts_model_path.endsWith('/en_US-amy-medium.onnx') ? 'Piper Amy · English' : 'Custom Piper voice' };
 }
 export function normalizeVoiceConfig(patch, previous = voiceDefaults()) {
   if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('Invalid voice settings');
@@ -56,7 +58,11 @@ export function normalizeVoiceConfig(patch, previous = voiceDefaults()) {
   for (const [key, value] of Object.entries(patch)) {
     if (!Object.hasOwn(previous, key)) throw new Error('Unknown voice setting');
     if (key === 'backend') { if (value !== 'local') throw new Error('Local Voice requires the local backend'); continue; }
-    if (key === 'autostart') {
+    if (key === 'tts_speed' || key === 'piper_noise_scale') {
+      const [min,max] = key === 'tts_speed' ? [.6,1.5] : [0,1];
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) throw new Error('Voice setting is outside its allowed range');
+      result[key] = value;
+    } else if (key === 'autostart') {
       if (typeof value !== 'boolean') throw new Error('Start with Recall must be on or off');
       result[key] = value;
     } else if (key === 'wake_words') {
@@ -67,6 +73,8 @@ export function normalizeVoiceConfig(patch, previous = voiceDefaults()) {
       result[key] = value;
     }
   }
+  if (!['piper','kokoro'].includes(result.tts_backend)) throw new Error('Choose Amy or Kokoro');
+  if (!['af_heart','af_bella','af_sarah','af_nicole'].includes(result.kokoro_voice)) throw new Error('Choose an available Kokoro voice');
   if (!['local', 'vesktop'].includes(result.audio_mode)) throw new Error('Choose local audio or Virtual in/out');
   if (!['recall', 'local'].includes(result.recognition_source)) throw new Error('Choose Recall recognition or a separate recognizer');
   if (!['always', 'wakeword'].includes(result.mode)) throw new Error('Choose wake names or always listening');
@@ -88,12 +96,16 @@ export function createVoiceController({ userData, home = homedir(), runtime = pr
   const events = [];
   let lastObserved = '';
   function record(event) { events.push({at:new Date().toISOString(),event}); if(events.length>80)events.shift(); }
+  function voiceModels() {
+    return {piper:present(config.tts_model_path) && present(config.tts_model_path+'.json'),
+      kokoro:['model.onnx','voices.bin','tokens.txt','lexicon-us-en.txt','espeak-ng-data/phontab'].every(name=>present(join(config.kokoro_model_dir,name)))};
+  }
   function components() {
     const models = join(home, '.local/share/nx-recall/models');
     return { runtime: present(python), llama: present(join(models, 'llama-voice/llama-server')),
       llm: present(join(models, 'qwen3.5-4b-q4_k_m.gguf')),
       stt: config.recognition_source === 'recall' || ['encoder.int8.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'tokens.txt'].every(name => present(join(config.stt_model_dir, name))),
-      tts: present(config.tts_model_path) && present(config.tts_model_path + '.json') };
+      tts: voiceModels()[config.tts_backend] };
   }
 
   try { config = normalizeVoiceConfig(JSON.parse(readFileSync(file, 'utf8')), defaults); } catch { /* New profile or invalid settings: safe local defaults. */ }
@@ -119,7 +131,7 @@ export function createVoiceController({ userData, home = homedir(), runtime = pr
       } catch { /* Worker may not have written its first atomic snapshot yet. */ }
     }
     if(status) { lastStatus=status; if(status.error)lastError=`Local Voice reported ${status.error}`; const observed=JSON.stringify([status.event,status.updated_at,status.error]); if(observed!==lastObserved) { lastObserved=observed; record(/^[a-z_]{1,60}$/.test(status.event)?status.event:'worker_status'); } }
-    return { running: !!child, preparing: !!setupChild, setupProgress, setupAvailable: present(setupScript), components: components(), models: voiceModelLabels(config), stopping: !!stopping, available: Object.values(components()).every(Boolean), config: { ...config, wake_words: [...config.wake_words] }, status, error: lastError };
+    return { running: !!child, preparing: !!setupChild, setupProgress, setupAvailable: present(setupScript), components: components(), models: voiceModelLabels(config), voiceModels: voiceModels(), stopping: !!stopping, available: Object.values(components()).every(Boolean), config: { ...config, wake_words: [...config.wake_words] }, status, error: lastError };
   }
   function save(patch) {
     if (child || setupChild) throw new Error('Stop Local Voice or wait for setup before changing settings');
@@ -171,7 +183,7 @@ export function createVoiceController({ userData, home = homedir(), runtime = pr
     if (!present(setupScript)) throw new Error('Local Voice setup is missing. Reinstall the current NX Recall release.');
     lastError = null;
     setupProgress = { stage: 'preparing', percent: null };
-    const worker = spawnWorker('python3', [setupScript], { stdio: ['ignore', 'pipe', 'ignore'], detached: true, env: workerEnv() });
+    const worker = spawnWorker('python3', [setupScript, '--tts-backend', config.tts_backend], { stdio: ['ignore', 'pipe', 'ignore'], detached: true, env: workerEnv() });
     setupChild = worker; record('setup_started');
     let buffer = '';
     worker.stdout?.on('data', chunk => {

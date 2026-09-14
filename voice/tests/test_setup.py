@@ -90,6 +90,25 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), self.body)
         self.assertFalse(setup.reuse_file(source, target, 1, self.sha))
 
+    def test_kokoro_is_optional_and_selected_setup_preserves_piper(self):
+        with patch.object(setup, 'install_archive') as archive, patch.object(setup, 'download') as download:
+            setup.install_voice_model(self.root, 'kokoro')
+        self.assertEqual(archive.call_count, 1)
+        self.assertEqual(archive.call_args.args[0], setup.KOKORO)
+        self.assertEqual(archive.call_args.args[1], self.root / 'voices' / setup.KOKORO_DIR)
+        download.assert_not_called()
+        with self.assertRaises(ValueError):
+            setup.install_voice_model(self.root, 'remote')
+
+    def test_kokoro_readiness_requires_phonemizer_data(self):
+        required = {'model.onnx': 1, 'voices.bin': 1, 'espeak-ng-data/phontab': 1}
+        for name in ('model.onnx', 'voices.bin'):
+            (self.root / name).write_bytes(b'x')
+        self.assertFalse(setup.complete_dir(self.root, required))
+        (self.root / 'espeak-ng-data').mkdir()
+        (self.root / 'espeak-ng-data/phontab').write_bytes(b'x')
+        self.assertTrue(setup.complete_dir(self.root, required))
+
     def test_unexpected_archive_layout_does_not_replace_install(self):
         archive = self.archive()
         body = archive.read_bytes()

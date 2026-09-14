@@ -1,4 +1,5 @@
 """Real offline voice loop using only synthetic speech and private audio buses."""
+import argparse
 import asyncio
 import json
 import tempfile
@@ -24,8 +25,8 @@ class TestMemory:
         return None
 
 
-async def main():
-    config = dict(mode='wakeword', recognition_source='local', audio_mode='vesktop', wake_words=['lanalu', 'chat gpt'],
+async def main(tts_backend="piper"):
+    config = dict(tts_backend=tts_backend, mode='wakeword', recognition_source='local', audio_mode='vesktop', wake_words=['lanalu', 'chat gpt', 'chatgpt'],
                   llama_binary=str(Path.home()/'.local/share/nx-recall/models/llama-voice/llama-server'),
                   llm_model=str(Path.home()/'.local/share/nx-recall/models/qwen3.5-4b-q4_k_m.gguf'))
     private = tempfile.TemporaryDirectory(prefix='nx-recall-voice-test-')
@@ -38,6 +39,11 @@ async def main():
     control = Control(Path(private.name) / 'control.sock', queue, control_status)
     speech = Speech()
     question = await speech.synthesize('Chat GPT, what is the name of the test project?')
+    class ObservedSpeech(Speech):
+        async def transcribe(self, pcm):
+            text = await super().transcribe(pcm)
+            print('Synthetic recognized input:', repr(text), flush=True)
+            return text
     devices = Devices('nx_recall_voice_test')
     audio = Audio(devices)
     feeder = None
@@ -71,7 +77,7 @@ async def main():
                 if len(samples) > 48000 * 45:
                     raise RuntimeError('Unexpected test audio length')
         collector = asyncio.create_task(collect())
-        with patch('nx_recall_voice.recall.RecallClient', TestMemory), patch('nx_recall_voice.local.LocalModel', IsolatedModel):
+        with patch('nx_recall_voice.recall.RecallClient', TestMemory), patch('nx_recall_voice.local.LocalModel', IsolatedModel), patch('nx_recall_voice.speech.Speech', ObservedSpeech):
             worker = asyncio.create_task(run_local(config, audio, status, queue))
             await asyncio.wait_for(listening.wait(), 30)
             # First turn uses only typed IPC: no incoming audio or wake phrase.
@@ -93,7 +99,11 @@ async def main():
                 playback_sink = devices.incoming
             feeder = Audio(Input())
             await feeder.write(question)
-            await asyncio.wait_for(replied.wait(), 30)
+            try:
+                await asyncio.wait_for(replied.wait(), 30)
+            except TimeoutError:
+                print('Synthetic voice timeout:', {'events': events, 'output_bytes': len(samples)}, flush=True)
+                raise
         assert 'local_turn_failed' not in events, events
         peak = max(abs(x) for x in array('h', samples))
         assert peak > 1000, peak
@@ -115,4 +125,6 @@ async def main():
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tts-backend", choices=("piper", "kokoro"), default="piper")
+    asyncio.run(main(parser.parse_args().tts_backend))

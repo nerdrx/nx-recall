@@ -152,6 +152,65 @@ export function runE2E(deps) {
       return {file,fakeSetupCancel:state.setupAvailable};
     });
 
+    await step('022-corrected-name-assistance', async () => {
+      await deps.request('vocab.set',{terms:['Lanalu','ordinary'],name_assistance_enabled:false});
+      await js(`window.__recallDebug.go('settings',{section:'quality'})`);
+      await waitFor('name assistance switch ready',()=>js(`document.getElementById('vocab-name-assistance')?.disabled===false`));
+      assert(await js(`document.getElementById('vocab-name-assistance').getAttribute('aria-checked')==='false'`),'name assistance not off by default');
+      assert(await js(`document.getElementById('vocab-name-assistance-card').textContent.includes('does not retrain the model')`),'hint overclaims training');
+      assert(await js(`!document.getElementById('vocab-effective').textContent.includes('biasing')`),'inactive glossary claims decoder bias');
+      await deps.request('mock.mutation_feedback',{method:'vocab.set',delay:300});
+      await js(`document.getElementById('vocab-name-assistance').click()`);
+      await waitFor('name assistance saving',()=>js(`document.getElementById('settings-save-nameAssistance').textContent==='Saving…' && document.getElementById('vocab-name-assistance').disabled`));
+      await waitFor('name assistance saved',()=>js(`document.getElementById('settings-save-nameAssistance').textContent==='Saved'`));
+      const enabled=await deps.request('vocab.get',{});
+      assert(enabled.name_assistance_enabled===true && JSON.stringify(enabled.user)===JSON.stringify(['Lanalu','ordinary']),'toggle replaced glossary');
+      assert(enabled.applied_to_decoder===false,'global glossary incorrectly marked active');
+      await deps.request('mock.mutation_feedback',{method:'vocab.set',delay:100,fail:true});
+      await js(`document.getElementById('vocab-name-assistance').click()`);
+      await waitFor('name assistance local error',()=>js(`document.getElementById('settings-save-nameAssistance').dataset.state==='error'`));
+      assert(await js(`document.getElementById('vocab-name-assistance').getAttribute('aria-checked')==='true' && !document.getElementById('vocab-name-assistance').disabled`),'failed toggle did not restore confirmed setting');
+      await js(`document.getElementById('vocab-name-assistance').click()`);
+      await waitFor('name assistance off saved',()=>js(`document.getElementById('settings-save-nameAssistance').textContent==='Saved' && document.getElementById('vocab-name-assistance').getAttribute('aria-checked')==='false'`));
+      await js(`document.getElementById('vocab-name-assistance').click()`);
+      await waitFor('name assistance on saved again',()=>js(`document.getElementById('settings-save-nameAssistance').textContent==='Saved' && document.getElementById('vocab-name-assistance').getAttribute('aria-checked')==='true'`));
+      await deps.request('mock.name_assistance_runtime',{available:false});
+      await waitFor('missing runtime explained',()=>js(`document.getElementById('vocab-name-assistance-state').textContent.includes('Install Local Voice first')`));
+      assert(await js(`!document.getElementById('vocab-name-assistance').disabled`),'cannot disable when runtime is missing');
+      await js(`document.getElementById('vocab-name-assistance').click()`);
+      await waitFor('missing runtime blocks enabling',()=>js(`document.getElementById('vocab-name-assistance').getAttribute('aria-checked')==='false' && document.getElementById('vocab-name-assistance').disabled`));
+      await deps.request('mock.name_assistance_runtime',{available:true});
+      await waitFor('runtime restored',()=>js(`!document.getElementById('vocab-name-assistance').disabled`));
+      await js(`document.getElementById('vocab-name-assistance').click()`);
+      await waitFor('configured wording',()=>js(`document.getElementById('vocab-name-assistance-state').textContent.startsWith('Configured for') && document.getElementById('settings-save-nameAssistance').textContent==='Saved'`));
+      await js(`document.getElementById('vocab-name-assistance-card').scrollIntoView({block:'start'})`);
+      return {file:await shot('022-corrected-name-assistance'),glossaryPreserved:true,rollback:true};
+    });
+
+    await step('021-lanalu-voice-settings', async () => {
+      await js(`window.__recallDebug.go('lanalu')`);
+      await waitFor('voice controls ready',()=>js(`document.getElementById('voice-wake-words')?.value && document.getElementById('voice-style-save')?.disabled===false`));
+      await js(`document.getElementById('voice-tts-backend').value='kokoro';document.getElementById('voice-tts-backend').dispatchEvent(new Event('change'));document.getElementById('voice-kokoro-voice').value='af_bella';document.getElementById('voice-tts-speed').value=.85;document.getElementById('voice-tts-speed').dispatchEvent(new Event('input'));document.getElementById('voice-style-save').click()`);
+      await waitFor('Kokoro voice saved',()=>js(`window.recall.voice.state().then(s=>s.config.tts_backend==='kokoro' && s.config.kokoro_voice==='af_bella' && s.config.tts_speed===.85)`));
+      assert(await js(`document.getElementById('voice-piper-variation').closest('div').parentElement.hidden`),'Amy variation shown for Kokoro');
+      await waitFor('voice save released',()=>js(`!document.getElementById('voice-style-save').disabled`));
+      await js(`document.getElementById('voice-tts-backend').value='piper';document.getElementById('voice-tts-backend').dispatchEvent(new Event('change'));document.getElementById('voice-tts-speed').value=1.15;document.getElementById('voice-tts-speed').dispatchEvent(new Event('input'));document.getElementById('voice-piper-variation').value=.4;document.getElementById('voice-piper-variation').dispatchEvent(new Event('input'));document.getElementById('voice-style-save').click()`);
+      await waitFor('Amy settings saved',()=>js(`window.recall.voice.state().then(s=>s.config.tts_backend==='piper' && s.config.tts_speed===1.15 && s.config.piper_noise_scale===.4)`));
+      const state=await js(`window.recall.voice.state()`);
+      if(state.available){
+        await waitFor('voice start ready',()=>js(`![...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Start Local Voice').disabled`));
+        await js(`[...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Start Local Voice').click()`);
+        await waitFor('voice style locked',()=>js(`document.getElementById('voice-tts-backend').disabled && document.getElementById('voice-tts-speed').disabled && document.getElementById('voice-piper-variation').disabled`));
+        await js(`[...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Stop Local Voice').click()`);
+        await waitFor('voice style editable',()=>js(`!document.getElementById('voice-tts-backend').disabled`));
+      }
+      await js(`document.getElementById('lanalu-voice-style').scrollIntoView({block:'start'})`);
+      const amyFile=await shot('021-lanalu-amy-settings');
+      await js(`document.getElementById('voice-tts-backend').value='kokoro';document.getElementById('voice-tts-backend').dispatchEvent(new Event('change'));document.getElementById('voice-style-save').click()`);
+      await waitFor('Kokoro restored',()=>js(`document.getElementById('lanalu-models').textContent.includes('Kokoro Bella')`));
+      return {amyFile,kokoroFile:await shot('021-lanalu-kokoro-settings'),locked:state.available};
+    });
+
     await step('019-save-feedback-stays-with-action', async () => {
       await js(`window.__recallDebug.go('lanalu')`);
       await waitFor('voice settings ready',()=>js(`document.getElementById('voice-wake-words')?.value`));

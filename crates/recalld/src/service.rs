@@ -3961,6 +3961,8 @@ impl Service {
         {
             tracing::warn!("could not record the correction as ground truth: {e:#}");
         }
+        crate::vocab::remember_corrected_names(&store, prior_text.as_deref().unwrap_or(""), &text)
+            .map_err(Error::from)?;
         let row = store.segment_row(segment_id).map_err(Error::from)?;
         tx.commit().map_err(|e| Error::internal(e.to_string()))?;
         drop(store);
@@ -4001,6 +4003,11 @@ impl Service {
     /// Replace the user glossary. Whole-list replacement, because it is the
     /// only shape that can express a deletion.
     fn vocab_set(&self, req: &Request) -> Result<Value, Error> {
+        let assistance = match req.param("name_assistance_enabled") {
+            None => None,
+            Some(Value::Bool(value)) => Some(*value),
+            _ => return Err(Error::params("name_assistance_enabled must be a boolean")),
+        };
         let terms = match req.param("terms") {
             Some(Value::Array(items)) => {
                 let mut out = Vec::with_capacity(items.len());
@@ -4012,11 +4019,29 @@ impl Service {
                 }
                 out
             }
+            None if assistance.is_some() => {
+                crate::vocab::user_terms(&self.store()).map_err(Error::from)?
+            }
             _ => return Err(Error::params("terms must be an array of strings")),
         };
         let cap = self.control.asr().vocab_max_terms;
         let store = self.store();
-        crate::vocab::set_user_terms(&store, &terms, cap).map_err(Error::from)?;
+        let tx = store
+            .conn()
+            .unchecked_transaction()
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if req.param("terms").is_some() {
+            crate::vocab::set_user_terms(&store, &terms, cap).map_err(Error::from)?;
+        }
+        if let Some(enabled) = assistance {
+            store
+                .set_setting(
+                    crate::vocab::NAME_ASSISTANCE_KEY,
+                    if enabled { "true" } else { "false" },
+                )
+                .map_err(Error::from)?;
+        }
+        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
         let vocab = crate::vocab::read(&store, cap).map_err(Error::from)?;
         drop(store);
         let mut data = vocab.to_json();
@@ -9373,6 +9398,35 @@ mod tests {
     /// relative recall against a +20% gate, and a glossary that bleeds into
     /// unrelated turns at the strongest setting), and a client showing a
     /// glossary screen must not imply an effect the daemon does not have.
+    #[test]
+    fn name_assistance_opt_in_preserves_glossary_and_rejects_invalid_toggle() {
+        let r = rig("name-assistance");
+        let got = call(&r, r#"{"id":1,"method":"vocab.get"}"#).unwrap();
+        assert_eq!(got["name_assistance_enabled"], false);
+        call(
+            &r,
+            r#"{"id":2,"method":"vocab.set","params":{"terms":["Lanalu","ordinary","two words"]}}"#,
+        )
+        .unwrap();
+        let enabled = call(
+            &r,
+            r#"{"id":3,"method":"vocab.set","params":{"name_assistance_enabled":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(enabled["name_assistance_enabled"], true);
+        assert_eq!(enabled["name_assistance_terms"], json!(["Lanalu"]));
+        assert_eq!(enabled["user"], json!(["Lanalu", "ordinary", "two words"]));
+        assert!(call(&r, r#"{"id":4,"method":"vocab.set","params":{"terms":[],"name_assistance_enabled":"yes"}}"#).is_err());
+        let got = call(&r, r#"{"id":5,"method":"vocab.get"}"#).unwrap();
+        assert_eq!(got["user"], enabled["user"]);
+        let disabled = call(
+            &r,
+            r#"{"id":6,"method":"vocab.set","params":{"name_assistance_enabled":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(disabled["name_assistance_enabled"], false);
+    }
+
     #[test]
     fn the_glossary_round_trips_and_announces_itself() {
         let r = rig("vocab");

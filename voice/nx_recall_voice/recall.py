@@ -26,16 +26,22 @@ class RecallError(RuntimeError):
 
 class RecognitionUnavailable(RecallError):
     """A fixed diagnostic code, never transcript content or private device names."""
-    def __init__(self, code):
+    def __init__(self, code, diagnostics=None):
         self.code = code
+        self.diagnostics = diagnostics or {}
         super().__init__("Shared recognition is unavailable")
 
 
-def _recognized(segments, start_ns, end_ns, source, consumed=()):
+def _recognized(segments, start_ns, end_ns, source, consumed=(), capture_window=None):
     """Accept only whole, closely aligned turns; never splice unrelated words."""
     if not isinstance(segments, list) or len(segments) >= 64:
         return None
-    margin = 400_000_000
+    # Neural and energy VAD disagree about quiet phonemes. The actual captured
+    # PCM window is stronger evidence than broadening the voiced-core tolerance.
+    if capture_window is None:
+        lower, upper = start_ns - 400_000_000, end_ns + 400_000_000
+    else:
+        lower, upper = capture_window[0] - 200_000_000, capture_window[1] + 200_000_000
     rows = []
     for row in segments:
         if not isinstance(row, dict) or row.get('source') != source:
@@ -46,7 +52,7 @@ def _recognized(segments, start_ns, end_ns, source, consumed=()):
             return None
         if b <= start_ns or a >= end_ns:
             continue
-        if b <= a or a < start_ns - margin or b > end_ns + margin:
+        if b <= a or a < lower or b > upper:
             return None
         ident = row.get('id')
         text = _clean(row.get('text'), 2001)
@@ -245,7 +251,7 @@ class RecallClient:
             return None
         return None
 
-    async def recognize(self, start_ns, end_ns, *, source, capture_source=None, input_guard=None, wait_seconds=8):
+    async def recognize(self, start_ns, end_ns, *, source, capture_source=None, input_guard=None, capture_window=None, wait_seconds=8):
         """Read this live VAD interval from Recall; no alternate STT is invoked.
 
         Microphone reuse requires the same resolved device. Vesktop reuse requires
@@ -258,11 +264,21 @@ class RecallClient:
             raise RecognitionUnavailable('invalid_interval')
         if end_ns > time.time_ns() + 1_000_000_000 or time.time_ns() - end_ns > 20_000_000_000:
             raise RecognitionUnavailable('stale_interval')
+        if capture_window is not None:
+            if (not isinstance(capture_window, (tuple, list)) or len(capture_window) != 2
+                    or any(type(value) is not int for value in capture_window)
+                    or not start_ns - 1_000_000_000 <= capture_window[0] <= start_ns
+                    or not end_ns <= capture_window[1] <= end_ns + 2_000_000_000):
+                raise RecognitionUnavailable('invalid_interval')
         if source == 'vesktop' and not callable(input_guard):
             raise RecognitionUnavailable('input_mismatch')
         if source == 'mic' and (not isinstance(capture_source, str) or not capture_source):
             raise RecognitionUnavailable('input_mismatch')
         started = time.monotonic()
+        window = capture_window or (start_ns, end_ns)
+        diagnostics = {'recognition_voiced_ms': (end_ns - start_ns) // 1_000_000,
+                       'recognition_observed_ms': (window[1] - window[0]) // 1_000_000,
+                       'recognition_candidate_count': 0}
         async def operation(call):
             sequence = 0
             async def rpc(method, params=None):
@@ -296,9 +312,27 @@ class RecallClient:
                         raise RecognitionUnavailable('source_unavailable')
                     if matching[0]['streams'] != 1:
                         raise RecognitionUnavailable('ambiguous_source')
-                reply = await rpc('transcript', {'source': source, 'from': start_ns - 400_000_000,
-                                                 'to': end_ns + 400_000_001, 'limit': 64})
-                result = _recognized(reply.get('segments'), start_ns, end_ns, source, self.recognized_ids)
+                # The wider READ can diagnose clock/segmentation disagreement;
+                # admission remains bounded by the actual observed audio window.
+                reply = await rpc('transcript', {'source': source, 'from': window[0] - 5_000_000_000,
+                                                 'to': window[1] + 5_000_000_001, 'limit': 64})
+                segments = reply.get('segments')
+                candidates = []
+                if isinstance(segments, list):
+                    for row in segments:
+                        if not isinstance(row, dict) or row.get('source') != source:
+                            continue
+                        try:
+                            a, b = int(row['t_start_ns']), int(row['t_end_ns'])
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        candidates.append((a, b))
+                diagnostics['recognition_candidate_count'] = len(candidates)
+                if candidates:
+                    a, b = min(candidates, key=lambda bounds: abs(bounds[0] - start_ns) + abs(bounds[1] - end_ns))
+                    diagnostics['recognition_start_offset_ms'] = (a - start_ns) // 1_000_000
+                    diagnostics['recognition_end_offset_ms'] = (b - end_ns) // 1_000_000
+                result = _recognized(segments, start_ns, end_ns, source, self.recognized_ids, capture_window)
                 if result is not None and result == previous:
                     self.recognized_ids.extend(result['segment_ids'])
                     return {**result, 'wait_ms': int((time.monotonic() - started) * 1000)}
@@ -310,7 +344,7 @@ class RecallClient:
         except RecognitionUnavailable:
             raise
         except TimeoutError:
-            raise RecognitionUnavailable('timeout') from None
+            raise RecognitionUnavailable('timeout', diagnostics) from None
         except (RecallError, OSError, ValueError, UnicodeError):
             raise RecognitionUnavailable('unavailable') from None
 

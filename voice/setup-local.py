@@ -35,6 +35,17 @@ PIPER = {
     'en_US-amy-medium.onnx.json': (4882, '95a23eb4d42909d38df73bb9ac7f45f597dbfcde2d1bf9526fdeaf5466977d77'),
 }
 
+KOKORO_DIR = 'kokoro-multi-lang-v1_0'
+# Publisher release asset and SHA256; optional, never fetched for Piper setup.
+KOKORO = ('https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/'
+          + KOKORO_DIR + '.tar.bz2', 349906910,
+          'c5f7e2d2caf082bc1d20fb70334a61d99d20b484500aad32e7cf84c128ea3298')
+KOKORO_FILES = {'model.onnx': 325560556, 'voices.bin': 28200960,
+                'tokens.txt': 687, 'lexicon-us-en.txt': 5956885,
+                'espeak-ng-data/phondata': 550424,
+                'espeak-ng-data/phonindex': 39074,
+                'espeak-ng-data/phontab': 55796}
+
 
 def progress(stage, percent):
     print(json.dumps({'event': 'setup_progress', 'stage': stage, 'percent': percent}), flush=True)
@@ -160,7 +171,7 @@ def reuse_file(source, target, size, sha):
     return True
 
 
-def install_models(models=MODELS):
+def install_models(models=MODELS, tts_backend="piper"):
     progress('llama', 0)
     install_archive(LLAMA, models / 'llama-voice', 'llama', llama_complete, 'llama-server')
     progress('llama', 100)
@@ -172,7 +183,18 @@ def install_models(models=MODELS):
     install_archive(PARAKEET, models / STT, 'speech_model',
                     lambda p: complete_dir(p, STT_FILES), 'encoder.int8.onnx')
     progress('speech_model', 100)
+    install_voice_model(models, tts_backend)
+
+
+def install_voice_model(models=MODELS, tts_backend="piper"):
+    if tts_backend not in {"piper", "kokoro"}:
+        raise ValueError("Unknown local voice backend")
     progress('voice_model', 0)
+    if tts_backend == "kokoro":
+        install_archive(KOKORO, models / 'voices' / KOKORO_DIR, 'voice_model',
+                        lambda p: complete_dir(p, KOKORO_FILES), 'model.onnx')
+        progress('voice_model', 100)
+        return
     for name, (size, sha) in PIPER.items():
         target = models / 'voices' / name
         if not valid_file(target, size, sha):
@@ -182,7 +204,7 @@ def install_models(models=MODELS):
     progress('voice_model', 100)
 
 
-def check_ready(models=MODELS, runtime=None):
+def check_ready(models=MODELS, runtime=None, tts_backend="piper"):
     """Read-only install validation; no imports that load models or audio devices."""
     runtime = runtime or Path.home() / '.local/share/nx-recall/voice'
     python = runtime / 'venv/bin/python'
@@ -192,8 +214,10 @@ def check_ready(models=MODELS, runtime=None):
         'llama': llama_complete(models / 'llama-voice'),
         'language_model': valid_file(target, *QWEN[1:]),
         'speech_model': complete_dir(models / STT, STT_FILES),
-        'voice_model': all(valid_file(models / 'voices' / name, *metadata)
-                           for name, metadata in PIPER.items()),
+        'voice_model': (complete_dir(models / 'voices' / KOKORO_DIR, KOKORO_FILES)
+                        if tts_backend == 'kokoro' else
+                        all(valid_file(models / 'voices' / name, *metadata)
+                            for name, metadata in PIPER.items())),
     }
     if checks['runtime']:
         result = subprocess.run([str(python), '-c', 'import numpy, sherpa_onnx, piper, nx_recall_voice'],
@@ -213,9 +237,11 @@ def main():
         raise RuntimeError('Local Voice automatic setup currently supports Linux x86_64')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true', help='Check installed runtime and models without downloads or changes')
+    parser.add_argument('--tts-backend', choices=('piper', 'kokoro'), default='piper',
+                        help='Optional local voice model to install or check')
     args = parser.parse_args()
     if args.check:
-        if not check_ready():
+        if not check_ready(tts_backend=args.tts_backend):
             raise RuntimeError('Local Voice setup is incomplete')
         return
     root = Path(__file__).resolve().parent
@@ -234,7 +260,7 @@ def main():
         subprocess.run([str(venv / 'bin/python'), '-m', 'pip', 'install', '--disable-pip-version-check', str(root)], check=True)
         subprocess.run([str(venv / 'bin/python'), '-c', 'import numpy, sherpa_onnx, piper, nx_recall_voice'], check=True)
         progress('runtime', 100)
-        install_models()
+        install_models(tts_backend=args.tts_backend)
         progress('complete', 100)
         print('Local Voice is ready. Enable it in NX Recall Settings when you want to listen.', flush=True)
 

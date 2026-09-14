@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.18.3 — A voice that feels closer
+
+- Add four optional local Kokoro voices, speaking-speed controls, and Amy synthesis variation. Models download only during explicit setup.
+- Stream native speech chunks into playback and use six synthesis threads for Kokoro by default, reducing the tested sample’s first-audio wait without changing its text or speaking pace.
+- Accept split Lanalu wake spellings including “La nalu”, “Lana Lou” and “Lana Loo”. Ordinary “no no no” is not made a wake phrase.
+- Match shared recognition against the actual captured audio window, including its padding, while retaining source, age, coverage and duplicate guards.
+- Add optional experimental corrected-name assistance: acoustic spelling hints can replace one trusted name while preserving all other recognized words. This is not model-weight retraining and defaults off.
+
 ## 0.18.2 — Shared words, clearer saves
 
 - Name the virtual-audio mode **Virtual in/out** throughout Lanalu’s controls and documentation.

@@ -2165,6 +2165,11 @@ export function startMock({
         corrections: [...VOCAB_AUTO.corrections],
       },
       effective: effectiveVocab(),
+      applied_to_decoder: false,
+      name_assistance_enabled: state.vocab.nameAssistanceEnabled === true,
+      name_assistance_experimental: true,
+      name_assistance_runtime_available: state.vocab.nameAssistanceRuntime !== false,
+      name_assistance_terms: state.vocab.user.filter(term => /^[\p{Lu}][\p{L}]*$/u.test(term)),
     };
   }
 
@@ -3819,10 +3824,18 @@ export function startMock({
 
     // --- 0.8.0: vocabulary -------------------------------------------------
 
+    'mock.name_assistance_runtime'(params) {
+      state.vocab.nameAssistanceRuntime = params.available === true;
+      const payload = vocabPayload();
+      emit('status','vocab',payload);
+      return payload;
+    },
+
     'vocab.get': () => vocabPayload(),
 
     'vocab.set'(params) {
-      const raw = params?.terms;
+      if (params.name_assistance_enabled !== undefined && typeof params.name_assistance_enabled !== 'boolean') throw err('bad_params', 'Name assistance must be on or off');
+      const raw = params?.terms ?? state.vocab.user;
       if (!Array.isArray(raw)) throw err('bad_params', 'vocab.set needs terms: an array of strings');
       const out = [];
       const seen = new Set();
@@ -3838,6 +3851,7 @@ export function startMock({
       // REPLACES the user glossary — the method is not "add" (PROTOCOL), so a
       // client that sends a shorter list has removed something and meant to.
       state.vocab.user = out;
+      if (params.name_assistance_enabled !== undefined) state.vocab.nameAssistanceEnabled = params.name_assistance_enabled;
       const payload = vocabPayload();
       // On `status`, the topic every client already subscribes to, for exactly
       // the reason the `mic` event is there: a new topic would make an older

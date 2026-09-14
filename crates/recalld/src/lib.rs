@@ -146,3 +146,5 @@ pub mod worlds;
 /// ~640 KB, bundled so the daemon has no runtime asset lookup. The heavier
 /// analysis models are *not* bundled — they live in `[models].dir`.
 pub const VAD_MODEL: &[u8] = include_bytes!("../models/silero_vad.onnx");
+
+pub mod name_assistance;

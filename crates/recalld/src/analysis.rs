@@ -197,6 +197,7 @@ pub struct Analyzer {
     /// One transducer, behind whichever binding `[identity].split_turns` asked
     /// for at load (0.12.4). See [`crate::asr::Decoder`].
     asr: crate::asr::Decoder,
+    name_assistance: crate::name_assistance::NameAssistance,
     embedder: Embedder,
     cfg: IdentityConfig,
     /// The conversational language prior's thresholds and the arbiter's
@@ -243,6 +244,7 @@ impl Analyzer {
             performance: std::sync::Arc::default(),
             overlap: OverlapDetector::load(&models.segmentation)?,
             asr: crate::asr::Decoder::load(models, cfg.split_turns)?,
+            name_assistance: crate::name_assistance::NameAssistance::new(models),
             embedder: Embedder::load(models)?,
             cfg: cfg.clone(),
             lang_cfg: LangConfig::default(),
@@ -378,6 +380,7 @@ impl Analyzer {
         }
         let pointed = models.with_asr(export);
         self.asr = crate::asr::Decoder::load(&pointed, self.cfg.split_turns)?;
+        self.name_assistance.set_models(&pointed);
         Ok(true)
     }
     // ---- end light mode -----------------------------------------------
@@ -401,6 +404,9 @@ impl Analyzer {
     pub fn transcribe_final(&mut self, samples: &[f32]) -> String {
         let _timer = self.performance.recognition.measure();
         self.asr.transcribe(samples)
+    }
+    pub fn configure_name_assistance(&mut self, enabled: bool, terms: Vec<String>) {
+        self.name_assistance.configure(enabled, terms);
     }
 
     // ---- 0.12.5, sliced turns: begin ---------------------------------------
@@ -576,6 +582,9 @@ impl Analyzer {
     /// into one row rather than left as several, since six embeddings of six
     /// fragments are six weaker claims about the same person.
     pub fn prepare_said(&mut self, samples: &[f32], gate: Gate, raw: String) -> Result<Prepared> {
+        let refined = self.name_assistance.refine(samples, raw.clone());
+        let name_refined = refined != raw;
+        let raw = refined;
         let duration_s = samples.len() as f32 / SAMPLE_RATE as f32;
         let overlap_frac = {
             let _timer = self.performance.overlap.measure();
@@ -604,7 +613,11 @@ impl Analyzer {
             overlap_frac,
             duration_s,
             text,
-            asr_model_id: self.asr.model_id().to_string(),
+            asr_model_id: if name_refined {
+                format!("{}+name-hints-v1", self.asr.model_id())
+            } else {
+                self.asr.model_id().to_string()
+            },
             model_lang: self.asr.lang(),
             embedding,
             refusal,

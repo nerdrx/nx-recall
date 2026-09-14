@@ -161,9 +161,22 @@ function who(p) {
   return p.name || p.auto || speakerLabel(p.speaker_id);
 }
 
+export function vocabularyAssistanceState(vocab) {
+  const supported = typeof vocab?.name_assistance_enabled === 'boolean';
+  const enabled = supported && vocab.name_assistance_enabled;
+  const count = Array.isArray(vocab?.name_assistance_terms) ? vocab.name_assistance_terms.length : 0;
+  const runtimeAvailable = vocab?.name_assistance_runtime_available === true;
+  const summary = !supported ? 'Update Recall to use corrected-name assistance.'
+    : !runtimeAvailable ? 'Install Local Voice first to use corrected-name assistance.'
+    : !enabled ? 'Experimental name assistance is off.'
+    : !count ? 'Enabled. Add an eligible name before assistance can be used.'
+    : `Configured for ${count} selected name${count === 1 ? '' : 's'}. Used on eligible future speech.`;
+  return {supported, enabled, count, runtimeAvailable, summary};
+}
+
 export function mount(root, ctx, options = {}) {
   const settings = options?.settings === true;
-  const saveFeedback = Object.fromEntries(['translation', 'mood', 'moodDisplay', 'light', 'threads', 'enrichment', 'vocabulary'].map(key => {
+  const saveFeedback = Object.fromEntries(['translation', 'mood', 'moodDisplay', 'light', 'threads', 'enrichment', 'vocabulary', 'nameAssistance'].map(key => {
     const status = h('p', { class: 'sub', id: `settings-save-${key}` });
     return [key, Object.assign(createMutationFeedback({ status }), { status })];
   }));
@@ -981,19 +994,27 @@ export function mount(root, ctx, options = {}) {
         h('span', {
           class: 'sub',
           id: 'vocab-effective',
-          text: vocab ? `${(vocab.effective ?? []).length} terms biasing the transcriber` : '',
+          text: vocab ? `${(vocab.effective ?? []).length} collected spelling hints` : '',
         })
       ),
       h('p', {
         class: 'rail-hint',
         style: 'padding:0 0 10px;max-width:70ch',
-        text: 'Names, worlds and jargon the transcriber is nudged toward. Add the words it keeps getting wrong — this changes what future turns are heard as, and never rewrites one that already exists.',
+        text: 'Keep useful spellings here. The general glossary is collected for reference; optional name assistance below uses only selected names on future speech.',
       })
     );
     if (!vocab) {
       vocabCard.append(h('p', { class: 'rail-hint', id: 'vocab-loading', style: 'padding:0', text: 'Loading.' }));
       return;
     }
+
+    const assistance = vocabularyAssistanceState(vocab);
+    const assistanceToggle = h('button', {id:'vocab-name-assistance',class:'toggle',role:'switch','aria-checked':String(assistance.enabled),'aria-label':'Use corrected names to help recognition',disabled:vocabPending || !assistance.supported || (!assistance.enabled && !assistance.runtimeAvailable) || store.conn.status!=='connected',onclick:()=>void setNameAssistance(!assistance.enabled)});
+    vocabCard.append(h('section',{id:'vocab-name-assistance-card',class:'tune-block'},
+      h('label',{for:'vocab-name-assistance'},h('b',{text:'Use corrected names to help recognition'}),' ',h('span',{class:'chip',text:'Experimental'})), assistanceToggle,
+      h('p',{class:'sub',id:'vocab-name-assistance-state',text:assistance.summary}),
+      h('p',{class:'sub',text:'Uses spelling hints; does not retrain the model. Only selected single-word names are eligible. Ordinary corrected words are not automatically learned.'}),
+      saveFeedback.nameAssistance.status));
 
     const input = h('input', {
       class: 'input',
@@ -1050,6 +1071,7 @@ export function mount(root, ctx, options = {}) {
     const groups = [
       ['roster', 'From the roster', 'Display names of people who have been in the instance with you.'],
       ['worlds', 'From worlds', 'Names of worlds that have been named out loud or joined.'],
+      ['speakers', 'Named voices', 'Names assigned to voices in Recall.'],
       ['corrections', 'From your corrections', 'Words you have retyped, which is the strongest signal there is.'],
     ];
     for (const [key, title, hint] of groups) {
@@ -1070,6 +1092,23 @@ export function mount(root, ctx, options = {}) {
           terms.length ? row : h('span', { class: 'sub', text: 'Nothing here yet.' })
         )
       );
+    }
+  }
+
+  async function setNameAssistance(enabled) {
+    if (vocabPending || !vocabularyAssistanceState(vocab).supported || (enabled && !vocabularyAssistanceState(vocab).runtimeAvailable)) return;
+    const before = vocab;
+    vocabPending = true;
+    vocab = {...vocab, name_assistance_enabled:enabled};
+    renderVocab();
+    try {
+      const reply = await saveFeedback.nameAssistance.run(() => ask('vocab.set', {name_assistance_enabled:enabled}));
+      vocab = reply; store.vocab = reply;
+    } catch {
+      vocab = before;
+    } finally {
+      vocabPending = false;
+      renderVocab();
     }
   }
 

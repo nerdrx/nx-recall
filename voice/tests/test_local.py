@@ -51,6 +51,9 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         self.statuses = asyncio.Queue()
         self.shared_requests = []
         self.transcriptions = 0
+        self.synthesis_finished = False
+        self.synthesis_release = asyncio.Event()
+        self.synthesis_release.set()
         self.model_gate = asyncio.Event()
         self.model_gate.set()
         self.model_messages = []
@@ -60,11 +63,15 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         class Speech:
             def __init__(self, config):
                 pass
+            async def warmup(self):
+                pass
             async def transcribe(self, pcm):
                 test.transcriptions += 1
                 return pending.pop(0)
-            async def synthesize(self, text):
-                return VOICE
+            async def synthesize_stream(self, text):
+                yield VOICE
+                await test.synthesis_release.wait()
+                test.synthesis_finished = True
         class Model:
             process = types.SimpleNamespace(returncode=None)
             def __init__(self, config):
@@ -223,6 +230,18 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.audio.clears, 1)
         self.assertEqual(self.transcriptions, 1)
 
+    async def test_first_audio_plays_before_synthesis_finishes(self):
+        await self.start_worker()
+        self.synthesis_release.clear()
+        await self.utterance()
+        await self.wait_status('local_speaking')
+        await asyncio.wait_for(self.audio.playing.wait(), 1)
+        self.assertFalse(self.synthesis_finished)
+        self.audio.release.set()
+        self.synthesis_release.set()
+        await self.wait_status('local_listening')
+        self.assertTrue(self.synthesis_finished)
+
     async def test_shared_recognition_reuses_exact_vad_span_without_local_stt(self):
         await self.start_worker(recognition='recall')
         await self.utterance()
@@ -301,6 +320,13 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(local.voiced_time_span(b"", end))
         self.assertIsNone(local.voiced_time_span(VOICE, end, threshold=.2))
         self.assertEqual(local.voiced_time_span(VOICE, end), (end - 20_000_000, end))
+
+    def test_lanalu_split_phonetic_spellings_without_unrelated_fuzzy_matches(self):
+        for name in ('Lanalu', 'Lana Lu', 'Lana-Lou', 'Lanalou', 'Lana loo', 'Lanaloo', 'Lanalau', 'La nalu', 'La na lu'):
+            self.assertTrue(local.contains_wake_word(f'Hey {name}, can you hear me?', ['lanalu']), name)
+        for text in ('Lana is here', 'Lu said hello', 'no no no', 'nonono', 'lanaluv', 'lanaloupe', 'banana loop'):
+            self.assertFalse(local.contains_wake_word(text, ['lanalu']), text)
+        self.assertFalse(local.contains_wake_word('Lanalu hello', ['computer']))
 
     def test_wake_phrase_boundaries_and_empty_normalization(self):
         self.assertTrue(local.contains_wake_word("Hey, LANA-LU!", ["lana lu"]))

@@ -39,10 +39,10 @@
 //! and a usable one can be synthesised from `tokens.txt` by pairing each piece
 //! with `-id` as its score.
 //!
-//! So the list is assembled, stored, served and announced — a person can curate
-//! it, and it is what a decoder that can use it would be handed — and nothing
-//! is fed to the recognizer. When that changes it changes here, behind the same
-//! gate.
+//! The global decoder remains greedy. Optional experimental name assistance
+//! now uses weak acoustic bias in a separate pass and admits only one known-name
+//! substitution, preserving every other original word. It is disabled by default;
+//! ordinary correction words never become automatic name hints.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -73,6 +73,8 @@ pub struct Vocabulary {
     pub user: Vec<String>,
     pub auto: AutoTerms,
     pub effective: Vec<String>,
+    pub name_assistance_enabled: bool,
+    pub name_assistance_terms: Vec<String>,
 }
 
 impl Vocabulary {
@@ -89,6 +91,11 @@ impl Vocabulary {
             // Said out loud rather than left for a user to discover: the list
             // is real, and nothing is currently biased by it (module note).
             "applied_to_decoder": false,
+            "name_assistance_enabled": self.name_assistance_enabled,
+            "name_assistance_terms": self.name_assistance_terms,
+            "name_assistance_experimental": true,
+            "name_assistance_runtime_available": name_assistance_runtime_available(),
+            "name_assistance_status": if !self.name_assistance_enabled { "disabled" } else if !name_assistance_runtime_available() { "runtime_missing" } else if self.name_assistance_terms.is_empty() { "no_names" } else { "configured" },
         })
     }
 }
@@ -225,16 +232,81 @@ pub fn read(store: &Store, cap: usize) -> Result<Vocabulary> {
         speakers: clean_terms(&store.named_speakers()?),
     };
     let effective = effective(&user, &auto, cap);
+    let (name_assistance_enabled, name_assistance_terms) = name_assistance(store)?;
     Ok(Vocabulary {
+        name_assistance_enabled,
+        name_assistance_terms,
         user,
         auto,
         effective,
     })
 }
 
+/// Opt-in acoustic spelling hints. Never treats every corrected ordinary word as a name.
+pub const NAME_ASSISTANCE_KEY: &str = "vocab_name_assistance_enabled";
+const CORRECTED_NAMES_KEY: &str = "vocab_corrected_names";
+
+pub fn is_name_hint(term: &str) -> bool {
+    (3..=32).contains(&term.chars().count())
+        && term.chars().all(|c| c.is_ascii_alphabetic())
+        && term.chars().next().is_some_and(char::is_uppercase)
+}
+
+pub fn name_assistance_runtime_available() -> bool {
+    dirs::data_local_dir()
+        .is_some_and(|root| root.join("nx-recall/voice/venv/bin/python").is_file())
+}
+
+/// Fast settings-only snapshot for the inference thread; no correction-history join.
+pub fn name_assistance(store: &Store) -> Result<(bool, Vec<String>)> {
+    let enabled = store.setting(NAME_ASSISTANCE_KEY)?.as_deref() == Some("true");
+    let mut terms = user_terms(store)?;
+    let corrected: Vec<String> = store
+        .setting(CORRECTED_NAMES_KEY)?
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default();
+    terms.extend(corrected);
+    let terms = clean_terms(&terms)
+        .into_iter()
+        .filter(|s| is_name_hint(s))
+        .take(8)
+        .collect();
+    Ok((enabled, terms))
+}
+
+/// Only corrections to already named people become automatic acoustic hints.
+/// Explicit glossary names work directly; sentence-initial ordinary words do not.
+pub fn remember_corrected_names(store: &Store, before: &str, after: &str) -> Result<()> {
+    let known = store.named_speakers()?;
+    let mut names: Vec<String> = store
+        .setting(CORRECTED_NAMES_KEY)?
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default();
+    for term in corrected_words(before, after) {
+        if is_name_hint(&term) && known.iter().any(|s| s.eq_ignore_ascii_case(&term)) {
+            names.retain(|s| !s.eq_ignore_ascii_case(&term));
+            names.insert(0, term);
+        }
+    }
+    names.truncate(8);
+    store.set_setting(CORRECTED_NAMES_KEY, &serde_json::to_string(&names)?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_hints_require_an_actual_named_person() {
+        let store = Store::open_in_memory().unwrap();
+        let speaker = store.create_speaker("Lanalu", 1).unwrap();
+        store.rename_speaker(speaker, "Lanalu", 2).unwrap();
+        remember_corrected_names(&store, "wrong wrong", "Lanalu Ordinary").unwrap();
+        let (enabled, names) = name_assistance(&store).unwrap();
+        assert!(!enabled);
+        assert_eq!(names, vec!["Lanalu"]);
+    }
 
     fn strings(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

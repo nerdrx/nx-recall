@@ -42,6 +42,8 @@ you still meant to do. Optional local models help summarize and connect the reco
 
 <img src="assets/readme/memory.png" width="100%" alt="Recall Memory showing commitments linked to their original conversations.">
 
+**Teach it the spellings you care about.** Optional experimental [corrected-name assistance](docs/NAME-ASSISTANCE.md) uses trusted names as acoustic hints for future transcripts. It preserves the other recognized words and does not retrain model weights.
+
 **Keep the original close.** A summary is a starting point. Source turns let you check it.
 Saved moments, collections and recorded days remain useful without enabling a language model.
 
@@ -81,7 +83,7 @@ Confident, recent **named acoustic matches** can identify a speaker on the selec
 speaker labels, overlapping voices and uncertain matches stay unknown. Local microphone
 mode currently leaves the speaker unnamed. A voice match is not authorization.
 
-**No paid inference API.** Qwen3.5-4B prepares replies locally; Piper speaks them.
+**No paid inference API.** Qwen3.5-4B prepares replies locally. Choose fast Amy speech or one of four optional Kokoro voices, adjust the pace, and make Lanalu sound right for you.
 The same Qwen model is available to Recall's memory writer. Shared recognition uses
 Recall's selected speech model; separate recognition uses English Parakeet.
 
@@ -98,13 +100,22 @@ Stopping Local Voice restores the routes it changed.
 
 In a call, **memory answers are audible to everyone present** and may include saved
 Recall information. Remote microphones can echo; the routing is not an acoustic echo canceller.
-The included Amy voice and separate recognizer use English.
+The included voice choices and separate recognizer use English.
 
 [Local Voice setup, models and limitations →](docs/LOCAL-VOICE.md)
 
 </details>
 
 <br>
+
+<details>
+<summary><strong>Choose Lanalu’s voice</strong></summary>
+
+<img src="assets/readme/voice-settings.png" width="100%" alt="Lanalu voice settings with Kokoro voices, speaking speed and nearby save feedback.">
+
+Amy is the fast default. Kokoro begins playback as native sentence chunks arrive. Optional Kokoro voices are Heart, Bella, Sarah and Nicole. All run locally. Amy also has a voice-variation control; both engines support speaking speed.
+
+</details>
 
 ## Your conversations stay yours.
 

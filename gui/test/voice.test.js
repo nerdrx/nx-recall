@@ -82,7 +82,7 @@ test('setup has one owned process, bounded sanitized progress, and never starts 
   const worker=new EventEmitter(); worker.stdout=new EventEmitter();
   worker.kill=()=>{setImmediate(()=>worker.emit('exit',0));return true;};
   const voice=createVoiceController({userData:join(dir,'data'),home:dir,runtime:dir,setupScriptPath:script,spawnWorker:(binary,args,opts)=>{
-    ++launches; assert.equal(binary,'python3'); assert.deepEqual(args,[script]); assert.equal(opts.env.OPENAI_API_KEY,undefined); return worker;
+    ++launches; assert.equal(binary,'python3'); assert.deepEqual(args,[script,'--tts-backend','piper']); assert.equal(opts.env.OPENAI_API_KEY,undefined); return worker;
   }});
   voice.save({autostart:true});
   assert.equal(voice.setup().preparing,true); voice.setup(); assert.equal(launches,1);
@@ -130,4 +130,16 @@ test('shared recognition does not require a separate speech model',t=>{
   assert.equal(controller.state().available,true);
   controller.save({recognition_source:'local'});assert.equal(controller.state().available,false);
   controller.save({recognition_source:'recall'});assert.equal(controller.state().available,true);
+});
+
+test('voice preferences are bounded and Kokoro requires its own complete model',t=>{
+ const base=voiceDefaults('/example');
+ for(const patch of [{tts_speed:.59},{tts_speed:1.51},{tts_speed:NaN},{tts_speed:'1'},{piper_noise_scale:-.1},{piper_noise_scale:1.1},{tts_backend:'remote'},{kokoro_voice:'unknown'}])assert.throws(()=>normalizeVoiceConfig(patch,base));
+ const next=normalizeVoiceConfig({tts_backend:'kokoro',kokoro_voice:'af_bella',tts_speed:1.2,piper_noise_scale:.5},base);
+ assert.equal(voiceModelLabels(next).tts,'Kokoro Bella · English');assert.ok(voiceToml(next).includes('tts_speed = 1.2'));
+ const dir=mkdtempSync(join(tmpdir(),'nx-voice-kokoro-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));installFixture(dir);
+ const controller=createVoiceController({userData:join(dir,'data'),home:dir,runtime:dir});
+ controller.save({tts_backend:'kokoro'});assert.equal(controller.state().available,false);assert.equal(controller.state().voiceModels.piper,true);
+ for(const name of ['model.onnx','voices.bin','tokens.txt','lexicon-us-en.txt','espeak-ng-data/phontab'])touch(join(voiceDefaults(dir).kokoro_model_dir,name));
+ assert.equal(controller.state().available,true);assert.equal(controller.state().voiceModels.kokoro,true);
 });

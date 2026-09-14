@@ -812,9 +812,17 @@ impl Pipeline {
             reason,
         });
 
+        let names = self
+            .store
+            .lock()
+            .ok()
+            .and_then(|s| crate::vocab::name_assistance(&s).ok());
         let Some(analyzer) = &mut self.analyzer else {
             return;
         };
+        if let Some((enabled, terms)) = names {
+            analyzer.configure_name_assistance(enabled, terms);
+        }
         match analyzer.set_light(&models, want_light) {
             Ok(true) => {
                 info!(
