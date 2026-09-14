@@ -1,7 +1,7 @@
 import time
 import unittest
 
-from nx_recall_voice.recall import RecallClient, RecognitionUnavailable, _recognized
+from nx_recall_voice.recall import RecallClient, RecallError, RecognitionUnavailable, _recognized
 
 
 async def verified_input():
@@ -30,7 +30,7 @@ class SharedRecognitionTests(unittest.IsolatedAsyncioTestCase):
                     return {'enabled': True, 'active': True, 'device': device}
                 if method == 'devices.list':
                     return {'devices': [{'node_name': 'test-mic', 'is_default': True}]}
-                if method == 'transcript':
+                if method == 'voice.transcript':
                     reply = replies[min(self.reads, len(replies) - 1)]
                     self.reads += 1
                     return {'segments': reply}
@@ -65,7 +65,65 @@ class SharedRecognitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['segment_ids'], [7, 8])
         self.assertEqual(self.reads, 4)
         self.assertEqual(list(client.recognized_ids), [7, 8])
-        self.assertTrue(all(params['source'] == 'vesktop' for method, params in self.calls if method == 'transcript'))
+        self.assertTrue(all(params['source'] == 'vesktop' for method, params in self.calls if method == 'voice.transcript'))
+
+    async def test_canonical_id_is_consumed_once_across_verified_sources(self):
+        # Native voice.transcript retains canonical ID while projecting the exact
+        # observed source and its interval; no Python fallback to mic is allowed.
+        self.row.update(canonical_source='mic', canonical_segment_id=7,
+                        provenance='confirmed_mic_audio', audio_correlation=.99)
+        client = self.client([[self.row]])
+        first = await client.recognize(self.start, self.end, source='vesktop',
+                                       input_guard=verified_input, wait_seconds=1)
+        self.assertEqual(first['segment_ids'], [7])
+        self.row['source'] = 'mic'
+        with self.assertRaises(RecognitionUnavailable) as caught:
+            await client.recognize(self.start, self.end, source='mic',
+                                   capture_source='test-mic', wait_seconds=.1)
+        self.assertEqual(caught.exception.code, 'timeout')
+        self.assertEqual(list(client.recognized_ids), [7])
+
+    async def test_canonical_mic_row_does_not_substitute_for_observed_virtual_source(self):
+        client = self.client([[dict(self.row, source='mic')]])
+        with self.assertRaises(RecognitionUnavailable) as caught:
+            await client.recognize(self.start, self.end, source='vesktop',
+                                   input_guard=verified_input, wait_seconds=.1)
+        self.assertEqual(caught.exception.code, 'timeout')
+        queries = [params for method, params in self.calls if method == 'voice.transcript']
+        self.assertTrue(queries)
+        self.assertTrue(all(params['source'] == 'vesktop' for params in queries))
+        self.assertFalse(any(method == 'transcript' for method, _ in self.calls))
+
+    async def test_source_binding_must_remain_valid_until_stable_read(self):
+        client = self.client([[self.row]])
+        checks = iter([True, False])
+        async def guard():
+            return next(checks)
+        with self.assertRaises(RecognitionUnavailable) as caught:
+            await client.recognize(self.start, self.end, source='vesktop', input_guard=guard, wait_seconds=1)
+        self.assertEqual(caught.exception.code, 'input_mismatch')
+        self.assertEqual(self.reads, 1)
+        self.assertFalse(client.recognized_ids)
+
+    async def test_old_native_rpc_fails_explicitly_without_legacy_fallback(self):
+        client = RecallClient()
+        calls = []
+        async def session(operation):
+            async def call(method, params, ident):
+                calls.append(method)
+                if method == 'status':
+                    return {'paused': False}
+                if method == 'sources.list':
+                    return {'sources': [{'match_key': 'vesktop', 'allowed': True, 'streams': 1}]}
+                if method == 'voice.transcript':
+                    raise RecallError('unsupported method')
+                self.fail(method)
+            return await operation(call)
+        client._session = session
+        with self.assertRaises(RecognitionUnavailable) as caught:
+            await client.recognize(self.start, self.end, source='vesktop', input_guard=verified_input)
+        self.assertEqual(caught.exception.code, 'unavailable')
+        self.assertEqual(calls, ['status', 'sources.list', 'voice.transcript'])
 
     async def test_microphone_matches_explicit_pin_or_resolved_default(self):
         for device in ('test-mic', None):
@@ -83,7 +141,7 @@ class SharedRecognitionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RecognitionUnavailable) as caught:
                 await client.recognize(self.start, self.end, source=source, capture_source=capture, input_guard=verified_input, wait_seconds=1)
             self.assertEqual(caught.exception.code, code)
-            self.assertFalse(any(m == 'transcript' for m, _ in self.calls))
+            self.assertFalse(any(m == 'voice.transcript' for m, _ in self.calls))
 
     async def test_missing_or_unrelated_transcript_times_out_without_text(self):
         client = self.client([[dict(self.row, source='discord')]])
@@ -100,7 +158,7 @@ class SharedRecognitionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RecognitionUnavailable) as caught:
                 await client.recognize(self.start, self.end, source='vesktop', input_guard=guard)
             self.assertEqual(caught.exception.code, 'input_mismatch')
-            self.assertFalse(any(method == 'transcript' for method, _ in self.calls))
+            self.assertFalse(any(method == 'voice.transcript' for method, _ in self.calls))
 
     async def wrong_binding(self):
         return False

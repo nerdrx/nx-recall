@@ -39,29 +39,36 @@ export function sendVoiceText(socketPath, text) {
 }
 
 // Explicit private read: recognized words never enter state snapshots or Debug logs.
-export function readVoiceHeard(socketPath) {
+export function readVoiceHeard(socketPath, request = {type:'heard'}) {
   return new Promise((resolve, reject) => {
     const socket = createConnection(socketPath); socket.setEncoding('utf8');
     let buffer = '', settled = false;
     const finish = (error, heard) => {
       if (settled) return; settled = true; socket.destroy();
-      error ? reject(new Error(error)) : resolve({ok:true, heard});
+      error ? reject(new Error(error)) : resolve(request.type === 'heard' ? {ok:true, heard} : heard);
     };
-    socket.setTimeout(2000, () => finish('Heard words are temporarily unavailable.'));
-    socket.once('connect', () => socket.write(JSON.stringify({type:'heard'}) + '\n'));
+    socket.setTimeout(request.type === 'heard' ? 2000 : 7000, () => finish('Heard words are temporarily unavailable.'));
+    socket.once('connect', () => socket.write(JSON.stringify(request) + '\n'));
     socket.on('data', chunk => {
       buffer += chunk;
-      if (Buffer.byteLength(buffer) > 98304) return finish('Invalid heard-words response.');
+      if (Buffer.byteLength(buffer) > 196608) return finish('Invalid heard-words response.');
       if (!buffer.includes('\n')) return;
       try {
         const result = JSON.parse(buffer.slice(0, buffer.indexOf('\n')));
+        if (request.type === 'correct_heard') {
+          if (result.ok === true && result.saved === true) return finish(null, {ok:true,saved:true});
+          return finish(({heard_expired:'This turn has expired. Copy your correction before closing it.',busy:'Another correction is saving. Try again.',save_failed:'Recall could not save this correction. Try again.',invalid_request:'Enter a correction of 1–2000 characters.'})[result.error] || 'Could not save this correction.');
+        }
         if (result.ok !== true || !Array.isArray(result.heard) || result.heard.length > 6) throw new Error();
         const heard = result.heard.map(row => {
           if (!row || typeof row.text !== 'string' || [...row.text].length > 2000 ||
               !Number.isFinite(row.timestamp) || row.timestamp <= 0 ||
               !['recall','local'].includes(row.source) || typeof row.wake_detected !== 'boolean' ||
               !['reply','wake_name_missing','no_words'].includes(row.decision)) throw new Error();
-          return {text:row.text,timestamp:row.timestamp,source:row.source,wake_detected:row.wake_detected,decision:row.decision};
+          if (row.id !== undefined && (typeof row.id !== 'string' || !/^[0-9a-f]{32}$/.test(row.id))) throw new Error();
+          if (row.corrected_text !== undefined && (typeof row.corrected_text !== 'string' || [...row.corrected_text].length > 2000)) throw new Error();
+          return {text:row.text,timestamp:row.timestamp,source:row.source,wake_detected:row.wake_detected,decision:row.decision,
+            ...(row.id ? {id:row.id} : {}), ...(row.corrected_text !== undefined ? {corrected_text:row.corrected_text} : {})};
         });
         finish(null, heard);
       } catch { finish('Invalid heard-words response.'); }
@@ -69,6 +76,14 @@ export function readVoiceHeard(socketPath) {
     socket.once('error', () => finish('Heard words are temporarily unavailable.'));
     socket.once('end', () => finish('Heard words are temporarily unavailable.'));
   });
+}
+
+export function correctVoiceHeard(socketPath, id, text) {
+  if (typeof id !== 'string' || !/^[0-9a-f]{32}$/.test(id) || typeof text !== 'string' || !text.trim() || [...text].length > 2000)
+    return Promise.reject(new Error('Enter a correction of 1–2000 characters.'));
+  const request = {type:'correct_heard',id,text:text.trim()};
+  if (Buffer.byteLength(JSON.stringify(request)+'\n') > 8192) return Promise.reject(new Error('This correction is too long.'));
+  return readVoiceHeard(socketPath, request);
 }
 
 export function voiceDefaults(home = homedir()) {
@@ -268,6 +283,10 @@ export function createVoiceController({ userData, home = homedir(), runtime = pr
     const result=await sendText(join(runtime,'nx-recall-voice/control.sock'),text);
     record('typed_reply_received'); return result;
   }
+  async function correctHeard(id, text) {
+    if (!child || stopping) throw new Error('Start Lanalu before correcting a heard turn.');
+    return correctVoiceHeard(join(runtime,'nx-recall-voice/control.sock'), id, text);
+  }
   async function heard() {
     const worker = child;
     if (!worker || stopping) return {ok:true,heard:[]};
@@ -281,5 +300,5 @@ export function createVoiceController({ userData, home = homedir(), runtime = pr
       state:snapshot.status?.event || (child?'starting':'stopped'),connected:snapshot.status?.connected || false,
       lastError,recognition_source:snapshot.status?.recognition_source || config.recognition_source,recognition_error:snapshot.status?.recognition_error || null,recognition_wait_ms:snapshot.status?.recognition_wait_ms ?? null,audio_ready:!!snapshot.status?.audio_ready,error_stage:snapshot.status?.error_stage || null,lastUpdated:snapshot.status?.updated_at || null, routes:snapshot.status?.routes || null, retry_seconds:snapshot.status?.retry_seconds ?? null, latency_ms:snapshot.status?.latency_ms ?? null, input_kind:snapshot.status?.input_kind || null,events:[...events]};
   }
-  return { state, save, devices, start, setup, stop, send, heard, debug };
+  return { state, save, devices, start, setup, stop, send, heard, correctHeard, debug };
 }

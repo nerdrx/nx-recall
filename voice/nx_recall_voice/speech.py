@@ -6,6 +6,8 @@ conversation audio or transcript is stored. Models load lazily and remain hot.
 import asyncio
 import json
 import math
+import re
+import time
 from pathlib import Path
 import subprocess
 import threading
@@ -18,6 +20,32 @@ DEFAULT_KOKORO = DEFAULT_TTS.parent / "kokoro-multi-lang-v1_0"
 # IDs from the publisher's v1.0 voice map; never infer IDs across model versions.
 KOKORO_VOICES = {"af_heart": 3, "af_bella": 2, "af_sarah": 9, "af_nicole": 6}
 
+
+
+def name_only_edit(original, alternative, terms):
+    """Same conservative one-name gate as recalld::name_assistance."""
+    matches = list(re.finditer(r'\S+', original))
+    norm = lambda word: ''.join(c.lower() for c in word if c.isalnum())
+    before = [norm(m.group()) for m in matches]
+    after = [norm(w) for w in alternative.split()]
+    prefix = 0
+    while prefix < min(len(before), len(after)) and before[prefix] == after[prefix]:
+        prefix += 1
+    suffix = 0
+    while suffix < min(len(before)-prefix, len(after)-prefix) and before[-suffix-1] == after[-suffix-1]:
+        suffix += 1
+    old_end, new_end = len(before)-suffix, len(after)-suffix
+    if not 1 <= old_end-prefix <= 3 or new_end-prefix != 1:
+        return original
+    name = next((t for t in terms if norm(t) == after[prefix]), None)
+    if name is None:
+        return original
+    first, last = matches[prefix], matches[old_end-1]
+    leading = next((i for i,c in enumerate(first.group()) if c.isalnum()), None)
+    trailing = next((i for i in range(len(last.group())-1,-1,-1) if last.group()[i].isalnum()), None)
+    if leading is None or trailing is None:
+        return original
+    return original[:first.start()+leading] + name + original[last.start()+trailing+1:]
 
 
 def resample(pcm: bytes, source_rate: int, target_rate: int) -> bytes:
@@ -59,11 +87,44 @@ class Speech:
         self.tts_threads = max(1, min(8, int(config.get("tts_threads", tts_default))))
         self.max_seconds = min(60, max(1, float(config.get("max_utterance_seconds", 20))))
         self.recognizer = None
+        self.name_hints = ()
+        self.hint_terms = ()
+        self.hint_recognizer = None
+        self.hint_retry_at = 0.0
         self.voice = None
         # A cancelled asyncio.to_thread keeps running; locks protect native models
         # when the next utterance arrives before previous inference has completed.
         self.stt_lock = threading.Lock()
         self.tts_lock = threading.Lock()
+
+    def set_name_hints(self, terms):
+        self.name_hints = tuple(dict.fromkeys(t for t in terms if isinstance(t, str)
+                                and t.isascii() and t.isalpha() and 3 <= len(t) <= 32 and t[0].isupper()))[:8]
+
+    def _refine_names(self, samples, original):
+        # Called under stt_lock: cancelled turns cannot race native decoders.
+        terms = self.name_hints
+        if terms != self.hint_terms:
+            self.hint_terms, self.hint_recognizer, self.hint_retry_at = terms, None, 0.0
+        words = {''.join(c.lower() for c in w if c.isalnum()) for w in original.split()}
+        if not terms or not original or len(original) > 2000 or not 4000 <= len(samples) <= 240000 or any(t.lower() in words for t in terms):
+            return original
+        try:
+            if self.hint_recognizer is None:
+                if time.monotonic() < self.hint_retry_at:
+                    return original
+                from .name_assistance import build_recognizer
+                self.hint_retry_at = time.monotonic() + 30
+                self.hint_recognizer = build_recognizer(dict(terms=list(terms), threads=self.threads,
+                    **{key:str(self.stt_path/file) for key,file in dict(encoder='encoder.int8.onnx',decoder='decoder.int8.onnx',joiner='joiner.int8.onnx',tokens='tokens.txt').items()}))
+            stream = self.hint_recognizer.create_stream()
+            stream.accept_waveform(16000, samples)
+            self.hint_recognizer.decode_stream(stream)
+            return name_only_edit(original, stream.result.text, terms)
+        except Exception:
+            self.hint_recognizer = None
+            self.hint_retry_at = time.monotonic() + 30
+            return original
 
     async def transcribe(self, pcm_24k_mono: bytes) -> str:
         if len(pcm_24k_mono) % 2:
@@ -93,7 +154,7 @@ class Speech:
             stream = self.recognizer.create_stream()
             stream.accept_waveform(16000, samples)
             self.recognizer.decode_stream(stream)
-            return stream.result.text.strip()
+            return self._refine_names(samples, stream.result.text.strip())
 
     async def synthesize(self, text: str) -> bytes:
         if not text.strip():

@@ -135,10 +135,12 @@ pub mod turns;
 pub mod turnsplit;
 // ---- end 0.12.4 -----------------------------------------------------------
 // ---- 0.10.0, worlds and turn-taking --------------------------------------
+pub mod duplicate_audio;
 /// Turn-taking statistics: how a person talks (0.10.0).
 pub mod turntaking;
 pub mod vad;
 pub mod vocab;
+pub mod voice_duplicates;
 /// World memory: where a conversation happened (0.10.0).
 pub mod worlds;
 // ---- end 0.10.0 ----------------------------------------------------------

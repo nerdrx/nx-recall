@@ -32,6 +32,7 @@ contextBridge.exposeInMainWorld("recall", {
     state: () => ipcRenderer.invoke("recall:voice:state"),
     devices: () => ipcRenderer.invoke("recall:voice:devices"),
     save: (patch) => ipcRenderer.invoke("recall:voice:save", patch),
+    correctHeard: (id, text) => ipcRenderer.invoke("recall:voice:correctHeard", id, text),
     heard: () => ipcRenderer.invoke("recall:voice:heard"),
     send: (text) => ipcRenderer.invoke("recall:voice:send", text),
     debug: () => ipcRenderer.invoke("recall:voice:debug"),

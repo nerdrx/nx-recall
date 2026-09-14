@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.19.0 — Hear it, correct it, keep it once
+
+- Show live input and reply meters in Lanalu’s tab, with clearer virtual device names and connection instructions. Meters distinguish received sound from connected-but-silent routing.
+- Show the last six recognized voice turns, including missed wake names, in a private recent-turn view.
+- Correct heard words inline with nearby save feedback and draft preservation. Save labeled examples in Recall without rewriting original transcripts or replaying a reply.
+- Let both shared and separate recognition use trusted-name assistance. Ordinary phrases are not added as wake aliases.
+- Add opt-in, source-specific suppression of strongly confirmed microphone copies in new recordings, preserving a lightweight source observation for shared recognition. Keep uncertain, overlapping and source-first captures.
+- Redesign the README with a new cover, concise product tour and chibi Lanalu artwork.
+
 ## 0.18.3 — A voice that feels closer
 
 - Add four optional local Kokoro voices, speaking-speed controls, and Amy synthesis variation. Models download only during explicit setup.

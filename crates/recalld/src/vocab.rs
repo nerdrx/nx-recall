@@ -293,9 +293,42 @@ pub fn remember_corrected_names(store: &Store, before: &str, after: &str) -> Res
     Ok(())
 }
 
+/// Lanalu is an explicit product name, so a heard-turn correction can teach
+/// that spelling without asking the user to mislabel a real speaker as Lanalu.
+pub fn remember_heard_names(store: &Store, before: &str, after: &str) -> Result<()> {
+    remember_corrected_names(store, before, after)?;
+    let has_lanalu = |text: &str| {
+        text.split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|word| word.eq_ignore_ascii_case("lanalu"))
+    };
+    if has_lanalu(after) && !has_lanalu(before) {
+        let mut names: Vec<String> = store
+            .setting(CORRECTED_NAMES_KEY)?
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        names.retain(|name| !name.eq_ignore_ascii_case("Lanalu"));
+        names.insert(0, "Lanalu".into());
+        names.truncate(8);
+        store.set_setting(CORRECTED_NAMES_KEY, &serde_json::to_string(&names)?)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heard_names_only_accept_the_explicit_whole_product_name() {
+        let store = Store::open_in_memory().unwrap();
+        for text in ["nonono", "no no no", "Lanaluv", "x_Lanalu", "Lana lu"] {
+            remember_heard_names(&store, "wrong", text).unwrap();
+            assert!(name_assistance(&store).unwrap().1.is_empty());
+        }
+        remember_heard_names(&store, "la nalu", "Hello, LANALU!").unwrap();
+        assert_eq!(name_assistance(&store).unwrap().1, vec!["Lanalu"]);
+        assert!(store.named_speakers().unwrap().is_empty());
+    }
 
     #[test]
     fn automatic_hints_require_an_actual_named_person() {

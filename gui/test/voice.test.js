@@ -18,6 +18,9 @@ test('heard turns are bounded newest-first with explicit wake decisions', () => 
   assert.equal(malformed.text.length,2000);assert.equal(malformed.timestamp,null);assert.equal(malformed.source,'Recognition');
   assert.equal(heardRows([{decision:'reply'}])[0].decision,'Passed to Lanalu');
   assert.equal(heardRows([{decision:'no_words'}])[0].decision,'No words recognized');
+  const [editable]=heardRows([{id:'a'.repeat(32),text:'nonono',corrected_text:'Lanalu'}]);
+  assert.equal(editable.id,'a'.repeat(32));assert.equal(editable.text,'nonono');assert.equal(editable.correctedText,'Lanalu');
+  assert.equal(heardRows([{id:'invalid'}])[0].id,null);
 });
 
 test('voice meters distinguish actual audio, silence, stale input and stopped workers', () => {

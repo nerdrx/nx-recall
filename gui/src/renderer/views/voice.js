@@ -34,7 +34,9 @@ export function voiceAudioLevels(state, now = Date.now() / 1000) {
 export function heardRows(heard) {
   if (!Array.isArray(heard)) return [];
   return heard.slice(-6).reverse().map(item => ({
+    id: typeof item?.id === 'string' && /^[a-f0-9]{32}$/.test(item.id) ? item.id : null,
     text: typeof item?.text === 'string' ? item.text.slice(0,2000) : '',
+    correctedText: typeof item?.corrected_text === 'string' ? item.corrected_text.slice(0,2000) : '',
     source: item?.source === 'recall' ? 'Recall recognition' : item?.source === 'local' ? 'Separate recognition' : 'Recognition',
     timestamp: Number.isFinite(item?.timestamp) && item.timestamp > 0 && item.timestamp < 8640000000000 ? item.timestamp : null,
     decision: ({reply:'Passed to Lanalu',wake_name_missing:'Wake name missed — no reply',no_words:'No words recognized'})[item?.decision] || 'Recognition received',
@@ -73,17 +75,70 @@ export function mountVoice(api = window.recall.voice) {
   const heardList = h('div', {id:'lanalu-heard-list',class:'lanalu-heard-list'});
   const heardState = h('p', {id:'lanalu-heard-state',class:'sub',role:'status','aria-live':'polite'});
   const heardCard = h('section', {class:'card',id:'lanalu-heard'},h('h3',{class:'card-title',text:'What Lanalu heard'}),
-    h('p',{class:'sub',text:'The last six recognized turns, newest first. Check the words and whether the wake name passed. This view clears when Local Voice stops; Recall’s saved transcript is separate.'}),heardState,heardList);
-  let heardSignature = '';
-  function clearHeard(text) { heardList.replaceChildren(); heardSignature = ''; heardState.textContent = text; }
+    h('p',{class:'sub',text:'The last six recognized turns, newest first. This view clears when Local Voice stops. Saved corrections remain in Recall and can supply trusted name hints; they do not train model weights or resend a reply.'}),heardState,heardList);
+  const heardEntries = new Map();
+  let correctionPending = null;
+  function updateCorrectionControls() {
+    for (const entry of heardEntries.values()) {
+      entry.edit.disabled = !!correctionPending || entry.expired;
+      entry.save.disabled = !!correctionPending || entry.expired;
+      entry.cancel.disabled = correctionPending === entry;
+      entry.draft.disabled = correctionPending === entry;
+    }
+  }
+  function clearHeard(text, retainDrafts = false) {
+    for (const [key,entry] of heardEntries) {
+      if (retainDrafts && !entry.editor.hidden) { entry.expired=true; entry.feedback.textContent='Connection unavailable. Your draft is kept here; wait for this turn to reconnect.'; }
+      else { entry.article.remove(); heardEntries.delete(key); }
+    }
+    updateCorrectionControls(); heardState.textContent = text;
+  }
+  function createHeardEntry(row) {
+    const entry = {row,expired:false};
+    entry.meta=h('p',{class:'sub'}); entry.original=h('p',{class:'lanalu-heard-text'});
+    entry.corrected=h('p',{class:'lanalu-heard-corrected',hidden:true});entry.decision=h('p',{class:'sub'});
+    entry.feedback=h('p',{class:'sub',role:'status','aria-live':'polite'});
+    entry.draft=h('textarea',{class:'input',rows:2,maxlength:2000,'aria-label':'Corrected words'});
+    entry.cancel=h('button',{class:'btn',text:'Cancel',onclick:()=>{entry.editor.hidden=true;entry.edit.hidden=!entry.row.id;entry.feedback.textContent='';if(entry.expired){entry.article.remove();heardEntries.delete(entry.row.id);} }});
+    entry.save=h('button',{class:'btn primary',text:'Save correction',onclick:async()=>{
+      if (correctionPending || entry.expired) return;
+      const text=entry.draft.value.trim();
+      if (!text) {entry.feedback.textContent='Enter the corrected words first.';return;}
+      correctionPending=entry;entry.feedback.textContent='Saving correction…';updateCorrectionControls();
+      try {
+        const result=await api.correctHeard(entry.row.id,text);
+        if (result?.ok!==true) throw new Error('Correction could not be saved.');
+        if (!destroyed && heardEntries.get(entry.row.id)===entry) {
+          entry.row.correctedText=text;entry.corrected.textContent='Corrected spelling: '+text;entry.corrected.hidden=false;
+          entry.editor.hidden=true;entry.edit.hidden=false;entry.feedback.textContent='Correction saved. Original words and wake decision are unchanged.';
+        }
+      } catch (failure) { if (!destroyed && heardEntries.get(entry.row.id)===entry) entry.feedback.textContent=entry.expired?'This turn expired. Your draft is kept here; it was not applied to another turn.':(failure?.message || 'Correction could not be saved. Your draft is kept here.'); }
+      finally {if(correctionPending===entry)correctionPending=null;updateCorrectionControls();}
+    }});
+    entry.editor=h('div',{class:'lanalu-heard-editor',hidden:true},entry.draft,h('div',{class:'voice-actions'},entry.save,entry.cancel));
+    entry.edit=h('button',{class:'btn',text:'Correct words',hidden:!row.id,onclick:()=>{entry.draft.value=entry.row.correctedText||entry.row.text;entry.editor.hidden=false;entry.edit.hidden=true;entry.feedback.textContent='';entry.draft.focus();}});
+    entry.article=h('article',{class:'lanalu-heard-turn',dataset:{heardId:row.id||''}},entry.meta,entry.original,entry.corrected,entry.decision,entry.edit,entry.editor,entry.feedback);
+    return entry;
+  }
   function renderHeard(items) {
-    const rows = heardRows(items), signature = JSON.stringify(rows);
+    const rows = heardRows(items), keys = new Set();
     heardState.textContent = rows.length ? 'Recent recognition · not an accuracy score' : 'Waiting for recognized words…';
-    if (signature === heardSignature) return;
-    heardSignature = signature;
-    heardList.replaceChildren(...rows.map(row => h('article', {class:'lanalu-heard-turn'},
-      h('p',{class:'sub'},row.source, row.timestamp ? ' · '+new Date(row.timestamp*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : ''),
-      h('p',{class:'lanalu-heard-text',text:row.text || 'No words recognized.'}),h('p',{class:'sub',text:row.decision}))));
+    rows.forEach((row,index)=>{
+      const key=row.id || JSON.stringify([row.timestamp,row.text,index]);keys.add(key);
+      let entry=heardEntries.get(key);
+      if (!entry) {entry=createHeardEntry(row);heardEntries.set(key,entry);}
+      const expired=entry.expired;entry.expired=false;entry.row={...row,correctedText:row.correctedText||entry.row.correctedText};
+      if(expired)entry.feedback.textContent='Turn reconnected. Your draft is ready to save.';
+      entry.meta.textContent=row.source+(row.timestamp?' · '+new Date(row.timestamp*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}):'');
+      entry.original.textContent=row.text||'No words recognized.';entry.decision.textContent=row.decision;
+      entry.corrected.textContent='Corrected spelling: '+entry.row.correctedText;entry.corrected.hidden=!entry.row.correctedText;
+      if (heardList.children[index]!==entry.article) heardList.insertBefore(entry.article,heardList.children[index]||null);
+    });
+    for(const [key,entry] of heardEntries) if(!keys.has(key)) {
+      if(!entry.editor.hidden) {entry.expired=true;entry.feedback.textContent='This turn expired. Your draft is kept here; it cannot be saved to another turn.';}
+      else {entry.article.remove();heardEntries.delete(key);}
+    }
+    updateCorrectionControls();
   }
   let sending=false;
   const reply=h('div',{id:'lanalu-reply',class:'lanalu-reply',role:'log','aria-live':'polite'});
@@ -234,10 +289,10 @@ export function mountVoice(api = window.recall.voice) {
           if (result?.ok !== true || !Array.isArray(result.heard)) throw new Error('Unavailable');
           renderHeard(result.heard);
         } catch {
-          if (!destroyed && active && ticket === generation && current.running && !current.stopping) clearHeard('Recognized words are unavailable. Open Debug to check Local Voice.');
+          if (!destroyed && active && ticket === generation && current.running && !current.stopping) clearHeard('Recognized words are unavailable. Open Debug to check Local Voice.',true);
         }
       }
-    } catch { if (!destroyed) { error.textContent = 'Local Voice status is unavailable.'; clearHeard('Recognized words are unavailable.'); render(); } }
+    } catch { if (!destroyed) { error.textContent = 'Local Voice status is unavailable.'; clearHeard('Recognized words are unavailable.',true); render(); } }
     finally { if (!destroyed && active && ticket === generation) timer = setTimeout(refresh, 1500); }
   }
   render();

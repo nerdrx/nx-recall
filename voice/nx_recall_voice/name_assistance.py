@@ -31,6 +31,40 @@ def send(connection, payload):
     connection.sendall(struct.pack('!I', len(payload)) + payload)
 
 
+def build_recognizer(config):
+    import sherpa_onnx
+    terms = config['terms']
+    if not isinstance(terms, list) or not 1 <= len(terms) <= 8 or any(
+        not isinstance(t, str) or not 3 <= len(t) <= 32 or not t.isascii() or not t.isalpha()
+        for t in terms
+    ):
+        raise ValueError('invalid hints')
+    paths = {key: Path(config[key]) for key in ('encoder', 'decoder', 'joiner', 'tokens')}
+    if any(not p.is_absolute() or not p.is_file() for p in paths.values()):
+        raise ValueError('missing model')
+    pieces = []
+    for line in paths['tokens'].read_text().splitlines():
+        piece, _, index = line.rpartition(' ')
+        if piece and not piece.startswith('<') and index.isdigit():
+            pieces.append((piece, int(index)))
+    vocabulary = {p for p, _ in pieces}
+    if '▁' not in vocabulary or any(c not in vocabulary for term in terms for c in term):
+        raise ValueError('unsupported hint encoding')
+    with tempfile.TemporaryDirectory(prefix='nx-recall-hint-model-') as directory:
+        vocab = Path(directory) / 'bpe.vocab'
+        hints = Path(directory) / 'names.txt'
+        vocab.write_text(''.join(f'{piece}\t{-index}\n' for piece, index in pieces))
+        hints.write_text('\n'.join(terms) + '\n')
+        recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+            **{key: str(value) for key, value in paths.items()},
+            num_threads=max(1, min(4, int(config.get('threads', 2)))),
+            model_type='nemo_transducer', decoding_method='modified_beam_search',
+            hotwords_file=str(hints), hotwords_score=.7,
+            modeling_unit='bpe', bpe_vocab=str(vocab),
+        )
+    return recognizer
+
+
 def run(path):
     import numpy as np
     import sherpa_onnx
@@ -41,35 +75,7 @@ def run(path):
         if uid != os.getuid():
             raise PermissionError
         config = json.loads(receive(connection, 32768))
-        terms = config['terms']
-        if not isinstance(terms, list) or not 1 <= len(terms) <= 8 or any(
-            not isinstance(t, str) or not 3 <= len(t) <= 32 or not t.isascii() or not t.isalpha()
-            for t in terms
-        ):
-            raise ValueError('invalid hints')
-        paths = {key: Path(config[key]) for key in ('encoder', 'decoder', 'joiner', 'tokens')}
-        if any(not p.is_absolute() or not p.is_file() for p in paths.values()):
-            raise ValueError('missing model')
-        pieces = []
-        for line in paths['tokens'].read_text().splitlines():
-            piece, _, index = line.rpartition(' ')
-            if piece and not piece.startswith('<') and index.isdigit():
-                pieces.append((piece, int(index)))
-        vocabulary = {p for p, _ in pieces}
-        if '▁' not in vocabulary or any(c not in vocabulary for term in terms for c in term):
-            raise ValueError('unsupported hint encoding')
-        with tempfile.TemporaryDirectory(prefix='nx-recall-hint-model-') as directory:
-            vocab = Path(directory) / 'bpe.vocab'
-            hints = Path(directory) / 'names.txt'
-            vocab.write_text(''.join(f'{piece}\t{-index}\n' for piece, index in pieces))
-            hints.write_text('\n'.join(terms) + '\n')
-            recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
-                **{key: str(value) for key, value in paths.items()},
-                num_threads=max(1, min(4, int(config.get('threads', 2)))),
-                model_type='nemo_transducer', decoding_method='modified_beam_search',
-                hotwords_file=str(hints), hotwords_score=.7,
-                modeling_unit='bpe', bpe_vocab=str(vocab),
-            )
+        recognizer = build_recognizer(config)
         send(connection, b'ready')
         # Parent controls idle lifetime; read timeout is only for startup and requests.
         connection.settimeout(None)

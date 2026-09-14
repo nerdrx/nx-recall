@@ -72,6 +72,8 @@ const ALLOWED = new Set([
   // words, and a roster join asks for one person's brief.
   'vocab.get',
   'vocab.set',
+  'voice.dedup.get',
+  'voice.dedup.set',
   'accuracy.summary',
   'saved.searches.list',
   'saved.searches.save',
@@ -206,6 +208,7 @@ export function registerIpc({ voice, openVoiceDebug, request, setPaused, getStat
   ipcMain.handle('recall:voice:state', () => voice.state());
   ipcMain.handle('recall:voice:devices', () => voice.devices());
   ipcMain.handle('recall:voice:save', (_e, patch) => voice.save(patch));
+  ipcMain.handle('recall:voice:correctHeard', (_e, id, text) => voice.correctHeard(id, text));
   ipcMain.handle('recall:voice:heard', () => voice.heard());
   ipcMain.handle('recall:voice:send', (_e, text) => voice.send(text));
   ipcMain.handle('recall:voice:debug', () => voice.debug());

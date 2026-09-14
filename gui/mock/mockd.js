@@ -3833,6 +3833,13 @@ export function startMock({
 
     'vocab.get': () => vocabPayload(),
 
+    'voice.dedup.get': () => ({sources:state.voiceDedupSources||[],policy:'confirmed_mic_audio_only'}),
+    'voice.dedup.set'(params) {
+      if(!Array.isArray(params.sources)||params.sources.length>16||params.sources.some(key=>typeof key!=='string'||!key||['mic','room'].includes(key)))throw err('bad_params','Expected application source keys');
+      state.voiceDedupSources=[...new Set(params.sources)];
+      return {sources:state.voiceDedupSources,policy:'confirmed_mic_audio_only'};
+    },
+
     'vocab.set'(params) {
       if (params.name_assistance_enabled !== undefined && typeof params.name_assistance_enabled !== 'boolean') throw err('bad_params', 'Name assistance must be on or off');
       const raw = params?.terms ?? state.vocab.user;

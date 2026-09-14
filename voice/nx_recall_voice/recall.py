@@ -1,7 +1,7 @@
-"""Read-only NX Recall retrieval over its local Unix socket.
+"""NX Recall retrieval and explicit heard-word corrections over its local Unix socket.
 
 Returned transcripts are untrusted reference material, never model instructions.
-No recording controls, database access, cloud service, or transcript logging.
+No recording controls, direct database access, cloud service, or transcript logging.
 """
 import asyncio
 from datetime import datetime, timezone
@@ -183,6 +183,46 @@ class RecallClient:
         self.semantic = semantic
         self.recognized_ids = deque(maxlen=128)
 
+    async def name_assistance(self):
+        async def operation(call):
+            result = await call('vocab.name_assistance', {}, 1)
+            terms = result.get('terms')
+            if (type(result.get('enabled')) is not bool or not isinstance(terms, list)
+                    or len(terms) > 8 or any(not isinstance(term, str) or
+                    not re.fullmatch(r'[A-Z][a-zA-Z]{2,31}', term) for term in terms)):
+                raise RecallError("Invalid name assistance response")
+            return terms if result['enabled'] else []
+        try:
+            async with asyncio.timeout(min(1.0, self.timeout)):
+                return await self._session(operation)
+        except (RecallError, OSError, TimeoutError, ValueError, UnicodeError):
+            return []
+
+    async def correct_heard(self, original_text, text, source):
+        if (source not in ('recall', 'local') or
+                not isinstance(original_text, str) or len(original_text) > 2000
+                or not isinstance(text, str) or not text.strip() or len(text) > 2000):
+            raise ValueError("Invalid heard correction")
+        async def operation(call):
+            result = await call('voice.correct_heard',
+                                {'original_text': original_text, 'text': text, 'source': source}, 1)
+            names = result.get('names')
+            if (result.get('saved') is not True or not isinstance(names, list) or len(names) > 8
+                    or any(not isinstance(name, str) or len(name) > 100 for name in names)):
+                raise RecallError("Invalid correction response")
+            response = {'saved': True, 'names': names}
+            ident = result.get('correction_id')
+            if isinstance(ident, str) and len(ident) <= 100:
+                response['correction_id'] = ident
+            return response
+        try:
+            async with asyncio.timeout(self.timeout):
+                return await self._session(operation)
+        except RecallError:
+            raise
+        except (OSError, TimeoutError, ValueError, UnicodeError):
+            raise RecallError("NX Recall could not save the correction") from None
+
     async def retrieve(self, query, limit=4):
         """Return at most eight excerpts, each 1500 chars, 6000 chars total.
 
@@ -314,7 +354,10 @@ class RecallClient:
                         raise RecognitionUnavailable('ambiguous_source')
                 # The wider READ can diagnose clock/segmentation disagreement;
                 # admission remains bounded by the actual observed audio window.
-                reply = await rpc('transcript', {'source': source, 'from': window[0] - 5_000_000_000,
+                # Native lookup projects verified duplicate observations onto the
+                # requested source while retaining the canonical segment ID.
+                # Never substitute unrelated microphone transcript rows here.
+                reply = await rpc('voice.transcript', {'source': source, 'from': window[0] - 5_000_000_000,
                                                  'to': window[1] + 5_000_000_001, 'limit': 64})
                 segments = reply.get('segments')
                 candidates = []

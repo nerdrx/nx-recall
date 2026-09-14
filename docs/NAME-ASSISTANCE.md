@@ -6,8 +6,12 @@ It is not model-weight training. The normal recognizer still produces the baseli
 
 Explicit glossary names can be used directly. Future transcript corrections can add a name when the spelling matches an already named person. Speaker labels identify people; changing a speaker label alone does not train the speech decoder. Only short alphabetic ASCII names are currently eligible, with at most eight active hints. Ordinary corrected words are not automatically learned as names.
 
+Heard-turn corrections can also be saved from **Lanalu → What Lanalu heard → Correct words**. Recall keeps up to 200 labeled examples without rewriting the archived transcript. An explicit correction to the whole name “Lanalu” adds its canonical spelling to the trusted-name cache. It does not turn “nonono” into a wake alias.
+
 The refinement uses the selected recognition weights through the optional local voice Python runtime. It runs in an isolated helper because the bundled native recognition library does not support the required decoding mode. Private local IPC carries bounded audio and text; no cloud inference or account credentials are involved. Missing runtime, unsupported input, helper failure or timeout keeps the original recognized text.
 
 The feature adds a second recognition pass to eligible clips of at most 15 seconds, so it uses additional CPU and memory. Disable it if the extra processing is not useful on your machine. It does not reprocess or rewrite old transcripts automatically.
 
 A small development check used six difficult corrected “Lanalu” clips and 29 negative/control clips. Conservative name-only refinement recovered the name in two target clips and left the controls unchanged. These selected samples are preliminary evidence, not an accuracy guarantee for other people, names, accents or recordings.
+
+The separate Local Voice recognizer also reads this setting before each turn and can run the same conservative name-only refinement using its own Parakeet model. Disabled hints or an unavailable settings service keep ordinary recognition. Optional refinement errors preserve the original words. This adds model memory and a second pass; it does not guarantee correct recognition.

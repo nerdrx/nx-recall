@@ -1,8 +1,10 @@
 """Same-user, bounded local text input. Conversation text is never logged."""
 import asyncio
 from dataclasses import dataclass
+from .recall import RecallClient, RecallError
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import stat
@@ -22,6 +24,7 @@ class Control:
         self.status = status
         self.server = None
         self.clients = set()
+        self.correction_lock = asyncio.Lock()
 
     async def start(self):
         folder = self.path.parent
@@ -35,6 +38,26 @@ class Control:
             self.path.unlink()
         self.server = await asyncio.start_unix_server(self.handle, path=self.path, limit=8192)
         self.path.chmod(0o600)
+
+    async def correct_heard(self, data):
+        ident, text = data.get('id'), data.get('text')
+        if (set(data) != {'type', 'id', 'text'} or not isinstance(ident, str)
+                or not re.fullmatch(r'[0-9a-f]{32}', ident) or not isinstance(text, str)
+                or not text.strip() or len(text) > 2000):
+            return {'ok': False, 'error': 'invalid_request'}
+        if self.correction_lock.locked():
+            return {'ok': False, 'error': 'busy'}
+        async with self.correction_lock:
+            lookup = getattr(self.status, 'heard_turn', None)
+            turn = lookup(ident) if callable(lookup) else None
+            if turn is None:
+                return {'ok': False, 'error': 'heard_expired'}
+            try:
+                saved = await RecallClient().correct_heard(turn['text'], text.strip(), turn['source'])
+            except (RecallError, ValueError):
+                return {'ok': False, 'error': 'save_failed'}
+            self.status.corrected_heard(ident, text.strip())
+            return {'ok': True, **saved}
 
     async def handle(self, reader, writer):
         task = asyncio.current_task()
@@ -58,6 +81,8 @@ class Control:
                 if isinstance(data, dict) and data == {'type': 'heard'}:
                     snapshot = getattr(self.status, 'heard', None)
                     result = {'ok': True, 'heard': snapshot() if callable(snapshot) else []}
+                elif isinstance(data, dict) and data.get('type') == 'correct_heard':
+                    result = await self.correct_heard(data)
                 elif not isinstance(text, str) or not text.strip() or len(text) > 2000 or data.get('type') != 'text':
                     raise ValueError('Invalid request')
                 elif not self.status.data.get('connected'):

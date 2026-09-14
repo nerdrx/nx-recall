@@ -164,7 +164,8 @@ use crate::threads::{OpenThread, RECENT_SPEAKERS, Threader, Turn};
 // Schema23 adds saved collections and an indexed chronological history walk.
 // Schema24 adds revision-guarded review state referencing source segments.
 // Migration helpers complete before the stored schema version is advanced.
-pub const SCHEMA_VERSION: i64 = 24;
+// Schema25 preserves source observations when confirmed microphone copies are suppressed.
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// `sources.kind` for an application playback stream — the only kind before v4.
 pub const KIND_APP: &str = "app";
@@ -1558,6 +1559,7 @@ impl Store {
         crate::saved::migrate_v22(&self.conn)?;
         crate::saved::migrate_v23(&self.conn)?;
         crate::review::migrate_v24(&self.conn)?;
+        crate::voice_duplicates::migrate(&self.conn)?;
         // ---- end 0.14.0 ------------------------------------------------------
 
         match current {

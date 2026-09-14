@@ -14,6 +14,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RecallClient } from '../src/main/client.js';
 import { startMock } from '../mock/mockd.js';
+import { dedupSourceSelection } from '../src/renderer/views/sources.js';
+
+test('microphone-copy opt-in preserves other application selections',()=>{
+  const original=['first','second'];
+  assert.deepEqual(dedupSourceSelection(original,'third',true),['first','second','third']);
+  assert.deepEqual(dedupSourceSelection(original,'second',true),original);
+  assert.deepEqual(dedupSourceSelection(original,'first',false),['second']);
+  assert.deepEqual(original,['first','second']);
+});
 
 let n = 0;
 const sockPath = () => join(tmpdir(), `nx-recall-sources-${process.pid}-${++n}.sock`);

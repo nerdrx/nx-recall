@@ -216,6 +216,14 @@ async def run_local(config, audio, status, text_queue=None):
                 status('recall_transcript_received', recognized_characters=len(text),
                        matched_segments=len(recognized['segment_ids']), wait_ms=recognized['wait_ms'], recognition_error=None)
             else:
+                set_hints = getattr(speech, 'set_name_hints', None)
+                if callable(set_hints):
+                    # Settings-only read: corrections affect the next turn; no archive scan.
+                    try:
+                        hints = await recall.name_assistance()
+                    except Exception:
+                        hints = []
+                    set_hints(hints)
                 text = (await speech.transcribe(pcm)).strip()
             wake_detected = contains_wake_word(text, config["wake_words"])
             wake_missing = config.get("mode", "wakeword") == "wakeword" and not wake_detected

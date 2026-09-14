@@ -32,7 +32,13 @@ import { CAPTION_RANGES, normalizeCaptionSettings } from '../lib/captions.js';
 export const id = 'sources';
 let lastSection = 'capture';
 
+export function dedupSourceSelection(sources, key, enabled) {
+  return enabled ? [...new Set([...sources,key])] : sources.filter(value=>value!==key);
+}
+
 export function mount(root, ctx, arg = {}) {
+  let destroyed=false, dedupSources=null, dedupPending=null, dedupError='';
+  const dedupFeedback=new Map();
   const list = h('div', { id: 'source-list' });
   const sub = h('span', { class: 'sub', id: 'sources-sub' });
   const micCard = h('div', { class: 'card mic-card', id: 'mic-card' });
@@ -1608,6 +1614,28 @@ export function mount(root, ctx, arg = {}) {
 
   // -- the applications -----------------------------------------------------
 
+  async function loadDedup() {
+    try {
+      const result=await ask('voice.dedup.get');
+      if(result?.policy!=='confirmed_mic_audio_only'||!Array.isArray(result.sources))throw new Error('Unavailable');
+      dedupSources=result.sources;dedupError='';
+    } catch {dedupSources=null;dedupError='Microphone-copy detection is unavailable on this daemon.';}
+    if(!destroyed)render();
+  }
+
+  async function setDedup(key, enabled) {
+    if(dedupPending)return;
+    dedupPending=key;dedupFeedback.set(key,'Saving…');render();
+    try {
+      const latest=await ask('voice.dedup.get');
+      if(latest?.policy!=='confirmed_mic_audio_only'||!Array.isArray(latest.sources))throw new Error('Settings unavailable');
+      const result=await ask('voice.dedup.set',{sources:dedupSourceSelection(latest.sources,key,enabled)});
+      if(!Array.isArray(result?.sources))throw new Error('Settings were not confirmed');
+      dedupSources=result.sources;dedupFeedback.set(key,'Saved. Applies to new audio only.');
+    } catch(error) {dedupFeedback.set(key,'Could not save: '+error.message);}
+    finally {dedupPending=null;if(!destroyed)render();}
+  }
+
   function render() {
     renderMic();
     renderRoom();
@@ -1690,6 +1718,12 @@ export function mount(root, ctx, arg = {}) {
         toggle
       )
     );
+    if(!s.kind || s.kind==='app') {
+      const toggle=h('input',{type:'checkbox',checked:dedupSources?.includes(s.match_key),disabled:!!dedupPending||!dedupSources||store.conn.status!=='connected',dataset:{dedupSource:s.match_key},onchange:event=>void setDedup(s.match_key,event.target.checked)});
+      row.append(h('div',{class:'source-dedup-control'},h('label',{},toggle,' Skip confirmed microphone copies'),
+        h('p',{class:'sub',text:'Keeps the saved microphone copy. Only near-identical audio copies are skipped. Codec/effect changes, overlapping audio and uncertain matches are kept. Applies to new audio; if the app arrives first, both copies can remain.'}),
+        h('p',{class:'sub',role:'status','aria-live':'polite',dataset:{dedupFeedback:s.match_key},text:dedupFeedback.get(s.match_key)||dedupError})));
+    }
     return row;
   }
 
@@ -1728,6 +1762,7 @@ export function mount(root, ctx, arg = {}) {
     await loadDevices();
   })();
   void loadTruth();
+  void loadDedup();
 
   void (async () => {
     try {
@@ -1743,6 +1778,7 @@ export function mount(root, ctx, arg = {}) {
   void ctx;
   return {
     update(change) {
+      if(change?.conn && store.conn.status==='connected' && !dedupPending)void loadDedup();
       if (change?.mic || change?.conn) renderMic();
       if (change?.room || change?.conn) renderRoom();
       if (change?.status) renderStorage();
@@ -1837,6 +1873,7 @@ export function mount(root, ctx, arg = {}) {
       }
     },
     render,
+    destroy() {destroyed=true;},
   };
 }
 

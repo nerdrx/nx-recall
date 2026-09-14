@@ -854,6 +854,8 @@ select.input option, select.input optgroup {
 .src-row .name { font-size: 14px; font-weight: 600; }
 .src-row .key { font: 400 11px/1.5 var(--mono); color: var(--clear-muted); }
 .src-row .seen { font-size: 11px; color: var(--clear-muted); line-height: 1.5; }
+.source-dedup-control { grid-column: 2 / -1; }
+.source-dedup-control p { margin: 5px 0; max-width: 80ch; }
 /* 0.12.2 — one Discord client. Three columns rather than the source list's
    four: a client has no application plate, and the sentence saying why it is
    muted needs the width the plate would have taken. */
@@ -2122,3 +2124,5 @@ input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), select, te
 .lanalu-heard-turn { border-top: 1px solid var(--border); padding-top: 8px; }
 .lanalu-heard-turn p { margin: 4px 0; }
 .lanalu-heard-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.lanalu-heard-corrected { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--violet); }
+.lanalu-heard-editor textarea { width: 100%; margin: 8px 0; }

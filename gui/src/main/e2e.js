@@ -152,6 +152,28 @@ export function runE2E(deps) {
       return {file,fakeSetupCancel:state.setupAvailable};
     });
 
+    await step('026-microphone-copy-setting', async () => {
+      await deps.request('voice.dedup.set',{sources:['unrelated-app']});
+      await js(`window.__recallDebug.go('sources',{section:'capture'})`);
+      await waitFor('copy setting available',()=>js(`!!document.querySelector('[data-dedup-source]:not(:disabled)')`));
+      const key=await js(`document.querySelector('[data-dedup-source]').dataset.dedupSource`);
+      await deps.request('mock.mutation_feedback',{method:'voice.dedup.set',delay:300});
+      await js(`document.querySelector('[data-dedup-source]').click()`);
+      await waitFor('copy setting saving',()=>js(`document.querySelector('[data-dedup-source]').disabled && document.querySelector('[data-dedup-feedback]').textContent==='Saving…'`));
+      await waitFor('copy setting saved',()=>js(`document.querySelector('[data-dedup-source]').checked && document.querySelector('[data-dedup-feedback]').textContent.startsWith('Saved.')`));
+      const saved=await deps.request('voice.dedup.get',{});
+      assert(saved.sources.includes(key)&&saved.sources.includes('unrelated-app'),'save replaced another source');
+      await deps.request('mock.mutation_feedback',{method:'voice.dedup.set',delay:100,fail:true});
+      await js(`document.querySelector('[data-dedup-source]').click()`);
+      await waitFor('copy setting rollback',()=>js(`document.querySelector('[data-dedup-feedback]').textContent.startsWith('Could not save:') && document.querySelector('[data-dedup-source]').checked && !document.querySelector('[data-dedup-source]').disabled`));
+      await js(`document.querySelector('[data-dedup-source]').click()`);
+      await waitFor('copy setting disabled',()=>js(`!document.querySelector('[data-dedup-source]').checked && document.querySelector('[data-dedup-feedback]').textContent.startsWith('Saved.')`));
+      await js(`document.querySelector('[data-dedup-source]').click()`);
+      await waitFor('copy setting clean saved state',()=>js(`document.querySelector('[data-dedup-source]').checked && document.querySelector('[data-dedup-feedback]').textContent.startsWith('Saved.')`));
+      await js(`document.querySelector('[data-dedup-source]').scrollIntoView({block:'center'})`);
+      return {file:await shot('026-microphone-copy-setting'),preserved:true,rollback:true};
+    });
+
     await step('022-corrected-name-assistance', async () => {
       await deps.request('vocab.set',{terms:['Lanalu','ordinary'],name_assistance_enabled:false});
       await js(`window.__recallDebug.go('settings',{section:'quality'})`);
@@ -190,15 +212,18 @@ export function runE2E(deps) {
     await step('023-lanalu-audio-levels', async () => {
       await js(`window.__recallDebug.go('lanalu')`);
       await waitFor('Lanalu mounted',()=>js(`!!document.getElementById('lanalu-input-level')`));
-      await js(`window.__recallDebug.go('transcript')`);
       try {
         await js(`(async()=>{
           const {mountVoice}=await import('./views/voice.js');
           window.__meterState={running:true,available:true,config:{audio_mode:'vesktop',mode:'wakeword',wake_words:['Lanalu']},status:{event:'listening'}};
           window.__heardFixture={ok:true,heard:[]};
-          window.__meterController=mountVoice({state:async()=>window.__meterState,devices:async()=>({sources:[],sinks:[]}),heard:async()=>window.__heardFixture});
+          window.__correctionCalls=[];window.__correctionFail=true;
+          window.__meterController=mountVoice({state:async()=>window.__meterState,devices:async()=>({sources:[],sinks:[]}),heard:async()=>window.__heardFixture,correctHeard:async(id,text)=>{window.__correctionCalls.push({id,text});if(window.__correctionFail)throw new Error('Synthetic save failure');return {ok:true};}});
           window.__meterController.panel.hidden=false;
-          document.getElementById('main').replaceChildren(window.__meterController.panel);
+          const main=document.getElementById('main'),heading=main.querySelector('.view-head').cloneNode(true),body=document.createElement('div');
+          body.className='view-body view-enter lanalu-body';body.append(window.__meterController.panel);
+          window.__meterController.panel.querySelector('.settings-panel-head').remove();
+          main.replaceChildren(heading,body);
           window.__meterController.setActive(true);
         })()`);
         await waitFor('stale meter',()=>js(`document.getElementById('lanalu-input-state')?.textContent.includes('No recent input')`));
@@ -209,18 +234,37 @@ export function runE2E(deps) {
         assert(await js(`!!document.querySelector('label[for="lanalu-input-level"]') && document.getElementById('lanalu-input-level').getAttribute('aria-describedby')==='lanalu-input-state'`),'meter has no accessible label');
         const file=await shot('023-lanalu-audio-levels');
         await waitFor('heard waiting state',()=>js(`document.getElementById('lanalu-heard-state').textContent==='Waiting for recognized words…'`));
-        await js(`window.__heardFixture={ok:true,heard:[{text:'La nalu, hello.',source:'recall',timestamp:Date.now()/1000-1,decision:'reply'},{text:'<img src=x onerror=alert(1)> nonono',source:'local',timestamp:Date.now()/1000,decision:'wake_name_missing'}]};window.__meterController.setActive(true)`);
+        await js(`window.__heardFixture={ok:true,heard:[{id:'a'.repeat(32),text:'La nalu, hello.',source:'recall',timestamp:Date.now()/1000-1,decision:'reply'},{id:'b'.repeat(32),text:'<img src=x onerror=alert(1)> nonono',source:'local',timestamp:Date.now()/1000,decision:'wake_name_missing'}]};window.__meterController.setActive(true)`);
         await waitFor('heard words and wake decision',()=>js(`document.getElementById('lanalu-heard-list').textContent.includes('Wake name missed — no reply') && document.getElementById('lanalu-heard-list').textContent.includes('Passed to Lanalu')`));
         assert(await js(`document.querySelector('.lanalu-heard-text').textContent==='<img src=x onerror=alert(1)> nonono' && !document.querySelector('#lanalu-heard-list img')`),'recognized text was not rendered safely/newest-first');
         await js(`document.getElementById('lanalu-heard').scrollIntoView({block:'start'})`);
         const heardFile=await shot('024-lanalu-heard');
+        await js(`document.querySelector('.lanalu-heard-turn button').click();document.querySelector('.lanalu-heard-editor textarea').value='Lanalu, hello.';[...document.querySelectorAll('.lanalu-heard-turn button')].find(b=>b.textContent==='Save correction').click()`);
+        await waitFor('correction failure stays nearby',()=>js(`document.querySelector('.lanalu-heard-turn').textContent.includes('Synthetic save failure')`));
+        await js(`window.__heardFixture.heard.unshift({id:'c'.repeat(32),text:'Another turn',source:'local',decision:'no_words'});window.__meterController.setActive(true)`);
+        await waitFor('another poll rendered',()=>js(`document.querySelectorAll('.lanalu-heard-turn').length===3`));
+        assert(await js(`document.querySelector('.lanalu-heard-editor textarea').value==='Lanalu, hello.' && !document.querySelector('.lanalu-heard-editor').hidden`),'poll lost correction draft');
+        await js(`window.__correctionFail=false;[...document.querySelectorAll('.lanalu-heard-turn button')].find(b=>b.textContent==='Save correction').click()`);
+        await waitFor('correction saved beside original',()=>js(`document.querySelector('.lanalu-heard-turn').textContent.includes('Correction saved.') && document.querySelector('.lanalu-heard-corrected').textContent==='Corrected spelling: Lanalu, hello.'`));
+        assert(await js(`document.querySelector('.lanalu-heard-text').textContent==='<img src=x onerror=alert(1)> nonono' && document.querySelector('.lanalu-heard-turn').textContent.includes('Wake name missed — no reply') && window.__correctionCalls.length===2 && window.__correctionCalls.every(c=>c.id==='b'.repeat(32))`),'correction rewrote original or targeted wrong row');
+        const correctionFile=await shot('025-lanalu-correction');
+        await js(`document.querySelector('.lanalu-heard-turn button').click();document.querySelector('.lanalu-heard-editor textarea').value='Keep expired draft';window.__heardFixture.heard=window.__heardFixture.heard.filter(r=>r.id!=='b'.repeat(32));window.__meterController.setActive(true)`);
+        await waitFor('expired correction protected',()=>js(`document.querySelector('[data-heard-id="'+ 'b'.repeat(32)+'"]')?.textContent.includes('This turn expired')`));
+        assert(await js(`document.querySelector('[data-heard-id="'+ 'b'.repeat(32)+'"] textarea').value==='Keep expired draft' && [...document.querySelectorAll('[data-heard-id="'+ 'b'.repeat(32)+'"] button')].find(b=>b.textContent==='Save correction').disabled`),'expiration lost draft or permits stale save');
+        await js(`[...document.querySelectorAll('[data-heard-id="'+ 'b'.repeat(32)+'"] button')].find(b=>b.textContent==='Cancel').click()`);
         await js(`window.__heardFixture={ok:false};window.__meterController.setActive(true)`);
         await waitFor('heard failure clears old text',()=>js(`!document.getElementById('lanalu-heard-list').textContent && document.getElementById('lanalu-heard-state').textContent.includes('unavailable')`));
         await js(`window.__meterState.status.audio_levels_at=1;window.__meterController.setActive(true)`);
         await waitFor('old peak cleared',()=>js(`document.getElementById('lanalu-input-level').value===0 && document.getElementById('lanalu-input-state').textContent.includes('No recent input')`));
         await js(`window.__meterState.running=false;window.__meterController.setActive(true)`);
         await waitFor('stopped heard cleared',()=>js(`!document.getElementById('lanalu-heard-list').textContent && document.getElementById('lanalu-heard-state').textContent.startsWith('Start Local Voice')`));
-        return {file,heardFile,silence:true,signal:true,stale:true,accessible:true,heardSafe:true,heardCleared:true};
+        await js(`window.__meterState.running=true;window.__heardFixture={ok:true,heard:[{id:'d'.repeat(32),text:'Lanalu, remind me about our next world tour.',source:'recall',timestamp:Date.now()/1000-25,decision:'reply'},{id:'e'.repeat(32),text:'la nalu what did we plan',source:'recall',timestamp:Date.now()/1000,decision:'reply'}]};window.__meterController.setActive(true)`);
+        await waitFor('friendly recognition fixture',()=>js(`document.querySelector('.lanalu-heard-text')?.textContent==='la nalu what did we plan'`));
+        await js(`document.querySelector('.lanalu-heard-turn button').click();document.querySelector('.lanalu-heard-editor textarea').value='Lanalu, what did we plan?';[...document.querySelectorAll('.lanalu-heard-turn button')].find(b=>b.textContent==='Save correction').click()`);
+        await waitFor('friendly correction saved',()=>js(`document.querySelector('.lanalu-heard-corrected')?.textContent==='Corrected spelling: Lanalu, what did we plan?' && document.querySelector('.lanalu-heard-turn').textContent.includes('Correction saved.')`));
+        await js(`document.getElementById('lanalu-heard').scrollIntoView({block:'start'})`);
+        const releaseFile=await shot('025-lanalu-correction-release');
+        return {file,heardFile,correctionFile,releaseFile,silence:true,signal:true,stale:true,accessible:true,heardSafe:true,heardCleared:true,correctionDraft:true,correctionSaved:true,expirationSafe:true};
       } finally {
         await js(`window.__meterController?.destroy();window.__meterController?.panel.remove();delete window.__meterController;delete window.__meterState;delete window.__heardFixture`);
       }

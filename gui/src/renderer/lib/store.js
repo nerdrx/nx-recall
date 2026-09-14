@@ -1108,6 +1108,8 @@ function clearPartialFor(seg) {
 export function applyEvent(evt, opts = {}) {
   const d = evt?.data;
   switch (evt?.ev) {
+    case 'segment_duplicate':
+      return clearPartialFor({session:d?.session_id,t_start_ns:d?.t_start_ns}) ? {partial:true} : null;
     case 'segment': {
       if (!d || d.id == null) return null;
       noteUnknownSpeaker(d.speaker, opts.onSpeakersChanged);

@@ -10,6 +10,7 @@ from pathlib import Path
 import signal
 import time
 import tomllib
+import uuid
 
 from .audio import Audio, Devices, command
 from .control import Control
@@ -30,12 +31,22 @@ class Status:
 
     def record_heard(self, text, source, wake_detected, decision):
         # Deliberately separate from persisted/logged diagnostic fields.
-        self._heard.append({"text": text[:2000], "timestamp": time.time(),
+        self._heard.append({"id": uuid.uuid4().hex, "text": text[:2000], "timestamp": time.time(),
                             "source": source, "wake_detected": bool(wake_detected),
                             "decision": decision})
 
     def heard(self):
         return [dict(turn) for turn in self._heard]
+
+    def heard_turn(self, ident):
+        return next((dict(turn) for turn in self._heard if turn["id"] == ident), None)
+
+    def corrected_heard(self, ident, text):
+        for turn in self._heard:
+            if turn["id"] == ident:
+                turn["corrected_text"] = text[:2000]
+                return True
+        return False
 
     def __call__(self, event, **fields):
         self.data.update(fields, event=event, updated_at=time.time())

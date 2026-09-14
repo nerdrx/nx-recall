@@ -564,6 +564,11 @@ impl Service {
             // is already holding a socket.
             "lang.repair" => self.lang_repair(req),
             "vocab.get" => self.vocab_get(),
+            "vocab.name_assistance" => self.vocab_name_assistance(),
+            "voice.correct_heard" => self.voice_correct_heard(req),
+            "voice.dedup.get" => self.voice_dedup_get(),
+            "voice.dedup.set" => self.voice_dedup_set(req),
+            "voice.transcript" => self.voice_transcript(req),
             "vocab.set" => self.vocab_set(req),
             "segments.reassign" => self.segments_reassign(req),
             "segments.correct" => self.segments_correct(req),
@@ -3998,6 +4003,91 @@ impl Service {
         Ok(crate::vocab::read(&store, cap)
             .map_err(Error::from)?
             .to_json())
+    }
+
+    fn voice_dedup_get(&self) -> Result<Value, Error> {
+        let sources = crate::voice_duplicates::sources(&self.store()).map_err(Error::from)?;
+        Ok(json!({"sources":sources,"policy":"confirmed_mic_audio_only"}))
+    }
+
+    fn voice_dedup_set(&self, req: &Request) -> Result<Value, Error> {
+        let sources: Vec<String> = serde_json::from_value(
+            req.param("sources").cloned().unwrap_or(Value::Null),
+        )
+        .map_err(|_| Error::params("sources must be an array of application source keys"))?;
+        crate::voice_duplicates::set_sources(&self.store(), &sources)
+            .map_err(|e| Error::params(e.to_string()))?;
+        self.voice_dedup_get()
+    }
+
+    fn voice_transcript(&self, req: &Request) -> Result<Value, Error> {
+        let source = req.str("source")?;
+        let from = req.i64("from")?;
+        let to = req.i64("to")?;
+        if source.is_empty()
+            || source.len() > 200
+            || to <= from
+            || to.saturating_sub(from) > 120_000_000_000
+        {
+            return Err(Error::params(
+                "voice transcript needs one source and a window of at most 120 seconds",
+            ));
+        }
+        let limit = req.usize_or("limit", 64)?.clamp(1, 64);
+        let segments = crate::voice_duplicates::transcript(&self.store(), source, from, to, limit)
+            .map_err(Error::from)?;
+        Ok(json!({"segments":segments}))
+    }
+
+    /// A correction to an ephemeral voice turn is a labeled example, never an
+    /// invented transcript segment. Keep the example and trusted names atomic.
+    fn voice_correct_heard(&self, req: &Request) -> Result<Value, Error> {
+        let before = req.str("original_text")?;
+        let corrected = req.str("text")?;
+        let after = corrected.trim();
+        let source = req.str("source")?;
+        if before.chars().count() > 2000 || after.is_empty() || corrected.chars().count() > 2000 {
+            return Err(Error::params(
+                "text must be nonempty; each text is limited to 2000 characters",
+            ));
+        }
+        if !matches!(source, "recall" | "local") {
+            return Err(Error::params("source must be recall or local"));
+        }
+        let store = self.store();
+        let tx = store
+            .conn()
+            .unchecked_transaction()
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let at = utc_now_ns();
+        let mut examples: Vec<Value> = match store
+            .setting("voice_heard_corrections")
+            .map_err(Error::from)?
+        {
+            Some(raw) => serde_json::from_str(&raw).map_err(|e| Error::internal(e.to_string()))?,
+            None => Vec::new(),
+        };
+        // The service store mutex serializes this tiny, bounded journal.
+        let id = format!("{at}-{}", examples.len());
+        examples.push(json!({"id": id, "at_ns": at, "original_text": before, "text": after, "source": source}));
+        if examples.len() > 200 {
+            examples.drain(..examples.len() - 200);
+        }
+        crate::vocab::remember_heard_names(&store, before, after).map_err(Error::from)?;
+        store
+            .set_setting(
+                "voice_heard_corrections",
+                &serde_json::to_string(&examples).map_err(|e| Error::internal(e.to_string()))?,
+            )
+            .map_err(Error::from)?;
+        let (_, names) = crate::vocab::name_assistance(&store).map_err(Error::from)?;
+        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+        Ok(json!({"saved": true, "names": names, "correction_id": id}))
+    }
+
+    fn vocab_name_assistance(&self) -> Result<Value, Error> {
+        let (enabled, terms) = crate::vocab::name_assistance(&self.store()).map_err(Error::from)?;
+        Ok(json!({"enabled": enabled, "terms": terms}))
     }
 
     /// Replace the user glossary. Whole-list replacement, because it is the
@@ -9398,6 +9488,79 @@ mod tests {
     /// relative recall against a +20% gate, and a glossary that bleeds into
     /// unrelated turns at the strongest setting), and a client showing a
     /// glossary screen must not imply an effect the daemon does not have.
+    #[test]
+    fn heard_corrections_are_bounded_durable_and_do_not_rewrite_transcripts() {
+        let r = rig("heard-corrections");
+        let (segment, _) = a_segment(&r, "no no no");
+        let out = call(&r, r#"{"id":1,"method":"voice.correct_heard","params":{"original_text":"no no no","text":"lanalu!","source":"local"}}"#).unwrap();
+        assert_eq!(out["saved"], true);
+        assert_eq!(out["names"], json!(["Lanalu"]));
+        let status = call(&r, r#"{"id":2,"method":"vocab.name_assistance"}"#).unwrap();
+        assert_eq!(status, json!({"enabled": false, "terms": ["Lanalu"]}));
+        assert_eq!(
+            r.service
+                .store()
+                .segment_state(segment)
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("no no no")
+        );
+        for i in 0..201 {
+            call(&r, &json!({"id":3,"method":"voice.correct_heard","params":{"original_text":"","text":format!("Example {i}"),"source":"recall"}}).to_string()).unwrap();
+        }
+        let reopened = Store::open(&r.dir).unwrap();
+        let rows: Vec<Value> = serde_json::from_str(
+            &reopened
+                .setting("voice_heard_corrections")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 200);
+        assert_eq!(rows[0]["text"], "Example 1");
+        assert_eq!(rows.last().unwrap()["text"], "Example 200");
+        assert_eq!(
+            crate::vocab::name_assistance(&reopened).unwrap(),
+            (false, vec!["Lanalu".to_string()])
+        );
+    }
+
+    #[test]
+    fn heard_corrections_validate_and_roll_back_names_on_storage_failure() {
+        let r = rig("heard-correction-validation");
+        for params in [
+            json!({"original_text":"x","text":" ","source":"local"}),
+            json!({"original_text":"x","text":"Lanalu","source":"other"}),
+            json!({"original_text":"x".repeat(2001),"text":"Lanalu","source":"local"}),
+            json!({"original_text":"x","text":"x".repeat(2001),"source":"local"}),
+            json!({"original_text":2,"text":"Lanalu","source":"local"}),
+        ] {
+            assert!(
+                call(
+                    &r,
+                    &json!({"id":1,"method":"voice.correct_heard","params":params}).to_string()
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            r.service
+                .store()
+                .setting("voice_heard_corrections")
+                .unwrap()
+                .is_none()
+        );
+        r.service.store().conn().execute_batch("CREATE TRIGGER fail_heard_write BEFORE INSERT ON settings WHEN NEW.key = 'voice_heard_corrections' BEGIN SELECT RAISE(ABORT, 'test storage failure'); END;").unwrap();
+        assert!(call(&r, r#"{"id":1,"method":"voice.correct_heard","params":{"original_text":"nonono","text":"Lanalu","source":"local"}}"#).is_err());
+        assert!(
+            crate::vocab::name_assistance(&r.service.store())
+                .unwrap()
+                .1
+                .is_empty()
+        );
+    }
+
     #[test]
     fn name_assistance_opt_in_preserves_glossary_and_rejects_invalid_toggle() {
         let r = rig("name-assistance");

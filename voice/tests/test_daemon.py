@@ -16,6 +16,8 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             status('local_listening')
             for index in range(9):
                 status.record_heard(str(index) + 'private heard text' * 200, 'local', False, 'wake_name_missing')
+            for row in status.heard():
+                status.corrected_heard(row['id'], 'private corrected text')
             turns = status.heard()
             self.assertEqual(len(turns), 6)
             self.assertTrue(turns[0]['text'].startswith('3'))
@@ -26,6 +28,8 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('private heard text', (Path(directory) / 'status.json').read_text())
             self.assertNotIn('private heard text', repr(status.data))
             self.assertNotIn('private heard text', repr(log.call_args_list))
+            self.assertNotIn('private corrected text', (Path(directory) / 'status.json').read_text())
+            self.assertNotIn('private corrected text', repr(log.call_args_list))
             self.assertEqual(list(Path(directory).iterdir()), [Path(directory) / 'status.json'])
 
     def test_audio_meter_preserves_turn_state_without_logging(self):

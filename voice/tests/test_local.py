@@ -51,6 +51,7 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         self.statuses = asyncio.Queue()
         self.shared_requests = []
         self.transcriptions = 0
+        self.name_hints = []
         self.synthesis_finished = False
         self.synthesis_release = asyncio.Event()
         self.synthesis_release.set()
@@ -65,6 +66,8 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
                 pass
             async def warmup(self):
                 pass
+            def set_name_hints(self, hints):
+                test.name_hints.append(hints)
             async def transcribe(self, pcm):
                 test.transcriptions += 1
                 return pending.pop(0)
@@ -89,6 +92,8 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
                 pass
             async def retrieve(self, text, limit):
                 return []
+            async def name_assistance(self):
+                return ['Lanalu']
             async def recognize(self, *args, **kwargs):
                 test.shared_requests.append((args, kwargs))
                 if recognition_error:
@@ -140,6 +145,7 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_status("local_speaking")
         self.assertIn("speaker is unknown", self.model_messages[0][0]["content"])
         self.assertEqual(self.transcriptions, 2)
+        self.assertEqual(self.name_hints, [['Lanalu'], ['Lanalu']])
 
     async def test_heard_keeps_empty_voice_but_not_typed_input(self):
         await self.start_worker(texts=[""])
@@ -264,6 +270,7 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_status('local_speaking')
         self.assertEqual(self.transcriptions, 0)
         self.assertEqual(len(self.shared_requests), 1)
+        self.assertEqual(self.name_hints, [])
         self.assertEqual(self.heard, [('Lanalu say hello', 'recall', True, 'reply')])
         bounds, options = self.shared_requests[0]
         self.assertEqual(bounds[1] - bounds[0], 60_000_000)

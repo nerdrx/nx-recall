@@ -44,6 +44,43 @@ class RecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(r["source"].endswith("keyword") for r in results))
         self.assertEqual(results[0]["timestamp"], "2026-09-14T12:00:00Z")
 
+    async def test_name_assistance_uses_only_small_settings_rpc_and_fails_closed(self):
+        client = RecallClient(self.path)
+        result = {'enabled': True, 'terms': ['Lanalu']}
+        async def session(operation):
+            async def call(method, params, ident):
+                self.assertEqual((method, params), ('vocab.name_assistance', {}))
+                return result
+            return await operation(call)
+        client._session = session
+        self.assertEqual(await client.name_assistance(), ['Lanalu'])
+        result['enabled'] = False
+        self.assertEqual(await client.name_assistance(), [])
+        result.update(enabled=True, terms=['nonono', 'L'])
+        self.assertEqual(await client.name_assistance(), [])
+        async def unavailable(operation):
+            raise OSError('unavailable')
+        client._session = unavailable
+        self.assertEqual(await client.name_assistance(), [])
+
+    async def test_correction_rpc_is_explicit_validated_and_bounded(self):
+        seen = []
+        client = RecallClient(self.path)
+        async def session(operation):
+            async def call(method, params, ident):
+                seen.append((method, params, ident))
+                return {'saved': True, 'names': ['Lanalu'], 'correction_id': 'example-id'}
+            return await operation(call)
+        client._session = session
+        result = await client.correct_heard('la nalu', 'Lanalu', 'local')
+        self.assertEqual(seen, [('voice.correct_heard', {'original_text': 'la nalu', 'text': 'Lanalu', 'source': 'local'}, 1)])
+        self.assertEqual(result['correction_id'], 'example-id')
+        await client.correct_heard('', 'Lanalu', 'recall')
+        for args in [('x', '', 'local'), ('x', 'a' * 2001, 'local'), ('x', 'Lanalu', 'other')]:
+            with self.assertRaises(ValueError):
+                await client.correct_heard(*args)
+        self.assertEqual(len(seen), 2)
+
     async def test_missing_socket_is_explicit_and_empty_query_is_local(self):
         client = RecallClient(self.path)
         self.assertEqual(await client.retrieve("   "), [])

@@ -5923,3 +5923,14 @@ entry using monotonic time. Recognition separates primary final passes from
 live caption calls. Finalization includes nested speaker ranking; refinement
 includes language/speaker follow-up work. Stages have different sample counts
 and may overlap: their medians are not additive. Missing samples remain null.
+
+
+## Local voice corrections and microphone copies (0.19.0)
+
+`voice.correct_heard {original_text,text,source}` saves a labeled heard-turn correction. Both texts are limited to 2,000 characters; corrected `text` must be nonempty. `source` is `recall` or `local`. The atomic result is `{saved:true,names:[...],correction_id:...}`. Recall retains at most 200 examples in its settings store. This method does not create speaker identities or rewrite archive segments. `vocab.name_assistance {}` reads only the current `{enabled,terms}` settings without scanning correction history.
+
+The voice worker's separate same-user control socket exposes `{type:"heard"}` and `{type:"correct_heard",id,text}`. Heard entries carry a session-local UUID, original text, optional corrected text, recognition source, timestamp and wake-check outcome. A correction requires an ID from the worker's current six-turn window. Expired entries fail explicitly. Reads may contain up to 192 KiB; requests remain bounded to 8 KiB. These words do not enter the diagnostic status file.
+
+`voice.dedup.get {}` returns `{sources:[match_key,...],policy:"confirmed_mic_audio_only"}`. `voice.dedup.set {sources:[...]}` replaces the opted-in source list; preserve other choices when changing one source. The default is empty. No historical data is deleted by enabling the feature.
+
+`voice.transcript {source,from,to,limit}` is the bounded shared-recognition view. It includes normal source turns and confirmed source observations referring to the retained microphone segment. Observation rows carry the observed source/session/times plus `canonical_segment_id`, `canonical_source` and `provenance:"confirmed_mic_audio"`. Consume canonical IDs once; never treat arbitrary microphone turns as source observations. Ordinary transcript/history queries still show the canonical recording. Windows are limited to 120 seconds and results to 64 turns.

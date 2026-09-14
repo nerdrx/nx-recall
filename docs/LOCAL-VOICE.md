@@ -6,7 +6,9 @@ NX Recall can host Lanalu as a local voice assistant. The desktop app owns the w
 
 The **What Lanalu heard** card in her tab shows the latest six completed voice recognitions, newest first. Each entry shows the words, recognition source, time and whether the turn passed the wake-name check. Missed wake names are shown even when no reply follows. “Passed to Lanalu” means the turn was accepted for processing, not that a reply succeeded or that its meaning was understood correctly. Words appear after a spoken turn is recognized, not word by word while you speak.
 
-This small view lives only in the voice worker's memory and clears when Local Voice stops. It does not put recognized text into Debug or diagnostic files. Recall's normal archive still follows its separately configured capture and retention settings. Typed messages appear in the written conversation instead.
+Use **Correct words** on a heard turn to save the intended wording. The original recognition and wake decision remain visible. Corrections are saved as labeled examples in Recall (up to 200 recent examples); trusted corrected names can help future recognition when corrected-name assistance is enabled. A correction does not send a new reply or retrain model weights.
+
+This small recent-turn view lives only in the voice worker's memory and clears when Local Voice stops. It does not put recognized text into Debug or diagnostic files. Recall's normal archive still follows its separately configured capture and retention settings. Typed messages appear in the written conversation instead.
 
 ## Which virtual device goes where?
 
@@ -52,6 +54,12 @@ Lanalu and the optional Recall memory writer use [Qwen3.5 4B](https://huggingfac
 Recall memory retrieval uses its existing same-user Unix socket, with bounded semantic/keyword results. Retrieved text is reference material, not executable instructions. Unrelated records should not be treated as evidence for a memory answer. There are no automatic tool actions or account automation.
 
 Speaker names come from Recall's own recent acoustic matches for the selected virtual input stream. A name is used only if assigned explicitly, non-generic, strongly matched, temporally aligned and unambiguous. “Speaker…” labels, missing scores, overlapping speakers and uncertain matches stay unknown. Similarity is not a calibrated probability. Recognition can lag behind speech processing; a reply may use no name even for an enrolled speaker. Local microphone mode currently leaves the speaker unknown.
+
+## Keep confirmed microphone copies once
+
+In **Sources**, enable **Skip confirmed microphone copies** for an application that also carries your microphone voice. This is off by default and applies only to that application. When its audio closely matches a recently committed microphone turn, Recall keeps the microphone recording and words, plus a small source/time observation. Shared recognition can still use those words for the application without adding another archive entry or WAV. Existing recordings are not deleted.
+
+Only near-identical audio copies are skipped. The filter checks timing, coverage and the residual after matching volume; matching words alone are not enough. Codec/effect changes, extra speech, capture gaps and uncertain matches are kept. In tests, network-codec versions of the same speech were retained, so this does not yet reliably remove Discord round-trip copies. Application turns that finish before the microphone transcript is committed also stay. The check uses a bounded recent-audio cache and adds no waiting period.
 
 ## Runtime
 

@@ -527,6 +527,13 @@ enum DiscordSide {
     Neither,
 }
 
+struct RecentMicTurn {
+    id: i64,
+    start: i64,
+    end: i64,
+    samples: Vec<f32>,
+}
+
 pub struct Pipeline {
     vad: SileroVad,
     seg_cfg: SegmenterConfig,
@@ -588,6 +595,10 @@ pub struct Pipeline {
     /// every reanchor gap as `SchedulerStarvation`, which is the safe
     /// default — it is never wrong to say "no eviction was seen".
     queue: Option<Arc<EventQueue>>,
+    recent_mic: std::collections::VecDeque<RecentMicTurn>,
+    duplicate_sources: Vec<String>,
+    duplicates_checked_at: Option<std::time::Instant>,
+    duplicates_mic_generation: u64,
 }
 
 impl Pipeline {
@@ -701,6 +712,10 @@ impl Pipeline {
             gpu_busy: crate::light::GpuBusyMonitor::new(),
             light_checked_at: None,
             queue: None,
+            recent_mic: std::collections::VecDeque::new(),
+            duplicate_sources: Vec::new(),
+            duplicates_checked_at: None,
+            duplicates_mic_generation: 0,
         })
     }
 
@@ -855,6 +870,7 @@ impl Pipeline {
         if self.control.is_paused() {
             if !self.was_paused {
                 self.was_paused = true;
+                self.recent_mic.clear();
                 info!("paused: audio is being discarded, nothing is written");
             }
             self.sessions.remove(&chunk.session_id);
@@ -954,6 +970,7 @@ impl Pipeline {
         // what keeps the words on either side of it out of the same segment
         // (audit finding #21).
         if let Some(skew_ns) = entry.maybe_reanchor(chunk.capture_mono_ns) {
+            self.recent_mic.clear();
             entry.discard_across_gap(fresh_state);
             self.stats.gaps_discarded.fetch_add(1, Ordering::Relaxed);
             // 0.14.0: classify the gap at the moment it happens. The queue is
@@ -1204,6 +1221,7 @@ impl Pipeline {
     // ---- end 0.12.1 / 0.12.2 --------------------------------------------------
 
     fn on_session_end(&mut self, session_id: i64, mono_ns: u64) -> Result<()> {
+        self.recent_mic.clear();
         let mut final_turns = Vec::new();
         // 0.14.0: was the capture side already quiet before this arrived? A
         // clean app exit closes within one buffer period of its last audio;
@@ -1227,6 +1245,7 @@ impl Pipeline {
             self.write_segment(session_id, span)?;
         }
         self.sessions.remove(&session_id);
+        self.recent_mic.clear();
         // 0.12.1: the two caches that outlive `sessions` on purpose (the mute
         // removes the entry) must not outlive the session itself, or a reused
         // row id would inherit a stale answer.
@@ -1276,6 +1295,7 @@ impl Pipeline {
     /// never one (audit finding #21, and the reason a flap must not become a
     /// second way to trigger that bug).
     fn on_gap(&mut self, session_id: i64, mono_ns: u64, gap_ms: u64) -> Result<()> {
+        self.recent_mic.clear();
         let Some(entry) = self.sessions.get_mut(&session_id) else {
             // Nothing has produced a buffer for this session since it opened
             // (or since its last flap), so there is no `SessionPipeline` yet
@@ -1486,6 +1506,76 @@ impl Pipeline {
         last
     }
 
+    fn refresh_duplicate_sources(&mut self) {
+        let generation = self.control.mic_generation();
+        if generation != self.duplicates_mic_generation {
+            self.recent_mic.clear();
+            self.duplicates_mic_generation = generation;
+        }
+        if self
+            .duplicates_checked_at
+            .is_some_and(|at| at.elapsed().as_secs_f32() < 1.0)
+        {
+            return;
+        }
+        self.duplicates_checked_at = Some(std::time::Instant::now());
+        self.duplicate_sources = self
+            .store
+            .lock()
+            .ok()
+            .and_then(|store| crate::voice_duplicates::sources(&store).ok())
+            .unwrap_or_default();
+        if self.duplicate_sources.is_empty() {
+            self.recent_mic.clear();
+        }
+    }
+
+    fn duplicate_mic_segment(
+        &mut self,
+        session: i64,
+        start: i64,
+        end: i64,
+        samples: &[f32],
+    ) -> Option<i64> {
+        let key = self.session_source_key(session)?;
+        if !self.duplicate_sources.contains(&key)
+            || self.control.is_paused()
+            || !self.control.mic().enabled
+            || !self.control.mic_active()
+        {
+            return None;
+        }
+        self.recent_mic
+            .retain(|mic| end.abs_diff(mic.end) <= 30_000_000_000);
+        for mic in self.recent_mic.iter().rev() {
+            let Some(score) =
+                crate::duplicate_audio::confirmed_mic_copy(&mic.samples, mic.start, samples, start)
+            else {
+                continue;
+            };
+            let result = self.store.lock().ok().map(|store| {
+                crate::voice_duplicates::observe(&store, mic.id, session, start, end, score)
+            });
+            match result {
+                Some(Ok(true)) => {
+                    self.bus.publish(Topic::Segments,"segment_duplicate",json!({"session_id":session,"t_start_ns":start.to_string(),"t_end_ns":end.to_string(),"canonical_segment_id":mic.id,"source":key}));
+                    info!(
+                        session_id = session,
+                        canonical_segment_id = mic.id,
+                        correlation = score,
+                        "confirmed microphone copy; reused canonical transcript"
+                    );
+                    return Some(mic.id);
+                }
+                Some(Err(e)) => warn!(
+                    "could not preserve microphone copy provenance; keeping source audio: {e:#}"
+                ),
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// One row: the whole turn, or one piece of a split one.
     fn write_piece(
         &mut self,
@@ -1510,7 +1600,17 @@ impl Pipeline {
         let is_mic = session.is_mic;
         let is_room = session.is_room;
         let discord_speaker = session.discord_speaker;
-        let rel = segment_path(session_id, session.segment_seq, t_start_ns);
+        let segment_seq = session.segment_seq;
+        self.refresh_duplicate_sources();
+        if !is_mic && !is_room && discord_speaker.is_none() {
+            if let Some(canonical) =
+                self.duplicate_mic_segment(session_id, t_start_ns, t_end_ns, &samples)
+            {
+                self.close_partial_turn(session_id, canonical, t_end_ns);
+                return Ok(());
+            }
+        }
+        let rel = segment_path(session_id, segment_seq, t_start_ns);
         let abs = self.data_dir.join(&rel);
 
         {
@@ -1769,6 +1869,20 @@ impl Pipeline {
         // rather than before the broadcast, so the replacement can never be
         // published before the thing that replaces it.
         self.close_partial_turn(session_id, segment_id, t_end_ns);
+        if is_mic
+            && !self.duplicate_sources.is_empty()
+            && samples.len() <= 15 * SAMPLE_RATE as usize
+        {
+            self.recent_mic.push_back(RecentMicTurn {
+                id: segment_id,
+                start: t_start_ns,
+                end: t_end_ns,
+                samples,
+            });
+            while self.recent_mic.len() > 8 {
+                self.recent_mic.pop_front();
+            }
+        }
         // ---- 0.11.0, partial turns: end --------------------------------------
         // 0.12.5: the slicer is NOT reset here. This is one PIECE, and a split
         // turn is several pieces of one turn; the state is about the turn, so
@@ -2571,6 +2685,117 @@ mod tests {
                 None,
             ),
         );
+    }
+
+    #[test]
+    fn confirmed_source_copy_skips_wav_and_asr_only_after_mic_commit() {
+        let (mut p, dir) = test_pipeline("mic-copy");
+        let (mic_id, app, foreign) = {
+            let store = p.store.lock().unwrap();
+            let mic = store
+                .upsert_source_kind("mic", "Microphone", "mic", 0)
+                .unwrap();
+            let ms = store.begin_session(mic, 0).unwrap();
+            let id = store
+                .insert_segment(ms, 0, 2_000_000_000, "mic.wav", 0)
+                .unwrap();
+            store.correct_segment_text(id, "Hello Lanalu").unwrap();
+            let source = store.upsert_source("vesktop", "Virtual in/out", 0).unwrap();
+            let app = store.begin_session(source, 0).unwrap();
+            let source = store.upsert_source("discord", "Other client", 0).unwrap();
+            let foreign = store.begin_session(source, 0).unwrap();
+            crate::voice_duplicates::set_sources(&store, &["vesktop".into()]).unwrap();
+            (id, app, foreign)
+        };
+        open_session(&mut p, app);
+        open_session(&mut p, foreign);
+        for session in p.sessions.values_mut() {
+            session.anchor = Anchor {
+                mono_ns: 0,
+                utc_ns: 0,
+            };
+            session.anchor_sample = 0;
+        }
+        p.control.set_mic(Some(true), None);
+        p.control.set_mic_active(true);
+        let mut seed = 17u32;
+        let samples: Vec<f32> = (0..32_000)
+            .map(|i| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed as f64 / u32::MAX as f64 * 2.0 - 1.0) as f32
+                    * 0.15
+                    * (0.3 + 0.7 * (i as f32 / 1300.0).sin().abs())
+            })
+            .collect();
+        p.refresh_duplicate_sources();
+        assert!(
+            p.duplicate_mic_segment(app, 0, 2_000_000_000, &samples)
+                .is_none(),
+            "source-first must retain audio"
+        );
+        p.recent_mic.push_back(RecentMicTurn {
+            id: mic_id,
+            start: 0,
+            end: 2_000_000_000,
+            samples: samples.clone(),
+        });
+        assert!(
+            p.duplicate_mic_segment(foreign, 0, 2_000_000_000, &samples)
+                .is_none()
+        );
+        p.control.set_mic(Some(false), None);
+        assert!(
+            p.duplicate_mic_segment(app, 0, 2_000_000_000, &samples)
+                .is_none()
+        );
+        p.control.set_mic(Some(true), None);
+        p.refresh_duplicate_sources();
+        assert!(
+            p.recent_mic.is_empty(),
+            "microphone configuration changes invalidate proof"
+        );
+        p.recent_mic.push_back(RecentMicTurn {
+            id: mic_id,
+            start: 0,
+            end: 2_000_000_000,
+            samples: samples.clone(),
+        });
+        p.write_piece(
+            app,
+            crate::vad::SegmentSpan {
+                start: 0,
+                end: 32_000,
+                voiced_start: 0,
+                voiced_end: 32_000,
+            },
+            &samples,
+            crate::turnsplit::Piece {
+                from: 0,
+                to: 32_000,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(p.stats.segments_written.load(Ordering::Relaxed), 0);
+        assert!(
+            !dir.join("segments").exists(),
+            "no duplicate WAV may be written"
+        );
+        let store = p.store.lock().unwrap();
+        assert_eq!(store.segment_count(app).unwrap(), 0);
+        assert_eq!(
+            crate::voice_duplicates::transcript(&store, "vesktop", 0, 3_000_000_000, 64).unwrap()
+                [0]["id"],
+            mic_id
+        );
+        drop(store);
+        p.on_gap(app, 1_000_000, 1).unwrap();
+        assert!(
+            p.recent_mic.is_empty(),
+            "even short reconnects invalidate acoustic evidence"
+        );
+        drop(p);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

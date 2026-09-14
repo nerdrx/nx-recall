@@ -69,6 +69,17 @@ const segment = (over = {}) => ({
 
 // -- it is not a segment ----------------------------------------------------
 
+test('confirmed duplicate removes only its exact provisional source turn',()=>{
+  reset();applyEvent(partial());
+  const event={ev:'segment_duplicate',data:{session_id:3,t_start_ns:NS(T0),canonical_segment_id:7}};
+  assert.equal(applyEvent({...event,data:{...event.data,session_id:4}}),null);
+  assert.ok(store.partial);
+  assert.equal(applyEvent({...event,data:{...event.data,t_start_ns:NS(T0+1)}}),null);
+  assert.ok(store.partial);
+  assert.deepEqual(applyEvent(event),{partial:true});
+  assert.equal(store.partial,null);assert.equal(store.segments.length,0);assert.equal(store.appended,0);
+});
+
 test('a partial goes nowhere near the segment list', () => {
   reset();
   const change = applyEvent(partial());

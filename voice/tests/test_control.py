@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 from nx_recall_voice.control import Control
 from nx_recall_voice.daemon import Status
@@ -76,11 +76,13 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         self.control.status.data['connected'] = False
         for index in range(8):
             self.control.status.record_heard('\0' * 2500, 'recall', False, 'wake_name_missing')
-        reader, writer = await asyncio.open_unix_connection(self.path, limit=98304)
+        for turn in self.control.status.heard():
+            self.control.status.corrected_heard(turn['id'], '\0' * 2000)
+        reader, writer = await asyncio.open_unix_connection(self.path, limit=196608)
         writer.write(b'{"type":"heard"}\n')
         await writer.drain()
         raw = await asyncio.wait_for(reader.readline(), 1)
-        self.assertLess(len(raw), 98304)
+        self.assertLess(len(raw), 196608)
         result = json.loads(raw)
         self.assertTrue(result['ok'])
         self.assertEqual(len(result['heard']), 6)
@@ -92,6 +94,35 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.request(b'{"type":"heard","text":"extra"}\n'))['error'], 'invalid_request')
         with patch('nx_recall_voice.control.os.getuid', return_value=-1):
             self.assertEqual((await self.request(b'{"type":"heard"}\n'))['error'], 'forbidden')
+
+    async def test_heard_correction_preserves_original_and_saves_only_current_id(self):
+        self.control.status = Status()
+        status = self.control.status
+        status.record_heard('la nalu hello', 'local', False, 'wake_name_missing')
+        original = status.heard()[0]
+        async def correct(text='Lanalu hello', ident=original['id']):
+            return await self.request(json.dumps({'type': 'correct_heard', 'id': ident, 'text': text}).encode() + b'\n')
+        with patch('nx_recall_voice.control.RecallClient') as client:
+            client.return_value.correct_heard = AsyncMock(return_value={'saved': True, 'names': ['Lanalu']})
+            self.assertEqual(await correct(), {'ok': True, 'saved': True, 'names': ['Lanalu']})
+            client.return_value.correct_heard.assert_awaited_once_with('la nalu hello', 'Lanalu hello', 'local')
+            current = status.heard()[0]
+            self.assertEqual(current['corrected_text'], 'Lanalu hello')
+            self.assertEqual({k: v for k, v in current.items() if k != 'corrected_text'}, original)
+            self.assertTrue(self.queue.empty())
+            self.assertNotIn('Lanalu', repr(status.data))
+            for invalid in ('', ' ' * 2, 'a' * 2001):
+                self.assertEqual((await correct(invalid))['error'], 'invalid_request')
+            self.assertEqual((await correct(ident='0' * 32))['error'], 'heard_expired')
+            self.assertEqual(client.return_value.correct_heard.await_count, 1)
+            from nx_recall_voice.recall import RecallError
+            client.return_value.correct_heard.side_effect = RecallError('failure')
+            self.assertEqual((await correct('changed again'))['error'], 'save_failed')
+            self.assertEqual(status.heard()[0], current)
+            for _ in range(6):
+                status.record_heard('next', 'local', False, 'wake_name_missing')
+            self.assertEqual((await correct())['error'], 'heard_expired')
+            self.assertEqual(client.return_value.correct_heard.await_count, 2)
 
     async def test_close_removes_socket(self):
         await self.control.close()

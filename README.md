@@ -114,6 +114,15 @@ She has **her own tab**, written input, voice controls, and a Debug window that 
 
 <img src="assets/readme/local-voice.png" width="100%" alt="Lanalu's dedicated tab with written conversation, listening controls and audio settings.">
 
+**See what she heard. Correct what she missed.** Live audio meters show whether sound is arriving. Her recent-turn panel shows the recognized words—even when she misses her wake name. Correct a spelling in place and save it as a labeled example; optional trusted-name assistance can help future recognition.
+
+<details>
+<summary><strong>Give a missed name its proper spelling</strong></summary>
+
+<img src="assets/readme/heard-corrections.png" width="100%" alt="Lanalu's heard words with an inline saved correction, the original recognition, and the original wake decision.">
+
+</details>
+
 ### Make her sound like her.
 
 Keep fast **Amy**, or choose **Heart, Bella, Sarah, or Nicole** with optional Kokoro speech. Adjust the speaking pace; Amy also offers voice variation. Kokoro plays each native sentence chunk as it becomes ready.
