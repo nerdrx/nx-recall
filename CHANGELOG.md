@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.18.2 — Shared words, clearer saves
+
+- Name the virtual-audio mode **Virtual in/out** throughout Lanalu’s controls and documentation.
+
+- Choose shared Recall recognition (default) or a separate local recognizer in Lanalu's tab. Shared mode checks the capture source and waits for matching transcript turns without running duplicate speech recognition.
+- Show recognition waits and unavailable inputs in Lanalu's Debug window instead of silently falling back to a different recognizer.
+- Keep save feedback beside the action across settings, speaker names, transcript corrections, review, notes, moments, searches and collections. Prevent duplicate submissions and preserve failed drafts.
+- Replace repeated historical speaker-activity scans with a single timestamp lookup pass, preserving overlap and backfill behavior. The measured candidate query returned identical results in 52 ms versus 23.2 seconds on the tested archive.
+- Move expensive speaker-calibration fitting outside the archive mutex so fitting does not block capture and user actions. Defer installing a fit if the archive changed while it was computed.
+- Rebuild the README around conversations, memories and Lanalu, with actual app screenshots using demonstration data and original character artwork.
+
 ## 0.18.1 — A home for Lanalu
 
 - Upgrade Lanalu and the optional Recall memory model to Qwen3.5 4B, with thinking disabled for direct, bounded replies.
@@ -15,7 +26,7 @@
 - **Local Voice in Recall.** Start and stop Lanalu from Settings, with optional
   startup alongside the app. The desktop app owns the worker; there is no extra
   bridge service or paid API.
-- **Two audio modes.** Connect the dedicated Vesktop call through private
+- **Two audio modes.** Connect the dedicated voice-client call through private
   virtual speaker/microphone devices, or choose a microphone and normal local
   output. Other Discord clients and default routes stay unchanged. Recall's
   existing recording connection is preserved.

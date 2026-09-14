@@ -5472,7 +5472,14 @@ impl Service {
             let (cleared, dropped) = crate::identity_learn::reset(&store, now)?;
             return Ok(json!({ "reset": true, "cleared": cleared, "projection": dropped }));
         }
-        Ok(crate::identity_learn::calibrate(&store, &self.control.identity, apply, now)?.to_json())
+        drop(store);
+        Ok(crate::identity_learn::calibrate_shared(
+            &self.store,
+            &self.control.identity,
+            apply,
+            now,
+        )?
+        .to_json())
     }
 
     // ---- end 0.11.0 -------------------------------------------------------

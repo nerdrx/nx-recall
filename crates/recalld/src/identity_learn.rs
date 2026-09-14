@@ -376,27 +376,110 @@ fn no_worse(baseline: &Score, candidate: &Score) -> bool {
     candidate.f_beta(calib::BETA) + 1e-9 >= baseline.f_beta(calib::BETA)
 }
 
-/// Run the pass. `apply` is the only thing that separates the preview from the
-/// write; every measurement happens either way.
+/// Snapshot only calibration inputs while the caller holds the store lock.
+struct Snapshot {
+    report: Report,
+    overlap: Vec<(i64, bool, f32)>,
+    rows: Vec<CalibrationRow>,
+    bank: Bank,
+    you: Option<i64>,
+    base_agg: calib::Aggregate,
+}
+
+impl Snapshot {
+    fn read(store: &Store) -> Result<Self> {
+        let rows = store.truth_calibration_rows(MIN_DURATION_S)?;
+        let bank = match rows.first() {
+            Some(row) => store.prototypes_with_source(&row.embedding.model_id)?,
+            None => Vec::new(),
+        };
+        Ok(Self {
+            report: Report {
+                installed: store
+                    .learned_thresholds()?
+                    .into_iter()
+                    .map(|r| (r.speaker_id, r.threshold, r.margin, r.n))
+                    .collect(),
+                projection_installed: store.installed_projection()?.is_some(),
+                ..Report::default()
+            },
+            overlap: store.truth_overlap_rows_in_order()?,
+            rows,
+            bank,
+            you: store.you_speaker_id()?,
+            base_agg: store.learned_aggregate()?,
+        })
+    }
+}
+
+struct Plan {
+    report: Report,
+    projection: Option<Projection>,
+}
+
+/// Run the pass. `apply` separates preview from installation.
 pub fn calibrate(
     store: &Store,
     cfg: &IdentityConfig,
     apply: bool,
     now_utc_ns: i64,
 ) -> Result<Report> {
-    let mut report = Report {
-        installed: store
-            .learned_thresholds()?
-            .into_iter()
-            .map(|r| (r.speaker_id, r.threshold, r.margin, r.n))
-            .collect(),
-        projection_installed: store.installed_projection()?.is_some(),
-        ..Report::default()
-    };
+    let plan = fit(Snapshot::read(store)?, cfg)?;
+    if apply {
+        commit(store, plan, now_utc_ns)
+    } else {
+        Ok(plan.report)
+    }
+}
 
+/// The expensive replay and matrix fits never hold the daemon's Store mutex.
+/// A concurrent write invalidates installation, so an old fit cannot overwrite
+/// a user's reset, merge, deletion, or a newly enrolled voice.
+pub fn calibrate_shared(
+    store: &std::sync::Mutex<Store>,
+    cfg: &IdentityConfig,
+    apply: bool,
+    now_utc_ns: i64,
+) -> Result<Report> {
+    calibrate_shared_with(store, cfg, apply, now_utc_ns, fit)
+}
+
+fn calibrate_shared_with(
+    store: &std::sync::Mutex<Store>,
+    cfg: &IdentityConfig,
+    apply: bool,
+    now_utc_ns: i64,
+    compute: impl FnOnce(Snapshot, &IdentityConfig) -> Result<Plan>,
+) -> Result<Report> {
+    let (snapshot, revision) = {
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+        (Snapshot::read(&guard)?, guard.conn().total_changes())
+    };
+    let mut plan = compute(snapshot, cfg)?;
+    if !apply {
+        return Ok(plan.report);
+    }
+    let guard = store.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.conn().total_changes() != revision {
+        plan.report.note = Some("archive changed during calibration; installation deferred".into());
+        return Ok(plan.report);
+    }
+    commit(&guard, plan, now_utc_ns)
+}
+
+fn fit(snapshot: Snapshot, cfg: &IdentityConfig) -> Result<Plan> {
+    let Snapshot {
+        mut report,
+        overlap,
+        rows,
+        bank,
+        you,
+        base_agg,
+    } = snapshot;
+    let mut projection = None;
     // ---- step 3 first: it needs no embeddings and no bank ----------------
     {
-        let rows = store.truth_overlap_rows_in_order()?;
+        let rows = overlap;
         let times: Vec<i64> = rows.iter().map(|r| r.0).collect();
         let cut = calib::split_at(&times, FIT_FRACTION).min(rows.len());
         let pairs: Vec<(bool, f32)> = rows.iter().map(|r| (r.1, r.2)).collect();
@@ -423,15 +506,15 @@ pub fn calibrate(
         });
     }
 
-    let rows = store.truth_calibration_rows(MIN_DURATION_S)?;
     report.rows = rows.len();
     if rows.len() < 2 {
         report.note = Some("not enough truth rows to split".into());
-        return Ok(report);
+        return Ok(Plan {
+            report,
+            projection: None,
+        });
     }
     let model_id = rows[0].embedding.model_id.clone();
-    let bank: Bank = store.prototypes_with_source(&model_id)?;
-    let you = store.you_speaker_id()?;
 
     let times: Vec<i64> = rows.iter().map(|r| r.t_start_ns).collect();
     let cut = calib::split_at(&times, FIT_FRACTION).min(rows.len());
@@ -450,7 +533,10 @@ pub fn calibrate(
     }
     if eval.is_empty() {
         report.note = Some("every truth row shares one instant; nothing is held out".into());
-        return Ok(report);
+        return Ok(Plan {
+            report,
+            projection: None,
+        });
     }
 
     let global = (cfg.label_threshold, 0.0);
@@ -458,7 +544,6 @@ pub fn calibrate(
     // Every arm below is measured under the aggregate the daemon uses *right
     // now*, so "would this be better?" means better than what the user has,
     // not better than a rule nothing is running.
-    let base_agg = store.learned_aggregate()?;
     report.aggregate_installed = base_agg;
 
     // ---- step 1: per-voice thresholds ------------------------------------
@@ -540,9 +625,8 @@ pub fn calibrate(
                 report.projection_swap = calib::may_install(&report.baseline, &s)
                     && mint_path_is_safe(&report.baseline_minting, &sm);
                 report.projection = Some((w, s));
-                if apply && report.projection_swap {
-                    let version = now_utc_ns;
-                    store.install_projection(&p, version, now_utc_ns)?;
+                if report.projection_swap {
+                    projection = Some(p);
                 }
             }
         }
@@ -563,9 +647,6 @@ pub fn calibrate(
     // Only when the pass actually measured something. A run that could not
     // split, or could not fit a candidate at all, has no verdict to refuse it
     // with, and absence of evidence is not refusal.
-    if apply && report.projection_installed && !report.projection_swap {
-        report.projection_cleared = store.clear_projection()?;
-    }
 
     // ---- step 4: how a voice's prototypes become one score (0.12.0) --------
 
@@ -671,16 +752,35 @@ pub fn calibrate(
                 && mint_path_is_safe(&incumbent_minting, &bm);
             report.aggregate = Some((b.rule, b.fitted));
             report.aggregate_thresholds = b.thresholds.clone();
-            if apply && report.aggregate_swap {
-                store.set_learned_aggregate(b.rule)?;
-            }
         }
         report.aggregates = arms;
     }
 
+    Ok(Plan { report, projection })
+}
+
+fn commit(store: &Store, plan: Plan, now_utc_ns: i64) -> Result<Report> {
+    let Plan {
+        mut report,
+        projection,
+    } = plan;
+    // An insufficient-data preview must have no side effects.
+    if report.note.is_some() {
+        return Ok(report);
+    }
+    if let Some(projection) = projection {
+        store.install_projection(&projection, now_utc_ns, now_utc_ns)?;
+    } else if report.projection_installed && !report.projection_swap {
+        report.projection_cleared = store.clear_projection()?;
+    }
+    if report.aggregate_swap {
+        if let Some((rule, _)) = report.aggregate {
+            store.set_learned_aggregate(rule)?;
+        }
+    }
     // ---- write, if the gate said so --------------------------------------
 
-    if apply && report.aggregate_swap {
+    if report.aggregate_swap {
         // A threshold is a number on a score scale, and the scale just moved.
         // Every learned bar in the table was fitted against the *old* rule for
         // turning a voice's prototypes into one score, and against the new one
@@ -707,7 +807,7 @@ pub fn calibrate(
                 report.written += 1;
             }
         }
-    } else if apply && report.thresholds_swap {
+    } else if report.thresholds_swap {
         let keep: Vec<i64> = report.proposed.iter().map(|v| v.speaker_id).collect();
         // Every voice not in the proposal goes back to the global. A learned
         // value nothing re-derived tonight is a value nothing stands behind.
@@ -740,12 +840,11 @@ pub fn calibrate(
     // the audit trail for a pass that did not touch the database. The term that
     // means "this run installed a projection" is `projection_swap`, which is
     // also the condition guarding the `install_projection` call above.
-    if apply
-        && (report.written > 0
-            || report.cleared > 0
-            || report.projection_swap
-            || report.projection_cleared
-            || report.aggregate_swap)
+    if report.written > 0
+        || report.cleared > 0
+        || report.projection_swap
+        || report.projection_cleared
+        || report.aggregate_swap
     {
         let targets: Vec<i64> = report.proposed.iter().map(|v| v.speaker_id).collect();
         store.log_operation(
@@ -1033,6 +1132,43 @@ pub fn reset(store: &Store, now_utc_ns: i64) -> Result<(usize, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_calibration_releases_store_during_compute_and_rejects_stale_install() {
+        let store = std::sync::Mutex::new(Store::open_in_memory().unwrap());
+        let result = calibrate_shared_with(
+            &store,
+            &IdentityConfig::default(),
+            true,
+            42,
+            |snapshot, cfg| {
+                let guard = store
+                    .try_lock()
+                    .expect("capture and RPC must be able to acquire Store during fit");
+                // Stand in for a concurrent user's edit; no fitted setting may
+                // overwrite it when the worker returns to the database.
+                guard.create_speaker("synthetic", 42).unwrap();
+                drop(guard);
+                fit(snapshot, cfg)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.note.as_deref(),
+            Some("archive changed during calibration; installation deferred")
+        );
+        assert_eq!(result.written, 0);
+        assert_eq!(result.cleared, 0);
+    }
+
+    #[test]
+    fn shared_calibration_preview_matches_direct_preview() {
+        let store = std::sync::Mutex::new(Store::open_in_memory().unwrap());
+        let cfg = IdentityConfig::default();
+        let direct = calibrate(&store.lock().unwrap(), &cfg, false, 42).unwrap();
+        let shared = calibrate_shared(&store, &cfg, false, 42).unwrap();
+        assert_eq!(direct.to_json(), shared.to_json());
+    }
 
     // ---- 0.12.2: the gate prices the mint path ----------------------------
 

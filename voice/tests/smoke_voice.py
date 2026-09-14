@@ -25,7 +25,7 @@ class TestMemory:
 
 
 async def main():
-    config = dict(mode='wakeword', audio_mode='vesktop', wake_words=['lanalu', 'chat gpt'],
+    config = dict(mode='wakeword', recognition_source='local', audio_mode='vesktop', wake_words=['lanalu', 'chat gpt'],
                   llama_binary=str(Path.home()/'.local/share/nx-recall/models/llama-voice/llama-server'),
                   llm_model=str(Path.home()/'.local/share/nx-recall/models/qwen3.5-4b-q4_k_m.gguf'))
     private = tempfile.TemporaryDirectory(prefix='nx-recall-voice-test-')

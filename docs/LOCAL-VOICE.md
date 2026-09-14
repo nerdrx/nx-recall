@@ -4,26 +4,32 @@ NX Recall can host Lanalu as a local voice assistant. The desktop app owns the w
 
 ## Audio modes
 
-- **Vesktop call:** Recall exposes a private incoming speaker and generated-voice microphone. Only the Vesktop process with the configured profile is routed. Normal Discord, desktop defaults and other apps keep their routes. You join and leave Discord calls yourself.
-- **This computer:** choose a microphone and normal speaker/headphones. Nothing is rerouted globally. Playback temporarily gates microphone input with a short echo tail so ordinary speakers do not feed the assistant's voice back into itself. This mode is half-duplex; Vesktop supports barge-in.
+- **Virtual in/out:** Recall exposes a private incoming speaker and generated-voice microphone. Only the configured voice-client profile is routed. Normal Discord, desktop defaults and other apps keep their routes. You join and leave Discord calls yourself.
+- **This computer:** choose a microphone and normal speaker/headphones. Nothing is rerouted globally. Playback temporarily gates microphone input with a short echo tail so ordinary speakers do not feed the assistant's voice back into itself. This mode is half-duplex; Virtual in/out supports barge-in.
 
-Vesktop initially uses its saved input until detection completes. Select the Recall virtual microphone explicitly in Vesktop once visible for predictable first-call behavior. Stopping Local Voice restores prior Vesktop routes, including its prior microphone. Other participants' microphone/screen-share echo remains possible; this is not an acoustic echo canceller.
+Your voice client initially uses its saved input until detection completes. Select the Recall virtual microphone explicitly in the voice client once visible for predictable first-call behavior. Stopping Local Voice restores the client’s prior routes, including its prior microphone. Other participants' microphone/screen-share echo remains possible; this is not an acoustic echo canceller.
 
 ## Typed chat and diagnostics
 
-Open the **Lanalu** tab directly from the navigation rail. Typed requests bypass the wake phrase and voice recognition. Replies appear in the current view as text as well as through the selected audio output. The visible exchange is not saved by this chat view and is cleared when you leave it. In Vesktop mode the local model can stay ready while the call is disconnected; audio replies need a connected call or a selected local output.
+Open the **Lanalu** tab directly from the navigation rail. Typed requests bypass the wake phrase and voice recognition. Replies appear in the current view as text as well as through the selected audio output. The visible exchange is not saved by this chat view and is cleared when you leave it. In Virtual in/out mode the local model can stay ready while the call is disconnected; audio replies need a connected call or a selected local output.
 
 The **Debug** button opens a separate window with worker state, component readiness, routing counts and recent diagnostic events. This view excludes conversation text and credentials. A stopped worker retains its last failure so it can be diagnosed.
 
 ## Local speech and memory
 
-The worker runs Parakeet 110M speech recognition, Qwen3.5 4B through llama.cpp Vulkan, and Piper Amy synthesis using downloaded local models. Wake phrases (“Lanalu” or “Chat GPT” by default) are recognized locally. Always-listening mode responds to each detected utterance. PCM, transcripts and retrieved records never go to a cloud API; no API credentials are read by this worker.
+By default, Lanalu reuses **Recall recognition**: it reads the words Recall has already recognized for the same live input and utterance. It does not run a second speech decoder. Choose **Separate recognition** to use the optional local Parakeet 110M decoder instead. Both modes use Qwen3.5 4B through llama.cpp Vulkan and Piper Amy synthesis using downloaded local models. Wake phrases (“Lanalu” or “Chat GPT” by default) are recognized locally. Always-listening mode responds to each detected utterance. PCM, transcripts and retrieved records never go to a cloud API; no API credentials are read by this worker.
+
+Shared recognition waits up to eight seconds for a complete, stable transcript match. It accepts only the exact source and live utterance time range, including a small allowance for Recall's normal 200 ms speech padding. Split transcript segments are joined in time order; a segment is not reused for a later question. Wider merged turns, stale text, unrelated sources and ambiguous matches are rejected rather than guessed. This conservative matching can skip an utterance when Recall's segmentation differs substantially from Lanalu's local activity detector.
+
+For a local microphone, Recall's enabled, active microphone must resolve to the same device Lanalu is capturing. For Virtual in/out, Lanalu verifies actual PipeWire links from its selected profile to both its private input and Recall's recording tee; the binding must remain unchanged from speech onset through transcript matching. Another client instance cannot supply the words. Shared recognition needs Recall recording enabled for that input and enough time for its normal decoder to commit the turn. There is no silent fallback to a second decoder.
+
+The inline state reports **Waiting for Recall recognition**, then either continues to a reply or reports why recognition is unavailable. Diagnostic codes distinguish paused capture, missing capture, an input mismatch, ambiguous sources, stale intervals and timeout; diagnostics contain no words. Fix the input/capture setting or explicitly select separate recognition to retry. Typed chat remains usable without a matching audio transcript. Recall's existing recording and retention rules continue to govern the reused transcript.
 
 Lanalu and the optional Recall memory writer use [Qwen3.5 4B](https://huggingface.co/Qwen/Qwen3.5-4B), with [pinned Q4_K_M weights](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/tree/e87f176479d0855a907a41277aca2f8ee7a09523). Thinking is disabled for direct replies and structured extraction. Lanalu keeps a Vulkan model server ready; Recall’s background writer uses its configured local llama-cli runtime and CPU/GPU budget. The model file is shared, while each process keeps its own conversation state.
 
 Recall memory retrieval uses its existing same-user Unix socket, with bounded semantic/keyword results. Retrieved text is reference material, not executable instructions. Unrelated records should not be treated as evidence for a memory answer. There are no automatic tool actions or account automation.
 
-Speaker names come from Recall's own recent acoustic matches for the exact Vesktop stream. A name is used only if assigned explicitly, non-generic, strongly matched, temporally aligned and unambiguous. “Speaker…” labels, missing scores, overlapping speakers and uncertain matches stay unknown. Similarity is not a calibrated probability. Recognition can lag behind speech processing; a reply may use no name even for an enrolled speaker. Local microphone mode currently leaves the speaker unknown.
+Speaker names come from Recall's own recent acoustic matches for the selected virtual input stream. A name is used only if assigned explicitly, non-generic, strongly matched, temporally aligned and unambiguous. “Speaker…” labels, missing scores, overlapping speakers and uncertain matches stay unknown. Similarity is not a calibrated probability. Recognition can lag behind speech processing; a reply may use no name even for an enrolled speaker. Local microphone mode currently leaves the speaker unknown.
 
 ## Runtime
 

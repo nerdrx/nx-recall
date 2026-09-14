@@ -15,6 +15,7 @@ SILENCE = bytes(960)
 class FakeAudio:
     capture = None
     def __init__(self):
+        self.devices = types.SimpleNamespace(capture_source="test-mic")
         self.frames = asyncio.Queue()
         self.started = asyncio.Event()
         self.playing = asyncio.Event()
@@ -22,6 +23,8 @@ class FakeAudio:
         self.clears = 0
         self.reads = 0
         self.write_cancelled = False
+    async def recognition_binding(self):
+        return ('private-test-binding',)
     async def start(self):
         self.started.set()
     async def read(self):
@@ -42,10 +45,11 @@ class FakeAudio:
 
 
 class VoiceTests(unittest.IsolatedAsyncioTestCase):
-    async def start_worker(self, mode="vesktop", texts=None, identity_error=False, trigger="wakeword"):
+    async def start_worker(self, mode="vesktop", texts=None, identity_error=False, trigger="wakeword", recognition="local", recognition_error=None):
         self.text_queue = asyncio.Queue(maxsize=1)
         self.audio = FakeAudio()
         self.statuses = asyncio.Queue()
+        self.shared_requests = []
         self.transcriptions = 0
         self.model_gate = asyncio.Event()
         self.model_gate.set()
@@ -78,6 +82,13 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
                 pass
             async def retrieve(self, text, limit):
                 return []
+            async def recognize(self, *args, **kwargs):
+                test.shared_requests.append((args, kwargs))
+                if recognition_error:
+                    raise recall.RecognitionUnavailable(recognition_error)
+                if kwargs.get('source') == 'vesktop' and not await kwargs['input_guard']():
+                    raise recall.RecognitionUnavailable('input_mismatch')
+                return {'text': pending.pop(0), 'segment_ids': [4], 'wait_ms': 200}
             async def identify(self, *args, **kwargs):
                 if identity_error:
                     raise RuntimeError("synthetic unavailable")
@@ -87,7 +98,7 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
                         patch.dict(sys.modules, {"nx_recall_voice.speech": types.SimpleNamespace(Speech=Speech)})]:
             patcher.start()
             self.addCleanup(patcher.stop)
-        config = {"audio_mode": mode, "mode": trigger, "wake_words": ["lanalu"], "silence_duration_ms": 40}
+        config = {"audio_mode": mode, "mode": trigger, "recognition_source": recognition, "wake_words": ["lanalu"], "silence_duration_ms": 40}
         self.worker = asyncio.create_task(local.run_local(config, self.audio,
                     lambda event, **fields: self.statuses.put_nowait((event, fields)), self.text_queue))
         self.addAsyncCleanup(self.stop_worker)
@@ -211,6 +222,42 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
         self.assertEqual(self.audio.clears, 1)
         self.assertEqual(self.transcriptions, 1)
+
+    async def test_shared_recognition_reuses_exact_vad_span_without_local_stt(self):
+        await self.start_worker(recognition='recall')
+        await self.utterance()
+        await self.wait_status('recall_transcript_received')
+        await self.wait_status('local_speaking')
+        self.assertEqual(self.transcriptions, 0)
+        self.assertEqual(len(self.shared_requests), 1)
+        bounds, options = self.shared_requests[0]
+        self.assertEqual(bounds[1] - bounds[0], 60_000_000)
+        self.assertEqual(options['source'], 'vesktop')
+        self.assertIsNone(options['capture_source'])
+        self.assertTrue(await options['input_guard']())
+
+    async def test_shared_recognition_failure_never_falls_back_to_local_stt(self):
+        await self.start_worker(mode='local', recognition='recall', recognition_error='input_mismatch')
+        await self.utterance()
+        fields = await self.wait_status('recognition_unavailable')
+        self.assertEqual(fields['recognition_error'], 'input_mismatch')
+        self.assertEqual(self.transcriptions, 0)
+        self.assertFalse(self.model_messages)
+        self.assertEqual(self.shared_requests[0][1]['capture_source'], 'test-mic')
+
+    async def test_shared_vesktop_binding_change_rejects_other_stream(self):
+        await self.start_worker(recognition='recall')
+        reads = 0
+        async def changed_binding():
+            nonlocal reads
+            reads += 1
+            return ('original' if reads == 1 else 'replacement',)
+        self.audio.recognition_binding = changed_binding
+        await self.utterance()
+        fields = await self.wait_status('recognition_unavailable')
+        self.assertEqual(fields['recognition_error'], 'input_mismatch')
+        self.assertEqual(self.transcriptions, 0)
+        self.assertFalse(self.model_messages)
 
     async def test_model_cleanup_even_when_audio_clear_fails(self):
         await self.start_worker()

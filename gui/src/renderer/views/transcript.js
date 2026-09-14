@@ -1,3 +1,4 @@
+import { createMutationFeedback } from '../lib/mutation.js';
 import { searchableSpeakerSelect } from '../lib/searchable-select.js';
 // Live transcript — the view the app is for. Segments stream in as they are
 // transcribed; anything the pipeline itself refused to identify is visibly
@@ -1276,6 +1277,14 @@ export function openSegmentSheet(seg, ctx) {
       hidden: true,
     });
     text.value = seg.text ?? '';
+    const saveStatus = h('p', { class: 'sub', id: 'segment-save-status' });
+    const saveButton = h('button', { class: 'btn primary', id: 'segment-save', onclick: () => void save() }, 'Save');
+    const feedback = createMutationFeedback({ status: saveStatus, button: saveButton });
+    async function performSave(task) {
+      text.readOnly = true;
+      try { return await feedback.run(task); }
+      finally { text.readOnly = false; }
+    }
 
     const reader = h('button', {
       class: 'fix-text',
@@ -1301,7 +1310,7 @@ export function openSegmentSheet(seg, ctx) {
     }
 
     function endEdit({ revert = false } = {}) {
-      if (revert) text.value = seg.text ?? '';
+      if (revert) { text.value = seg.text ?? ''; feedback.clear(); }
       text.hidden = true;
       reader.hidden = false;
       reader.textContent = text.value || '…';
@@ -1309,7 +1318,7 @@ export function openSegmentSheet(seg, ctx) {
     }
 
     text.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && !feedback.pending) {
         // Stopped here so the sheet's own Escape does not also close the sheet:
         // one keystroke, one meaning, and the nearer thing wins.
         e.preventDefault();
@@ -1327,20 +1336,18 @@ export function openSegmentSheet(seg, ctx) {
 
     /** The one motion: Enter in the words saves the words and nothing else. */
     async function saveText() {
+      if (feedback.pending) return;
       if (text.value === seg.text) {
         endEdit();
         return;
       }
       try {
-        await ask('segments.correct', { segment_id: seg.id, text: text.value });
+        await performSave(() => ask('segments.correct', { segment_id: seg.id, text: text.value }));
         // No optimistic write: the daemon broadcasts the corrected segment,
         // every client updates from that, and the row grows its "edited" mark
         // through the same path a correction made in the CLI would take.
         endEdit();
-        toast('Fixed. It feeds the accuracy figures and the vocabulary.', 'ok');
-      } catch (e) {
-        toast(`Could not save that — ${e.message}`, 'error');
-      }
+      } catch { /* Keep the correction open with its inline error. */ }
     }
 
     // ------------------------------------------------------------------
@@ -1370,7 +1377,9 @@ export function openSegmentSheet(seg, ctx) {
       'data-keep-escape': '',
       maxlength: '48',
     });
+    const nameStatus = h('p', { class: 'sub', id: 'name-voice-status' });
     const nameBtn = h('button', { class: 'btn small', id: 'name-voice-save', onclick: () => void saveName() }, 'Name');
+    const nameFeedback = createMutationFeedback({ status: nameStatus, button: nameBtn, success: 'Name saved.' });
     const nameRow = h(
       'div',
       { class: 'name-voice-row', id: 'name-voice-row', hidden: !unnamed() },
@@ -1429,39 +1438,33 @@ export function openSegmentSheet(seg, ctx) {
       }
     });
     async function saveName() {
+      if (nameFeedback.pending) return;
       const sp = unnamed();
       const name = nameInput.value.trim();
       if (!sp || !name) return;
-      nameBtn.disabled = true;
+      nameInput.readOnly = true;
       try {
-        await ask('speakers.name', { id: sp.id, name });
+        await nameFeedback.run(() => ask('speakers.name', { id: sp.id, name }));
         // No optimistic write: the `relabel` event relabels this row and every
         // other one, and the hint below reflects the store once it has.
-        toast(`Named ${name}. Every turn of that voice now says so.`, 'ok');
         nameInput.value = '';
         setTimeout(() => { paintNameRow(); speakerPicker.refresh(); paintHlRow(); }, 50);
-      } catch (e) {
-        toast(`Could not name that voice — ${e.message}`, 'error');
-      } finally {
-        nameBtn.disabled = false;
-      }
+      } catch { /* Keep the entered name available for retry. */ }
+      finally { nameInput.readOnly = false; }
     }
 
     const save = async () => {
-      const jobs = [];
-      if (picked !== (seg.speaker ?? null)) jobs.push(ask('segments.reassign', { segment_id: seg.id, speaker_id: picked }));
-      if (text.value !== seg.text) jobs.push(ask('segments.correct', { segment_id: seg.id, text: text.value }));
-      if (!jobs.length) {
-        close();
-        return;
-      }
+      if (feedback.pending) return;
+      const reassign = picked !== (seg.speaker ?? null);
+      const correct = text.value !== seg.text;
+      if (!reassign && !correct) { close(); return; }
       try {
-        await Promise.all(jobs);
-        toast('Segment updated.', 'ok');
+        await performSave(() => Promise.all([
+          ...(reassign ? [ask('segments.reassign', { segment_id: seg.id, speaker_id: picked })] : []),
+          ...(correct ? [ask('segments.correct', { segment_id: seg.id, text: text.value })] : []),
+        ]));
         close();
-      } catch (e) {
-        toast(`Could not save the correction — ${e.message}`, 'error');
-      }
+      } catch { /* Both controls remain available with their inline failure. */ }
     };
 
     // "Who said this?" is a question about a sound, so the sound is one press
@@ -1558,6 +1561,7 @@ export function openSegmentSheet(seg, ctx) {
       ),
       ...speakerPicker.nodes,
       nameRow,
+      nameStatus,
       // Under the naming offer and not inside it: `nameRow` is hidden the
       // moment a voice has a name, and a highlight is for exactly the voice
       // you already know the name of. See `paintHlRow` above.
@@ -1575,11 +1579,12 @@ export function openSegmentSheet(seg, ctx) {
       provenanceLine(seg),
       reader,
       text,
+      saveStatus,
       h(
         'div',
         { class: 'actions' },
         h('button', { class: 'btn', onclick: () => close() }, 'Cancel'),
-        h('button', { class: 'btn primary', id: 'segment-save', onclick: save }, 'Save')
+        saveButton
       ),
     ];
   };

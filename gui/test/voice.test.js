@@ -12,6 +12,8 @@ test('voice accepts only fixed local settings and encodes TOML safely', () => {
   const base = voiceDefaults('/example');
   assert.equal(base.backend, 'local');
   assert.equal(base.autostart, false);
+  assert.equal(base.recognition_source, 'recall');
+  assert.throws(() => normalizeVoiceConfig({ recognition_source: 'remote' }, base));
   assert.throws(() => normalizeVoiceConfig({ autostart: 'yes' }, base));
   assert.throws(() => normalizeVoiceConfig({ backend: 'openai' }, base));
   assert.throws(() => normalizeVoiceConfig({ llm_url: 'https://remote.test' }, base));
@@ -48,6 +50,7 @@ test('voice controller persists settings, owns one worker and waits for graceful
 });
 
 test('voice status does not claim listening before worker readiness', () => {
+  assert.match(voiceStateLabel({ running: true, status:{event:'recognition_unavailable',recognition_error:'paused'} }), /Resume capture/);
   assert.equal(voiceStateLabel({ running: true }), 'Starting Local Voice…');
   assert.equal(voiceStateLabel({ running: true, status: { event: 'local_ready' } }), 'Listening locally');
   assert.equal(voiceStateLabel({ running: false, available: false }), 'Local Voice needs setup');
@@ -65,7 +68,8 @@ test('setup requires packaged script, reports all missing components, and reject
   const voice = createVoiceController({userData: join(dir,'data'), home:dir, runtime:dir, setupScriptPath:join(dir,'missing.py')});
   assert.equal(voice.state().setupAvailable,false);
   assert.equal(voice.state().available,false);
-  assert.ok(Object.values(voice.state().components).every(v=>!v));
+  assert.equal(voice.state().components.stt,true);
+  assert.ok(Object.entries(voice.state().components).filter(([key])=>key!=='stt').every(([,v])=>!v));
   assert.throws(()=>voice.start(), /Set up Local Voice/);
   assert.throws(()=>voice.setup(), /setup is missing/);
 });
@@ -115,6 +119,15 @@ test('debug retains stopped worker state, routes and error without transcript fi
 
  test('model labels describe configured models without exposing custom paths', () => {
   const base=voiceDefaults('/example');
-  assert.deepEqual(voiceModelLabels(base), {llm:'Qwen3.5 4B · Q4_K_M',stt:'Parakeet 110M · English',tts:'Piper Amy · English'});
-  assert.deepEqual(voiceModelLabels({...base,stt_model_dir:'/private/model',tts_model_path:'/private/voice.onnx'}), {llm:'Qwen3.5 4B · Q4_K_M',stt:'Custom recognition model',tts:'Custom Piper voice'});
+  assert.deepEqual(voiceModelLabels(base), {llm:'Qwen3.5 4B · Q4_K_M',stt:'Recall’s configured recognition model',tts:'Piper Amy · English'});
+  assert.deepEqual(voiceModelLabels({...base,recognition_source:'local',stt_model_dir:'/private/model',tts_model_path:'/private/voice.onnx'}), {llm:'Qwen3.5 4B · Q4_K_M',stt:'Custom recognition model',tts:'Custom Piper voice'});
+});
+
+test('shared recognition does not require a separate speech model',t=>{
+  const dir=mkdtempSync(join(tmpdir(),'nx-voice-shared-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));installFixture(dir);
+  const base=voiceDefaults(dir);rmSync(base.stt_model_dir,{recursive:true});
+  const controller=createVoiceController({userData:join(dir,'data'),home:dir,runtime:dir});
+  assert.equal(controller.state().available,true);
+  controller.save({recognition_source:'local'});assert.equal(controller.state().available,false);
+  controller.save({recognition_source:'recall'});assert.equal(controller.state().available,true);
 });

@@ -225,7 +225,8 @@ cat > "$STAGE/README-NX.md" <<EOF
 # NX Recall $VERSION — Linux x86-64
 
 Local-first, always-on conversation transcription with cross-session speaker
-identity. Private repo, no cloud, no telemetry, no export.
+identity, a searchable local archive, and optional Lanalu voice conversation.
+Local inference, no telemetry, and user-controlled capture and export.
 
 ## Install through NX Hub
 
@@ -242,10 +243,10 @@ copies \`usr/\` into \`~/.local\`, records every file, and uninstalls exactly.
     systemctl --user daemon-reload
     systemctl --user enable --now nx-recall
 
-\`models fetch\` is the only part of this program that opens a network socket. It
-pulls ~500 MB of ONNX models from the sherpa-onnx GitHub releases into
-\`~/.local/share/nx-recall/models\` and verifies every file's exact byte size.
-Transcription itself never touches the network.
+Model setup downloads files into \`~/.local/share/nx-recall/models\`. Installation,
+model setup and updates need network access; local transcription and inference
+do not send conversations to a cloud API. Optional Virtual in/out output sends generated
+replies to the call you joined. Set up Lanalu from her tab in the desktop app.
 
 ## Capture is default-deny
 

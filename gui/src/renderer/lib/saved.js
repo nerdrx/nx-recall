@@ -1,3 +1,4 @@
+import { createMutationFeedback } from './mutation.js';
 // User-created moments point at captured turns; this dialog never copies audio.
 import { h, fmtClock } from './dom.js';
 import { ask, segmentSpeakerLabel } from './store.js';
@@ -22,7 +23,6 @@ export async function saveMomentSheet(segmentIds, { title = '', note = '', id = 
   return new Promise(resolve => {
     let settled = false;
     const finish = value => { if (!settled) { settled = true; resolve(value); } };
-    let busy = false;
     const close = openSheet(close => {
       const name = h('input', { class: 'input', id: 'moment-title', maxlength: '180', value: title, placeholder: 'Optional title' });
       const annotation = h('textarea', { class: 'input', id: 'moment-note', maxlength: '4096', rows: '3', placeholder: 'Your own note — separate from the transcript' });
@@ -32,15 +32,16 @@ export async function saveMomentSheet(segmentIds, { title = '', note = '', id = 
       const start = choice('moment-start', original[0]);
       const end = choice('moment-end', original.at(-1));
       const submit = h('button', { class: 'btn primary', id: 'moment-save', onclick: async () => {
-        if (busy) return;
+        if (feedback.pending) return;
         try {
           const ids = rows.length ? selectedMomentIds(rows, start.value, end.value) : original;
-          busy = true; submit.disabled = true; error.textContent = '';
-          const res = await ask('saved.moments.save', { ...(id != null ? { id } : {}), segment_ids: ids, title: name.value.trim(), note: annotation.value.trim() });
+          name.readOnly = annotation.readOnly = true; start.disabled = end.disabled = true;
+          const res = await feedback.run(() => ask('saved.moments.save', { ...(id != null ? { id } : {}), segment_ids: ids, title: name.value.trim(), note: annotation.value.trim() }));
           finish(res.moment); close(res.moment); toast('Moment saved in Memory.');
-        } catch (e) { error.textContent = e.message || 'Could not save this moment.'; }
-        finally { busy = false; submit.disabled = false; }
+        } catch (e) { error.hidden = false; error.textContent = e.message || 'Could not save this moment.'; }
+        finally { name.readOnly = annotation.readOnly = false; start.disabled = end.disabled = false; }
       } }, id == null ? 'Save moment' : 'Save changes');
+      const feedback = createMutationFeedback({ status: error, button: submit, success: 'Moment saved.' });
       return [h('h2', { text: id == null ? 'Save a moment' : 'Edit saved moment' }),
         h('p', { class: 'sub', text: 'Keep a link to these turns. Audio follows your retention settings; deleted sources are not kept by saving.' }),
         h('label', { for: 'moment-title', text: 'Title' }), name,

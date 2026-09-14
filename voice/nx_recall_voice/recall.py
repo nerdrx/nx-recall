@@ -12,6 +12,8 @@ import re
 from pathlib import Path
 import socket
 import struct
+import time
+from collections import deque
 
 MAX_LINE = 1024 * 1024
 MAX_TEXT = 1500
@@ -20,6 +22,52 @@ MAX_TOTAL_TEXT = 6000
 
 class RecallError(RuntimeError):
     """A sanitized local retrieval failure; contains no query/transcript text."""
+
+
+class RecognitionUnavailable(RecallError):
+    """A fixed diagnostic code, never transcript content or private device names."""
+    def __init__(self, code):
+        self.code = code
+        super().__init__("Shared recognition is unavailable")
+
+
+def _recognized(segments, start_ns, end_ns, source, consumed=()):
+    """Accept only whole, closely aligned turns; never splice unrelated words."""
+    if not isinstance(segments, list) or len(segments) >= 64:
+        return None
+    margin = 400_000_000
+    rows = []
+    for row in segments:
+        if not isinstance(row, dict) or row.get('source') != source:
+            continue
+        try:
+            a, b = int(row['t_start_ns']), int(row['t_end_ns'])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if b <= start_ns or a >= end_ns:
+            continue
+        if b <= a or a < start_ns - margin or b > end_ns + margin:
+            return None
+        ident = row.get('id')
+        text = _clean(row.get('text'), 2001)
+        if type(ident) is not int or ident in consumed or not text or len(text) > 2000:
+            return None
+        rows.append((a, b, ident, text))
+    rows.sort()
+    if not rows or len({r[2] for r in rows}) != len(rows):
+        return None
+    covered, last = 0, start_ns
+    for a, b, _, _ in rows:
+        left, right = max(a, start_ns), min(b, end_ns)
+        covered += max(0, right - max(left, last))
+        last = max(last, right)
+    edge = min(300_000_000, (end_ns - start_ns) // 4)
+    if covered < (end_ns - start_ns) * .75 or rows[0][0] > start_ns + edge or rows[-1][1] < end_ns - edge:
+        return None
+    text = ' '.join(r[3] for r in rows)
+    if len(text) > 2000:
+        return None
+    return {'text': text, 'segment_ids': [r[2] for r in rows]}
 
 
 class _RemoteError(RecallError):
@@ -127,6 +175,7 @@ class RecallClient:
         self.socket_path = Path(socket_path).expanduser() if socket_path else default_socket()
         self.timeout = timeout
         self.semantic = semantic
+        self.recognized_ids = deque(maxlen=128)
 
     async def retrieve(self, query, limit=4):
         """Return at most eight excerpts, each 1500 chars, 6000 chars total.
@@ -195,6 +244,75 @@ class RecallClient:
         except (RecallError, OSError, TimeoutError, ValueError, UnicodeError):
             return None
         return None
+
+    async def recognize(self, start_ns, end_ns, *, source, capture_source=None, input_guard=None, wait_seconds=8):
+        """Read this live VAD interval from Recall; no alternate STT is invoked.
+
+        Microphone reuse requires the same resolved device. Vesktop reuse requires
+        one active captured application stream, so another instance cannot answer.
+        Two matching reads allow split transcript commits to settle.
+        """
+        if type(start_ns) is not int or type(end_ns) is not int or source not in ('mic', 'vesktop'):
+            raise ValueError('Shared recognition needs an exact source and UTC interval')
+        if not 40_000_000 <= end_ns - start_ns <= 60_000_000_000:
+            raise RecognitionUnavailable('invalid_interval')
+        if end_ns > time.time_ns() + 1_000_000_000 or time.time_ns() - end_ns > 20_000_000_000:
+            raise RecognitionUnavailable('stale_interval')
+        if source == 'vesktop' and not callable(input_guard):
+            raise RecognitionUnavailable('input_mismatch')
+        if source == 'mic' and (not isinstance(capture_source, str) or not capture_source):
+            raise RecognitionUnavailable('input_mismatch')
+        started = time.monotonic()
+        async def operation(call):
+            sequence = 0
+            async def rpc(method, params=None):
+                nonlocal sequence
+                sequence += 1
+                return await call(method, params or {}, sequence)
+            previous = None
+            while True:
+                state = await rpc('status')
+                if state.get('paused') is not False:
+                    raise RecognitionUnavailable('paused')
+                if source == 'mic':
+                    mic = await rpc('mic.get')
+                    if mic.get('enabled') is not True or mic.get('active') is not True:
+                        raise RecognitionUnavailable('source_unavailable')
+                    device = mic.get('device')
+                    if device is None:
+                        devices = (await rpc('devices.list')).get('devices')
+                        defaults = [d.get('node_name') for d in devices if isinstance(d, dict) and d.get('is_default') is True] if isinstance(devices, list) else []
+                        if len(defaults) != 1:
+                            raise RecognitionUnavailable('input_mismatch')
+                        device = defaults[0]
+                    if device != capture_source:
+                        raise RecognitionUnavailable('input_mismatch')
+                else:
+                    if await input_guard() is not True:
+                        raise RecognitionUnavailable('input_mismatch')
+                    sources = (await rpc('sources.list')).get('sources')
+                    matching = [s for s in sources if isinstance(s, dict) and s.get('match_key') == 'vesktop'] if isinstance(sources, list) else []
+                    if len(matching) != 1 or matching[0].get('allowed') is not True or not matching[0].get('streams'):
+                        raise RecognitionUnavailable('source_unavailable')
+                    if matching[0]['streams'] != 1:
+                        raise RecognitionUnavailable('ambiguous_source')
+                reply = await rpc('transcript', {'source': source, 'from': start_ns - 400_000_000,
+                                                 'to': end_ns + 400_000_001, 'limit': 64})
+                result = _recognized(reply.get('segments'), start_ns, end_ns, source, self.recognized_ids)
+                if result is not None and result == previous:
+                    self.recognized_ids.extend(result['segment_ids'])
+                    return {**result, 'wait_ms': int((time.monotonic() - started) * 1000)}
+                previous = result
+                await asyncio.sleep(.2)
+        try:
+            async with asyncio.timeout(min(10, max(.1, float(wait_seconds)))):
+                return await self._session(operation)
+        except RecognitionUnavailable:
+            raise
+        except TimeoutError:
+            raise RecognitionUnavailable('timeout') from None
+        except (RecallError, OSError, ValueError, UnicodeError):
+            raise RecognitionUnavailable('unavailable') from None
 
     async def _session(self, operation):
         reader, writer = await asyncio.open_unix_connection(str(self.socket_path), limit=MAX_LINE)

@@ -1310,6 +1310,34 @@ pub struct TranscriptRow {
     pub text: Option<String>,
 }
 
+/// Prefix maximum of closed speaking ends, plus the earliest still-open span.
+/// Starts arrive sorted. Nested intervals cannot extend reach and need no entry.
+#[derive(Default)]
+struct SpeakingReach {
+    closed: Vec<(i64, i64)>,
+    open: Option<i64>,
+}
+
+impl SpeakingReach {
+    fn add(&mut self, start: i64, end: Option<i64>) {
+        match end {
+            None => {
+                self.open = Some(self.open.map_or(start, |old| old.min(start)));
+            }
+            Some(end) if self.closed.last().is_none_or(|&(_, old)| end > old) => {
+                self.closed.push((start, end));
+            }
+            Some(_) => {}
+        }
+    }
+
+    fn overlaps(&self, start: i64, end: i64) -> bool {
+        let n = self.closed.partition_point(|&(at, _)| at < end);
+        (n > 0 && self.closed[n - 1].1 > start)
+            || (end > start && self.open.is_some_and(|at| at < end))
+    }
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -7620,36 +7648,40 @@ impl Store {
         patterns: &[String],
         limit: usize,
     ) -> Result<Vec<TruthCandidate>> {
-        if patterns.is_empty() {
+        if patterns.is_empty() || limit == 0 {
             return Ok(Vec::new());
+        }
+        // Walk the timestamp index once, rather than scanning its historical
+        // prefix again for every unknown segment. Only times enter this cache.
+        let mut reach = SpeakingReach::default();
+        let mut spans = self
+            .conn
+            .prepare("SELECT t_start_ns, t_end_ns FROM truth_speaking ORDER BY t_start_ns")?;
+        for span in spans.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))? {
+            let (start, end) = span?;
+            reach.add(start, end);
         }
         let sql = format!(
             "SELECT g.id, g.t_start_ns, g.t_end_ns, g.speaker_id, g.overlap_frac, sc.kind,
-                    sc.match_key
+                    sc.match_key, g.truth_verdict IS NULL
                FROM segments g
                JOIN sessions ss ON ss.id = g.session_id
                JOIN sources  sc ON sc.id = ss.source_id
               WHERE g.deleted_at IS NULL
                 AND ({})
-                AND (g.truth_verdict IS NULL
-                     OR (g.truth_verdict = ?1
-                         AND EXISTS (SELECT 1 FROM truth_speaking t
-                                      WHERE t.t_start_ns < g.t_end_ns
-                                        AND COALESCE(t.t_end_ns, g.t_end_ns) > g.t_start_ns)))
-              ORDER BY g.t_start_ns DESC
-              LIMIT ?2",
-            Self::discord_source_clause(patterns.len(), 3)
+                AND (g.truth_verdict IS NULL OR g.truth_verdict = ?1)
+              ORDER BY g.t_start_ns DESC",
+            Self::discord_source_clause(patterns.len(), 2)
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut binds: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(truth_verdict::UNKNOWN), Box::new(limit as i64)];
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(truth_verdict::UNKNOWN)];
         for p in patterns {
             binds.push(Box::new(p.to_lowercase()));
         }
         let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-        Ok(stmt
-            .query_map(refs.as_slice(), |r| {
-                Ok(TruthCandidate {
+        let rows = stmt.query_map(refs.as_slice(), |r| {
+            Ok((
+                TruthCandidate {
                     id: r.get(0)?,
                     t_start_ns: r.get(1)?,
                     t_end_ns: r.get(2)?,
@@ -7657,9 +7689,21 @@ impl Store {
                     overlap_frac: r.get(4)?,
                     kind: r.get(5)?,
                     source: r.get(6)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+                },
+                r.get::<_, bool>(7)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (candidate, unjudged) = row?;
+            if unjudged || reach.overlaps(candidate.t_start_ns, candidate.t_end_ns) {
+                out.push(candidate);
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Stamp a segment with what Discord said about it. Never touches
@@ -10168,6 +10212,30 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn speaking_reach_matches_correlated_overlap_at_boundaries() {
+        let spans = [
+            (0, Some(5)),
+            (1, Some(3)),
+            (3, Some(7)),
+            (8, Some(8)),
+            (9, Some(12)),
+            (13, None),
+        ];
+        let mut reach = super::SpeakingReach::default();
+        for &(start, end) in &spans {
+            reach.add(start, end);
+        }
+        for start in -1..16 {
+            for end in start..17 {
+                let expected = spans
+                    .iter()
+                    .any(|&(a, b)| a < end && b.unwrap_or(end) > start);
+                assert_eq!(reach.overlaps(start, end), expected, "{start}..{end}");
+            }
+        }
+    }
+
     #[test]
     fn the_microphone_joins_the_conversation_it_is_actually_in() {
         // The user's half of a conversation lives in the mic session while

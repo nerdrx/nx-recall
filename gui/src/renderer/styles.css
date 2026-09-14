@@ -2110,3 +2110,7 @@ input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), select, te
 .lanalu-header-art { width: 280px; height: 140px; object-fit: contain; margin-left: auto; border-radius: 8px; }
 @media(max-width:800px) { .lanalu-header-art { width: 180px; height: 90px; } }
 @media(max-width:600px) { .lanalu-header-art { display:none; } }
+
+/* A write reports its outcome beside the control that initiated it. */
+.mutation-feedback[data-state="error"] { color: var(--clear-danger); }
+.mutation-feedback[data-state="pending"] { color: var(--text); }

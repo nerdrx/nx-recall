@@ -1,3 +1,4 @@
+import { createMutationFeedback } from '../lib/mutation.js';
 import { searchableSpeakerSelect } from '../lib/searchable-select.js';
 // Search — over the transcript, with speaker / source / date facets, in three
 // modes: the words (FTS), the meaning (vectors), or both fused. The mode
@@ -254,18 +255,22 @@ export function mount(root, ctx, arg) {
     } }, 'Last 7 days'), scopeLabel);
   const saveSearch = () => openSheet((close) => {
     const name = h('input', { class: 'input', id: 'saved-search-name', value: qInput.value.trim().slice(0, 120), maxlength: 120 });
+    const saveStatus = h('p', { class: 'sub', id: 'saved-search-status' });
     const save = h('button', { class: 'btn primary', onclick: async () => {
+      if (feedback.pending) return;
       if (!name.value.trim()) { name.focus(); return; }
-      save.disabled = true;
       try {
         const snapshot = { ...facetState, q: qInput.value, speaker: speakerSel.value, source: sourceSel.value,
           from: fromInput.value, to: toInput.value, asked: qInput.value === facetState.q ? facetState.asked : null };
-        await ask('saved.searches.save', { name: name.value.trim(), query: snapshot.q, filters: savedSearchFilters(snapshot) });
+        name.readOnly = true;
+        await feedback.run(() => ask('saved.searches.save', { name: name.value.trim(), query: snapshot.q, filters: savedSearchFilters(snapshot) }));
         close(); toast('Search saved in Memory.', '');
-      } catch (e) { toast(e.message, 'error'); save.disabled = false; }
+      } catch { /* Keep the draft and its inline failure available for retry. */ }
+      finally { name.readOnly = false; }
     } }, 'Save search');
+    const feedback = createMutationFeedback({ status: saveStatus, button: save, success: 'Search saved.' });
     return [h('h2', { text: 'Save this search' }), h('p', { class: 'sub', text: 'Keep this query and its filters in Memory. Last 7 days stays relative; chosen dates stay fixed.' }),
-      h('label', { for: 'saved-search-name', text: 'Name' }), name,
+      h('label', { for: 'saved-search-name', text: 'Name' }), name, saveStatus,
       h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => close() }, 'Cancel'), save)];
   });
   const contextEmpty = h('aside', { class: 'search-context-empty', 'aria-label': 'Conversation reader' },

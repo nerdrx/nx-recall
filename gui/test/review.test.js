@@ -103,3 +103,34 @@ test('a failed in-flight save cannot re-enable a card invalidated by newer sourc
     assert.match(descendants(card).find(node => node.class === 'review-problem' || node.className === 'review-problem').textContent, /Refresh before reviewing/);
   });
 });
+
+
+test('correction saves report pending inline, reject duplicates, and preserve draft on failure', async () => {
+  const request = deferred(); let writes = 0;
+  await mountedReview(method => {
+    if (method === 'review.list') return { items: [{ ...fixture }], next_before_id: null };
+    if (method === 'segments.correct') { writes++; return request.promise; }
+    return {};
+  }, async root => {
+    const card = findCard(root);
+    const words = descendants(card).find(node => node.tag === 'textarea');
+    const problem = descendants(card).find(node => node.className === 'review-problem');
+    words.value = 'my corrected words';
+    const correct = findButton(card, 'Save correction');
+    const first = correct.click(), duplicate = correct.click();
+    await flush();
+    assert.equal(writes, 1);
+    assert.equal(correct.disabled, true);
+    assert.equal(words.readOnly, true);
+    assert.equal(problem.dataset.state, 'pending');
+    assert.equal(problem.textContent, 'Saving…');
+    request.reject(new Error('Connection lost'));
+    await Promise.all([first, duplicate]);
+    assert.equal(findCard(root), card);
+    assert.equal(words.value, 'my corrected words');
+    assert.equal(words.readOnly, false);
+    assert.equal(correct.disabled, false);
+    assert.equal(problem.dataset.state, 'error');
+    assert.match(problem.textContent, /Connection lost/);
+  });
+});

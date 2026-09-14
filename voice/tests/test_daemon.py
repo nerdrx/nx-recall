@@ -12,12 +12,13 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
     def test_config_requires_local_backend_and_real_wake_phrase(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "voice.toml"
-            for data in ['backend="openai"', 'wake_words=["!!!"]', 'audio_mode="all"']:
+            for data in ['backend="openai"', 'wake_words=["!!!"]', 'audio_mode="all"', 'recognition_source="cloud"']:
                 path.write_text(data)
                 with self.subTest(data=data), self.assertRaises(ValueError):
                     load_config(path)
             path.write_text('mode="always"')
             self.assertEqual(load_config(path)["mode"], "always")
+            self.assertEqual(load_config(path)["recognition_source"], "recall")
             self.assertTrue(load_config(path)["llm_model"].endswith("qwen3.5-4b-q4_k_m.gguf"))
 
     async def test_transient_start_and_cleanup_errors_still_retry(self):

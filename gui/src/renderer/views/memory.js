@@ -29,6 +29,7 @@ import { store, speakerLabel, ask, applyAssist, MOOD_MODES } from '../lib/store.
 // speaker id and nothing else.
 import { lookOn, lookOf, iconSpan } from './highlight.js';
 import { toast } from '../lib/sheets.js';
+import { createMutationFeedback } from '../lib/mutation.js';
 import { mountReview } from './review.js';
 import { mountArchive } from './memory-archive.js';
 
@@ -162,6 +163,19 @@ function who(p) {
 
 export function mount(root, ctx, options = {}) {
   const settings = options?.settings === true;
+  const saveFeedback = Object.fromEntries(['translation', 'mood', 'moodDisplay', 'light', 'threads', 'enrichment', 'vocabulary'].map(key => {
+    const status = h('p', { class: 'sub', id: `settings-save-${key}` });
+    return [key, Object.assign(createMutationFeedback({ status }), { status })];
+  }));
+  const rowFeedback = new Map();
+  function feedbackFor(kind, id) {
+    const key = `${kind}-${id}`;
+    if (!rowFeedback.has(key)) {
+      const status = h('span', { class: 'sub', id: `save-${key}` });
+      rowFeedback.set(key, Object.assign(createMutationFeedback({ status }), { status }));
+    }
+    return rowFeedback.get(key);
+  }
   let summary = null;
   let commitments = [];
   let topics = [];
@@ -465,7 +479,7 @@ export function mount(root, ctx, options = {}) {
     clear(openCard);
     const shown = showAll
       ? commitments
-      : commitments.filter((c) => c.state === 'candidate' || c.state === 'confirmed');
+      : commitments.filter((c) => busy.has(c.id) || c.state === 'candidate' || c.state === 'confirmed');
     const settled = commitments.length - shown.length;
 
     openCard.append(
@@ -610,6 +624,7 @@ export function mount(root, ctx, options = {}) {
         )
       )
     );
+    row.querySelector('.commit-actions').append(feedbackFor('commitment', c.id).status);
     return row;
   }
 
@@ -623,6 +638,7 @@ export function mount(root, ctx, options = {}) {
   }
 
   async function setState(c, state) {
+    if (busy.has(c.id)) return;
     const before = c.state;
     // Optimistic, like every other switch in this app: the daemon confirms
     // with a `commitment` broadcast and a failure puts it back.
@@ -630,19 +646,11 @@ export function mount(root, ctx, options = {}) {
     busy.add(c.id);
     renderCommitments();
     try {
-      Object.assign(c, await ask('commitments.set_state', { id: c.id, state }));
-      await refreshSummary();
-      toast(
-        state === 'dismissed'
-          ? 'Dismissed. Nothing was deleted — the conversation is untouched.'
-          : state === 'done'
-            ? 'Marked done.'
-            : 'Confirmed.',
-        'ok'
-      );
+      Object.assign(c, await feedbackFor('commitment', c.id).run(() => ask('commitments.set_state', { id: c.id, state })));
+      void refreshSummary().catch(() => {});
     } catch (e) {
       c.state = before;
-      toast(`Could not change that — ${e.message}`, 'error');
+
     } finally {
       busy.delete(c.id);
       renderCommitments();
@@ -769,6 +777,7 @@ export function mount(root, ctx, options = {}) {
         h('span', { class: `chip state ${n.state}`, dataset: { noteState: n.state }, text: n.state })
       )
     );
+    row.querySelector('.note-actions').append(feedbackFor('note', n.id).status);
     return row;
   }
 
@@ -783,19 +792,14 @@ export function mount(root, ctx, options = {}) {
    * ask to be reminded of something you said without a time in it.
    */
   async function snoozeNote(n, minutes) {
+    if (noteBusy.has(n.id)) return;
     noteBusy.add(n.id);
     renderNotes();
     try {
-      Object.assign(n, await ask('notes.set_state', { id: n.id, state: 'open', snooze_min: minutes }));
-      const hours = Math.round(minutes / 60);
-      toast(
-        `Back in ${
-          minutes < 60 ? `${minutes} minutes` : `${hours} hour${hours === 1 ? '' : 's'}`
-        }.`,
-        'ok'
-      );
+      Object.assign(n, await feedbackFor('note', n.id).run(() => ask('notes.set_state', { id: n.id, state: 'open', snooze_min: minutes })));
+
     } catch (e) {
-      toast(`Could not snooze that — ${e.message}`, 'error');
+      // Kept beside the note by its feedback controller.
     } finally {
       noteBusy.delete(n.id);
       renderNotes();
@@ -803,16 +807,17 @@ export function mount(root, ctx, options = {}) {
   }
 
   async function setNoteState(n, state) {
+    if (noteBusy.has(n.id)) return;
     const before = n.state;
     // Optimistic with a rollback, like every other switch in this app.
     n.state = state;
     noteBusy.add(n.id);
     renderNotes();
     try {
-      Object.assign(n, await ask('notes.set_state', { id: n.id, state }));
+      Object.assign(n, await feedbackFor('note', n.id).run(() => ask('notes.set_state', { id: n.id, state })));
     } catch (e) {
       n.state = before;
-      toast(`Could not change that note — ${e.message}`, 'error');
+
     } finally {
       noteBusy.delete(n.id);
       renderNotes();
@@ -963,9 +968,11 @@ export function mount(root, ctx, options = {}) {
   // heard, and pretending otherwise would be a button that does nothing.
 
   let vocabPending = false;
+  let vocabDraft = '';
 
   function renderVocab() {
     clear(vocabCard);
+    vocabCard.append(saveFeedback.vocabulary.status);
     vocabCard.append(
       h(
         'div',
@@ -991,6 +998,8 @@ export function mount(root, ctx, options = {}) {
     const input = h('input', {
       class: 'input',
       id: 'vocab-add',
+      value: vocabDraft,
+      oninput: e => { vocabDraft = e.target.value; },
       type: 'text',
       placeholder: 'add a word or a name',
       disabled: vocabPending,
@@ -1072,7 +1081,8 @@ export function mount(root, ctx, options = {}) {
       toast(`“${term}” is already in your glossary.`, '');
       return;
     }
-    await setTerms([...have, term]);
+    vocabDraft = raw;
+    if (await setTerms([...have, term])) { vocabDraft = ''; renderVocab(); }
   }
 
   /**
@@ -1082,17 +1092,19 @@ export function mount(root, ctx, options = {}) {
    * failure puts the old list back.
    */
   async function setTerms(terms) {
+    if (vocabPending) return false;
     const before = vocab;
     vocab = { ...vocab, user: terms };
     vocabPending = true;
     renderVocab();
     try {
-      const out = await ask('vocab.set', { terms });
+      const out = await saveFeedback.vocabulary.run(() => ask('vocab.set', { terms }));
       vocab = out;
       store.vocab = out;
+      return true;
     } catch (e) {
       vocab = before;
-      toast(`Could not change the vocabulary — ${e.message}`, 'error');
+      return false;
     } finally {
       vocabPending = false;
       renderVocab();
@@ -1255,6 +1267,7 @@ export function mount(root, ctx, options = {}) {
 
   function renderEnrichment() {
     clear(enrichCard);
+    enrichCard.append(saveFeedback.threads.status, saveFeedback.enrichment.status);
     const cfg = summary?.config ?? {};
     const st = summary?.enrichment ?? { phase: 'off' };
     const phase = cfg.enabled ? st.phase ?? 'idle' : 'off';
@@ -1400,6 +1413,7 @@ export function mount(root, ctx, options = {}) {
 
   function renderTranslation() {
     clear(translateCard);
+    translateCard.append(saveFeedback.translation.status);
     const a = store.assist;
     const langs = a.languages.length ? a.languages : null;
     const live = store.conn.status === 'connected' && !translatePending;
@@ -1567,6 +1581,7 @@ export function mount(root, ctx, options = {}) {
 
   function renderMood() {
     clear(moodCard);
+    moodCard.append(saveFeedback.mood.status, saveFeedback.moodDisplay.status);
     const st = store.status?.mood ?? null;
     const live = store.conn.status === 'connected' && !translatePending;
     const mode = MOOD_MODES.includes(store.assist.mood_display)
@@ -1746,16 +1761,17 @@ export function mount(root, ctx, options = {}) {
    * client that kept its own guess would draw a chip the daemon has switched on.
    */
   async function setAssist(patch) {
+    if (translatePending) return;
+    const feedback = Object.hasOwn(patch, 'mood_display') ? saveFeedback.moodDisplay : saveFeedback.translation;
     const before = { ...store.assist };
     applyAssist(patch);
     translatePending = true;
     renderTranslation();
     renderMood();
     try {
-      applyAssist(await ask('assist.set', patch));
+      applyAssist(await feedback.run(() => ask('assist.set', patch)));
     } catch (e) {
       store.assist = before;
-      toast(`Could not change that — ${e.message}`, 'error');
     } finally {
       translatePending = false;
       renderTranslation();
@@ -1776,17 +1792,18 @@ export function mount(root, ctx, options = {}) {
    * only has to get the one that pressed it there without a round trip.
    */
   async function setMood(enabled) {
+    if (moodPending) return;
     if (!store.status) return;
     const before = store.status.mood ? { ...store.status.mood } : null;
     store.status = { ...store.status, mood: { ...store.status.mood, enabled } };
     moodPending = true;
     renderMood();
     try {
-      const reply = await ask('mood.set', { enabled });
+      const reply = await saveFeedback.mood.run(() => ask('mood.set', { enabled }));
       store.status = { ...store.status, mood: { ...store.status.mood, ...reply } };
     } catch (e) {
       store.status = { ...store.status, mood: before };
-      toast(`Could not change that — ${e.message}`, 'error');
+
     } finally {
       moodPending = false;
       renderMood();
@@ -1805,6 +1822,7 @@ export function mount(root, ctx, options = {}) {
 
   function renderLight() {
     clear(lightCard);
+    lightCard.append(saveFeedback.light.status);
     const st = store.status?.asr ?? null;
     const lm = st?.light_mode ?? null;
     const mode = LIGHT_MODES.includes(lm?.mode) ? lm.mode : 'auto';
@@ -1873,6 +1891,7 @@ export function mount(root, ctx, options = {}) {
    * so a second window converges on that instead of this function's reply.
    */
   async function setLight(mode) {
+    if (lightPending) return;
     if (!store.status) return;
     const before = store.status.asr ? { ...store.status.asr } : null;
     store.status = {
@@ -1882,11 +1901,11 @@ export function mount(root, ctx, options = {}) {
     lightPending = true;
     renderLight();
     try {
-      const reply = await ask('asr.light.set', { mode });
+      const reply = await saveFeedback.light.run(() => ask('asr.light.set', { mode }));
       store.status = { ...store.status, asr: { ...store.status.asr, ...reply } };
     } catch (e) {
       store.status = { ...store.status, asr: before };
-      toast(`Could not change that — ${e.message}`, 'error');
+
     } finally {
       lightPending = false;
       renderLight();
@@ -1962,6 +1981,7 @@ export function mount(root, ctx, options = {}) {
   }
 
   async function setThreads(next) {
+    if (threadsPending) return;
     const before = summary?.config?.llm_threads;
     threadsPending = true;
     // Optimistic, like every other control in this app: the daemon answers
@@ -1969,19 +1989,15 @@ export function mount(root, ctx, options = {}) {
     if (summary?.config) summary.config.llm_threads = next;
     renderEnrichment();
     try {
-      const out = await ask('graph.set', { llm_threads: next });
+      const out = await saveFeedback.threads.run(() => ask('graph.set', { llm_threads: next }));
       summary = { ...(summary ?? {}), config: out.config, enrichment: out.enrichment };
       // The shared store carries the config for anything outside this view;
       // leaving it stale would make the app disagree with itself about a
       // number the daemon has already accepted.
       store.graph = { ...store.graph, config: out.config, enrichment: out.enrichment };
-      // No toast on success, unlike the switch. The number is right under the
-      // cursor and the line above it moves with it, so a notification would
-      // only be a second copy of what a person is already looking at — and
-      // stepping from four to eight would raise four of them.
     } catch (e) {
       if (summary?.config) summary.config.llm_threads = before;
-      toast(`Could not change that — ${e.message}`, 'error');
+
     } finally {
       threadsPending = false;
       renderEnrichment();
@@ -2012,22 +2028,18 @@ export function mount(root, ctx, options = {}) {
   }
 
   async function setEnabled(next) {
+    if (switchPending) return;
     switchPending = true;
     renderEnrichment();
     try {
-      const out = await ask('graph.enrich', { action: next ? 'start' : 'stop' });
+      const out = await saveFeedback.enrichment.run(() => ask('graph.enrich', { action: next ? 'start' : 'stop' }));
       summary = { ...(summary ?? {}), config: out.config, enrichment: out.enrichment };
-      toast(
-        next
-          ? 'The local model will read your conversations while the machine is idle.'
-          : 'Stopped. Everything it already found stays; nothing new is written.',
-        'ok'
-      );
-    } catch (e) {
-      toast(`Could not change that — ${e.message}`, 'error');
+
+    } catch {
+      // The local feedback keeps the failure beside this setting.
     } finally {
       switchPending = false;
-      await refreshSummary().catch(() => {});
+      void refreshSummary().then(renderEnrichment).catch(() => {});
       renderEnrichment();
     }
   }
@@ -2106,6 +2118,7 @@ export function mount(root, ctx, options = {}) {
       );
       clear(topicsCard);
       clear(enrichCard);
+    enrichCard.append(saveFeedback.threads.status, saveFeedback.enrichment.status);
       return;
     }
     renderSub();
@@ -2201,7 +2214,7 @@ export function mount(root, ctx, options = {}) {
       if (change?.relabel) renderCommitments();
     },
     reload: load,
-    destroy() { archive?.destroy(); review?.destroy(); },
+    destroy() { Object.values(saveFeedback).forEach(feedback => feedback.destroy()); rowFeedback.forEach(feedback => feedback.destroy()); archive?.destroy(); review?.destroy(); },
     // 0.9.0: a reminder, from a toast or from an OS notification, lands on its
     // row. Returns null when the note is not in the list, which is how the
     // controller knows to say so rather than scrolling to nothing.

@@ -39,6 +39,9 @@ def load_config(path):
     config = tomllib.loads(Path(path).read_text())
     if config.get("backend", "local") != "local":
         raise ValueError("NX Recall Voice supports local inference only")
+    config.setdefault("recognition_source", "recall")
+    if config["recognition_source"] not in ("recall", "local"):
+        raise ValueError("Invalid recognition source")
     config.setdefault("mode", "wakeword")
     config.setdefault("audio_mode", "vesktop")
     config.setdefault("wake_words", ["lanalu", "lana lu", "lana lou", "chatgpt", "chat gpt"])
@@ -90,6 +93,8 @@ async def run(config, status=None, text_queue=None):
                 await router.restore()
             await devices.start()
             audio = Audio(devices)
+            if router:
+                audio.recognition_binding = getattr(router, "recognition_binding", None)
             status('waiting_for_vesktop_streams' if router else 'starting', audio_mode=config['audio_mode'], connected=False)
             previous = None
             while os.getppid() == parent:

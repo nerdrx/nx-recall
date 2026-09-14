@@ -2551,7 +2551,7 @@ export function startMock({
           }))
           .filter((h) => h.total > 0),
         top_sources: [
-          { display_name: 'vesktop', match_key: 'vesktop', count: 18, by_cause: { scheduler_starvation: 12, queue_overflow: 4, flap: 2 } },
+          { display_name: 'Virtual in/out', match_key: 'vesktop', count: 18, by_cause: { scheduler_starvation: 12, queue_overflow: 4, flap: 2 } },
           { display_name: 'Discord', match_key: 'Discord', count: 14, by_cause: { scheduler_starvation: 9, queue_overflow: 2, flap: 3 } },
           { display_name: 'Microphone', match_key: 'mic', count: 7, by_cause: { scheduler_starvation: 5, session_end: 2 } },
           { display_name: 'VRChat', match_key: 'VRChat.exe', count: 2, by_cause: { scheduler_starvation: 1, queue_overflow: 1 } },
@@ -4400,6 +4400,12 @@ export function startMock({
       return { corrected: row.id };
     },
 
+    'mock.mutation_feedback'(params) {
+      if (params?.action === 'status') return { calls: state.mutationFeedback?.calls ?? 0 };
+      state.mutationFeedback = { method: params.method, delay: Math.min(5000, Math.max(0, Number(params.delay) || 0)), fail: !!params.fail, remaining: 1, calls: 0 };
+      return { armed: true };
+    },
+
     'mock.search_fail_once'() {
       state.searchFailNext = true;
       return { armed: true };
@@ -4886,11 +4892,22 @@ export function startMock({
           write({ id: msg.id, err: { code: 'unknown_method', msg: `no method ${msg.method}` } });
           continue;
         }
-        try {
-          write({ id: msg.id, ok: fn(msg.params ?? {}, client) ?? {} });
-        } catch (e) {
-          write({ id: msg.id, err: { code: e.code || 'internal', msg: e.message } });
+        const reply = () => {
+          try {
+            write({ id: msg.id, ok: fn(msg.params ?? {}, client) ?? {} });
+          } catch (e) {
+            write({ id: msg.id, err: { code: e.code || 'internal', msg: e.message } });
+          }
+        };
+        const fault = state.mutationFeedback;
+        if (fault?.method === msg.method) {
+          fault.calls++;
+          if (fault.remaining-- > 0) {
+            setTimeout(() => fault.fail ? write({ id: msg.id, err: { code: 'busy', msg: 'Synthetic save failure; your edit is unchanged.' } }) : reply(), fault.delay);
+            continue;
+          }
         }
+        reply();
       }
     });
 

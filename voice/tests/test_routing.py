@@ -134,6 +134,46 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn((13, 16), edges)
             self.assertIn((13, 22), edges)
 
+    async def test_recognition_binding_requires_same_profile_tee_and_private_bus(self):
+        recorder = node(10, "nx-recall-capture", "Stream/Input/Audio")
+        routing.props(recorder)["application.name"] = "nx-recall"
+        objects = [{"id": 0, "type": "PipeWire:Interface:Core", "info": {"cookie": 123}},
+                   node(1, "lanalu_incoming", "Audio/Sink"),
+                   node(3, "vesktop", "Stream/Output/Audio", "vesktop", 42),
+                   node(4, "other-profile", "Stream/Output/Audio", "vesktop", 43),
+                   recorder, node(20, "unrelated_sink", "Audio/Sink"),
+                   port(11, 1, "in"), port(13, 3, "out"), port(14, 4, "out"),
+                   port(21, 10, "in"), port(22, 20, "in")]
+        edges = {(13, 11), (13, 21)}
+        async def snapshot():
+            return copy.deepcopy(objects) + [link(*edge) for edge in edges]
+        with patch.object(routing, "snapshot", snapshot), patch.object(routing, "command") as command, \
+                patch.object(routing, "process_matches", lambda pid, profile: pid == 42):
+            router = routing.Router("/profiles/lanalu")
+            original = await router.recognition_binding()
+            self.assertIsNotNone(original)
+            self.assertEqual(original, await router.recognition_binding())
+            edges.remove((13, 21)); edges.add((14, 21))
+            self.assertIsNone(await router.recognition_binding())  # only the other client is recorded
+            edges.remove((14, 21)); edges.add((13, 21))
+            edges.remove((13, 11)); edges.add((13, 22))
+            self.assertIsNone(await router.recognition_binding())  # no matching VAD input
+            edges.remove((13, 22)); edges.add((13, 11))
+            for index in [1, 2, 4, 6, 7, 9]:  # every stream, tap, and bus identity
+                routing.props(objects[index])["object.serial"] += 100
+                self.assertNotEqual(original, await router.recognition_binding())
+                routing.props(objects[index])["object.serial"] -= 100
+            objects[0]["info"]["cookie"] += 1
+            self.assertNotEqual(original, await router.recognition_binding())
+            routing.props(objects[7])["audio.channel"] = "FL"
+            objects.append(port(15, 3, "out", "FR"))
+            self.assertIsNone(await router.recognition_binding())  # every channel must reach both consumers
+            edges.update({(15, 11), (15, 21)})
+            self.assertIsNotNone(await router.recognition_binding())
+            routing.props(objects[3])["application.process.id"] = 42
+            self.assertIsNone(await router.recognition_binding())  # multiple profile streams are ambiguous
+            command.assert_not_called()
+
     async def test_missing_or_duplicate_device_fails_closed(self):
         objects = [{"id": 0, "type": "PipeWire:Interface:Core", "info": {"cookie": 123}},
                    node(1, "lanalu_incoming", "Audio/Sink"),

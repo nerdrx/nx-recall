@@ -1,4 +1,5 @@
 import { h } from '../lib/dom.js';
+import { createMutationFeedback } from '../lib/mutation.js';
 
 export const id = 'lanalu';
 export function mount(root) {
@@ -12,6 +13,9 @@ export function mount(root) {
   return controller;
 }
 
+export function recognitionProblem(code) {
+  return ({paused:'Resume capture in Recall.',source_unavailable:'Enable the matching input in Recall Sources.',input_mismatch:'Choose the same microphone in Recall and Lanalu.',ambiguous_source:'Choose one matching input in Recall Sources.',timeout:'Recall has not recognized this turn yet. Try again after capture catches up.'})[code] || '';
+}
 export function voiceStateLabel(state) {
   if (state.stopping) return 'Stopping…';
   if (state.preparing) {
@@ -20,7 +24,8 @@ export function voiceStateLabel(state) {
   }
   if (!state.running) return state.error || (state.available ? 'Stopped' : 'Local Voice needs setup');
   const event = state.status?.event;
-  return ({ audio_ready: 'Listening locally', local_listening: 'Listening locally', local_thinking: 'Thinking locally', local_speaking: 'Speaking', loading_local_models: 'Loading local models', waiting_for_vesktop_streams: 'Waiting for Lanalu to join voice', retrying: 'Retrying audio · check selected devices or Vesktop', recall_unavailable: 'Recall memory unavailable; continuing conversation', recall_identity_unavailable: 'Speaker identity unavailable; continuing conversation', local_ready: 'Listening locally', listening: 'Listening locally', speech_started: 'Hearing speech',
+  if (event === 'recognition_unavailable') return 'Recognition needs attention · ' + (recognitionProblem(state.status?.recognition_error) || 'Check Recall capture.');
+  return ({ waiting_for_recall_transcript: 'Waiting for Recall to recognize this turn', recall_transcript_received: 'Recall recognized speech', audio_ready: 'Listening locally', local_listening: 'Listening locally', local_thinking: 'Thinking locally', local_speaking: 'Speaking', loading_local_models: 'Loading local models', waiting_for_vesktop_streams: 'Waiting for the selected voice client to join voice', retrying: 'Retrying audio · check selected devices or the voice client', recall_unavailable: 'Recall memory unavailable; continuing conversation', recall_identity_unavailable: 'Speaker identity unavailable; continuing conversation', local_ready: 'Listening locally', listening: 'Listening locally', speech_started: 'Hearing speech',
     speech_stopped: 'Understanding speech', transcribing: 'Understanding speech', thinking: 'Thinking locally',
     speaking: 'Speaking', interrupted: 'Listening after interruption', routing: 'Connecting audio',
     reconnecting: 'Reconnecting audio', local_llm_starting: 'Loading local model',
@@ -44,7 +49,9 @@ export function mountVoice() {
   const autostart = h('input', { id: 'voice-autostart', type: 'checkbox' });
   const error = h('p', { role: 'alert', class: 'sub' });
   const audioMode = h('select', { id: 'voice-audio-mode', class: 'input', onchange: () => { local.hidden = audioMode.value !== 'local'; vesktop.hidden = audioMode.value !== 'vesktop'; } },
-    h('option', { value: 'vesktop', text: 'Lanalu in Vesktop' }), h('option', { value: 'local', text: 'This computer · microphone & speakers' }));
+    h('option', { value: 'vesktop', text: 'Virtual in/out' }), h('option', { value: 'local', text: 'This computer · microphone & speakers' }));
+  const recognition = h('select', { id: 'voice-recognition-source', class: 'input', 'aria-describedby': 'voice-recognition-help' },
+    h('option', { value: 'recall', text: 'Use Recall’s recognizer' }), h('option', { value: 'local', text: 'Separate recognizer · Parakeet' }));
   const mode = h('select', { id: 'voice-listening-mode', class: 'input', onchange: () => { wake.disabled = busy || current.running || mode.value !== 'wakeword'; } },
     h('option', { value: 'wakeword', text: 'Reply when a wake name is heard' }), h('option', { value: 'always', text: 'Reply to each spoken turn' }));
   const wake = h('input', { id: 'voice-wake-words', class: 'input', type: 'text', maxlength: 640, placeholder: 'Lanalu, Chat GPT', 'aria-describedby': 'voice-wake-help' });
@@ -54,8 +61,10 @@ export function mountVoice() {
   const refreshDevices = h('button', { class: 'btn', text: 'Refresh audio devices', onclick: () => void loadDevices() });
   const local = h('div', {}, row('Microphone', source), row('Voice output', sink), refreshDevices,
     h('p', { class: 'sub', text: 'Headphones keep generated speech out of your microphone. Local speaker mode pauses listening while speaking to prevent feedback.' }));
-  const vesktop = h('p', { class: 'sub', text: 'Uses only the dedicated Lanalu Vesktop profile. Join a voice channel yourself; other Discord clients keep their audio routing. Memory answers can include saved Recall information and are audible to everyone in the call.' });
-  const save = h('button', { class: 'btn', text: 'Save settings', onclick: () => void action(async () => { current = await api.save(patch()); error.textContent = 'Settings saved.'; }) });
+  const vesktop = h('p', { class: 'sub', text: 'Connects the selected voice client’s dedicated profile through virtual audio input and output. Join a voice channel yourself; other clients keep their audio routing. Memory answers can include saved Recall information and are audible to everyone in the call.' });
+  const saveStatus = h('p', { class: 'sub', id: 'voice-save-status' });
+  const save = h('button', { class: 'btn', text: 'Save settings', onclick: () => { const changes = patch(); void saveFeedback.run(async () => { current = await api.save(changes); }).catch(() => {}).finally(() => { if (!destroyed) render(); }); render(); } });
+  const saveFeedback = createMutationFeedback({ status: saveStatus, button: save, success: 'Settings saved.' });
   const setup = h('button', { id: 'voice-setup', class: 'btn primary', text: 'Set up Local Voice', onclick: () => void action(async () => { current = await api.setup(); }) });
   const missing = h('p', { class: 'sub', id: 'voice-missing' });
   const setupHelp = h('p', { class: 'sub', text: 'One-time setup downloads about 3 GB of models and speech tools. After setup, recognition, replies and voice run locally with no API fees. Setup does not start listening.' });
@@ -70,14 +79,14 @@ export function mountVoice() {
       h('p', { class: 'sub', text: 'Runs while NX Recall is open, including in the tray. Quitting Recall stops the conversation.' })),
     h('section',{class:'card lanalu-message-card'},h('h3',{class:'card-title',text:'Write to Lanalu'}),
       h('label',{for:'lanalu-message',text:'Your message'}),message,
-      h('p',{id:'lanalu-message-help',class:'sub',text:'Typed requests bypass wake names. Lanalu replies here and through the selected voice output. In Vesktop mode, people in the call can hear the answer. Ctrl/Cmd+Enter to send.'}),
+      h('p',{id:'lanalu-message-help',class:'sub',text:'Typed requests bypass wake names. Lanalu replies here and through the selected voice output. In Virtual in/out mode, people in the call can hear the answer. Ctrl/Cmd+Enter to send.'}),
       h('div',{class:'voice-actions'},send),messageStatus,reply),
-    h('section', { class: 'card' }, h('h3', { class: 'card-title', text: 'Local models' }), models, h('p', { class: 'sub', text: 'Configured models run on this computer. Debug shows whether their files are ready.' })),
+    h('section', { class: 'card' }, h('h3', { class: 'card-title', text: 'Local models' }), row('Speech recognition', recognition), h('p', { id: 'voice-recognition-help', class: 'sub', text: 'Using Recall shares its configured recognizer. The matching microphone or incoming audio from the selected voice client must be captured in Recall. The separate recognizer uses its own English Parakeet model.' }), models, h('p', { class: 'sub', text: 'Configured models run on this computer. Debug shows whether their files are ready.' })),
     h('section', { class: 'card' }, h('h3', { class: 'card-title', text: 'Audio connection' }), row('Where to talk', audioMode), local, vesktop),
     h('section', { class: 'card' }, h('h3', { class: 'card-title', text: 'When to reply' }), row('Listening mode', mode), row('Wake names, separated by commas', wake),
       h('p', { id: 'voice-wake-help', class: 'sub', text: 'Each request must include a wake name in wake-name mode. Names are recognized locally after a spoken turn. They trigger replies; they do not identify who is speaking.' }),
-      h('p', { class: 'sub', text: 'In Vesktop, recognizes only people with an assigned name and a confident voice match in Recall. Generic speaker labels and uncertain matches stay unknown. Recognition uses Recall’s recent transcript and can arrive after the reply. A voice match is recognition, not permission to access private information.' }),
-      h('p', { class: 'sub', text: 'The included speech model and Amy voice use English. Stop Local Voice before changing settings.' }), save));
+      h('p', { class: 'sub', text: 'In Virtual in/out mode, recognizes only people with an assigned name and a confident voice match in Recall. Generic speaker labels and uncertain matches stay unknown. Recognition uses Recall’s recent transcript and can arrive after the reply. A voice match is recognition, not permission to access private information.' }),
+      h('p', { class: 'sub', text: 'The included speech model and Amy voice use English. Stop Local Voice before changing settings.' }), save, saveStatus));
   async function sendMessage() {
     if(sending || !current.running || !message.value.trim())return;
     sending=true;messageStatus.textContent='Sending locally…';render();
@@ -85,7 +94,7 @@ export function mountVoice() {
     catch(e){if(!destroyed)messageStatus.textContent=e.message;}
     finally{sending=false;if(!destroyed)render();}
   }
-  function patch() { return { autostart: autostart.checked, audio_mode: audioMode.value, mode: mode.value, wake_words: wake.value.split(',').map(v => v.trim()).filter(Boolean), local_source: source.value, local_sink: sink.value }; }
+  function patch() { return { autostart: autostart.checked, audio_mode: audioMode.value, recognition_source: recognition.value, mode: mode.value, wake_words: wake.value.split(',').map(v => v.trim()).filter(Boolean), local_source: source.value, local_sink: sink.value }; }
   function render() {
     status.textContent = voiceStateLabel(current);
     models.replaceChildren(...Object.entries(current.models || {}).flatMap(([key, value]) => [h('dt', { text: ({llm:'Replies',stt:'Speech recognition',tts:'Voice'})[key] || key }), h('dd', { text: value })]));
@@ -93,7 +102,7 @@ export function mountVoice() {
     message.disabled=sending;
     if(!current.running && !messageStatus.textContent)messageStatus.textContent='Start Lanalu to send a message.';
     else if(current.running && messageStatus.textContent==='Start Lanalu to send a message.')messageStatus.textContent='Type a message; no wake name is required.';
-    for (const control of [autostart, audioMode, mode, wake, source, sink, refreshDevices, save]) control.disabled = busy || current.running || current.preparing;
+    for (const control of [autostart, audioMode, recognition, mode, wake, source, sink, refreshDevices, save]) control.disabled = busy || saveFeedback.pending || current.running || current.preparing;
     wake.disabled ||= mode.value !== 'wakeword';
     setup.hidden = current.available && !current.preparing;
     setup.disabled = busy || current.running || current.preparing || !current.setupAvailable;
@@ -135,7 +144,7 @@ export function mountVoice() {
       if (!initialized) {
         initialized = true;
         autostart.checked = current.config.autostart;
-        audioMode.value = current.config.audio_mode; mode.value = current.config.mode; wake.value = current.config.wake_words.join(', ');
+        audioMode.value = current.config.audio_mode; recognition.value = current.config.recognition_source || 'recall'; mode.value = current.config.mode; wake.value = current.config.wake_words.join(', ');
         local.hidden = audioMode.value !== 'local'; vesktop.hidden = audioMode.value !== 'vesktop';
         await loadDevices();
       }
@@ -144,5 +153,5 @@ export function mountVoice() {
     finally { if (!destroyed && active && ticket === generation) timer = setTimeout(refresh, 1500); }
   }
   render();
-  return { panel, setActive(value) { ++generation; active = value; clearTimeout(timer); if (active) void refresh(); }, destroy() { destroyed = true; active = false; clearTimeout(timer); } };
+  return { panel, setActive(value) { ++generation; active = value; clearTimeout(timer); if (active) void refresh(); }, destroy() { saveFeedback.destroy(); destroyed = true; active = false; clearTimeout(timer); } };
 }

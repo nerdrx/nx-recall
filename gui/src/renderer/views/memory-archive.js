@@ -1,3 +1,4 @@
+import { createMutationFeedback } from '../lib/mutation.js';
 import { h, clear, fmtDate, fmtClock } from '../lib/dom.js';
 import { ask, segmentSpeakerLabel } from '../lib/store.js';
 import { toast, openSheet, confirmSheet } from '../lib/sheets.js';
@@ -291,13 +292,16 @@ export function mountArchive(root, ctx, digestRow) {
       const name = h('input', { id: 'collection-name', class: 'input', value: record?.name ?? '', maxlength: '120' });
       const problem = h('p', { role: 'alert' });
       const save = button('Save collection', async () => {
-        if (!name.value.trim()) { problem.textContent = 'Give the collection a name.'; return; }
-        save.disabled = true;
+        if (feedback.pending) return;
+        if (!name.value.trim()) { problem.hidden = false; problem.textContent = 'Give the collection a name.'; return; }
         try {
-          const reply = await ask('saved.collections.save', { ...(record ? { id: record.id } : {}), name: name.value.trim() });
+          name.readOnly = true;
+          const reply = await feedback.run(() => ask('saved.collections.save', { ...(record ? { id: record.id } : {}), name: name.value.trim() }));
           close(); collectionFilter = String(reply.collection.id); offsets.moments = 0; if (!dead && mode === 'saved') void show('saved');
-        } catch (e) { problem.textContent = e.message; save.disabled = false; }
+        } catch { /* Inline feedback retains this draft for retry. */ }
+        finally { name.readOnly = false; }
       }, { id: 'collection-save' });
+      const feedback = createMutationFeedback({ status: problem, button: save, success: 'Collection saved.' });
       return [h('h2', { text: record ? 'Rename collection' : 'New collection' }), h('label', { for: 'collection-name', text: 'Name' }), name, problem,
         h('div', { class: 'sheet-actions' }, button('Cancel', () => close()), save)];
     });
@@ -312,10 +316,13 @@ export function mountArchive(root, ctx, digestRow) {
       select.value = record.collection_id == null ? '' : String(record.collection_id);
       const problem = h('p', { role: 'alert' });
       const move = button('Move moment', async () => {
-        move.disabled = true;
-        try { await ask('saved.moments.move', { id: record.id, collection_id: select.value ? Number(select.value) : null }); close(); if (!dead && mode === 'saved') void show('saved'); }
-        catch (e) { problem.textContent = e.message; move.disabled = false; }
+        if (feedback.pending) return;
+        select.disabled = true;
+        try { await feedback.run(() => ask('saved.moments.move', { id: record.id, collection_id: select.value ? Number(select.value) : null })); close(); if (!dead && mode === 'saved') void show('saved'); }
+        catch { /* Keep the selected destination on failure. */ }
+        finally { select.disabled = false; }
       }, { id: 'moment-move' });
+      const feedback = createMutationFeedback({ status: problem, button: move, pending: 'Moving…', success: 'Moment moved.' });
       return [h('h2', { text: 'Move saved moment' }), h('label', { for: 'moment-collection', text: 'Collection' }), select,
         h('p', { class: 'sub', text: 'Create a collection from Memory if you need a new destination.' }), problem,
         h('div', { class: 'sheet-actions' }, button('Cancel', () => close()), move)];
@@ -327,13 +334,16 @@ export function mountArchive(root, ctx, digestRow) {
       const note = h('textarea', { id: 'saved-edit-note', rows: '4', maxlength: '4096', text: record.note ?? '' });
       const status = h('p', { class: 'sub', role: 'alert' });
       const save = button('Save', async () => {
-        if (kind === 'searches' && !title.value.trim()) { status.textContent = 'Give this search a name.'; title.focus(); return; }
-        save.disabled = true;
+        if (feedback.pending) return;
+        if (kind === 'searches' && !title.value.trim()) { status.hidden = false; status.textContent = 'Give this search a name.'; title.focus(); return; }
         try {
-          await ask(`saved.${kind}.save`, kind === 'moments' ? { id: record.id, segment_ids: record.segment_ids, title: title.value.trim(), note: note.value } : { id: record.id, name: title.value.trim(), query: record.query, filters: record.filters });
+          title.readOnly = note.readOnly = true;
+          await feedback.run(() => ask(`saved.${kind}.save`, kind === 'moments' ? { id: record.id, segment_ids: record.segment_ids, title: title.value.trim(), note: note.value } : { id: record.id, name: title.value.trim(), query: record.query, filters: record.filters }));
           close(); if (!dead && mode === 'saved') void show('saved');
-        } catch (e) { status.textContent = `Could not save — ${e.message}`; save.disabled = false; }
+        } catch { /* Keep both title and note available for retry. */ }
+        finally { title.readOnly = note.readOnly = false; }
       });
+      const feedback = createMutationFeedback({ status, button: save });
       return [h('h2', { text: kind === 'moments' ? 'Edit saved moment' : 'Rename saved search' }), h('label', { for: 'saved-edit-title', text: 'Title' }), title,
         kind === 'moments' ? h('label', { for: 'saved-edit-note', text: 'Note' }) : null, kind === 'moments' ? note : null, status,
         h('div', { class: 'sheet-actions' }, button('Cancel', () => close()), save)];

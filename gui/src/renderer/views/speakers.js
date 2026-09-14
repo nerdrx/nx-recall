@@ -1,3 +1,4 @@
+import { createMutationFeedback } from '../lib/mutation.js';
 // Speakers — the identity surface, and where onboarding actually happens.
 //
 // DESIGN §5: "Onboarding is naming." Two named voices covered 38% of all speech
@@ -372,7 +373,9 @@ export function mount(root, ctx) {
 
   // -- list -----------------------------------------------------------------
 
+  let activeRename = null;
   function renderList() {
+    if (activeRename?.isConnected) return; // Preserve an unsaved name while live updates arrive.
     // The live feed repaints this list every couple of seconds (the counts
     // move). A repaint while a row menu is open would tear the menu out from
     // under the pointer, so the repaint waits for the menu to close instead.
@@ -532,6 +535,7 @@ export function mount(root, ctx) {
    * motion instead of two round trips through the transcript.
    */
   function startRename(spId, { listen = false } = {}) {
+    if (activeRename?.isConnected) { activeRename.querySelector('input')?.focus(); return; }
     const row = list.querySelector(`.sp-row[data-speaker="${spId}"]`);
     const target = row?.querySelector('.sp-name');
     if (!target) {
@@ -547,40 +551,46 @@ export function mount(root, ctx) {
     const input = h('input', {
       class: 'input',
       id: 'rename-input',
+      'aria-label': 'Speaker name',
+      'aria-describedby': 'rename-status',
       value: sp?.name ?? '',
       placeholder: sp?.auto ?? 'Name this voice',
       style: 'width:180px',
     });
-    // Enter commits and then blurs, so without this guard the same rename runs
-    // twice and the second replaceWith throws on an already-detached input.
+    const status = h('span', { class: 'sub rename-status', id: 'rename-status' });
+    const editor = h('span', { class: 'rename-editor' }, input, status);
+    const feedback = createMutationFeedback({ status, success: 'Name saved.' });
+    activeRename = editor;
     let settled = false;
     const restore = () => {
-      if (input.isConnected) input.replaceWith(target);
+      if (editor.isConnected) editor.replaceWith(target);
+      activeRename = null;
     };
     const commit = async () => {
-      if (settled) return;
-      settled = true;
+      if (settled || feedback.pending) return;
       const next = input.value.trim();
-      restore();
-      if (next === (sp?.name ?? '')) return;
+      if (next === (sp?.name ?? '')) { settled = true; restore(); renderList(); return; }
+      input.readOnly = true;
       try {
-        await ask('speakers.name', { id: spId, name: next });
-        // Nothing is patched here on purpose: the daemon broadcasts `relabel`
-        // and the whole UI updates from that one path, so a rename made in
-        // another client looks identical to one made here.
-      } catch (e) {
-        toast(`Could not rename — ${e.message}`, 'error');
+        await feedback.run(() => ask('speakers.name', { id: spId, name: next }));
+        settled = true;
+        restore(); renderList();
+        list.querySelector(`.sp-row[data-speaker="${spId}"] .sp-name`)?.after(status);
+      } catch {
+        // Failed acknowledgement leaves the name exactly where it was typed.
+        input.readOnly = false;
+        input.focus();
       }
     };
     input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') commit();
-      if (e.key === 'Escape') {
+      if (e.key === 'Enter') { e.preventDefault(); void commit(); }
+      if (e.key === 'Escape' && !feedback.pending) {
         settled = true;
-        restore();
+        feedback.destroy(); restore(); renderList();
       }
     });
-    input.addEventListener('blur', commit);
-    target.replaceWith(input);
+    input.addEventListener('blur', () => void commit());
+    target.replaceWith(editor);
     input.focus();
     input.select();
   }

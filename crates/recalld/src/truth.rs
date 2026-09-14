@@ -1508,7 +1508,8 @@ fn calibrate_pass(
         // after it. The re-check that costs is now a `COUNT(*)`.
         return Ok(());
     }
-    let report = crate::identity_learn::calibrate(&guard, identity, true, now)?;
+    drop(guard);
+    let report = crate::identity_learn::calibrate_shared(store, identity, true, now)?;
     *last = Some((now, rows));
     info!(
         rows = report.rows,

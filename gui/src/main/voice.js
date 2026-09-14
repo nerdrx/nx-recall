@@ -39,7 +39,7 @@ export function sendVoiceText(socketPath, text) {
 }
 
 export function voiceDefaults(home = homedir()) {
-  return { backend: 'local', autostart: false, audio_mode: 'vesktop', mode: 'wakeword',
+  return { backend: 'local', autostart: false, audio_mode: 'vesktop', recognition_source: 'recall', mode: 'wakeword',
     wake_words: ['lanalu', 'chat gpt'], local_source: '', local_sink: '',
     vesktop_profile: join(home, '.config/vesktop'),
     stt_model_dir: join(home, '.local/share/nx-recall/models/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8'),
@@ -47,7 +47,7 @@ export function voiceDefaults(home = homedir()) {
 }
 export function voiceModelLabels(config) {
   return { llm: 'Qwen3.5 4B · Q4_K_M',
-    stt: config.stt_model_dir.endsWith('/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8') ? 'Parakeet 110M · English' : 'Custom recognition model',
+    stt: config.recognition_source === 'recall' ? 'Recall’s configured recognition model' : config.stt_model_dir.endsWith('/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8') ? 'Parakeet 110M · English' : 'Custom recognition model',
     tts: config.tts_model_path.endsWith('/en_US-amy-medium.onnx') ? 'Piper Amy · English' : 'Custom Piper voice' };
 }
 export function normalizeVoiceConfig(patch, previous = voiceDefaults()) {
@@ -67,7 +67,8 @@ export function normalizeVoiceConfig(patch, previous = voiceDefaults()) {
       result[key] = value;
     }
   }
-  if (!['local', 'vesktop'].includes(result.audio_mode)) throw new Error('Choose local audio or Vesktop');
+  if (!['local', 'vesktop'].includes(result.audio_mode)) throw new Error('Choose local audio or Virtual in/out');
+  if (!['recall', 'local'].includes(result.recognition_source)) throw new Error('Choose Recall recognition or a separate recognizer');
   if (!['always', 'wakeword'].includes(result.mode)) throw new Error('Choose wake names or always listening');
   if (result.mode === 'wakeword' && !result.wake_words.some(word => /[\p{L}\p{N}]/u.test(word))) throw new Error('Enter at least one wake name');
   return result;
@@ -91,7 +92,7 @@ export function createVoiceController({ userData, home = homedir(), runtime = pr
     const models = join(home, '.local/share/nx-recall/models');
     return { runtime: present(python), llama: present(join(models, 'llama-voice/llama-server')),
       llm: present(join(models, 'qwen3.5-4b-q4_k_m.gguf')),
-      stt: ['encoder.int8.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'tokens.txt'].every(name => present(join(config.stt_model_dir, name))),
+      stt: config.recognition_source === 'recall' || ['encoder.int8.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'tokens.txt'].every(name => present(join(config.stt_model_dir, name))),
       tts: present(config.tts_model_path) && present(config.tts_model_path + '.json') };
   }
 
@@ -109,6 +110,9 @@ export function createVoiceController({ userData, home = homedir(), runtime = pr
           latency_ms: Number.isFinite(data.latency_ms) ? data.latency_ms : null,
           input_kind: ['text','voice','audio'].includes(data.input_kind) ? data.input_kind : null,
           audio_ready: !!data.audio_ready,
+          recognition_source: ['recall','local'].includes(data.recognition_source) ? data.recognition_source : config.recognition_source,
+          recognition_error: ['paused','source_unavailable','input_mismatch','ambiguous_source','timeout'].includes(data.recognition_error) ? data.recognition_error : null,
+          recognition_wait_ms: Number.isFinite(data.wait_ms) ? data.wait_ms : null,
           error_stage: ['recognition','memory','generation','synthesis','playback'].includes(data.error_stage)?data.error_stage:null,
           routes: data.routes ? {ready:!!data.routes.ready,playback:Number.isFinite(data.routes.playback)?data.routes.playback:null,capture:Number.isFinite(data.routes.capture)?data.routes.capture:null}:null,
         };
@@ -222,7 +226,7 @@ export function createVoiceController({ userData, home = homedir(), runtime = pr
     return {running:snapshot.running, preparing:snapshot.preparing, stopping:snapshot.stopping,
       available:snapshot.available,components:snapshot.components,models:snapshot.models,setupProgress:snapshot.setupProgress,
       state:snapshot.status?.event || (child?'starting':'stopped'),connected:snapshot.status?.connected || false,
-      lastError,audio_ready:!!snapshot.status?.audio_ready,error_stage:snapshot.status?.error_stage || null,lastUpdated:snapshot.status?.updated_at || null, routes:snapshot.status?.routes || null, retry_seconds:snapshot.status?.retry_seconds ?? null, latency_ms:snapshot.status?.latency_ms ?? null, input_kind:snapshot.status?.input_kind || null,events:[...events]};
+      lastError,recognition_source:snapshot.status?.recognition_source || config.recognition_source,recognition_error:snapshot.status?.recognition_error || null,recognition_wait_ms:snapshot.status?.recognition_wait_ms ?? null,audio_ready:!!snapshot.status?.audio_ready,error_stage:snapshot.status?.error_stage || null,lastUpdated:snapshot.status?.updated_at || null, routes:snapshot.status?.routes || null, retry_seconds:snapshot.status?.retry_seconds ?? null, latency_ms:snapshot.status?.latency_ms ?? null, input_kind:snapshot.status?.input_kind || null,events:[...events]};
   }
   return { state, save, devices, start, setup, stop, send, debug };
 }

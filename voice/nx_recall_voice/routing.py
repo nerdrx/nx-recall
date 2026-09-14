@@ -198,6 +198,36 @@ class Router:
                 result[kind].append(i)
         return result
 
+    async def recognition_binding(self):
+        """Prove Recall and our VAD receive the same exact profile stream.
+
+        Read-only, with serials so reconnects/reused IDs cannot preserve a stale
+        proof. The opaque result is compared at onset and during transcription.
+        """
+        graph = Graph(await snapshot())
+        selected = self.selected(graph)["playback"]
+        sinks = [i for i, obj in graph.nodes.items()
+                 if props(obj).get("node.name") == self.incoming
+                 and props(obj).get("media.class") == "Audio/Sink"]
+        if graph.cookie is None or len(selected) != 1 or len(sinks) != 1:
+            return None
+        outputs = set(graph.channels(selected[0], "out").values())
+        inputs = set(graph.channels(sinks[0], "in").values())
+        if not outputs or not inputs:
+            return None
+        proof = []
+        try:
+            for output in sorted(outputs):
+                tees = sorted(edge for edge in graph.links if edge[0] == output and graph.recall_tee(edge))
+                incoming = sorted(edge for edge in graph.links if edge[0] == output and edge[1] in inputs)
+                if not tees or not incoming:
+                    return None
+                proof.append((graph.ref(output), tuple(graph.ref(edge[1]) for edge in tees),
+                              tuple(graph.ref(edge[1]) for edge in incoming)))
+            return (graph.cookie, str(props(graph.nodes[selected[0]])["object.serial"]), tuple(proof))
+        except (KeyError, ValueError, TypeError):
+            return None
+
     async def _change(self, edge, disconnect=False, journal=None):
         graph = Graph(await snapshot())
         if graph.cookie != self.cookie or not all(graph.valid(ref) for ref in edge):

@@ -152,30 +152,95 @@ export function runE2E(deps) {
       return {file,fakeSetupCancel:state.setupAvailable};
     });
 
+    await step('019-save-feedback-stays-with-action', async () => {
+      await js(`window.__recallDebug.go('lanalu')`);
+      await waitFor('voice settings ready',()=>js(`document.getElementById('voice-wake-words')?.value`));
+      await waitFor('voice save ready',()=>js(`![...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Save settings').disabled`));
+      await js(`[...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Save settings').click()`);
+      await waitFor('inline voice saved',()=>js(`document.getElementById('voice-save-status')?.textContent==='Settings saved.'`));
+      assert(await js(`document.getElementById('voice-save-status').parentElement.textContent.includes('When to reply')`),'voice feedback is separated from Save');
+      await js(`window.__recallDebug.go('settings',{section:'processing'})`);
+      await waitFor('thread control ready',()=>js(`document.querySelector('#enrich-threads [data-step="1"]')?.disabled===false`));
+      await deps.request('mock.mutation_feedback',{method:'graph.set',delay:2400});
+      await js(`document.querySelector('#enrich-threads [data-step="1"]').click()`);
+      await waitFor('pending confirmation',()=>js(`document.getElementById('settings-save-threads').textContent==='Saving…'`));
+      assert(await js(`document.querySelector('#enrich-threads [data-step="1"]').disabled`),'duplicate write still enabled');
+      await waitFor('slow write feedback',()=>js(`document.getElementById('settings-save-threads').textContent.startsWith('Still saving')`));
+      await waitFor('confirmed save',()=>js(`document.getElementById('settings-save-threads').textContent==='Saved'`));
+      const before=await js(`document.getElementById('enrich-threads-value').textContent`);
+      await deps.request('mock.mutation_feedback',{method:'graph.set',delay:100,fail:true});
+      await js(`document.querySelector('#enrich-threads [data-step="1"]').click()`);
+      await waitFor('local save error',()=>js(`document.getElementById('settings-save-threads').dataset.state==='error'`));
+      assert(await js(`document.getElementById('enrich-threads-value').textContent===${JSON.stringify(before)}`),'failed setting did not roll back');
+      assert(await js(`!document.querySelector('#enrich-threads [data-step="1"]').disabled`),'failed save remained blocked');
+      await js(`document.getElementById('settings-save-threads').scrollIntoView({block:'center'})`);
+      const file=await shot('019-save-feedback');
+      await js(`window.__recallDebug.go('settings',{section:'quality'})`);
+      await waitFor('vocabulary ready',()=>js(`document.getElementById('vocab-add-go')?.disabled===false`));
+      await deps.request('mock.mutation_feedback',{method:'vocab.set',delay:100,fail:true});
+      await js(`document.getElementById('vocab-add').value='SyntheticVocabulary';document.getElementById('vocab-add-go').click()`);
+      await waitFor('vocabulary rejected',()=>js(`document.getElementById('settings-save-vocabulary')?.dataset.state==='error'`));
+      assert(await js(`document.getElementById('vocab-add').value==='SyntheticVocabulary'`),'vocabulary draft cleared on failure');
+      await js(`document.getElementById('vocab-add-go').click()`);
+      await waitFor('vocabulary saved',()=>js(`document.getElementById('settings-save-vocabulary').textContent==='Saved' && document.getElementById('vocab-add').value===''`));
+      await js(`window.__recallDebug.go('speakers')`);
+      await waitFor('speaker rows',()=>js(`!!document.querySelector('.sp-row .sp-name')`));
+      await deps.request('mock.mutation_feedback',{method:'speakers.name',delay:200,fail:true});
+      await js(`document.querySelector('.sp-row .sp-name').click()`);
+      await js(`(() => {const input=document.getElementById('rename-input');input.value='Synthetic saved name';input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));input.dispatchEvent(new Event('blur'));})()`);
+      await waitFor('name error remains near draft',()=>js(`document.getElementById('rename-status')?.dataset.state==='error'`));
+      assert(await js(`document.getElementById('rename-input').value==='Synthetic saved name'`),'failed name draft lost');
+      assert((await deps.request('mock.mutation_feedback',{action:'status'})).calls===1,'Enter and blur duplicated rename');
+      await js(`document.getElementById('rename-input').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))`);
+      await waitFor('name retry saved',()=>js(`!document.getElementById('rename-input') && document.getElementById('rename-status')?.textContent==='Name saved.'`));
+      await js(`import('./lib/saved.js').then(({saveMomentSheet})=>{void saveMomentSheet([window.__recallDebug.store.segments[0].id]);})`);
+      await waitFor('moment editor',()=>js(`!!document.getElementById('moment-save')`));
+      await deps.request('mock.mutation_feedback',{method:'saved.moments.save',delay:150,fail:true});
+      await js(`document.getElementById('moment-title').value='Synthetic title';document.getElementById('moment-note').value='Synthetic note';document.getElementById('moment-save').click()`);
+      await waitFor('moment error',()=>js(`document.getElementById('moment-error')?.dataset.state==='error'`));
+      assert(await js(`document.getElementById('moment-title').value==='Synthetic title' && document.getElementById('moment-note').value==='Synthetic note'`),'failed moment draft lost');
+      await js(`document.getElementById('moment-save').click()`);
+      await waitFor('moment retry saved',()=>js(`!document.getElementById('moment-title')`));
+      return {file,localSuccess:true,slow:true,rollback:true,nameRetry:true,momentRetry:true};
+    });
+
     await step('018-lanalu-primary-text-and-debug', async () => {
       await js(`document.querySelector('.rail-item[data-view="lanalu"]').click()`);
       await waitFor('Lanalu tab',()=>js(`document.body.dataset.view==='lanalu' && document.getElementById('voice-wake-words')?.value`));
       assert(await js(`document.querySelector('#main h1').textContent==='Lanalu'`),'primary heading missing');
+      assert(await js(`document.querySelector('#voice-audio-mode option[value="vesktop"]').textContent==='Virtual in/out'`),'virtual mode label missing');
+      assert(await js(`!document.getElementById('settings-voice').textContent.toLowerCase().includes('vesktop')`),'client-specific product copy remains');
       const state=await js(`window.recall.voice.state()`);
       await waitFor('configured models',()=>js(`document.getElementById('lanalu-models')?.textContent.includes('Qwen3.5 4B')`));
-      assert(await js(`document.getElementById('lanalu-models').textContent.includes('Parakeet 110M')`),'recognition model missing');
+      assert(await js(`document.getElementById('lanalu-models').textContent.includes('Recall’s configured recognition model')`),'recognition model missing');
       if(state.available){
+        assert(await js(`document.getElementById('voice-recognition-source').value==='recall'`),'shared recognizer is not default');
+        await js(`document.getElementById('voice-recognition-source').value='local';[...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Save settings').click()`);
+        await waitFor('separate recognition saved',()=>js(`window.recall.voice.state().then(s=>s.config.recognition_source==='local')`));
+        await waitFor('separate recognition label',()=>js(`document.getElementById('lanalu-models').textContent.includes('Parakeet 110M')`));
         await waitFor('start voice enabled',()=>js(`![...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Start Local Voice').disabled`));
         await js(`[...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Start Local Voice').click()`);
         await waitFor('fake voice running',()=>js(`window.recall.voice.state().then(s=>s.running)`));
+        await waitFor('recognizer locked while running',()=>js(`document.getElementById('voice-recognition-source').disabled`));
         await js(`document.getElementById('lanalu-message').value='Synthetic hello';document.getElementById('lanalu-send').click()`);
         await waitFor('typed reply visible',()=>js(`document.getElementById('lanalu-reply').textContent.includes('Synthetic local reply')`));
         const debug=await js(`window.recall.voice.debug()`);
         assert(!JSON.stringify(debug).includes('Synthetic hello'),'message leaked into debug');
         await js(`[...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Stop Local Voice').click()`);
         await waitFor('fake voice stopped',()=>js(`window.recall.voice.state().then(s=>!s.running)`));
+        await waitFor('recognizer editable',()=>js(`!document.getElementById('voice-recognition-source').disabled`));
+        await js(`document.getElementById('voice-recognition-source').value='recall';[...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Save settings').click()`);
+        await waitFor('shared recognition restored',()=>js(`document.getElementById('lanalu-models').textContent.includes('Recall’s configured recognition model')`));
       }
       await js(`document.getElementById('lanalu-debug').click()`);
       await waitFor('debug window',()=>deps.voiceDebug()?.webContents && !deps.voiceDebug().webContents.isLoading());
       await waitFor('debug data',()=>deps.voiceDebug().webContents.executeJavaScript(`document.getElementById('debug-data').textContent.includes('components')`));
       assert(await deps.voiceDebug().webContents.executeJavaScript(`document.getElementById('debug-summary').textContent.includes('Qwen3.5 4B')`),'debug model missing');
       const debugFile=await shotOf(deps.voiceDebug(),'018-lanalu-debug');deps.voiceDebug().close();
-      return {file:await shot('018-lanalu-primary'),debugFile,typed:state.available};
+      const file=await shot('018-lanalu-primary');
+      await js(`document.getElementById('voice-recognition-source').closest('.card').scrollIntoView({block:'start'})`);
+      const recognitionFile=await shot('018-lanalu-recognition');
+      return {file,debugFile,recognitionFile,typed:state.available};
     });
 
     // 1 — the socket handshake actually completed

@@ -67,7 +67,7 @@
   <rect x="470" y="176" width="460" height="3" fill="url(#beam)"/>
   <text x="700" y="212" text-anchor="middle" fill="#8f83b8"
         font-family="ui-monospace,'Cascadia Code','JetBrains Mono',Menlo,monospace"
-        font-size="19" letter-spacing="6">TOTAL RECALL FOR YOUR SOCIAL LIFE</text>
+        font-size="19" letter-spacing="6">YOUR CONVERSATIONS, KEPT CLOSE</text>
 
   <!-- spec line -->
   <g font-family="ui-monospace,'Cascadia Code','JetBrains Mono',Menlo,monospace" font-size="14" letter-spacing="2">
@@ -75,7 +75,7 @@
       <tspan fill="#a56bff">LOCAL</tspan><tspan> </tspan><tspan>INFERENCE</tspan>
       <tspan dx="26" fill="#a56bff">ZERO</tspan><tspan> </tspan><tspan>TELEMETRY</tspan>
       <tspan dx="26" fill="#a56bff">25</tspan><tspan> </tspan><tspan>LANGUAGES</tspan>
-      <tspan dx="26" fill="#a56bff">&lt;5%</tspan><tspan> </tspan><tspan>OF ONE CORE</tspan>
+      <tspan dx="26" fill="#a56bff">YOUR</tspan><tspan> </tspan><tspan>ARCHIVE</tspan>
     </text>
   </g>
 </svg>

@@ -152,14 +152,15 @@ class VoiceActivity:
 
 async def run_local(config, audio, status, text_queue=None):
     from .speech import Speech
-    from .recall import RecallClient
+    from .recall import RecallClient, RecognitionUnavailable
     speech = Speech(config)
     model = LocalModel(config)
     recall = RecallClient(config.get("recall_socket"))
     history = []
     turn = None
     text_queue = text_queue or asyncio.Queue(maxsize=1)
-    reading = typed = None
+    reading = typed = capture_binding = None
+    binding_tasks = set()
     def new_vad():
         return VoiceActivity(config.get("local_vad_threshold", .012),
                              config.get("silence_duration_ms", 650),
@@ -173,13 +174,40 @@ async def run_local(config, audio, status, text_queue=None):
         history.extend([{"role": "user", "content": text[:1600]}, {"role": "assistant", "content": reply}])
         del history[:-8]
 
-    async def respond(pcm=None, end_ns=None, typed_text=None, response=None):
+    async def current_binding():
+        getter = getattr(audio, 'recognition_binding', None)
+        if not callable(getter):
+            return None
+        try:
+            return await getter()
+        except Exception:
+            return None
+
+    async def respond(pcm=None, end_ns=None, typed_text=None, response=None, binding=None):
         nonlocal speaking, echo_until
         started = time.monotonic()
         stage = "recognition"
         result_error = "turn_failed"
         try:
-            text = typed_text if typed_text is not None else (await speech.transcribe(pcm)).strip()
+            if typed_text is not None:
+                text = typed_text
+            elif config.get('recognition_source', 'recall') == 'recall':
+                span = voiced_time_span(pcm, end_ns, config.get('local_vad_threshold', .012))
+                if span is None:
+                    return
+                source = 'mic' if config.get('audio_mode') == 'local' else 'vesktop'
+                capture_source = getattr(audio.devices, 'capture_source', None) if source == 'mic' else None
+                expected = await binding if binding is not None else None
+                async def input_guard():
+                    return expected is not None and await current_binding() == expected
+                status('waiting_for_recall_transcript', recognition_source='recall', recognition_error=None)
+                recognized = await recall.recognize(*span, source=source, capture_source=capture_source,
+                                                    input_guard=input_guard if source == 'vesktop' else None)
+                text = recognized['text']
+                status('recall_transcript_received', recognized_characters=len(text),
+                       matched_segments=len(recognized['segment_ids']), wait_ms=recognized['wait_ms'], recognition_error=None)
+            else:
+                text = (await speech.transcribe(pcm)).strip()
             if not text:
                 return
             if typed_text is None and config.get("mode", "wakeword") == "wakeword" and not contains_wake_word(text, config["wake_words"]):
@@ -231,6 +259,8 @@ async def run_local(config, audio, status, text_queue=None):
             if response is None:
                 remember(text, reply)
             status("local_listening")
+        except RecognitionUnavailable as exc:
+            status('recognition_unavailable', recognition_source='recall', recognition_error=exc.code)
         except asyncio.CancelledError:
             result_error = "interrupted"
             raise
@@ -247,7 +277,8 @@ async def run_local(config, audio, status, text_queue=None):
         # Drop startup audio backlog so speech timestamps align with Recall.
         await Audio.stop_process(audio.capture)
         await audio.start()
-        status("local_listening", backend="local", connected=True, mode=config.get("mode"))
+        status("local_listening", backend="local", connected=True, mode=config.get("mode"),
+               recognition_source=config.get("recognition_source", "recall"), recognition_error=None)
         reading = asyncio.create_task(audio.read())
         typed = asyncio.create_task(text_queue.get())
         while True:
@@ -276,6 +307,10 @@ async def run_local(config, audio, status, text_queue=None):
                 vad = new_vad()
                 continue
             onset, utterance = vad.feed(pcm)
+            if onset and config.get('recognition_source', 'recall') == 'recall' and config.get('audio_mode') == 'vesktop':
+                capture_binding = asyncio.create_task(current_binding())
+                binding_tasks.add(capture_binding)
+                capture_binding.add_done_callback(binding_tasks.discard)
             if onset and turn is not None and not turn.done():
                 turn.cancel()
                 await asyncio.gather(turn, return_exceptions=True)
@@ -285,8 +320,11 @@ async def run_local(config, audio, status, text_queue=None):
                 if turn and not turn.done():
                     turn.cancel()
                     await asyncio.gather(turn, return_exceptions=True)
-                turn = asyncio.create_task(respond(utterance, time.time_ns()), name="nx-recall-voice-turn")
+                turn = asyncio.create_task(respond(utterance, time.time_ns(), binding=capture_binding), name="nx-recall-voice-turn")
     finally:
+        for pending in binding_tasks:
+            pending.cancel()
+        await asyncio.gather(*binding_tasks, return_exceptions=True)
         if typed and typed.done() and not typed.cancelled() and typed.exception() is None:
             request = typed.result()
             if isinstance(request, TextTurn) and not request.response.done():

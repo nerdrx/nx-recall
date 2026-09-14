@@ -1,3 +1,4 @@
+import { createMutationFeedback } from '../lib/mutation.js';
 import { h, clear } from '../lib/dom.js';
 import { ask } from '../lib/store.js';
 import { play, stop, isActive, onPlayback } from '../lib/preview.js';
@@ -54,10 +55,11 @@ export function mountReview(root, ctx) {
       const key = `review:${item.id}`;
       if (isActive(key)) { stop(); return; }
       const result = await play(key, [item.id]);
-      if (!dead && !result.played && !result.stopped) problem.textContent = 'Audio is unavailable. It may have expired or been removed.';
+      if (!dead && !result.played && !result.stopped) { problem.hidden = false; problem.textContent = 'Audio is unavailable. It may have expired or been removed.'; }
     }, { 'aria-pressed': 'false' });
     const mark = button('Mark reviewed', () => save(false));
     const correct = button('Save correction', () => save(true));
+    const feedback = createMutationFeedback({ status: problem, success: 'Reviewed.' });
     const node = h('article', { class: 'card review-card', dataset: { reviewId: item.id } },
       h('p', { class: 'sub', text: archiveAttribution(item) }),
       ...reviewReasons(item).map(text => h('p', { class: 'review-reason', text })),
@@ -66,11 +68,11 @@ export function mountReview(root, ctx) {
         button('Open transcript', () => ctx.jumpToSegment(item))), problem);
     async function save(edit) {
       const owner = cards.get(item.id);
-      if (dead || owner?.node !== node || owner.stale) return;
-      if (!edit && words.value !== item.text) { problem.textContent = 'Save your correction first, or restore the original words.'; return; }
-      correct.disabled = mark.disabled = true; problem.textContent = '';
+      if (dead || owner?.node !== node || owner.stale || feedback.pending) return;
+      if (!edit && words.value !== item.text) { problem.hidden = false; problem.textContent = 'Save your correction first, or restore the original words.'; return; }
+      correct.disabled = mark.disabled = true; words.readOnly = true; problem.textContent = '';
       try {
-        await correctAndReview(item, edit ? words.value : item.text);
+        await feedback.run(() => correctAndReview(item, edit ? words.value : item.text));
         if (dead || cards.get(item.id)?.node !== node) return;
         if (isActive(`review:${item.id}`)) stop();
         cards.delete(item.id); node.remove();
@@ -79,10 +81,11 @@ export function mountReview(root, ctx) {
         void loadEvidence();
       } catch (error) {
         if (dead || cards.get(item.id)?.node !== node) return;
-        if (!owner.stale) { problem.textContent = error.message; correct.disabled = mark.disabled = false; }
+        if (!owner.stale) { correct.disabled = mark.disabled = false; }
+        words.readOnly = false;
       }
     }
-    cards.set(item.id, { item, node, listen, correct, mark, problem, words, stale: false });
+    cards.set(item.id, { item, node, listen, correct, mark, problem, words, feedback, stale: false });
     return node;
   }
   async function loadEvidence() {
@@ -99,7 +102,7 @@ export function mountReview(root, ctx) {
     try {
       const reply = await ask('review.list', { limit: 30, ...(advance && next ? { before_id: next } : {}) });
       if (dead || !active || ticket !== generation) return;
-      stopOwned(); cards.clear(); clear(list);
+      stopOwned(); for (const card of cards.values()) card.feedback.destroy(); cards.clear(); clear(list);
       next = reply.next_before_id;
       for (const item of reply.items ?? []) list.append(card(item));
       more.hidden = next == null;
@@ -125,6 +128,8 @@ export function mountReview(root, ctx) {
         const current = cards.get(item.id);
         if (current) {
           current.stale = true;
+          current.feedback.destroy();
+          current.problem.hidden = false;
           const draft = current.words.value !== current.item.text;
           if (!draft) current.words.value = item.text ?? '';
           current.correct.disabled = current.mark.disabled = true;
@@ -132,6 +137,6 @@ export function mountReview(root, ctx) {
         }
       }
     },
-    destroy() { dead = true; active = false; generation++; evidenceGeneration++; stopOwned(); offPlayback(); cards.clear(); },
+    destroy() { dead = true; active = false; generation++; evidenceGeneration++; stopOwned(); offPlayback(); for (const card of cards.values()) card.feedback.destroy(); cards.clear(); },
   };
 }

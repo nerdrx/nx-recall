@@ -430,7 +430,7 @@ export function mount(root, ctx, arg = {}) {
       return 'Per-user audio: not available on this daemon.';
     }
     if (!a.enabled) {
-      return 'Per-user audio is off. With it on, Vesktop sends each person in the call as their own stream, and every turn is that person by construction — no voice matching, no overlap to un-mix. Set [truth] audio = true and switch it on in Vencord → RecallBridge as well; both sides are off by default, because this takes people’s voices out of the client.';
+      return 'Per-user audio is off. With it on, the selected voice client sends each person in the call as their own stream, and every turn is that person by construction — no voice matching, no overlap to un-mix. Set [truth] audio = true and switch it on in Vencord → RecallBridge as well; both sides are off by default, because this takes people’s voices out of the client.';
     }
     if (!a.live) {
       return 'Per-user audio is on and nothing is arriving. Join a voice call with RecallBridge’s audio option enabled; until a stream arrives, Discord is recorded off the speakers exactly as before.';
