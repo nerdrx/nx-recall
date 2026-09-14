@@ -138,6 +138,12 @@ rm -f "$G/resources/default_app.asar"
 mkdir -p "$G/resources/app"
 cp -a "$ROOT/gui/src" "$ROOT/gui/assets" "$G/resources/app/"
 cp "$ROOT/gui/package.json" "$G/resources/app/package.json"
+# Local Voice is an app-owned worker, not another systemd service. Its optional
+# Python environment and model data live outside the package manifest.
+mkdir -p "$U/lib/nx-recall/voice"
+cp -a "$ROOT/voice/nx_recall_voice" "$U/lib/nx-recall/voice/"
+cp "$ROOT/voice/pyproject.toml" "$ROOT/voice/setup-local.py" "$U/lib/nx-recall/voice/"
+find "$U/lib/nx-recall/voice" -type d -name __pycache__ -prune -exec rm -rf {} +
 # src/main/e2e.js travels with it, exactly as it does in the AppImage build's
 # `files` glob. It is a dynamic import behind `NX_RECALL_E2E=1` and it is what
 # lets the *packaged* app — not a checkout — be driven under gamescope.

@@ -186,7 +186,7 @@ export function broadcast(channel, payload) {
 /// the renderer's own toast is where the whole thing is readable anyway.
 const MAX_NOTIFY = 220;
 
-export function registerIpc({ request, setPaused, getState, showWindow, relaunch, captions, notify, chooseFolder, openFolder, chooseBackupFolder, openBackupFolder }) {
+export function registerIpc({ voice, request, setPaused, getState, showWindow, relaunch, captions, notify, chooseFolder, openFolder, chooseBackupFolder, openBackupFolder }) {
   ipcMain.handle('recall:request', async (_e, method, params) => {
     if (!ALLOWED.has(method)) return { ok: false, err: { code: 'refused', msg: `method ${method} is not exposed to the UI` } };
     try {
@@ -201,6 +201,14 @@ export function registerIpc({ request, setPaused, getState, showWindow, relaunch
   ipcMain.handle('recall:setPaused', async (_e, next) => ({ paused: await setPaused(!!next) }));
 
   ipcMain.handle('recall:getState', () => getState());
+
+  // Explicit voice operations; no shell commands or remote API calls.
+  ipcMain.handle('recall:voice:state', () => voice.state());
+  ipcMain.handle('recall:voice:devices', () => voice.devices());
+  ipcMain.handle('recall:voice:save', (_e, patch) => voice.save(patch));
+  ipcMain.handle('recall:voice:setup', () => voice.setup());
+  ipcMain.handle('recall:voice:start', () => voice.start());
+  ipcMain.handle('recall:voice:stop', () => voice.stop());
 
   ipcMain.handle('recall:show', () => {
     showWindow();

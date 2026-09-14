@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.18.0 — Local voice, shared memory
+
+- **Local Voice in Recall.** Start and stop Lanalu from Settings, with optional
+  startup alongside the app. The desktop app owns the worker; there is no extra
+  bridge service or paid API.
+- **Two audio modes.** Connect the dedicated Vesktop call through private
+  virtual speaker/microphone devices, or choose a microphone and normal local
+  output. Other Discord clients and default routes stay unchanged. Recall's
+  existing recording connection is preserved.
+- **Offline conversation.** Parakeet hears speech, Qwen generates concise
+  replies through llama.cpp Vulkan, and Piper speaks. Wake names and
+  always-listening modes run locally. Call mode supports interruption; local
+  speaker mode gates capture during playback to prevent feedback.
+- **Recall-backed answers and names.** Bounded local search provides memory.
+  Only confident, temporally aligned acoustic matches with an assigned name
+  identify a speaker; generic labels and uncertainty stay unknown. Matching
+  can lag behind a reply and is not an authentication mechanism.
+- **Optional component setup.** Local Voice has its own runtime and model
+  setup; existing model files are reused. Downloads occur during setup,
+  not during conversation. English speech models are the initial default.
+- Tested with synthetic end-to-end local speech, isolated PipeWire routes,
+  and hidden Gamescope UI interactions. Real-person recognition accuracy and
+  live conversation quality still depend on enrolled voices and the machine.
+
 ## 0.17.1 — Find the right speaker
 
 - Search the Speakers page by name, voice label, or ID; combine with Named or

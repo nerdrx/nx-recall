@@ -28,6 +28,14 @@ contextBridge.exposeInMainWorld("recall", {
   // Never throws: every view renders an error state rather than dying.
   request: (method, params) => ipcRenderer.invoke("recall:request", method, params),
   setPaused: (next) => ipcRenderer.invoke("recall:setPaused", next),
+  voice: {
+    state: () => ipcRenderer.invoke("recall:voice:state"),
+    devices: () => ipcRenderer.invoke("recall:voice:devices"),
+    save: (patch) => ipcRenderer.invoke("recall:voice:save", patch),
+    setup: () => ipcRenderer.invoke("recall:voice:setup"),
+    start: () => ipcRenderer.invoke("recall:voice:start"),
+    stop: () => ipcRenderer.invoke("recall:voice:stop"),
+  },
   getState: () => ipcRenderer.invoke("recall:getState"),
   show: () => ipcRenderer.invoke("recall:show"),
   relaunch: () => ipcRenderer.invoke("recall:relaunch"),

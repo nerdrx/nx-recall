@@ -123,6 +123,17 @@ shows measured delays, daemon memory, queued and dropped audio, and repair state
 Latency summaries retain the latest 256 measurements per category and reset
 with the daemon; they contain no query or transcript text.
 
+## Local Voice
+
+**Settings → Local Voice** hosts Lanalu inside Recall, using local speech
+recognition, a local language model, and a local voice. It can use the dedicated
+Vesktop call or a microphone and normal speakers. Recall search supplies memory;
+only confident acoustic matches with assigned names identify a speaker.
+The app owns the worker, with no separate bridge service or paid API.
+See [Local Voice setup and limits](docs/LOCAL-VOICE.md).
+
+![Local Voice settings](assets/readme/local-voice.png)
+
 ## Quiet Studio in 0.15
 
 A complete desktop design pass keeps the focus on conversations: flat surfaces,

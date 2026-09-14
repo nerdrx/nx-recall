@@ -2094,3 +2094,8 @@ input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), select, te
 .view-head .searchable-speaker-select { width: 190px; flex-shrink: 1; }
 .speaker-select-status { font-size: 11px; max-width: 240px; }
 .sp-actions .searchable-speaker-select { width: 190px; }
+
+/* Local Voice uses the same settings cards and controls as recording. */
+.voice-field { display: grid; gap: 8px; margin-block: 16px; max-width: 620px; }
+.voice-field select, .voice-field input { width: 100%; min-width: 0; }
+.voice-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-block: 14px; }

@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 // Headless driver — only ever loaded when NX_RECALL_E2E=1.
 //
 // It drives the REAL DOM (clicking the real rail buttons, typing into the real
@@ -107,6 +108,49 @@ export function runE2E(deps) {
     const w = win();
     if (w.webContents.isLoading()) await new Promise((r) => w.webContents.once('did-finish-load', r));
     await sleep(1200); // first paint + boot() queries
+
+    await step('018-local-voice-settings-stay-local-and-save', async () => {
+      await js(`window.__recallDebug.go('settings', {section:'voice'})`);
+      await waitFor('voice config loaded', () => js(`document.getElementById('voice-wake-words')?.value.includes('lanalu')`));
+      assert(await js(`document.getElementById('settings-voice').textContent.includes('do not identify who is speaking')`), 'wake-name scope missing');
+      await js(`(() => { const el=document.getElementById('voice-audio-mode'); el.value='local'; el.dispatchEvent(new Event('change')); })()`);
+      assert(await js(`document.getElementById('voice-source').checkVisibility()`), 'local device selectors stayed hidden');
+      await js(`(() => { const el=document.getElementById('voice-listening-mode'); el.value='always'; el.dispatchEvent(new Event('change')); })()`);
+      assert(await js(`document.getElementById('voice-wake-words').disabled`), 'wake names editable in always mode');
+      await js(`document.getElementById('voice-audio-mode').value='vesktop'; document.getElementById('voice-audio-mode').dispatchEvent(new Event('change')); [...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Save settings').click()`);
+      await waitFor('voice settings saved', () => js(`document.getElementById('settings-voice').textContent.includes('Settings saved.')`));
+      const state = await js(`window.recall.voice.state()`);
+      assert(state.config.backend === 'local' && state.config.mode === 'always' && !state.running, 'saving started audio or changed backend');
+      if (state.available) {
+        await js(`[...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Start Local Voice').click()`);
+        await waitFor('fake voice started', () => js(`window.recall.voice.state().then(s=>s.running)`));
+        assert(await js(`document.getElementById('voice-audio-mode').disabled`), 'running voice settings remained editable');
+        await js(`[...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Stop Local Voice').click()`);
+        await waitFor('fake voice stopped', () => js(`window.recall.voice.state().then(s=>!s.running)`));
+      }
+      return { running: false, mode: state.config.mode, fakeStartStop: state.available, file: await shot('018-local-voice') };
+    });
+
+    await step('018-local-voice-setup-onboarding', async () => {
+      const original = await js(`window.recall.voice.state()`);
+      await js(`window.recall.voice.save({tts_model_path:'/nonexistent/nx-recall-e2e-voice.onnx'})`);
+      await js(`window.__recallDebug.go('settings', {section:'voice'})`);
+      await waitFor('voice setup visible',()=>js(`document.getElementById('voice-setup')?.checkVisibility()`));
+      assert(await js(`document.getElementById('settings-voice').textContent.includes('about 2 GB')`),'download size missing');
+      await waitFor('missing voice component',()=>js(`document.getElementById('voice-missing').textContent.includes('Amy voice')`));
+      const state=await js(`window.recall.voice.state()`);
+      if(state.setupAvailable) {
+        await js(`document.getElementById('voice-setup').click()`);
+        await waitFor('fake setup started',()=>js(`window.recall.voice.state().then(s=>s.preparing)`));
+        assert(await js(`document.getElementById('voice-setup').disabled`),'second setup still enabled');
+        await js(`[...document.querySelectorAll('#settings-voice button')].find(b=>b.textContent==='Cancel setup').click()`);
+        await waitFor('fake setup stopped',()=>js(`window.recall.voice.state().then(s=>!s.preparing)`));
+      }
+      const file=await shot('018-local-voice-setup');
+      await js(`window.recall.voice.save({tts_model_path:${JSON.stringify(original.config.tts_model_path)}})`);
+      assert(!(await js(`window.recall.voice.state()`)).running,'setup started voice');
+      return {file,fakeSetupCancel:state.setupAvailable};
+    });
 
     // 1 — the socket handshake actually completed
     await step('connect', async () => {
@@ -5212,7 +5256,7 @@ export function runE2E(deps) {
             focused: document.activeElement.dataset.section, visible: originalPanels.filter(p => !p.hidden).map(p => p.dataset.section),
             tabstops: tabs.filter(t => t.tabIndex === 0).length, count: tabs.length };
         })()`);
-        assert(info.count === (view === 'settings' ? 5 : 4) && info.tabstops === 1, `${view} category tab stops invalid: ${JSON.stringify(info)}`);
+        assert(info.count === (view === 'settings' ? 6 : 4) && info.tabstops === 1, `${view} category tab stops invalid: ${JSON.stringify(info)}`);
         assert(info.selected === last && info.focused === last && info.visible.join() === last, `${view} End key did not select/focus its last category`);
         await js(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true })); document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))`);
         assert(await js(`document.activeElement.dataset.section === ${JSON.stringify(next)}`), `${view} arrow key did not move categories`);
@@ -5384,4 +5428,11 @@ export function runE2E(deps) {
         deps.quit();
       })
   );
+}
+
+// Used only by the private E2E app instance; no audio process is created.
+export function spawnVoiceTestWorker() {
+  const child = new EventEmitter();
+  child.kill = () => { setTimeout(() => child.emit('exit', 0, null), 20); return true; };
+  return child;
 }

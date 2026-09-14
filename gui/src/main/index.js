@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { RecallClient, defaultSocketPath } from './client.js';
 import { registerIpc, broadcast } from './ipc.js';
+import { createVoiceController } from './voice.js';
 import {
   captionsAreOpen,
   getCaptionSettings,
@@ -49,6 +50,8 @@ let tray = null;
 let client = null;
 let statusTimer = null;
 let quitting = false;
+let voice = null;
+let voiceQuitPending = false;
 
 // Everything the tray renders. Kept here, not in the renderer, precisely so a
 // closed window changes nothing about what the tray can say.
@@ -534,7 +537,14 @@ async function bootstrap() {
     updateTray();
   });
 
+  const voiceOptions = { userData: app.getPath('userData') };
+  if (process.env.NX_RECALL_E2E === '1') voiceOptions.spawnWorker = (await import('./e2e.js')).spawnVoiceTestWorker;
+  voice = createVoiceController(voiceOptions);
+  if (voice.state().config.autostart) {
+    try { voice.start(); } catch (error) { console.warn('[recall] Local Voice could not start:', error.message); }
+  }
   registerIpc({
+    voice,
     request: (method, params) => client.request(method, params),
     setPaused,
     getState: () => ({
@@ -690,7 +700,14 @@ app.on('activate', () => showWindow());
 // Closing the last window must NOT quit — the tray is the app.
 app.on('window-all-closed', () => {});
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
+  if (voice && (voice.state().running || voice.state().preparing)) {
+    event.preventDefault();
+    if (voiceQuitPending) return;
+    voiceQuitPending = true;
+    void voice.stop().finally(() => app.quit());
+    return;
+  }
   quitting = true;
   // The layer-shell captions are a separate process (see main/captions.js) and
   // would otherwise still be on the screen after the app that owns them is gone.
