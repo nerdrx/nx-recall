@@ -1,4 +1,5 @@
 import asyncio
+from array import array
 import types
 import unittest
 from unittest.mock import patch
@@ -30,6 +31,21 @@ class Process:
 
 
 class AudioTests(unittest.IsolatedAsyncioTestCase):
+    async def test_levels_measure_input_and_reset_without_retaining_pcm(self):
+        audio = Audio(types.SimpleNamespace())
+        reader = asyncio.StreamReader()
+        reader.feed_data(array('h', [16384] * 480).tobytes())
+        audio.capture = types.SimpleNamespace(stdout=reader)
+        await audio.read()
+        levels = audio.levels()
+        self.assertEqual(levels['audio_input_peak'], .5)
+        self.assertGreater(levels['last_input_signal_at'], 0)
+        self.assertEqual(audio.levels()['audio_input_peak'], 0)
+        self.assertEqual(Audio.peak(array('h', [-32768]).tobytes()), 1)
+        reader.feed_data(bytes(960))
+        await audio.read()
+        self.assertEqual(audio.levels()['last_input_signal_at'], levels['last_input_signal_at'])
+
     async def test_clear_interrupts_paced_audio_and_reaps_playback(self):
         audio = Audio(types.SimpleNamespace())
         proc = Process()

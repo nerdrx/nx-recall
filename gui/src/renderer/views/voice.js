@@ -16,6 +16,21 @@ export function mount(root) {
 export function recognitionProblem(code) {
   return ({paused:'Resume capture in Recall.',source_unavailable:'Enable the matching input in Recall Sources.',input_mismatch:'Choose the same microphone in Recall and Lanalu.',ambiguous_source:'Choose one matching input in Recall Sources.',timeout:'Could not match this turn to Recall. Try again or use separate recognition.'})[code] || '';
 }
+export function voiceAudioLevels(state, now = Date.now() / 1000) {
+  const status = state.status || {};
+  const recent = stamp => Number.isFinite(stamp) && stamp > 0 && now >= stamp && now - stamp < 4;
+  const valid = peak => Number.isFinite(peak) && peak >= 0 && peak <= 1;
+  const fresh = state.running && !state.stopping && recent(status.audio_levels_at);
+  const inputFresh = fresh && recent(status.audio_input_read_at) && valid(status.audio_input_peak);
+  const outputFresh = fresh && valid(status.audio_output_peak);
+  const input = inputFresh ? status.audio_input_peak : 0;
+  const output = outputFresh ? status.audio_output_peak : 0;
+  return {
+    input, output,
+    inputLabel: !state.running || state.stopping ? 'Input stopped' : !inputFresh ? 'No recent input · check audio connection' : input > 0 ? 'Receiving audio signal' : 'Input connected · silence',
+    outputLabel: !state.running || state.stopping ? 'Output stopped' : !outputFresh ? 'No recent output measurement' : output > 0 ? 'Writing generated audio' : 'No generated audio',
+  };
+}
 export function voiceStateLabel(state) {
   if (state.stopping) return 'Stopping…';
   if (state.preparing) {
@@ -33,12 +48,19 @@ export function voiceStateLabel(state) {
     turn_complete: 'Listening locally', local_turn_failed: 'A reply failed; listening again',
   })[event] || (state.status?.error ? 'Voice needs attention' : 'Starting Local Voice…');
 }
-export function mountVoice() {
-  const api = window.recall.voice;
+export function mountVoice(api = window.recall.voice) {
   let active = false, destroyed = false, timer = null, busy = false, initialized = false, generation = 0;
   let current = { running: false, available: false, config: {} };
   const models = h('dl', { class: 'settings-shortcuts', id: 'lanalu-models' });
   const status = h('p', { role: 'status', 'aria-live': 'polite', class: 'sub', text: 'Open Local Voice to load its status.' });
+  const inputLevel = h('meter', {id:'lanalu-input-level',min:0,max:1,value:0,'aria-describedby':'lanalu-input-state'});
+  const outputLevel = h('meter', {id:'lanalu-output-level',min:0,max:1,value:0,'aria-describedby':'lanalu-output-state'});
+  const inputState = h('span', {id:'lanalu-input-state',class:'sub'});
+  const outputState = h('span', {id:'lanalu-output-state',class:'sub'});
+  const audioLevels = h('div', {class:'lanalu-audio-levels'},
+    h('div', {}, h('label', {for:inputLevel.id,text:'Audio reaching Lanalu'}),inputLevel,inputState),
+    h('div', {}, h('label', {for:outputLevel.id,text:'Lanalu output'}),outputLevel,outputState),
+    h('p', {class:'sub',text:'Levels show audio, not recognized speech. Output shows audio written by Lanalu, not confirmation that another app receives it.'}));
   let sending=false;
   const reply=h('div',{id:'lanalu-reply',class:'lanalu-reply',role:'log','aria-live':'polite'});
   const messageStatus=h('p',{class:'sub',role:'status','aria-live':'polite'});
@@ -69,7 +91,11 @@ export function mountVoice() {
   const refreshDevices = h('button', { class: 'btn', text: 'Refresh audio devices', onclick: () => void loadDevices() });
   const local = h('div', {}, row('Microphone', source), row('Voice output', sink), refreshDevices,
     h('p', { class: 'sub', text: 'Headphones keep generated speech out of your microphone. Local speaker mode pauses listening while speaking to prevent feedback.' }));
-  const vesktop = h('p', { class: 'sub', text: 'Connects the selected voice client’s dedicated profile through virtual audio input and output. Join a voice channel yourself; other clients keep their audio routing. Memory answers can include saved Recall information and are audible to everyone in the call.' });
+  const vesktop = h('div', {class:'sub'},
+    h('p', {text:'In your voice client, select these devices after starting Local Voice:'}),
+    h('ul', {},h('li', {},h('strong', {text:'Output: '}),'NX Recall - Call audio to Lanalu'),h('li', {},h('strong', {text:'Input: '}),'NX Recall - Lanalu microphone')),
+    h('p', {text:'Do not select “NX Recall - Internal voice bus”; Recall manages it internally.'}),
+    h('p', {text:'Join a voice channel yourself; other clients keep their audio routing. Memory answers can include saved Recall information and are audible to everyone in the call.'}));
   const saveStatus = h('p', { class: 'sub', id: 'voice-save-status' });
   const save = h('button', { class: 'btn', text: 'Save settings', onclick: () => saveSettings(saveFeedback) });
   const saveFeedback = createMutationFeedback({ status: saveStatus, button: save, success: 'Settings saved.' });
@@ -90,7 +116,7 @@ export function mountVoice() {
   const panel = h('section', { id: 'settings-voice', class: 'settings-panel', role: 'tabpanel', 'aria-labelledby': 'settings-tab-voice', dataset: { settingsPanel: 'voice' }, hidden: true },
     h('header', { class: 'settings-panel-head' }, h('h2', { class: 'settings-group-title', text: 'Local Voice' }),
       h('p', { class: 'sub', text: 'Talk with your local assistant using Recall memory. Recognition, replies and generated speech stay on this computer.' })),
-    h('section', { class: 'card' }, h('h3', { class: 'card-title', text: 'Voice conversation' }), status, error,
+    h('section', { class: 'card' }, h('h3', { class: 'card-title', text: 'Voice conversation' }), status, error, audioLevels,
       h('div', { class: 'voice-actions' }, setup, start, stop, debug), setupHelp, missing,
       h('label', { for: 'voice-autostart' }, autostart, ' Start with Recall'),
       h('p', { class: 'sub', text: 'Runs while NX Recall is open, including in the tray. Quitting Recall stops the conversation.' })),
@@ -116,6 +142,9 @@ export function mountVoice() {
   function patch() { return { tts_backend:voiceEngine.value, kokoro_voice:kokoroVoice.value, tts_speed:Number(speed.value), piper_noise_scale:Number(variation.value), autostart: autostart.checked, audio_mode: audioMode.value, recognition_source: recognition.value, mode: mode.value, wake_words: wake.value.split(',').map(v => v.trim()).filter(Boolean), local_source: source.value, local_sink: sink.value }; }
   function render() {
     status.textContent = voiceStateLabel(current);
+    const levels = voiceAudioLevels(current);
+    inputLevel.value = levels.input; outputLevel.value = levels.output;
+    inputState.textContent = levels.inputLabel; outputState.textContent = levels.outputLabel;
     paintVoiceChoice();
     voiceSetup.disabled=busy || saveFeedback.pending || voiceSaveFeedback.pending || current.running || current.preparing || !current.setupAvailable;
     models.replaceChildren(...Object.entries(current.models || {}).flatMap(([key, value]) => [h('dt', { text: ({llm:'Replies',stt:'Speech recognition',tts:'Voice'})[key] || key }), h('dd', { text: value })]));
@@ -172,7 +201,7 @@ export function mountVoice() {
         await loadDevices();
       }
       render();
-    } catch { if (!destroyed) error.textContent = 'Local Voice status is unavailable.'; }
+    } catch { if (!destroyed) { error.textContent = 'Local Voice status is unavailable.'; render(); } }
     finally { if (!destroyed && active && ticket === generation) timer = setTimeout(refresh, 1500); }
   }
   render();

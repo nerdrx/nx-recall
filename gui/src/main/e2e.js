@@ -187,6 +187,34 @@ export function runE2E(deps) {
       return {file:await shot('022-corrected-name-assistance'),glossaryPreserved:true,rollback:true};
     });
 
+    await step('023-lanalu-audio-levels', async () => {
+      await js(`window.__recallDebug.go('lanalu')`);
+      await waitFor('Lanalu mounted',()=>js(`!!document.getElementById('lanalu-input-level')`));
+      await js(`window.__recallDebug.go('transcript')`);
+      try {
+        await js(`(async()=>{
+          const {mountVoice}=await import('./views/voice.js');
+          window.__meterState={running:true,available:true,config:{audio_mode:'vesktop',mode:'wakeword',wake_words:['Lanalu']},status:{event:'listening'}};
+          window.__meterController=mountVoice({state:async()=>window.__meterState,devices:async()=>({sources:[],sinks:[]})});
+          window.__meterController.panel.hidden=false;
+          document.getElementById('main').replaceChildren(window.__meterController.panel);
+          window.__meterController.setActive(true);
+        })()`);
+        await waitFor('stale meter',()=>js(`document.getElementById('lanalu-input-state')?.textContent.includes('No recent input')`));
+        await js(`window.__meterState.status={event:'listening',audio_levels_at:Date.now()/1000,audio_input_read_at:Date.now()/1000,audio_input_peak:0,audio_output_peak:0};window.__meterController.setActive(true)`);
+        await waitFor('silent meter',()=>js(`document.getElementById('lanalu-input-state').textContent==='Input connected · silence' && document.getElementById('lanalu-input-level').value===0`));
+        await js(`window.__meterState.status.audio_input_peak=.45;window.__meterState.status.audio_output_peak=.25;window.__meterController.setActive(true)`);
+        await waitFor('signal meter',()=>js(`document.getElementById('lanalu-input-level').value===.45 && document.getElementById('lanalu-input-state').textContent==='Receiving audio signal' && document.getElementById('lanalu-output-level').value===.25`));
+        assert(await js(`!!document.querySelector('label[for="lanalu-input-level"]') && document.getElementById('lanalu-input-level').getAttribute('aria-describedby')==='lanalu-input-state'`),'meter has no accessible label');
+        const file=await shot('023-lanalu-audio-levels');
+        await js(`window.__meterState.status.audio_levels_at=1;window.__meterController.setActive(true)`);
+        await waitFor('old peak cleared',()=>js(`document.getElementById('lanalu-input-level').value===0 && document.getElementById('lanalu-input-state').textContent.includes('No recent input')`));
+        return {file,silence:true,signal:true,stale:true,accessible:true};
+      } finally {
+        await js(`window.__meterController?.destroy();window.__meterController?.panel.remove();delete window.__meterController;delete window.__meterState`);
+      }
+    });
+
     await step('021-lanalu-voice-settings', async () => {
       await js(`window.__recallDebug.go('lanalu')`);
       await waitFor('voice controls ready',()=>js(`document.getElementById('voice-wake-words')?.value && document.getElementById('voice-style-save')?.disabled===false`));

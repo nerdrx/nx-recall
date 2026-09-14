@@ -122,6 +122,8 @@ export function createVoiceController({ userData, home = homedir(), runtime = pr
           latency_ms: Number.isFinite(data.latency_ms) ? data.latency_ms : null,
           input_kind: ['text','voice','audio'].includes(data.input_kind) ? data.input_kind : null,
           audio_ready: !!data.audio_ready,
+          ...Object.fromEntries(['audio_input_peak','audio_output_peak'].map(key => [key, Number.isFinite(data[key]) && data[key] >= 0 && data[key] <= 1 ? data[key] : null])),
+          ...Object.fromEntries(['audio_levels_at','audio_input_read_at','last_input_signal_at'].map(key => [key, Number.isFinite(data[key]) && data[key] > 0 && data[key] <= Date.now()/1000 + 1 ? data[key] : null])),
           recognition_source: ['recall','local'].includes(data.recognition_source) ? data.recognition_source : config.recognition_source,
           recognition_error: ['paused','source_unavailable','input_mismatch','ambiguous_source','timeout'].includes(data.recognition_error) ? data.recognition_error : null,
           recognition_wait_ms: Number.isFinite(data.wait_ms) ? data.wait_ms : null,

@@ -6,7 +6,22 @@ import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { EventEmitter } from 'node:events';
 import { normalizeVoiceConfig, voiceDefaults, voiceToml, createVoiceController, sendVoiceText, voiceModelLabels } from '../src/main/voice.js';
-import { voiceStateLabel } from '../src/renderer/views/voice.js';
+import { voiceStateLabel, voiceAudioLevels } from '../src/renderer/views/voice.js';
+
+test('voice meters distinguish actual audio, silence, stale input and stopped workers', () => {
+  const state = {running:true,status:{event:'listening',audio_levels_at:100,audio_input_read_at:100,audio_input_peak:.25,audio_output_peak:.5}};
+  assert.deepEqual(voiceAudioLevels(state,101), {input:.25,output:.5,inputLabel:'Receiving audio signal',outputLabel:'Writing generated audio'});
+  assert.equal(voiceAudioLevels({...state,status:{...state.status,audio_input_peak:0}},101).inputLabel,'Input connected · silence');
+  assert.equal(voiceAudioLevels(state,104).input,0);
+  assert.match(voiceAudioLevels({...state,status:{...state.status,audio_input_read_at:90}},101).inputLabel,/No recent input/);
+  assert.match(voiceAudioLevels({running:true,status:{event:'listening'}},101).inputLabel,/No recent input/);
+  for (const value of [NaN,Infinity,-1,1.1,'0.5',undefined]) {
+    assert.equal(voiceAudioLevels({...state,status:{...state.status,audio_input_peak:value}},101).input,0);
+  }
+  assert.equal(voiceAudioLevels(state,99).input,0);
+  assert.equal(voiceAudioLevels({...state,running:false},101).inputLabel,'Input stopped');
+  assert.equal(voiceAudioLevels({...state,stopping:true},101).output,0);
+});
 
 test('voice accepts only fixed local settings and encodes TOML safely', () => {
   const base = voiceDefaults('/example');
@@ -113,6 +128,13 @@ test('debug retains stopped worker state, routes and error without transcript fi
   const voice=createVoiceController({userData:join(dir,'data'),home:dir,runtime:dir,spawnWorker:()=>worker});voice.start();
   const statusFile=join(dir,'nx-recall-voice/status.json');mkdirSync(join(statusFile,'..'),{recursive:true});
   writeFileSync(statusFile,JSON.stringify({pid:worker.pid,event:'retrying',error:'BrokenPipeError',retry_seconds:2,routes:{ready:false,playback:1,capture:0},transcript:'PRIVATE SENTENCE',input_kind:'text',error_stage:'playback',updated_at:1}));
+  const snapshot=JSON.parse(readFileSync(statusFile,'utf8'));
+  writeFileSync(statusFile,JSON.stringify({...snapshot,audio_input_peak:.4,audio_output_peak:.2,audio_levels_at:1,audio_input_read_at:1,last_input_signal_at:1}));
+  assert.equal(voice.state().status.audio_input_peak,.4);
+  assert.equal(voice.state().status.audio_output_peak,.2);
+  assert.equal(voice.state().status.audio_input_read_at,1);
+  writeFileSync(statusFile,JSON.stringify({...snapshot,audio_input_peak:5,audio_output_peak:'0.2',audio_levels_at:Date.now()/1000+500,audio_input_read_at:-1,last_input_signal_at:'1'}));
+  for(const key of ['audio_input_peak','audio_output_peak','audio_levels_at','audio_input_read_at','last_input_signal_at']) assert.equal(voice.state().status[key],null);
   await voice.stop();const debug=voice.debug();
   assert.equal(debug.state,'retrying');assert.equal(debug.running,false);assert.equal(debug.routes.playback,1);assert.equal(debug.retry_seconds,2);assert.match(debug.lastError,/BrokenPipeError/);assert.ok(!JSON.stringify(debug).includes('PRIVATE SENTENCE'));
 });

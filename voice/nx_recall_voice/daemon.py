@@ -28,11 +28,19 @@ class Status:
 
     def __call__(self, event, **fields):
         self.data.update(fields, event=event, updated_at=time.time())
+        self._write()
+        logging.info("%s %s", event, json.dumps(fields))
+
+    def audio_levels(self, fields):
+        # Quiet telemetry must not overwrite the conversation state or flood logs.
+        self.data.update(fields)
+        self._write()
+
+    def _write(self):
         target = runtime() / "status.json"
         temporary = target.with_suffix(".tmp")
         temporary.write_text(json.dumps(self.data) + "\n")
         temporary.replace(target)
-        logging.info("%s %s", event, json.dumps(fields))
 
 
 def load_config(path):
@@ -112,6 +120,8 @@ async def run(config, status=None, text_queue=None):
                     task = asyncio.create_task(run_local(config, audio, status, text_queue))
                 if status.data.get('audio_ready') != bool(ready):
                     status('audio_ready' if ready else 'waiting_for_vesktop_streams', audio_ready=bool(ready))
+                if hasattr(status, 'audio_levels'):
+                    status.audio_levels(audio.levels())
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             raise

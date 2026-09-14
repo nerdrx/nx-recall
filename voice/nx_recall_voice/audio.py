@@ -1,5 +1,6 @@
 """Private PipeWire-Pulse buses and bounded, paced PCM subprocess transport."""
 import asyncio
+from array import array
 import json
 import time
 from pathlib import Path
@@ -75,8 +76,8 @@ class Devices:
         if names & {self.incoming, self.outgoing, self.microphone}:
             raise RuntimeError("Lanalu device name already exists; stop the other bridge first")
         try:
-            for name, label in [(self.incoming, "NX_Recall_Voice_Incoming"),
-                                (self.outgoing, "NX_Recall_Voice_Output")]:
+            for name, label in [(self.incoming, "NX Recall - Call audio to Lanalu"),
+                                (self.outgoing, "NX Recall - Internal voice bus")]:
                 stereo = name == self.incoming
                 self.modules.append(await command(
                     "pactl", "load-module", "module-null-sink", f"sink_name={name}",
@@ -85,13 +86,13 @@ class Devices:
                     # A zero driver priority leaves an isolated bus unclocked.
                     # Keep it below hardware drivers, with default-device priority zero.
                     # Keep owned buses clocked across playback teardown and idle gaps.
-                    f"sink_properties=device.description={label} priority.session=0 priority.driver=1 node.always-process=true lanalu.bridge.owner={self.owner}"))
+                    f"sink_properties='device.description=\"{label}\" priority.session=0 priority.driver=1 node.always-process=true lanalu.bridge.owner={self.owner}'"))
                 await self.save_refs()
             self.modules.append(await command(
                 "pactl", "load-module", "module-remap-source",
                 f"master={self.outgoing}.monitor", f"source_name={self.microphone}",
                 "channels=1", "channel_map=mono",
-                f"source_properties=device.description=NX_Recall_Voice_Microphone priority.session=0 lanalu.bridge.owner={self.owner}"))
+                f"source_properties='device.description=\"NX Recall - Lanalu microphone\" priority.session=0 lanalu.bridge.owner={self.owner}'"))
             await self.save_refs()
         except BaseException:
             await self.close()
@@ -112,6 +113,22 @@ class Audio:
         self.sent = 0
         self.started = None
         self.lock = asyncio.Lock()
+        self.input_peak = 0.0
+        self.output_peak = 0.0
+        self.input_read_at = 0.0
+        self.last_input_signal_at = 0.0
+
+    @staticmethod
+    def peak(pcm):
+        return max((abs(x) for x in array('h', pcm)), default=0) / 32768
+
+    def levels(self):
+        """One interval of amplitudes only; never retain audio or recognized words."""
+        result = dict(audio_input_peak=self.input_peak, audio_output_peak=self.output_peak,
+                      audio_levels_at=time.time(), audio_input_read_at=self.input_read_at,
+                      last_input_signal_at=self.last_input_signal_at)
+        self.input_peak = self.output_peak = 0.0
+        return result
 
     async def process(self, record):
         target = (self.devices.capture_source if hasattr(self.devices, 'capture_source') else self.devices.incoming + '.monitor') if record else (self.devices.playback_sink if hasattr(self.devices, 'playback_sink') else self.devices.outgoing)
@@ -130,7 +147,13 @@ class Audio:
         self.capture = await self.process(True)
 
     async def read(self):
-        return await self.capture.stdout.readexactly(960)  # 20ms, mono PCM16 @ 24kHz
+        pcm = await self.capture.stdout.readexactly(960)  # 20ms, mono PCM16 @ 24kHz
+        level = self.peak(pcm)
+        self.input_peak = max(self.input_peak, level)
+        self.input_read_at = time.time()
+        if level >= .001:
+            self.last_input_signal_at = self.input_read_at
+        return pcm
 
     def begin_item(self, item_id):
         self.sent = 0
@@ -154,6 +177,7 @@ class Audio:
                 if self.started is None:
                     self.started = time.monotonic()
                 self.sent += len(part)
+                self.output_peak = max(self.output_peak, self.peak(part))
             await asyncio.sleep(len(part) / 48000)
 
     @staticmethod

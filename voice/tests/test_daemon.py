@@ -1,4 +1,5 @@
 import tempfile
+import json
 import asyncio
 from pathlib import Path
 import unittest
@@ -9,6 +10,18 @@ from nx_recall_voice import daemon
 
 
 class DaemonTests(unittest.IsolatedAsyncioTestCase):
+    def test_audio_meter_preserves_turn_state_without_logging(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(daemon, 'runtime', lambda: Path(directory)), patch.object(daemon.logging, 'info') as log:
+            status = daemon.Status()
+            status('local_speaking', input_kind='text')
+            updated = status.data['updated_at']
+            status.audio_levels(dict(audio_input_peak=.3, audio_levels_at=123))
+            saved = json.loads((Path(directory) / 'status.json').read_text())
+            self.assertEqual(saved['event'], 'local_speaking')
+            self.assertEqual(saved['updated_at'], updated)
+            self.assertEqual(saved['audio_input_peak'], .3)
+            self.assertEqual(log.call_count, 1)
+
     def test_config_requires_local_backend_and_real_wake_phrase(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "voice.toml"

@@ -2115,3 +2115,6 @@ input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), select, te
 .mutation-feedback[data-state="error"] { color: var(--clear-danger); }
 .mutation-feedback[data-state="pending"] { color: var(--text); }
 #lanalu-voice-style input[type="range"] { accent-color: var(--violet); }
+.lanalu-audio-levels { display: grid; gap: 10px; margin: 14px 0; }
+.lanalu-audio-levels > div { display: grid; gap: 5px; }
+.lanalu-audio-levels meter { width: 100%; height: 16px; accent-color: var(--violet); }

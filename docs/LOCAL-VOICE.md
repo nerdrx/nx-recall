@@ -2,6 +2,14 @@
 
 NX Recall can host Lanalu as a local voice assistant. The desktop app owns the worker and its lifecycle; no extra bridge service or paid API is required. Start and stop it in the **Lanalu** tab.
 
+## Which virtual device goes where?
+
+In the selected voice client, use **NX Recall - Call audio to Lanalu** as its output and **NX Recall - Lanalu microphone** as its input. Recall attaches these routes automatically while Virtual in/out is active.
+
+A second output called **NX Recall - Internal voice bus** is the local speech engine's feed into the virtual microphone. It is not another listening device. Do not select it as the call's output: that would feed the call back into its microphone. Older installations call these devices `NX_Recall_Voice_Incoming`, `NX_Recall_Voice_Microphone`, and `NX_Recall_Voice_Output` respectively.
+
+The input meter in Lanalu's tab measures sound actually arriving at her capture stream. A connected route with a flat meter can still mean a silent, muted or deafened call. The reply meter measures generated audio sent to the local speech bus; it cannot confirm that a remote participant heard it. Virtual mode hears incoming call audio, not your physical microphone directly. To speak to Lanalu through the call, your human-controlled account must transmit to the account running the selected client.
+
 ## Audio modes
 
 - **Virtual in/out:** Recall exposes a private incoming speaker and generated-voice microphone. Only the configured voice-client profile is routed. Normal Discord, desktop defaults and other apps keep their routes. You join and leave Discord calls yourself.
