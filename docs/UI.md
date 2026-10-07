@@ -145,3 +145,29 @@ Everyone / Anyone / Link choice; typing never submits or changes an identity.
 Arrow Down enters the native selector and Escape clears its query. Discord
 status refreshes preserve the query and caret. Merge and assignment sheets use
 the same matching with 40 choices per page, keyboard navigation, and result counts.
+
+## 0.19.1: idle model memory
+
+Optional recognition models (CJK decoders, language identification and language
+arbiters), acoustic name-assistance workers, and the shared semantic embedder
+expire after five minutes without model use. Speech housekeeping polls once per
+second, including when the audio queue is empty or capture is paused. Semantic
+repair performs its own nonblocking housekeeping. In-flight work keeps exclusive
+access; resources are never removed from a running inference operation.
+
+The core recognizer, segmentation and speaker embedding stay ready. Semantic
+startup still validates the installed model as before; eviction keeps model paths
+and the search index, then reloads on the next real use. Repair progress and
+availability checks do not reset the model idle timer. A model used continuously
+will remain loaded, and the first use after an idle period includes reload time.
+No fixed end-user memory saving or recognition speedup is implied.
+
+A synthetic resource probe can be run independently with
+`cargo test -p recalld --test idle_memory -- --ignored --nocapture`.
+It touches and releases 128 MiB through the actual idle-eviction helper and prints
+process RSS before, during, and after. This checks OS resource reclamation, not
+memory consumption of real speech models or a user's archive.
+
+One local isolated run measured 9.6 MiB baseline RSS, 137.6 MiB with the synthetic
+resource, and 9.6 MiB after eviction. This is not a measurement of production
+model savings; native runtimes can retain other allocations.

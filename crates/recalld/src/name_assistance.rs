@@ -14,6 +14,7 @@ pub struct NameAssistance {
     terms: Vec<String>,
     recognizer: Option<HintWorker>,
     retry_at: Option<Instant>,
+    last_used: Option<Instant>,
 }
 impl NameAssistance {
     pub fn new(models: &ModelSet) -> Self {
@@ -22,7 +23,15 @@ impl NameAssistance {
             terms: Vec::new(),
             recognizer: None,
             retry_at: None,
+            last_used: None,
         }
+    }
+    pub fn evict_idle(&mut self, now: Instant) -> usize {
+        usize::from(crate::idle_model::evict(
+            &mut self.recognizer,
+            &mut self.last_used,
+            now,
+        ))
     }
     pub fn configure(&mut self, enabled: bool, terms: Vec<String>) {
         let terms = if enabled {
@@ -72,7 +81,9 @@ impl NameAssistance {
         let Some(recognizer) = self.recognizer.as_mut() else {
             return original;
         };
-        match recognizer.transcribe(samples) {
+        let result = recognizer.transcribe(samples);
+        self.last_used = Some(Instant::now());
+        match result {
             Ok(alternative) => {
                 name_only_edit(&original, &alternative, &self.terms).unwrap_or(original)
             }
@@ -296,6 +307,36 @@ mod tests {
         assert_eq!(result, "No no no");
         assert!(assistant.recognizer.is_none());
         assert!(assistant.retry_at.is_some_and(|t| t > Instant::now()));
+        assert!(!directory.exists());
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    }
+
+    #[test]
+    fn idle_helper_is_reaped_without_forgetting_terms() {
+        let models =
+            ModelSet::resolve_at(PathBuf::from("/nonexistent-models"), &Default::default());
+        let mut assistant = NameAssistance::new(&models);
+        assistant.configure(true, vec!["Lanalu".into()]);
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let directory = std::env::temp_dir().join(format!("nx-recall-idle-helper-{pid}"));
+        std::fs::create_dir(&directory).unwrap();
+        assistant.recognizer = Some(HintWorker {
+            child,
+            stream,
+            directory: directory.clone(),
+        });
+        let now = Instant::now();
+        assistant.last_used = Some(now);
+        assert_eq!(assistant.evict_idle(now), 0);
+        assert_eq!(
+            assistant.evict_idle(now + crate::idle_model::IDLE_TIMEOUT),
+            1
+        );
+        assert!(assistant.recognizer.is_none());
+        assert_eq!(assistant.terms, vec!["Lanalu"]);
+        assert!(assistant.retry_at.is_none());
         assert!(!directory.exists());
         assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
     }

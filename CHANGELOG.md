@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.19.1 — Let idle models rest
+
+- Release optional CJK recognition, language identification, English/German
+  arbitration, and acoustic name-assistance resources after five minutes unused.
+  Models reload on demand; the primary transcription path stays loaded.
+- Release the shared semantic model when idle without clearing search vectors,
+  archive coverage, or durable repair progress. Active inference is protected by
+  the existing model lock; model loading errors remain retryable.
+- Run lightweight housekeeping even when capture is quiet or paused, preserving
+  queue shutdown and final-turn flushing. No model downloads or feature changes.
+- The first use after eviction pays model-loading latency. Actual RAM savings
+  depend on which models were loaded and whether they are still being used.
+
 ## 0.19.0 — Hear it, correct it, keep it once
 
 - Show live input and reply meters in Lanalu’s tab, with clearer virtual device names and connection instructions. Meters distinguish received sound from connected-but-silent routing.

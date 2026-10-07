@@ -151,6 +151,8 @@
 //! Latin `<|ja|>` that [`crate::lang::classify`] would read as English — the
 //! exact class of undetectable failure this whole module exists to remove.
 
+use std::time::Instant;
+
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
@@ -853,6 +855,7 @@ impl Drop for CjkAsr {
 struct Lazy<T> {
     got: Option<T>,
     unavailable: bool,
+    last_used: Option<Instant>,
 }
 
 // Hand-written rather than derived: `#[derive(Default)]` on a generic struct
@@ -863,6 +866,7 @@ impl<T> Default for Lazy<T> {
         Self {
             got: None,
             unavailable: false,
+            last_used: None,
         }
     }
 }
@@ -870,6 +874,17 @@ impl<T> Default for Lazy<T> {
 impl<T> Lazy<T> {
     fn get_or_load(
         &mut self,
+        present: bool,
+        how_to_get_it: impl FnOnce() -> String,
+        load: impl FnOnce() -> Result<T>,
+        loaded: impl FnOnce(&T),
+    ) -> Option<&mut T> {
+        self.get_or_load_at(Instant::now(), present, how_to_get_it, load, loaded)
+    }
+
+    fn get_or_load_at(
+        &mut self,
+        now: Instant,
         present: bool,
         how_to_get_it: impl FnOnce() -> String,
         load: impl FnOnce() -> Result<T>,
@@ -892,14 +907,22 @@ impl<T> Lazy<T> {
                 }
             }
         }
-        self.got.as_mut()
+        let got = self.got.as_mut();
+        if got.is_some() {
+            self.last_used = Some(now);
+        }
+        got
+    }
+
+    fn evict_idle(&mut self, now: Instant) -> bool {
+        crate::idle_model::evict(&mut self.got, &mut self.last_used, now)
     }
 }
 
 /// Every optional model this route needs, each loaded the first time it is
-/// wanted and resident from then on.
+/// wanted and released after five minutes without use.
 ///
-/// The two decoders are held separately and are *both* resident once used —
+/// The two decoders are held separately and can both be resident while used —
 /// 655 MB plus 239 MB on an install that meets Japanese and Korean speakers in
 /// the same evening. That is the honest price of rule (b) and it is why the
 /// switches are separate: a machine that only ever hears one of the two pays
@@ -927,6 +950,19 @@ impl Cjk {
             lid: Lazy::default(),
             windows: cfg.lid_windows.max(1),
         }
+    }
+
+    /// Drop loaded optional models after five minutes without successful use.
+    /// Slots that were missing or failed to load keep their existing latch.
+    pub fn evict_idle(&mut self, now: Instant) -> usize {
+        [
+            self.ja_asr.evict_idle(now),
+            self.sv_asr.evict_idle(now),
+            self.lid.evict_idle(now),
+        ]
+        .into_iter()
+        .filter(|evicted| *evicted)
+        .count()
     }
 
     /// Is this language's decoder switched on and on disk?
@@ -1254,6 +1290,11 @@ pub fn settled_by_lid(store: &Store, segment_id: i64) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
 
     fn tags(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -1264,6 +1305,65 @@ mod tests {
             lang: lang.into(),
             confidence,
         }
+    }
+
+    #[test]
+    fn lazy_models_refresh_idle_time_and_reload_after_eviction() {
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut loads = 0;
+        let mut slot = Lazy::default();
+        let start = Instant::now();
+        let load = || {
+            loads += 1;
+            Ok(DropProbe(Arc::clone(&dropped)))
+        };
+        assert!(
+            slot.get_or_load_at(start, true, String::new, load, |_| {})
+                .is_some()
+        );
+
+        let refreshed = start + Duration::from_secs(4 * 60);
+        assert!(!slot.evict_idle(refreshed));
+        assert!(
+            slot.get_or_load_at(
+                refreshed,
+                true,
+                String::new,
+                || {
+                    loads += 1;
+                    Ok(DropProbe(Arc::clone(&dropped)))
+                },
+                |_| {}
+            )
+            .is_some()
+        );
+        assert!(!slot.evict_idle(refreshed + Duration::from_secs(4 * 60 + 59)));
+        let timeout = crate::idle_model::IDLE_TIMEOUT;
+        assert!(slot.evict_idle(refreshed + timeout));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+
+        assert!(
+            slot.get_or_load_at(
+                refreshed + timeout,
+                true,
+                String::new,
+                || {
+                    loads += 1;
+                    Ok(DropProbe(Arc::clone(&dropped)))
+                },
+                |_| {}
+            )
+            .is_some()
+        );
+        assert_eq!(loads, 2);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
     /// A router pointed at a directory with nothing in it: both switches on,
