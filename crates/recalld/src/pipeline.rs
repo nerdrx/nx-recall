@@ -744,7 +744,24 @@ impl Pipeline {
         // Held for the life of the thread so a gap can be classified against
         // the queue's own eviction count (0.14.0). See the `queue` field.
         self.queue = Some(Arc::clone(&queue));
-        while let Some(event) = queue.pop() {
+        let mut last_housekeeping = std::time::Instant::now();
+        loop {
+            let polled = queue.pop_timeout(std::time::Duration::from_secs(1));
+            let now = std::time::Instant::now();
+            if now.duration_since(last_housekeeping) >= std::time::Duration::from_secs(1) {
+                last_housekeeping = now;
+                if let Some(analyzer) = self.analyzer.as_mut() {
+                    let dropped = analyzer.evict_idle_models(now);
+                    if dropped > 0 {
+                        tracing::info!(dropped, "unloaded idle optional speech models");
+                    }
+                }
+            }
+            let event = match polled {
+                crate::queue::PopResult::Event(event) => event,
+                crate::queue::PopResult::Timeout => continue,
+                crate::queue::PopResult::Closed => break,
+            };
             let semantic = self.semantic.clone();
             let _priority = semantic.as_ref().map(|leg| leg.live_priority());
             let result = match event {

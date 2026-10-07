@@ -73,7 +73,7 @@ pub enum Arbitration {
 }
 
 /// Both constrained decoders, loaded the first time each is needed and resident
-/// from then on.
+/// until idle eviction.
 ///
 /// `*_unavailable` is not the same as `*_asr == None`: "not tried yet" and
 /// "tried, not installed" differ, and the difference is what keeps a missing
@@ -81,8 +81,10 @@ pub enum Arbitration {
 pub struct Arbiters {
     models: ModelSet,
     en: Option<Asr>,
+    en_last_used: Option<std::time::Instant>,
     en_unavailable: bool,
     de: Option<Whisper>,
+    de_last_used: Option<std::time::Instant>,
     de_unavailable: bool,
 }
 
@@ -91,10 +93,24 @@ impl Arbiters {
         Self {
             models: models.clone(),
             en: None,
+            en_last_used: None,
             en_unavailable: false,
             de: None,
+            de_last_used: None,
             de_unavailable: false,
         }
+    }
+
+    pub fn evict_idle(&mut self, now: std::time::Instant) -> usize {
+        usize::from(crate::idle_model::evict(
+            &mut self.en,
+            &mut self.en_last_used,
+            now,
+        )) + usize::from(crate::idle_model::evict(
+            &mut self.de,
+            &mut self.de_last_used,
+            now,
+        ))
     }
 
     /// Which languages this machine can actually arbitrate, for `models status`
@@ -158,7 +174,7 @@ impl Arbiters {
         }
     }
 
-    /// The English-only export, loaded on demand and kept.
+    /// The English-only export, loaded on demand and kept while in use.
     ///
     /// It has not been part of the default model set since 0.5.6 (the
     /// multilingual export beats it at English too), so the honest answer here
@@ -190,10 +206,13 @@ impl Arbiters {
                 }
             }
         }
+        if self.en.is_some() {
+            self.en_last_used = Some(std::time::Instant::now());
+        }
         self.en.as_mut()
     }
 
-    /// The German arbiter, loaded on demand and kept (0.7.7).
+    /// The German arbiter, loaded on demand and kept while in use (0.7.7).
     pub fn german(&mut self) -> Option<&mut Whisper> {
         if self.de.is_none() && !self.de_unavailable {
             let model = self.models.arbiter(ARBITER_DE);
@@ -218,6 +237,9 @@ impl Arbiters {
                     }
                 }
             }
+        }
+        if self.de.is_some() {
+            self.de_last_used = Some(std::time::Instant::now());
         }
         self.de.as_mut()
     }

@@ -150,3 +150,5 @@ pub mod worlds;
 pub const VAD_MODEL: &[u8] = include_bytes!("../models/silero_vad.onnx");
 
 pub mod name_assistance;
+
+pub mod idle_model;

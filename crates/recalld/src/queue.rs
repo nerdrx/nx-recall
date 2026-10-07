@@ -58,6 +58,13 @@ impl CaptureEvent {
     }
 }
 
+/// A timeout is housekeeping time, never an end-of-stream signal.
+pub enum PopResult {
+    Event(CaptureEvent),
+    Timeout,
+    Closed,
+}
+
 struct Inner {
     items: VecDeque<CaptureEvent>,
     queued_samples: usize,
@@ -161,6 +168,23 @@ impl EventQueue {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
+        }
+    }
+
+    /// Wait for audio or a housekeeping deadline, preserving close-and-drain semantics.
+    pub fn pop_timeout(&self, timeout: std::time::Duration) -> PopResult {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut inner, _) = self
+            .not_empty
+            .wait_timeout_while(inner, timeout, |i| i.items.is_empty() && !i.closed)
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(item) = inner.items.pop_front() {
+            inner.queued_samples = inner.queued_samples.saturating_sub(item.weight());
+            PopResult::Event(item)
+        } else if inner.closed {
+            PopResult::Closed
+        } else {
+            PopResult::Timeout
         }
     }
 
@@ -307,5 +331,28 @@ mod tests {
         let got = q.pop().expect("blocked pop should return the pushed chunk");
         assert_eq!(mark_of(&got), 3.0);
         h.join().unwrap();
+    }
+    #[test]
+    fn housekeeping_timeout_is_not_shutdown_and_close_still_drains() {
+        use std::time::Duration;
+        let q = EventQueue::new(10);
+        assert!(matches!(q.pop_timeout(Duration::ZERO), PopResult::Timeout));
+        q.push(chunk(9, 4, 3.0));
+        assert_eq!(q.queued_samples(), 4);
+        q.push(CaptureEvent::SessionEnd {
+            session_id: 7,
+            mono_ns: 8,
+        });
+        q.close();
+        assert!(matches!(
+            q.pop_timeout(Duration::ZERO),
+            PopResult::Event(CaptureEvent::Audio(_))
+        ));
+        assert_eq!(q.queued_samples(), 0);
+        assert!(matches!(
+            q.pop_timeout(Duration::ZERO),
+            PopResult::Event(CaptureEvent::SessionEnd { session_id: 7, .. })
+        ));
+        assert!(matches!(q.pop_timeout(Duration::ZERO), PopResult::Closed));
     }
 }

@@ -206,7 +206,7 @@ pub struct Analyzer {
     /// suite — keeps the two-argument constructor it always had.
     lang_cfg: LangConfig,
     /// The two constrained decoders, each loaded the first time a suspected
-    /// flip needs it and resident from then on (`crate::arbiter`).
+    /// flip needs it until idle eviction (`crate::arbiter`).
     arbiters: Arbiters,
     /// Which capture sources count as Discord (0.11.0). Read from
     /// `[truth].sources` rather than copied into `[identity]`, and defaulted
@@ -216,7 +216,7 @@ pub struct Analyzer {
 
     // ---- Japanese, Korean, Chinese (0.11.0/0.11.6, `crate::asr_cjk`) -----
     /// The CJK decoders and the spoken-language identifier that routes to
-    /// them, each loaded the first time it is needed and resident from then on.
+    /// them, each loaded the first time it is needed until idle eviction.
     cjk: crate::asr_cjk::Cjk,
     /// The switch and the operating point the router reads. Defaulted like
     /// `lang_cfg`, and set from the running config by [`Analyzer::
@@ -325,6 +325,12 @@ impl Analyzer {
     /// reads it to say whether a turn was too short to cut or merely unchanged.
     pub fn identity_config(&self) -> &IdentityConfig {
         &self.cfg
+    }
+
+    pub fn evict_idle_models(&mut self, now: std::time::Instant) -> usize {
+        self.arbiters.evict_idle(now)
+            + self.cjk.evict_idle(now)
+            + self.name_assistance.evict_idle(now)
     }
 
     pub fn attach_performance(

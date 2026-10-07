@@ -57,7 +57,7 @@
 //! it asynchronous would cost more than it saves.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -122,6 +122,8 @@ pub struct TextEmbedder {
     session: Session,
     tokenizer: Tokenizer,
     model_id: String,
+    model_path: PathBuf,
+    tokenizer_path: PathBuf,
     /// The export declares a `token_type_ids` input; some re-exports do not.
     wants_token_type: bool,
 }
@@ -133,6 +135,8 @@ impl TextEmbedder {
     }
 
     pub fn load_at(model: &Path, tokenizer: &Path, model_id: String) -> Result<Self> {
+        let model_path = model.to_path_buf();
+        let tokenizer_path = tokenizer.to_path_buf();
         let ort_err = |what: &'static str| move |e: ort::Error<_>| anyhow::anyhow!("{what}: {e}");
         // One thread, like every other model in this daemon: throughput is not
         // the constraint, never stealing a VR frame is.
@@ -165,6 +169,8 @@ impl TextEmbedder {
             session,
             tokenizer,
             model_id,
+            model_path,
+            tokenizer_path,
             wants_token_type,
         })
     }
@@ -1418,7 +1424,9 @@ pub fn run_repair(
                     if gate().is_some() {
                         return Ok(None);
                     }
-                    embedder.embed_passage(text).map(Some)
+                    embedder
+                        .with(|embedder| embedder.embed_passage(text))
+                        .map(Some)
                 },
             )
             .unwrap_or_else(|_| {
@@ -1428,6 +1436,9 @@ pub fn run_repair(
                 status.retry_at = Some(Instant::now() + Duration::from_secs(1));
                 Duration::from_secs(1)
             });
+        if leg.evict_idle(Instant::now()) {
+            tracing::info!("unloaded idle semantic model");
+        }
         stop.wait(delay);
     }
     let mut status = leg.repair.lock().unwrap_or_else(|p| p.into_inner());
@@ -1442,11 +1453,80 @@ pub fn run_repair(
 /// snapshot DB changes first, then release the store before inference/refits.
 pub struct SemanticLeg {
     model_id: String,
-    embedder: Mutex<TextEmbedder>,
+    embedder: Mutex<EmbedderCache>,
     index: Mutex<Arc<VectorIndex>>,
     coverage: Mutex<Option<(i64, Coverage)>>,
     foreground: AtomicUsize,
     repair: Mutex<RepairStatus>,
+}
+
+/// The shared ONNX session can be dropped during long idle periods and rebuilt
+/// from these small paths on the next query, live segment, or repair batch.
+struct EmbedderCache<T = TextEmbedder> {
+    slot: Option<T>,
+    model_path: PathBuf,
+    tokenizer_path: PathBuf,
+    model_id: String,
+    last_used: Option<Instant>,
+}
+
+impl<T> EmbedderCache<T> {
+    #[cfg(test)]
+    fn empty(model_path: PathBuf, tokenizer_path: PathBuf, model_id: String) -> Self {
+        Self {
+            slot: None,
+            model_path,
+            tokenizer_path,
+            model_id,
+            last_used: None,
+        }
+    }
+
+    fn evict_idle(&mut self, now: Instant) -> bool {
+        crate::idle_model::evict(&mut self.slot, &mut self.last_used, now)
+    }
+}
+
+impl EmbedderCache<TextEmbedder> {
+    fn new(embedder: TextEmbedder) -> Self {
+        Self {
+            model_path: embedder.model_path.clone(),
+            tokenizer_path: embedder.tokenizer_path.clone(),
+            model_id: embedder.model_id.clone(),
+            slot: Some(embedder),
+            last_used: Some(Instant::now()),
+        }
+    }
+
+    fn with<T>(&mut self, f: impl FnOnce(&mut TextEmbedder) -> Result<T>) -> Result<T> {
+        if self.slot.is_none() {
+            self.slot = Some(TextEmbedder::load_at(
+                &self.model_path,
+                &self.tokenizer_path,
+                self.model_id.clone(),
+            )?);
+        }
+        let result = f(self.slot.as_mut().expect("loaded above"));
+        self.last_used = Some(Instant::now());
+        result
+    }
+}
+
+fn try_evict_idle<T>(
+    cache: &Mutex<EmbedderCache<T>>,
+    foreground: &AtomicUsize,
+    now: Instant,
+) -> bool {
+    if foreground.load(Ordering::SeqCst) > 0 {
+        return false;
+    }
+    let Ok(mut cache) = cache.try_lock() else {
+        return false;
+    };
+    if foreground.load(Ordering::SeqCst) > 0 {
+        return false;
+    }
+    cache.evict_idle(now)
 }
 
 impl SemanticLeg {
@@ -1455,7 +1535,7 @@ impl SemanticLeg {
         Self {
             index: Mutex::new(Arc::new(VectorIndex::empty(model_id.clone(), DIM))),
             model_id,
-            embedder: Mutex::new(embedder),
+            embedder: Mutex::new(EmbedderCache::new(embedder)),
             coverage: Mutex::new(None),
             foreground: AtomicUsize::new(0),
             repair: Mutex::new(RepairStatus::default()),
@@ -1489,7 +1569,7 @@ impl SemanticLeg {
             .embedder
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .embed_query(q)?;
+            .with(|embedder| embedder.embed_query(q))?;
         Ok(base.search(&base.prepare_query(&qv.vector), limit, within))
     }
 
@@ -1532,7 +1612,7 @@ impl SemanticLeg {
             .embedder
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .embed_passage(&text)?;
+            .with(|embedder| embedder.embed_passage(&text))?;
         Ok(write_vector(store.conn(), segment_id, &v, text_hash(&text), Some(&text))?.is_some())
     }
 
@@ -1566,7 +1646,7 @@ impl SemanticLeg {
         if control.is_paused() {
             return Ok(false);
         }
-        let vector = embedder.embed_passage(&text)?;
+        let vector = embedder.with(|embedder| embedder.embed_passage(&text))?;
         drop(embedder);
         let store = store.lock().unwrap_or_else(|p| p.into_inner());
         if control.is_paused() {
@@ -1585,6 +1665,12 @@ impl SemanticLeg {
             "discarded": status.discarded,
             "retry_in_ms": status.retry_at.map(|at| at.saturating_duration_since(Instant::now()).as_millis() as u64).unwrap_or(0),
         })
+    }
+
+    /// Drop the ONNX session only after a full idle timeout. Never wait behind
+    /// an active inference call. A concurrent caller can reload after the drop.
+    fn evict_idle(&self, now: Instant) -> bool {
+        try_evict_idle(&self.embedder, &self.foreground, now)
     }
 
     /// Rank `limit` segments by meaning, within `within`.
@@ -1620,7 +1706,7 @@ impl SemanticLeg {
             .embedder
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .embed_query(q)?;
+            .with(|embedder| embedder.embed_query(q))?;
         let model_id = self.model_id.clone();
         let conn = store.conn();
         let mut stmt = conn.prepare(
@@ -1927,6 +2013,91 @@ pub fn status_command(data_dir: &Path, cfg: &crate::config::Config) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_eviction_is_nonblocking_and_respects_foreground_work() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct Probe(Arc<AtomicUsize>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let start = Instant::now();
+        let cache = Mutex::new(EmbedderCache::empty(
+            PathBuf::from("missing.onnx"),
+            PathBuf::from("missing.json"),
+            "test@1".into(),
+        ));
+        {
+            let mut held = cache.lock().unwrap();
+            held.slot = Some(Probe(Arc::clone(&dropped)));
+            held.last_used = Some(start);
+            assert!(!try_evict_idle(
+                &cache,
+                &AtomicUsize::new(0),
+                start + crate::idle_model::IDLE_TIMEOUT,
+            ));
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        }
+
+        let foreground = AtomicUsize::new(0);
+        let active = Foreground::new(&foreground);
+        assert!(!try_evict_idle(
+            &cache,
+            &foreground,
+            start + crate::idle_model::IDLE_TIMEOUT,
+        ));
+        assert!(cache.lock().unwrap().slot.is_some());
+        drop(active);
+        assert!(try_evict_idle(
+            &cache,
+            &foreground,
+            start + crate::idle_model::IDLE_TIMEOUT,
+        ));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_reload_retries_without_mutating_index_or_repair_state() {
+        let model_id = "missing@1".to_string();
+        let leg = SemanticLeg {
+            model_id: model_id.clone(),
+            embedder: Mutex::new(EmbedderCache::empty(
+                PathBuf::from("/no-such-semantic-model/model.onnx"),
+                PathBuf::from("/no-such-semantic-model/tokenizer.json"),
+                model_id.clone(),
+            )),
+            index: Mutex::new(Arc::new(VectorIndex::empty(model_id, DIM))),
+            coverage: Mutex::new(None),
+            foreground: AtomicUsize::new(0),
+            repair: Mutex::new(RepairStatus::default()),
+        };
+        let index = Arc::clone(&leg.index.lock().unwrap());
+        let repair = leg.repair_status();
+        let mut closure_calls = 0;
+
+        for _ in 0..2 {
+            let result = {
+                let mut cache = leg.embedder.lock().unwrap();
+                cache.with(|_| {
+                    closure_calls += 1;
+                    Ok(())
+                })
+            };
+            assert!(result.is_err());
+            let cache = leg.embedder.lock().unwrap();
+            assert!(cache.slot.is_none());
+            assert!(cache.last_used.is_none());
+        }
+
+        assert_eq!(closure_calls, 0);
+        assert!(Arc::ptr_eq(&index, &leg.index.lock().unwrap()));
+        assert_eq!(repair, leg.repair_status());
+    }
 
     #[test]
     fn the_prefixes_are_exactly_what_e5_was_trained_with() {
